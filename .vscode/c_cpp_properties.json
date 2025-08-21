@@ -1,0 +1,37 @@
+//
+// !!! WARNING !!! AUTO-GENERATED FILE!
+// PLEASE DO NOT MODIFY IT AND USE "platformio.ini":
+// https://docs.platformio.org/page/projectconf/section_env_build.html#build-flags
+//
+{
+    "configurations": [
+        {
+            "name": "PlatformIO",
+            "includePath": [
+                "F:/maimaicontrol V3.0/maimai-input-control-firmware/src",
+                ""
+            ],
+            "browse": {
+                "limitSymbolsToIncludedHeaders": true,
+                "path": [
+                    "F:/maimaicontrol V3.0/maimai-input-control-firmware/src",
+                    ""
+                ]
+            },
+            "defines": [
+                "F_CPU=133000000L",
+                "PLATFORMIO=60118",
+                "ARDUINO_RASPBERRY_PI_PICO",
+                "ARDUINO_ARCH_RP2040",
+                ""
+            ],
+            "compilerPath": "C:/Users/asdfg/.platformio/packages/toolchain-gccarmnoneeabi/bin/arm-none-eabi-gcc.exe",
+            "compilerArgs": [
+                "-mthumb",
+                "-mcpu=cortex-m0plus",
+                ""
+            ]
+        }
+    ],
+    "version": 4
+}
