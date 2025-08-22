@@ -295,9 +295,6 @@ void Mai2Serial::task() {
     }
 }
 
-// 私有方法实现
-// format_touch_data函数已删除 - 不再需要格式化坐标压力数据
-
 // 发送触摸状态 - 使用新的bitmap数据结构
 bool Mai2Serial::send_touch_state(uint32_t state1, uint32_t state2) {
     // 直接创建Mai2Serial_TouchData对象并调用send_touch_data
