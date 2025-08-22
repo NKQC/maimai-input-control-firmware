@@ -110,8 +110,6 @@ enum class BindingState : uint8_t {
     AUTO_SERIAL_BINDING_COMPLETE // 自动绑定完成
 };
 
-
-
 // GTX312L设备映射结构体 - 基于模块地址的统一结构
 struct GTX312L_DeviceMapping {
     uint16_t device_addr;                           // GTX312L_PhysicalAddr的get_device_mask()返回值
@@ -195,8 +193,10 @@ public:
     void unregisterGTX312L(GTX312L* device);
     
     // 工作模式设置
-    bool setWorkMode(InputWorkMode mode);
-    InputWorkMode getWorkMode() const;
+    inline bool setWorkMode(InputWorkMode mode);
+    inline InputWorkMode getWorkMode() const {
+        return config_->work_mode;
+    }
     
     // 核心循环函数
     void loop0();  // CPU0：GTX312L触摸采样和Serial/HID处理
@@ -238,10 +238,10 @@ public:
     // 映射设置方法
     void setSerialMapping(uint16_t device_addr, uint8_t channel, Mai2_TouchArea area);
     void setHIDMapping(uint16_t device_addr, uint8_t channel, float x, float y);
-    void setKeyboardMapping(uint16_t device_addr, uint8_t channel, HID_KeyCode key); // 设置键盘映射
+    void setTouchKeyboardMapping(uint16_t device_addr, uint8_t channel, HID_KeyCode key); // 设置键盘映射
     Mai2_TouchArea getSerialMapping(uint16_t device_addr, uint8_t channel);
-    TouchAxis getHIDMapping(uint16_t device_addr, uint8_t channel);
-    HID_KeyCode getKeyboardMapping(uint16_t device_addr, uint8_t channel);          // 获取键盘映射
+
+    HID_KeyCode getTouchKeyboardMapping(uint16_t device_addr, uint8_t channel);          // 获取键盘映射
     
     // 物理键盘GPIO映射方法
     bool addPhysicalKeyboard(MCU_GPIO gpio, HID_KeyCode default_key = HID_KeyCode::KEY_NONE);
@@ -259,9 +259,9 @@ public:
     
     // 触摸键盘映射方法
     void setTouchKeyboardEnabled(bool enabled);
-    bool getTouchKeyboardEnabled() const;
-    void setTouchKeyboardMode(TouchKeyboardMode mode);
-    TouchKeyboardMode getTouchKeyboardMode() const;
+    inline bool getTouchKeyboardEnabled() const;
+    inline void setTouchKeyboardMode(TouchKeyboardMode mode);
+    inline TouchKeyboardMode getTouchKeyboardMode() const;
     
     // 通道控制接口
     void enableAllChannels();   // 启用所有通道(绑定时使用)
@@ -350,6 +350,20 @@ private:
     InputManager_PrivateConfig* config_;    // 配置指针缓存
     bool mcp23s17_available_;                // MCP23S17是否可用的缓存状态
     
+    // 统一键盘触发表
+    // 共享内存结构体，用于loop0向loop1传递键盘bitmap
+    struct SharedKeyboardData {
+        volatile KeyboardBitmap touch_keyboard_bitmap;  // 触摸键盘bitmap（loop0写入）
+        volatile bool data_ready;                       // 数据就绪标志
+        
+        SharedKeyboardData() : data_ready(false) {
+            touch_keyboard_bitmap.clear();
+        }
+    } shared_keyboard_data_;
+    
+    KeyboardBitmap gpio_keyboard_bitmap_;  // GPIO键盘bitmap（loop1使用，避免跨核竞态）
+    KeyboardBitmap touch_bitmap_cache_;    // 触摸键盘bitmap缓存（从loop0共享内存读取）
+    
     // GPIO状态管理
     uint32_t mcu_gpio_states_;               // MCU GPIO状态位图
     uint32_t mcu_gpio_previous_states_;      // MCU GPIO上一次状态
@@ -359,18 +373,20 @@ private:
     // 内部处理函数
     inline void updateTouchStates();
     inline void processSerialMode();
-    inline void processHIDMode();
     inline void sendHIDTouchData();
-    void sendSerialToHIDKeyboardData();  // 发送Serial到HID键盘数据
+    
+    // 统一键盘处理函数
+    inline void collectKeysFromTouch();      // 从触摸映射收集按键状态
+    inline void collectKeysFromGPIO();       // 从GPIO物理键盘收集按键状态
     void processAutoAdjustSensitivity();
     
     // GPIO键盘处理函数
-    void updateGPIOStates();          // 更新GPIO状态
-    void processGPIOKeyboard();       // 处理GPIO键盘输入
-    void processTouchKeyboard();      // 处理触摸键盘映射
-    bool readMCUGPIO(uint8_t pin, bool& value);  // 读取MCU GPIO
-    bool readMCPGPIO(uint8_t pin, bool& value);  // 读取MCP GPIO
-    void sendLogicalKeys(uint8_t gpio_id, bool pressed);  // 发送逻辑按键
+    inline void updateGPIOStates();          // 更新GPIO状态
+    inline void processGPIOKeyboard();       // 处理GPIO键盘输入
+    inline void processTouchKeyboard();      // 处理触摸键盘映射
+    inline bool readMCUGPIO(uint8_t pin, bool& value);  // 读取MCU GPIO
+    inline bool readMCPGPIO(uint8_t pin, bool& value);  // 读取MCP GPIO
+    inline void setLogicalKeysInBitmap(uint8_t gpio_id, bool pressed, KeyboardBitmap& bitmap);  // 在bitmap中设置逻辑按键
     
     // 设备查找
     int findDeviceIndex(uint16_t device_addr);

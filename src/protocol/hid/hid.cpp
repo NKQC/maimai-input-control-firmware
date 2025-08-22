@@ -193,6 +193,37 @@ bool HID::send_keyboard_report(const HID_KeyboardReport& report) {
                       reinterpret_cast<const uint8_t*>(&report), 7);
 }
 
+// 高效发送键盘bitmap数据
+bool HID::send_keyboard_data(const KeyboardBitmap& bitmap) {
+    if (!is_ready()) {
+        return false;
+    }
+    
+    HID_KeyboardReport report;
+    uint8_t key_count = 0;
+    
+    // 处理修饰键
+    if (bitmap.getKey(HID_KeyCode::KEY_LEFT_CTRL)) report.modifier |= 0x01;
+    if (bitmap.getKey(HID_KeyCode::KEY_LEFT_SHIFT)) report.modifier |= 0x02;
+    if (bitmap.getKey(HID_KeyCode::KEY_LEFT_ALT)) report.modifier |= 0x04;
+    if (bitmap.getKey(HID_KeyCode::KEY_LEFT_GUI)) report.modifier |= 0x08;
+    if (bitmap.getKey(HID_KeyCode::KEY_RIGHT_CTRL)) report.modifier |= 0x10;
+    if (bitmap.getKey(HID_KeyCode::KEY_RIGHT_SHIFT)) report.modifier |= 0x20;
+    if (bitmap.getKey(HID_KeyCode::KEY_RIGHT_ALT)) report.modifier |= 0x40;
+    if (bitmap.getKey(HID_KeyCode::KEY_RIGHT_GUI)) report.modifier |= 0x80;
+    
+    // 遍历所有支持的按键（除修饰键外）
+    for (const HID_KeyCode& key : supported_keys) {
+        if (key >= HID_KeyCode::KEY_LEFT_CTRL) continue; // 跳过修饰键
+        
+        if (bitmap.getKey(key) && key_count < 6) {
+            report.keys[key_count++] = static_cast<uint8_t>(key);
+        }
+    }
+    
+    return send_keyboard_report(report);
+}
+
 // 按下按键
 bool HID::press_key(HID_KeyCode key, uint8_t modifier) {
     if (!is_ready()) {

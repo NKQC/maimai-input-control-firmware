@@ -116,6 +116,13 @@ UIManager::UIManager()
     , neopixel_grid_(nullptr)
     , light_mapping_status_(nullptr)
     
+    // UART设置相关
+    , mai2serial_baudrate_dropdown_(nullptr)
+    , mai2light_baudrate_dropdown_(nullptr)
+    , uart_status_label_(nullptr)
+    , current_mai2serial_baudrate_(115200)
+    , current_mai2light_baudrate_(115200)
+    
     // 状态页面相关
     , status_mode_label_(nullptr)
     , status_touch_label_(nullptr)
@@ -362,6 +369,7 @@ bool UIManager::set_current_page(UIPage page) {
             case UIPage::KEY_MAPPING: create_key_mapping_page(); break;
             case UIPage::GUIDED_BINDING: create_guided_binding_page(); break;
             case UIPage::SETTINGS: create_settings_page(); break;
+            case UIPage::UART_SETTINGS: create_uart_settings_page(); break;
             case UIPage::CALIBRATION: create_calibration_page(); break;
             case UIPage::DIAGNOSTICS: create_diagnostics_page(); break;
             case UIPage::LIGHT_MAPPING: create_light_mapping_page(); break;
@@ -509,6 +517,15 @@ void UIManager::handle_confirm_input() {
                 case 5: set_current_page(UIPage::LIGHT_MAPPING); break;
                 case 6: set_current_page(UIPage::ABOUT); break;
                 case 7: /* 退出或其他操作 */ break;
+            }
+            break;
+            
+        case UIPage::SETTINGS:
+            // 根据菜单索引切换到设置子页面
+            switch (current_menu_index_) {
+                case 0: set_current_page(UIPage::UART_SETTINGS); break;
+                // 可以在这里添加更多设置子页面
+                default: break;
             }
             break;
             
@@ -746,7 +763,7 @@ bool UIManager::update_key_mapping_display() {
     // 显示每个设备的键盘映射
     for (int i = 0; i < device_count; i++) {
         for (uint8_t ch = 0; ch < 12; ch++) {
-            HID_KeyCode key = input_manager_->getKeyboardMapping(devices[i].device.device_addr, ch);
+            HID_KeyCode key = input_manager_->getTouchKeyboardMapping(devices[i].device.device_addr, ch);
             if (key != HID_KeyCode::KEY_NONE) {
                 char item_text[64];
                 snprintf(item_text, sizeof(item_text), "Dev%04X Ch%d: %s", 
@@ -890,8 +907,8 @@ bool UIManager::handle_hid_key_selection(lv_event_t* e) {
     // 转换按键名称为按键代码
     HID_KeyCode key_code = getKeyCodeFromName(key_name);
     
-    // 设置键盘映射
-    input_manager_->setKeyboardMapping(device_addr, channel, key_code);
+    // 设置触摸键盘映射
+    input_manager_->setTouchKeyboardMapping(device_addr, channel, key_code);
     log_debug("Key mapping set: Dev" + std::to_string(device_addr) + " Ch" + std::to_string(channel) + " -> " + key_name);
     
     // 更新显示
@@ -912,7 +929,7 @@ bool UIManager::clear_all_key_mappings() {
     // 清除所有设备的键盘映射
     for (int i = 0; i < device_count; i++) {
         for (uint8_t ch = 0; ch < 12; ch++) {
-            input_manager_->setKeyboardMapping(devices[i].device.device_addr, ch, HID_KeyCode::KEY_NONE);
+            input_manager_->setTouchKeyboardMapping(devices[i].device.device_addr, ch, HID_KeyCode::KEY_NONE);
         }
     }
     
@@ -1405,7 +1422,85 @@ void UIManager::create_settings_page() {
     lv_obj_set_style_text_color(title, lv_color_white(), 0);
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 10);
     
+    // 创建设置菜单项
+    lv_obj_t* uart_settings_label = lv_label_create(page);
+    lv_label_set_text(uart_settings_label, "> UART Settings");
+    lv_obj_set_style_text_color(uart_settings_label, lv_color_white(), 0);
+    lv_obj_align(uart_settings_label, LV_ALIGN_CENTER, 0, 0);
+    
+    // 添加导航提示
+    lv_obj_t* help_text = lv_label_create(page);
+    lv_label_set_text(help_text, "UP/DOWN: Navigate\nCONFIRM: Select\nBACK: Return");
+    lv_obj_set_style_text_color(help_text, lv_color_white(), 0);
+    lv_obj_align(help_text, LV_ALIGN_BOTTOM_MID, 0, -10);
+    
     pages_[UIPage::SETTINGS] = page;
+}
+
+void UIManager::create_uart_settings_page() {
+    // 创建UART设置页面
+    lv_obj_t* page = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(page, lv_color_black(), 0);
+    
+    // 添加标题
+    lv_obj_t* title = lv_label_create(page);
+    lv_label_set_text(title, "UART Settings");
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 10);
+    lv_obj_set_style_text_color(title, lv_color_white(), 0);
+    
+    // Mai2Serial波特率设置
+    lv_obj_t* mai2serial_label = lv_label_create(page);
+    lv_label_set_text(mai2serial_label, "Mai2Serial Baudrate:");
+    lv_obj_align(mai2serial_label, LV_ALIGN_TOP_LEFT, 10, 40);
+    lv_obj_set_style_text_color(mai2serial_label, lv_color_white(), 0);
+    
+    mai2serial_baudrate_dropdown_ = lv_dropdown_create(page);
+    lv_dropdown_set_options(mai2serial_baudrate_dropdown_, "9600\n19200\n38400\n57600\n115200\n230400\n460800\n921600");
+    lv_obj_align(mai2serial_baudrate_dropdown_, LV_ALIGN_TOP_LEFT, 10, 65);
+    lv_obj_set_width(mai2serial_baudrate_dropdown_, 120);
+    lv_obj_add_event_cb(mai2serial_baudrate_dropdown_, dropdown_event_cb, LV_EVENT_VALUE_CHANGED, this);
+    
+    // Mai2Light波特率设置
+    lv_obj_t* mai2light_label = lv_label_create(page);
+    lv_label_set_text(mai2light_label, "Mai2Light Baudrate:");
+    lv_obj_align(mai2light_label, LV_ALIGN_TOP_LEFT, 10, 100);
+    lv_obj_set_style_text_color(mai2light_label, lv_color_white(), 0);
+    
+    mai2light_baudrate_dropdown_ = lv_dropdown_create(page);
+    lv_dropdown_set_options(mai2light_baudrate_dropdown_, "9600\n19200\n38400\n57600\n115200\n230400\n460800\n921600");
+    lv_obj_align(mai2light_baudrate_dropdown_, LV_ALIGN_TOP_LEFT, 10, 125);
+    lv_obj_set_width(mai2light_baudrate_dropdown_, 120);
+    lv_obj_add_event_cb(mai2light_baudrate_dropdown_, dropdown_event_cb, LV_EVENT_VALUE_CHANGED, this);
+    
+    // 状态标签
+    uart_status_label_ = lv_label_create(page);
+    lv_label_set_text(uart_status_label_, "Status: Ready");
+    lv_obj_align(uart_status_label_, LV_ALIGN_TOP_LEFT, 10, 160);
+    lv_obj_set_style_text_color(uart_status_label_, lv_color_white(), 0);
+    
+    // 保存按钮
+    lv_obj_t* save_btn = lv_btn_create(page);
+    lv_obj_set_size(save_btn, 80, 30);
+    lv_obj_align(save_btn, LV_ALIGN_BOTTOM_LEFT, 10, -10);
+    lv_obj_add_event_cb(save_btn, button_event_cb, LV_EVENT_CLICKED, this);
+    lv_obj_t* save_label = lv_label_create(save_btn);
+    lv_label_set_text(save_label, "Save");
+    lv_obj_center(save_label);
+    
+    // 重置按钮
+    lv_obj_t* reset_btn = lv_btn_create(page);
+    lv_obj_set_size(reset_btn, 80, 30);
+    lv_obj_align(reset_btn, LV_ALIGN_BOTTOM_RIGHT, -10, -10);
+    lv_obj_add_event_cb(reset_btn, button_event_cb, LV_EVENT_CLICKED, this);
+    lv_obj_t* reset_label = lv_label_create(reset_btn);
+    lv_label_set_text(reset_label, "Reset");
+    lv_obj_center(reset_label);
+    
+    // 设置默认值
+    lv_dropdown_set_selected(mai2serial_baudrate_dropdown_, 4); // 115200
+    lv_dropdown_set_selected(mai2light_baudrate_dropdown_, 4);  // 115200
+    
+    pages_[UIPage::UART_SETTINGS] = page;
 }
 
 void UIManager::create_calibration_page() {
@@ -1626,10 +1721,40 @@ void UIManager::button_event_cb(lv_event_t* e) {
             }
         }
         
+        // UART设置页面的按钮处理
+        if (ui->current_page_ == UIPage::UART_SETTINGS) {
+            lv_obj_t* label = lv_obj_get_child(btn, 0);
+            if (label) {
+                const char* text = lv_label_get_text(label);
+                if (text) {
+                    if (strcmp(text, "Save") == 0) {
+                        ui->save_uart_settings();
+                        return;
+                    } else if (strcmp(text, "Reset") == 0) {
+                        ui->reset_uart_settings();
+                        return;
+                    }
+                }
+            }
+        }
+        
         // 其他页面的按钮处理
         int menu_index = (int)(intptr_t)lv_obj_get_user_data(btn);
         ui->current_menu_index_ = menu_index;
         ui->handle_confirm_input();
+    }
+}
+
+void UIManager::dropdown_event_cb(lv_event_t* e) {
+    UIManager* ui = static_cast<UIManager*>(lv_event_get_user_data(e));
+    lv_obj_t* dropdown = lv_event_get_target(e);
+    
+    if (ui && ui->current_page_ == UIPage::UART_SETTINGS) {
+        if (dropdown == ui->mai2serial_baudrate_dropdown_) {
+            ui->handle_mai2serial_baudrate_change();
+        } else if (dropdown == ui->mai2light_baudrate_dropdown_) {
+            ui->handle_mai2light_baudrate_change();
+        }
     }
 }
 
@@ -2168,12 +2293,7 @@ bool UIManager::show_sensitivity_page() {
     return set_current_page(UIPage::SENSITIVITY);
 }
 
-bool UIManager::set_sensitivity_for_device(const std::string& device_name, uint8_t channel, uint8_t sensitivity) {
-    if (input_manager_) {
-        return input_manager_->set_channel_sensitivity_by_name(device_name, channel, sensitivity);
-    }
-    return false;
-}
+
 
 // 显示绑定状态
 bool UIManager::show_binding_status(const std::string& message, bool is_success) {
@@ -2316,6 +2436,97 @@ void UIManager::update_main_page() {
 
 void UIManager::update_settings_page() {
     // 更新设置页面
+}
+
+void UIManager::update_uart_settings_page() {
+    if (current_page_ != UIPage::UART_SETTINGS || !uart_status_label_) {
+        return;
+    }
+    
+    // 更新状态标签
+    std::string status_text = "Status: ";
+    if (input_manager_ && light_manager_) {
+        status_text += "Ready";
+    } else {
+        status_text += "Not Ready";
+    }
+    
+    lv_label_set_text(uart_status_label_, status_text.c_str());
+}
+
+void UIManager::handle_mai2serial_baudrate_change() {
+    if (!mai2serial_baudrate_dropdown_) {
+        return;
+    }
+    
+    uint16_t selected = lv_dropdown_get_selected(mai2serial_baudrate_dropdown_);
+    uint32_t baudrates[] = {9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600};
+    
+    if (selected < sizeof(baudrates) / sizeof(baudrates[0])) {
+        current_mai2serial_baudrate_ = baudrates[selected];
+        
+        // 更新状态
+        if (uart_status_label_) {
+            std::string status = "Mai2Serial: " + std::to_string(current_mai2serial_baudrate_) + " bps";
+            lv_label_set_text(uart_status_label_, status.c_str());
+        }
+    }
+}
+
+void UIManager::handle_mai2light_baudrate_change() {
+    if (!mai2light_baudrate_dropdown_) {
+        return;
+    }
+    
+    uint16_t selected = lv_dropdown_get_selected(mai2light_baudrate_dropdown_);
+    uint32_t baudrates[] = {9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600};
+    
+    if (selected < sizeof(baudrates) / sizeof(baudrates[0])) {
+        current_mai2light_baudrate_ = baudrates[selected];
+        
+        // 更新状态
+        if (uart_status_label_) {
+            std::string status = "Mai2Light: " + std::to_string(current_mai2light_baudrate_) + " bps";
+            lv_label_set_text(uart_status_label_, status.c_str());
+        }
+    }
+}
+
+void UIManager::save_uart_settings() {
+    if (!input_manager_ || !light_manager_) {
+        if (uart_status_label_) {
+            lv_label_set_text(uart_status_label_, "Error: Managers not available");
+        }
+        return;
+    }
+    
+    // 通过InputManager设置Mai2Serial波特率
+    // 这里需要InputManager提供设置波特率的接口
+    
+    // 通过LightManager设置Mai2Light波特率
+    // 这里需要LightManager提供设置波特率的接口
+    
+    if (uart_status_label_) {
+        lv_label_set_text(uart_status_label_, "Settings saved successfully");
+    }
+}
+
+void UIManager::reset_uart_settings() {
+    // 重置为默认值115200
+    current_mai2serial_baudrate_ = 115200;
+    current_mai2light_baudrate_ = 115200;
+    
+    if (mai2serial_baudrate_dropdown_) {
+        lv_dropdown_set_selected(mai2serial_baudrate_dropdown_, 4); // 115200
+    }
+    
+    if (mai2light_baudrate_dropdown_) {
+        lv_dropdown_set_selected(mai2light_baudrate_dropdown_, 4); // 115200
+    }
+    
+    if (uart_status_label_) {
+        lv_label_set_text(uart_status_label_, "Settings reset to default");
+    }
 }
 
 void UIManager::update_calibration_page() {

@@ -19,7 +19,10 @@ InputManager* InputManager::getInstance() {
 
 // 私有构造函数
 InputManager::InputManager() 
-    : binding_active_(false)
+    : sample_counter_(0)
+    , last_reset_time_(0)
+    , current_sample_rate_(0)
+    , binding_active_(false)
     , binding_state_(BindingState::IDLE)
     , current_binding_index_(0)
     , binding_start_time_(0)
@@ -28,7 +31,6 @@ InputManager::InputManager()
     , hid_binding_channel_(0)
     , hid_binding_x_(0.0f)
     , hid_binding_y_(0.0f)
-
     , mai2_serial_(nullptr)
     , hid_(nullptr)
     , ui_manager_(nullptr)
@@ -37,9 +39,8 @@ InputManager::InputManager()
     , mcp23s17_available_(false)
     , mcu_gpio_states_(0)
     , mcu_gpio_previous_states_(0)
-    , sample_counter_(0)
-    , last_reset_time_(0)
-    , current_sample_rate_(0) {
+    , gpio_keyboard_bitmap_()
+    , touch_bitmap_cache_() {
     
     // 初始化触摸状态数组
     for (int i = 0; i < 8; i++) {
@@ -140,7 +141,6 @@ bool InputManager::registerGTX312L(GTX312L* device) {
 void InputManager::unregisterGTX312L(GTX312L* device) {
     if (!device) return;
     
-    InputManager_PrivateConfig* config = inputmanager_get_config_holder();
     uint16_t device_addr = device->get_physical_device_address().get_device_mask();
     
     // 从设备列表中移除
@@ -151,10 +151,10 @@ void InputManager::unregisterGTX312L(GTX312L* device) {
         // 重新整理设备映射数组
         int removed_index = findDeviceIndex(device_addr);
         if (removed_index >= 0) {
-            for (int i = removed_index; i < config->device_count - 1; i++) {
-                config->device_mappings[i] = config->device_mappings[i + 1];
+            for (int i = removed_index; i < config_->device_count - 1; i++) {
+                config_->device_mappings[i] = config_->device_mappings[i + 1];
             }
-            config->device_count--;
+            config_->device_count--;
         }
     }
 }
@@ -162,35 +162,27 @@ void InputManager::unregisterGTX312L(GTX312L* device) {
 // 物理键盘映射管理方法
 bool InputManager::addPhysicalKeyboard(MCU_GPIO gpio, HID_KeyCode default_key) {
     // 添加新映射
-    PhysicalKeyboardMapping new_mapping;
-    new_mapping.mcu_gpio = gpio;
-    new_mapping.default_key = default_key;
+    PhysicalKeyboardMapping new_mapping(gpio, default_key);
     config_->physical_keyboard_mappings.push_back(new_mapping);
-    
     return true;
 }
 
 bool InputManager::addPhysicalKeyboard(MCP_GPIO gpio, HID_KeyCode default_key) {
     // 添加新映射
-    PhysicalKeyboardMapping new_mapping;
-    new_mapping.mcp_gpio = gpio;
-    new_mapping.default_key = default_key;
+    PhysicalKeyboardMapping new_mapping(gpio, default_key);
     config_->physical_keyboard_mappings.push_back(new_mapping);
-    
     return true;
 }
 
 bool InputManager::removePhysicalKeyboard(uint8_t gpio_pin) {
-    InputManager_PrivateConfig* config = inputmanager_get_config_holder();
-    
-    auto it = std::find_if(config->physical_keyboard_mappings.begin(), 
-                          config->physical_keyboard_mappings.end(),
+    auto it = std::find_if(config_->physical_keyboard_mappings.begin(), 
+                          config_->physical_keyboard_mappings.end(),
                           [gpio_pin](const PhysicalKeyboardMapping& mapping) {
                               return mapping.gpio == gpio_pin;
                           });
     
-    if (it != config->physical_keyboard_mappings.end()) {
-        config->physical_keyboard_mappings.erase(it);
+    if (it != config_->physical_keyboard_mappings.end()) {
+        config_->physical_keyboard_mappings.erase(it);
         return true;
     }
     
@@ -198,8 +190,7 @@ bool InputManager::removePhysicalKeyboard(uint8_t gpio_pin) {
 }
 
 void InputManager::clearPhysicalKeyboards() {
-    InputManager_PrivateConfig* config = inputmanager_get_config_holder();
-    config->physical_keyboard_mappings.clear();
+    config_->physical_keyboard_mappings.clear();
 }
 
 // 逻辑按键映射管理方法
@@ -278,33 +269,26 @@ void InputManager::setTouchKeyboardEnabled(bool enabled) {
     config->touch_keyboard_enabled = enabled;
 }
 
-bool InputManager::getTouchKeyboardEnabled() const {
-    InputManager_PrivateConfig* config = inputmanager_get_config_holder();
-    return config->touch_keyboard_enabled;
+inline bool InputManager::getTouchKeyboardEnabled() const {
+    return config_->touch_keyboard_enabled;
 }
 
-void InputManager::setTouchKeyboardMode(TouchKeyboardMode mode) {
-    InputManager_PrivateConfig* config = inputmanager_get_config_holder();
-    config->touch_keyboard_mode = mode;
+inline void InputManager::setTouchKeyboardMode(TouchKeyboardMode mode) {
+    config_->touch_keyboard_mode = mode;
 }
 
-TouchKeyboardMode InputManager::getTouchKeyboardMode() const {
-    InputManager_PrivateConfig* config = inputmanager_get_config_holder();
-    return config->touch_keyboard_mode;
+inline TouchKeyboardMode InputManager::getTouchKeyboardMode() const {
+    return config_->touch_keyboard_mode;
 }
 
 // 设置工作模式
-bool InputManager::setWorkMode(InputWorkMode mode) {
-    InputManager_PrivateConfig* config = inputmanager_get_config_holder();
-    config->work_mode = mode;
+inline bool InputManager::setWorkMode(InputWorkMode mode) {
+    config_->work_mode = mode;
     return true;
 }
 
 // 获取工作模式
-InputWorkMode InputManager::getWorkMode() const {
-    InputManager_PrivateConfig* config = inputmanager_get_config_holder();
-    return config->work_mode;
-}
+
 
 // CPU0核心循环 - GTX312L触摸采样和Serial/HID处理
 void InputManager::loop0() {
@@ -324,24 +308,33 @@ void InputManager::loop0() {
         InputWorkMode work_mode = getWorkMode();
         if (work_mode == InputWorkMode::SERIAL_MODE) {
             processSerialMode();
-        } else if (work_mode == InputWorkMode::HID_MODE) {
-            processHIDMode();
         }
     }
 }
 
 // CPU1核心循环 - 键盘处理和HID发送
 void InputManager::loop1() {
-    // 更新GPIO状态
-    updateGPIOStates();
+    // 1. 从共享内存获取loop0传递的触摸键盘bitmap（CPU0写入，CPU1只读）
+    touch_bitmap_cache_.bitmap = shared_keyboard_data_.touch_keyboard_bitmap.bitmap;
     
-    // 处理GPIO键盘输入
+    // 2. 采样GPIO键盘数据到独立bitmap（CPU1内部处理，无跨核竞态）
+    gpio_keyboard_bitmap_.clear();
+    updateGPIOStates();
     processGPIOKeyboard();
     
-    // 处理触摸键盘映射
-    processTouchKeyboard();
+    // 3. 合并触摸和GPIO键盘bitmap（CPU1内部操作，线程安全）
+    gpio_keyboard_bitmap_.bitmap |= touch_bitmap_cache_.bitmap;
     
-    // 在HID模式下发送触摸数据
+    // 4. 根据最终bitmap发送键盘状态
+    for (const auto& key : supported_keys) {
+        if (gpio_keyboard_bitmap_.getKey(key)) {
+            hid_->press_key(key);
+            continue;
+        }
+        hid_->release_key(key);
+    }
+    
+    // 5. 在HID模式下发送触摸数据
     if (getWorkMode() == InputWorkMode::HID_MODE) {
         sendHIDTouchData();
     }
@@ -712,16 +705,8 @@ Mai2_TouchArea InputManager::getSerialMapping(uint16_t device_addr, uint8_t chan
     return mapping ? mapping->serial_area[channel] : MAI2_NO_USED;
 }
 
-// 获取HID映射
-TouchAxis InputManager::getHIDMapping(uint16_t device_addr, uint8_t channel) {
-    if (channel >= 12) return TouchAxis();
-    
-    GTX312L_DeviceMapping* mapping = findDeviceMapping(device_addr);
-    return mapping ? mapping->hid_area[channel] : TouchAxis();
-}
-
 // 设置键盘映射
-void InputManager::setKeyboardMapping(uint16_t device_addr, uint8_t channel, HID_KeyCode key) {
+void InputManager::setTouchKeyboardMapping(uint16_t device_addr, uint8_t channel, HID_KeyCode key) {
     if (channel >= 12) return;
     
     GTX312L_DeviceMapping* mapping = findDeviceMapping(device_addr);
@@ -730,8 +715,8 @@ void InputManager::setKeyboardMapping(uint16_t device_addr, uint8_t channel, HID
     }
 }
 
-// 获取键盘映射
-HID_KeyCode InputManager::getKeyboardMapping(uint16_t device_addr, uint8_t channel) {
+// 获取触摸键盘映射
+HID_KeyCode InputManager::getTouchKeyboardMapping(uint16_t device_addr, uint8_t channel) {
     if (channel >= 12) return HID_KeyCode::KEY_NONE;
     
     GTX312L_DeviceMapping* mapping = findDeviceMapping(device_addr);
@@ -797,13 +782,15 @@ inline void InputManager::processSerialMode() {
     touch_state.parts.state1 = 0;
     touch_state.parts.state2 = 0;
     
+    // 使用静态触摸键盘bitmap，不清空，直接覆盖更新
+    static KeyboardBitmap touch_keyboard_bitmap;
+    
     // 遍历所有设备和通道，基于设备地址掩码进行映射
     for (int i = 0; i < config_->device_count; i++) {
         uint16_t current = current_touch_states_[i].physical_addr.mask;
         uint16_t previous = previous_touch_states_[i].physical_addr.mask;
-        uint16_t changed = current ^ previous;
         
-        if (changed == 0) continue; // 没有变化
+        // 即使没有变化也要发送，这与HID不同
         
         // 根据设备地址掩码查找对应的映射配置
         uint16_t device_addr = current_touch_states_[i].physical_addr.mask & 0xF000; // 获取设备地址
@@ -820,50 +807,125 @@ inline void InputManager::processSerialMode() {
         if (!mapping) continue; // 未找到匹配的映射
         
         for (uint8_t ch = 0; ch < 12; ch++) {
-            if (!(changed & (1 << ch))) continue; // 该通道没有变化
-            
-            Mai2_TouchArea area = mapping->serial_area[ch];
-            if (area == MAI2_NO_USED) continue;
-            
+            // 处理所有通道，不跳过无变化的通道
             bool touched = (current & (1 << ch)) != 0;
             
-            // 设置对应区域的状态
-            if (area >= 1 && area <= 34) {
-                uint8_t bit_index = area - 1;
-                if (bit_index < 32) {
-                    if (touched) {
-                        touch_state.parts.state1 |= (1UL << bit_index);
+            // 处理Serial触摸映射
+            Mai2_TouchArea area = mapping->serial_area[ch];
+            if (area != MAI2_NO_USED) {
+                // 设置对应区域的状态
+                if (area >= 1 && area <= 34) {
+                    uint8_t bit_index = area - 1;
+                    if (bit_index < 32) {
+                        if (touched) {
+                            touch_state.parts.state1 |= (1UL << bit_index);
+                        } else {
+                            touch_state.parts.state1 &= ~(1UL << bit_index);
+                        }
                     } else {
-                        touch_state.parts.state1 &= ~(1UL << bit_index);
+                        bit_index -= 32;
+                        if (touched) {
+                            touch_state.parts.state2 |= (1 << bit_index);
+                        } else {
+                            touch_state.parts.state2 &= ~(1 << bit_index);
+                        }
                     }
+                }
+            }
+            
+            // 处理触摸键盘映射
+            HID_KeyCode key = mapping->keyboard_keys[ch];
+            if (key != HID_KeyCode::KEY_NONE) {
+                if (touched) {
+                    touch_keyboard_bitmap.setKey(key, true);
                 } else {
-                    bit_index -= 32;
-                    if (touched) {
-                        touch_state.parts.state2 |= (1 << bit_index);
-                    } else {
-                        touch_state.parts.state2 &= ~(1 << bit_index);
-                    }
+                    touch_keyboard_bitmap.setKey(key, false);
                 }
             }
         }
     }
+    
+    // 将触摸键盘bitmap写入共享内存传递给loop1
+    shared_keyboard_data_.touch_keyboard_bitmap.bitmap = touch_keyboard_bitmap.bitmap;
     
     // Serial模式下：只发送Serial数据，HID触摸发送直接失效
     if (mai2_serial_) {
         mai2_serial_->send_touch_state(touch_state.parts.state1, touch_state.parts.state2);
     }
     
-    // 在Serial模式下，如果绑区完成且有键盘映射，同时发送HID键盘数据
-    if (isAutoSerialBindingComplete() && hid_) {
-        sendSerialToHIDKeyboardData();
-    }
+    // HID键盘数据处理移到loop1中进行
 }
 
 // 处理HID模式
-inline void InputManager::processHIDMode() {
-    // HID模式下：串口直接失效，只处理HID触摸数据
-    // HID模式的具体处理在sendHIDTouchData中完成
-    // 在此模式下，mai2_serial_不会被调用，确保串口失效
+// 统一键盘处理函数实现
+inline void InputManager::collectKeysFromTouch() {
+    // 从触摸映射收集按键状态到键盘触发表
+    for (int device_index = 0; device_index < 8; device_index++) {
+        const GTX312L_SampleResult& current_state = current_touch_states_[device_index];
+        const GTX312L_SampleResult& previous_state = previous_touch_states_[device_index];
+        
+        // 查找对应的设备映射
+        GTX312L_DeviceMapping* device_mapping = nullptr;
+        for (int i = 0; i < config_->device_count; i++) {
+            if (config_->device_mappings[i].device_addr == current_state.physical_addr.get_device_mask()) {
+                device_mapping = &config_->device_mappings[i];
+                break;
+            }
+        }
+        
+        if (device_mapping) {
+            // 遍历所有通道
+            for (int channel = 0; channel < 12; channel++) {
+                bool current_touched = (current_state.physical_addr.mask & (1 << channel)) != 0;
+                bool previous_touched = (previous_state.physical_addr.mask & (1 << channel)) != 0;
+                
+                // 检查通道状态是否发生变化
+                if (current_touched != previous_touched) {
+                    HID_KeyCode key = device_mapping->keyboard_keys[channel];
+                    if (key != HID_KeyCode::KEY_NONE) {
+                        shared_keyboard_data_.touch_keyboard_bitmap.setKey(key, current_touched);
+                    }
+                }
+            }
+        }
+    }
+}
+
+inline void InputManager::collectKeysFromGPIO() {
+    // 从GPIO物理键盘收集按键状态到键盘触发表
+    for (const auto& mapping : config_->physical_keyboard_mappings) {
+        bool current_pressed = false;
+        uint8_t gpio_pin = mapping.gpio;
+        
+        // 检查GPIO状态
+        if (gpio_pin < 64) {  // MCU GPIO
+            current_pressed = (mcu_gpio_states_ & (1ULL << gpio_pin)) != 0;
+        } else if (gpio_pin >= 64 && gpio_pin < 80) {  // MCP23S17 GPIO
+            int mcp_pin = gpio_pin - 64;
+            // 组合port_a和port_b为16位状态
+            uint16_t full_state = (static_cast<uint16_t>(mcp_gpio_states_.port_b) << 8) | mcp_gpio_states_.port_a;
+            current_pressed = (full_state & (1 << mcp_pin)) != 0;
+        }
+        
+        // 简单的按键状态判断（假设高电平有效）
+        bool key_active = current_pressed;
+        
+        // 设置默认按键状态
+        if (mapping.default_key != HID_KeyCode::KEY_NONE) {
+            gpio_keyboard_bitmap_.setKey(mapping.default_key, key_active);
+        }
+        
+        // 设置逻辑映射按键状态
+        for (const auto& logical_mapping : config_->logical_key_mappings) {
+            if (logical_mapping.gpio_id == gpio_pin) {
+                for (int i = 0; i < logical_mapping.key_count && i < 3; i++) {
+                    if (logical_mapping.keys[i] != HID_KeyCode::KEY_NONE) {
+                        gpio_keyboard_bitmap_.setKey(logical_mapping.keys[i], key_active);
+                    }
+                }
+            }
+        }
+    }
 }
 
 // 发送HID触摸数据
@@ -915,52 +977,6 @@ inline void InputManager::sendHIDTouchData() {
     }
 }
 
-// 在Serial模式下发送HID触摸数据
-void InputManager::sendSerialToHIDKeyboardData() {
-    if (!hid_) return;
-    
-    InputManager_PrivateConfig* config = inputmanager_get_config_holder();
-    
-    // 遍历所有设备和通道，检测触摸状态变化
-    for (int i = 0; i < config->device_count; i++) {
-        uint16_t current = current_touch_states_[i].physical_addr.mask;
-        uint16_t previous = previous_touch_states_[i].physical_addr.mask;
-        uint16_t changed = current ^ previous;
-        
-        if (changed == 0) continue; // 没有变化
-        
-        // 根据设备地址掩码查找对应的映射配置
-        uint16_t device_addr = current_touch_states_[i].physical_addr.mask & 0xF000;
-        
-        // 查找匹配的设备映射
-        GTX312L_DeviceMapping* mapping = nullptr;
-        for (int j = 0; j < config->device_count; j++) {
-            if ((config->device_mappings[j].device_addr & 0xF000) == device_addr) {
-                mapping = &config->device_mappings[j];
-                break;
-            }
-        }
-        
-        if (!mapping) continue; // 未找到匹配的映射
-        
-        for (uint8_t ch = 0; ch < 12; ch++) {
-            if (!(changed & (1 << ch))) continue; // 该通道没有变化
-            
-            // 检查是否有键盘按键映射（Serial逻辑分区绑定到HID键盘按键）
-            if (mapping->keyboard_keys[ch] != HID_KeyCode::KEY_NONE) {
-                bool pressed = (current & (1 << ch)) != 0;
-                
-                // 发送HID键盘事件
-                if (pressed) {
-                    hid_->press_key(mapping->keyboard_keys[ch]);
-                } else {
-                    hid_->release_key(mapping->keyboard_keys[ch]);
-                }
-            }
-        }
-    }
-}
-
 // 查找设备索引
 int InputManager::findDeviceIndex(uint16_t device_addr) {
     InputManager_PrivateConfig* config = inputmanager_get_config_holder();
@@ -979,8 +995,6 @@ GTX312L_DeviceMapping* InputManager::findDeviceMapping(uint16_t device_addr) {
     int index = findDeviceIndex(device_addr);
     return (index >= 0) ? &config->device_mappings[index] : nullptr;
 }
-
-
 
 // 静态配置变量
 static InputManager_PrivateConfig static_config_;
@@ -1020,7 +1034,7 @@ bool inputmanager_load_config_from_manager() {
     std::vector<uint8_t> config_data;
     if (config_mgr->get_binary(INPUTMANAGER_GTX312L_DEVICES, config_data)) {
         if (config_data.size() == sizeof(InputManager_PrivateConfig)) {
-            std::memcpy(&static_config_, config_data.data(), sizeof(InputManager_PrivateConfig));
+            static_config_ = *reinterpret_cast<const InputManager_PrivateConfig*>(config_data.data());
         } else {
             success = false;
         }
@@ -1557,82 +1571,30 @@ void InputManager::updateGPIOStates() {
 }
 
 void InputManager::processGPIOKeyboard() {
-    // 处理物理键盘映射
+    // 处理物理键盘映射，将状态映射到gpio_keyboard_bitmap_
     for (const auto& mapping : config_->physical_keyboard_mappings) {
         uint8_t gpio_pin = mapping.gpio;
         bool current_state = false;
-        bool previous_state = false;
         
         if (is_mcu_gpio(gpio_pin)) {
             uint8_t pin_num = get_gpio_pin_number(gpio_pin);
             current_state = !(mcu_gpio_states_ & (1ULL << pin_num)); // 低电平有效
-            previous_state = !(mcu_gpio_previous_states_ & (1ULL << pin_num));
         } else if (is_mcp_gpio(gpio_pin)) {
             uint8_t pin_num = get_gpio_pin_number(gpio_pin);
             if (pin_num <= 8) { // PORTA
                 current_state = !(mcp_gpio_states_.port_a & (1 << (pin_num - 1)));
-                previous_state = !(mcp_gpio_previous_states_.port_a & (1 << (pin_num - 1)));
             } else { // PORTB
                 current_state = !(mcp_gpio_states_.port_b & (1 << (pin_num - 9)));
-                previous_state = !(mcp_gpio_previous_states_.port_b & (1 << (pin_num - 9)));
             }
         }
         
-        // 检测状态变化并发送按键事件
-        if (current_state != previous_state) {
-            if (current_state) {
-                // 按键按下 - 发送默认按键和逻辑映射按键
-                if (mapping.default_key != HID_KeyCode::KEY_NONE && hid_) {
-                    hid_->press_key(mapping.default_key);
-                }
-                sendLogicalKeys(gpio_pin, true);
-            } else {
-                // 按键释放
-                if (mapping.default_key != HID_KeyCode::KEY_NONE && hid_) {
-                    hid_->release_key(mapping.default_key);
-                }
-                sendLogicalKeys(gpio_pin, false);
+        // 将GPIO键盘状态映射到gpio_keyboard_bitmap_（CPU1内部处理，避免跨核竞态）
+        if (current_state) {
+            // 按键按下 - 设置默认按键和逻辑映射按键到bitmap
+            if (mapping.default_key != HID_KeyCode::KEY_NONE) {
+                gpio_keyboard_bitmap_.setKey(mapping.default_key, true);
             }
-        }
-    }
-}
-
-void InputManager::processTouchKeyboard() {
-    if (!config_->touch_keyboard_enabled) return;
-    
-    // 检查A1-A8触摸区域
-    for (int i = 0; i < config_->device_count; i++) {
-        uint16_t current = current_touch_states_[i].physical_addr.mask;
-        uint16_t previous = previous_touch_states_[i].physical_addr.mask;
-        uint16_t changed = current ^ previous;
-        
-        if (changed == 0) continue;
-        
-        // 查找A1-A8区域的映射
-        GTX312L_DeviceMapping* mapping = findDeviceMapping(current_touch_states_[i].physical_addr.mask & 0xF000);
-        if (!mapping) continue;
-        
-        for (uint8_t ch = 0; ch < 8; ch++) { // 只处理A1-A8
-            if (!(changed & (1 << ch))) continue;
-            
-            bool pressed = (current & (1 << ch)) != 0;
-            
-            // 根据触摸键盘模式处理
-            switch (config_->touch_keyboard_mode) {
-                case TouchKeyboardMode::KEY_ONLY:
-                case TouchKeyboardMode::BOTH:
-                    // 只发送键盘事件，不发送触摸事件
-                    if (pressed && hid_) {
-                        hid_->press_key(TOUCH_KEYBOARD_KEY);
-                    } else if (hid_) {
-                        hid_->release_key(TOUCH_KEYBOARD_KEY);
-                    }
-                    break;
-                    
-                case TouchKeyboardMode::TOUCH_ONLY:
-                    // 只发送触摸事件，键盘事件由正常流程处理
-                    break;
-            }
+            setLogicalKeysInBitmap(gpio_pin, true, gpio_keyboard_bitmap_);
         }
     }
 }
@@ -1666,17 +1628,13 @@ bool InputManager::readMCPGPIO(uint8_t pin, bool& value) {
     return mcp23s17_->read_pin(port, pin_num, value);
 }
 
-void InputManager::sendLogicalKeys(uint8_t gpio_pin, bool pressed) {
+void InputManager::setLogicalKeysInBitmap(uint8_t gpio_pin, bool pressed, KeyboardBitmap& bitmap) {
     // 查找该GPIO的逻辑按键映射
     for (const auto& mapping : config_->logical_key_mappings) {
         if (mapping.gpio_id == gpio_pin) {
             for (int i = 0; i < 3; i++) {
-                if (mapping.keys[i] != HID_KeyCode::KEY_NONE && hid_) {
-                    if (pressed) {
-                        hid_->press_key(mapping.keys[i]);
-                    } else {
-                        hid_->release_key(mapping.keys[i]);
-                    }
+                if (mapping.keys[i] != HID_KeyCode::KEY_NONE) {
+                    bitmap.setKey(mapping.keys[i], pressed);
                 }
             }
             break;

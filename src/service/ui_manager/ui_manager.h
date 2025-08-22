@@ -26,6 +26,7 @@ enum class UIPage {
     KEY_MAPPING,        // 按键映射页面
     GUIDED_BINDING,     // 引导式绑区页面
     LIGHT_MAPPING,      // 灯光区域映射页面
+    UART_SETTINGS,      // UART波特率设置页面
     ERROR,              // 故障页面
     ABOUT               // 关于页面
 };
@@ -213,8 +214,7 @@ public:
     // 灵敏度调整页面
     bool show_sensitivity_page();
     bool auto_select_sensitivity_point(); // 自动选择需要修改灵敏度的位点
-    bool set_sensitivity_for_device(const std::string& device_name, uint8_t channel, uint8_t sensitivity);
-    
+
     // 触摸区域映射页面
     bool show_touch_mapping_page();
     bool start_touch_mapping_mode(); // 开始触摸映射模式
@@ -240,7 +240,7 @@ public:
     bool start_guided_binding(); // 开始引导式绑区
     bool update_guided_binding_progress(uint8_t step, const std::string& current_area); // 更新绑区进度
     
-    // 灯光映射页面
+    // 灯光映射相关
     bool show_light_mapping_page();
     bool start_light_mapping_mode(); // 开始灯光映射模式
     bool show_light_region_selection(); // 显示灯光区域选择
@@ -250,6 +250,14 @@ public:
     bool handle_neopixel_selection(lv_event_t* e); // 处理Neopixel选择
     bool save_light_mapping(); // 保存灯光映射
     bool clear_light_mapping(); // 清除灯光映射
+    
+    // UART设置页面
+    bool show_uart_settings_page();
+    void update_uart_settings_display(); // 更新UART设置显示
+    void handle_mai2serial_baudrate_change(); // 处理mai2serial波特率变化
+    void handle_mai2light_baudrate_change(); // 处理mai2light波特率变化
+    void save_uart_settings(); // 保存UART设置
+    void reset_uart_settings(); // 重置UART设置
     
     // 故障界面管理
     bool show_error_page();
@@ -377,6 +385,13 @@ private:
     lv_obj_t* light_mapping_status_;   // 灯光映射状态标签
     lv_obj_t* neopixel_buttons_[32];   // Neopixel按钮数组(最多32个)
     
+    // UART设置相关
+    lv_obj_t* mai2serial_baudrate_dropdown_; // mai2serial波特率下拉框
+    lv_obj_t* mai2light_baudrate_dropdown_;  // mai2light波特率下拉框
+    lv_obj_t* uart_status_label_;            // UART状态标签
+    uint32_t current_mai2serial_baudrate_;   // 当前mai2serial波特率
+    uint32_t current_mai2light_baudrate_;    // 当前mai2light波特率
+    
     // 状态页面相关
     lv_obj_t* status_mode_label_;
     lv_obj_t* status_touch_label_;
@@ -419,6 +434,7 @@ private:
     void create_key_mapping_page();
     void create_guided_binding_page();
     void create_light_mapping_page();
+    void create_uart_settings_page();
     void create_error_page();
     void create_about_page();
     
@@ -433,10 +449,12 @@ private:
     void update_key_mapping_page();
     void update_guided_binding_page();
     void update_light_mapping_page();
+    void update_uart_settings_page();
     void update_error_page();
     
-    // 事件处理
+    // 事件回调函数
     static void button_event_cb(lv_event_t* e);
+    static void dropdown_event_cb(lv_event_t* e);
     static void slider_event_cb(lv_event_t* e);
     static void page_event_cb(lv_event_t* e);
     

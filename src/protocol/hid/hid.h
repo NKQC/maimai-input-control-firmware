@@ -21,7 +21,7 @@ enum class HID_ReportType : uint8_t {
     FEATURE = 3
 };
 
-// 键盘按键代码 (USB HID)
+// 键盘按键代码 (USB HID) - 前置定义
 enum class HID_KeyCode : uint8_t {
     KEY_NONE = 0x00,
     KEY_A = 0x04,
@@ -86,6 +86,212 @@ enum class HID_KeyCode : uint8_t {
     KEY_RIGHT_ALT = 0xE6,
     KEY_RIGHT_GUI = 0xE7
 };
+
+// 遍历所有支持的HID键码
+static const HID_KeyCode supported_keys[] = {
+    HID_KeyCode::KEY_A, HID_KeyCode::KEY_B, HID_KeyCode::KEY_C, HID_KeyCode::KEY_D,
+    HID_KeyCode::KEY_E, HID_KeyCode::KEY_F, HID_KeyCode::KEY_G, HID_KeyCode::KEY_H,
+    HID_KeyCode::KEY_I, HID_KeyCode::KEY_J, HID_KeyCode::KEY_K, HID_KeyCode::KEY_L,
+    HID_KeyCode::KEY_M, HID_KeyCode::KEY_N, HID_KeyCode::KEY_O, HID_KeyCode::KEY_P,
+    HID_KeyCode::KEY_Q, HID_KeyCode::KEY_R, HID_KeyCode::KEY_S, HID_KeyCode::KEY_T,
+    HID_KeyCode::KEY_U, HID_KeyCode::KEY_V, HID_KeyCode::KEY_W, HID_KeyCode::KEY_X,
+    HID_KeyCode::KEY_Y, HID_KeyCode::KEY_Z, HID_KeyCode::KEY_1, HID_KeyCode::KEY_2,
+    HID_KeyCode::KEY_3, HID_KeyCode::KEY_4, HID_KeyCode::KEY_5, HID_KeyCode::KEY_6,
+    HID_KeyCode::KEY_7, HID_KeyCode::KEY_8, HID_KeyCode::KEY_9, HID_KeyCode::KEY_0,
+    HID_KeyCode::KEY_ENTER, HID_KeyCode::KEY_ESCAPE, HID_KeyCode::KEY_BACKSPACE,
+    HID_KeyCode::KEY_TAB, HID_KeyCode::KEY_SPACE, HID_KeyCode::KEY_F1, HID_KeyCode::KEY_F2,
+    HID_KeyCode::KEY_F3, HID_KeyCode::KEY_F4, HID_KeyCode::KEY_F5, HID_KeyCode::KEY_F6,
+    HID_KeyCode::KEY_F7, HID_KeyCode::KEY_F8, HID_KeyCode::KEY_F9, HID_KeyCode::KEY_F10,
+    HID_KeyCode::KEY_F11, HID_KeyCode::KEY_F12, HID_KeyCode::KEY_LEFT_CTRL,
+    HID_KeyCode::KEY_LEFT_SHIFT, HID_KeyCode::KEY_LEFT_ALT, HID_KeyCode::KEY_LEFT_GUI,
+    HID_KeyCode::KEY_RIGHT_CTRL, HID_KeyCode::KEY_RIGHT_SHIFT, HID_KeyCode::KEY_RIGHT_ALT,
+    HID_KeyCode::KEY_RIGHT_GUI
+};
+
+// 键盘bitmap结构体 - 使用union uint64_t高效编码键盘状态
+union KeyboardBitmap {
+    uint64_t bitmap;  // 64位bitmap，支持64个按键
+    struct {
+        uint8_t KEY_NONE : 1;     // bit 0
+        uint8_t KEY_A : 1;        // bit 1
+        uint8_t KEY_B : 1;        // bit 2
+        uint8_t KEY_C : 1;        // bit 3
+        uint8_t KEY_D : 1;        // bit 4
+        uint8_t KEY_E : 1;        // bit 5
+        uint8_t KEY_F : 1;        // bit 6
+        uint8_t KEY_G : 1;        // bit 7
+        uint8_t KEY_H : 1;        // bit 8
+        uint8_t KEY_I : 1;        // bit 9
+        uint8_t KEY_J : 1;        // bit 10
+        uint8_t KEY_K : 1;        // bit 11
+        uint8_t KEY_L : 1;        // bit 12
+        uint8_t KEY_M : 1;        // bit 13
+        uint8_t KEY_N : 1;        // bit 14
+        uint8_t KEY_O : 1;        // bit 15
+        uint8_t KEY_P : 1;        // bit 16
+        uint8_t KEY_Q : 1;        // bit 17
+        uint8_t KEY_R : 1;        // bit 18
+        uint8_t KEY_S : 1;        // bit 19
+        uint8_t KEY_T : 1;        // bit 20
+        uint8_t KEY_U : 1;        // bit 21
+        uint8_t KEY_V : 1;        // bit 22
+        uint8_t KEY_W : 1;        // bit 23
+        uint8_t KEY_X : 1;        // bit 24
+        uint8_t KEY_Y : 1;        // bit 25
+        uint8_t KEY_Z : 1;        // bit 26
+        uint8_t KEY_1 : 1;        // bit 27
+        uint8_t KEY_2 : 1;        // bit 28
+        uint8_t KEY_3 : 1;        // bit 29
+        uint8_t KEY_4 : 1;        // bit 30
+        uint8_t KEY_5 : 1;        // bit 31
+        uint8_t KEY_6 : 1;        // bit 32
+        uint8_t KEY_7 : 1;        // bit 33
+        uint8_t KEY_8 : 1;        // bit 34
+        uint8_t KEY_9 : 1;        // bit 35
+        uint8_t KEY_0 : 1;        // bit 36
+        uint8_t KEY_ENTER : 1;    // bit 37
+        uint8_t KEY_ESCAPE : 1;   // bit 38
+        uint8_t KEY_BACKSPACE : 1; // bit 39
+        uint8_t KEY_TAB : 1;      // bit 40
+        uint8_t KEY_SPACE : 1;    // bit 41
+        uint8_t KEY_F1 : 1;       // bit 42
+        uint8_t KEY_F2 : 1;       // bit 43
+        uint8_t KEY_F3 : 1;       // bit 44
+        uint8_t KEY_F4 : 1;       // bit 45
+        uint8_t KEY_F5 : 1;       // bit 46
+        uint8_t KEY_F6 : 1;       // bit 47
+        uint8_t KEY_F7 : 1;       // bit 48
+        uint8_t KEY_F8 : 1;       // bit 49
+        uint8_t KEY_F9 : 1;       // bit 50
+        uint8_t KEY_F10 : 1;      // bit 51
+        uint8_t KEY_F11 : 1;      // bit 52
+        uint8_t KEY_F12 : 1;      // bit 53
+        uint8_t KEY_LEFT_CTRL : 1; // bit 54
+        uint8_t KEY_LEFT_SHIFT : 1; // bit 55
+        uint8_t KEY_LEFT_ALT : 1;  // bit 56
+        uint8_t KEY_LEFT_GUI : 1;  // bit 57
+        uint8_t KEY_RIGHT_CTRL : 1; // bit 58
+        uint8_t KEY_RIGHT_SHIFT : 1; // bit 59
+        uint8_t KEY_RIGHT_ALT : 1;  // bit 60
+        uint8_t KEY_RIGHT_GUI : 1;  // bit 61
+        uint8_t reserved : 2;      // bit 62-63 保留
+    } keys;
+    
+    KeyboardBitmap() : bitmap(0) {}
+    
+    // 设置按键状态
+    void setKey(HID_KeyCode key, bool pressed) {
+        uint8_t bit_index = getBitIndex(key);
+        if (pressed) {
+            bitmap |= (1ULL << bit_index);
+        } else {
+            bitmap &= ~(1ULL << bit_index);
+        }
+    }
+    
+    // volatile版本的setKey方法
+    void setKey(HID_KeyCode key, bool pressed) volatile {
+        uint8_t bit_index = getBitIndex(key);
+        if (bit_index < 64) {
+            if (pressed) {
+                bitmap |= (1ULL << bit_index);
+            } else {
+                bitmap &= ~(1ULL << bit_index);
+            }
+        }
+    }
+    
+    // 获取按键状态
+    bool getKey(HID_KeyCode key) const {
+        uint8_t bit_index = getBitIndex(key);
+        if (bit_index < 64) {
+            return (bitmap & (1ULL << bit_index)) != 0;
+        }
+        return false;
+    }
+    
+    // 清空所有按键
+    void clear() {
+        bitmap = 0;
+    }
+    
+    // 清空所有按键（volatile版本）
+    void clear() volatile {
+        bitmap = 0;
+    }
+    
+private:
+    // 获取HID_KeyCode对应的位索引
+    uint8_t getBitIndex(HID_KeyCode key) const volatile {
+        switch (key) {
+            case HID_KeyCode::KEY_NONE: return 0;
+            case HID_KeyCode::KEY_A: return 1;
+            case HID_KeyCode::KEY_B: return 2;
+            case HID_KeyCode::KEY_C: return 3;
+            case HID_KeyCode::KEY_D: return 4;
+            case HID_KeyCode::KEY_E: return 5;
+            case HID_KeyCode::KEY_F: return 6;
+            case HID_KeyCode::KEY_G: return 7;
+            case HID_KeyCode::KEY_H: return 8;
+            case HID_KeyCode::KEY_I: return 9;
+            case HID_KeyCode::KEY_J: return 10;
+            case HID_KeyCode::KEY_K: return 11;
+            case HID_KeyCode::KEY_L: return 12;
+            case HID_KeyCode::KEY_M: return 13;
+            case HID_KeyCode::KEY_N: return 14;
+            case HID_KeyCode::KEY_O: return 15;
+            case HID_KeyCode::KEY_P: return 16;
+            case HID_KeyCode::KEY_Q: return 17;
+            case HID_KeyCode::KEY_R: return 18;
+            case HID_KeyCode::KEY_S: return 19;
+            case HID_KeyCode::KEY_T: return 20;
+            case HID_KeyCode::KEY_U: return 21;
+            case HID_KeyCode::KEY_V: return 22;
+            case HID_KeyCode::KEY_W: return 23;
+            case HID_KeyCode::KEY_X: return 24;
+            case HID_KeyCode::KEY_Y: return 25;
+            case HID_KeyCode::KEY_Z: return 26;
+            case HID_KeyCode::KEY_1: return 27;
+            case HID_KeyCode::KEY_2: return 28;
+            case HID_KeyCode::KEY_3: return 29;
+            case HID_KeyCode::KEY_4: return 30;
+            case HID_KeyCode::KEY_5: return 31;
+            case HID_KeyCode::KEY_6: return 32;
+            case HID_KeyCode::KEY_7: return 33;
+            case HID_KeyCode::KEY_8: return 34;
+            case HID_KeyCode::KEY_9: return 35;
+            case HID_KeyCode::KEY_0: return 36;
+            case HID_KeyCode::KEY_ENTER: return 37;
+            case HID_KeyCode::KEY_ESCAPE: return 38;
+            case HID_KeyCode::KEY_BACKSPACE: return 39;
+            case HID_KeyCode::KEY_TAB: return 40;
+            case HID_KeyCode::KEY_SPACE: return 41;
+            case HID_KeyCode::KEY_F1: return 42;
+            case HID_KeyCode::KEY_F2: return 43;
+            case HID_KeyCode::KEY_F3: return 44;
+            case HID_KeyCode::KEY_F4: return 45;
+            case HID_KeyCode::KEY_F5: return 46;
+            case HID_KeyCode::KEY_F6: return 47;
+            case HID_KeyCode::KEY_F7: return 48;
+            case HID_KeyCode::KEY_F8: return 49;
+            case HID_KeyCode::KEY_F9: return 50;
+            case HID_KeyCode::KEY_F10: return 51;
+            case HID_KeyCode::KEY_F11: return 52;
+            case HID_KeyCode::KEY_F12: return 53;
+            case HID_KeyCode::KEY_LEFT_CTRL: return 54;
+            case HID_KeyCode::KEY_LEFT_SHIFT: return 55;
+            case HID_KeyCode::KEY_LEFT_ALT: return 56;
+            case HID_KeyCode::KEY_LEFT_GUI: return 57;
+            case HID_KeyCode::KEY_RIGHT_CTRL: return 58;
+            case HID_KeyCode::KEY_RIGHT_SHIFT: return 59;
+            case HID_KeyCode::KEY_RIGHT_ALT: return 60;
+            case HID_KeyCode::KEY_RIGHT_GUI: return 61;
+            default: return 255; // 无效索引
+        }
+    }
+};
+
+
 
 // 键盘报告结构 (移除reserved字段)
 struct HID_KeyboardReport {
@@ -167,6 +373,7 @@ public:
     
     // 键盘功能
     bool send_keyboard_report(const HID_KeyboardReport& report);
+    bool send_keyboard_data(const KeyboardBitmap& bitmap);  // 高效发送键盘bitmap数据
     bool press_key(HID_KeyCode key, uint8_t modifier = 0);
     bool release_key(HID_KeyCode key);
     bool release_all_keys();
