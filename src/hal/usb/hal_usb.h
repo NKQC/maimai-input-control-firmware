@@ -65,6 +65,10 @@ public:
     // HID功能
     virtual bool send_touch_report(const TouchPoint* points, uint8_t count) = 0;
     virtual bool send_keyboard_report(uint8_t report_id, const KeyboardReport& report) = 0;
+    virtual bool send_hid_report(uint8_t report_id, const uint8_t* data, uint8_t length) = 0;
+    
+    // 设备配置
+    virtual bool configure_device(uint16_t vendor_id, uint16_t product_id, const std::string& manufacturer = "", const std::string& product = "", const std::string& serial = "") = 0;
     
     // CDC功能
     virtual bool cdc_write(const uint8_t* data, size_t length) = 0;
@@ -96,6 +100,8 @@ public:
     bool is_ready() const override;
     bool send_touch_report(const TouchPoint* points, uint8_t count) override;
     bool send_keyboard_report(uint8_t report_id, const KeyboardReport& report) override;
+    bool send_hid_report(uint8_t report_id, const uint8_t* data, uint8_t length) override;
+    bool configure_device(uint16_t vendor_id, uint16_t product_id, const std::string& manufacturer = "", const std::string& product = "", const std::string& serial = "") override;
     bool cdc_write(const uint8_t* data, size_t length) override;
     size_t cdc_read(uint8_t* buffer, size_t max_length) override;
     size_t cdc_available() const override;

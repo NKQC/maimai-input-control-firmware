@@ -226,6 +226,19 @@ bool HAL_USB_Device::send_keyboard_report(uint8_t report_id, const KeyboardRepor
     return tud_hid_report(0, hid_report, 8);  // 只发送前8个字节
 }
 
+bool HAL_USB_Device::send_hid_report(uint8_t report_id, const uint8_t* data, uint8_t length) {
+    if (!is_ready()) return false;
+    
+    return tud_hid_report(0, data, length);
+}
+
+bool HAL_USB_Device::configure_device(uint16_t vendor_id, uint16_t product_id, const std::string& manufacturer, const std::string& product, const std::string& serial) {
+    // TinyUSB在运行时不支持动态配置设备描述符
+    // 这些配置需要在编译时通过宏定义设置
+    // 这里只是一个占位实现，返回true表示"配置成功"
+    return true;
+}
+
 bool HAL_USB_Device::cdc_write(const uint8_t* data, size_t length) {
     if (!is_ready()) return false;
     

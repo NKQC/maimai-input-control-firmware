@@ -6,7 +6,8 @@
 #include <algorithm>
 #include <sstream>
 #include <iomanip>
-#include <avr/eeprom.h>
+// #include <avr/eeprom.h> // AVR specific, not available on Pico
+#include <hardware/sync.h>
 #include <hardware/flash.h>
 #include <pico/stdlib.h>
 
@@ -814,54 +815,13 @@ bool ConfigManager::validate_range(const ConfigItem& item, const std::vector<uin
 }
 
 bool ConfigManager::save_to_eeprom(const std::string& key, const std::vector<uint8_t>& data) {
-    ConfigManager_PrivateConfig config = config_manager_get_config_copy();
-    uint16_t addr = config.eeprom_start_addr;
-    
-    // 计算键的哈希作为地址偏移
-    uint32_t hash = 0;
-    for (char c : key) hash = hash * 31 + c;
-    addr += (hash % (config.eeprom_size - data.size() - 4));
-    
-    // 写入数据长度
-    uint16_t len = data.size();
-    eeprom_write_block(&len, (void*)addr, 2);
-    addr += 2;
-    
-    // 写入数据
-    if (!data.empty()) {
-        eeprom_write_block(data.data(), (void*)addr, len);
-    }
-    
-    statistics_.save_count++;
-    return true;
+    // Use flash storage instead of EEPROM on Pico
+    return save_to_flash(key, data);
 }
 
 bool ConfigManager::load_from_eeprom(const std::string& key, std::vector<uint8_t>& data) {
-    ConfigManager_PrivateConfig config = config_manager_get_config_copy();
-    uint16_t addr = config.eeprom_start_addr;
-    
-    // 计算键的哈希作为地址偏移
-    uint32_t hash = 0;
-    for (char c : key) hash = hash * 31 + c;
-    addr += (hash % (config.eeprom_size - 4));
-    
-    // 读取数据长度
-    uint16_t len;
-    eeprom_read_block(&len, (void*)addr, 2);
-    
-    if (len == 0xFFFF || len > config.eeprom_size) {
-        return false; // 未初始化或损坏
-    }
-    
-    addr += 2;
-    data.resize(len);
-    
-    if (len > 0) {
-        eeprom_read_block(data.data(), (void*)addr, len);
-    }
-    
-    statistics_.load_count++;
-    return true;
+    // Use flash storage instead of EEPROM on Pico
+    return load_from_flash(key, data);
 }
 
 bool ConfigManager::save_to_flash(const std::string& key, const std::vector<uint8_t>& data) {
@@ -890,7 +850,7 @@ bool ConfigManager::save_to_flash(const std::string& key, const std::vector<uint
     // 写入Flash
     flash_range_program(addr - XIP_BASE, write_data.data(), write_data.size());
     
-    statistics_.save_count++;
+    statistics_.total_saves++;
     return true;
 }
 
@@ -917,7 +877,7 @@ bool ConfigManager::load_from_flash(const std::string& key, std::vector<uint8_t>
         memcpy(data.data(), (void*)addr, len);
     }
     
-    statistics_.load_count++;
+    statistics_.total_loads++;
     return true;
 }
 

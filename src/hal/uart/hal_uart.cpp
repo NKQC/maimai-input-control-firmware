@@ -18,8 +18,8 @@ HAL_UART0* HAL_UART0::getInstance() {
 
 HAL_UART0::HAL_UART0() 
     : initialized_(false), tx_pin_(0), rx_pin_(0), baudrate_(115200),
-      rx_head_(0), rx_tail_(0), tx_head_(0), tx_tail_(0), tx_dma_active_(false),
-      dma_busy_(false), dma_tx_channel_(-1), dma_rx_channel_(-1) {
+      dma_busy_(false), dma_tx_channel_(-1), dma_rx_channel_(-1),
+      rx_head_(0), rx_tail_(0), tx_head_(0), tx_tail_(0), tx_dma_active_(false) {
 }
 
 HAL_UART0::~HAL_UART0() {
@@ -181,7 +181,7 @@ void HAL_UART0::handle_rx_irq() {
 }
 
 // DMA中断处理函数
-static void dma_uart1_tx_complete() {
+void dma_uart1_tx_complete() {
     HAL_UART1* instance = HAL_UART1::getInstance();
     if (instance) {
         // 更新tx_tail_指针
@@ -196,16 +196,16 @@ static void dma_uart1_tx_complete() {
         
         instance->dma_busy_ = false;
         if (instance->dma_callback_) {
-            instance->dma_callback_();
+            instance->dma_callback_(true);
         }
     }
 }
 
-static void dma_uart1_rx_complete() {
+void dma_uart1_rx_complete() {
     HAL_UART1* instance = HAL_UART1::getInstance();
     instance->dma_busy_ = false;
     if (instance->dma_callback_) {
-        instance->dma_callback_();
+        instance->dma_callback_(true);
     }
 }
 
@@ -337,20 +337,14 @@ bool HAL_UART1::read_dma(uint8_t* buffer, size_t length, dma_callback_t callback
     return true;
 }
 
-bool HAL_UART1::is_busy() {
+bool HAL_UART1::is_busy() const {
     return dma_busy_;
 }
 
-std::string HAL_UART1::get_name() const {
-    return "UART1";
-}
-
-bool HAL_UART1::is_ready() const {
-    return initialized_;
-}
+// get_name() 和 is_ready() 已在头文件中内联定义
 
 // DMA中断处理函数
-static void dma_uart0_tx_complete() {
+void dma_uart0_tx_complete() {
     HAL_UART0* instance = HAL_UART0::getInstance();
     if (instance) {
         // 更新tx_tail_指针
@@ -365,16 +359,16 @@ static void dma_uart0_tx_complete() {
         
         instance->dma_busy_ = false;
         if (instance->dma_callback_) {
-            instance->dma_callback_();
+            instance->dma_callback_(true);
         }
     }
 }
 
-static void dma_uart0_rx_complete() {
+void dma_uart0_rx_complete() {
     HAL_UART0* instance = HAL_UART0::getInstance();
     instance->dma_busy_ = false;
     if (instance->dma_callback_) {
-        instance->dma_callback_();
+        instance->dma_callback_(true);
     }
 }
 
@@ -506,17 +500,13 @@ bool HAL_UART0::read_dma(uint8_t* buffer, size_t length, dma_callback_t callback
     return true;
 }
 
-bool HAL_UART0::is_busy() {
+bool HAL_UART0::is_busy() const {
     return dma_busy_;
 }
 
-std::string HAL_UART0::get_name() const {
-    return "UART0";
-}
+// get_name() is already defined inline in header
 
-bool HAL_UART0::is_ready() const {
-    return initialized_;
-}
+// is_ready() is already defined inline in header
 
 // HAL_UART1 静态成员初始化
 HAL_UART1* HAL_UART1::instance_ = nullptr;
@@ -531,8 +521,8 @@ HAL_UART1* HAL_UART1::getInstance() {
 
 HAL_UART1::HAL_UART1() 
     : initialized_(false), tx_pin_(0), rx_pin_(0), baudrate_(115200),
-      rx_head_(0), rx_tail_(0), tx_head_(0), tx_tail_(0), tx_dma_active_(false),
-      dma_busy_(false), dma_tx_channel_(-1), dma_rx_channel_(-1) {
+      dma_busy_(false), dma_tx_channel_(-1), dma_rx_channel_(-1),
+      rx_head_(0), rx_tail_(0), tx_head_(0), tx_tail_(0), tx_dma_active_(false) {
 }
 
 HAL_UART1::~HAL_UART1() {

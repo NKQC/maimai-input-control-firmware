@@ -3,6 +3,7 @@
 #include "../../hal/spi/hal_spi.h"
 #include <stdint.h>
 #include <vector>
+#include <functional>
 
 /**
  * 协议层 - ST7735S TFT LCD显示屏
@@ -88,6 +89,8 @@ struct ST7735S_Color {
 
 class ST7735S {
 public:
+    using dma_callback_t = std::function<void(bool success)>;
+    
     ST7735S(HAL_SPI* spi_hal, uint8_t cs_pin, uint8_t dc_pin, uint8_t rst_pin = 255);
     ~ST7735S();
     
@@ -97,8 +100,11 @@ public:
     // 释放资源
     void deinit();
     
-    // 检查是否就绪
+    // 检查是否已初始化
     bool is_ready() const;
+    
+    // 检查DMA是否忙碌
+    bool is_dma_busy() const;
     
     // 基本控制
     bool reset();
@@ -118,15 +124,20 @@ public:
     // 像素数据写入（用于LVGL集成）
     bool write_pixel_data(uint16_t color565);
     
-    // 缓冲区操作（简化）
+    // 设置帧缓冲区（可选）
     bool set_framebuffer(uint16_t* buffer);
     
-    // 获取显示参数
+    // 获取显示尺寸
     uint16_t get_width() const;
     uint16_t get_height() const;
     
-    // 背光控制（如果有背光引脚）
+    // 背光控制（如果支持）
     bool set_backlight(uint8_t brightness);  // 0-255
+    
+    // DMA异步方法
+    bool write_data_buffer_async(const uint8_t* buffer, size_t length, dma_callback_t callback = nullptr);
+    bool fill_screen_async(ST7735S_Color color, dma_callback_t callback = nullptr);
+    bool draw_bitmap_async(int16_t x, int16_t y, uint16_t width, uint16_t height, const uint8_t* bitmap, dma_callback_t callback = nullptr);
     
 private:
     HAL_SPI* spi_hal_;
@@ -140,18 +151,37 @@ private:
     uint16_t width_;
     uint16_t height_;
     
-    // 帧缓冲区（可选）
+    // 帧缓冲区相关
     uint16_t* framebuffer_;
     bool use_framebuffer_;
     
-    // 内部方法
+    // DMA异步相关
+    volatile bool dma_busy_;
+    dma_callback_t current_callback_;
+    
+    // DMA传输队列优化
+    struct DMATransfer {
+        const uint8_t* data;
+        size_t length;
+        dma_callback_t callback;
+    };
+    static constexpr size_t MAX_DMA_QUEUE = 4;
+    DMATransfer dma_queue_[MAX_DMA_QUEUE];
+    size_t dma_queue_head_;
+    size_t dma_queue_tail_;
+    size_t dma_queue_count_;
+    
+    // 私有方法
     bool write_command(uint8_t cmd);
     bool write_data(uint8_t data);
     bool write_data_16(uint16_t data);
     bool write_data_buffer(const uint8_t* buffer, size_t length);
     bool spi_transfer(const uint8_t* tx_data, uint8_t* rx_data, size_t length);
     
-    // 初始化序列
+    // DMA回调处理
+    void on_dma_complete(bool success);
+    
+    // 初始化相关
     bool init_registers();
     bool configure_display();
 };

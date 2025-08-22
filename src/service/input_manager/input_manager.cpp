@@ -1,47 +1,13 @@
 #include "input_manager.h"
-#include "protocol/mai2serial/mai2serial.h"
+#include "../../service/config_manager/config_manager.h"
+#include "../../protocol/mai2serial/mai2serial.h"
 #include "pico/time.h"
-#include "pico/stdlib.h"
-#include "../../protocol/usb_serial_logs/usb_serial_logs.h"
-#include "../../hal/i2c/hal_i2c.h"
-#include <algorithm>
+#include "hardware/gpio.h"
 #include <cstring>
-#include <cstdio>
-#include <cmath>
+#include <algorithm>
 
-// 静态实例变量定义
+// 静态实例
 InputManager* InputManager::instance_ = nullptr;
-
-// 静态配置变量
-static InputManager_PrivateConfig static_config_;
-
-// InputManager配置管理纯公开函数实现
-InputManager_PrivateConfig* input_manager_get_config_holder() {
-    return &static_config_;
-}
-
-bool input_manager_load_config_from_manager(InputManager* manager) {
-    if (manager == nullptr) {
-        return false;
-    }
-    // 这里可以从manager中加载配置到static_config_
-    // 目前使用默认配置
-    return true;
-}
-
-InputManager_PrivateConfig input_manager_get_config_copy() {
-    return static_config_;
-}
-
-bool input_manager_write_config_to_manager(InputManager* manager, const InputManager_PrivateConfig& config) {
-    if (manager == nullptr) {
-        return false;
-    }
-    static_config_ = config;
-    // 这里可以将配置写入到manager中
-    return true;
-}
-
 
 // 单例模式实现
 InputManager* InputManager::getInstance() {
@@ -51,33 +17,44 @@ InputManager* InputManager::getInstance() {
     return instance_;
 }
 
-// 构造函数
-InputManager::InputManager()
-    : initialized_(false)
-    , current_mode_(InputMode::SERIAL) // 默认Serial模式
-    , mcp23s17_(nullptr)
+// 私有构造函数
+InputManager::InputManager() 
+    : binding_active_(false)
+    , binding_state_(BindingState::IDLE)
+    , current_binding_index_(0)
+    , binding_start_time_(0)
+    , binding_timeout_ms_(30000)  // 30秒超时
+    , hid_binding_device_addr_(0)
+    , hid_binding_channel_(0)
+    , hid_binding_x_(0.0f)
+    , hid_binding_y_(0.0f)
+
     , mai2_serial_(nullptr)
-    , hid_device_(nullptr)
-    , calibrating_(false)
-    , calibration_device_name_("")
-    , calibration_progress_(0)
-    , calibration_start_time_(0)
-    , auto_sensitivity_running_(false)
-    , auto_sensitivity_point_(0)
-    , auto_sensitivity_result_(0)
-    , auto_sensitivity_start_time_(0)
-    , debug_enabled_(false) {
+    , hid_(nullptr)
+    , ui_manager_(nullptr)
+    , mcp23s17_(nullptr)
+    , config_(inputmanager_get_config_holder())
+    , mcp23s17_available_(false)
+    , mcu_gpio_states_(0)
+    , mcu_gpio_previous_states_(0)
+    , sample_counter_(0)
+    , last_reset_time_(0)
+    , current_sample_rate_(0) {
     
-    // 初始化状态数组
-    current_touch_states_.fill(false);
-    current_key_states_.fill(false);
-    
-    // 初始化默认物理点位配置
-    for (uint8_t i = 0; i < 72; i++) {
-        physical_points_[i] = PhysicalPoint();
-        physical_points_[i].name = "Physical_" + std::to_string(i);
-        physical_points_[i].enabled = false; // 默认禁用，只在映射时启用
+    // 初始化触摸状态数组
+    for (int i = 0; i < 8; i++) {
+        current_touch_states_[i].physical_addr = 0;
+        current_touch_states_[i].timestamp = 0;
+        previous_touch_states_[i].physical_addr = 0;
+        previous_touch_states_[i].timestamp = 0;
     }
+    memset(original_channels_backup_, 0, sizeof(original_channels_backup_));
+    
+    // 初始化MCP GPIO状态
+    mcp_gpio_states_.port_a = 0;
+    mcp_gpio_states_.port_b = 0;
+    mcp_gpio_states_.timestamp = 0;
+    mcp_gpio_previous_states_ = mcp_gpio_states_;
 }
 
 // 析构函数
@@ -86,1666 +63,1677 @@ InputManager::~InputManager() {
 }
 
 // 初始化
-bool InputManager::init(const InputManager_Config& config) {
-    if (initialized_) {
+bool InputManager::init(const InitConfig& config) {
+    // 设置外部实例引用
+    mai2_serial_ = config.mai2_serial;
+    hid_ = config.hid;
+    ui_manager_ = config.ui_manager;
+    mcp23s17_ = config.mcp23s17;
+    mcp23s17_available_ = (mcp23s17_ != nullptr);
+    
+    // 初始化触摸状态数组
+    for (int i = 0; i < 8; i++) {
+        current_touch_states_[i] = {};
+        previous_touch_states_[i] = {};
+    }
+    
+    // 初始化GPIO状态
+    mcu_gpio_states_ = 0;
+    mcu_gpio_previous_states_ = 0;
+    mcp_gpio_states_.port_a = 0;
+    mcp_gpio_states_.port_b = 0;
+    mcp_gpio_states_.timestamp = 0;
+    mcp_gpio_previous_states_ = mcp_gpio_states_;
+    
+    // 加载配置
+    inputmanager_load_config_from_manager();
+    
+    return true;
+}
+
+// 去初始化
+void InputManager::deinit() {
+    // 保存配置
+    InputManager_PrivateConfig* config = inputmanager_get_config_holder();
+    inputmanager_write_config_to_manager(*config);
+    
+    // 取消所有活动操作
+    cancelBinding();
+    
+    // 清空设备列表
+    gtx312l_devices_.clear();
+    
+    // 重置配置中的设备计数
+    config->device_count = 0;
+}
+
+// 注册GTX312L设备
+bool InputManager::registerGTX312L(GTX312L* device) {
+    InputManager_PrivateConfig* config = inputmanager_get_config_holder();
+    
+    if (!device || config->device_count >= 8) {
+        return false;
+    }
+    
+    // 获取设备地址
+    uint16_t device_addr = device->get_physical_device_address().get_device_mask();
+    
+    // 检查是否已经注册
+    for (const auto& registered_device : gtx312l_devices_) {
+        if (registered_device->get_physical_device_address().get_device_mask() == device_addr) {
+            return false; // 已经注册
+        }
+    }
+    
+    // 添加到设备列表
+    gtx312l_devices_.push_back(device);
+    
+    // 初始化设备映射
+    config->device_mappings[config->device_count].device_addr = device_addr;
+    // 默认灵敏度已在构造函数中设置
+    
+    config->device_count++;
+    return true;
+}
+
+// 注销GTX312L设备
+void InputManager::unregisterGTX312L(GTX312L* device) {
+    if (!device) return;
+    
+    InputManager_PrivateConfig* config = inputmanager_get_config_holder();
+    uint16_t device_addr = device->get_physical_device_address().get_device_mask();
+    
+    // 从设备列表中移除
+    auto it = std::find(gtx312l_devices_.begin(), gtx312l_devices_.end(), device);
+    if (it != gtx312l_devices_.end()) {
+        gtx312l_devices_.erase(it);
+        
+        // 重新整理设备映射数组
+        int removed_index = findDeviceIndex(device_addr);
+        if (removed_index >= 0) {
+            for (int i = removed_index; i < config->device_count - 1; i++) {
+                config->device_mappings[i] = config->device_mappings[i + 1];
+            }
+            config->device_count--;
+        }
+    }
+}
+
+// 物理键盘映射管理方法
+bool InputManager::addPhysicalKeyboard(MCU_GPIO gpio, HID_KeyCode default_key) {
+    // 添加新映射
+    PhysicalKeyboardMapping new_mapping;
+    new_mapping.mcu_gpio = gpio;
+    new_mapping.default_key = default_key;
+    config_->physical_keyboard_mappings.push_back(new_mapping);
+    
+    return true;
+}
+
+bool InputManager::addPhysicalKeyboard(MCP_GPIO gpio, HID_KeyCode default_key) {
+    // 添加新映射
+    PhysicalKeyboardMapping new_mapping;
+    new_mapping.mcp_gpio = gpio;
+    new_mapping.default_key = default_key;
+    config_->physical_keyboard_mappings.push_back(new_mapping);
+    
+    return true;
+}
+
+bool InputManager::removePhysicalKeyboard(uint8_t gpio_pin) {
+    InputManager_PrivateConfig* config = inputmanager_get_config_holder();
+    
+    auto it = std::find_if(config->physical_keyboard_mappings.begin(), 
+                          config->physical_keyboard_mappings.end(),
+                          [gpio_pin](const PhysicalKeyboardMapping& mapping) {
+                              return mapping.gpio == gpio_pin;
+                          });
+    
+    if (it != config->physical_keyboard_mappings.end()) {
+        config->physical_keyboard_mappings.erase(it);
         return true;
     }
     
-    // 从配置中添加GTX312L设备
-    for (uint8_t i = 0; i < config.gtx312l_count && i < 8; i++) {
-        if (config.gtx312l_devices[i] != nullptr) {
-            std::string device_name = "GTX312L_" + std::to_string(i);
-            add_device(config.gtx312l_devices[i], device_name);
+    return false;
+}
+
+void InputManager::clearPhysicalKeyboards() {
+    InputManager_PrivateConfig* config = inputmanager_get_config_holder();
+    config->physical_keyboard_mappings.clear();
+}
+
+// 逻辑按键映射管理方法
+bool InputManager::addLogicalKeyMapping(uint8_t gpio_id, HID_KeyCode key) {
+    // 检查是否已存在该GPIO映射
+    for (auto& mapping : config_->logical_key_mappings) {
+        if (mapping.gpio_id == gpio_id) {
+            // 查找空位添加新按键（最多3个）
+            for (int i = 0; i < 3; i++) {
+                if (mapping.keys[i] == HID_KeyCode::KEY_NONE) {
+                    mapping.keys[i] = key;
+                    mapping.key_count++;
+                    return true;
+                }
+            }
+            return false; // 已满
         }
     }
     
-    // 设置HID设备
-    hid_device_ = config.hid;
-    
-    // 设置Mai2Serial设备
-    mai2_serial_ = config.mai2_serial;
-    
-    // 设置MCP23S17设备
-    mcp23s17_ = config.mcp23s17;
-    
-    if (devices_.empty()) {
-        log_debug("Warning: No GTX312L devices found");
-    }
-    
-    // 初始化通道管理
-    update_channel_bitmaps();
-    apply_channel_bitmaps_to_devices();
-    
-    initialized_ = true;
-    
-    log_debug("InputManager initialized with " + std::to_string(devices_.size()) + " devices");
+    // 添加新映射
+    LogicalKeyMapping new_mapping;
+    new_mapping.gpio_id = gpio_id;
+    new_mapping.keys[0] = key;
+    new_mapping.key_count = 1;
+    config_->logical_key_mappings.push_back(new_mapping);
     
     return true;
 }
 
-// 释放资源
-void InputManager::deinit() {
-    if (initialized_) {
-        // 停止校准
-        stop_calibration();
-        
-        // 释放所有设备
-        for (auto& pair : devices_) {
-            if (pair.second.device) {
-                pair.second.device->deinit();
-                delete pair.second.device;
+bool InputManager::removeLogicalKeyMapping(uint8_t gpio_id, HID_KeyCode key) {
+    for (auto& mapping : config_->logical_key_mappings) {
+        if (mapping.gpio_id == gpio_id) {
+            // 查找并移除指定的按键
+            for (int i = 0; i < 3; i++) {
+                if (mapping.keys[i] == key) {
+                    mapping.keys[i] = HID_KeyCode::KEY_NONE;
+                    mapping.key_count--;
+                    
+                    // 如果没有按键了，移除整个映射
+                    if (mapping.key_count == 0) {
+                        auto it = std::find_if(config_->logical_key_mappings.begin(), 
+                                              config_->logical_key_mappings.end(),
+                                              [gpio_id](const LogicalKeyMapping& m) {
+                                                  return m.gpio_id == gpio_id;
+                                              });
+                        if (it != config_->logical_key_mappings.end()) {
+                            config_->logical_key_mappings.erase(it);
+                        }
+                    }
+                    return true;
+                }
             }
         }
-        devices_.clear();
-        
-        // 清理回调
-        touch_event_callback_ = nullptr;
-        input_mapping_callback_ = nullptr;
-        device_status_callback_ = nullptr;
-        calibration_callback_ = nullptr;
-        
-        initialized_ = false;
-        
-        log_debug("InputManager deinitialized");
     }
+    return false;
 }
 
-// 检查是否就绪
-bool InputManager::is_ready() const {
-    return initialized_ && !devices_.empty();
+bool InputManager::clearLogicalKeyMapping(uint8_t gpio_id) {
+    auto it = std::find_if(config_->logical_key_mappings.begin(), 
+                          config_->logical_key_mappings.end(),
+                          [gpio_id](const LogicalKeyMapping& mapping) {
+                              return mapping.gpio_id == gpio_id;
+                          });
+    
+    if (it != config_->logical_key_mappings.end()) {
+        config_->logical_key_mappings.erase(it);
+        return true;
+    }
+    
+    return false;
 }
 
-// 添加设备
-bool InputManager::add_device(GTX312L* device, const std::string& device_name) {
-    if (!device) {
-        return false;
-    }
-    
-    if (devices_.size() >= 8) { // 最多支持8个设备
-        return false;
-    }
-    
-    // 生成设备名称：I2C通道+地址
-    std::string final_device_name = device_name.empty() ? generate_device_name(device) : device_name;
-    
-    // 检查设备名称是否已存在
-    if (devices_.find(final_device_name) != devices_.end()) {
-        log_debug("Device name already exists: " + final_device_name);
-        return false;
-    }
-    
-    DeviceInfo info;
-    info.device = device;
-    info.name = final_device_name;
-    info.connected = device->is_ready();
-    info.last_scan_time = 0;
-    
-    devices_[final_device_name] = info;
-    
-    log_debug("Added device: " + final_device_name);
-    
-    // 通知设备状态回调
-    if (device_status_callback_) {
-        device_status_callback_(final_device_name, info.connected);
-    }
-    
-    return true;
+// 触摸键盘映射管理方法
+void InputManager::setTouchKeyboardEnabled(bool enabled) {
+    InputManager_PrivateConfig* config = inputmanager_get_config_holder();
+    config->touch_keyboard_enabled = enabled;
 }
 
-// 移除设备
-bool InputManager::remove_device(const std::string& device_name) {
-    auto it = devices_.find(device_name);
-    if (it == devices_.end()) {
-        return false;
-    }
-    
-    if (it->second.device) {
-        it->second.device->deinit();
-        delete it->second.device;
-    }
-    
-    devices_.erase(it);
-    
-    log_debug("Removed device: " + device_name);
-    
-    // 通知设备状态回调
-    if (device_status_callback_) {
-        device_status_callback_(device_name, false);
-    }
-    
-    return true;
+bool InputManager::getTouchKeyboardEnabled() const {
+    InputManager_PrivateConfig* config = inputmanager_get_config_holder();
+    return config->touch_keyboard_enabled;
 }
 
-// 获取设备数量
-bool InputManager::get_device_count() const {
-    return devices_.size();
+void InputManager::setTouchKeyboardMode(TouchKeyboardMode mode) {
+    InputManager_PrivateConfig* config = inputmanager_get_config_holder();
+    config->touch_keyboard_mode = mode;
 }
 
-// 获取设备信息
-bool InputManager::get_device_info(const std::string& device_name, std::string& name, bool& connected) {
-    auto it = devices_.find(device_name);
-    if (it == devices_.end()) {
-        return false;
-    }
-    
-    name = it->second.name;
-    connected = it->second.connected;
-    return true;
-}
-
-// 设置HID设备
-bool InputManager::set_hid_device(HID* hid_device) {
-    hid_device_ = hid_device;
-    log_debug("HID device " + std::string(hid_device ? "set" : "cleared"));
-    return true;
-}
-
-// 获取HID设备
-HID* InputManager::get_hid_device() const {
-    return hid_device_;
+TouchKeyboardMode InputManager::getTouchKeyboardMode() const {
+    InputManager_PrivateConfig* config = inputmanager_get_config_holder();
+    return config->touch_keyboard_mode;
 }
 
 // 设置工作模式
-bool InputManager::set_input_mode(InputMode mode) {
-    current_mode_ = mode;
-    log_debug("Input mode set to " + std::string(mode == InputMode::SERIAL ? "SERIAL" : "HID"));
+bool InputManager::setWorkMode(InputWorkMode mode) {
+    InputManager_PrivateConfig* config = inputmanager_get_config_holder();
+    config->work_mode = mode;
     return true;
 }
 
 // 获取工作模式
-InputMode InputManager::get_input_mode() const {
-    return current_mode_;
+InputWorkMode InputManager::getWorkMode() const {
+    InputManager_PrivateConfig* config = inputmanager_get_config_holder();
+    return config->work_mode;
 }
 
-// 设置Mai2Serial设备
-bool InputManager::set_mai2serial_device(Mai2Serial* mai2_serial) {
-    mai2_serial_ = mai2_serial;
-    log_debug("Mai2Serial device " + std::string(mai2_serial ? "set" : "cleared"));
-    return true;
-}
-
-// 获取Mai2Serial设备
-Mai2Serial* InputManager::get_mai2serial_device() const {
-    return mai2_serial_;
-}
-
-// 配置管理已移至纯公开函数
-
-// 设置点位配置
-bool InputManager::set_point_config(uint8_t point_index, const InputPoint& point) {
-    if (!is_point_valid(point_index)) {
-        return false;
-    }
-    
-    points_[point_index] = point;
-    log_debug("Point " + std::to_string(point_index) + " configuration updated");
-    return true;
-}
-
-// 获取点位配置
-bool InputManager::get_point_config(uint8_t point_index, InputPoint& point) {
-    if (!is_point_valid(point_index)) {
-        return false;
-    }
-    
-    point = points_[point_index];
-    return true;
-}
-
-// 启用/禁用点位 - 直接设置到设备，无缓存
-bool InputManager::enable_point(uint8_t point_index, bool enabled) {
-    if (!is_point_valid(point_index)) {
-        return false;
-    }
-    
-    // 直接应用到对应的设备，无缓存
-    std::string device_name;
-    uint8_t channel;
-    point_index_to_device_channel(point_index, device_name, channel);
-    
-    auto device = find_device_by_name(device_name);
-    if (device) {
-        bool result = device->set_channel_enable(channel, enabled);
-        if (result) {
-            log_debug("Point " + std::to_string(point_index) + " " + (enabled ? "enabled" : "disabled"));
-        }
-        return result;
-    }
-    
-    return false;
-}
-
-// 获取点位启用状态 - 实时从设备读取
-bool InputManager::get_point_enabled(uint8_t point_index) const {
-    if (!is_point_valid(point_index)) {
-        return false;
-    }
-    
-    // 直接从对应的设备读取，无缓存
-    std::string device_name;
-    uint8_t channel;
-    point_index_to_device_channel(point_index, device_name, channel);
-    
-    auto device = find_device_by_name(device_name);
-    if (device) {
-        return device->get_channel_enable(channel);
-    }
-    
-    return false;
-}
-
-// 设置点位灵敏度 - 直接设置到设备，无缓存
-bool InputManager::set_point_sensitivity(uint8_t point_index, uint8_t sensitivity) {
-    if (!is_point_valid(point_index) || sensitivity > 63) {
-        return false;
-    }
-    
-    // 直接应用到对应的设备，无缓存
-    std::string device_name;
-    uint8_t channel;
-    point_index_to_device_channel(point_index, device_name, channel);
-    
-    auto device = find_device_by_name(device_name);
-    if (device) {
-        bool result = device->set_channel_sensitivity(channel, sensitivity);
-        if (result) {
-            log_debug("Point " + std::to_string(point_index) + " sensitivity set to " + std::to_string(sensitivity));
-        }
-        return result;
-    }
-    
-    return false;
-}
-
-// 设置全局灵敏度（应用到所有设备的所有通道）- 直接设置到设备，无缓存
-bool InputManager::set_global_sensitivity(uint8_t sensitivity) {
-    if (sensitivity > 63) {
-        return false;
-    }
-    
-    bool all_success = true;
-    
-    // 直接应用到所有设备的所有通道，无缓存
-    for (auto& device_pair : devices_) {
-        if (device_pair.second.device) {
-            if (!device_pair.second.device->set_global_sensitivity(sensitivity)) {
-                all_success = false;
-            }
-        }
-    }
-    
-    if (all_success) {
-        log_debug("Global sensitivity set to " + std::to_string(sensitivity));
-    }
-    return all_success;
-}
-
-// 获取全局灵敏度 - 从第一个可用设备实时读取
-uint8_t InputManager::get_global_sensitivity() const {
-    // 从第一个可用设备读取灵敏度
-    for (const auto& device_pair : devices_) {
-        if (device_pair.second.device && device_pair.second.connected) {
-            uint8_t sensitivity = 0;
-            if (device_pair.second.device->get_global_sensitivity(sensitivity)) {
-                return sensitivity;
-            }
-        }
-    }
-    
-    // 如果没有可用设备，返回默认值
-    return 32;
-}
-
-// 相对调整全局灵敏度 - 基于实时读取的值进行调整
-bool InputManager::adjust_global_sensitivity(int8_t delta) {
-    uint8_t current_sensitivity = get_global_sensitivity();
-    int16_t new_sensitivity = static_cast<int16_t>(current_sensitivity) + delta;
-    
-    // 限制范围在0-63之间
-    if (new_sensitivity < 0) {
-        new_sensitivity = 0;
-    } else if (new_sensitivity > 63) {
-        new_sensitivity = 63;
-    }
-    
-    return set_global_sensitivity(static_cast<uint8_t>(new_sensitivity));
-}
-
-
-
-// 设置点位阈值
-bool InputManager::set_point_threshold(uint8_t point_index, uint8_t threshold) {
-    if (!is_point_valid(point_index)) {
-        return false;
-    }
-    
-    points_[point_index].threshold = threshold;
-    return true;
-}
-
-// 添加区域
-bool InputManager::add_region(const InputRegion& region) {
-    // 检查区域名称是否已存在
-    for (const auto& existing : regions_) {
-        if (existing.name == region.name) {
-            return false;
-        }
-    }
-    
-    regions_.push_back(region);
-    log_debug("Added region: " + region.name);
-    return true;
-}
-
-// 移除区域
-bool InputManager::remove_region(const std::string& name) {
-    auto it = std::find_if(regions_.begin(), regions_.end(),
-                          [&name](const InputRegion& region) {
-                              return region.name == name;
-                          });
-    
-    if (it != regions_.end()) {
-        regions_.erase(it);
-        log_debug("Removed region: " + name);
-        return true;
-    }
-    
-    return false;
-}
-
-// 获取区域
-bool InputManager::get_region(const std::string& name, InputRegion& region) {
-    auto it = std::find_if(regions_.begin(), regions_.end(),
-                          [&name](const InputRegion& r) {
-                              return r.name == name;
-                          });
-    
-    if (it != regions_.end()) {
-        region = *it;
-        return true;
-    }
-    
-    return false;
-}
-
-// 获取区域名称列表
-std::vector<std::string> InputManager::get_region_names() {
-    std::vector<std::string> names;
-    for (const auto& region : regions_) {
-        names.push_back(region.name);
-    }
-    return names;
-}
-
-// 添加映射
-bool InputManager::add_mapping(const InputMapping& mapping) {
-    if (!is_point_valid(mapping.point_index)) {
-        return false;
-    }
-    
-    mappings_[mapping.point_index] = mapping;
-    log_debug("Added mapping for point " + std::to_string(mapping.point_index));
-    return true;
-}
-
-// 移除映射
-bool InputManager::remove_mapping(uint8_t point_index) {
-    if (!is_point_valid(point_index)) {
-        return false;
-    }
-    
-    mappings_[point_index] = InputMapping();
-    mappings_[point_index].point_index = point_index;
-    mappings_[point_index].enabled = false;
-    
-    log_debug("Removed mapping for point " + std::to_string(point_index));
-    return true;
-}
-
-// 获取映射
-bool InputManager::get_mapping(uint8_t point_index, InputMapping& mapping) {
-    if (!is_point_valid(point_index)) {
-        return false;
-    }
-    
-    mapping = mappings_[point_index];
-    return true;
-}
-
-// 启用/禁用映射
-bool InputManager::enable_mapping(uint8_t point_index, bool enabled) {
-    if (!is_point_valid(point_index)) {
-        return false;
-    }
-    
-    mappings_[point_index].enabled = enabled;
-    log_debug("Mapping for point " + std::to_string(point_index) + " " + (enabled ? "enabled" : "disabled"));
-    return true;
-}
-
-// 开始校准
-bool InputManager::start_calibration(const std::string& device_name) {
-    if (calibrating_) {
-        return false;
-    }
-    
-    calibrating_ = true;
-    calibration_device_name_ = device_name;
-    calibration_progress_ = 0;
-    calibration_start_time_ = time_us_32() / 1000;
-    
-    log_debug("Started calibration for device " + device_name);
-    
-    // 如果指定了特定设备
-    if (!device_name.empty()) {
-        auto it = devices_.find(device_name);
-        if (it != devices_.end() && it->second.device) {
-            it->second.device->calibrate();
-        }
-    } else {
-        // 校准所有设备
-        for (auto& pair : devices_) {
-            if (pair.second.device) {
-                pair.second.device->calibrate();
-            }
-        }
-    }
-    
-    return true;
-}
-
-// 停止校准
-bool InputManager::stop_calibration() {
-    if (!calibrating_) {
-        return false;
-    }
-    
-    calibrating_ = false;
-    log_debug("Stopped calibration");
-    
-    // 通知校准回调
-    if (calibration_callback_) {
-        calibration_callback_(calibration_device_name_, true);
-    }
-    
-    return true;
-}
-
-// 检查是否正在校准
-bool InputManager::is_calibrating() const {
-    return calibrating_;
-}
-
-// 获取校准进度
-bool InputManager::get_calibration_progress(uint8_t& progress) {
-    if (!calibrating_) {
-        return false;
-    }
-    
-    progress = calibration_progress_;
-    return true;
-}
-
-// 获取触摸状态
-bool InputManager::get_touch_state(uint8_t point_index, bool& pressed, uint8_t& pressure) {
-    if (!is_point_valid(point_index)) {
-        return false;
-    }
-    
-    pressed = current_states_[point_index];
-    pressure = 0;  // 移除压力处理，直接设为0
-    return true;
-}
-
-// 获取所有触摸状态
-bool InputManager::get_all_touch_states(std::array<bool, 34>& states) {
-    states = current_states_;
-    return true;
-}
-
-// 获取活跃触摸点数量
-uint8_t InputManager::get_active_touch_count() {
-    uint8_t count = 0;
-    for (bool state : current_states_) {
-        if (state) count++;
-    }
-    return count;
-}
-
-// 点位到坐标转换
-bool InputManager::point_to_coordinates(uint8_t point_index, uint16_t& x, uint16_t& y) {
-    if (!is_point_valid(point_index)) {
-        return false;
-    }
-    
-    x = points_[point_index].x_coord;
-    y = points_[point_index].y_coord;
-    return true;
-}
-
-// 坐标到点位转换 - 优化版本，支持区域检测和精确匹配
-bool InputManager::coordinates_to_point(uint16_t x, uint16_t y, uint8_t& point_index) {
-    uint32_t min_distance = UINT32_MAX;
-    uint8_t closest_point = 0;
-    bool found_valid_point = false;
-    
-    // 首先检查是否在任何启用点位的有效范围内
-    for (uint8_t i = 0; i < 34; i++) {
-        if (!get_point_enabled(i)) continue;
-        
-        int32_t dx = static_cast<int32_t>(x) - static_cast<int32_t>(points_[i].x_coord);
-        int32_t dy = static_cast<int32_t>(y) - static_cast<int32_t>(points_[i].y_coord);
-        uint32_t distance = dx * dx + dy * dy;
-        
-        // 检查是否在点位的有效半径内（基于点位大小）
-        uint32_t max_radius_sq = points_[i].radius * points_[i].radius;
-        
-        if (distance <= max_radius_sq) {
-            // 在有效范围内，选择最近的点
-            if (distance < min_distance) {
-                min_distance = distance;
-                closest_point = i;
-                found_valid_point = true;
-            }
-        } else if (!found_valid_point && distance < min_distance) {
-            // 如果没有找到有效范围内的点，记录最近的点作为备选
-            min_distance = distance;
-            closest_point = i;
-        }
-    }
-    
-    point_index = closest_point;
-    return found_valid_point || (min_distance < UINT32_MAX);
-}
-
-// 获取统计信息
-bool InputManager::get_statistics(InputStatistics& stats) {
-    stats = statistics_;
-    return true;
-}
-
-// 重置统计信息
-void InputManager::reset_statistics() {
-    statistics_ = InputStatistics();
-    statistics_.last_reset_time = time_us_32() / 1000;
-    log_debug("Statistics reset");
-}
-
-// 设置回调
-void InputManager::set_touch_event_callback(TouchEventCallback callback) {
-    touch_event_callback_ = callback;
-}
-
-void InputManager::set_input_mapping_callback(InputMappingCallback callback) {
-    input_mapping_callback_ = callback;
-}
-
-void InputManager::set_device_status_callback(DeviceStatusCallback callback) {
-    device_status_callback_ = callback;
-}
-
-void InputManager::set_calibration_callback(CalibrationCallback callback) {
-    calibration_callback_ = callback;
-}
-
-// CPU0任务处理 - 读取原始分区触发bitmap -> 映射到逻辑区 -> [Serial模式](传递给Mai2Serial) / [HID模式](将触摸映射Bitmap发送到FIFO跨核心传输)
+// CPU0核心循环 - GTX312L触摸采样和Serial/HID处理
 void InputManager::loop0() {
-    static uint32_t last_touch_bitmap = 0;
-    static uint8_t maintenance_counter = 0;
+    // 更新所有设备的触摸状态
+    updateTouchStates();
     
-    uint32_t current_touch_bitmap = 0;
-    bool touch_state_changed = false;
-    
-    // 1. 高频扫描GTX312L设备 - 读取原始物理触摸数据
-    for (auto& pair : devices_) {
-        DeviceInfo& info = pair.second;
-        if (!info.device || !info.connected) continue;
-        
-        GTX312L_TouchData data;
-        if (info.device->read_touch_data(data)) {
-            uint16_t touch_status = data.touch_status;
-            uint16_t prev_status = info.last_data.touch_status;
-            uint16_t changed = touch_status ^ prev_status;
-            
-            if (changed) {
-                // 计算设备在物理点位数组中的偏移
-                uint8_t device_index = 0;
-                for (const auto& dev_pair : devices_) {
-                    if (dev_pair.first == pair.first) break;
-                    device_index++;
-                }
-                uint8_t device_offset = device_index * 12;
-                
-                // 处理变化的通道
-                while (changed) {
-                    uint8_t ch = __builtin_ctz(changed);
-                    changed &= changed - 1;
-                    
-                    uint8_t physical_point = device_offset + ch;
-                    if (physical_point < 72 && physical_points_[physical_point].enabled) {
-                        bool pressed = (touch_status & (1 << ch)) != 0;
-                        if (current_touch_states_[physical_point] != pressed) {
-                            current_touch_states_[physical_point] = pressed;
-                            touch_state_changed = true;
-                            
-                            if (pressed) {
-                                current_touch_bitmap |= (1UL << physical_point);
-                            }
-                        }
-                    }
-                }
-                info.last_data = data;
-            }
-        }
+    // 处理自动灵敏度调整状态机
+    if (auto_adjust_context_.active) {
+        processAutoAdjustSensitivity();
     }
     
-    // 2. 只在触摸状态变化时进行映射和传输
-    if (touch_state_changed || current_touch_bitmap != last_touch_bitmap) {
-        last_touch_bitmap = current_touch_bitmap;
-        
-        if (current_mode_ == InputMode::SERIAL) {
-            // Serial模式：物理点位 -> 逻辑区域 -> Mai2Serial
-            process_serial_mode_mapping(current_touch_bitmap);
-        } else {
-            // HID模式：物理点位 -> 逻辑点位 -> FIFO传输到CPU1
-            process_hid_mode_mapping(current_touch_bitmap);
-        }
-    }
-    
-    // 3. 低频维护任务 - 每256次循环执行一次
-    if (++maintenance_counter == 0) {
-        // 处理校准状态
-        if (calibrating_) {
-            uint32_t elapsed = (time_us_32() / 1000) - calibration_start_time_;
-            calibration_progress_ = (elapsed > 10000) ? 100 : elapsed / 100;
-            if (calibration_progress_ >= 100) calibrating_ = false;
-        }
-        
-        // 处理自动灵敏度调整
-        if (auto_sensitivity_running_) {
-            process_auto_sensitivity_adjustment();
-        }
-        
-        // Serial模式下处理Mai2Serial命令
-        if (current_mode_ == InputMode::SERIAL && mai2_serial_) {
-            mai2_serial_->process_commands();
+    // 处理绑定状态
+    if (binding_active_) {
+        processBinding();
+    } else {
+        // 根据工作模式处理触摸数据
+        InputWorkMode work_mode = getWorkMode();
+        if (work_mode == InputWorkMode::SERIAL_MODE) {
+            processSerialMode();
+        } else if (work_mode == InputWorkMode::HID_MODE) {
+            processHIDMode();
         }
     }
 }
 
-// CPU1任务处理 - 键盘数据处理和HID模式
+// CPU1核心循环 - 键盘处理和HID发送
 void InputManager::loop1() {
-    static MCP23S17_GPIO_State last_gpio = {0};
+    // 更新GPIO状态
+    updateGPIOStates();
     
-    // 高速MCP23S17扫描 - 按键输入处理
-    if (mcp23s17_) {
-        MCP23S17_GPIO_State gpio_state;
-        if (mcp23s17_->read_all_gpio(gpio_state)) {
-            // 检查变化的GPIO位
-            uint16_t changed = gpio_state.port_a ^ last_gpio.port_a;
-            changed |= (gpio_state.port_b ^ last_gpio.port_b) << 8;
-            
-            if (changed) {
-                // 使用位操作快速处理GPIO变化
-                while (changed) {
-                    uint8_t i = __builtin_ctz(changed); // 找到最低位的1
-                    changed &= changed - 1; // 清除最低位的1
-                    
-                    bool pressed = (i < 8) ? 
-                        (gpio_state.port_a & (1 << i)) == 0 : // 假设低电平有效
-                        (gpio_state.port_b & (1 << (i - 8))) == 0;
-                    
-                    // 根据模式处理按键映射
-                    if (current_mode_ == InputMode::SERIAL) {
-                        // Serial模式：通过Mai2Serial发送按键数据
-                        if (mai2_serial_) {
-                            Mai2Serial_ButtonData button_data;
-                            button_data.button_id = i;
-                            button_data.pressed = pressed;
-                            mai2_serial_->send_button_data(button_data);
-                        }
-                    } else {
-                        // HID模式：处理按键到HID键盘映射
-                        process_key_input(i, pressed);
-                    }
-                }
-                last_gpio = gpio_state;
-            }
-        }
-    }
+    // 处理GPIO键盘输入
+    processGPIOKeyboard();
     
-    // HID模式专用处理
-    if (current_mode_ == InputMode::HID && hid_device_) {
-        // 从FIFO接收触摸数据（来自CPU0）
-        uint32_t touch_bitmap;
-        if (multicore_fifo_pop_timeout_us(0, &touch_bitmap)) {
-            // 转换触摸位图为HID触摸报告并发送
-            process_hid_touch_mapping();
-        }
-        
-        // 处理HID键盘映射
-        process_hid_keyboard_mapping();
-        
-        // 处理HID设备状态更新
-        hid_device_->update();
+    // 处理触摸键盘映射
+    processTouchKeyboard();
+    
+    // 在HID模式下发送触摸数据
+    if (getWorkMode() == InputWorkMode::HID_MODE) {
+        sendHIDTouchData();
     }
 }
 
-// Serial模式映射处理 - 物理点位 -> 逻辑区域 -> Mai2Serial
-void InputManager::process_serial_mode_mapping(uint32_t touch_bitmap) {
-    if (!mai2_serial_) return;
-    
-    // 根据Serial模式映射配置，将物理点位映射到逻辑区域
-    // Mai2 使用两个32位状态字来表示34个区域的触摸状态
-    uint32_t state1 = 0;  // 区域1-32 (bit 0-31)
-    uint32_t state2 = 0;  // 区域33-34 (bit 0-1)
-    
-    for (uint8_t area_idx = 0; area_idx < 34; area_idx++) {
-        if (!serial_mapping_.logical_areas[area_idx].enabled) continue;
-        
-        // 检查该逻辑区域的所有物理点位是否有触摸
-        bool area_touched = false;
-        for (uint8_t point_idx = 0; point_idx < 8; point_idx++) {
-            uint8_t physical_point = serial_mapping_.logical_areas[area_idx].physical_points[point_idx];
-            if (physical_point < 72 && (touch_bitmap & (1UL << physical_point))) {
-                area_touched = true;
-                break;
-            }
+// 开始Serial绑定
+void InputManager::startSerialBinding(InteractiveBindingCallback callback) {
+    if (getWorkMode() != InputWorkMode::SERIAL_MODE) {
+        if (callback) {
+            callback(false, "Not in Serial mode");
         }
-        
-        if (area_touched) {
-            // 区域编号从1开始，所以area_idx+1对应实际区域号
-            if (area_idx < 32) {
-                state1 |= (1UL << area_idx);  // 区域1-32映射到state1的bit 0-31
-            } else {
-                state2 |= (1UL << (area_idx - 32));  // 区域33-34映射到state2的bit 0-1
-            }
-        }
-    }
-    
-    // 使用二进制格式发送触摸状态到Mai2Serial
-    mai2_serial_->send_touch_state(state1, state2);
-}
-
-// HID模式映射处理 - 物理点位 -> 逻辑点位 -> FIFO传输到CPU1
-void InputManager::process_hid_mode_mapping(uint32_t touch_bitmap) {
-    // 根据HID模式映射配置，将物理点位映射到逻辑点位
-    uint32_t logical_point_bitmap = 0;
-    
-    for (uint8_t point_idx = 0; point_idx < 34; point_idx++) {
-        if (!hid_mapping_.logical_points[point_idx].enabled) continue;
-        
-        // 检查该逻辑点位的所有物理点位是否有触摸
-        bool point_touched = false;
-        for (uint8_t phys_idx = 0; phys_idx < 8; phys_idx++) {
-            uint8_t physical_point = hid_mapping_.logical_points[point_idx].physical_points[phys_idx];
-            if (physical_point < 72 && (touch_bitmap & (1UL << physical_point))) {
-                point_touched = true;
-                break;
-            }
-        }
-        
-        if (point_touched) {
-            logical_point_bitmap |= (1UL << point_idx);
-        }
-    }
-    
-    // 通过FIFO发送到CPU1进行HID处理
-    if (logical_point_bitmap != 0) {
-        multicore_fifo_push_timeout_us(logical_point_bitmap, 0); // 非阻塞发送
-    }
-}
-
-// 自动灵敏度调整处理
-void InputManager::process_auto_sensitivity_adjustment() {
-    if (!auto_sensitivity_running_) return;
-    
-    uint32_t elapsed = (time_us_32() / 1000) - auto_sensitivity_start_time_;
-    
-    // 自动灵敏度调整算法
-    if (elapsed > 5000) { // 5秒超时
-        auto_sensitivity_running_ = false;
-        log_debug("Auto sensitivity adjustment timeout");
         return;
     }
     
-    // 检查当前点位的触摸状态
-    if (auto_sensitivity_point_ < 34) {
-        bool is_touched = current_states_[auto_sensitivity_point_];
-        
-        if (is_touched) {
-            // 触摸检测到，记录当前灵敏度作为结果
-            uint8_t current_sensitivity = get_global_sensitivity();
-            auto_sensitivity_result_ = current_sensitivity;
-            auto_sensitivity_running_ = false;
-            
-            log_debug("Auto sensitivity found optimal value: " + std::to_string(current_sensitivity));
-        } else {
-            // 未检测到触摸，增加灵敏度
-            uint8_t current_sensitivity = get_global_sensitivity();
-            if (current_sensitivity < 63) {
-                set_global_sensitivity(current_sensitivity + 1);
-            } else {
-                // 达到最大灵敏度仍未检测到，停止调整
-                auto_sensitivity_running_ = false;
-                auto_sensitivity_result_ = 63;
-                log_debug("Auto sensitivity reached maximum value");
-            }
+    // 初始化Serial绑定状态
+    binding_active_ = true;
+    binding_callback_ = callback;
+    binding_state_ = BindingState::SERIAL_BINDING_INIT;
+    current_binding_index_ = 0;
+    binding_start_time_ = to_ms_since_boot(get_absolute_time());
+    
+    // 通过UI管理器显示绑定开始状态
+    if (ui_manager_) {
+        ui_manager_->show_binding_status("开始Serial绑定", false);
+    }
+    
+    // 备份当前通道状态并启用所有通道
+    backupChannelStates();
+    enableAllChannels();
+}
+
+// 开始HID绑定
+void InputManager::startHIDBinding(InteractiveBindingCallback callback) {
+    if (getWorkMode() != InputWorkMode::HID_MODE) {
+        if (callback) {
+            callback(false, "Not in HID mode");
         }
-    }
-}
-
-// 启用调试输出
-void InputManager::enable_debug_output(bool enabled) {
-    debug_enabled_ = enabled;
-    log_debug("Debug output " + std::string(enabled ? "enabled" : "disabled"));
-}
-
-// 开始自动灵敏度调整
-bool InputManager::start_auto_sensitivity_adjustment(uint8_t point_index) {
-    if (auto_sensitivity_running_ || !is_point_valid(point_index)) {
-        return false;
-    }
-    
-    auto_sensitivity_running_ = true;
-    auto_sensitivity_point_ = point_index;
-    auto_sensitivity_result_ = 0;
-    auto_sensitivity_start_time_ = time_us_32() / 1000;
-    
-    // 从较低的灵敏度开始
-    set_global_sensitivity(16);
-    
-    log_debug("Started auto sensitivity adjustment for point " + std::to_string(point_index));
-    return true;
-}
-
-// 停止自动灵敏度调整
-bool InputManager::stop_auto_sensitivity_adjustment() {
-    if (!auto_sensitivity_running_) {
-        return false;
-    }
-    
-    auto_sensitivity_running_ = false;
-    log_debug("Stopped auto sensitivity adjustment");
-    return true;
-}
-
-// 获取自动灵敏度调整结果
-bool InputManager::get_auto_sensitivity_result(uint8_t& result) {
-    if (auto_sensitivity_running_) {
-        return false;
-    }
-    
-    result = auto_sensitivity_result_;
-    return true;
-}
-
-// 检查自动灵敏度调整是否正在运行
-bool InputManager::is_auto_sensitivity_running() const {
-    return auto_sensitivity_running_;
-}
-
-// 手动触发逻辑区域 (Serial模式)
-bool InputManager::trigger_logical_area_manual(uint8_t area_index) {
-    if (area_index >= 34 || current_mode_ != InputMode::SERIAL) {
-        return false;
-    }
-    
-    if (mai2_serial_) {
-        uint32_t state1 = 0;
-        uint32_t state2 = 0;
-        
-        // 正确映射区域到状态位
-        if (area_index < 32) {
-            state1 = (1UL << area_index);  // 区域0-31映射到state1
-        } else {
-            state2 = (1UL << (area_index - 32));  // 区域32-33映射到state2
-        }
-        
-        // 发送触摸状态
-        mai2_serial_->send_touch_state(state1, state2);
-        
-        // 短暂延迟后发送释放状态
-        sleep_ms(50);
-        mai2_serial_->send_touch_state(0, 0);
-        
-        return true;
-    }
-    
-    return false;
-}
-
-// 手动触发逻辑点位 (HID模式)
-bool InputManager::trigger_logical_point_manual(uint8_t point_index) {
-    if (point_index >= 34 || current_mode_ != InputMode::HID) {
-        return false;
-    }
-    
-    if (hid_device_ && hid_mapping_.logical_points[point_index].enabled) {
-        uint16_t x = hid_mapping_.logical_points[point_index].x_coord;
-        uint16_t y = hid_mapping_.logical_points[point_index].y_coord;
-        
-        hid_device_->set_touch_point(point_index, x, y, 255);
-        hid_device_->send_report();
-        
-        // 延迟后释放
-        sleep_ms(50);
-        hid_device_->release_touch_point(point_index);
-        hid_device_->send_report();
-        
-        return true;
-    }
-    
-    return false;
-}
-
-// 手动触发HID坐标
-bool InputManager::trigger_hid_coordinate_manual(uint16_t x, uint16_t y) {
-    if (current_mode_ != InputMode::HID || !hid_device_) {
-        return false;
-    }
-    
-    // 使用临时触摸点ID (34)
-    hid_device_->set_touch_point(34, x, y, 255);
-    hid_device_->send_report();
-    
-    // 延迟后释放
-    sleep_ms(50);
-    hid_device_->release_touch_point(34);
-    hid_device_->send_report();
-    
-    return true;
-}
-
-// 根据映射更新通道位图
-void InputManager::update_channel_bitmaps() {
-    // 清空所有通道位图
-    for (uint8_t i = 0; i < 6; i++) {
-        channel_bitmaps_[i].enabled_channels = 0;
-        channel_bitmaps_[i].mapped_channels = 0;
-    }
-    
-    // 根据Serial模式映射计算需要的通道
-    for (uint8_t area_idx = 0; area_idx < 34; area_idx++) {
-        if (!serial_mapping_.logical_areas[area_idx].enabled) continue;
-        
-        for (uint8_t point_idx = 0; point_idx < 8; point_idx++) {
-            uint8_t physical_point = serial_mapping_.logical_areas[area_idx].physical_points[point_idx];
-            if (physical_point < 72) {
-                uint8_t device_id;
-                uint8_t channel = physical_point_to_device_channel(physical_point, device_id);
-                uint8_t device_index = get_device_index_by_id(device_id);
-                
-                if (device_index < 6) {
-                    channel_bitmaps_[device_index].mapped_channels |= (1 << channel);
-                }
-            }
-        }
-    }
-    
-    // 根据HID模式映射计算需要的通道
-    for (uint8_t point_idx = 0; point_idx < 34; point_idx++) {
-        if (!hid_mapping_.logical_points[point_idx].enabled) continue;
-        
-        for (uint8_t phys_idx = 0; phys_idx < 8; phys_idx++) {
-            uint8_t physical_point = hid_mapping_.logical_points[point_idx].physical_points[phys_idx];
-            if (physical_point < 72) {
-                uint8_t device_id;
-                uint8_t channel = physical_point_to_device_channel(physical_point, device_id);
-                uint8_t device_index = get_device_index_by_id(device_id);
-                
-                if (device_index < 6) {
-                    channel_bitmaps_[device_index].mapped_channels |= (1 << channel);
-                }
-            }
-        }
-    }
-    
-    // 启用所有映射的通道
-    for (uint8_t i = 0; i < 6; i++) {
-        channel_bitmaps_[i].enabled_channels = channel_bitmaps_[i].mapped_channels;
-    }
-}
-
-// 启用/禁用设备通道
-bool InputManager::enable_device_channel(uint8_t device_id, uint8_t channel, bool enabled) {
-    if (channel >= 12) return false;
-    
-    uint8_t device_index = get_device_index_by_id(device_id);
-    if (device_index >= 6) return false;
-    
-    if (enabled) {
-        channel_bitmaps_[device_index].enabled_channels |= (1 << channel);
-    } else {
-        channel_bitmaps_[device_index].enabled_channels &= ~(1 << channel);
-    }
-    
-    return true;
-}
-
-// 检查设备通道是否启用
-bool InputManager::is_device_channel_enabled(uint8_t device_id, uint8_t channel) const {
-    if (channel >= 12) return false;
-    
-    uint8_t device_index = get_device_index_by_id(device_id);
-    if (device_index >= 6) return false;
-    
-    return (channel_bitmaps_[device_index].enabled_channels & (1 << channel)) != 0;
-}
-
-// 获取设备通道位图
-uint16_t InputManager::get_device_channel_bitmap(uint8_t device_id) const {
-    uint8_t device_index = get_device_index_by_id(device_id);
-    if (device_index >= 6) return 0;
-    
-    return channel_bitmaps_[device_index].enabled_channels;
-}
-
-// 将通道位图应用到实际设备
-void InputManager::apply_channel_bitmaps_to_devices() {
-    for (const auto& pair : devices_) {
-        uint8_t device_id = pair.first;
-        const DeviceInfo& info = pair.second;
-        
-        if (info.device && info.connected) {
-            uint8_t device_index = get_device_index_by_id(device_id);
-            if (device_index < 6) {
-                uint16_t enabled_channels = channel_bitmaps_[device_index].enabled_channels;
-                info.device->set_enabled_channels(enabled_channels);
-            }
-        }
-    }
-}
-
-// 根据设备ID获取设备索引
-uint8_t InputManager::get_device_index_by_id(uint8_t device_id) const {
-    uint8_t index = 0;
-    for (const auto& pair : devices_) {
-        if (pair.first == device_id) {
-            return index;
-        }
-        index++;
-    }
-    return 255; // 无效索引
-}
-
-// 将物理点位转换为设备ID和通道
-uint8_t InputManager::physical_point_to_device_channel(uint8_t physical_point, uint8_t& device_id) const {
-    if (physical_point >= 72) {
-        device_id = 0;
-        return 0;
-    }
-    
-    uint8_t device_index = physical_point / 12;
-    uint8_t channel = physical_point % 12;
-    
-    // 根据设备索引获取实际设备ID
-    uint8_t current_index = 0;
-    for (const auto& pair : devices_) {
-        if (current_index == device_index) {
-            device_id = pair.first;
-            return channel;
-        }
-        current_index++;
-    }
-    
-    device_id = 0;
-    return 0;
-}
-
-// 获取调试信息
-std::string InputManager::get_debug_info() {
-    std::string info = "InputManager Debug Info:\n";
-    info += "Devices: " + std::to_string(devices_.size()) + "\n";
-    info += "Active touches: " + std::to_string(get_active_touch_count()) + "\n";
-    info += "Total touches: " + std::to_string(statistics_.total_touches) + "\n";
-    info += "Calibrating: " + std::string(calibrating_ ? "Yes" : "No") + "\n";
-    
-    return info;
-}
-
-// 测试点位
-bool InputManager::test_point(uint8_t point_index) {
-    if (!is_point_valid(point_index)) {
-        return false;
-    }
-    
-    // 模拟触摸事件
-    process_touch_event(point_index, true, 255);
-    sleep_ms(100);
-    process_touch_event(point_index, false, 0);
-    
-    log_debug("Tested point " + std::to_string(point_index));
-    return true;
-}
-
-// 私有方法实现
-void InputManager::scan_devices() {
-    // 已优化到loop0中，此函数保留用于兼容性
-    // 实际扫描逻辑已内联到loop0以获得最大性能
-}
-
-void InputManager::process_device_data(const std::string& device_name, const GTX312L_TouchData& data) {
-    // 已优化到loop0中，此函数保留用于兼容性
-    // 实际处理逻辑已内联到loop0以获得最大性能
-}
-
-// HID触摸输出处理 - 接收来自CPU0的触摸位图并转换为HID报告
-void InputManager::process_hid_touch_output(uint32_t touch_bitmap) {
-    if (!hid_device_) return;
-    
-    // 处理逻辑点位到XY坐标的映射
-    for (uint8_t i = 0; i < 34; i++) {
-        bool touched = (touch_bitmap & (1UL << i)) != 0;
-        
-        if (hid_mapping_.logical_points[i].enabled) {
-            uint16_t x = hid_mapping_.logical_points[i].x_coord;
-            uint16_t y = hid_mapping_.logical_points[i].y_coord;
-            
-            if (touched) {
-                hid_device_->set_touch_point(i, x, y, 255);
-            } else {
-                hid_device_->release_touch_point(i);
-            }
-        }
-    }
-    
-    // 发送HID报告
-    hid_device_->send_report();
-}
-
-// 键盘映射处理 - 处理MCP23S17按键状态变化
-void InputManager::process_keyboard_mapping(uint16_t key_state, uint16_t changed) {
-    if (!hid_device_) return;
-    
-    // 处理变化的按键
-    while (changed) {
-        uint8_t pin = __builtin_ctz(changed);
-        changed &= changed - 1;
-        
-        bool pressed = (key_state & (1 << pin)) != 0;
-        
-        // 查找对应的键盘映射
-        for (uint8_t i = 0; i < 16; i++) {
-            if (keyboard_mapping_.keys[i].enabled && 
-                keyboard_mapping_.keys[i].gpio_pin == pin &&
-                keyboard_mapping_.keys[i].is_mcp_pin) {
-                
-                // 处理组合键 (最多3个HID键)
-                for (uint8_t key_idx = 0; key_idx < 3; key_idx++) {
-                    uint8_t hid_key = keyboard_mapping_.keys[i].hid_keys[key_idx];
-                    if (hid_key == 0) break; // 0表示无效键
-                    
-                    if (pressed) {
-                        hid_device_->press_key(static_cast<HID_KeyCode>(hid_key));
-                    } else {
-                        hid_device_->release_key(static_cast<HID_KeyCode>(hid_key));
-                    }
-                }
-                break;
-            }
-        }
-    }
-    
-    // 发送HID键盘报告
-    hid_device_->send_keyboard_report();
-}
-}
-
-void InputManager::process_touch_event(uint8_t point_index, bool pressed, uint8_t pressure) {
-    if (!is_point_valid(point_index) || !get_point_enabled(point_index)) {
         return;
     }
     
-    bool current_state = current_states_[point_index];
+    // 初始化HID绑定状态
+    binding_active_ = true;
+    binding_callback_ = callback;
+    binding_state_ = BindingState::HID_BINDING_INIT;
+    binding_start_time_ = to_ms_since_boot(get_absolute_time());
+    hid_binding_device_addr_ = 0;
+    hid_binding_channel_ = 0;
+    hid_binding_x_ = 0.0f;
+    hid_binding_y_ = 0.0f;
     
-    // 直通处理 - 无防抖和延迟
-    if (pressed != current_state) {
-        if (pressed) {
-            handle_touch_press(point_index, pressure);
-        } else {
-            handle_touch_release(point_index);
+    // 通过UI管理器显示HID绑定开始状态
+    if (ui_manager_) {
+        ui_manager_->show_binding_status("开始HID绑定", false);
+    }
+    
+    // 备份当前通道状态并启用所有通道
+    backupChannelStates();
+    enableAllChannels();
+}
+
+// 开始自动Serial绑定
+bool InputManager::startAutoSerialBinding() {
+    if (getWorkMode() != InputWorkMode::SERIAL_MODE) {
+        return false;
+    }
+    
+    // 初始化自动绑定状态
+    binding_active_ = true;
+    binding_callback_ = nullptr;  // 自动绑区不使用回调
+    binding_state_ = BindingState::AUTO_SERIAL_BINDING_INIT;
+    current_binding_index_ = 0;
+    binding_start_time_ = to_ms_since_boot(get_absolute_time());
+    
+    // 通过UI管理器显示自动绑定开始状态
+    if (ui_manager_) {
+        ui_manager_->show_binding_status("开始自动Serial绑定", false);
+    }
+    
+    // 备份当前通道状态并启用所有通道
+    backupChannelStates();
+    enableAllChannels();
+    
+    return true;
+}
+
+// 取消绑定
+void InputManager::cancelBinding() {
+    if (binding_active_) {
+        // 恢复原始通道状态
+        restoreChannelStates();
+        
+        // 清除UI绑定状态
+        if (ui_manager_) {
+            ui_manager_->clear_binding_status();
         }
         
-        current_states_[point_index] = pressed;
+        // 重置绑定状态
+        binding_active_ = false;
+        binding_callback_ = nullptr;
+        binding_state_ = BindingState::IDLE;
+        current_binding_index_ = 0;
+        binding_start_time_ = 0;
         
-        // 执行映射
-        execute_mapping(point_index, pressed);
-        
-        // 更新统计
-        update_statistics(point_index, pressed);
+        // 重置HID绑定相关变量
+        hid_binding_device_addr_ = 0;
+        hid_binding_channel_ = 0;
+        hid_binding_x_ = 0.0f;
+        hid_binding_y_ = 0.0f;
     }
 }
 
-void InputManager::handle_touch_press(uint8_t point_index, uint8_t pressure) {
-    TouchEvent event;
-    event.type = TouchEvent::Type::PRESS;
-    event.point_index = point_index;
-    point_to_coordinates(point_index, event.x, event.y);
-    event.pressure = pressure;
-    event.timestamp = time_us_32() / 1000;
-    
-    if (touch_event_callback_) {
-        touch_event_callback_(event);
+// 设置HID绑定坐标
+void InputManager::setHIDCoordinates(float x, float y) {
+    if (binding_active_ && binding_state_ == BindingState::HID_BINDING_SET_COORDS) {
+        hid_binding_x_ = x;
+        hid_binding_y_ = y;
     }
-    
-    log_debug("Touch press: point " + std::to_string(point_index) + ", pressure " + std::to_string(pressure));
 }
 
-void InputManager::handle_touch_release(uint8_t point_index) {
-    TouchEvent event;
-    event.type = TouchEvent::Type::RELEASE;
-    event.point_index = point_index;
-    point_to_coordinates(point_index, event.x, event.y);
-    event.pressure = 0;
-    event.timestamp = time_us_32() / 1000;
-    event.duration = 0;  // 移除压力处理，直接设为0
-    
-    if (touch_event_callback_) {
-        touch_event_callback_(event);
+// 确认HID绑定
+void InputManager::confirmHIDBinding() {
+    if (binding_active_ && binding_state_ == BindingState::HID_BINDING_SET_COORDS) {
+        binding_state_ = BindingState::HID_BINDING_COMPLETE;
     }
-    
-    log_debug("Touch release: point " + std::to_string(point_index));
 }
 
-void InputManager::handle_touch_hold(uint8_t point_index) {
-    TouchEvent event;
-    event.type = TouchEvent::Type::HOLD;
-    event.point_index = point_index;
-    point_to_coordinates(point_index, event.x, event.y);
-    event.pressure = 0;  // 移除压力处理，直接设为0
-    event.timestamp = time_us_32() / 1000;
-    event.duration = 0;  // 移除压力处理，直接设为0
-    
-    if (touch_event_callback_) {
-        touch_event_callback_(event);
-    }
-    
-    log_debug("Touch hold: point " + std::to_string(point_index));
+// 检查自动绑区是否完成
+bool InputManager::isAutoSerialBindingComplete() const {
+    return binding_active_ && binding_state_ == BindingState::AUTO_SERIAL_BINDING_WAIT;
 }
 
-void InputManager::execute_mapping(uint8_t point_index, bool pressed) {
-    if (!is_point_valid(point_index) || !mappings_[point_index].enabled) {
-        return;
+// 确认自动绑区结果
+void InputManager::confirmAutoSerialBinding() {
+    if (binding_active_ && binding_state_ == BindingState::AUTO_SERIAL_BINDING_WAIT) {
+        binding_state_ = BindingState::AUTO_SERIAL_BINDING_COMPLETE;
+    }
+}
+
+// 自动调整指定通道的灵敏度
+uint8_t InputManager::autoAdjustSensitivity(uint16_t device_addr, uint8_t channel) {
+    if (channel >= 12) {
+        return 0; // 无效通道
     }
     
-    const InputMapping& mapping = mappings_[point_index];
-    
-    // 检查映射的有效性和条件
-    if (mapping.type == InputMapping::Type::NONE) {
-        return;
-    }
-    
-    // 记录映射执行时间用于调试
-    uint32_t execution_start = time_us_32() / 1000;
-    
-    switch (mapping.type) {
-        case InputMapping::Type::KEYBOARD:
-            send_keyboard_input(mapping, pressed);
+    // 查找设备
+    GTX312L* device = nullptr;
+    for (auto* dev : gtx312l_devices_) {
+        if (dev->get_physical_device_address().get_device_mask() == device_addr) {
+            device = dev;
             break;
-        case InputMapping::Type::MOUSE:
-            send_mouse_input(mapping, pressed);
-            break;
-        case InputMapping::Type::GAMEPAD:
-            send_gamepad_input(mapping, pressed);
-            break;
-        case InputMapping::Type::TOUCH:
-            send_touch_input(mapping, pressed);
-            break;
-        case InputMapping::Type::CUSTOM:
-            // 自定义处理 - 可扩展用户自定义映射逻辑
-            if (mapping.custom_handler) {
-                mapping.custom_handler(point_index, pressed, 255); // 使用最大压力值
-            }
-            break;
-        default:
-            // 未知映射类型，记录错误
-            if (debug_enabled_) {
-                log_debug("Unknown mapping type for point " + std::to_string(point_index));
-            }
-            return;
-    }
-    
-    // 更新映射统计信息
-    mapping_statistics_[point_index].execution_count++;
-    mapping_statistics_[point_index].last_execution_time = execution_start;
-    
-    // 通知映射回调
-    if (input_mapping_callback_) {
-        input_mapping_callback_(point_index, pressed);
-    }
-    
-    // 调试输出
-    if (debug_enabled_) {
-        uint32_t execution_time = (time_us_32() / 1000) - execution_start;
-        if (execution_time > 1) { // 只记录耗时超过1ms的映射
-            log_debug("Mapping execution for point " + std::to_string(point_index) + 
-                     " took " + std::to_string(execution_time) + "ms");
-        }
-    }
-}
-
-void InputManager::send_keyboard_input(const InputMapping& mapping, bool pressed) {
-    if (!hid_device_) return;
-    
-    HID_KeyCode key = static_cast<HID_KeyCode>(mapping.key_code);
-    
-    if (pressed) {
-        hid_device_->press_key(key, mapping.modifier);
-    } else {
-        hid_device_->release_key(key);
-    }
-}
-
-void InputManager::send_mouse_input(const InputMapping& mapping, bool pressed) {
-    if (!hid_device_) return;
-    
-    HID_MouseButton button = static_cast<HID_MouseButton>(mapping.key_code);
-    
-    if (pressed) {
-        hid_device_->press_mouse_button(button);
-    } else {
-        hid_device_->release_mouse_button(button);
-    }
-}
-
-void InputManager::send_gamepad_input(const InputMapping& mapping, bool pressed) {
-    if (!hid_device_) return;
-    
-    HID_GamepadButton button = static_cast<HID_GamepadButton>(mapping.key_code);
-    hid_device_->set_gamepad_button(button, pressed);
-}
-
-void InputManager::send_touch_input(const InputMapping& mapping, bool pressed) {
-    if (!hid_device_) return;
-    
-    uint16_t x, y;
-    if (point_to_coordinates(mapping.point_index, x, y)) {
-        if (pressed) {
-            hid_device_->set_touch_point(mapping.point_index, x, y, 255); // 使用最大压力值
-        } else {
-            hid_device_->release_touch_point(mapping.point_index);
-        }
-    }
-}
-
-bool InputManager::is_point_valid(uint8_t point_index) const {
-    return point_index < 34;
-}
-
-uint8_t InputManager::device_channel_to_point_index(const std::string& device_name, uint8_t channel) const {
-    // 查找设备在devices_映射中的位置索引
-    uint8_t device_index = 0;
-    for (const auto& pair : devices_) {
-        if (pair.first == device_name) {
-            return device_index * 12 + channel;
-        }
-        device_index++;
-    }
-    return 0xFF; // 设备未找到
-}
-
-void InputManager::point_index_to_device_channel(uint8_t point_index, std::string& device_name, uint8_t& channel) const {
-    uint8_t device_index = point_index / 12;
-    channel = point_index % 12;
-    
-    // 根据索引查找设备名称
-    uint8_t current_index = 0;
-    for (const auto& pair : devices_) {
-        if (current_index == device_index) {
-            device_name = pair.first;
-            return;
-        }
-        current_index++;
-    }
-    device_name = ""; // 设备未找到
-}
-
-void InputManager::update_statistics(uint8_t point_index, bool pressed) {
-    if (pressed) {
-        statistics_.total_touches++;
-        statistics_.valid_touches++;
-        if (point_index < 34) {
-            statistics_.point_counts[point_index]++;
-        }
-        
-        // 检查多点触摸
-        if (get_active_touch_count() > 1) {
-            statistics_.multi_touches++;
-        }
-    }
-}
-
-void InputManager::perform_auto_calibration() {
-    static uint32_t last_calibration = 0;
-    uint32_t current_time = time_us_32() / 1000;
-    
-    InputManager_PrivateConfig config = input_manager_get_config_copy();
-    if (current_time - last_calibration >= config.calibration_interval_s * 1000) {
-        if (!calibrating_) {
-            start_calibration(0xFF); // 校准所有设备
-        }
-        last_calibration = current_time;
-    }
-}
-
-void InputManager::check_device_connections() {
-    for (auto& pair : devices_) {
-        DeviceInfo& info = pair.second;
-        bool current_connected = info.device && info.device->is_ready();
-        
-        if (current_connected != info.connected) {
-            info.connected = current_connected;
-            
-            if (device_status_callback_) {
-                device_status_callback_(pair.first, current_connected);
-            }
-            
-            log_debug("Device " + std::to_string(pair.first) + " " + 
-                     (current_connected ? "connected" : "disconnected"));
-        }
-    }
-}
-
-void InputManager::log_debug(const std::string& message) {
-    if (debug_enabled_) {
-        USB_LOG_TAG_DEBUG("INPUT_MGR", "%s", message.c_str());
-    }
-}
-
-void InputManager::process_mcp23s17_input(const MCP23S17_GPIO_State& gpio_state) {
-    // 处理MCP23S17的GPIO输入状态
-    // 将GPIO状态映射到键盘逻辑区
-    
-    // 检查每个GPIO引脚的状态变化
-    static MCP23S17_GPIO_State last_gpio_state = {0, 0};
-    
-    // 检查PORTA的变化
-    uint8_t porta_changed = gpio_state.port_a ^ last_gpio_state.port_a;
-    if (porta_changed) {
-        for (uint8_t i = 0; i < 8; i++) {
-            if (porta_changed & (1 << i)) {
-                bool pressed = (gpio_state.port_a & (1 << i)) == 0; // 假设低电平有效
-                // 映射到键盘逻辑区
-                process_key_input(i, pressed);
-            }
         }
     }
     
-    // 检查PORTB的变化
-    uint8_t portb_changed = gpio_state.port_b ^ last_gpio_state.port_b;
-    if (portb_changed) {
-        for (uint8_t i = 0; i < 8; i++) {
-            if (portb_changed & (1 << i)) {
-                bool pressed = (gpio_state.port_b & (1 << i)) == 0; // 假设低电平有效
-                // 映射到键盘逻辑区
-                process_key_input(i + 8, pressed);
-            }
-        }
-    }
-    
-    last_gpio_state = gpio_state;
-}
-
-void InputManager::process_hid_keyboard_mapping() {
-    if (!hid_device_) return;
-    
-    static uint8_t hid_keys[6] = {0}; // HID键盘报告最多6个按键
-    static uint8_t modifiers = 0;
-    uint8_t key_count = 0;
-    
-    // 快速扫描所有键盘映射
-     for (uint8_t i = 0; i < 34; i++) {
-         if (current_states_[i] && mappings_[i].enabled && 
-             mappings_[i].type == InputMappingType::KEYBOARD) {
-             
-             uint32_t keycode = mappings_[i].keyboard.keycode;
-             
-             // 处理修饰键
-             if (keycode >= 0xE0 && keycode <= 0xE7) {
-                 modifiers |= (1 << (keycode - 0xE0));
-             } else if (key_count < 6) {
-                 hid_keys[key_count++] = keycode;
-             }
-         }
-     }
-    
-    // 发送HID键盘报告
-    uint8_t report[8] = {modifiers, 0}; // 修饰键 + 保留字节
-    memcpy(&report[2], hid_keys, 6);
-    hid_device_->send_keyboard_report(report, 8);
-    
-    // 清空状态
-    memset(hid_keys, 0, 6);
-    modifiers = 0;
-}
-
-void InputManager::process_hid_touch_mapping() {
-    if (!hid_device_) return;
-    
-    struct TouchReport {
-        uint8_t contact_id;
-        uint16_t x, y;
-        uint8_t pressure;
-    } touches[10]; // 最多10个触摸点
-    
-    uint8_t touch_count = 0;
-    
-    // 扫描所有触摸映射
-     for (uint8_t i = 0; i < 34; i++) {
-         if (current_states_[i] && mappings_[i].enabled && 
-             mappings_[i].type == InputMappingType::TOUCH && touch_count < 10) {
-             
-             touches[touch_count].contact_id = i;
-             touches[touch_count].x = mappings_[i].touch.x;
-             touches[touch_count].y = mappings_[i].touch.y;
-             touches[touch_count].pressure = 255; // 最大压力
-             touch_count++;
-         }
-     }
-    
-    // 发送HID触摸报告
-    if (touch_count > 0) {
-        hid_device_->send_touch_report((uint8_t*)touches, touch_count * sizeof(TouchReport));
-    }
-}
-
-void InputManager::process_key_input(uint8_t key_index, bool pressed) {
-    // 处理单个按键输入 - 直通处理无防抖
-    
-    if (key_index >= 16) { // MCP23S17最多16个GPIO
-        return;
-    }
-    
-    // 直接处理MCP23S17按键映射
-    if (hid_device_) {
-        // 查找对应的映射配置
-         for (uint8_t i = 0; i < 34; i++) {
-             if (mappings_[i].enabled && mappings_[i].type == InputMappingType::KEYBOARD &&
-                 mappings_[i].keyboard.keycode == key_index + 0x04) { // HID键码偏移
-                 
-                 uint8_t report[8] = {0};
-                 if (pressed) {
-                     report[2] = mappings_[i].keyboard.keycode;
-                 }
-                 hid_device_->send_keyboard_report(report, 8);
-                 break;
-             }
-         }
-    }
-    
-    log_debug("Key " + std::to_string(key_index) + (pressed ? " pressed" : " released"));
-}
-
-// 生成设备名称：I2C通道+地址
-std::string InputManager::generate_device_name(GTX312L* device) {
     if (!device) {
-        return "Unknown";
+        return 0; // 设备未找到
     }
     
-    // 假设GTX312L有获取I2C通道和地址的方法
-    // 这里需要根据实际的GTX312L实现来调整
-    uint8_t i2c_channel = 0; // 需要从device获取
-    uint8_t i2c_address = device->get_address();
+    // 如果状态机正在运行，返回当前灵敏度
+    if (auto_adjust_context_.active) {
+        return getSensitivity(device_addr, channel);
+    }
     
-    return "I2C" + std::to_string(i2c_channel) + "_0x" + 
-           std::to_string(i2c_address);
+    // 初始化状态机
+    auto_adjust_context_.device_addr = device_addr;
+    auto_adjust_context_.channel = channel;
+    auto_adjust_context_.original_sensitivity = getSensitivity(device_addr, channel);
+    auto_adjust_context_.current_sensitivity = 1;
+    auto_adjust_context_.touch_found_sensitivity = 0;
+    auto_adjust_context_.touch_lost_sensitivity = 0;
+    auto_adjust_context_.state = AutoAdjustState::FIND_TOUCH_START;
+    auto_adjust_context_.state_start_time = to_ms_since_boot(get_absolute_time());
+    auto_adjust_context_.active = true;
+    
+    return auto_adjust_context_.original_sensitivity;
 }
 
-// 根据设备名称查找设备
-GTX312L* InputManager::find_device_by_name(const std::string& device_name) {
-    auto it = devices_.find(device_name);
-    if (it != devices_.end()) {
-        return it->second.device;
+// 状态机处理函数
+void InputManager::processAutoAdjustSensitivity() {    
+    millis_t current_time = to_ms_since_boot(get_absolute_time());
+    millis_t elapsed = current_time - auto_adjust_context_.state_start_time;
+    
+    // 查找设备
+    GTX312L* device = nullptr;
+    for (auto* dev : gtx312l_devices_) {
+        if (dev->get_physical_device_address().get_device_mask() == auto_adjust_context_.device_addr) {
+            device = dev;
+            break;
+        }
     }
-    return nullptr;
+    
+    if (!device) {
+        // 设备未找到，结束状态机
+        auto_adjust_context_.active = false;
+        return;
+    }
+    
+    switch (auto_adjust_context_.state) {
+        case AutoAdjustState::FIND_TOUCH_START:
+            // 设置当前灵敏度并开始等待稳定
+            setSensitivity(auto_adjust_context_.device_addr, auto_adjust_context_.channel, 
+                          auto_adjust_context_.current_sensitivity);
+            auto_adjust_context_.state = AutoAdjustState::FIND_TOUCH_WAIT;
+            auto_adjust_context_.state_start_time = current_time;
+            break;
+            
+        case AutoAdjustState::FIND_TOUCH_WAIT:
+            if (elapsed >= auto_adjust_context_.stabilize_duration) {
+                // 检查是否检测到触摸
+                GTX312L_SampleResult result = device->sample_touch_data();
+                if (result.physical_addr.mask & (1 << auto_adjust_context_.channel)) {
+                    // 找到触摸，记录灵敏度
+                    auto_adjust_context_.touch_found_sensitivity = auto_adjust_context_.current_sensitivity;
+                    auto_adjust_context_.current_sensitivity = auto_adjust_context_.touch_found_sensitivity;
+                    auto_adjust_context_.state = AutoAdjustState::FIND_RELEASE_START;
+                    auto_adjust_context_.state_start_time = current_time;
+                } else {
+                    // 未找到触摸，增加灵敏度
+                    auto_adjust_context_.current_sensitivity++;
+                    if (auto_adjust_context_.current_sensitivity > 255) {
+                        // 未找到触摸，恢复原始灵敏度并结束
+                        setSensitivity(auto_adjust_context_.device_addr, auto_adjust_context_.channel, 
+                                      auto_adjust_context_.original_sensitivity);
+                        auto_adjust_context_.active = false;
+                        return;
+                    }
+                    auto_adjust_context_.state = AutoAdjustState::FIND_TOUCH_START;
+                    auto_adjust_context_.state_start_time = current_time;
+                }
+            }
+            break;
+            
+        case AutoAdjustState::FIND_RELEASE_START:
+            // 设置当前灵敏度并开始等待稳定
+            setSensitivity(auto_adjust_context_.device_addr, auto_adjust_context_.channel, 
+                          auto_adjust_context_.current_sensitivity);
+            auto_adjust_context_.state = AutoAdjustState::FIND_RELEASE_WAIT;
+            auto_adjust_context_.state_start_time = current_time;
+            break;
+            
+        case AutoAdjustState::FIND_RELEASE_WAIT:
+            if (elapsed >= auto_adjust_context_.stabilize_duration) {
+                // 检查是否失去触摸
+                GTX312L_SampleResult result = device->sample_touch_data();
+                if (!(result.physical_addr.mask & (1 << auto_adjust_context_.channel))) {
+                    // 失去触摸，记录灵敏度
+                    auto_adjust_context_.touch_lost_sensitivity = auto_adjust_context_.current_sensitivity;
+                    auto_adjust_context_.state = AutoAdjustState::VERIFY_THRESHOLD;
+                    auto_adjust_context_.state_start_time = current_time;
+                } else {
+                    // 仍有触摸，减小灵敏度
+                    auto_adjust_context_.current_sensitivity--;
+                    if (auto_adjust_context_.current_sensitivity < 1) {
+                        // 无法找到释放点，使用中间值
+                        uint8_t middle_sensitivity = (auto_adjust_context_.touch_found_sensitivity + 1) / 2;
+                        setSensitivity(auto_adjust_context_.device_addr, auto_adjust_context_.channel, middle_sensitivity);
+                        auto_adjust_context_.active = false;
+                        return;
+                    }
+                    auto_adjust_context_.state = AutoAdjustState::FIND_RELEASE_START;
+                    auto_adjust_context_.state_start_time = current_time;
+                }
+            }
+            break;
+            
+        case AutoAdjustState::VERIFY_THRESHOLD:
+            // 验证临界点
+            {
+                uint8_t critical_sensitivity = auto_adjust_context_.touch_lost_sensitivity + 1;
+                setSensitivity(auto_adjust_context_.device_addr, auto_adjust_context_.channel, critical_sensitivity);
+                auto_adjust_context_.state = AutoAdjustState::COMPLETE;
+                auto_adjust_context_.state_start_time = current_time;
+            }
+            break;
+            
+        case AutoAdjustState::COMPLETE:
+            if (elapsed >= auto_adjust_context_.stabilize_duration) {
+                // 最终验证
+                GTX312L_SampleResult result = device->sample_touch_data();
+                uint8_t final_sensitivity;
+                
+                if (result.physical_addr.mask & (1 << auto_adjust_context_.channel)) {
+                    // 找到了临界点
+                    final_sensitivity = auto_adjust_context_.touch_lost_sensitivity + 1;
+                } else {
+                    // 需要使用中间值
+                    final_sensitivity = (auto_adjust_context_.touch_lost_sensitivity + auto_adjust_context_.touch_found_sensitivity) / 2;
+                }
+                
+                setSensitivity(auto_adjust_context_.device_addr, auto_adjust_context_.channel, final_sensitivity);
+                auto_adjust_context_.active = false;
+            }
+            break;
+            
+        default:
+            auto_adjust_context_.active = false;
+            break;
+    }
 }
 
-// 获取所有设备名称
-std::vector<std::string> InputManager::get_device_names() {
-    std::vector<std::string> names;
-    for (const auto& pair : devices_) {
-        names.push_back(pair.first);
+
+
+// 设置灵敏度
+void InputManager::setSensitivity(uint16_t device_addr, uint8_t channel, uint8_t sensitivity) {
+    if (channel >= 12) return;
+    
+    GTX312L_DeviceMapping* mapping = findDeviceMapping(device_addr);
+    if (mapping) {
+        mapping->sensitivity[channel] = sensitivity;
+        
+        // 应用到实际设备
+        for (auto* device : gtx312l_devices_) {
+            if (device->get_physical_device_address().get_device_mask() == device_addr) {
+                device->set_sensitivity(channel, sensitivity);
+                break;
+            }
+        }
     }
-    return names;
+}
+
+// 获取灵敏度
+uint8_t InputManager::getSensitivity(uint16_t device_addr, uint8_t channel) {
+    if (channel >= 12) return 15;
+    
+    GTX312L_DeviceMapping* mapping = findDeviceMapping(device_addr);
+    return mapping ? mapping->sensitivity[channel] : 15;
 }
 
 // 通过设备名称设置通道灵敏度
 bool InputManager::set_channel_sensitivity_by_name(const std::string& device_name, uint8_t channel, uint8_t sensitivity) {
-    if (sensitivity > 63) {
+    if (channel >= 12) return false;
+    
+    // 遍历所有设备找到匹配的设备名称
+    for (auto* device : gtx312l_devices_) {
+        if (device && device->get_device_name() == device_name) {
+            uint16_t device_addr = device->get_physical_device_address().get_device_mask();
+            setSensitivity(device_addr, channel, sensitivity);
+            return true;
+        }
+    }
+    return false;
+}
+
+// 设置Serial映射
+void InputManager::setSerialMapping(uint16_t device_addr, uint8_t channel, Mai2_TouchArea area) {
+    if (channel >= 12) return;
+    
+    GTX312L_DeviceMapping* mapping = findDeviceMapping(device_addr);
+    if (mapping) {
+        mapping->serial_area[channel] = area;
+    }
+}
+
+// 设置HID映射
+void InputManager::setHIDMapping(uint16_t device_addr, uint8_t channel, float x, float y) {
+    if (channel >= 12) return;
+    
+    GTX312L_DeviceMapping* mapping = findDeviceMapping(device_addr);
+    if (mapping) {
+        mapping->hid_area[channel] = TouchAxis(x, y);
+    }
+}
+
+// 获取Serial映射
+Mai2_TouchArea InputManager::getSerialMapping(uint16_t device_addr, uint8_t channel) {
+    if (channel >= 12) return MAI2_NO_USED;
+    
+    GTX312L_DeviceMapping* mapping = findDeviceMapping(device_addr);
+    return mapping ? mapping->serial_area[channel] : MAI2_NO_USED;
+}
+
+// 获取HID映射
+TouchAxis InputManager::getHIDMapping(uint16_t device_addr, uint8_t channel) {
+    if (channel >= 12) return TouchAxis();
+    
+    GTX312L_DeviceMapping* mapping = findDeviceMapping(device_addr);
+    return mapping ? mapping->hid_area[channel] : TouchAxis();
+}
+
+// 设置键盘映射
+void InputManager::setKeyboardMapping(uint16_t device_addr, uint8_t channel, HID_KeyCode key) {
+    if (channel >= 12) return;
+    
+    GTX312L_DeviceMapping* mapping = findDeviceMapping(device_addr);
+    if (mapping) {
+        mapping->keyboard_keys[channel] = key;
+    }
+}
+
+// 获取键盘映射
+HID_KeyCode InputManager::getKeyboardMapping(uint16_t device_addr, uint8_t channel) {
+    if (channel >= 12) return HID_KeyCode::KEY_NONE;
+    
+    GTX312L_DeviceMapping* mapping = findDeviceMapping(device_addr);
+    return mapping ? mapping->keyboard_keys[channel] : HID_KeyCode::KEY_NONE;
+}
+
+// 启用所有通道
+void InputManager::enableAllChannels() {
+    for (auto* device : gtx312l_devices_) {
+        for (uint8_t ch = 0; ch < 12; ch++) {
+            device->set_channel_enable(ch, true);
+        }
+    }
+}
+
+// 仅启用已映射的通道
+void InputManager::enableMappedChannels() {
+    InputManager_PrivateConfig* config = inputmanager_get_config_holder();
+    InputWorkMode work_mode = getWorkMode();
+    
+    for (int i = 0; i < config->device_count; i++) {
+        auto* device = gtx312l_devices_[i];
+        auto& mapping = config->device_mappings[i];
+        
+        for (uint8_t ch = 0; ch < 12; ch++) {
+            bool enabled = false;
+            
+            if (work_mode == InputWorkMode::SERIAL_MODE) {
+                enabled = (mapping.serial_area[ch] != MAI2_NO_USED);
+            } else if (work_mode == InputWorkMode::HID_MODE) {
+                enabled = (mapping.hid_area[ch].x != 0.0f || mapping.hid_area[ch].y != 0.0f);
+            }
+            
+            device->set_channel_enable(ch, enabled);
+        }
+    }
+}
+
+// 更新触摸状态
+inline void InputManager::updateTouchStates() {
+    InputManager_PrivateConfig* config = inputmanager_get_config_holder();
+    millis_t current_time = to_ms_since_boot(get_absolute_time());
+    
+    for (int i = 0; i < config->device_count; i++) {
+        auto* device = gtx312l_devices_[i];
+        
+        // 保存之前的状态
+        previous_touch_states_[i] = current_touch_states_[i];
+        
+        // 获取当前触摸状态，直接存储GTX312L_SampleResult
+        current_touch_states_[i] = device->sample_touch_data();
+        
+        // 增加采样计数器
+        incrementSampleCounter();
+        current_touch_states_[i].timestamp = current_time;
+    }
+}
+
+// 处理Serial模式
+inline void InputManager::processSerialMode() {
+    
+    Mai2Serial_TouchState touch_state;
+    touch_state.parts.state1 = 0;
+    touch_state.parts.state2 = 0;
+    
+    // 遍历所有设备和通道，基于设备地址掩码进行映射
+    for (int i = 0; i < config_->device_count; i++) {
+        uint16_t current = current_touch_states_[i].physical_addr.mask;
+        uint16_t previous = previous_touch_states_[i].physical_addr.mask;
+        uint16_t changed = current ^ previous;
+        
+        if (changed == 0) continue; // 没有变化
+        
+        // 根据设备地址掩码查找对应的映射配置
+        uint16_t device_addr = current_touch_states_[i].physical_addr.mask & 0xF000; // 获取设备地址
+        
+        // 查找匹配的设备映射
+        GTX312L_DeviceMapping* mapping = nullptr;
+        for (int j = 0; j < config_->device_count; j++) {
+            if ((config_->device_mappings[j].device_addr & 0xF000) == device_addr) {
+                mapping = &config_->device_mappings[j];
+                break;
+            }
+        }
+        
+        if (!mapping) continue; // 未找到匹配的映射
+        
+        for (uint8_t ch = 0; ch < 12; ch++) {
+            if (!(changed & (1 << ch))) continue; // 该通道没有变化
+            
+            Mai2_TouchArea area = mapping->serial_area[ch];
+            if (area == MAI2_NO_USED) continue;
+            
+            bool touched = (current & (1 << ch)) != 0;
+            
+            // 设置对应区域的状态
+            if (area >= 1 && area <= 34) {
+                uint8_t bit_index = area - 1;
+                if (bit_index < 32) {
+                    if (touched) {
+                        touch_state.parts.state1 |= (1UL << bit_index);
+                    } else {
+                        touch_state.parts.state1 &= ~(1UL << bit_index);
+                    }
+                } else {
+                    bit_index -= 32;
+                    if (touched) {
+                        touch_state.parts.state2 |= (1 << bit_index);
+                    } else {
+                        touch_state.parts.state2 &= ~(1 << bit_index);
+                    }
+                }
+            }
+        }
+    }
+    
+    // Serial模式下：只发送Serial数据，HID触摸发送直接失效
+    if (mai2_serial_) {
+        mai2_serial_->send_touch_state(touch_state.parts.state1, touch_state.parts.state2);
+    }
+    
+    // 在Serial模式下，如果绑区完成且有键盘映射，同时发送HID键盘数据
+    if (isAutoSerialBindingComplete() && hid_) {
+        sendSerialToHIDKeyboardData();
+    }
+}
+
+// 处理HID模式
+inline void InputManager::processHIDMode() {
+    // HID模式下：串口直接失效，只处理HID触摸数据
+    // HID模式的具体处理在sendHIDTouchData中完成
+    // 在此模式下，mai2_serial_不会被调用，确保串口失效
+}
+
+// 发送HID触摸数据
+inline void InputManager::sendHIDTouchData() {
+    InputManager_PrivateConfig* config = inputmanager_get_config_holder();
+    
+    HID_TouchReport touch_report = {};
+    
+    uint8_t point_count = 0;
+    
+    // 遍历所有设备和通道，基于设备地址掩码进行映射
+    for (int i = 0; i < config->device_count && point_count < 10; i++) {
+        uint16_t current = current_touch_states_[i].physical_addr.mask;
+        
+        // 根据设备地址掩码查找对应的映射配置
+        uint16_t device_addr = current_touch_states_[i].physical_addr.mask & 0xF000; // 获取设备地址
+        
+        // 查找匹配的设备映射
+        GTX312L_DeviceMapping* mapping = nullptr;
+        for (int j = 0; j < config->device_count; j++) {
+            if ((config->device_mappings[j].device_addr & 0xF000) == device_addr) {
+                mapping = &config->device_mappings[j];
+                break;
+            }
+        }
+        
+        if (!mapping) continue; // 未找到匹配的映射
+        
+        for (uint8_t ch = 0; ch < 12 && point_count < 10; ch++) {
+            if (!(current & (1 << ch))) continue; // 该通道未触摸
+            
+            TouchAxis axis = mapping->hid_area[ch];
+            if (axis.x == 0.0f && axis.y == 0.0f) continue; // 未映射
+            
+            // 添加触摸点
+            touch_report.contacts[point_count].x = (uint16_t)(axis.x * 65535.0f);
+            touch_report.contacts[point_count].y = (uint16_t)(axis.y * 65535.0f);
+            touch_report.contacts[point_count].tip_switch = 1;
+            touch_report.contacts[point_count].contact_id = point_count;
+            point_count++;
+        }
+    }
+    
+    touch_report.contact_count = point_count;
+    
+    // 发送HID报告
+    if (hid_) {
+        hid_->send_touch_report(touch_report);
+    }
+}
+
+// 在Serial模式下发送HID触摸数据
+void InputManager::sendSerialToHIDKeyboardData() {
+    if (!hid_) return;
+    
+    InputManager_PrivateConfig* config = inputmanager_get_config_holder();
+    
+    // 遍历所有设备和通道，检测触摸状态变化
+    for (int i = 0; i < config->device_count; i++) {
+        uint16_t current = current_touch_states_[i].physical_addr.mask;
+        uint16_t previous = previous_touch_states_[i].physical_addr.mask;
+        uint16_t changed = current ^ previous;
+        
+        if (changed == 0) continue; // 没有变化
+        
+        // 根据设备地址掩码查找对应的映射配置
+        uint16_t device_addr = current_touch_states_[i].physical_addr.mask & 0xF000;
+        
+        // 查找匹配的设备映射
+        GTX312L_DeviceMapping* mapping = nullptr;
+        for (int j = 0; j < config->device_count; j++) {
+            if ((config->device_mappings[j].device_addr & 0xF000) == device_addr) {
+                mapping = &config->device_mappings[j];
+                break;
+            }
+        }
+        
+        if (!mapping) continue; // 未找到匹配的映射
+        
+        for (uint8_t ch = 0; ch < 12; ch++) {
+            if (!(changed & (1 << ch))) continue; // 该通道没有变化
+            
+            // 检查是否有键盘按键映射（Serial逻辑分区绑定到HID键盘按键）
+            if (mapping->keyboard_keys[ch] != HID_KeyCode::KEY_NONE) {
+                bool pressed = (current & (1 << ch)) != 0;
+                
+                // 发送HID键盘事件
+                if (pressed) {
+                    hid_->press_key(mapping->keyboard_keys[ch]);
+                } else {
+                    hid_->release_key(mapping->keyboard_keys[ch]);
+                }
+            }
+        }
+    }
+}
+
+// 查找设备索引
+int InputManager::findDeviceIndex(uint16_t device_addr) {
+    InputManager_PrivateConfig* config = inputmanager_get_config_holder();
+    
+    for (int i = 0; i < config->device_count; i++) {
+        if (config->device_mappings[i].device_addr == device_addr) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+// 查找设备映射
+GTX312L_DeviceMapping* InputManager::findDeviceMapping(uint16_t device_addr) {
+    InputManager_PrivateConfig* config = inputmanager_get_config_holder();
+    int index = findDeviceIndex(device_addr);
+    return (index >= 0) ? &config->device_mappings[index] : nullptr;
+}
+
+
+
+// 静态配置变量
+static InputManager_PrivateConfig static_config_;
+
+// 纯公开函数实现
+InputManager_PrivateConfig* inputmanager_get_config_holder() {
+    return &static_config_;
+}
+
+bool inputmanager_load_config_from_manager() {
+    ConfigManager* config_mgr = ConfigManager::getInstance();
+    if (!config_mgr) {
         return false;
     }
     
-    auto it = devices_.find(device_name);
-    if (it != devices_.end() && it->second.device) {
-        bool result = it->second.device->set_channel_sensitivity(channel, sensitivity);
-        if (result) {
-            log_debug("Device " + device_name + " channel " + std::to_string(channel) + " sensitivity set to " + std::to_string(sensitivity));
+    // 从ConfigManager加载配置项到静态配置
+    bool success = true;
+    
+    // 加载工作模式
+    uint8_t mode_value = 0;
+    if (config_mgr->get_uint8(INPUTMANAGER_WORK_MODE, mode_value)) {
+        static_config_.work_mode = static_cast<InputWorkMode>(mode_value);
+    }
+    
+    // 加载触摸键盘映射配置
+    uint8_t touch_enabled = 0;
+    if (config_mgr->get_uint8("input_manager_touch_keyboard_enabled", touch_enabled)) {
+        static_config_.touch_keyboard_enabled = (touch_enabled != 0);
+    }
+    
+    uint8_t touch_mode = 0;
+    if (config_mgr->get_uint8("input_manager_touch_keyboard_mode", touch_mode)) {
+        static_config_.touch_keyboard_mode = static_cast<TouchKeyboardMode>(touch_mode);
+    }
+    
+    // 加载设备映射
+    std::vector<uint8_t> config_data;
+    if (config_mgr->get_binary(INPUTMANAGER_GTX312L_DEVICES, config_data)) {
+        if (config_data.size() == sizeof(InputManager_PrivateConfig)) {
+            std::memcpy(&static_config_, config_data.data(), sizeof(InputManager_PrivateConfig));
+        } else {
+            success = false;
         }
-        return result;
     }
     
-    return false;
+    return success;
 }
 
-// 通过设备名称获取通道灵敏度
-bool InputManager::get_channel_sensitivity_by_name(const std::string& device_name, uint8_t channel, uint8_t& sensitivity) {
-    auto it = devices_.find(device_name);
-    if (it != devices_.end() && it->second.device) {
-        return it->second.device->get_channel_sensitivity(channel, sensitivity);
-    }
+// UI专用接口实现
+void InputManager::get_all_device_status(TouchDeviceStatus data[8], int& device_count) {
+    InputManager_PrivateConfig* config = inputmanager_get_config_holder();
+    device_count = config->device_count;
     
-    return false;
+    for (int i = 0; i < device_count && i < 8; i++) {
+        // 复制设备映射配置
+        data[i].device = config->device_mappings[i];
+        
+        // 获取当前触摸状态
+        data[i].touch_states = previous_touch_states_[i].physical_addr.mask;
+        
+        // 设置连接状态（假设所有配置的设备都已连接）
+        data[i].is_connected = true;
+        
+        // 生成设备名称（16位地址转换为HEX）
+        uint16_t device_addr = data[i].device.device_addr;
+        char hex_name[8];
+        snprintf(hex_name, sizeof(hex_name), "%04X", device_addr);
+        data[i].device_name = std::string(hex_name);
+    }
 }
 
-// 通过设备名称获取通道触摸状态
-bool InputManager::get_channel_touch_state_by_name(const std::string& device_name, uint8_t channel, bool& pressed, uint8_t& pressure) {
-    auto it = devices_.find(device_name);
-    if (it != devices_.end() && it->second.device) {
-        // 这里需要根据GTX312L的实际API来实现
-        // 假设有get_channel_touch_state方法
-        return it->second.device->get_channel_touch_state(channel, pressed, pressure);
+InputManager_PrivateConfig inputmanager_get_config_copy() {
+    return static_config_;
+}
+
+bool inputmanager_write_config_to_manager(const InputManager_PrivateConfig& config) {
+    ConfigManager* config_mgr = ConfigManager::getInstance();
+    if (!config_mgr) {
+        return false;
     }
     
-    return false;
+    // 将配置写入ConfigManager
+    bool success = true;
+    
+    success &= config_mgr->set_uint8(INPUTMANAGER_WORK_MODE, static_cast<uint8_t>(config.work_mode));
+    
+    // 保存触摸键盘映射配置
+    success &= config_mgr->set_uint8("input_manager_touch_keyboard_enabled", config.touch_keyboard_enabled ? 1 : 0);
+    success &= config_mgr->set_uint8("input_manager_touch_keyboard_mode", static_cast<uint8_t>(config.touch_keyboard_mode));
+    
+    std::vector<uint8_t> config_data(sizeof(InputManager_PrivateConfig));
+    std::memcpy(config_data.data(), &config, sizeof(InputManager_PrivateConfig));
+    success &= config_mgr->set_binary(INPUTMANAGER_GTX312L_DEVICES, config_data);
+    
+    if (success) {
+        success &= config_mgr->save_all_configs();
+        // 更新静态配置
+        static_config_ = config;
+    }
+    
+    return success;
+}
+
+// Serial绑定顺序定义
+
+
+// 绑定处理主函数
+void InputManager::processBinding() {
+    uint32_t current_time = to_ms_since_boot(get_absolute_time());
+    
+    // 检查超时
+    if (current_time - binding_start_time_ > binding_timeout_ms_) {
+        if (binding_callback_) {
+            binding_callback_(false, "Binding timeout");
+        }
+        cancelBinding();
+        return;
+    }
+    
+    // 根据绑定状态处理
+    switch (binding_state_) {
+        case BindingState::SERIAL_BINDING_INIT:
+        case BindingState::SERIAL_BINDING_WAIT_TOUCH:
+        case BindingState::SERIAL_BINDING_PROCESSING:
+        case BindingState::SERIAL_BINDING_COMPLETE:
+            processSerialBinding();
+            break;
+            
+        case BindingState::HID_BINDING_INIT:
+        case BindingState::HID_BINDING_WAIT_TOUCH:
+        case BindingState::HID_BINDING_SET_COORDS:
+        case BindingState::HID_BINDING_COMPLETE:
+            processHIDBinding();
+            break;
+            
+        case BindingState::AUTO_SERIAL_BINDING_INIT:
+        case BindingState::AUTO_SERIAL_BINDING_SCAN:
+        case BindingState::AUTO_SERIAL_BINDING_WAIT:
+        case BindingState::AUTO_SERIAL_BINDING_COMPLETE:
+            processAutoSerialBinding();
+            break;
+            
+        default:
+            break;
+    }
+}
+
+// 获取Serial绑定区域的辅助函数
+static Mai2_TouchArea getSerialBindingArea(uint8_t index) {
+    // Mai2_TouchArea枚举是连续的，从MAI2_AREA_A1=1开始到MAI2_AREA_E8=34
+    if (index < 34) {
+        return static_cast<Mai2_TouchArea>(MAI2_AREA_A1 + index);
+    }
+    return MAI2_NO_USED;
+}
+
+// Serial绑定处理
+void InputManager::processSerialBinding() {
+    switch (binding_state_) {
+        case BindingState::SERIAL_BINDING_INIT:
+            // 发送当前要绑定区域的mai2消息
+            if (current_binding_index_ < 34) {
+                Mai2_TouchArea current_area = getSerialBindingArea(current_binding_index_);
+                sendMai2TouchMessage(current_area);
+                binding_state_ = BindingState::SERIAL_BINDING_WAIT_TOUCH;
+                
+                // 通知UI显示当前绑定区域
+                if (binding_callback_) {
+                    char message[64];
+                    snprintf(message, sizeof(message), "Please touch %s area", getMai2AreaName(current_area));
+                    binding_callback_(true, message);
+                }
+                
+                // 通过UI管理器显示绑定状态
+                 if (ui_manager_) {
+                     char message[64];
+                     snprintf(message, sizeof(message), "绑定区域: %s (%d/34)", getMai2AreaName(current_area), current_binding_index_ + 1);
+                     ui_manager_->show_binding_status(message, false);
+                     ui_manager_->update_binding_progress(current_binding_index_ + 1, "Serial绑定进行中");
+                 }
+            } else {
+                // 所有区域绑定完成
+                binding_state_ = BindingState::SERIAL_BINDING_COMPLETE;
+            }
+            break;
+            
+        case BindingState::SERIAL_BINDING_WAIT_TOUCH:
+            // 检测触摸输入
+            for (size_t dev_idx = 0; dev_idx < gtx312l_devices_.size(); dev_idx++) {
+                uint16_t current_state = current_touch_states_[dev_idx].physical_addr.mask;
+                uint16_t previous_state = previous_touch_states_[dev_idx].physical_addr.mask;
+                uint16_t new_touches = current_state & ~previous_state;
+                
+                if (new_touches != 0) {
+                    // 找到第一个新触摸的通道
+                    for (uint8_t ch = 0; ch < 12; ch++) {
+                        if (new_touches & (1 << ch)) {
+                            // 绑定当前区域到这个通道
+                            Mai2_TouchArea current_area = getSerialBindingArea(current_binding_index_);
+                            uint16_t device_addr = gtx312l_devices_[dev_idx]->get_physical_device_address().get_device_mask();
+                            setSerialMapping(device_addr, ch, current_area);
+                            
+                            // 禁用这个通道以避免重复触发
+                            GTX312L_DeviceMapping* mapping = findDeviceMapping(device_addr);
+                            if (mapping) {
+                                mapping->CH_available[ch] = 0;
+                                gtx312l_devices_[dev_idx]->set_channel_enable(ch, false);
+                            }
+                            
+                            // 进入下一个区域绑定
+                            current_binding_index_++;
+                            binding_state_ = BindingState::SERIAL_BINDING_INIT;
+                            return;
+                        }
+                    }
+                }
+            }
+            break;
+            
+        case BindingState::SERIAL_BINDING_COMPLETE:
+            // 保存配置并完成绑定
+            {
+                InputManager_PrivateConfig* config = inputmanager_get_config_holder();
+                inputmanager_write_config_to_manager(*config);
+                
+                if (binding_callback_) {
+                    binding_callback_(true, "Serial binding completed successfully");
+                }
+                
+                // 清除UI绑定状态
+                if (ui_manager_) {
+                    ui_manager_->clear_binding_status();
+                }
+                
+                // 恢复原始通道状态
+                restoreChannelStates();
+                
+                // 重置绑定状态
+                binding_active_ = false;
+                binding_callback_ = nullptr;
+                binding_state_ = BindingState::IDLE;
+            }
+            break;
+            
+        default:
+            break;
+    }
+}
+
+// 自动Serial绑定处理
+void InputManager::processAutoSerialBinding() {
+    uint32_t current_time = to_ms_since_boot(get_absolute_time());
+    
+    switch (binding_state_) {
+        case BindingState::AUTO_SERIAL_BINDING_INIT:
+            // 开始扫描所有触摸输入
+            binding_state_ = BindingState::AUTO_SERIAL_BINDING_SCAN;
+            
+            if (binding_callback_) {
+                binding_callback_(true, "开始扫描触摸输入，请按顺序触摸所有区域");
+            }
+            
+            // 通过UI管理器显示扫描状态
+            if (ui_manager_) {
+                ui_manager_->show_binding_status("扫描模式：请按顺序触摸所有区域", false);
+                ui_manager_->update_guided_binding_progress(0, "开始扫描触摸输入");
+            }
+            break;
+            
+        case BindingState::AUTO_SERIAL_BINDING_SCAN:
+            // 检测触摸输入并自动分配
+            {
+                bool touch_detected = false;
+                
+                // 检查所有设备的触摸状态
+                for (size_t dev_idx = 0; dev_idx < gtx312l_devices_.size(); dev_idx++) {
+                    uint16_t current_state = current_touch_states_[dev_idx].physical_addr.mask;
+                    uint16_t previous_state = previous_touch_states_[dev_idx].physical_addr.mask;
+                    uint16_t new_touches = current_state & ~previous_state;
+                    
+                    if (new_touches != 0) {
+                        // 找到第一个新触摸的通道
+                        for (uint8_t ch = 0; ch < 12; ch++) {
+                            if (new_touches & (1 << ch)) {
+                                // 获取设备地址
+                                uint16_t device_addr = gtx312l_devices_[dev_idx]->get_physical_device_address().get_device_mask();
+                                
+                                // 检查这个通道是否已经被绑定
+                                Mai2_TouchArea existing_area = getSerialMapping(device_addr, ch);
+                                if (existing_area == MAI2_NO_USED && current_binding_index_ < 34) {
+                                    // 自动分配下一个可用的Mai2区域
+                                    Mai2_TouchArea target_area = getSerialBindingArea(current_binding_index_);
+                                    setSerialMapping(device_addr, ch, target_area);
+                                    
+                                    current_binding_index_++;
+                                    touch_detected = true;
+                                    
+                                    // 更新UI显示
+                                    if (ui_manager_) {
+                                        char message[128];
+                                        snprintf(message, sizeof(message), "检测到触摸：设备%04X 通道%d -> %s", 
+                                                device_addr, ch, getMai2AreaName(target_area));
+                                        ui_manager_->show_binding_status(message, false);
+                                        ui_manager_->update_guided_binding_progress(current_binding_index_, "自动绑定进行中");
+                                    }
+                                    
+                                    if (binding_callback_) {
+                                        char message[128];
+                                        snprintf(message, sizeof(message), "绑定成功：%s (%d/34)", 
+                                                getMai2AreaName(target_area), current_binding_index_);
+                                        binding_callback_(true, message);
+                                    }
+                                    
+                                    // 如果所有区域都已绑定，进入等待确认状态
+                                    if (current_binding_index_ >= 34) {
+                                        binding_state_ = BindingState::AUTO_SERIAL_BINDING_WAIT;
+                                        
+                                        if (ui_manager_) {
+                                            ui_manager_->show_binding_status("自动绑定完成，请确认", true);
+                                        }
+                                        
+                                        if (binding_callback_) {
+                                            binding_callback_(true, "自动绑定完成，请确认保存");
+                                        }
+                                    }
+                                    
+                                    break;
+                                }
+                            }
+                        }
+                        
+                        if (touch_detected) break;
+                    }
+                }
+            }
+            break;
+            
+        case BindingState::AUTO_SERIAL_BINDING_WAIT:
+            // 等待用户确认或超时
+            if (current_time - binding_start_time_ > binding_timeout_ms_) {
+                // 超时自动保存
+                binding_state_ = BindingState::AUTO_SERIAL_BINDING_COMPLETE;
+            }
+            // 用户可以通过UI确认或取消
+            break;
+            
+        case BindingState::AUTO_SERIAL_BINDING_COMPLETE:
+            // 保存配置并完成绑定
+            {
+                InputManager_PrivateConfig* config = inputmanager_get_config_holder();
+                inputmanager_write_config_to_manager(*config);
+                
+                if (binding_callback_) {
+                    char message[64];
+                    snprintf(message, sizeof(message), "自动绑定完成，共绑定%d个区域", current_binding_index_);
+                    binding_callback_(true, message);
+                }
+                
+                // 清除UI绑定状态
+                if (ui_manager_) {
+                    ui_manager_->clear_binding_status();
+                }
+                
+                // 恢复原始通道状态
+                restoreChannelStates();
+                
+                // 重置绑定状态
+                binding_active_ = false;
+                binding_callback_ = nullptr;
+                binding_state_ = BindingState::IDLE;
+            }
+            break;
+            
+        default:
+            break;
+    }
+}
+
+// HID绑定处理
+void InputManager::processHIDBinding() {
+    uint32_t current_time = to_ms_since_boot(get_absolute_time());
+    
+    switch (binding_state_) {
+        case BindingState::HID_BINDING_INIT:
+            binding_state_ = BindingState::HID_BINDING_WAIT_TOUCH;
+            if (binding_callback_) {
+                binding_callback_(false, "开始HID绑定，请按下要绑定的区域");
+            }
+            
+            // 通过UI管理器显示HID绑定状态
+             if (ui_manager_) {
+                 ui_manager_->show_binding_status("等待触摸输入...", false);
+             }
+            break;
+            
+        case BindingState::HID_BINDING_WAIT_TOUCH:
+            // 检查超时
+            if (current_time - binding_start_time_ > binding_timeout_ms_) {
+                if (binding_callback_) {
+                    binding_callback_(false, "HID绑定超时");
+                }
+                cancelBinding();
+                return;
+            }
+            
+            // 检测触摸输入
+            for (size_t dev_idx = 0; dev_idx < gtx312l_devices_.size(); dev_idx++) {
+                uint16_t current_state = current_touch_states_[dev_idx].physical_addr.mask;
+                uint16_t previous_state = previous_touch_states_[dev_idx].physical_addr.mask;
+                uint16_t new_touches = current_state & ~previous_state;
+                
+                if (new_touches != 0) {
+                    // 找到第一个新触摸的通道
+                    for (uint8_t ch = 0; ch < 12; ch++) {
+                        if (new_touches & (1 << ch)) {
+                            hid_binding_device_addr_ = gtx312l_devices_[dev_idx]->get_physical_device_address().get_device_mask();
+                            hid_binding_channel_ = ch;
+                            hid_binding_x_ = 0.5f;  // 默认中心坐标
+                            hid_binding_y_ = 0.5f;
+                            binding_state_ = BindingState::HID_BINDING_SET_COORDS;
+                            
+                            if (binding_callback_) {
+                                char message[128];
+                                snprintf(message, sizeof(message), "检测到触摸点位，设备:0x%04X 通道:%d，请在屏幕上设置X Y坐标", 
+                                        hid_binding_device_addr_, ch);
+                                binding_callback_(false, message);
+                            }
+                            
+                            // 通过UI管理器显示坐标设置界面
+                             if (ui_manager_) {
+                                 char message[64];
+                                 snprintf(message, sizeof(message), "设置坐标 - 设备:0x%04X 通道:%d", hid_binding_device_addr_, ch);
+                                 ui_manager_->show_binding_status(message, false);
+                             }
+                            return;
+                        }
+                    }
+                }
+            }
+            break;
+            
+        case BindingState::HID_BINDING_SET_COORDS:
+            // 实时发送HID触摸数据，坐标跟随当前设置
+            if (hid_) {
+                // 构造HID触摸报告
+                HID_TouchReport touch_report;
+                touch_report.contact_count = 1;
+                touch_report.contacts[0].contact_id = 1;
+                touch_report.contacts[0].tip_switch = 1;
+                touch_report.contacts[0].x = (uint16_t)(hid_binding_x_ * 32767);
+                touch_report.contacts[0].y = (uint16_t)(hid_binding_y_ * 32767);
+                
+                // 发送HID报告
+                hid_->send_touch_report(touch_report);
+            }
+            
+            // 检查是否有新的坐标设置或确认绑定的信号
+            // 这里需要UI层调用setHIDCoordinates方法来更新坐标
+            // 或者调用confirmHIDBinding来确认绑定
+            break;
+            
+        case BindingState::HID_BINDING_COMPLETE:
+            // 保存绑定结果
+            setHIDMapping(hid_binding_device_addr_, hid_binding_channel_, hid_binding_x_, hid_binding_y_);
+            
+            // 保存配置并完成绑定
+            {
+                InputManager_PrivateConfig* config = inputmanager_get_config_holder();
+                inputmanager_write_config_to_manager(*config);
+                
+                if (binding_callback_) {
+                    char message[128];
+                    snprintf(message, sizeof(message), "HID绑定完成，坐标:(%.2f,%.2f)", hid_binding_x_, hid_binding_y_);
+                    binding_callback_(true, message);
+                }
+                
+                // 清除UI绑定状态
+                if (ui_manager_) {
+                    ui_manager_->clear_binding_status();
+                }
+                
+                // 恢复原始通道状态
+                restoreChannelStates();
+                
+                // 重置绑定状态
+                binding_active_ = false;
+                binding_callback_ = nullptr;
+                binding_state_ = BindingState::IDLE;
+            }
+            break;
+            
+        default:
+            break;
+    }
+}
+
+// 备份通道状态
+void InputManager::backupChannelStates() {
+    InputManager_PrivateConfig* config = inputmanager_get_config_holder();
+    for (uint8_t i = 0; i < config->device_count && i < 8; i++) {
+        for (uint8_t ch = 0; ch < 12; ch++) {
+            original_channels_backup_[i][ch] = config->device_mappings[i].CH_available[ch];
+        }
+    }
+}
+
+// 恢复通道状态
+void InputManager::restoreChannelStates() {
+    InputManager_PrivateConfig* config = inputmanager_get_config_holder();
+    for (uint8_t i = 0; i < config->device_count && i < 8; i++) {
+        for (uint8_t ch = 0; ch < 12; ch++) {
+            config->device_mappings[i].CH_available[ch] = original_channels_backup_[i][ch];
+            
+            // 更新硬件设备状态
+            if (i < gtx312l_devices_.size()) {
+                gtx312l_devices_[i]->set_channel_enable(ch, original_channels_backup_[i][ch]);
+            }
+        }
+    }
+}
+
+
+
+// 发送Mai2触摸消息
+void InputManager::sendMai2TouchMessage(Mai2_TouchArea area) {
+    if (mai2_serial_) {
+        // 创建触摸状态，只设置指定区域为触摸状态
+        Mai2Serial_TouchState touch_state;
+        touch_state.parts.state1 = 0;
+        touch_state.parts.state2 = 0;
+        
+        // 设置对应区域的状态
+        if (area >= 1 && area <= 34) {
+            uint8_t bit_index = area - 1;
+            if (bit_index < 32) {
+                touch_state.parts.state1 |= (1UL << bit_index);
+            } else {
+                bit_index -= 32;
+                touch_state.parts.state2 |= (1 << bit_index);
+            }
+        }
+        
+        // 发送触摸状态
+         mai2_serial_->send_touch_state(touch_state.parts.state1, touch_state.parts.state2);
+    }
+}
+
+// 获取Mai2区域名称
+const char* InputManager::getMai2AreaName(Mai2_TouchArea area) {
+    if (area >= MAI2_NO_USED && area <= MAI2_AREA_E8) {
+        return mai2_area_names[area];
+    }
+    return "UNKNOWN";
+}
+
+// GPIO键盘处理方法实现
+void InputManager::updateGPIOStates() {
+    // 保存上一次状态
+    mcu_gpio_previous_states_ = mcu_gpio_states_;
+    mcp_gpio_previous_states_ = mcp_gpio_states_;
+    
+    // 读取MCU GPIO状态 - 读取所有GPIO引脚状态
+    mcu_gpio_states_ = 0;
+    for (uint8_t pin = 0; pin < 30; pin++) {
+        if (gpio_get(pin)) {
+            mcu_gpio_states_ |= (1ULL << pin);
+        }
+    }
+    
+    // 读取MCP23S17 GPIO状态
+    if (mcp23s17_available_ && mcp23s17_) {
+        mcp23s17_->read_all_gpio(mcp_gpio_states_);
+    }
+}
+
+void InputManager::processGPIOKeyboard() {
+    // 处理物理键盘映射
+    for (const auto& mapping : config_->physical_keyboard_mappings) {
+        uint8_t gpio_pin = mapping.gpio;
+        bool current_state = false;
+        bool previous_state = false;
+        
+        if (is_mcu_gpio(gpio_pin)) {
+            uint8_t pin_num = get_gpio_pin_number(gpio_pin);
+            current_state = !(mcu_gpio_states_ & (1ULL << pin_num)); // 低电平有效
+            previous_state = !(mcu_gpio_previous_states_ & (1ULL << pin_num));
+        } else if (is_mcp_gpio(gpio_pin)) {
+            uint8_t pin_num = get_gpio_pin_number(gpio_pin);
+            if (pin_num <= 8) { // PORTA
+                current_state = !(mcp_gpio_states_.port_a & (1 << (pin_num - 1)));
+                previous_state = !(mcp_gpio_previous_states_.port_a & (1 << (pin_num - 1)));
+            } else { // PORTB
+                current_state = !(mcp_gpio_states_.port_b & (1 << (pin_num - 9)));
+                previous_state = !(mcp_gpio_previous_states_.port_b & (1 << (pin_num - 9)));
+            }
+        }
+        
+        // 检测状态变化并发送按键事件
+        if (current_state != previous_state) {
+            if (current_state) {
+                // 按键按下 - 发送默认按键和逻辑映射按键
+                if (mapping.default_key != HID_KeyCode::KEY_NONE && hid_) {
+                    hid_->press_key(mapping.default_key);
+                }
+                sendLogicalKeys(gpio_pin, true);
+            } else {
+                // 按键释放
+                if (mapping.default_key != HID_KeyCode::KEY_NONE && hid_) {
+                    hid_->release_key(mapping.default_key);
+                }
+                sendLogicalKeys(gpio_pin, false);
+            }
+        }
+    }
+}
+
+void InputManager::processTouchKeyboard() {
+    if (!config_->touch_keyboard_enabled) return;
+    
+    // 检查A1-A8触摸区域
+    for (int i = 0; i < config_->device_count; i++) {
+        uint16_t current = current_touch_states_[i].physical_addr.mask;
+        uint16_t previous = previous_touch_states_[i].physical_addr.mask;
+        uint16_t changed = current ^ previous;
+        
+        if (changed == 0) continue;
+        
+        // 查找A1-A8区域的映射
+        GTX312L_DeviceMapping* mapping = findDeviceMapping(current_touch_states_[i].physical_addr.mask & 0xF000);
+        if (!mapping) continue;
+        
+        for (uint8_t ch = 0; ch < 8; ch++) { // 只处理A1-A8
+            if (!(changed & (1 << ch))) continue;
+            
+            bool pressed = (current & (1 << ch)) != 0;
+            
+            // 根据触摸键盘模式处理
+            switch (config_->touch_keyboard_mode) {
+                case TouchKeyboardMode::KEY_ONLY:
+                case TouchKeyboardMode::BOTH:
+                    // 只发送键盘事件，不发送触摸事件
+                    if (pressed && hid_) {
+                        hid_->press_key(TOUCH_KEYBOARD_KEY);
+                    } else if (hid_) {
+                        hid_->release_key(TOUCH_KEYBOARD_KEY);
+                    }
+                    break;
+                    
+                case TouchKeyboardMode::TOUCH_ONLY:
+                    // 只发送触摸事件，键盘事件由正常流程处理
+                    break;
+            }
+        }
+    }
+}
+
+bool InputManager::readMCUGPIO(uint8_t pin, bool& value) {
+    if (pin >= 30) { // RP2040有30个GPIO引脚
+        return false;
+    }
+    
+    value = gpio_get(pin);
+    return true;
+}
+
+bool InputManager::readMCPGPIO(uint8_t pin, bool& value) {
+    if (!mcp23s17_available_ || pin >= 16) { // MCP23S17有16个GPIO引脚
+        return false;
+    }
+    
+    // 将pin转换为port和pin_num
+    MCP23S17_Port port;
+    uint8_t pin_num;
+    
+    if (pin < 8) {
+        port = MCP23S17_PORT_A;
+        pin_num = pin;
+    } else {
+        port = MCP23S17_PORT_B;
+        pin_num = pin - 8;
+    }
+    
+    return mcp23s17_->read_pin(port, pin_num, value);
+}
+
+void InputManager::sendLogicalKeys(uint8_t gpio_pin, bool pressed) {
+    // 查找该GPIO的逻辑按键映射
+    for (const auto& mapping : config_->logical_key_mappings) {
+        if (mapping.gpio_id == gpio_pin) {
+            for (int i = 0; i < 3; i++) {
+                if (mapping.keys[i] != HID_KeyCode::KEY_NONE && hid_) {
+                    if (pressed) {
+                        hid_->press_key(mapping.keys[i]);
+                    } else {
+                        hid_->release_key(mapping.keys[i]);
+                    }
+                }
+            }
+            break;
+        }
+    }
+}
+
+// 获取触摸IC采样速率
+uint8_t InputManager::getTouchSampleRate(uint16_t device_addr) {
+    // 返回实际测量的采样频率
+    return static_cast<uint8_t>(current_sample_rate_);
+}
+
+void InputManager::incrementSampleCounter() {
+    sample_counter_++;
+    
+    // 检查是否需要重置计数器（每秒一次）
+    uint32_t current_time = to_ms_since_boot(get_absolute_time());
+    if (current_time - last_reset_time_ >= 1000) {
+        current_sample_rate_ = sample_counter_;
+        sample_counter_ = 0;
+        last_reset_time_ = current_time;
+    }
+}
+
+void InputManager::resetSampleCounter() {
+    sample_counter_ = 0;
+    current_sample_rate_ = 0;
+    last_reset_time_ = to_ms_since_boot(get_absolute_time());
+}
+
+// 获取HID键盘回报速率
+uint8_t InputManager::getHIDReportRate() {
+    if (hid_) {
+        HID_Config config;
+        if (hid_->get_config(config)) {
+            // 返回回报间隔的倒数作为回报速率 (Hz)
+            if (config.report_interval_ms > 0) {
+                return 1000 / config.report_interval_ms;
+            }
+        }
+    }
+    return 0; // HID未初始化或配置无效
+}
+
+// 获取物理键盘映射列表
+const std::vector<PhysicalKeyboardMapping>& InputManager::getPhysicalKeyboards() const {
+    return config_->physical_keyboard_mappings;
+}
+
+// 清除所有逻辑按键映射
+void InputManager::clearAllLogicalKeyMappings() {
+    config_->logical_key_mappings.clear();
+    inputmanager_write_config_to_manager(*config_);
+}
+
+// 获取逻辑按键映射列表
+const std::vector<LogicalKeyMapping>& InputManager::getLogicalKeyMappings() const {
+    return config_->logical_key_mappings;
 }

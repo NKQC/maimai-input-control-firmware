@@ -91,7 +91,7 @@
  *                                    -> 不要在Loop中进行任何额外的操作和检查 所有异常使用惰性处理 除非抛出异常否则完全不检查 不要设置轮询周期 直接最大化速度轮询和处理 所有操作直接直通 以最简化和最高速率完成 
  *                                    -> 提供Loop0接口(运行在CPU0上的loop) (读取原始分区触发bitmap -> 映射到逻辑区 -> 模式切换([Serial模式](传递给Mai2Light -> 调用Mai2Light的Loop 处理UART消息) / [HID模式](将触摸映射Bitmap发送到FIFO跨核心传输)))
  *                                    -> 提供Loop1接口(运行在CPU1上的loop) (读取MCP23S17数据 -> 映射到键盘逻辑区 -> 映射到HID_KEYBOARD / [如果使用HID模式](接收触摸Bitmap 映射到预先设置好的点位坐标))
- *                                    -> 提供一个自动触摸灵敏度调整接口 在映射完成后可用 自动校准灵敏度 (在调用前会完成:将一个导电模块悬浮在要调整的区域触摸区域上方指定高度 调用时需要完成: 逐级增大灵敏度(每次调整都需要重新校准 后面不再赘述) 直到可以感应到触摸 并记录下当前灵敏度 随后逐级缩小灵敏度 直到找到失去触摸的灵敏度 随后再逐级增大灵敏度 一旦发现只增大一级就能检测到触摸的临界点 则记录这个临界点 如果需要增大几级才能重新找到 则找到响应的中间值灵敏度 返回 不保存 这个模块只负责找临界点)
+ *                                    -> 提供一个单通道自动触摸灵敏度调整接口 在映射完成后可用 自动校准灵敏度 (在调用前会完成:将一个导电模块悬浮在要调整的区域触摸区域上方指定高度 调用时需要完成: 逐级增大灵敏度(每次调整都需要重新校准 后面不再赘述) 直到可以感应到触摸 并记录下当前灵敏度 随后逐级缩小灵敏度 直到找到失去触摸的灵敏度 随后再逐级增大灵敏度 一旦发现只增大一级就能检测到触摸的临界点 则记录这个临界点 如果需要增大几级才能重新找到 则找到响应的中间值灵敏度 返回 不保存 这个模块只负责找临界点)
  *                                    -> 触摸映射应当根据启动时设置的模式决定调用 提供设置映射绑定接口 和一个手动触发映射的接口 允许指定一个映射区域直接触发 以进行选区设置(Serial的传入触发逻辑区域 HID的传入坐标 编号默认使用第一位)
  *                                    -> 未绑定的触摸区域应当通过GTX312L接口关闭通道 使其提高稳定性和速度 此时只在需要执行绑定操作时开启全部通道
  * 
@@ -209,7 +209,7 @@
 #define ST7735S_CS_PIN 22
 
 // Watchdog配置
-#define WATCHDOG_TIMEOUT_MS 8000
+#define WATCHDOG_TIMEOUT_MS 5000
 #define WATCHDOG_FEED_INTERVAL_MS 1000
 
 // 全局对象声明
@@ -374,9 +374,9 @@ bool init_protocol_layer() {
         return false;
     }
     
-    // 初始化HID
-    hid = new HID(hal_usb);
-    if (!hid || !hid->init()) {
+    // 初始化HID (使用单例模式)
+    hid = HID::getInstance();
+    if (!hid || !hid->init(hal_usb)) {
         error_handler("Failed to initialize HID");
         return false;
     }
@@ -397,23 +397,46 @@ bool init_service_layer() {
     
     // 初始化InputManager
     input_manager = InputManager::getInstance();
-    InputManager_Config input_config = {};
-    input_config.config_manager = config_manager;
+    
+    // 准备InputManager初始化配置
+    InputManager::InitConfig input_config;
     input_config.mai2_serial = mai2_serial;
     input_config.hid = hid;
+    input_config.ui_manager = ui_manager;
     input_config.mcp23s17 = mcp23s17;
-    
-    // 添加GTX312L设备到InputManager
-    for (uint8_t i = 0; i < gtx312l_count; i++) {
-        if (gtx312l_devices[i]) {
-            input_config.gtx312l_devices[i] = gtx312l_devices[i];
-        }
-    }
-    input_config.gtx312l_count = gtx312l_count;
     
     if (!input_manager->init(input_config)) {
         error_handler("Failed to initialize InputManager");
         return false;
+    }
+    
+    // 注册MCP23S17的GPIO 1-11作为键盘
+    if (mcp23s17) {
+        // 注册GPIOA1-A8 (对应MCP_GPIO::GPIOA1到GPIOA8)
+        for (int i = 1; i <= 8; i++) {
+            MCP_GPIO gpio = static_cast<MCP_GPIO>(0xC0 + i); // GPIOA1-A8
+            input_manager->addPhysicalKeyboard(gpio, HID_KeyCode::KEY_NONE);
+        }
+        
+        // 注册GPIOB1-B3 (对应MCP_GPIO::GPIOB1到GPIOB3)
+        for (int i = 9; i <= 11; i++) {
+            MCP_GPIO gpio = static_cast<MCP_GPIO>(0xC0 + i); // GPIOB1-B3
+            input_manager->addPhysicalKeyboard(gpio, HID_KeyCode::KEY_NONE);
+        }
+        
+        // 设置GPIOB8为输出模式并输出高电平以点亮LED
+        mcp23s17->set_pin_direction(MCP23S17_PORT_B, 7, MCP23S17_OUTPUT); // GPIOB8是端口B的第7位(0-7)
+        mcp23s17->write_pin(MCP23S17_PORT_B, 7, true); // 输出高电平
+    }
+    
+    // 注册GTX312L设备到InputManager
+    for (uint8_t i = 0; i < gtx312l_count; i++) {
+        if (gtx312l_devices[i]) {
+            if (!input_manager->registerGTX312L(gtx312l_devices[i])) {
+                error_handler("Failed to register GTX312L device");
+                return false;
+            }
+        }
     }
     
     // 初始化LightManager
@@ -460,11 +483,17 @@ void scan_i2c_devices() {
             if (gtx312l_count >= 8) break;
             
             // 尝试创建GTX312L实例
-            GTX312L* device = new GTX312L(hal_i2c0, addr, "I2C0_GTX312L");
+            GTX312L* device = new GTX312L(hal_i2c0, I2C_Bus::I2C0, addr);
+
             if (device && device->init()) {
                 // 初始化成功，加入注册组
                 gtx312l_devices[gtx312l_count] = device;
                 gtx312l_count++;
+                
+                // 注册到InputManager
+                if (input_manager) {
+                    input_manager->registerGTX312L(device);
+                }
                 
                 if (usb_logs) {
                     char buffer[128];
@@ -486,16 +515,20 @@ void scan_i2c_devices() {
             if (gtx312l_count >= 8) break;
             
             // 尝试创建GTX312L实例
-            GTX312L* device = new GTX312L(hal_i2c1, addr, "I2C1_GTX312L");
+            GTX312L* device = new GTX312L(hal_i2c1, I2C_Bus::I2C1, addr);
             if (device && device->init()) {
                 // 初始化成功，加入注册组
                 gtx312l_devices[gtx312l_count] = device;
                 gtx312l_count++;
                 
+                // 注册到InputManager
+                if (input_manager) {
+                    input_manager->registerGTX312L(device);
+                }
+                
                 if (usb_logs) {
                     char buffer[128];
-                    snprintf(buffer, sizeof(buffer), "Found GTX312L on I2C1: %s (0x%02X)", 
-                            device->get_device_name().c_str(), addr);
+                    snprintf(buffer, sizeof(buffer), "Found GTX312L on I2C1: (0x%02X)", addr);
                     usb_logs->info(std::string(buffer));
                 }
             } else {
@@ -516,9 +549,9 @@ void scan_i2c_devices() {
                 GTX312L_DeviceInfo info;
                 if (gtx312l_devices[i]->read_device_info(info)) {
                     char buffer[256];
-                    snprintf(buffer, sizeof(buffer), "Device %d: %s, ChipID=0x%04X, FW=0x%02X", 
+                    snprintf(buffer, sizeof(buffer), "Device %d: %s, I2C=0x%02X, Valid=%s", 
                             i, gtx312l_devices[i]->get_device_name().c_str(),
-                            info.chip_id, info.firmware_version);
+                            info.i2c_address, info.is_valid ? "Yes" : "No");
                     usb_logs->info(std::string(buffer));
                 }
             }
@@ -689,9 +722,6 @@ void core0_task() {
         heartbeat_task();
         watchdog_task();
         status_update_task();
-        
-        // 短暂延时避免CPU占用过高
-        delayMicroseconds(100);
     }
 }
 
@@ -724,8 +754,7 @@ void core1_task() {
             last_ui_update = current_time;
         }
         
-        // 短暂延时避免CPU占用过高
-        delayMicroseconds(500);
+        // 移除延迟以实现最高速率处理
     }
     
     core1_running = false;

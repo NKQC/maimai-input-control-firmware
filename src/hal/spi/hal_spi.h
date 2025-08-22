@@ -34,7 +34,12 @@ public:
     virtual inline size_t get_tx_buffer_free_space() const = 0;
     virtual inline size_t get_rx_buffer_data_count() const = 0;
     
-    // 检查DMA传输状态
+    // 同步传输方法
+    virtual size_t write(const uint8_t* data, size_t length) = 0;
+    virtual size_t read(uint8_t* buffer, size_t length) = 0;
+    virtual size_t transfer(const uint8_t* tx_data, uint8_t* rx_data, size_t length) = 0;
+    
+    // 检查DMA传输状态8
     virtual bool is_busy() const = 0;
     
     // 设置CS引脚
@@ -66,11 +71,20 @@ public:
     bool write_dma(const uint8_t* data, size_t length, dma_callback_t callback = nullptr) override;
     bool read_dma(uint8_t* buffer, size_t length, dma_callback_t callback = nullptr) override;
     bool transfer_dma(const uint8_t* tx_data, uint8_t* rx_data, size_t length, dma_callback_t callback = nullptr) override;
-    inline size_t write_to_tx_buffer(const uint8_t* data, size_t length) override;
-    inline size_t read_from_rx_buffer(uint8_t* buffer, size_t length) override;
-    inline void trigger_tx_dma() override;
-    inline size_t get_tx_buffer_free_space() const override;
-    inline size_t get_rx_buffer_data_count() const override;
+    bool write_async(const uint8_t* data, size_t length, dma_callback_t callback);
+    bool read_async(uint8_t* buffer, size_t length, dma_callback_t callback);
+    bool transfer_async(const uint8_t* tx_data, uint8_t* rx_data, size_t length, dma_callback_t callback);
+    size_t write_to_tx_buffer(const uint8_t* data, size_t length) override;
+    size_t read_from_rx_buffer(uint8_t* buffer, size_t length) override;
+    void trigger_tx_dma() override;
+    size_t get_tx_buffer_free_space() const override;
+    size_t get_rx_buffer_data_count() const override;
+    
+    // 同步传输方法
+    size_t write(const uint8_t* data, size_t length) override;
+    size_t read(uint8_t* buffer, size_t length) override;
+    size_t transfer(const uint8_t* tx_data, uint8_t* rx_data, size_t length) override;
+    
     bool is_busy() const override;
     void set_cs_pin(uint8_t cs_pin, bool active_low = true) override;
     void cs_select() override;
@@ -80,9 +94,9 @@ public:
     std::string get_name() const override { return "SPI0"; }
     bool is_ready() const override { return initialized_; }
 
-    bool dma_busy_;
-    dma_callback_t dma_callback_;
-    
+    // 友元函数声明
+    friend void dma_spi0_complete();
+
 private:
     bool initialized_;
     uint8_t sck_pin_;
@@ -93,6 +107,8 @@ private:
     uint32_t frequency_;
     int dma_tx_channel_;
     int dma_rx_channel_;
+    bool dma_busy_;
+    dma_callback_t dma_callback_;
     
     // TX环形缓冲区
     static constexpr size_t TX_BUFFER_SIZE = 256;
@@ -126,11 +142,17 @@ public:
     bool write_dma(const uint8_t* data, size_t length, dma_callback_t callback = nullptr) override;
     bool read_dma(uint8_t* buffer, size_t length, dma_callback_t callback = nullptr) override;
     bool transfer_dma(const uint8_t* tx_data, uint8_t* rx_data, size_t length, dma_callback_t callback = nullptr) override;
-    inline size_t write_to_tx_buffer(const uint8_t* data, size_t length) override;
-    inline size_t read_from_rx_buffer(uint8_t* buffer, size_t length) override;
-    inline void trigger_tx_dma() override;
-    inline size_t get_tx_buffer_free_space() const override;
-    inline size_t get_rx_buffer_data_count() const override;
+    size_t write_to_tx_buffer(const uint8_t* data, size_t length) override;
+    size_t read_from_rx_buffer(uint8_t* buffer, size_t length) override;
+    void trigger_tx_dma() override;
+    size_t get_tx_buffer_free_space() const override;
+    size_t get_rx_buffer_data_count() const override;
+    size_t write(const uint8_t* data, size_t length) override;
+    size_t read(uint8_t* buffer, size_t length) override;
+    size_t transfer(const uint8_t* tx_data, uint8_t* rx_data, size_t length) override;
+    bool write_async(const uint8_t* data, size_t length, dma_callback_t callback);
+    bool read_async(uint8_t* buffer, size_t length, dma_callback_t callback);
+    bool transfer_async(const uint8_t* tx_data, uint8_t* rx_data, size_t length, dma_callback_t callback);
     bool is_busy() const override;
     void set_cs_pin(uint8_t cs_pin, bool active_low = true) override;
     void cs_select() override;
@@ -140,6 +162,9 @@ public:
     std::string get_name() const override;
     bool is_ready() const override;
 
+    // 友元函数声明
+    friend void dma_spi1_complete();
+
 private:
     bool initialized_;
     uint8_t sck_pin_;
@@ -147,13 +172,13 @@ private:
     uint8_t miso_pin_;
     uint8_t cs_pin_;
     bool cs_active_low_;
-    uint32_t frequency_;
-    bool dma_busy_;
-    dma_callback_t dma_callback_;
-    int dma_tx_channel_;
-    int dma_rx_channel_;
-    
-    static HAL_SPI1* instance_;
+     uint32_t frequency_;
+     int dma_tx_channel_;
+     int dma_rx_channel_;
+     bool dma_busy_;
+     dma_callback_t dma_callback_;
+     
+     static HAL_SPI1* instance_;
     
     // 私有构造函数（单例模式）
     HAL_SPI1();

@@ -38,6 +38,19 @@
 #define MCP23S17_REG_OLATA      0x14  // 输出锁存寄存器A
 #define MCP23S17_REG_OLATB      0x15  // 输出锁存寄存器B
 
+
+// MCP23S17 GPIO枚举 (6-7位 = 11, 即0xC0)
+enum class MCP_GPIO : uint8_t {
+    // GPIOA1-A8 (1-8)
+    GPIOA1 = 0xC1, GPIOA2 = 0xC2, GPIOA3 = 0xC3, GPIOA4 = 0xC4,
+    GPIOA5 = 0xC5, GPIOA6 = 0xC6, GPIOA7 = 0xC7, GPIOA8 = 0xC8,
+    // GPIOB1-B8 (9-16)
+    GPIOB1 = 0xC9, GPIOB2 = 0xCA, GPIOB3 = 0xCB, GPIOB4 = 0xCC,
+    GPIOB5 = 0xCD, GPIOB6 = 0xCE, GPIOB7 = 0xCF, GPIOB8 = 0xD0,
+    GPIO_NONE = 0xFF  // 无效GPIO
+};
+
+
 // GPIO端口定义
 enum MCP23S17_Port {
     MCP23S17_PORT_A = 0,
@@ -65,6 +78,8 @@ struct MCP23S17_GPIO_State {
 
 class MCP23S17 {
 public:
+    using dma_callback_t = std::function<void(bool success)>;
+    
     MCP23S17(HAL_SPI* spi_hal, uint8_t cs_pin, uint8_t device_addr = 0);
     ~MCP23S17();
     
@@ -118,6 +133,11 @@ public:
     // 任务处理（需要在主循环中调用）
     void task();
     
+    // DMA异步传输方法
+    bool spi_transfer_async(const uint8_t* tx_data, uint8_t* rx_data, size_t length, dma_callback_t callback = nullptr);
+    bool write_register_async(uint8_t reg, uint8_t value, dma_callback_t callback = nullptr);
+    bool read_register_async(uint8_t reg, uint8_t* value, dma_callback_t callback = nullptr);
+    
     // 配置寄存器操作
     bool configure_iocon(uint8_t config);
     
@@ -133,6 +153,10 @@ private:
     // 状态缓存
     MCP23S17_GPIO_State last_state_;
     bool state_changed_;
+    
+    // DMA相关成员
+    dma_callback_t current_dma_callback_;
+    bool dma_in_progress_;
     
     // 内部方法
     bool write_register(uint8_t reg, uint8_t value);

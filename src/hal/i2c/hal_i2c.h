@@ -9,7 +9,14 @@
  * HAL层 - I2C接口抽象类
  * 提供底层I2C接口，支持I2C0和I2C1两个实例
  * 使用DMA实现高效的数据传输
+ * 只负责提供I2C通道枚举，不管理其他业务逻辑
  */
+
+// I2C总线枚举 - HAL层只提供通道信息
+enum class I2C_Bus : uint8_t {
+    I2C0 = 0,
+    I2C1 = 1
+};
 
 class HAL_I2C {
 public:

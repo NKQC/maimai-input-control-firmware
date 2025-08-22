@@ -5,7 +5,7 @@
 
 MCP23S17::MCP23S17(HAL_SPI* spi_hal, uint8_t cs_pin, uint8_t device_addr)
     : spi_hal_(spi_hal), cs_pin_(cs_pin), device_addr_(device_addr & 0x07),
-      initialized_(false), state_changed_(false) {
+      initialized_(false), state_changed_(false), dma_in_progress_(false) {
     memset(&last_state_, 0, sizeof(last_state_));
 }
 
@@ -426,36 +426,11 @@ bool MCP23S17::configure_iocon(uint8_t config) {
 
 // 私有方法实现
 bool MCP23S17::write_register(uint8_t reg, uint8_t value) {
-    if (!spi_hal_) {
-        return false;
-    }
-    
-    uint8_t tx_data[3];
-    tx_data[0] = MCP23S17_OPCODE_WRITE | (device_addr_ << 1);
-    tx_data[1] = reg;
-    tx_data[2] = value;
-    
-    return spi_transfer(tx_data, nullptr, sizeof(tx_data));
+    return write_register_async(reg, value, nullptr);
 }
 
 bool MCP23S17::read_register(uint8_t reg, uint8_t& value) {
-    if (!spi_hal_) {
-        return false;
-    }
-    
-    uint8_t tx_data[3];
-    uint8_t rx_data[3];
-    
-    tx_data[0] = MCP23S17_OPCODE_READ | (device_addr_ << 1);
-    tx_data[1] = reg;
-    tx_data[2] = 0x00;  // 虚拟字节
-    
-    if (spi_transfer(tx_data, rx_data, sizeof(tx_data))) {
-        value = rx_data[2];
-        return true;
-    }
-    
-    return false;
+    return read_register_async(reg, &value, nullptr);
 }
 
 bool MCP23S17::write_register_pair(uint8_t reg_a, uint8_t value_a, uint8_t reg_b, uint8_t value_b) {
@@ -518,4 +493,75 @@ bool MCP23S17::test_device_communication() {
     }
     
     return (read_value & 0x08) == 0x08;  // 检查HAEN位
+}
+
+// DMA异步传输方法实现
+bool MCP23S17::spi_transfer_async(const uint8_t* tx_data, uint8_t* rx_data, size_t length, dma_callback_t callback) {
+    if (!spi_hal_ || dma_in_progress_) {
+        return false;
+    }
+    
+    dma_in_progress_ = true;
+    current_dma_callback_ = callback;
+    
+    // 拉低CS
+    gpio_put(cs_pin_, 0);
+    sleep_us(1);
+    
+    // 设置DMA完成回调
+    auto dma_complete_callback = [this](bool success) {
+        // 拉高CS
+        sleep_us(1);
+        gpio_put(cs_pin_, 1);
+        
+        dma_in_progress_ = false;
+        
+        if (current_dma_callback_) {
+            current_dma_callback_(success);
+            current_dma_callback_ = nullptr;
+        }
+    };
+    
+    // 启动异步DMA传输
+    if (!spi_hal_->transfer_dma(tx_data, rx_data, length, dma_complete_callback)) {
+        // DMA启动失败，恢复状态
+        gpio_put(cs_pin_, 1);
+        dma_in_progress_ = false;
+        current_dma_callback_ = nullptr;
+        return false;
+    }
+    
+    return true;
+}
+
+bool MCP23S17::write_register_async(uint8_t reg, uint8_t value, dma_callback_t callback) {
+    static uint8_t tx_buffer[3];
+    
+    // 构建SPI命令
+    tx_buffer[0] = MCP23S17_OPCODE_WRITE | (device_addr_ << 1);
+    tx_buffer[1] = reg;
+    tx_buffer[2] = value;
+    
+    return spi_transfer_async(tx_buffer, nullptr, 3, callback);
+}
+
+bool MCP23S17::read_register_async(uint8_t reg, uint8_t* value, dma_callback_t callback) {
+    static uint8_t tx_buffer[3];
+    static uint8_t rx_buffer[3];
+    
+    // 构建SPI命令
+    tx_buffer[0] = MCP23S17_OPCODE_READ | (device_addr_ << 1);
+    tx_buffer[1] = reg;
+    tx_buffer[2] = 0x00;  // 虚拟字节
+    
+    auto read_callback = [value, callback](bool success) {
+        if (success && value) {
+            *value = rx_buffer[2];  // 读取的数据在第三个字节
+        }
+        if (callback) {
+            callback(success);
+        }
+    };
+    
+    return spi_transfer_async(tx_buffer, rx_buffer, 3, read_callback);
 }

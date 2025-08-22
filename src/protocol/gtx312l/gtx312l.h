@@ -11,16 +11,64 @@
  * 基于I2C通信的12通道电容式触摸控制器
  * 支持触摸按键检测，无坐标输出
  * 工作电压：1.8V-5.5V，支持I2C接口
+ * 负责物理地址组装和掩码管理
  */
+typedef uint32_t millis_t;
+
+// 16位物理地址掩码和反馈结构体 - 使用union和位域
+union GTX312L_PhysicalAddr {
+    struct {
+        uint16_t CH0: 1;     // 通道0状态
+        uint16_t CH1: 1;     // 通道1状态
+        uint16_t CH2: 1;     // 通道2状态
+        uint16_t CH3: 1;     // 通道3状态
+        uint16_t CH4: 1;     // 通道4状态
+        uint16_t CH5: 1;     // 通道5状态
+        uint16_t CH6: 1;     // 通道6状态
+        uint16_t CH7: 1;     // 通道7状态
+        uint16_t CH8: 1;     // 通道8状态
+        uint16_t CH9: 1;     // 通道9状态
+        uint16_t CH10: 1;    // 通道10状态
+        uint16_t CH11: 1;    // 通道11状态
+        uint16_t addr: 2;    // GTX312L设备地址 (13-12位)
+        uint16_t i2c_port: 2; // I2C端口 (15-14位)
+    };
+    uint16_t mask;           // 完整的16位掩码
+    
+    // 构造函数
+    GTX312L_PhysicalAddr(uint8_t i2c_addr = 0, uint8_t gtx_addr = 0, uint16_t channel_bitmap = 0) {
+        mask = ((uint16_t)(i2c_addr & 0x03) << 14) | 
+               ((uint16_t)(gtx_addr & 0x03) << 12) | 
+               (channel_bitmap & 0x0FFF);
+    }
+    
+    // 获取设备掩码 (通道bitmap为0时的地址)
+    uint16_t get_device_mask() const {
+        return mask & 0xF000;
+    }
+};
+
+// GTX312L采样结果结构体
+struct GTX312L_SampleResult {
+    GTX312L_PhysicalAddr physical_addr;  // 包含设备地址和触摸bitmap的完整16位数据
+    millis_t timestamp;                  // 时间戳
+    
+    // 默认构造函数
+    GTX312L_SampleResult() : physical_addr(0, 0, 0), timestamp(0) {}
+    
+    GTX312L_SampleResult(uint16_t device_mask, uint16_t touch_bitmap) 
+        : physical_addr((device_mask | (touch_bitmap & 0x0FFF))), timestamp(0) {}
+};
+
+// https://www.cpbay.com/Uploads/20210128/601279b9b90ec.pdf
 
 // GTX312L I2C地址范围（可配置）
-#define GTX312L_I2C_ADDR_MIN        0x28    // 最小I2C地址
-#define GTX312L_I2C_ADDR_MAX        0x2F    // 最大I2C地址
-#define GTX312L_I2C_ADDR_DEFAULT    0x28    // 默认I2C地址
+#define GTX312L_I2C_ADDR_MIN        0xB6    // 最小I2C地址
+#define GTX312L_I2C_ADDR_MAX        0xB0    // 最大I2C地址
+#define GTX312L_I2C_ADDR_DEFAULT    0xB2    // 默认I2C地址
 
-// GTX312L寄存器定义（基于官方datasheet）
-#define GTX312L_REG_CHIP_ID         0x00    // 芯片ID寄存器
-#define GTX312L_REG_FIRMWARE_VER    0x01    // 固件版本寄存器
+// GTX312L寄存器定义（基于实际datasheet）
+#define GTX312L_REG_CHIPADDR_VER    0x01    // 芯片ID寄存器
 #define GTX312L_REG_TOUCH_STATUS_L  0x02    // 触摸状态寄存器低字节（通道1-8）
 #define GTX312L_REG_TOUCH_STATUS_H  0x03    // 触摸状态寄存器高字节（通道9-12）
 #define GTX312L_REG_CH_ENABLE_L     0x04    // 通道使能寄存器低字节（通道1-8）
@@ -75,6 +123,8 @@
 // 扩展配置位定义
 #define GTX312L_EXP_EN              0x02    // 扩展功能使能位
 #define GTX312L_EXP_MODE            0x01    // 扩展模式位
+
+// 删除了不存在的寄存器相关常量定义
 
 // 触摸数据结构（12个通道的状态）
 struct GTX312L_TouchData {
@@ -136,12 +186,10 @@ struct GTX312L_Config {
 
 // 设备信息结构
 struct GTX312L_DeviceInfo {
-    uint16_t chip_id;
-    uint8_t firmware_version;
     uint8_t i2c_address;
     bool is_valid;
     
-    GTX312L_DeviceInfo() : chip_id(0), firmware_version(0), i2c_address(0), is_valid(false) {}
+    GTX312L_DeviceInfo() : i2c_address(0), is_valid(false) {}
 };
 
 // 触摸回调函数类型
@@ -149,78 +197,44 @@ typedef std::function<void(uint8_t device_index, const GTX312L_TouchData& touch_
 
 class GTX312L {
 public:
-    GTX312L(HAL_I2C* i2c_hal, uint8_t device_address, const std::string& device_name = "");
+    GTX312L(HAL_I2C* i2c_hal, I2C_Bus i2c_bus, uint8_t device_addr);
     ~GTX312L();
     
-    // 初始化和释放
+    // 初始化和清理
     bool init();
     void deinit();
-    bool is_ready() const;
+    
+    // 物理地址相关
+    GTX312L_PhysicalAddr get_physical_device_address() const;  // 获取16位物理设备地址（通道bitmap为0）
+    
+    // 触摸数据读取 - 返回设备地址+采样bitmap
+    GTX312L_SampleResult sample_touch_data();  // 高效采样接口
     
     // 设备信息
     bool read_device_info(GTX312L_DeviceInfo& info);
     std::string get_device_name() const;
-    uint8_t get_device_address() const;
     
-    // 触摸数据读取
-    bool read_touch_data(GTX312L_TouchData& touch_data);
-    
-    // 配置管理
-    bool set_config(const GTX312L_Config& config);
-    bool get_config(GTX312L_Config& config);
-    
-    // 单独设置
-    bool set_global_sensitivity(uint8_t sensitivity);                   // 设置全局灵敏度（应用到所有通道）
-    bool set_channel_sensitivity(uint8_t channel, uint8_t sensitivity); // 设置单个通道灵敏度
+    // 核心功能接口
     bool set_channel_enable(uint8_t channel, bool enabled);            // 设置单个通道使能状态
-    bool set_all_channels_enable(bool enabled);                        // 设置所有通道使能状态
-    bool set_multi_touch_mode(bool enabled);                           // 设置多点触摸模式
-    bool set_interrupt_mode(bool enabled);                             // 设置中断模式
-    
-    // 单独获取 - 实时从设备读取
-    uint8_t get_global_sensitivity() const;                            // 获取全局灵敏度（从第一个通道读取）
-    uint8_t get_channel_sensitivity(uint8_t channel) const;            // 获取单个通道灵敏度
-    bool get_channel_enable(uint8_t channel) const;                    // 获取单个通道使能状态
-    
-    // 校准和控制
-    bool calibrate();                   // 手动校准
-    bool reset();                       // 复位设备
-    bool enter_sleep();                 // 进入睡眠模式
-    bool wakeup();                      // 唤醒设备
-    
-    // 中断处理（默认关闭）
-    void set_touch_callback(GTX312L_TouchCallback callback, uint8_t device_index);
-    void handle_interrupt();
-    
-    // 任务处理（轮询模式）
-    void task();
-    
-    // 静态方法：I2C总线扫描和设备发现
-    static std::vector<uint8_t> scan_i2c_bus(HAL_I2C* i2c_hal);
-    static std::vector<GTX312L*> discover_devices(HAL_I2C* i2c_hal, const std::string& name_prefix = "GTX312L");
-    static void cleanup_devices(std::vector<GTX312L*>& devices);
+    bool set_sensitivity(uint8_t channel, uint8_t sensitivity);        // 设置通道灵敏度
     
 private:
+    // I2C通信相关
     HAL_I2C* i2c_hal_;
-    uint8_t device_address_;
-    std::string device_name_;
+    I2C_Bus i2c_bus_;
+    uint8_t device_addr_;                    // GTX312L设备地址 (0-3)
+    uint8_t i2c_device_address_;             // 实际I2C设备地址 (0x14 + device_addr_)
+    GTX312L_PhysicalAddr physical_device_address_;  // 16位物理设备地址
+    
+    // 设备状态
     bool initialized_;
     
-    // 配置数据
-    GTX312L_Config config_;
+    // 内部辅助函数
+    bool write_register(uint8_t reg, uint8_t value);
+    bool read_register(uint8_t reg, uint8_t& value);
+    bool write_registers(uint8_t reg, const uint8_t* data, size_t length);
+    bool read_registers(uint8_t reg, uint8_t* data, size_t length);
     
-    // 回调函数
-    GTX312L_TouchCallback touch_callback_;
-    uint8_t device_index_;
-    
-    // 内部方法
-    bool write_register(uint8_t reg_addr, uint8_t data);
-    bool read_register(uint8_t reg_addr, uint8_t& data);
-    bool read_registers(uint8_t reg_addr, uint8_t* data, uint8_t length);
-
-    // 数据解析
-    void parse_touch_data(const uint8_t* raw_data, GTX312L_TouchData& touch_data);
-    
-    // 设备检测
-    static bool is_gtx312l_device(HAL_I2C* i2c_hal, uint8_t address);
+    // 配置性能优化设置
+    bool configure_performance_settings();
 };

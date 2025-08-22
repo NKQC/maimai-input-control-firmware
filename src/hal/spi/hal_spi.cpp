@@ -5,6 +5,10 @@
 #include <hardware/irq.h>
 #include <pico/stdlib.h>
 
+// 前向声明DMA完成回调函数
+void dma_spi0_complete();
+void dma_spi1_complete();
+
 // HAL_SPI0 静态成员初始化
 HAL_SPI0* HAL_SPI0::instance_ = nullptr;
 
@@ -18,8 +22,8 @@ HAL_SPI0* HAL_SPI0::getInstance() {
 
 HAL_SPI0::HAL_SPI0() 
     : initialized_(false), sck_pin_(0), mosi_pin_(0), miso_pin_(0), 
-      cs_pin_(0), cs_active_low_(true), frequency_(1000000), dma_busy_(false),
-      dma_tx_channel_(-1), dma_rx_channel_(-1) {}
+      cs_pin_(0), cs_active_low_(true), frequency_(1000000),
+      dma_tx_channel_(-1), dma_rx_channel_(-1), dma_busy_(false) {}
 
 HAL_SPI0::~HAL_SPI0() {
     deinit();
@@ -214,7 +218,7 @@ bool HAL_SPI0::transfer_async(const uint8_t* tx_data, uint8_t* rx_data, size_t l
 }
 
 // DMA中断处理函数
-static void dma_spi0_complete() {
+void dma_spi0_complete() {
     HAL_SPI0* instance = HAL_SPI0::getInstance();
     instance->dma_busy_ = false;
     if (instance->dma_callback_) {
@@ -226,13 +230,43 @@ bool HAL_SPI0::is_busy() const {
     return dma_busy_;
 }
 
-std::string HAL_SPI0::get_name() const {
-    return "SPI0";
+size_t HAL_SPI0::write_to_tx_buffer(const uint8_t* data, size_t length) {
+    // 简单实现：直接返回0，表示不支持缓冲区操作
+    return 0;
 }
 
-bool HAL_SPI0::is_ready() const {
-    return initialized_;
+size_t HAL_SPI0::read_from_rx_buffer(uint8_t* buffer, size_t length) {
+    // 简单实现：直接返回0，表示不支持缓冲区操作
+    return 0;
 }
+
+void HAL_SPI0::trigger_tx_dma() {
+    // 简单实现：空函数
+}
+
+size_t HAL_SPI0::get_tx_buffer_free_space() const {
+    // 简单实现：返回0
+    return 0;
+}
+
+size_t HAL_SPI0::get_rx_buffer_data_count() const {
+    // 简单实现：返回0
+    return 0;
+}
+
+bool HAL_SPI0::write_dma(const uint8_t* data, size_t length, dma_callback_t callback) {
+    return write_async(data, length, callback);
+}
+
+bool HAL_SPI0::read_dma(uint8_t* buffer, size_t length, dma_callback_t callback) {
+    return read_async(buffer, length, callback);
+}
+
+bool HAL_SPI0::transfer_dma(const uint8_t* tx_data, uint8_t* rx_data, size_t length, dma_callback_t callback) {
+    return transfer_async(tx_data, rx_data, length, callback);
+}
+
+
 
 // HAL_SPI1 静态成员初始化
 HAL_SPI1* HAL_SPI1::instance_ = nullptr;
@@ -247,8 +281,8 @@ HAL_SPI1* HAL_SPI1::getInstance() {
 
 HAL_SPI1::HAL_SPI1() 
     : initialized_(false), sck_pin_(0), mosi_pin_(0), miso_pin_(0), 
-      cs_pin_(0), cs_active_low_(true), frequency_(1000000), dma_busy_(false),
-      dma_tx_channel_(-1), dma_rx_channel_(-1) {}
+      cs_pin_(0), cs_active_low_(true), frequency_(1000000),
+      dma_tx_channel_(-1), dma_rx_channel_(-1), dma_busy_(false) {}
 
 HAL_SPI1::~HAL_SPI1() {
     deinit();
@@ -360,7 +394,7 @@ void HAL_SPI1::set_frequency(uint32_t frequency) {
 }
 
 // DMA中断处理函数
-static void dma_spi1_complete() {
+void dma_spi1_complete() {
     HAL_SPI1* instance = HAL_SPI1::getInstance();
     instance->dma_busy_ = false;
     if (instance->dma_callback_) {
@@ -461,4 +495,40 @@ std::string HAL_SPI1::get_name() const {
 
 bool HAL_SPI1::is_ready() const {
     return initialized_;
+}
+
+size_t HAL_SPI1::write_to_tx_buffer(const uint8_t* data, size_t length) {
+    // 简单实现：直接返回0，表示不支持缓冲区操作
+    return 0;
+}
+
+size_t HAL_SPI1::read_from_rx_buffer(uint8_t* buffer, size_t length) {
+    // 简单实现：直接返回0，表示不支持缓冲区操作
+    return 0;
+}
+
+void HAL_SPI1::trigger_tx_dma() {
+    // 简单实现：空函数
+}
+
+size_t HAL_SPI1::get_tx_buffer_free_space() const {
+    // 简单实现：返回0
+    return 0;
+}
+
+size_t HAL_SPI1::get_rx_buffer_data_count() const {
+    // 简单实现：返回0
+    return 0;
+}
+
+bool HAL_SPI1::write_dma(const uint8_t* data, size_t length, dma_callback_t callback) {
+    return write_async(data, length, callback);
+}
+
+bool HAL_SPI1::read_dma(uint8_t* buffer, size_t length, dma_callback_t callback) {
+    return read_async(buffer, length, callback);
+}
+
+bool HAL_SPI1::transfer_dma(const uint8_t* tx_data, uint8_t* rx_data, size_t length, dma_callback_t callback) {
+    return transfer_async(tx_data, rx_data, length, callback);
 }

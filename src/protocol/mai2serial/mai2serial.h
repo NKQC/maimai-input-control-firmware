@@ -37,11 +37,12 @@ enum Mai2_TouchArea {
     
     // E区 (内环扩展) 27-34
     MAI2_AREA_E1, MAI2_AREA_E2, MAI2_AREA_E3, MAI2_AREA_E4,
-    MAI2_AREA_E5, MAI2_AREA_E6, MAI2_AREA_E7, MAI2_AREA_E8
+    MAI2_AREA_E5, MAI2_AREA_E6, MAI2_AREA_E7, MAI2_AREA_E8,
+    MAI2_NO_USED
 };
 
 // 区域名称映射表 - 用于调试和显示
-static const char* mai2_area_names[35] = {
+__attribute__((unused)) static const char* mai2_area_names[35] = {
     "NONE",
     "A1", "A2", "A3", "A4", "A5", "A6", "A7", "A8",
     "B1", "B2", "B3", "B4", "B5", "B6", "B7", "B8", 

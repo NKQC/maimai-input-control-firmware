@@ -1,0 +1,7 @@
+SPI
+bblanchon/ArduinoJson@^6.21.2
+lvgl/lvgl@^8.3.6
+adafruit/Adafruit NeoPixel@^1.11.0
+Wire
+adafruit/Adafruit GFX Library@^1.11.5
+adafruit/Adafruit ST7735 and ST7789 Library@^1.10.0

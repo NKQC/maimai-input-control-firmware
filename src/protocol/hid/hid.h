@@ -11,11 +11,7 @@
 // HID设备类型
 enum class HID_DeviceType : uint8_t {
     KEYBOARD = 0,
-    MOUSE = 1,
-    GAMEPAD = 2,
-    JOYSTICK = 3,
-    TOUCH = 4,
-    CUSTOM = 5
+    TOUCH = 4
 };
 
 // HID报告类型
@@ -91,70 +87,14 @@ enum class HID_KeyCode : uint8_t {
     KEY_RIGHT_GUI = 0xE7
 };
 
-// 鼠标按键
-enum class HID_MouseButton : uint8_t {
-    LEFT = 0x01,
-    RIGHT = 0x02,
-    MIDDLE = 0x04,
-    BUTTON4 = 0x08,
-    BUTTON5 = 0x10
-};
-
-// 游戏手柄按键
-enum class HID_GamepadButton : uint16_t {
-    BUTTON_1 = 0x0001,
-    BUTTON_2 = 0x0002,
-    BUTTON_3 = 0x0004,
-    BUTTON_4 = 0x0008,
-    BUTTON_5 = 0x0010,
-    BUTTON_6 = 0x0020,
-    BUTTON_7 = 0x0040,
-    BUTTON_8 = 0x0080,
-    BUTTON_9 = 0x0100,
-    BUTTON_10 = 0x0200,
-    BUTTON_11 = 0x0400,
-    BUTTON_12 = 0x0800,
-    BUTTON_13 = 0x1000,
-    BUTTON_14 = 0x2000,
-    BUTTON_15 = 0x4000,
-    BUTTON_16 = 0x8000
-};
-
-// 键盘报告结构
+// 键盘报告结构 (移除reserved字段)
 struct HID_KeyboardReport {
     uint8_t modifier;           // 修饰键 (Ctrl, Shift, Alt, GUI)
-    uint8_t reserved;           // 保留字节
     uint8_t keys[6];           // 同时按下的按键 (最多6个)
     
-    HID_KeyboardReport() : modifier(0), reserved(0) {
+    HID_KeyboardReport() : modifier(0) {
         memset(keys, 0, sizeof(keys));
     }
-};
-
-// 鼠标报告结构
-struct HID_MouseReport {
-    uint8_t buttons;            // 鼠标按键状态
-    int8_t x;                   // X轴相对移动
-    int8_t y;                   // Y轴相对移动
-    int8_t wheel;               // 滚轮
-    int8_t pan;                 // 水平滚轮
-    
-    HID_MouseReport() : buttons(0), x(0), y(0), wheel(0), pan(0) {}
-};
-
-// 游戏手柄报告结构
-struct HID_GamepadReport {
-    uint16_t buttons;           // 按键状态
-    int8_t left_x;              // 左摇杆X轴
-    int8_t left_y;              // 左摇杆Y轴
-    int8_t right_x;             // 右摇杆X轴
-    int8_t right_y;             // 右摇杆Y轴
-    uint8_t left_trigger;       // 左扳机
-    uint8_t right_trigger;      // 右扳机
-    uint8_t dpad;               // 方向键
-    
-    HID_GamepadReport() : buttons(0), left_x(0), left_y(0), right_x(0), 
-                         right_y(0), left_trigger(0), right_trigger(0), dpad(0) {}
 };
 
 // 触摸报告结构
@@ -177,17 +117,6 @@ struct HID_TouchReport {
     HID_TouchReport() : contact_count(0) {}
 };
 
-// 自定义报告结构
-struct HID_CustomReport {
-    uint8_t report_id;          // 报告ID
-    uint8_t data[64];           // 数据
-    uint8_t length;             // 数据长度
-    
-    HID_CustomReport() : report_id(0), length(0) {
-        memset(data, 0, sizeof(data));
-    }
-};
-
 // HID配置结构
 struct HID_Config {
     HID_DeviceType device_type; // 设备类型
@@ -200,7 +129,7 @@ struct HID_Config {
     bool enable_boot_protocol;  // 启用引导协议
     
     HID_Config() 
-        : device_type(HID_DeviceType::CUSTOM)
+        : device_type(HID_DeviceType::KEYBOARD)
         , vendor_id(0x2E8A)
         , product_id(0x000A)
         , manufacturer("MaiMai Controller")
@@ -210,19 +139,25 @@ struct HID_Config {
         , enable_boot_protocol(false) {}
 };
 
-// 回调函数类型
+// 回调函数类型定义
 using HID_ReportCallback = std::function<void(HID_ReportType type, const uint8_t* data, uint8_t length)>;
 using HID_ConnectCallback = std::function<void(bool connected)>;
 using HID_ErrorCallback = std::function<void(const std::string& error)>;
 
-// HID类
+// HID类 - 单例模式
 class HID {
 public:
-    explicit HID(HAL_USB* usb_hal);
+    // 获取单例实例
+    static HID* getInstance();
+    
+    // 禁用拷贝构造和赋值操作
+    HID(const HID&) = delete;
+    HID& operator=(const HID&) = delete;
+    
     ~HID();
     
-    // 初始化和释放
-    bool init();
+    // 初始化和反初始化
+    bool init(HAL_USB* usb_hal);
     void deinit();
     bool is_ready() const;
     
@@ -237,30 +172,11 @@ public:
     bool release_all_keys();
     bool type_string(const std::string& text);
     
-    // 鼠标功能
-    bool send_mouse_report(const HID_MouseReport& report);
-    bool move_mouse(int8_t x, int8_t y);
-    bool click_mouse(HID_MouseButton button);
-    bool press_mouse_button(HID_MouseButton button);
-    bool release_mouse_button(HID_MouseButton button);
-    bool scroll_wheel(int8_t wheel, int8_t pan = 0);
-    
-    // 游戏手柄功能
-    bool send_gamepad_report(const HID_GamepadReport& report);
-    bool set_gamepad_button(HID_GamepadButton button, bool pressed);
-    bool set_gamepad_axis(uint8_t axis, int8_t value);
-    bool set_gamepad_trigger(uint8_t trigger, uint8_t value);
-    bool set_gamepad_dpad(uint8_t direction);
-    
     // 触摸功能
     bool send_touch_report(const HID_TouchReport& report);
     bool set_touch_point(uint8_t contact_id, uint16_t x, uint16_t y, uint8_t pressure = 255);
     bool release_touch_point(uint8_t contact_id);
     bool release_all_touch_points();
-    
-    // 自定义报告
-    bool send_custom_report(const HID_CustomReport& report);
-    bool send_raw_report(uint8_t report_id, const uint8_t* data, uint8_t length);
     
     // 状态查询
     bool is_connected() const;
@@ -272,23 +188,27 @@ public:
     void set_connect_callback(HID_ConnectCallback callback);
     void set_error_callback(HID_ErrorCallback callback);
     
-    // 任务处理
+    // 任务循环
     void task();
     
-    // 静态辅助方法
+    // 静态工具函数
     static HID_KeyCode char_to_keycode(char c);
     static uint8_t char_to_modifier(char c);
     static std::vector<uint8_t> generate_hid_descriptor(HID_DeviceType device_type);
     
 private:
+    // 私有构造函数
+    HID();
+    
+    // 单例实例
+    static HID* instance_;
+    
     HAL_USB* usb_hal_;
     bool initialized_;
     HID_Config config_;
     
-    // 当前状态
+    // 当前报告状态
     HID_KeyboardReport current_keyboard_report_;
-    HID_MouseReport current_mouse_report_;
-    HID_GamepadReport current_gamepad_report_;
     HID_TouchReport current_touch_report_;
     
     // 统计信息
@@ -296,7 +216,7 @@ private:
     uint32_t error_count_;
     uint32_t last_report_time_;
     
-    // 回调
+    // 回调函数
     HID_ReportCallback report_callback_;
     HID_ConnectCallback connect_callback_;
     HID_ErrorCallback error_callback_;
@@ -307,34 +227,22 @@ private:
     void handle_connection_change(bool connected);
     void handle_error(const std::string& error);
     
-    // HID描述符生成
+    // 描述符生成
     std::vector<uint8_t> generate_keyboard_descriptor();
-    std::vector<uint8_t> generate_mouse_descriptor();
-    std::vector<uint8_t> generate_gamepad_descriptor();
     std::vector<uint8_t> generate_touch_descriptor();
-    std::vector<uint8_t> generate_custom_descriptor();
     
-    // 键盘辅助方法
+    // 键盘报告处理
     bool add_key_to_report(HID_KeyCode key);
     bool remove_key_from_report(HID_KeyCode key);
     void clear_keyboard_report();
     
-    // 鼠标辅助方法
-    void clear_mouse_report();
-    
-    // 游戏手柄辅助方法
-    void clear_gamepad_report();
-    
-    // 触摸辅助方法
+    // 触摸报告处理
     HID_TouchPoint* find_touch_point(uint8_t contact_id);
     void clear_touch_report();
 };
 
 // 便利宏定义
-#define HID_PRESS_KEY(hid, key) (hid)->press_key(HID_KeyCode::key)
-#define HID_RELEASE_KEY(hid, key) (hid)->release_key(HID_KeyCode::key)
-#define HID_CLICK_MOUSE(hid, button) (hid)->click_mouse(HID_MouseButton::button)
-#define HID_PRESS_GAMEPAD(hid, button) (hid)->set_gamepad_button(HID_GamepadButton::button, true)
-#define HID_RELEASE_GAMEPAD(hid, button) (hid)->set_gamepad_button(HID_GamepadButton::button, false)
+#define HID_PRESS_KEY(key) HID::getInstance()->press_key(HID_KeyCode::key)
+#define HID_RELEASE_KEY(key) HID::getInstance()->release_key(HID_KeyCode::key)
 
 #endif // HID_H

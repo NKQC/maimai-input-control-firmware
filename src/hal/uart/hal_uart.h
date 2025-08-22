@@ -92,6 +92,10 @@ private:
     int dma_tx_channel_;
     int dma_rx_channel_;
     
+    // 友元函数声明，允许DMA回调函数访问私有成员
+    friend void dma_uart0_tx_complete();
+    friend void dma_uart0_rx_complete();
+    
     // RX环形缓冲区
     static constexpr size_t RX_BUFFER_SIZE = 256;
     uint8_t rx_buffer_[RX_BUFFER_SIZE];
@@ -149,6 +153,10 @@ private:
     dma_callback_t dma_callback_;
     int dma_tx_channel_;
     int dma_rx_channel_;
+    
+    // 友元函数声明，允许DMA回调函数访问私有成员
+    friend void dma_uart1_tx_complete();
+    friend void dma_uart1_rx_complete();
     
     // RX环形缓冲区
     static constexpr size_t RX_BUFFER_SIZE = 256;
