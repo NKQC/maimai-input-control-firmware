@@ -17,7 +17,7 @@ public:
     virtual ~HAL_UART() = default;
     
     // 初始化UART接口
-    virtual bool init(uint8_t tx_pin, uint8_t rx_pin, uint32_t baudrate = 115200, bool flow_control = false) = 0;
+    virtual bool init(uint8_t tx_pin, uint8_t rx_pin, uint32_t baudrate = 115200, bool flow_control = false, uint8_t cts_pin = 255, uint8_t rts_pin = 255) = 0;
     
     // 释放UART资源
     virtual void deinit() = 0;
@@ -61,7 +61,7 @@ public:
     static HAL_UART0* getInstance();
     ~HAL_UART0();
     
-    bool init(uint8_t tx_pin, uint8_t rx_pin, uint32_t baudrate = 115200, bool flow_control = false) override;
+    bool init(uint8_t tx_pin, uint8_t rx_pin, uint32_t baudrate = 115200, bool flow_control = false, uint8_t cts_pin = 255, uint8_t rts_pin = 255) override;
     void deinit() override;
     bool write_dma(const uint8_t* data, size_t length, dma_callback_t callback = nullptr) override;
     bool read_dma(uint8_t* buffer, size_t length, dma_callback_t callback = nullptr) override;
@@ -123,7 +123,7 @@ public:
     static HAL_UART1* getInstance();
     ~HAL_UART1();
     
-    bool init(uint8_t tx_pin, uint8_t rx_pin, uint32_t baudrate = 115200, bool flow_control = false) override;
+    bool init(uint8_t tx_pin, uint8_t rx_pin, uint32_t baudrate = 115200, bool flow_control = false, uint8_t cts_pin = 255, uint8_t rts_pin = 255) override;
     void deinit() override;
     bool write_dma(const uint8_t* data, size_t length, dma_callback_t callback = nullptr) override;
     bool read_dma(uint8_t* buffer, size_t length, dma_callback_t callback = nullptr) override;

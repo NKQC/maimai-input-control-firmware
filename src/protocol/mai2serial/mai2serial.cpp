@@ -268,8 +268,8 @@ void Mai2Serial::show_status_info() {
     }
     
     char info[128];
-    snprintf(info, sizeof(info), "Status: %s, Baud: %u", 
-             status_str, config_.baud_rate);
+    snprintf(info, sizeof(info), "Status: %s, Baud: %lu", 
+             status_str, static_cast<unsigned long>(config_.baud_rate));
     send_response(info);
 }
 

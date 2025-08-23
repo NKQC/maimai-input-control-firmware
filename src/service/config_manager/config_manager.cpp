@@ -1,984 +1,761 @@
+#include <mutex>
 #include "config_manager.h"
-#include "../../service/input_manager/input_manager.h"
-#include "../../service/light_manager/light_manager.h"
-#include "../../service/ui_manager/ui_manager.h"
+#include "../input_manager/input_manager.h"
+#include "../light_manager/light_manager.h"
+#include "../ui_manager/ui_manager.h"
 #include <cstring>
 #include <algorithm>
 #include <sstream>
 #include <iomanip>
-// #include <avr/eeprom.h> // AVR specific, not available on Pico
-#include <hardware/sync.h>
-#include <hardware/flash.h>
-#include <pico/stdlib.h>
+#include <stdexcept>
+#include <stdio.h>
+#include <stdlib.h>
 
-// 静态实例变量定义
-ConfigManager* ConfigManager::instance_ = nullptr;
+// RP2040 LittleFS支持
+#ifdef PICO_PLATFORM
+#include "pico/stdlib.h"
+#include "hardware/flash.h"
+#include "hardware/sync.h"
+#include "LittleFS.h"
+#endif
 
-// 静态配置变量
-static ConfigManager_PrivateConfig static_config_;
+// 常量定义
+const char* ConfigManager::CONFIG_FILE_PATH = "/config.json";
 
-// 纯公开函数实现
-ConfigManager_PrivateConfig* config_manager_get_config_holder() {
-    return &static_config_;
-}
+// 静态成员变量定义
+bool ConfigManager::_initialized = false;
+bool ConfigManager::_config_valid = false;
+uint32_t ConfigManager::_error_count = 0;
+config_map_t ConfigManager::_default_map;
+config_map_t ConfigManager::_runtime_map;
+std::map<std::string, std::string> ConfigManager::_string_cache;
+std::vector<ConfigInitFunction> ConfigManager::_init_functions;
+ConfigManager* ConfigManager::_instance = nullptr;
 
-bool config_manager_load_config_from_manager(ConfigManager* config_manager) {
-    if (!config_manager) {
-        return false;
-    }
-    
-    // 从ConfigManager加载配置项到静态配置
-    bool success = true;
-    
-    // 加载各种配置项
-    success &= config_manager->get_bool("enable_auto_save", static_config_.enable_auto_save);
-    success &= config_manager->get_uint16("auto_save_interval", static_config_.auto_save_interval);
-    success &= config_manager->get_bool("enable_backup", static_config_.enable_backup);
-    success &= config_manager->get_uint8("max_backups", static_config_.max_backups);
-    success &= config_manager->get_bool("enable_validation", static_config_.enable_validation);
-    success &= config_manager->get_bool("enable_encryption", static_config_.enable_encryption);
-    success &= config_manager->get_string("encryption_key", static_config_.encryption_key);
-    success &= config_manager->get_uint16("eeprom_start_addr", static_config_.eeprom_start_addr);
-    success &= config_manager->get_uint16("eeprom_size", static_config_.eeprom_size);
-    success &= config_manager->get_uint32("flash_start_addr", static_config_.flash_start_addr);
-    success &= config_manager->get_uint32("flash_size", static_config_.flash_size);
-    
-    return success;
-}
-
-ConfigManager_PrivateConfig config_manager_get_config_copy() {
-    return static_config_;
-}
-
-bool config_manager_write_config_to_manager(ConfigManager* config_manager, const ConfigManager_PrivateConfig& config) {
-    if (!config_manager) {
-        return false;
-    }
-    
-    // 将配置写入ConfigManager
-    bool success = true;
-    
-    success &= config_manager->set_bool("enable_auto_save", config.enable_auto_save);
-    success &= config_manager->set_uint16("auto_save_interval", config.auto_save_interval);
-    success &= config_manager->set_bool("enable_backup", config.enable_backup);
-    success &= config_manager->set_uint8("max_backups", config.max_backups);
-    success &= config_manager->set_bool("enable_validation", config.enable_validation);
-    success &= config_manager->set_bool("enable_encryption", config.enable_encryption);
-    success &= config_manager->set_string("encryption_key", config.encryption_key);
-    success &= config_manager->set_uint16("eeprom_start_addr", config.eeprom_start_addr);
-    success &= config_manager->set_uint16("eeprom_size", config.eeprom_size);
-    success &= config_manager->set_uint32("flash_start_addr", config.flash_start_addr);
-    success &= config_manager->set_uint32("flash_size", config.flash_size);
-    
-    // 更新静态配置
-    static_config_ = config;
-    
-    return success;
-}
-
-// 单例模式实现
+// 单例获取
 ConfigManager* ConfigManager::getInstance() {
-    if (instance_ == nullptr) {
-        instance_ = new ConfigManager();
+    if (!_instance) {
+        _instance = new ConfigManager();
     }
-    return instance_;
+    return _instance;
 }
 
-// 构造函数和析构函数
-ConfigManager::ConfigManager()
-    : initialized_(false)
-    , input_manager_(nullptr)
-    , light_manager_(nullptr)
-    , ui_manager_(nullptr)
-    , last_auto_save_time_(0)
-    , debug_enabled_(false)
-    , statistics_() {
+// 构造函数
+ConfigManager::ConfigManager() {
 }
 
+// 析构函数
 ConfigManager::~ConfigManager() {
-    deinit();
+    if (_initialized) {
+        save_config();
+    }
 }
 
-// 初始化和释放
-bool ConfigManager::init() {
-    if (initialized_) {
-        return true;
+// 初始化默认配置并加锁只读
+void ConfigManager::initialize_defaults() {
+    
+    _default_map.clear();
+    _string_cache.clear();
+    
+    // 调用所有注册的初始化函数
+    for (const auto& init_func : _init_functions) {
+        init_func(_default_map);
     }
     
-    log_debug("Initializing ConfigManager...");
+    // 调用各服务的默认配置注册函数
+    inputmanager_register_default_configs(_default_map);
+    lightmanager_register_default_configs(_default_map);
+    uimanager_register_default_configs(_default_map);
+}
+
+// 计算config_map的CRC32校验码
+uint32_t ConfigManager::calculate_crc32(const config_map_t& config_map) {
+    std::string json_data;
     
-    // 注册系统配置
-    if (!register_system_configs()) {
-        log_error("Failed to register system configs");
+    // 简化的JSON序列化用于CRC计算
+    json_data += "{";
+    bool first = true;
+    for (const auto& pair : config_map) {
+        if (!first) json_data += ",";
+        first = false;
+        
+        const std::string& key = pair.first;
+        const ConfigValue& value = pair.second;
+        
+        json_data += "\"" + key + "\":{";
+        json_data += "\"type\":" + std::to_string(static_cast<int>(value.type)) + ",";
+        json_data += "\"has_range\":" + std::string(value.has_range ? "true" : "false") + ",";
+        
+        switch (value.type) {
+            case ConfigValueType::BOOL:
+                json_data += "\"value\":" + std::string(value.bool_val ? "true" : "false");
+                break;
+            case ConfigValueType::INT8:
+                json_data += "\"value\":" + std::to_string(value.int8_val);
+                if (value.has_range) {
+                    json_data += ",\"min\":" + std::to_string(value.min_val.int8_min);
+                    json_data += ",\"max\":" + std::to_string(value.max_val.int8_max);
+                }
+                break;
+            case ConfigValueType::UINT8:
+                json_data += "\"value\":" + std::to_string(value.uint8_val);
+                if (value.has_range) {
+                    json_data += ",\"min\":" + std::to_string(value.min_val.uint8_min);
+                    json_data += ",\"max\":" + std::to_string(value.max_val.uint8_max);
+                }
+                break;
+            case ConfigValueType::UINT16:
+                json_data += "\"value\":" + std::to_string(value.uint16_val);
+                if (value.has_range) {
+                    json_data += ",\"min\":" + std::to_string(value.min_val.uint16_min);
+                    json_data += ",\"max\":" + std::to_string(value.max_val.uint16_max);
+                }
+                break;
+            case ConfigValueType::UINT32:
+                json_data += "\"value\":" + std::to_string(value.uint32_val);
+                if (value.has_range) {
+                    json_data += ",\"min\":" + std::to_string(value.min_val.uint32_min);
+                    json_data += ",\"max\":" + std::to_string(value.max_val.uint32_max);
+                }
+                break;
+            case ConfigValueType::FLOAT:
+                json_data += "\"value\":" + std::to_string(value.float_val);
+                if (value.has_range) {
+                    json_data += ",\"min\":" + std::to_string(value.min_val.float_min);
+                    json_data += ",\"max\":" + std::to_string(value.max_val.float_max);
+                }
+                break;
+            case ConfigValueType::STRING:
+                json_data += "\"value\":\"" + value.string_val + "\"";
+                break;
+        }
+        json_data += "}";
+    }
+    json_data += "}";
+    
+    return ConfigCRC::calculate_crc32(json_data);
+}
+
+// LittleFS初始化
+bool ConfigManager::littlefs_init() {
+#ifdef PICO_PLATFORM
+    if (!LittleFS.begin()) {
         return false;
     }
-    
-    // 加载所有配置
-    if (!load_all_configs()) {
-        log_debug("Failed to load configs, using defaults");
-        // 使用默认值，不算错误
-    }
-    
-    // 重置统计信息
-    reset_statistics();
-    
-    initialized_ = true;
-    log_debug("ConfigManager initialized successfully");
     return true;
+#else
+    return false;
+#endif
 }
 
-void ConfigManager::deinit() {
-    if (!initialized_) {
-        return;
+// 检查文件是否存在
+bool ConfigManager::littlefs_file_exists(const std::string& path) {
+#ifdef PICO_PLATFORM
+    return LittleFS.exists(path.c_str());
+#else
+    return false;
+#endif
+}
+
+// 读取文件
+bool ConfigManager::littlefs_read_file(const std::string& path, std::string& content) {
+#ifdef PICO_PLATFORM
+    if (!LittleFS.exists(path.c_str())) {
+        return false;
     }
     
-    log_debug("Deinitializing ConfigManager...");
-    
-    // 保存所有脏配置
-    save_all_configs();
-    
-    // 清理数据
-    configs_.clear();
-    groups_.clear();
-    templates_.clear();
-    backups_.clear();
-    
-    // 清理回调
-    change_callback_ = nullptr;
-    save_callback_ = nullptr;
-    load_callback_ = nullptr;
-    validation_callback_ = nullptr;
-    
-    initialized_ = false;
-    log_debug("ConfigManager deinitialized");
-}
-
-bool ConfigManager::is_ready() const {
-    return initialized_;
-}
-
-// 服务依赖
-bool ConfigManager::set_input_manager(InputManager* input_manager) {
-    input_manager_ = input_manager;
-    
-    // 注册输入相关配置
-    if (initialized_ && input_manager_) {
-        register_input_configs();
+    File file = LittleFS.open(path.c_str(), "r");
+    if (!file) {
+        return false;
     }
     
+    content.clear();
+    while (file.available()) {
+        content += (char)file.read();
+    }
+    file.close();
     return true;
+#else
+    return false;
+#endif
 }
 
-bool ConfigManager::set_light_manager(LightManager* light_manager) {
-    light_manager_ = light_manager;
-    
-    // 注册灯光相关配置
-    if (initialized_ && light_manager_) {
-        register_light_configs();
-    }
-    
-    return true;
-}
-
-bool ConfigManager::set_ui_manager(UIManager* ui_manager) {
-    ui_manager_ = ui_manager;
-    
-    // 注册UI相关配置
-    if (initialized_ && ui_manager_) {
-        register_ui_configs();
-    }
-    
-    return true;
-}
-
-// 配置管理已移至纯公开函数
-
-// 配置项管理
-bool ConfigManager::register_config(const std::string& key, const ConfigItem& item) {
-    if (!validate_key(key)) {
-        log_error("Invalid config key: " + key);
+// 写入文件
+bool ConfigManager::littlefs_write_file(const std::string& path, const std::string& content) {
+#ifdef PICO_PLATFORM
+    File file = LittleFS.open(path.c_str(), "w");
+    if (!file) {
         return false;
     }
     
-    if (configs_.find(key) != configs_.end()) {
-        log_debug("Config key already exists, updating: " + key);
-    }
-    
-    configs_[key] = item;
-    configs_[key].key = key;
-    
-    log_debug("Registered config: " + key);
-    return true;
+    size_t written = file.write(reinterpret_cast<const uint8_t*>(content.c_str()), content.length());
+    file.close();
+    return written == content.length();
+#else
+    return false;
+#endif
 }
 
-bool ConfigManager::unregister_config(const std::string& key) {
-    auto it = configs_.find(key);
-    if (it == configs_.end()) {
+// 私有接口：保存config_map到文件
+bool ConfigManager::config_save(const config_map_t* config_map, const std::string& file_path) {
+    if (!config_map) {
         return false;
     }
+        
+        // 构建JSON字符串
+        std::string json_data = "{";
+        bool first = true;
+        
+        // 序列化配置数据
+        for (const auto& pair : *config_map) {
+            if (!first) json_data += ",";
+            first = false;
+            
+            const std::string& key = pair.first;
+            const ConfigValue& value = pair.second;
+            
+            json_data += "\"" + key + "\":{";
+            json_data += "\"type\":" + std::to_string(static_cast<int>(value.type));
+            
+            switch (value.type) {
+                case ConfigValueType::BOOL:
+                    json_data += ",\"value\":" + std::string(value.bool_val ? "true" : "false");
+                    break;
+                case ConfigValueType::INT8:
+                    json_data += ",\"value\":" + std::to_string(value.int8_val);
+                    if (value.has_range) {
+                        json_data += ",\"min\":" + std::to_string(value.min_val.int8_min);
+                        json_data += ",\"max\":" + std::to_string(value.max_val.int8_max);
+                    }
+                    break;
+                case ConfigValueType::UINT8:
+                    json_data += ",\"value\":" + std::to_string(value.uint8_val);
+                    if (value.has_range) {
+                        json_data += ",\"min\":" + std::to_string(value.min_val.uint8_min);
+                        json_data += ",\"max\":" + std::to_string(value.max_val.uint8_max);
+                    }
+                    break;
+                case ConfigValueType::UINT16:
+                    json_data += ",\"value\":" + std::to_string(value.uint16_val);
+                    if (value.has_range) {
+                        json_data += ",\"min\":" + std::to_string(value.min_val.uint16_min);
+                        json_data += ",\"max\":" + std::to_string(value.max_val.uint16_max);
+                    }
+                    break;
+                case ConfigValueType::UINT32:
+                    json_data += ",\"value\":" + std::to_string(value.uint32_val);
+                    if (value.has_range) {
+                        json_data += ",\"min\":" + std::to_string(value.min_val.uint32_min);
+                        json_data += ",\"max\":" + std::to_string(value.max_val.uint32_max);
+                    }
+                    break;
+                case ConfigValueType::FLOAT:
+                    json_data += ",\"value\":" + std::to_string(value.float_val);
+                    if (value.has_range) {
+                        json_data += ",\"min\":" + std::to_string(value.min_val.float_min);
+                        json_data += ",\"max\":" + std::to_string(value.max_val.float_max);
+                    }
+                    break;
+                case ConfigValueType::STRING:
+                    json_data += ",\"value\":\"" + value.string_val + "\"";
+                    break;
+            }
+            json_data += "}";
+        }
+        
+        // 计算并添加CRC
+        uint32_t crc = calculate_crc32(*config_map);
+        json_data += ",\"" + std::string(CONFIG_KEY_CRC) + "\":" + std::to_string(crc);
+        json_data += "}";
+        
+        // 写入文件
+        return littlefs_write_file(file_path, json_data);
+}
+
+// 简化的JSON解析器
+static std::map<std::string, std::string> parse_simple_json(const std::string& json) {
+    std::map<std::string, std::string> result;
     
-    configs_.erase(it);
-    log_debug("Unregistered config: " + key);
-    return true;
-}
-
-bool ConfigManager::has_config(const std::string& key) const {
-    return configs_.find(key) != configs_.end();
-}
-
-bool ConfigManager::get_config_info(const std::string& key, ConfigItem& item) {
-    auto it = configs_.find(key);
-    if (it == configs_.end()) {
-        return false;
-    }
-    
-    item = it->second;
-    return true;
-}
-
-std::vector<std::string> ConfigManager::get_config_keys() const {
-    std::vector<std::string> keys;
-    for (const auto& pair : configs_) {
-        keys.push_back(pair.first);
-    }
-    return keys;
-}
-
-// 基本读写操作
-bool ConfigManager::set_bool(const std::string& key, bool value) {
-    return set_value(key, to_bytes(value));
-}
-
-bool ConfigManager::get_bool(const std::string& key, bool& value) {
-    std::vector<uint8_t> data;
-    if (!get_value(key, data)) {
-        return false;
-    }
-    return from_bytes(data, value);
-}
-
-bool ConfigManager::set_uint8(const std::string& key, uint8_t value) {
-    return set_value(key, to_bytes(value));
-}
-
-bool ConfigManager::get_uint8(const std::string& key, uint8_t& value) {
-    std::vector<uint8_t> data;
-    if (!get_value(key, data)) {
-        return false;
-    }
-    return from_bytes(data, value);
-}
-
-bool ConfigManager::set_uint16(const std::string& key, uint16_t value) {
-    return set_value(key, to_bytes(value));
-}
-
-bool ConfigManager::get_uint16(const std::string& key, uint16_t& value) {
-    std::vector<uint8_t> data;
-    if (!get_value(key, data)) {
-        return false;
-    }
-    return from_bytes(data, value);
-}
-
-bool ConfigManager::set_uint32(const std::string& key, uint32_t value) {
-    return set_value(key, to_bytes(value));
-}
-
-bool ConfigManager::get_uint32(const std::string& key, uint32_t& value) {
-    std::vector<uint8_t> data;
-    if (!get_value(key, data)) {
-        return false;
-    }
-    return from_bytes(data, value);
-}
-
-bool ConfigManager::set_float(const std::string& key, float value) {
-    return set_value(key, to_bytes(value));
-}
-
-bool ConfigManager::get_float(const std::string& key, float& value) {
-    std::vector<uint8_t> data;
-    if (!get_value(key, data)) {
-        return false;
-    }
-    return from_bytes(data, value);
-}
-
-bool ConfigManager::set_string(const std::string& key, const std::string& value) {
-    return set_value(key, to_bytes(value));
-}
-
-bool ConfigManager::get_string(const std::string& key, std::string& value) {
-    std::vector<uint8_t> data;
-    if (!get_value(key, data)) {
-        return false;
-    }
-    return from_bytes(data, value);
-}
-
-bool ConfigManager::set_binary(const std::string& key, const std::vector<uint8_t>& value) {
-    return set_value(key, value);
-}
-
-bool ConfigManager::get_binary(const std::string& key, std::vector<uint8_t>& value) {
-    return get_value(key, value);
-}
-
-// 通用读写操作
-bool ConfigManager::set_value(const std::string& key, const std::vector<uint8_t>& data) {
-    if (!initialized_) {
-        return false;
-    }
-    
-    auto it = configs_.find(key);
-    if (it == configs_.end()) {
-        log_error("Config not found: " + key);
-        return false;
-    }
-    
-    if (!validate_access(key, true)) {
-        log_error("Write access denied: " + key);
-        return false;
-    }
-    
-    if (!validate_type(it->second, data) || !validate_range(it->second, data)) {
-        log_error("Validation failed: " + key);
-        statistics_.validation_errors++;
-        return false;
-    }
-    
-    // 更新数据
-    it->second.data = data;
-    it->second.dirty = true;
-    it->second.last_modified = statistics_.uptime_seconds;
-    
-    // 通知变更
-    notify_change(key, it->second);
-    
-    statistics_.total_writes++;
-    log_debug("Set config: " + key);
-    return true;
-}
-
-bool ConfigManager::get_value(const std::string& key, std::vector<uint8_t>& data) {
-    if (!initialized_) {
-        return false;
-    }
-    
-    auto it = configs_.find(key);
-    if (it == configs_.end()) {
-        return false;
-    }
-    
-    if (!validate_access(key, false)) {
-        return false;
-    }
-    
-    data = it->second.data;
-    statistics_.total_reads++;
-    return true;
-}
-
-// 默认值操作
-bool ConfigManager::reset_to_default(const std::string& key) {
-    auto it = configs_.find(key);
-    if (it == configs_.end()) {
-        return false;
-    }
-    
-    it->second.data = it->second.default_data;
-    it->second.dirty = true;
-    it->second.last_modified = statistics_.uptime_seconds;
-    
-    notify_change(key, it->second);
-    log_debug("Reset to default: " + key);
-    return true;
-}
-
-bool ConfigManager::reset_all_to_default() {
-    for (auto& pair : configs_) {
-        pair.second.data = pair.second.default_data;
-        pair.second.dirty = true;
-        pair.second.last_modified = statistics_.uptime_seconds;
-        notify_change(pair.first, pair.second);
-    }
-    
-    log_debug("Reset all configs to default");
-    return true;
-}
-
-// 持久化操作
-bool ConfigManager::save_config(const std::string& key) {
-    if (key.empty()) {
-        return save_all_configs();
-    }
-    
-    auto it = configs_.find(key);
-    if (it == configs_.end()) {
-        return false;
-    }
-    
-    bool success = false;
-    switch (it->second.storage) {
-        case ConfigStorage::EEPROM:
-            success = save_to_eeprom(key, it->second.data);
-            break;
-        case ConfigStorage::FLASH:
-            success = save_to_flash(key, it->second.data);
-            break;
-        case ConfigStorage::RAM:
-        case ConfigStorage::EXTERNAL:
-        default:
-            success = true; // RAM不需要保存
-            break;
-    }
-    
-    if (success) {
-        it->second.dirty = false;
-        statistics_.total_saves++;
-        log_debug("Saved config: " + key);
-    } else {
-        log_error("Failed to save config: " + key);
-    }
-    
-    return success;
-}
-
-bool ConfigManager::load_config(const std::string& key) {
-    if (key.empty()) {
-        return load_all_configs();
-    }
-    
-    auto it = configs_.find(key);
-    if (it == configs_.end()) {
-        return false;
-    }
-    
-    std::vector<uint8_t> data;
-    bool success = false;
-    
-    switch (it->second.storage) {
-        case ConfigStorage::EEPROM:
-            success = load_from_eeprom(key, data);
-            break;
-        case ConfigStorage::FLASH:
-            success = load_from_flash(key, data);
-            break;
-        case ConfigStorage::RAM:
-        case ConfigStorage::EXTERNAL:
-        default:
-            success = true; // RAM使用当前值
-            data = it->second.data;
-            break;
-    }
-    
-    if (success && !data.empty()) {
-        if (validate_type(it->second, data) && validate_range(it->second, data)) {
-            it->second.data = data;
-            it->second.dirty = false;
-            statistics_.total_loads++;
-            log_debug("Loaded config: " + key);
+    size_t pos = 0;
+    while (pos < json.length()) {
+        // 查找键
+        size_t key_start = json.find('"', pos);
+        if (key_start == std::string::npos) break;
+        key_start++;
+        
+        size_t key_end = json.find('"', key_start);
+        if (key_end == std::string::npos) break;
+        
+        std::string key = json.substr(key_start, key_end - key_start);
+        
+        // 查找值
+        size_t colon = json.find(':', key_end);
+        if (colon == std::string::npos) break;
+        
+        size_t value_start = colon + 1;
+        while (value_start < json.length() && (json[value_start] == ' ' || json[value_start] == '\t')) {
+            value_start++;
+        }
+        
+        size_t value_end;
+        if (json[value_start] == '{') {
+            // 对象值
+            int brace_count = 1;
+            value_end = value_start + 1;
+            while (value_end < json.length() && brace_count > 0) {
+                if (json[value_end] == '{') brace_count++;
+                else if (json[value_end] == '}') brace_count--;
+                value_end++;
+            }
         } else {
-            log_error("Validation failed for loaded config: " + key);
-            statistics_.validation_errors++;
-            success = false;
-        }
-    } else {
-        log_debug("Failed to load config, using default: " + key);
-        it->second.data = it->second.default_data;
-        it->second.dirty = true;
-    }
-    
-    return success;
-}
-
-bool ConfigManager::save_all_configs() {
-    bool all_success = true;
-    
-    for (auto& pair : configs_) {
-        if (pair.second.dirty && pair.second.storage != ConfigStorage::RAM) {
-            if (!save_config(pair.first)) {
-                all_success = false;
+            // 简单值
+            value_end = json.find(',', value_start);
+            if (value_end == std::string::npos) {
+                value_end = json.find('}', value_start);
             }
         }
+        
+        if (value_end == std::string::npos) break;
+        
+        std::string value = json.substr(value_start, value_end - value_start);
+        result[key] = value;
+        
+        pos = value_end + 1;
     }
     
-    log_debug("Save all configs completed");
-    return all_success;
-}
-
-bool ConfigManager::load_all_configs() {
-    bool all_success = true;
-    
-    for (auto& pair : configs_) {
-        if (pair.second.storage != ConfigStorage::RAM) {
-            if (!load_config(pair.first)) {
-                all_success = false;
-            }
-        }
-    }
-    
-    log_debug("Load all configs completed");
-    return all_success;
-}
-
-// 统计信息
-bool ConfigManager::get_statistics(ConfigStatistics& stats) {
-    stats = statistics_;
-    return true;
-}
-
-void ConfigManager::reset_statistics() {
-    statistics_ = ConfigStatistics();
-    statistics_.last_reset_time = 0; // 应该使用实际时间
-}
-
-// 回调设置
-void ConfigManager::set_change_callback(ConfigChangeCallback callback) {
-    change_callback_ = callback;
-}
-
-void ConfigManager::set_save_callback(ConfigSaveCallback callback) {
-    save_callback_ = callback;
-}
-
-void ConfigManager::set_load_callback(ConfigLoadCallback callback) {
-    load_callback_ = callback;
-}
-
-void ConfigManager::set_validation_callback(ConfigValidationCallback callback) {
-    validation_callback_ = callback;
-}
-
-// 任务处理
-void ConfigManager::task() {
-    if (!initialized_) {
-        return;
-    }
-    
-    statistics_.uptime_seconds++;
-    
-    // 处理自动保存
-    handle_auto_save();
-}
-
-// 调试功能
-void ConfigManager::enable_debug_output(bool enabled) {
-    debug_enabled_ = enabled;
-}
-
-std::string ConfigManager::get_debug_info() {
-    std::stringstream ss;
-    ss << "ConfigManager Debug Info:\n";
-    ss << "Initialized: " << (initialized_ ? "Yes" : "No") << "\n";
-    ss << "Total configs: " << configs_.size() << "\n";
-    ss << "Total groups: " << groups_.size() << "\n";
-    ss << "Total templates: " << templates_.size() << "\n";
-    ss << "Total backups: " << backups_.size() << "\n";
-    ConfigManager_PrivateConfig config = config_manager_get_config_copy();
-    ss << "Auto save enabled: " << (config.enable_auto_save ? "Yes" : "No") << "\n";
-    ss << "Debug enabled: " << (debug_enabled_ ? "Yes" : "No") << "\n";
-    return ss.str();
-}
-
-// 预定义配置注册
-bool ConfigManager::register_system_configs() {
-    // 系统基本配置
-    ConfigItem item;
-    
-    // 设备名称
-    item = ConfigItem();
-    item.description = "Device name";
-    item.type = ConfigType::STRING;
-    item.access = ConfigAccess::READ_WRITE;
-    item.storage = ConfigStorage::EEPROM;
-    item.max_length = 32;
-    item.default_data = to_bytes(std::string("MaiMai Controller"));
-    item.data = item.default_data;
-    register_config("system.device_name", item);
-    
-    // 固件版本
-    item = ConfigItem();
-    item.description = "Firmware version";
-    item.type = ConfigType::STRING;
-    item.access = ConfigAccess::READ_ONLY;
-    item.storage = ConfigStorage::RAM;
-    item.max_length = 16;
-    item.default_data = to_bytes(std::string("3.0.0"));
-    item.data = item.default_data;
-    register_config("system.firmware_version", item);
-    
-    // 硬件版本
-    item = ConfigItem();
-    item.description = "Hardware version";
-    item.type = ConfigType::STRING;
-    item.access = ConfigAccess::READ_ONLY;
-    item.storage = ConfigStorage::RAM;
-    item.max_length = 16;
-    item.default_data = to_bytes(std::string("1.0.0"));
-    item.data = item.default_data;
-    register_config("system.hardware_version", item);
-    
-    // 调试模式
-    item = ConfigItem();
-    item.description = "Debug mode enabled";
-    item.type = ConfigType::BOOL;
-    item.access = ConfigAccess::READ_WRITE;
-    item.storage = ConfigStorage::EEPROM;
-    item.default_data = to_bytes(false);
-    item.data = item.default_data;
-    register_config("system.debug_enabled", item);
-    
-    log_debug("System configs registered");
-    return true;
-}
-
-bool ConfigManager::register_input_configs() {
-    if (!input_manager_) {
-        return false;
-    }
-    
-    ConfigItem item;
-    
-    // 扫描间隔
-    item = ConfigItem();
-    item.description = "Input scan interval (ms)";
-    item.type = ConfigType::UINT16;
-    item.access = ConfigAccess::READ_WRITE;
-    item.storage = ConfigStorage::EEPROM;
-    item.min_value = 1;
-    item.max_value = 100;
-    item.default_data = to_bytes(static_cast<uint16_t>(10));
-    item.data = item.default_data;
-    register_config("input.scan_interval", item);
-    
-    // 防抖时间
-    item = ConfigItem();
-    item.description = "Input debounce time (ms)";
-    item.type = ConfigType::UINT16;
-    item.access = ConfigAccess::READ_WRITE;
-    item.storage = ConfigStorage::EEPROM;
-    item.min_value = 0;
-    item.max_value = 100;
-    item.default_data = to_bytes(static_cast<uint16_t>(5));
-    item.data = item.default_data;
-    register_config("input.debounce_time", item);
-    
-    // 长按阈值
-    item = ConfigItem();
-    item.description = "Hold threshold (ms)";
-    item.type = ConfigType::UINT16;
-    item.access = ConfigAccess::READ_WRITE;
-    item.storage = ConfigStorage::EEPROM;
-    item.min_value = 100;
-    item.max_value = 5000;
-    item.default_data = to_bytes(static_cast<uint16_t>(500));
-    item.data = item.default_data;
-    register_config("input.hold_threshold", item);
-    
-    log_debug("Input configs registered");
-    return true;
-}
-
-bool ConfigManager::register_light_configs() {
-    if (!light_manager_) {
-        return false;
-    }
-    
-    ConfigItem item;
-    
-    // 全局亮度
-    item = ConfigItem();
-    item.description = "Global brightness (0-255)";
-    item.type = ConfigType::UINT8;
-    item.access = ConfigAccess::READ_WRITE;
-    item.storage = ConfigStorage::EEPROM;
-    item.min_value = 0;
-    item.max_value = 255;
-    item.default_data = to_bytes(static_cast<uint8_t>(128));
-    item.data = item.default_data;
-    register_config("light.global_brightness", item);
-    
-    // 更新间隔
-    item = ConfigItem();
-    item.description = "Light update interval (ms)";
-    item.type = ConfigType::UINT16;
-    item.access = ConfigAccess::READ_WRITE;
-    item.storage = ConfigStorage::EEPROM;
-    item.min_value = 10;
-    item.max_value = 1000;
-    item.default_data = to_bytes(static_cast<uint16_t>(50));
-    item.data = item.default_data;
-    register_config("light.update_interval", item);
-    
-    log_debug("Light configs registered");
-    return true;
-}
-
-bool ConfigManager::register_ui_configs() {
-    if (!ui_manager_) {
-        return false;
-    }
-    
-    ConfigItem item;
-    
-    // 屏幕亮度
-    item = ConfigItem();
-    item.description = "Screen brightness (0-255)";
-    item.type = ConfigType::UINT8;
-    item.access = ConfigAccess::READ_WRITE;
-    item.storage = ConfigStorage::EEPROM;
-    item.min_value = 0;
-    item.max_value = 255;
-    item.default_data = to_bytes(static_cast<uint8_t>(200));
-    item.data = item.default_data;
-    register_config("ui.screen_brightness", item);
-    
-    // 屏保时间
-    item = ConfigItem();
-    item.description = "Screensaver timeout (s)";
-    item.type = ConfigType::UINT16;
-    item.access = ConfigAccess::READ_WRITE;
-    item.storage = ConfigStorage::EEPROM;
-    item.min_value = 0;
-    item.max_value = 3600;
-    item.default_data = to_bytes(static_cast<uint16_t>(300));
-    item.data = item.default_data;
-    register_config("ui.screensaver_timeout", item);
-    
-    log_debug("UI configs registered");
-    return true;
-}
-
-// 私有方法实现
-bool ConfigManager::validate_key(const std::string& key) const {
-    if (key.empty() || key.length() > 64) {
-        return false;
-    }
-    
-    // 检查字符是否有效
-    for (char c : key) {
-        if (!std::isalnum(c) && c != '.' && c != '_' && c != '-') {
-            return false;
-        }
-    }
-    
-    return true;
-}
-
-bool ConfigManager::validate_access(const std::string& key, bool write_access) const {
-    auto it = configs_.find(key);
-    if (it == configs_.end()) {
-        return false;
-    }
-    
-    const ConfigItem& item = it->second;
-    
-    if (write_access) {
-        return item.access == ConfigAccess::READ_WRITE || item.access == ConfigAccess::WRITE_ONCE;
-    } else {
-        return item.access != ConfigAccess::ADMIN_ONLY; // 简化的权限检查
-    }
-}
-
-bool ConfigManager::validate_type(const ConfigItem& item, const std::vector<uint8_t>& data) const {
-    switch (item.type) {
-        case ConfigType::BOOL:
-            return data.size() == 1;
-        case ConfigType::INT8:
-        case ConfigType::UINT8:
-            return data.size() == 1;
-        case ConfigType::INT16:
-        case ConfigType::UINT16:
-            return data.size() == 2;
-        case ConfigType::INT32:
-        case ConfigType::UINT32:
-        case ConfigType::FLOAT:
-            return data.size() == 4;
-        case ConfigType::STRING:
-        case ConfigType::BINARY:
-            return data.size() <= item.max_length;
-        default:
-            return false;
-    }
-}
-
-bool ConfigManager::validate_range(const ConfigItem& item, const std::vector<uint8_t>& data) const {
-    // 简化的范围检查
-    if (item.type == ConfigType::UINT8 && data.size() == 1) {
-        uint8_t value = data[0];
-        return value >= item.min_value && value <= item.max_value;
-    }
-    
-    return true; // 其他类型暂时跳过范围检查
-}
-
-bool ConfigManager::save_to_eeprom(const std::string& key, const std::vector<uint8_t>& data) {
-    // Use flash storage instead of EEPROM on Pico
-    return save_to_flash(key, data);
-}
-
-bool ConfigManager::load_from_eeprom(const std::string& key, std::vector<uint8_t>& data) {
-    // Use flash storage instead of EEPROM on Pico
-    return load_from_flash(key, data);
-}
-
-bool ConfigManager::save_to_flash(const std::string& key, const std::vector<uint8_t>& data) {
-    ConfigManager_PrivateConfig config = config_manager_get_config_copy();
-    uint32_t addr = config.flash_start_addr;
-    
-    // 计算键的哈希作为地址偏移
-    uint32_t hash = 0;
-    for (char c : key) hash = hash * 31 + c;
-    addr += (hash % (config.flash_size - data.size() - 4)) & ~0xFF; // 页对齐
-    
-    // 擦除扇区
-    flash_range_erase(addr - XIP_BASE, FLASH_SECTOR_SIZE);
-    
-    // 准备写入数据
-    std::vector<uint8_t> write_data;
-    uint32_t len = data.size();
-    write_data.insert(write_data.end(), (uint8_t*)&len, (uint8_t*)&len + 4);
-    write_data.insert(write_data.end(), data.begin(), data.end());
-    
-    // 页对齐
-    while (write_data.size() % FLASH_PAGE_SIZE) {
-        write_data.push_back(0xFF);
-    }
-    
-    // 写入Flash
-    flash_range_program(addr - XIP_BASE, write_data.data(), write_data.size());
-    
-    statistics_.total_saves++;
-    return true;
-}
-
-bool ConfigManager::load_from_flash(const std::string& key, std::vector<uint8_t>& data) {
-    ConfigManager_PrivateConfig config = config_manager_get_config_copy();
-    uint32_t addr = config.flash_start_addr;
-    
-    // 计算键的哈希作为地址偏移
-    uint32_t hash = 0;
-    for (char c : key) hash = hash * 31 + c;
-    addr += (hash % (config.flash_size - 4)) & ~0xFF; // 页对齐
-    
-    // 读取数据长度
-    uint32_t len = *(uint32_t*)addr;
-    
-    if (len == 0xFFFFFFFF || len > config.flash_size) {
-        return false; // 未初始化或损坏
-    }
-    
-    addr += 4;
-    data.resize(len);
-    
-    if (len > 0) {
-        memcpy(data.data(), (void*)addr, len);
-    }
-    
-    statistics_.total_loads++;
-    return true;
-}
-
-void ConfigManager::handle_auto_save() {
-    ConfigManager_PrivateConfig config = config_manager_get_config_copy();
-    if (!config.enable_auto_save) {
-        return;
-    }
-    
-    uint32_t current_time = statistics_.uptime_seconds;
-    if (current_time - last_auto_save_time_ >= config.auto_save_interval) {
-        save_all_configs();
-        last_auto_save_time_ = current_time;
-    }
-}
-
-void ConfigManager::notify_change(const std::string& key, const ConfigItem& item) {
-    if (change_callback_) {
-        change_callback_(key, item);
-    }
-}
-
-void ConfigManager::log_debug(const std::string& message) {
-    if (debug_enabled_) {
-        printf("[CONFIG_DEBUG] %s\n", message.c_str());
-    }
-}
-
-void ConfigManager::log_error(const std::string& message) {
-    printf("[CONFIG_ERROR] %s\n", message.c_str());
-}
-
-// 类型转换辅助实现
-std::vector<uint8_t> ConfigManager::to_bytes(bool value) {
-    return {static_cast<uint8_t>(value ? 1 : 0)};
-}
-
-std::vector<uint8_t> ConfigManager::to_bytes(uint8_t value) {
-    return {value};
-}
-
-std::vector<uint8_t> ConfigManager::to_bytes(uint16_t value) {
-    return {static_cast<uint8_t>(value & 0xFF), static_cast<uint8_t>((value >> 8) & 0xFF)};
-}
-
-std::vector<uint8_t> ConfigManager::to_bytes(uint32_t value) {
-    return {
-        static_cast<uint8_t>(value & 0xFF),
-        static_cast<uint8_t>((value >> 8) & 0xFF),
-        static_cast<uint8_t>((value >> 16) & 0xFF),
-        static_cast<uint8_t>((value >> 24) & 0xFF)
-    };
-}
-
-std::vector<uint8_t> ConfigManager::to_bytes(float value) {
-    union { float f; uint32_t i; } converter;
-    converter.f = value;
-    return to_bytes(converter.i);
-}
-
-std::vector<uint8_t> ConfigManager::to_bytes(const std::string& value) {
-    std::vector<uint8_t> result(value.begin(), value.end());
     return result;
 }
 
-bool ConfigManager::from_bytes(const std::vector<uint8_t>& data, bool& value) {
-    if (data.size() != 1) return false;
-    value = data[0] != 0;
+// 从对象字符串中提取值
+static std::string extract_value_from_object(const std::string& obj, const std::string& field) {
+    size_t field_pos = obj.find('"' + field + '"');
+    if (field_pos == std::string::npos) return "";
+    
+    size_t colon = obj.find(':', field_pos);
+    if (colon == std::string::npos) return "";
+    
+    size_t value_start = colon + 1;
+    while (value_start < obj.length() && (obj[value_start] == ' ' || obj[value_start] == '\t')) {
+        value_start++;
+    }
+    
+    size_t value_end;
+    if (obj[value_start] == '"') {
+        value_start++;
+        value_end = obj.find('"', value_start);
+    } else {
+        value_end = obj.find(',', value_start);
+        if (value_end == std::string::npos) {
+            value_end = obj.find('}', value_start);
+        }
+    }
+    
+    if (value_end == std::string::npos) return "";
+    
+    return obj.substr(value_start, value_end - value_start);
+}
+
+// 私有接口：从文件读取config_map
+void ConfigManager::config_read(config_map_t* config_map, const std::string& file_path) {
+    if (!config_map) {
+        return;
+    }
+    
+    std::string json_content;
+    if (!littlefs_read_file(file_path, json_content)) {
+        return;
+    }
+    
+    if (json_content.empty()) {
+        return;
+    }
+        
+        // 解析JSON
+        auto json_map = parse_simple_json(json_content);
+        
+        config_map->clear();
+        uint32_t stored_crc = 0;
+        
+        // 反序列化配置数据
+        for (const auto& kv : json_map) {
+            const std::string& key = kv.first;
+            const std::string& obj_str = kv.second;
+            
+            // 处理CRC键
+            if (key == CONFIG_KEY_CRC) {
+                stored_crc = std::stoul(obj_str);
+                continue;
+            }
+            
+            // 解析配置对象
+            std::string type_str = extract_value_from_object(obj_str, "type");
+            std::string value_str = extract_value_from_object(obj_str, "value");
+            
+            if (type_str.empty() || value_str.empty()) {
+                continue;
+            }
+            
+            ConfigValueType type = static_cast<ConfigValueType>(std::stoi(type_str));
+            ConfigValue new_value;
+            
+            switch (type) {
+                case ConfigValueType::BOOL:
+                    new_value = ConfigValue(value_str == "true");
+                    break;
+                case ConfigValueType::INT8: {
+                    int8_t val = static_cast<int8_t>(std::stoi(value_str));
+                    std::string min_str = extract_value_from_object(obj_str, "min");
+                    std::string max_str = extract_value_from_object(obj_str, "max");
+                    if (!min_str.empty() && !max_str.empty()) {
+                        new_value = ConfigValue(val, static_cast<int8_t>(std::stoi(min_str)), static_cast<int8_t>(std::stoi(max_str)));
+                    } else {
+                        new_value = ConfigValue(val);
+                    }
+                    break;
+                }
+                case ConfigValueType::UINT8: {
+                    uint8_t val = static_cast<uint8_t>(std::stoul(value_str));
+                    std::string min_str = extract_value_from_object(obj_str, "min");
+                    std::string max_str = extract_value_from_object(obj_str, "max");
+                    if (!min_str.empty() && !max_str.empty()) {
+                        new_value = ConfigValue(val, static_cast<uint8_t>(std::stoul(min_str)), static_cast<uint8_t>(std::stoul(max_str)));
+                    } else {
+                        new_value = ConfigValue(val);
+                    }
+                    break;
+                }
+                case ConfigValueType::UINT16: {
+                    uint16_t val = static_cast<uint16_t>(std::stoul(value_str));
+                    std::string min_str = extract_value_from_object(obj_str, "min");
+                    std::string max_str = extract_value_from_object(obj_str, "max");
+                    if (!min_str.empty() && !max_str.empty()) {
+                        new_value = ConfigValue(val, static_cast<uint16_t>(std::stoul(min_str)), static_cast<uint16_t>(std::stoul(max_str)));
+                    } else {
+                        new_value = ConfigValue(val);
+                    }
+                    break;
+                }
+                case ConfigValueType::UINT32: {
+                    uint32_t val = static_cast<uint32_t>(std::stoul(value_str));
+                    std::string min_str = extract_value_from_object(obj_str, "min");
+                    std::string max_str = extract_value_from_object(obj_str, "max");
+                    if (!min_str.empty() && !max_str.empty()) {
+                        new_value = ConfigValue(val, static_cast<uint32_t>(std::stoul(min_str)), static_cast<uint32_t>(std::stoul(max_str)));
+                    } else {
+                        new_value = ConfigValue(val);
+                    }
+                    break;
+                }
+                case ConfigValueType::FLOAT: {
+                    float val = std::stof(value_str);
+                    std::string min_str = extract_value_from_object(obj_str, "min");
+                    std::string max_str = extract_value_from_object(obj_str, "max");
+                    if (!min_str.empty() && !max_str.empty()) {
+                        new_value = ConfigValue(val, std::stof(min_str), std::stof(max_str));
+                    } else {
+                        new_value = ConfigValue(val);
+                    }
+                    break;
+                }
+                case ConfigValueType::STRING:
+                    new_value = ConfigValue(value_str);
+                    break;
+                default:
+                    continue;
+            }
+            
+            (*config_map)[key] = new_value;
+        }
+        
+        // CRC校验
+        uint32_t calculated_crc = calculate_crc32(*config_map);
+        if (calculated_crc != stored_crc) {
+            config_map->clear();
+            return;
+        }
+}
+
+// 异常处理/重置流程
+void ConfigManager::handle_config_exception() {
+    _error_count++;
+    
+    // 使用默认map保存配置
+    if (config_save(&_default_map, CONFIG_FILE_PATH)) {
+        // 复制默认map到运行时map
+        _runtime_map = _default_map;
+        _config_valid = true;
+    } else {
+        _config_valid = false;
+    }
+}
+
+// 初始化配置模块
+bool ConfigManager::initialize() {
+    if (_initialized) {
+        return true;
+    }
+    
+    // 初始化LittleFS
+    if (!littlefs_init()) {
+        return false;
+    }
+    
+    _initialized = true;
+    _config_valid = false;
+    
+    // 初始化默认配置
+    initialize_defaults();
+    
+    // 尝试读取配置文件
+    config_read(&_runtime_map, CONFIG_FILE_PATH);
+    
+    // 合并缺失的默认配置键
+    for (const auto& default_pair : _default_map) {
+        if (_runtime_map.find(default_pair.first) == _runtime_map.end()) {
+            _runtime_map[default_pair.first] = default_pair.second;
+        }
+    }
+    
+    _config_valid = true;
+    
     return true;
 }
 
-bool ConfigManager::from_bytes(const std::vector<uint8_t>& data, uint8_t& value) {
-    if (data.size() != 1) return false;
-    value = data[0];
+// 反初始化配置模块
+void ConfigManager::deinit() {
+    _initialized = false;
+    _config_valid = false;
+    _runtime_map.clear();
+    _default_map.clear();
+    _string_cache.clear();
+    _init_functions.clear();
+    _error_count = 0;
+}
+
+// 检查配置键是否存在
+bool ConfigManager::has_key(const std::string& key) {
+    // 先检查运行时map
+    if (_runtime_map.find(key) != _runtime_map.end()) {
+        return true;
+    }
+    
+    // 再检查默认map
+    return _default_map.find(key) != _default_map.end();
+}
+
+// 读取配置值
+ConfigValue ConfigManager::get(const std::string& key) {
+    // 先从运行时map中查找
+    auto runtime_it = _runtime_map.find(key);
+    if (runtime_it != _runtime_map.end()) {
+        return runtime_it->second;
+    }
+    
+    // 从默认map中查找
+    auto default_it = _default_map.find(key);
+    if (default_it != _default_map.end()) {
+        // 添加到运行时map
+        _runtime_map[key] = default_it->second;
+        return default_it->second;
+    }
+    
+    // 键未注册，返回默认的bool值
+    return ConfigValue(false);
+}
+
+// 设置配置值
+void ConfigManager::set(const std::string& key, const ConfigValue& value) {
+    // 先检查运行时map
+    auto runtime_it = _runtime_map.find(key);
+    if (runtime_it != _runtime_map.end()) {
+        // 复制范围限制信息
+        ConfigValue new_value = value;
+        if (runtime_it->second.has_range && new_value.type == runtime_it->second.type) {
+            new_value.copy_range_from(runtime_it->second);
+            new_value.clamp_value();
+        }
+        _runtime_map[key] = new_value;
+        
+        // 清除字符串缓存
+        auto cache_it = _string_cache.find(key);
+        if (cache_it != _string_cache.end()) {
+            _string_cache.erase(cache_it);
+        }
+        return;
+    }
+    
+    // 检查默认map
+    auto default_it = _default_map.find(key);
+    if (default_it != _default_map.end()) {
+        // 从默认map添加到运行时map
+        ConfigValue new_value = value;
+        if (default_it->second.has_range && new_value.type == default_it->second.type) {
+            new_value.copy_range_from(default_it->second);
+            new_value.clamp_value();
+        }
+        _runtime_map[key] = new_value;
+        return;
+    }
+    return;
+}
+
+// 便捷类型获取接口实现
+bool ConfigManager::get_bool(const std::string& key) {
+    ConfigValue val = get(key);
+    if (val.type != ConfigValueType::BOOL) {
+        return false;
+    }
+    return val.bool_val;
+}
+
+int8_t ConfigManager::get_int8(const std::string& key) {
+    ConfigValue val = get(key);
+    if (val.type != ConfigValueType::INT8) {
+        return 0;
+    }
+    return val.int8_val;
+}
+
+uint8_t ConfigManager::get_uint8(const std::string& key) {
+    ConfigValue val = get(key);
+    if (val.type != ConfigValueType::UINT8) {
+        return 0;
+    }
+    return val.uint8_val;
+}
+
+uint16_t ConfigManager::get_uint16(const std::string& key) {
+    ConfigValue val = get(key);
+    if (val.type != ConfigValueType::UINT16) {
+        return 0;
+    }
+    return val.uint16_val;
+}
+
+uint32_t ConfigManager::get_uint32(const std::string& key) {
+    ConfigValue val = get(key);
+    if (val.type != ConfigValueType::UINT32) {
+        return 0;
+    }
+    return val.uint32_val;
+}
+
+float ConfigManager::get_float(const std::string& key) {
+    ConfigValue val = get(key);
+    if (val.type != ConfigValueType::FLOAT) {
+        return 0.0f;
+    }
+    return val.float_val;
+}
+
+std::string ConfigManager::get_string(const std::string& key) {
+    ConfigValue val = get(key);
+    if (val.type != ConfigValueType::STRING) {
+        return "";
+    }
+    return val.string_val;
+}
+
+const char* ConfigManager::get_cstring(const std::string& key) {
+    // 使用缓存避免返回临时对象的指针
+    auto cache_it = _string_cache.find(key);
+    if (cache_it != _string_cache.end()) {
+        return cache_it->second.c_str();
+    }
+    
+    std::string str = get_string(key);
+    _string_cache[key] = str;
+    return _string_cache[key].c_str();
+}
+
+// 便捷类型设置接口实现
+void ConfigManager::set_bool(const std::string& key, bool value) {
+    set(key, ConfigValue(value));
+}
+
+void ConfigManager::set_int8(const std::string& key, int8_t value) {
+    set(key, ConfigValue(value));
+}
+
+void ConfigManager::set_uint8(const std::string& key, uint8_t value) {
+    set(key, ConfigValue(value));
+}
+
+void ConfigManager::set_uint16(const std::string& key, uint16_t value) {
+    set(key, ConfigValue(value));
+}
+
+void ConfigManager::set_uint32(const std::string& key, uint32_t value) {
+    set(key, ConfigValue(value));
+}
+
+void ConfigManager::set_float(const std::string& key, float value) {
+    set(key, ConfigValue(value));
+}
+
+void ConfigManager::set_string(const std::string& key, const std::string& value) {
+    set(key, ConfigValue(value));
+}
+
+// 批量操作接口
+std::map<std::string, ConfigValue> ConfigManager::get_all() {
+    return _runtime_map;
+}
+
+void ConfigManager::set_batch(const std::map<std::string, ConfigValue>& values) {
+    for (const auto& pair : values) {
+        set(pair.first, pair.second);
+    }
+}
+
+// 配置分组接口
+std::map<std::string, ConfigValue> ConfigManager::get_group(const std::string& prefix) {
+    std::map<std::string, ConfigValue> result;
+    for (const auto& pair : _runtime_map) {
+        if (pair.first.substr(0, prefix.length()) == prefix) {
+            result[pair.first] = pair.second;
+        }
+    }
+    return result;
+}
+
+void ConfigManager::set_group(const std::string& prefix, const std::map<std::string, ConfigValue>& values) {
+    for (const auto& pair : values) {
+        if (pair.first.substr(0, prefix.length()) == prefix) {
+            set(pair.first, pair.second);
+        }
+    }
+}
+
+// 配置初始化函数注册
+bool ConfigManager::register_init_function(ConfigInitFunction func) {
+    _init_functions.push_back(func);
     return true;
 }
 
-bool ConfigManager::from_bytes(const std::vector<uint8_t>& data, uint16_t& value) {
-    if (data.size() != 2) return false;
-    value = data[0] | (static_cast<uint16_t>(data[1]) << 8);
-    return true;
+// 保存配置到文件
+bool ConfigManager::save_config() {
+    bool result = config_save(&_runtime_map, CONFIG_FILE_PATH);
+    if (!result) {
+        _error_count++;
+    }
+    return result;
 }
 
-bool ConfigManager::from_bytes(const std::vector<uint8_t>& data, uint32_t& value) {
-    if (data.size() != 4) return false;
-    value = data[0] | (static_cast<uint32_t>(data[1]) << 8) |
-            (static_cast<uint32_t>(data[2]) << 16) | (static_cast<uint32_t>(data[3]) << 24);
-    return true;
+// 重置到默认配置
+bool ConfigManager::reset_to_defaults() {
+    _runtime_map = _default_map;
+    return save_config();
 }
 
-bool ConfigManager::from_bytes(const std::vector<uint8_t>& data, float& value) {
-    if (data.size() != 4) return false;
-    uint32_t int_value;
-    if (!from_bytes(data, int_value)) return false;
-    union { float f; uint32_t i; } converter;
-    converter.i = int_value;
-    value = converter.f;
-    return true;
+// 调试接口
+void ConfigManager::debug_print_all_configs() {
+    // 在RP2040上可以通过串口输出调试信息
+    // 这里简化实现
 }
 
-bool ConfigManager::from_bytes(const std::vector<uint8_t>& data, std::string& value) {
-    value = std::string(data.begin(), data.end());
-    return true;
+// 字符串验证
+bool ConfigManager::is_valid_string(const std::string& str) {
+    // 简单的字符串验证
+    return !str.empty() && str.length() < 256;
 }

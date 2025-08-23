@@ -3,165 +3,193 @@
 
 #include "../../protocol/mai2light/mai2light.h"
 #include "../../protocol/neopixel/neopixel.h"
-#include <array>
-#include <vector>
+#include "../../hal/uart/hal_uart.h"
+#include <stdint.h>
 #include <string>
+#include <vector>
 #include <functional>
-#include <map>
-#include <memory>
+#include "../config_manager/config_types.h"
 
 // 前向声明
-class HID;
+class ConfigManager;
+class UIManager;
 
-// LED效果类型
-enum class LightEffect {
-    NONE = 0,
-    STATIC,          // 静态颜色
-    BREATHING,       // 呼吸效果
-    RAINBOW,         // 彩虹效果
-    WAVE,           // 波浪效果
-    RIPPLE,         // 涟漪效果
-    FLASH,          // 闪烁效果
-    FADE,           // 渐变效果
-    CHASE,          // 追逐效果
-    SPARKLE,        // 闪烁星光
-    FIRE,           // 火焰效果
-    CUSTOM          // 自定义效果
+// LightManager配置键定义 - 遵循服务层规则2: {服务名}_{子模块}_{键}
+#define LIGHTMANAGER_ENABLE "LIGHTMANAGER_ENABLE"
+#define LIGHTMANAGER_UART_DEVICE "LIGHTMANAGER_UART_DEVICE"
+#define LIGHTMANAGER_BAUD_RATE "LIGHTMANAGER_BAUD_RATE"
+#define LIGHTMANAGER_NODE_ID "LIGHTMANAGER_NODE_ID"
+#define LIGHTMANAGER_NEOPIXEL_COUNT "LIGHTMANAGER_NEOPIXEL_COUNT"
+#define LIGHTMANAGER_NEOPIXEL_PIN "LIGHTMANAGER_NEOPIXEL_PIN"
+#define LIGHTMANAGER_REGION_MAPPINGS "LIGHTMANAGER_REGION_MAPPINGS"
+
+// 协议常量定义 (基于BD15070_4.h)
+#define BD15070_SYNC 0xE0
+#define BD15070_MARKER 0xD0
+
+// 协议命令定义
+enum BD15070_Command : uint8_t {
+    SetLedGs8Bit = 0x31,
+    SetLedGs8BitMulti = 0x32,
+    SetLedGs8BitMultiFade = 0x33,
+    SetLedFet = 0x39,
+    SetDcUpdate = 0x3B,
+    SetLedGsUpdate = 0x3C,
+    SetDc = 0x3F,
+    SetEEPRom = 0x7B,
+    GetEEPRom = 0x7C,
+    SetEnableResponse = 0x7D,
+    SetDisableResponse = 0x7E,
+    GetBoardInfo = 0xF0,
+    GetBoardStatus = 0xF1,
+    GetFirmSum = 0xF2,
+    GetProtocolVersion = 0xF3
 };
 
-// LED区域定义
-struct LightRegion {
-    std::string name;           // 区域名称
-    std::vector<uint8_t> leds;  // LED索引列表
-    bool enabled;               // 是否启用
-    uint8_t priority;           // 优先级 (0-255)
-    
-    LightRegion() : enabled(true), priority(128) {}
+// 应答状态定义
+enum BD15070_AckStatus : uint8_t {
+    AckStatus_Ok = 0x01,
+    AckStatus_SumError = 0x02,
+    AckStatus_ParityError = 0x03,
+    AckStatus_FramingError = 0x04,
+    AckStatus_OverRunError = 0x05,
+    AckStatus_RecvBfOverFlow = 0x06,
+    AckStatus_Invalid = 0xFF
 };
 
-// LED效果参数
-struct EffectParams {
-    LightEffect effect;         // 效果类型
-    Mai2Light_RGB color1;       // 主颜色
-    Mai2Light_RGB color2;       // 辅助颜色
-    uint16_t speed;             // 速度 (ms)
-    uint8_t intensity;          // 强度 (0-255)
-    uint8_t fade_time;          // 渐变时间
-    bool reverse;               // 反向
-    bool loop;                  // 循环
-    uint32_t duration;          // 持续时间 (ms, 0=无限)
-    
-    EffectParams() 
-        : effect(LightEffect::NONE)
-        , color1{255, 255, 255}
-        , color2{0, 0, 0}
-        , speed(1000)
-        , intensity(255)
-        , fade_time(100)
-        , reverse(false)
-        , loop(true)
-        , duration(0) {}
+// 应答报告定义
+enum BD15070_AckReport : uint8_t {
+    AckReport_Ok = 0x01,
+    AckReport_Busy = 0x02,
+    AckReport_CommandUnknown = 0x03,
+    AckReport_ParamError = 0x04,
+    AckReport_Invalid = 0xFF
 };
 
-// LED状态
-struct LedState {
-    Mai2Light_RGB current_color;    // 当前颜色
-    Mai2Light_RGB target_color;     // 目标颜色
-    uint8_t brightness;             // 亮度
-    uint32_t last_update;           // 上次更新时间
-    bool dirty;                     // 需要更新
+// 数据类型定义
+typedef uint32_t bitmap32_t;
+
+// 请求数据包结构 (基于BD15070_4.h PacketReq)
+struct BD15070_PacketReq {
+    uint8_t dstNodeID;
+    uint8_t srcNodeID;
+    uint8_t length;
+    uint8_t command;
     
-    LedState() : brightness(255), last_update(0), dirty(false) {
-        current_color = {0, 0, 0};
-        target_color = {0, 0, 0};
-    }
+    union {
+        uint8_t timeout;
+        struct {
+            uint8_t index;
+            uint8_t color[3];
+        } led_gs8bit;
+        struct {
+            uint8_t start;
+            uint8_t end;
+            uint8_t skip;
+            uint8_t Multi_color[3];
+            uint8_t speed;
+        } led_multi;
+        struct {
+            uint8_t BodyLed;
+            uint8_t ExtLed;
+            uint8_t SideLed;
+        } led_fet;
+        struct {
+            uint8_t Set_adress;
+            uint8_t writeData;
+        } eeprom_set;
+        uint8_t Get_adress;
+        uint8_t Direct_color[11][3];
+    } data;
 };
 
-// 触摸反馈配置
-struct TouchFeedback {
-    bool enabled;               // 是否启用
-    LightEffect effect;         // 反馈效果
-    Mai2Light_RGB color;        // 反馈颜色
-    uint16_t duration;          // 持续时间 (ms)
-    uint8_t intensity;          // 强度
-    uint8_t fade_time;          // 渐变时间
+// 应答数据包结构 (基于BD15070_4.h PacketAck)
+struct BD15070_PacketAck {
+    uint8_t dstNodeID;
+    uint8_t srcNodeID;
+    uint8_t length;
+    uint8_t status;
+    uint8_t command;
+    uint8_t report;
     
-    TouchFeedback() 
-        : enabled(true)
-        , effect(LightEffect::FLASH)
-        , color{255, 255, 255}
-        , duration(200)
-        , intensity(255)
-        , fade_time(50) {}
+    union {
+        uint8_t eepData;
+        struct {
+            uint8_t boardNo[9];
+            uint8_t firmRevision;
+        } board_info;
+        struct {
+            uint8_t timeoutStat;
+            uint8_t timeoutSec;
+            uint8_t pwmIo;
+            uint8_t fetTimeout;
+        } board_status;
+        struct {
+            uint8_t sum_upper;
+            uint8_t sum_lower;
+        } firm_sum;
+        struct {
+            uint8_t appliMode;
+            uint8_t major;
+            uint8_t minor;
+        } protocol_version;
+    } data;
+};
+
+// 灯光区域映射结构
+struct LightRegionMapping {
+    std::string name;                    // 区域名称
+    uint8_t mai2light_start_index;       // Mai2Light起始索引
+    uint8_t mai2light_end_index;         // Mai2Light结束索引
+    bitmap32_t neopixel_bitmap;          // Neopixel位置bitmap (最多32个位置)
+    bool enabled;                        // 是否启用映射
+    
+    LightRegionMapping() : name(), mai2light_start_index(0), 
+                          mai2light_end_index(0), neopixel_bitmap(0), enabled(true) {}
 };
 
 // 灯光管理器私有配置
+// 遵循服务层规则3: 私有配置结构体，不存储在Class内部
 struct LightManager_PrivateConfig {
-    uint16_t update_interval_ms;    // 更新间隔
-    uint8_t global_brightness;      // 全局亮度
-    uint8_t max_brightness;         // 最大亮度限制
-    bool enable_touch_feedback;     // 启用触摸反馈
-    bool enable_auto_dim;           // 启用自动调光
-    uint16_t auto_dim_timeout;      // 自动调光超时 (s)
-    uint8_t idle_brightness;        // 空闲亮度
-    bool enable_power_saving;       // 启用节能模式
-    uint16_t power_saving_timeout;  // 节能模式超时 (s)
-    
+    bool enable;                         // 启用灯光管理器
+    std::string uart_device;             // UART设备名称
+    uint32_t baud_rate;                  // 波特率
+    uint8_t node_id;                     // 节点ID
+    uint16_t neopixel_count;             // Neopixel数量
+    uint8_t neopixel_pin;                // Neopixel引脚
+
     LightManager_PrivateConfig()
-        : update_interval_ms(20)
-        , global_brightness(255)
-        , max_brightness(255)
-        , enable_touch_feedback(true)
-        , enable_auto_dim(false)
-        , auto_dim_timeout(300)
-        , idle_brightness(64)
-        , enable_power_saving(false)
-        , power_saving_timeout(600) {}
+        : enable(true)
+        , uart_device("uart1")
+        , baud_rate(115200)
+        , node_id(1)
+        , neopixel_count(128)
+        , neopixel_pin(16) {}
 };
 
-// 灯光管理器配置（仅包含服务指针）
+// 灯光管理器配置 (仅包含服务指针)
+// 遵循服务层规则3: 服务依赖配置结构体
 struct LightManager_Config {
-    // 外部服务指针
-    class ConfigManager* config_manager;
-    class InputManager* input_manager;
-    class UIManager* ui_manager;
-    
+    ConfigManager* config_manager;
+    UIManager* ui_manager;
+
     LightManager_Config()
         : config_manager(nullptr)
-        , input_manager(nullptr)
         , ui_manager(nullptr) {}
 };
 
-// 灯光统计信息
-struct LightStatistics {
-    uint32_t total_updates;         // 总更新次数
-    uint32_t effect_changes;        // 效果变更次数
-    uint32_t touch_feedbacks;       // 触摸反馈次数
-    uint32_t power_cycles;          // 电源循环次数
-    uint32_t last_reset_time;       // 上次重置时间
-    uint32_t uptime_seconds;        // 运行时间
-    
-    LightStatistics() 
-        : total_updates(0)
-        , effect_changes(0)
-        , touch_feedbacks(0)
-        , power_cycles(0)
-        , last_reset_time(0)
-        , uptime_seconds(0) {}
-};
+// 配置管理函数声明
+// 遵循服务层规则3: 配置管理函数 - 完全的单数据存储和及时响应配置更变
+void lightmanager_register_default_configs(config_map_t& default_map);     // [默认配置注册函数] 注册默认配置到ConfigManager
+LightManager_Config* lightmanager_get_config_holder();                     // [配置保管函数] 保存静态私有配置变量并返回指针
+bool lightmanager_load_config_from_manager(LightManager_Config* config);   // [配置加载函数] 从ConfigManager获取配置存入指针
+LightManager_PrivateConfig lightmanager_get_config_copy();                 // [配置读取函数] 复制配置副本并返回
+bool lightmanager_write_config_to_manager(const LightManager_PrivateConfig& config); // [配置写入函数] 将参数传回ConfigManager
 
-// 回调函数类型
-using LightEffectCallback = std::function<void(const std::string& region, LightEffect effect)>;
-using LightStatusCallback = std::function<void(bool enabled, uint8_t brightness)>;
-using LightErrorCallback = std::function<void(const std::string& error)>;
+// Mai2Light命令回调函数类型
+typedef std::function<void(BD15070_Command command, const BD15070_PacketReq& packet)> LightManager_CommandCallback;
 
-// LightManager配置管理纯公开函数
-LightManager_Config* light_manager_get_config_holder();
-bool light_manager_load_config_from_manager(LightManager_Config* config);
-LightManager_PrivateConfig* light_manager_get_config_copy();
-bool light_manager_write_config_to_manager(const LightManager_Config* config);
-
-// 灯光管理器类
+// 灯光管理器类 (单例)
 class LightManager {
 public:
     // 单例模式
@@ -175,167 +203,102 @@ public:
     void deinit();
     bool is_ready() const;
     
-    // 设备管理
-    bool add_mai2light_device(Mai2Light* device, const std::string& device_name = "");
-    bool add_neopixel_device(NeoPixel* device, const std::string& device_name = "");
-    bool remove_device(const std::string& device_name);
-    uint8_t get_device_count() const;
-    bool get_device_info(const std::string& device_name, std::string& type, bool& connected);
+    // 区域映射管理
+    bool add_region_mapping(const LightRegionMapping& mapping);
+    bool remove_region_mapping(const std::string& name);
+    bool get_region_mapping(const std::string& name, LightRegionMapping& mapping) const;
+    std::vector<std::string> get_region_names() const;
+    bool enable_region_mapping(const std::string& name, bool enabled);
     
-    // 配置管理已移至纯公开函数
+    // 区域映射配置管理
+    bool save_region_mappings();
+    bool load_region_mappings();
+    bool reset_region_mappings();
     
-    // 区域管理
-    bool add_region(const LightRegion& region);
-    bool remove_region(const std::string& name);
-    bool get_region(const std::string& name, LightRegion& region);
-    std::vector<std::string> get_region_names();
-    bool enable_region(const std::string& name, bool enabled);
-    bool set_region_priority(const std::string& name, uint8_t priority);
+    // 手动触发映射接口
+    bool trigger_region_mapping(const std::string& region_name, uint8_t r, uint8_t g, uint8_t b);
     
-    // LED控制
-    bool set_led_color(uint8_t led_index, const Mai2Light_RGB& color);
-    bool set_led_color(uint8_t led_index, uint8_t r, uint8_t g, uint8_t b);
-    bool set_region_color(const std::string& region_name, const Mai2Light_RGB& color);
-    bool set_region_color(const std::string& region_name, uint8_t r, uint8_t g, uint8_t b);
-    bool set_all_leds_color(const Mai2Light_RGB& color);
-    bool set_all_leds_color(uint8_t r, uint8_t g, uint8_t b);
+    // Loop接口 - 处理Mai2Light回调
+    void loop();
     
-    // 亮度控制
-    bool set_global_brightness(uint8_t brightness);
-    bool set_led_brightness(uint8_t led_index, uint8_t brightness);
-    bool set_region_brightness(const std::string& region_name, uint8_t brightness);
-    uint8_t get_global_brightness() const;
-    
-    // 效果控制
-    bool set_effect(const std::string& region_name, const EffectParams& params);
-    bool stop_effect(const std::string& region_name);
-    bool stop_all_effects();
-    bool get_effect(const std::string& region_name, EffectParams& params);
-    
-    // 预设效果
-    bool apply_static_effect(const std::string& region_name, const Mai2Light_RGB& color);
-    bool apply_breathing_effect(const std::string& region_name, const Mai2Light_RGB& color, uint16_t speed = 2000);
-    bool apply_rainbow_effect(const std::string& region_name, uint16_t speed = 1000);
-    bool apply_wave_effect(const std::string& region_name, const Mai2Light_RGB& color, uint16_t speed = 500);
-    bool apply_flash_effect(const std::string& region_name, const Mai2Light_RGB& color, uint16_t speed = 200);
-    
-    // 触摸反馈
-    bool set_touch_feedback(uint8_t point_index, const TouchFeedback& feedback);
-    bool get_touch_feedback(uint8_t point_index, TouchFeedback& feedback);
-    bool trigger_touch_feedback(uint8_t point_index);
-    bool enable_touch_feedback(bool enabled);
-    
-    // 电源管理
-    bool set_power_state(bool enabled);
-    bool get_power_state() const;
-    bool enter_power_saving_mode();
-    bool exit_power_saving_mode();
-    bool is_power_saving_mode() const;
-    
-    // 自动调光
-    bool enable_auto_dim(bool enabled);
-    bool set_auto_dim_timeout(uint16_t timeout_seconds);
-    bool set_idle_brightness(uint8_t brightness);
-    
-    // 状态查询
-    bool get_led_color(uint8_t led_index, Mai2Light_RGB& color);
-    bool get_led_brightness(uint8_t led_index, uint8_t& brightness);
-    bool is_effect_active(const std::string& region_name);
-    
-    // 统计信息
-    bool get_statistics(LightStatistics& stats);
-    void reset_statistics();
-    
-    // 回调设置
-    void set_effect_callback(LightEffectCallback callback);
-    void set_status_callback(LightStatusCallback callback);
-    void set_error_callback(LightErrorCallback callback);
-    
-    // 任务处理
-    void task();
+    // 设置回调函数
+    void set_command_callback(LightManager_CommandCallback callback);
     
     // 调试功能
     void enable_debug_output(bool enabled);
-    std::string get_debug_info();
-    bool test_led(uint8_t led_index);
-    bool test_region(const std::string& region_name);
+    std::string get_debug_info() const;
     
 private:
-    // 私有构造函数（单例模式）
+    // 私有构造函数 (单例模式)
     LightManager();
     LightManager(const LightManager&) = delete;
     LightManager& operator=(const LightManager&) = delete;
     
-    // 静态实例
+    // 单例实例
     static LightManager* instance_;
-    
-    // 设备信息结构体
-    struct DeviceInfo {
-        enum Type { MAI2LIGHT, NEOPIXEL } type;
-        std::string name;
-        union {
-            Mai2Light* mai2light;
-            NeoPixel* neopixel;
-        } device;
-        bool connected;
-        uint8_t led_count;
-        uint8_t led_offset;  // 在全局LED数组中的偏移
-    };
     
     // 成员变量
     bool initialized_;
-    std::map<std::string, DeviceInfo> devices_;
-    std::vector<LightRegion> regions_;
-    std::map<std::string, EffectParams> active_effects_;
-    std::array<LedState, 256> led_states_;  // 最多支持256个LED
-    std::array<TouchFeedback, 34> touch_feedbacks_;  // 34个触摸点
-    LightStatistics statistics_;
-    
-    // 状态变量
-    uint8_t total_led_count_;
-    bool power_enabled_;
-    bool power_saving_mode_;
-    uint32_t last_activity_time_;
-    uint32_t last_update_time_;
     bool debug_enabled_;
     
+    // 协议相关 - 遵循服务层规则3: 服务本身完全不保存配置
+    HAL_UART* uart_hal_;
+    NeoPixel* neopixel_;
+    // node_id_ 已移除 - 通过lightmanager_get_config_copy()获取
+    
+    // 接收缓冲区
+    uint8_t rx_buffer_[64];
+    uint8_t rx_buffer_pos_;
+    bool escape_next_;
+    
+    // 区域映射
+    std::vector<LightRegionMapping> region_mappings_;
+    
+    // 渐变效果状态
+    struct FadeState {
+        bool active;
+        uint32_t start_time;
+        uint32_t end_time;
+        uint8_t start_led;
+        uint8_t end_led;
+        NeoPixel_Color start_color;
+        NeoPixel_Color end_color;
+    } fade_state_;
+    
     // 回调函数
-    LightEffectCallback effect_callback_;
-    LightStatusCallback status_callback_;
-    LightErrorCallback error_callback_;
+    LightManager_CommandCallback command_callback_;
     
-    // 私有方法
-    void update_effects();
-    void update_led_states();
-    void apply_brightness_limits();
-    void handle_auto_dim();
-    void handle_power_saving();
+    // 内部方法
+    void process_received_data();
+    bool parse_packet(const uint8_t* buffer, uint8_t length, BD15070_PacketReq& packet);
+    void handle_command(const BD15070_PacketReq& packet);
+    void send_ack(BD15070_Command command, BD15070_AckStatus status = AckStatus_Ok, 
+                  BD15070_AckReport report = AckReport_Ok, const uint8_t* data = nullptr, uint8_t data_length = 0);
     
-    // 效果处理
-    void process_static_effect(const std::string& region_name, const EffectParams& params);
-    void process_breathing_effect(const std::string& region_name, const EffectParams& params);
-    void process_rainbow_effect(const std::string& region_name, const EffectParams& params);
-    void process_wave_effect(const std::string& region_name, const EffectParams& params);
-    void process_ripple_effect(const std::string& region_name, const EffectParams& params);
-    void process_flash_effect(const std::string& region_name, const EffectParams& params);
-    void process_fade_effect(const std::string& region_name, const EffectParams& params);
-    void process_chase_effect(const std::string& region_name, const EffectParams& params);
-    void process_sparkle_effect(const std::string& region_name, const EffectParams& params);
-    void process_fire_effect(const std::string& region_name, const EffectParams& params);
+    // 命令处理函数
+    void handle_set_led_gs8bit(const BD15070_PacketReq& packet);
+    void handle_set_led_gs8bit_multi(const BD15070_PacketReq& packet);
+    void handle_set_led_gs8bit_multi_fade(const BD15070_PacketReq& packet);
+    void handle_set_led_fet(const BD15070_PacketReq& packet);
+    void handle_set_led_gs_update(const BD15070_PacketReq& packet);
+    void handle_get_board_info(const BD15070_PacketReq& packet);
+    void handle_get_board_status(const BD15070_PacketReq& packet);
+    void handle_get_firm_sum(const BD15070_PacketReq& packet);
+    void handle_get_protocol_version(const BD15070_PacketReq& packet);
+    void handle_eeprom_commands(const BD15070_PacketReq& packet);
     
-    // 颜色处理
-    Mai2Light_RGB interpolate_color(const Mai2Light_RGB& color1, const Mai2Light_RGB& color2, float factor);
-    Mai2Light_RGB apply_brightness(const Mai2Light_RGB& color, uint8_t brightness);
-    Mai2Light_RGB hsv_to_rgb(uint16_t hue, uint8_t saturation, uint8_t value);
+    // 映射和转换函数
+    void map_mai2light_to_neopixel(uint8_t mai2light_index, uint8_t r, uint8_t g, uint8_t b);
+    void map_range_to_neopixel(uint8_t start_index, uint8_t end_index, uint8_t r, uint8_t g, uint8_t b);
+    bitmap32_t get_neopixel_bitmap_for_mai2light_range(uint8_t start_index, uint8_t end_index) const;
     
-    // 工具方法
-    bool is_led_valid(uint8_t led_index) const;
-    bool is_region_valid(const std::string& region_name) const;
-    uint8_t get_region_led_count(const std::string& region_name) const;
-    void mark_leds_dirty(const std::vector<uint8_t>& led_indices);
-    void update_device_leds();
-    void log_debug(const std::string& message);
-    void log_error(const std::string& message);
+    // 渐变效果处理
+    void update_fade_effects();
+    
+    // 工具函数
+    uint8_t calculate_checksum(const uint8_t* data, uint8_t length) const;
+    void log_debug(const std::string& message) const;
+    void log_error(const std::string& message) const;
 };
 
 #endif // LIGHT_MANAGER_H

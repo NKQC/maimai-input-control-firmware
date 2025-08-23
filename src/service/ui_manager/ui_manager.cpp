@@ -25,23 +25,62 @@ UIManager_PrivateConfig* ui_manager_get_config_holder() {
     return &static_config_;
 }
 
+// 默认配置注册函数
+void uimanager_register_default_configs(config_map_t& default_map) {
+    // 注册UIManager默认配置
+    default_map[UIMANAGER_REFRESH_RATE] = ConfigValue((uint16_t)50);  // 默认刷新率50ms
+    default_map[UIMANAGER_BRIGHTNESS] = ConfigValue((uint8_t)128);  // 默认亮度50%
+    default_map[UIMANAGER_ENABLE_BACKLIGHT] = ConfigValue(true);  // 默认启用背光
+    default_map[UIMANAGER_BACKLIGHT_TIMEOUT] = ConfigValue((uint16_t)30000);  // 默认背光超时30秒
+    default_map[UIMANAGER_SCREEN_TIMEOUT] = ConfigValue((uint16_t)60000);  // 默认屏幕超时60秒
+    default_map[UIMANAGER_ENABLE_JOYSTICK] = ConfigValue(true);  // 默认启用摇杆
+    default_map[UIMANAGER_JOYSTICK_SENSITIVITY] = ConfigValue((uint8_t)128);  // 默认摇杆灵敏度50%
+}
+
+// 配置加载函数 - 从ConfigManager加载配置到静态配置变量
 bool ui_manager_load_config_from_manager(ConfigManager* config_manager) {
     if (config_manager == nullptr) {
         return false;
     }
-    // 从配置管理器加载配置
+    
+    // 从ConfigManager加载各项配置
+    static_config_.refresh_rate_ms = config_manager->get_uint16("UIMANAGER_REFRESH_RATE");
+    static_config_.brightness = config_manager->get_uint8("UIMANAGER_BRIGHTNESS");
+    static_config_.enable_backlight = config_manager->get_bool("UIMANAGER_ENABLE_BACKLIGHT");
+    static_config_.backlight_timeout = config_manager->get_uint16("UIMANAGER_BACKLIGHT_TIMEOUT");
+    static_config_.screen_timeout = config_manager->get_uint16("UIMANAGER_SCREEN_TIMEOUT");
+    static_config_.enable_joystick = config_manager->get_bool("UIMANAGER_ENABLE_JOYSTICK");
+    static_config_.joystick_sensitivity = config_manager->get_uint8("UIMANAGER_JOYSTICK_SENSITIVITY");
+    
     return true;
 }
 
+// 配置读取函数 - 返回当前配置的副本
 UIManager_PrivateConfig ui_manager_get_config_copy() {
     return static_config_;
 }
 
+// 配置写入函数 - 将配置写入ConfigManager并保存
 bool ui_manager_write_config_to_manager(ConfigManager* config_manager, const UIManager_PrivateConfig& config) {
     if (config_manager == nullptr) {
         return false;
     }
+    
+    // 更新静态配置
     static_config_ = config;
+    
+    // 将配置写入ConfigManager
+    config_manager->set_uint16("UIMANAGER_REFRESH_RATE", config.refresh_rate_ms);
+    config_manager->set_uint8("UIMANAGER_BRIGHTNESS", config.brightness);
+    config_manager->set_bool("UIMANAGER_ENABLE_BACKLIGHT", config.enable_backlight);
+    config_manager->set_uint16("UIMANAGER_BACKLIGHT_TIMEOUT", config.backlight_timeout);
+    config_manager->set_uint16("UIMANAGER_SCREEN_TIMEOUT", config.screen_timeout);
+    config_manager->set_bool("UIMANAGER_ENABLE_JOYSTICK", config.enable_joystick);
+    config_manager->set_uint8("UIMANAGER_JOYSTICK_SENSITIVITY", config.joystick_sensitivity);
+    
+    // 保存所有配置到存储
+    config_manager->save_config();
+    
     return true;
 }
 
@@ -1662,8 +1701,7 @@ void UIManager::button_event_cb(lv_event_t* e) {
                     uint16_t device_addr = device_status[ui->selected_device_index_].device.device_addr;
                     
                     // 启动自动灵敏度调整
-                    uint8_t original_sensitivity = ui->input_manager_->autoAdjustSensitivity(device_addr, ui->selected_channel_);
-                    (void)original_sensitivity; // 抑制未使用变量警告
+                    ui->input_manager_->autoAdjustSensitivity(device_addr, ui->selected_channel_);
                     
                     // 设置自动调整状态
                     ui->auto_adjust_active_ = true;
@@ -1886,8 +1924,8 @@ void UIManager::update_status_page() {
     
     // 更新灯光状态
     if (light_manager_) {
-        bool light_enabled = light_manager_->get_power_state();
-        std::string light_text = "Light: " + std::string(light_enabled ? "Enabled" : "Disabled");
+        bool light_enabled = light_manager_->is_ready();
+        std::string light_text = "Light: " + std::string(light_enabled ? "Ready" : "Not Ready");
         lv_label_set_text(status_light_label_, light_text.c_str());
     }
     
@@ -2377,6 +2415,9 @@ bool UIManager::clear_binding_status() {
             break;
         case UIPage::SETTINGS:
             create_settings_page();
+            break;
+        case UIPage::UART_SETTINGS:
+            create_uart_settings_page();
             break;
         case UIPage::CALIBRATION:
             create_calibration_page();

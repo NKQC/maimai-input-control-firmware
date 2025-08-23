@@ -1,6 +1,9 @@
 #pragma once
 
 #include <stdint.h>
+#include "../config_manager/config_types.h"
+
+// InputManager配置键定义 - 移除重复定义，使用下方统一定义
 #include <functional>
 #include <array>
 #include <vector>
@@ -77,6 +80,11 @@ enum class TouchKeyboardMode : uint8_t {
 // 配置键预处理定义
 #define INPUTMANAGER_WORK_MODE "input_manager_work_mode"
 #define INPUTMANAGER_GTX312L_DEVICES "input_manager_gtx312l_devices"
+#define INPUTMANAGER_TOUCH_KEYBOARD_ENABLED "input_manager_touch_keyboard_enabled"
+#define INPUTMANAGER_TOUCH_KEYBOARD_MODE "input_manager_touch_keyboard_mode"
+#define INPUTMANAGER_DEVICE_COUNT "input_manager_device_count"
+#define INPUTMANAGER_PHYSICAL_KEYBOARDS "input_manager_physical_keyboards"
+#define INPUTMANAGER_LOGICAL_MAPPINGS "input_manager_logical_mappings"
 
 // 工作模式枚举
 enum class InputWorkMode : uint8_t {
@@ -114,7 +122,7 @@ enum class BindingState : uint8_t {
 struct GTX312L_DeviceMapping {
     uint16_t device_addr;                           // GTX312L_PhysicalAddr的get_device_mask()返回值
     uint8_t sensitivity[12];                        // 每个通道的灵敏度设置
-    uint8_t CH_available[12];                      // 通道是否启用bitmap 启用为1
+    GTX312L_PortEnableBitmap CH_available;          // 通道是否启用bitmap 启用为1
     Mai2_TouchArea serial_area[12];                 // 12个通道对应的Mai2区域映射
     TouchAxis hid_area[12];                         // 12个通道对应的HID坐标映射
     HID_KeyCode keyboard_keys[12];                  // 12个通道对应的HID键盘按键映射
@@ -123,11 +131,11 @@ struct GTX312L_DeviceMapping {
         // 初始化serial_area为未使用状态
         for (int i = 0; i < 12; i++) {
             sensitivity[i] = 15;                        // 默认灵敏度
-            CH_available[i] = 1;
             serial_area[i] = MAI2_NO_USED;
             hid_area[i] = TouchAxis(0.0f, 0.0f);
             keyboard_keys[i] = HID_KeyCode::KEY_NONE;   // 默认无按键映射
         }
+        CH_available.value = 0x0FFF;  // 启用所有12个通道
     }
 };
 
@@ -159,11 +167,12 @@ struct InputManager_PrivateConfig {
     }
 };
 
-// 公共配置管理函数声明
-InputManager_PrivateConfig* inputmanager_get_config_holder();
-bool inputmanager_load_config_from_manager();
-InputManager_PrivateConfig inputmanager_get_config_copy();
-bool inputmanager_write_config_to_manager(const InputManager_PrivateConfig& config);
+// 配置管理函数声明 - 符合架构要求的配置注册模式
+void inputmanager_register_default_configs(config_map_t& default_map);  // [默认配置注册函数]
+InputManager_PrivateConfig* inputmanager_get_config_holder();  // [配置保管函数]
+bool inputmanager_load_config_from_manager();  // [配置加载函数]
+InputManager_PrivateConfig inputmanager_get_config_copy();  // [配置读取函数]
+bool inputmanager_write_config_to_manager(const InputManager_PrivateConfig& config);  // [配置写入函数]
 
 // 交互式绑定回调函数类型
 using InteractiveBindingCallback = std::function<void(bool success, const char* message)>;
@@ -217,7 +226,6 @@ public:
     void confirmHIDBinding();                  // 确认HID绑定
     
     // 灵敏度调整接口
-    uint8_t autoAdjustSensitivity(uint16_t device_addr);
     uint8_t autoAdjustSensitivity(uint16_t device_addr, uint8_t channel); // 指定通道的灵敏度调整
     void setSensitivity(uint16_t device_addr, uint8_t channel, uint8_t sensitivity);
     uint8_t getSensitivity(uint16_t device_addr, uint8_t channel);
@@ -266,6 +274,7 @@ public:
     // 通道控制接口
     void enableAllChannels();   // 启用所有通道(绑定时使用)
     void enableMappedChannels(); // 仅启用已映射的通道
+    void updateChannelStatesAfterBinding();  // 绑定后更新通道状态
     
     // 性能监控接口
     uint8_t getTouchSampleRate(uint16_t device_addr);  // 获取触摸IC采样速率
@@ -274,8 +283,6 @@ public:
     // 采样计数器（用于实际测量采样频率）
     void incrementSampleCounter();
     void resetSampleCounter();
-    
-    // 移除配置管理接口 - 使用外部公共函数
     
 private:
     // 单例模式
@@ -350,17 +357,6 @@ private:
     InputManager_PrivateConfig* config_;    // 配置指针缓存
     bool mcp23s17_available_;                // MCP23S17是否可用的缓存状态
     
-    // 统一键盘触发表
-    // 共享内存结构体，用于loop0向loop1传递键盘bitmap
-    struct SharedKeyboardData {
-        volatile KeyboardBitmap touch_keyboard_bitmap;  // 触摸键盘bitmap（loop0写入）
-        volatile bool data_ready;                       // 数据就绪标志
-        
-        SharedKeyboardData() : data_ready(false) {
-            touch_keyboard_bitmap.clear();
-        }
-    } shared_keyboard_data_;
-    
     KeyboardBitmap gpio_keyboard_bitmap_;  // GPIO键盘bitmap（loop1使用，避免跨核竞态）
     KeyboardBitmap touch_bitmap_cache_;    // 触摸键盘bitmap缓存（从loop0共享内存读取）
     
@@ -370,14 +366,30 @@ private:
     MCP23S17_GPIO_State mcp_gpio_states_;    // MCP GPIO状态
     MCP23S17_GPIO_State mcp_gpio_previous_states_; // MCP GPIO上一次状态
     
+    // GPIO处理缓存变量（避免高频函数中的内存分配）
+    mutable uint32_t gpio_mcu_changed_;      // MCU GPIO变化位图缓存
+    mutable uint32_t gpio_mcu_inverted_;     // MCU GPIO反转位图缓存
+    mutable uint16_t gpio_mcp_changed_a_;    // MCP GPIO Port A变化位图缓存
+    mutable uint16_t gpio_mcp_changed_b_;    // MCP GPIO Port B变化位图缓存
+    mutable uint16_t gpio_mcp_inverted_a_;   // MCP GPIO Port A反转位图缓存
+    mutable uint16_t gpio_mcp_inverted_b_;   // MCP GPIO Port B反转位图缓存
+    mutable const PhysicalKeyboardMapping* gpio_mappings_cache_;     // 物理键盘映射指针缓存
+    mutable size_t gpio_mapping_count_cache_;                        // 物理键盘映射数量缓存
+    mutable const LogicalKeyMapping* gpio_logical_mappings_cache_;   // 逻辑键盘映射指针缓存
+    mutable size_t gpio_logical_count_cache_;                        // 逻辑键盘映射数量缓存
+    mutable uint8_t gpio_pin_cache_;         // GPIO引脚号缓存
+    mutable uint8_t gpio_pin_num_cache_;     // GPIO引脚编号缓存
+    mutable uint8_t gpio_bit_pos_cache_;     // GPIO位位置缓存
+    mutable bool gpio_current_state_cache_;  // GPIO当前状态缓存
+    mutable const PhysicalKeyboardMapping* gpio_mapping_ptr_cache_;  // 当前映射指针缓存
+    mutable const HID_KeyCode* gpio_keys_ptr_cache_;                 // 当前按键指针缓存
+    
     // 内部处理函数
     inline void updateTouchStates();
     inline void processSerialMode();
     inline void sendHIDTouchData();
     
     // 统一键盘处理函数
-    inline void collectKeysFromTouch();      // 从触摸映射收集按键状态
-    inline void collectKeysFromGPIO();       // 从GPIO物理键盘收集按键状态
     void processAutoAdjustSensitivity();
     
     // GPIO键盘处理函数
@@ -386,7 +398,6 @@ private:
     inline void processTouchKeyboard();      // 处理触摸键盘映射
     inline bool readMCUGPIO(uint8_t pin, bool& value);  // 读取MCU GPIO
     inline bool readMCPGPIO(uint8_t pin, bool& value);  // 读取MCP GPIO
-    inline void setLogicalKeysInBitmap(uint8_t gpio_id, bool pressed, KeyboardBitmap& bitmap);  // 在bitmap中设置逻辑按键
     
     // 设备查找
     int findDeviceIndex(uint16_t device_addr);

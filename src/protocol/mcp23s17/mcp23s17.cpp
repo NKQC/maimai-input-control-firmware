@@ -461,38 +461,31 @@ bool MCP23S17::spi_transfer(const uint8_t* tx_data, uint8_t* rx_data, size_t len
 }
 
 bool MCP23S17::configure_device() {
-    // 配置IOCON寄存器
+    // 配置IOCON寄存器 - 固定使用BANK=0模式以获得最高效率
     // BANK=0, MIRROR=0, SEQOP=0, DISSLW=0, HAEN=1, ODR=0, INTPOL=0
-    uint8_t iocon_config = 0x08;  // HAEN=1 (启用硬件地址)
+    uint8_t iocon_config = MCP23S17_IOCON_HAEN;  // 仅启用硬件地址，确保BANK=0
     
     if (!configure_iocon(iocon_config)) {
         return false;
     }
     
-    // 默认配置：所有引脚为输入，启用上拉电阻
+    // 高效批量配置：使用寄存器对写入提高效率
     bool result = true;
-    result &= set_port_direction(MCP23S17_PORT_A, 0xFF);  // 全部输入
-    result &= set_port_direction(MCP23S17_PORT_B, 0xFF);  // 全部输入
-    result &= set_port_pullup(MCP23S17_PORT_A, 0xFF);    // 全部上拉
-    result &= set_port_pullup(MCP23S17_PORT_B, 0xFF);    // 全部上拉
+    result &= write_register_pair(MCP23S17_REG_IODIRA, 0xFF, MCP23S17_REG_IODIRB, 0xFF);  // 全部输入
+    result &= write_register_pair(MCP23S17_REG_GPPUA, 0xFF, MCP23S17_REG_GPPUB, 0xFF);    // 全部上拉
     
     return result;
 }
 
 bool MCP23S17::test_device_communication() {
-    // 测试读写IOCON寄存器
-    uint8_t test_value = 0x08;  // HAEN=1
-    
-    if (!write_register(MCP23S17_REG_IOCON, test_value)) {
-        return false;
-    }
-    
+    // 高效通信测试：读取IOCON寄存器默认值
     uint8_t read_value;
     if (!read_register(MCP23S17_REG_IOCON, read_value)) {
         return false;
     }
     
-    return (read_value & 0x08) == 0x08;  // 检查HAEN位
+    // 验证读取到的值是合理的（BANK位应为0，其他位应为默认值）
+    return (read_value & MCP23S17_IOCON_BANK) == 0;  // 确保BANK=0模式
 }
 
 // DMA异步传输方法实现

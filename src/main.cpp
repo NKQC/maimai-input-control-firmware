@@ -67,6 +67,7 @@
  * 2.所有配置的键都应当以预处理形式被定义在每个服务各自的.h中 且不直接使用任何字符串键获取/写入配置 全部使用预处理完成 预处理名称定义应当是 {服务名}_{子模块(如有)}_{键}
  * 3.所有服务的配置不应该存在Class内部 每个服务都要经过下列模式处理
  *      - 每个服务构造一个struct作为私有配置
+ *      - 构造一个静态的公共公开函数[默认配置注册函数] 该函数用于注册默认配置到ConfigManager 它使用ConfigManager的私有变量注册所有用到的键和默认值 默认值的范围和超过范围需要执行的内容等信息
  *      - 构造一个静态的公共公开函数[配置保管函数] 该函数保存一个静态的私有配置变量 它返回该私有地址的指针
  *      - 构造一个静态的公共公开函数[配置加载函数] 该函数调用[配置保管函数]获取指针并从ConfigManager获取到所有需要的配置 存入该指针
  *      - 构造一个静态的公共公开函数[配置读取函数] 该函数调用[配置保管函数]获取指针 并复制一个配置的副本 返回该配置副本
@@ -99,7 +100,7 @@
  *                                    -> 单个灯区域可以映射至多32个Neopixel位置 使用bitmap完成这些位置的选址
  *                                    -> 直接注册Mai2Light回调 将读取的指定灯映射到Neopixel指定路径上 包括色彩和亮度等映射
  *                                    -> 提供Loop接口 用于读取Mai2Light的回调函数 并根据配置文件映射 调用Neopixel的设置颜色接口 实现灯光映射
- *                                    -> 提供一个手动触发映射的接口 允许指定一个映射区域直接触发 以进行灯光设置(Serial的传入触发逻辑区域 HID的传入坐标 编号默认使用第一位)
+ *                                    -> 提供一个手动触发映射的接口 允许指定一个映射区域直接触发 以进行灯光设置
  * 
  * [服务模块/用户界面] Class UIManager(单例) 使用LVGL构造彩色UI 使用现代化风格菜单 驱动ST7735S TFT屏幕 提供可视化设置 可设置其他服务模块 注意 该服务只能调用模块接口实现功能 除屏幕相关设置 自身不进行任何其他调用和设置 状态机和页面位置由内部维护
  *                                    -> 使用摇杆开关作为输入 其具有A B BUTTON三个按钮 其中A/B是拨动方向生效 其为数字输入 作为上下翻页键 在设置数值时应当在拨动一边时前指定ms只上/下调数值一次 随后加速滚动/调整数值 按钮即确认功能 LOW有效 无需软件防抖
@@ -124,7 +125,7 @@
  *                                    -> 提供Loop接口 用于读取用户输入 并根据输入调用其他服务模块的接口 实现用户界面的功能
  * 
  * [服务层/存取配置] Class ConfigManager(单例) 配置文件管理类 提供保存和加载参数的能力 直接交互flash和读取设置 该模块全局使用map进行交互 完全使用键值对对参数读写
- *                                    -> 每个模块定义存储参数规则: 每个模块必须在各自所属区域使用预处理+std::string作为键 值的类型使用ConfigManager定义的数据类型 随后写公开的初始化函数 并调用ConfigManager将函数注册 以提供配置定义和初始化
+ *                                    -> 每个模块定义存储参数规则: 每个模块必须在各自所属区域使用预处理+std::string作为键 值的类型使用ConfigManager定义的数据类型 随后写公开的初始化函数 并调用ConfigManager将函数注册 以提供配置定义和初始化 即注册[默认配置注册函数]
  *                                    -> ConfigManager内部自行通过struct定义常用数据类型 并在后续所有读写中直接使用自定义的数据类型 每个数字型(如任何长度的int float double等)数据类型 都允许设置最大值 最小值和默认值 和超标时进行的动作(限制到最近的合法值/拒绝修改) 每个字符串型都允许设置最大长度 长度超标时进行的动作(直接截断/驳回设置)和默认值
  *                                    -> 配置将被以json写入板载flash 并以json形式读取 json中存储了每个要存储数据的键 值和值的数据类型 和其他任何附加内容(这一点在保存设置接口中说明)
  *                                    -> 该模块由以下两个主要的私有变量执行运行时配置操作 <默认配置MAP>: 仅在实例被执行初始化时执行: 其调用所有注册的初始化函数 按顺序依次将默认函数的配置参数写入该函数    <运行时配置MAP>: 这是该管理器通过外部接口修改参数和读取参数时间接交互的变量 相当于配置文件数据的运行时映射
@@ -180,33 +181,44 @@
 #include "service/ui_manager/ui_manager.h"
 
 // 系统配置
-#define SYSTEM_VERSION "3.0.0"
-#define HARDWARE_VERSION "1.0.0"
+#define SYSTEM_VERSION "3.0.1"
+#define HARDWARE_VERSION "3.0"
 #define BUILD_DATE __DATE__
 #define BUILD_TIME __TIME__
 
 // 引脚定义
-#define LED_BUILTIN_PIN 25
+#define LED_BUILTIN_PIN 0
 #define I2C0_SDA_PIN 4
 #define I2C0_SCL_PIN 5
 #define I2C1_SDA_PIN 6
 #define I2C1_SCL_PIN 7
-#define SPI0_MISO_PIN 16
+// ST7735S
+#define SPI0_MISO_PIN 16 // 不使用引脚 但确实是SPI0 RX
 #define SPI0_MOSI_PIN 19
 #define SPI0_SCK_PIN 18
-#define SPI0_CS_PIN 17
-#define SPI1_MISO_PIN 12
-#define SPI1_MOSI_PIN 15
-#define SPI1_SCK_PIN 14
-#define SPI1_CS_PIN 13
-#define UART0_TX_PIN 0
-#define UART0_RX_PIN 1
+#define ST7735S_DC_PIN 21
+#define ST7735S_RST_PIN 20
+#define ST7735S_CS_PIN 17
+#define SPI0_FREQ 12000000
+// MCP23S17
+#define SPI1_MISO_PIN 28
+#define SPI1_MOSI_PIN 27
+#define SPI1_SCK_PIN 26
+#define MCP23S17_CS_PIN 29
+#define SPI1_FREQ 10000000
+
+#define UART0_TX_PIN 12
+#define UART0_RX_PIN 13
+#define UART0_CTS_PIN 14
+#define UART0_RTS_PIN 15
 #define UART1_TX_PIN 8
 #define UART1_RX_PIN 9
-#define NEOPIXEL_PIN 2
-#define ST7735S_DC_PIN 20
-#define ST7735S_RST_PIN 21
-#define ST7735S_CS_PIN 22
+#define NEOPIXEL_PIN 11
+
+// 摇杆引脚定义
+#define JOYSTICK_BUTTON_A_PIN MCU_GPIO::GPIO2    // 摇杆A按钮(上方向)
+#define JOYSTICK_BUTTON_B_PIN MCU_GPIO::GPIO3    // 摇杆B按钮(下方向)
+#define JOYSTICK_BUTTON_CONFIRM_PIN MCU_GPIO::GPIO1  // 摇杆确认按钮
 
 // Watchdog配置
 #define WATCHDOG_TIMEOUT_MS 5000
@@ -284,26 +296,26 @@ bool init_hal_layer() {
     
     // 初始化SPI
     hal_spi0 = HAL_SPI0::getInstance();
-    if (!hal_spi0 || !hal_spi0->init(SPI0_SCK_PIN, SPI0_MOSI_PIN, SPI0_MISO_PIN, 1000000)) {
+    if (!hal_spi0 || !hal_spi0->init(SPI0_SCK_PIN, SPI0_MOSI_PIN, SPI0_MISO_PIN, SPI0_FREQ)) {
         error_handler("Failed to initialize SPI0");
         return false;
     }
     
     hal_spi1 = HAL_SPI1::getInstance();
-    if (!hal_spi1 || !hal_spi1->init(SPI1_SCK_PIN, SPI1_MOSI_PIN, SPI1_MISO_PIN, 1000000)) {
+    if (!hal_spi1 || !hal_spi1->init(SPI1_SCK_PIN, SPI1_MOSI_PIN, SPI1_MISO_PIN, SPI1_FREQ)) {
         error_handler("Failed to initialize SPI1");
         return false;
     }
     
     // 初始化UART
     hal_uart0 = HAL_UART0::getInstance();
-    if (!hal_uart0 || !hal_uart0->init(UART0_TX_PIN, UART0_RX_PIN, 115200)) {
+    if (!hal_uart0 || !hal_uart0->init(UART0_TX_PIN, UART0_RX_PIN, 9600, true, UART0_CTS_PIN, UART0_RTS_PIN)) {
         error_handler("Failed to initialize UART0");
         return false;
     }
     
     hal_uart1 = HAL_UART1::getInstance();
-    if (!hal_uart1 || !hal_uart1->init(UART1_TX_PIN, UART1_RX_PIN, 115200)) {
+    if (!hal_uart1 || !hal_uart1->init(UART1_TX_PIN, UART1_RX_PIN, 9600)) {
         error_handler("Failed to initialize UART1");
         return false;
     }
@@ -333,7 +345,7 @@ bool init_protocol_layer() {
     scan_i2c_devices();
     
     // 初始化MCP23S17
-    mcp23s17 = new MCP23S17(hal_spi0, 0);
+    mcp23s17 = new MCP23S17(hal_spi1, MCP23S17_CS_PIN);
     if (!mcp23s17 || !mcp23s17->init()) {
         error_handler("Failed to initialize MCP23S17");
         return false;
@@ -347,7 +359,7 @@ bool init_protocol_layer() {
     }
     
     // 初始化ST7735S
-    st7735s = new ST7735S(hal_spi1, ST7735S_DC_PIN, ST7735S_RST_PIN, ST7735S_CS_PIN);
+    st7735s = new ST7735S(hal_spi0, ST7735S_CS_PIN, ST7735S_DC_PIN, ST7735S_RST_PIN);
     if (!st7735s || !st7735s->init()) {
         error_handler("Failed to initialize ST7735S");
         return false;
@@ -390,7 +402,7 @@ bool init_protocol_layer() {
 bool init_service_layer() {
     // 首先初始化ConfigManager
     config_manager = ConfigManager::getInstance();
-    if (!config_manager || !config_manager->init()) {
+    if (!config_manager || !config_manager->initialize()) {
         error_handler("Failed to initialize ConfigManager");
         return false;
     }
@@ -411,23 +423,29 @@ bool init_service_layer() {
     }
     
     // 注册MCP23S17的GPIO 1-11作为键盘
-    if (mcp23s17) {
-        // 注册GPIOA1-A8 (对应MCP_GPIO::GPIOA1到GPIOA8)
-        for (int i = 1; i <= 8; i++) {
-            MCP_GPIO gpio = static_cast<MCP_GPIO>(0xC0 + i); // GPIOA1-A8
-            input_manager->addPhysicalKeyboard(gpio, HID_KeyCode::KEY_NONE);
-        }
-        
-        // 注册GPIOB1-B3 (对应MCP_GPIO::GPIOB1到GPIOB3)
-        for (int i = 9; i <= 11; i++) {
-            MCP_GPIO gpio = static_cast<MCP_GPIO>(0xC0 + i); // GPIOB1-B3
-            input_manager->addPhysicalKeyboard(gpio, HID_KeyCode::KEY_NONE);
-        }
-        
-        // 设置GPIOB8为输出模式并输出高电平以点亮LED
-        mcp23s17->set_pin_direction(MCP23S17_PORT_B, 7, MCP23S17_OUTPUT); // GPIOB8是端口B的第7位(0-7)
-        mcp23s17->write_pin(MCP23S17_PORT_B, 7, true); // 输出高电平
-    }
+    // 设置GPIOB8为输出模式并输出高电平以点亮LED
+    mcp23s17->set_pin_direction(MCP23S17_PORT_B, 7, MCP23S17_OUTPUT); // GPIOB8是端口B的第7位(0-7)
+    mcp23s17->write_pin(MCP23S17_PORT_B, 7, 0); // 输出高电平
+    
+    // 注册按键
+    input_manager->addPhysicalKeyboard(MCP_GPIO::GPIOA0, HID_KeyCode::KEY_W);
+    input_manager->addPhysicalKeyboard(MCP_GPIO::GPIOA1, HID_KeyCode::KEY_E);
+    input_manager->addPhysicalKeyboard(MCP_GPIO::GPIOA2, HID_KeyCode::KEY_D);
+    input_manager->addPhysicalKeyboard(MCP_GPIO::GPIOA3, HID_KeyCode::KEY_C);
+    input_manager->addPhysicalKeyboard(MCP_GPIO::GPIOA4, HID_KeyCode::KEY_X);
+    input_manager->addPhysicalKeyboard(MCP_GPIO::GPIOA5, HID_KeyCode::KEY_Z);
+    input_manager->addPhysicalKeyboard(MCP_GPIO::GPIOA6, HID_KeyCode::KEY_A);
+    input_manager->addPhysicalKeyboard(MCP_GPIO::GPIOA7, HID_KeyCode::KEY_Q);
+
+    input_manager->addPhysicalKeyboard(MCP_GPIO::GPIOB0, HID_KeyCode::KEY_9);
+    input_manager->addPhysicalKeyboard(MCP_GPIO::GPIOB1, HID_KeyCode::KEY_3);
+    input_manager->addPhysicalKeyboard(MCP_GPIO::GPIOB2, HID_KeyCode::KEY_ENTER);
+    input_manager->addPhysicalKeyboard(MCP_GPIO::GPIOB3, HID_KeyCode::KEY_SPACE);
+
+    // 注册摇杆GPIO引脚
+    input_manager->addPhysicalKeyboard(JOYSTICK_BUTTON_A_PIN, HID_KeyCode::KEY_JOYSTICK_A);
+    input_manager->addPhysicalKeyboard(JOYSTICK_BUTTON_B_PIN, HID_KeyCode::KEY_JOYSTICK_B);
+    input_manager->addPhysicalKeyboard(JOYSTICK_BUTTON_CONFIRM_PIN, HID_KeyCode::KEY_JOYSTICK_CONFIRM);
     
     // 注册GTX312L设备到InputManager
     for (uint8_t i = 0; i < gtx312l_count; i++) {
@@ -713,7 +731,7 @@ void core0_task() {
         // LightManager Loop - 每10ms执行一次
         if (current_time - last_light_update >= 10) {
             if (light_manager) {
-                light_manager->task();
+                light_manager->loop();
             }
             last_light_update = current_time;
         }

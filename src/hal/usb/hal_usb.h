@@ -18,7 +18,7 @@
 #ifndef USB_PID
 #define USB_PID                 0x0024  // 参考WashingTouch
 #endif
-#define USB_SERIAL              "123456789"
+#define USB_SERIAL              "01934"
 #define USB_DEVICE_NAME         "HAL_USB_Device"
 
 // HID报告ID
@@ -28,8 +28,6 @@
 
 // 触摸屏配置
 #define TOUCH_LOCAL_NUM         10      // 最大触摸点数
-#define TOUCH_SCREEN_WIDTH      1920
-#define TOUCH_SCREEN_HEIGHT     1080
 
 // 触摸点数据结构
 struct TouchPoint {

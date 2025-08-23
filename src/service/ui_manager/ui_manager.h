@@ -4,6 +4,7 @@
 #include "lvgl.h"
 #include "../../protocol/st7735s/st7735s.h"
 #include "../../protocol/hid/hid.h"
+#include "../config_manager/config_types.h"
 #include <string>
 #include <functional>
 #include <map>
@@ -13,6 +14,15 @@
 class InputManager;
 class LightManager;
 class ConfigManager;
+
+// UIManager配置键定义
+#define UIMANAGER_REFRESH_RATE "UIMANAGER_REFRESH_RATE"
+#define UIMANAGER_BRIGHTNESS "UIMANAGER_BRIGHTNESS"
+#define UIMANAGER_ENABLE_BACKLIGHT "UIMANAGER_ENABLE_BACKLIGHT"
+#define UIMANAGER_BACKLIGHT_TIMEOUT "UIMANAGER_BACKLIGHT_TIMEOUT"
+#define UIMANAGER_SCREEN_TIMEOUT "UIMANAGER_SCREEN_TIMEOUT"
+#define UIMANAGER_ENABLE_JOYSTICK "UIMANAGER_ENABLE_JOYSTICK"
+#define UIMANAGER_JOYSTICK_SENSITIVITY "UIMANAGER_JOYSTICK_SENSITIVITY"
 
 // UI页面类型
 enum class UIPage {
@@ -142,11 +152,12 @@ using UIEventCallback = std::function<void(UIEvent event, const std::string& ele
 using UIPageCallback = std::function<void(UIPage page)>;
 using UIJoystickCallback = std::function<void(JoystickButton button, bool pressed)>;
 
-// 配置管理函数
-UIManager_PrivateConfig* ui_manager_get_config_holder();
-bool ui_manager_load_config_from_manager(ConfigManager* config_manager);
-UIManager_PrivateConfig ui_manager_get_config_copy();
-bool ui_manager_write_config_to_manager(ConfigManager* config_manager, const UIManager_PrivateConfig& config);
+// 配置管理函数声明
+void uimanager_register_default_configs(config_map_t& default_map);  // 注册默认配置到ConfigManager
+UIManager_PrivateConfig* ui_manager_get_config_holder();  // 配置保管函数
+bool ui_manager_load_config_from_manager(ConfigManager* config_manager);  // 配置加载函数
+UIManager_PrivateConfig ui_manager_get_config_copy();  // 配置读取函数
+bool ui_manager_write_config_to_manager(ConfigManager* config_manager, const UIManager_PrivateConfig& config);  // 配置写入函数
 
 // UIManager类
 class UIManager {

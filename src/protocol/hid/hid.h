@@ -25,70 +25,77 @@ enum class HID_ReportType : uint8_t {
 enum class HID_KeyCode : uint8_t {
     KEY_NONE = 0x00,
     KEY_A = 0x04,
-    KEY_B = 0x05,
-    KEY_C = 0x06,
-    KEY_D = 0x07,
-    KEY_E = 0x08,
-    KEY_F = 0x09,
-    KEY_G = 0x0A,
-    KEY_H = 0x0B,
-    KEY_I = 0x0C,
-    KEY_J = 0x0D,
-    KEY_K = 0x0E,
-    KEY_L = 0x0F,
-    KEY_M = 0x10,
-    KEY_N = 0x11,
-    KEY_O = 0x12,
-    KEY_P = 0x13,
-    KEY_Q = 0x14,
-    KEY_R = 0x15,
-    KEY_S = 0x16,
-    KEY_T = 0x17,
-    KEY_U = 0x18,
-    KEY_V = 0x19,
-    KEY_W = 0x1A,
-    KEY_X = 0x1B,
-    KEY_Y = 0x1C,
-    KEY_Z = 0x1D,
-    KEY_1 = 0x1E,
-    KEY_2 = 0x1F,
-    KEY_3 = 0x20,
-    KEY_4 = 0x21,
-    KEY_5 = 0x22,
-    KEY_6 = 0x23,
-    KEY_7 = 0x24,
-    KEY_8 = 0x25,
-    KEY_9 = 0x26,
-    KEY_0 = 0x27,
-    KEY_ENTER = 0x28,
-    KEY_ESCAPE = 0x29,
-    KEY_BACKSPACE = 0x2A,
-    KEY_TAB = 0x2B,
-    KEY_SPACE = 0x2C,
+    KEY_B,
+    KEY_C,
+    KEY_D,
+    KEY_E,
+    KEY_F,
+    KEY_G,
+    KEY_H,
+    KEY_I,
+    KEY_J,
+    KEY_K,
+    KEY_L,
+    KEY_M,
+    KEY_N,
+    KEY_O,
+    KEY_P,
+    KEY_Q,
+    KEY_R,
+    KEY_S,
+    KEY_T,
+    KEY_U,
+    KEY_V,
+    KEY_W,
+    KEY_X,
+    KEY_Y,
+    KEY_Z,
+    KEY_1,
+    KEY_2,
+    KEY_3,
+    KEY_4,
+    KEY_5,
+    KEY_6,
+    KEY_7,
+    KEY_8,
+    KEY_9,
+    KEY_0,
+    KEY_ENTER,
+    KEY_ESCAPE,
+    KEY_BACKSPACE,
+    KEY_TAB,
+    KEY_SPACE,
+
     KEY_F1 = 0x3A,
-    KEY_F2 = 0x3B,
-    KEY_F3 = 0x3C,
-    KEY_F4 = 0x3D,
-    KEY_F5 = 0x3E,
-    KEY_F6 = 0x3F,
-    KEY_F7 = 0x40,
-    KEY_F8 = 0x41,
-    KEY_F9 = 0x42,
-    KEY_F10 = 0x43,
-    KEY_F11 = 0x44,
-    KEY_F12 = 0x45,
+    KEY_F2,
+    KEY_F3,
+    KEY_F4,
+    KEY_F5,
+    KEY_F6,
+    KEY_F7,
+    KEY_F8,
+    KEY_F9,
+    KEY_F10,
+    KEY_F11,
+    KEY_F12,
+    // HID控制按键
     KEY_LEFT_CTRL = 0xE0,
-    KEY_LEFT_SHIFT = 0xE1,
-    KEY_LEFT_ALT = 0xE2,
-    KEY_LEFT_GUI = 0xE3,
-    KEY_RIGHT_CTRL = 0xE4,
-    KEY_RIGHT_SHIFT = 0xE5,
-    KEY_RIGHT_ALT = 0xE6,
-    KEY_RIGHT_GUI = 0xE7
+    KEY_LEFT_SHIFT,
+    KEY_LEFT_ALT,
+    KEY_LEFT_GUI,
+    KEY_RIGHT_CTRL,
+    KEY_RIGHT_SHIFT,
+    KEY_RIGHT_ALT,
+    KEY_RIGHT_GUI,
+    // 摇杆专用按键
+    KEY_JOYSTICK_A,      // 摇杆A按钮
+    KEY_JOYSTICK_B,      // 摇杆B按钮
+    KEY_JOYSTICK_CONFIRM, // 摇杆确认按钮
 };
 
 // 遍历所有支持的HID键码
-static const HID_KeyCode supported_keys[] = {
+#define SUPPORTED_KEYS_COUNT 64
+static const HID_KeyCode supported_keys[SUPPORTED_KEYS_COUNT] = {
     HID_KeyCode::KEY_A, HID_KeyCode::KEY_B, HID_KeyCode::KEY_C, HID_KeyCode::KEY_D,
     HID_KeyCode::KEY_E, HID_KeyCode::KEY_F, HID_KeyCode::KEY_G, HID_KeyCode::KEY_H,
     HID_KeyCode::KEY_I, HID_KeyCode::KEY_J, HID_KeyCode::KEY_K, HID_KeyCode::KEY_L,
@@ -102,15 +109,20 @@ static const HID_KeyCode supported_keys[] = {
     HID_KeyCode::KEY_TAB, HID_KeyCode::KEY_SPACE, HID_KeyCode::KEY_F1, HID_KeyCode::KEY_F2,
     HID_KeyCode::KEY_F3, HID_KeyCode::KEY_F4, HID_KeyCode::KEY_F5, HID_KeyCode::KEY_F6,
     HID_KeyCode::KEY_F7, HID_KeyCode::KEY_F8, HID_KeyCode::KEY_F9, HID_KeyCode::KEY_F10,
-    HID_KeyCode::KEY_F11, HID_KeyCode::KEY_F12, HID_KeyCode::KEY_LEFT_CTRL,
+    HID_KeyCode::KEY_F11, HID_KeyCode::KEY_F12, HID_KeyCode::KEY_JOYSTICK_A,
+    HID_KeyCode::KEY_JOYSTICK_B, HID_KeyCode::KEY_JOYSTICK_CONFIRM, HID_KeyCode::KEY_LEFT_CTRL,
     HID_KeyCode::KEY_LEFT_SHIFT, HID_KeyCode::KEY_LEFT_ALT, HID_KeyCode::KEY_LEFT_GUI,
     HID_KeyCode::KEY_RIGHT_CTRL, HID_KeyCode::KEY_RIGHT_SHIFT, HID_KeyCode::KEY_RIGHT_ALT,
     HID_KeyCode::KEY_RIGHT_GUI
 };
 
-// 键盘bitmap结构体 - 使用union uint64_t高效编码键盘状态
+// 键盘bitmap结构体 - 使用union 128位高效编码键盘状态
 union KeyboardBitmap {
-    uint64_t bitmap;  // 64位bitmap，支持64个按键
+    struct {
+        uint64_t bitmap_low;   // 低64位bitmap
+        uint64_t bitmap_high;  // 高64位bitmap
+    };
+    uint64_t bitmap[2];  // 兼容性访问，支持128个按键
     struct {
         uint8_t KEY_NONE : 1;     // bit 0
         uint8_t KEY_A : 1;        // bit 1
@@ -174,18 +186,36 @@ union KeyboardBitmap {
         uint8_t KEY_RIGHT_SHIFT : 1; // bit 59
         uint8_t KEY_RIGHT_ALT : 1;  // bit 60
         uint8_t KEY_RIGHT_GUI : 1;  // bit 61
-        uint8_t reserved : 2;      // bit 62-63 保留
+        uint8_t KEY_JOYSTICK_A : 1; // bit 62
+        uint8_t KEY_JOYSTICK_B : 1; // bit 63
+        uint8_t KEY_JOYSTICK_CONFIRM : 1; // bit 64 (高64位的第0位)
+        uint8_t reserved : 7;      // bit 65-71 保留
     } keys;
     
-    KeyboardBitmap() : bitmap(0) {}
+    KeyboardBitmap() : bitmap_low(0), bitmap_high(0) {}
     
+    KeyboardBitmap& operator|=(const KeyboardBitmap& other) {
+        bitmap_low |= other.bitmap_low;
+        bitmap_high |= other.bitmap_high;
+        return *this;
+    }
+
     // 设置按键状态
     void setKey(HID_KeyCode key, bool pressed) {
         uint8_t bit_index = getBitIndex(key);
-        if (pressed) {
-            bitmap |= (1ULL << bit_index);
-        } else {
-            bitmap &= ~(1ULL << bit_index);
+        if (bit_index < 64) {
+            if (pressed) {
+                bitmap_low |= (1ULL << bit_index);
+            } else {
+                bitmap_low &= ~(1ULL << bit_index);
+            }
+        } else if (bit_index < 128) {
+            uint8_t high_bit = bit_index - 64;
+            if (pressed) {
+                bitmap_high |= (1ULL << high_bit);
+            } else {
+                bitmap_high &= ~(1ULL << high_bit);
+            }
         }
     }
     
@@ -194,9 +224,16 @@ union KeyboardBitmap {
         uint8_t bit_index = getBitIndex(key);
         if (bit_index < 64) {
             if (pressed) {
-                bitmap |= (1ULL << bit_index);
+                bitmap_low |= (1ULL << bit_index);
             } else {
-                bitmap &= ~(1ULL << bit_index);
+                bitmap_low &= ~(1ULL << bit_index);
+            }
+        } else if (bit_index < 128) {
+            uint8_t high_bit = bit_index - 64;
+            if (pressed) {
+                bitmap_high |= (1ULL << high_bit);
+            } else {
+                bitmap_high &= ~(1ULL << high_bit);
             }
         }
     }
@@ -205,89 +242,32 @@ union KeyboardBitmap {
     bool getKey(HID_KeyCode key) const {
         uint8_t bit_index = getBitIndex(key);
         if (bit_index < 64) {
-            return (bitmap & (1ULL << bit_index)) != 0;
+            return (bitmap_low & (1ULL << bit_index)) != 0;
+        } else if (bit_index < 128) {
+            uint8_t high_bit = bit_index - 64;
+            return (bitmap_high & (1ULL << high_bit)) != 0;
         }
         return false;
     }
     
     // 清空所有按键
     void clear() {
-        bitmap = 0;
+        bitmap_low = 0;
+        bitmap_high = 0;
     }
     
     // 清空所有按键（volatile版本）
     void clear() volatile {
-        bitmap = 0;
+        bitmap_low = 0;
+        bitmap_high = 0;
     }
     
-private:
     // 获取HID_KeyCode对应的位索引
     uint8_t getBitIndex(HID_KeyCode key) const volatile {
-        switch (key) {
-            case HID_KeyCode::KEY_NONE: return 0;
-            case HID_KeyCode::KEY_A: return 1;
-            case HID_KeyCode::KEY_B: return 2;
-            case HID_KeyCode::KEY_C: return 3;
-            case HID_KeyCode::KEY_D: return 4;
-            case HID_KeyCode::KEY_E: return 5;
-            case HID_KeyCode::KEY_F: return 6;
-            case HID_KeyCode::KEY_G: return 7;
-            case HID_KeyCode::KEY_H: return 8;
-            case HID_KeyCode::KEY_I: return 9;
-            case HID_KeyCode::KEY_J: return 10;
-            case HID_KeyCode::KEY_K: return 11;
-            case HID_KeyCode::KEY_L: return 12;
-            case HID_KeyCode::KEY_M: return 13;
-            case HID_KeyCode::KEY_N: return 14;
-            case HID_KeyCode::KEY_O: return 15;
-            case HID_KeyCode::KEY_P: return 16;
-            case HID_KeyCode::KEY_Q: return 17;
-            case HID_KeyCode::KEY_R: return 18;
-            case HID_KeyCode::KEY_S: return 19;
-            case HID_KeyCode::KEY_T: return 20;
-            case HID_KeyCode::KEY_U: return 21;
-            case HID_KeyCode::KEY_V: return 22;
-            case HID_KeyCode::KEY_W: return 23;
-            case HID_KeyCode::KEY_X: return 24;
-            case HID_KeyCode::KEY_Y: return 25;
-            case HID_KeyCode::KEY_Z: return 26;
-            case HID_KeyCode::KEY_1: return 27;
-            case HID_KeyCode::KEY_2: return 28;
-            case HID_KeyCode::KEY_3: return 29;
-            case HID_KeyCode::KEY_4: return 30;
-            case HID_KeyCode::KEY_5: return 31;
-            case HID_KeyCode::KEY_6: return 32;
-            case HID_KeyCode::KEY_7: return 33;
-            case HID_KeyCode::KEY_8: return 34;
-            case HID_KeyCode::KEY_9: return 35;
-            case HID_KeyCode::KEY_0: return 36;
-            case HID_KeyCode::KEY_ENTER: return 37;
-            case HID_KeyCode::KEY_ESCAPE: return 38;
-            case HID_KeyCode::KEY_BACKSPACE: return 39;
-            case HID_KeyCode::KEY_TAB: return 40;
-            case HID_KeyCode::KEY_SPACE: return 41;
-            case HID_KeyCode::KEY_F1: return 42;
-            case HID_KeyCode::KEY_F2: return 43;
-            case HID_KeyCode::KEY_F3: return 44;
-            case HID_KeyCode::KEY_F4: return 45;
-            case HID_KeyCode::KEY_F5: return 46;
-            case HID_KeyCode::KEY_F6: return 47;
-            case HID_KeyCode::KEY_F7: return 48;
-            case HID_KeyCode::KEY_F8: return 49;
-            case HID_KeyCode::KEY_F9: return 50;
-            case HID_KeyCode::KEY_F10: return 51;
-            case HID_KeyCode::KEY_F11: return 52;
-            case HID_KeyCode::KEY_F12: return 53;
-            case HID_KeyCode::KEY_LEFT_CTRL: return 54;
-            case HID_KeyCode::KEY_LEFT_SHIFT: return 55;
-            case HID_KeyCode::KEY_LEFT_ALT: return 56;
-            case HID_KeyCode::KEY_LEFT_GUI: return 57;
-            case HID_KeyCode::KEY_RIGHT_CTRL: return 58;
-            case HID_KeyCode::KEY_RIGHT_SHIFT: return 59;
-            case HID_KeyCode::KEY_RIGHT_ALT: return 60;
-            case HID_KeyCode::KEY_RIGHT_GUI: return 61;
-            default: return 255; // 无效索引
-        }
+        if ((uint8_t)key < 3) return 0;
+        if ((uint8_t)key < 44) return (uint8_t)key - 3;
+        if ((uint8_t)key < 70) return (uint8_t)key - 16;
+        return (uint8_t)key - 54;
     }
 };
 

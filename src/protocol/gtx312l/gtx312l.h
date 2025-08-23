@@ -48,6 +48,24 @@ union GTX312L_PhysicalAddr {
     }
 };
 
+union GTX312L_PortEnableBitmap {
+    struct {
+        uint16_t CH0: 1;     // 通道0状态
+        uint16_t CH1: 1;     // 通道1状态
+        uint16_t CH2: 1;     // 通道2状态
+        uint16_t CH3: 1;     // 通道3状态
+        uint16_t CH4: 1;     // 通道4状态
+        uint16_t CH5: 1;     // 通道5状态
+        uint16_t CH6: 1;     // 通道6状态
+        uint16_t CH7: 1;     // 通道7状态
+        uint16_t CH8: 1;     // 通道8状态
+        uint16_t CH9: 1;     // 通道9状态
+        uint16_t CH10: 1;    // 通道10状态
+        uint16_t CH11: 1;    // 通道11状态
+    } port_enable;
+    uint16_t value;
+};
+
 // GTX312L采样结果结构体
 struct GTX312L_SampleResult {
     GTX312L_PhysicalAddr physical_addr;  // 包含设备地址和触摸bitmap的完整16位数据
@@ -68,23 +86,23 @@ struct GTX312L_SampleResult {
 #define GTX312L_I2C_ADDR_DEFAULT    0xB2    // 默认I2C地址
 
 // GTX312L寄存器定义（基于实际datasheet）
-#define GTX312L_REG_CHIPADDR_VER    0x01    // 芯片ID寄存器
+#define GTX312L_REG_CHIPADDR_VER    0x01    // 芯片地址寄存器
 #define GTX312L_REG_TOUCH_STATUS_L  0x02    // 触摸状态寄存器低字节（通道1-8）
 #define GTX312L_REG_TOUCH_STATUS_H  0x03    // 触摸状态寄存器高字节（通道9-12）
 #define GTX312L_REG_CH_ENABLE_L     0x04    // 通道使能寄存器低字节（通道1-8）
 #define GTX312L_REG_CH_ENABLE_H     0x05    // 通道使能寄存器高字节（通道9-12）
 #define GTX312L_REG_MON_RST         0x0A    // 监控复位寄存器
-#define GTX312L_REG_SOFT_RST        0x0B    // 软件复位寄存器
+#define GTX312L_REG_SLEEP           0x0B    // 睡眠寄存器
 #define GTX312L_REG_I2C_PU_DIS      0x0C    // I2C上拉禁用寄存器
 #define GTX312L_REG_WRITE_LOCK      0x0F    // 寄存器写保护锁
-#define GTX312L_REG_INT_MODE        0x10    // 中断模式配置寄存器
-#define GTX312L_REG_EXP_CONFIG      0x11    // 扩展配置寄存器
-#define GTX312L_REG_CAL_TIME        0x13    // 校准时间配置寄存器
-#define GTX312L_REG_SEN_IDLE_TIME   0x14    // 感应空闲时间寄存器
-#define GTX312L_REG_SEN_IDLE_SUFFIX 0x15    // 感应空闲时间后缀寄存器
-#define GTX312L_REG_BUSY_TO_IDLE    0x17    // 忙碌到空闲时间寄存器
-#define GTX312L_REG_I2B_MODE        0x18    // I2B模式寄存器
-#define GTX312L_REG_SLIDE_MODE      0x19    // 滑动模式寄存器
+#define GTX312L_REG_INT_TOUCH_MODE  0x10    // 中断/触触摸模式配置寄存器 0:(0单点模式/1多点模式) 5:(0脉冲模式/1电平模式) 
+#define GTX312L_REG_EXP_CONFIG      0x11    // 触摸过期时间寄存器 0:过期模式(0不同触摸不更新时间/1不同触摸更新时间) 1:模式开关(0关闭/1开启) 4-6: 超时时间
+#define GTX312L_REG_CAL_TIME        0x13    // 校准时间配置寄存器  0-3
+#define GTX312L_REG_SEN_IDLE_TIME   0x14    // 感应空闲时间寄存器  0-3
+#define GTX312L_REG_SEN_IDLE_SUFFIX 0x15    // 感应空闲时间后缀寄存器 0-3
+#define GTX312L_REG_BUSY_TO_IDLE    0x17    // 忙碌到空闲时间寄存器 0-2
+#define GTX312L_REG_I2B_MODE        0x18    // I2B(空闲到忙碌)模式寄存器 0:(0自动模式/1手动模式)
+#define GTX312L_REG_SLIDE_MODE      0x19    // 滑动模式寄存器 0:(0关闭/1启用)
 #define GTX312L_REG_SENSITIVITY_1   0x20    // 通道1灵敏度寄存器
 #define GTX312L_REG_SENSITIVITY_2   0x21    // 通道2灵敏度寄存器
 #define GTX312L_REG_SENSITIVITY_3   0x22    // 通道3灵敏度寄存器
@@ -97,12 +115,9 @@ struct GTX312L_SampleResult {
 #define GTX312L_REG_SENSITIVITY_10  0x29    // 通道10灵敏度寄存器
 #define GTX312L_REG_SENSITIVITY_11  0x2A    // 通道11灵敏度寄存器
 #define GTX312L_REG_SENSITIVITY_12  0x2B    // 通道12灵敏度寄存器
-#define GTX312L_REG_GLOBAL_CONFIG_1 0x2C    // 全局配置寄存器1
-#define GTX312L_REG_GLOBAL_CONFIG_2 0x2D    // 全局配置寄存器2
 
 // 触摸通道相关常量
 #define GTX312L_MAX_CHANNELS        12      // 最大触摸通道数
-#define GTX312L_CHIP_ID_VALUE       0xB6B2  // 预期的芯片ID值（根据datasheet）
 
 // 寄存器值定义
 #define GTX312L_WRITE_LOCK_VALUE    0x5A    // 写保护解锁值
@@ -123,8 +138,6 @@ struct GTX312L_SampleResult {
 // 扩展配置位定义
 #define GTX312L_EXP_EN              0x02    // 扩展功能使能位
 #define GTX312L_EXP_MODE            0x01    // 扩展模式位
-
-// 删除了不存在的寄存器相关常量定义
 
 // 触摸数据结构（12个通道的状态）
 struct GTX312L_TouchData {
@@ -151,39 +164,6 @@ struct GTX312L_TouchData {
     }
 };
 
-// 配置结构
-struct GTX312L_Config {
-    uint8_t sensitivity[GTX312L_MAX_CHANNELS];     // 每个通道的灵敏度 (0-63)
-    uint8_t channel_enable_mask_l;                 // 通道1-8使能掩码
-    uint8_t channel_enable_mask_h;                 // 通道9-12使能掩码
-    uint8_t cal_time;                              // 校准时间配置 (0-15)
-    uint8_t sen_idle_time;                         // 感应空闲时间 (0-15)
-    uint8_t sen_idle_time_suffix;                  // 感应空闲时间后缀 (0-15)
-    uint8_t busy_to_idle_time;                     // 忙碌到空闲时间 (0-7)
-    bool interrupt_enable;                         // 中断使能
-    bool multi_touch_enable;                       // 多点触摸使能
-    bool exp_enable;                               // 扩展功能使能
-    bool i2c_pullup_disable;                       // I2C上拉禁用
-    
-    GTX312L_Config() {
-        // 初始化所有通道灵敏度为默认值
-        for (int i = 0; i < GTX312L_MAX_CHANNELS; i++) {
-            sensitivity[i] = GTX312L_SENSITIVITY_DEFAULT;
-        }
-        
-        channel_enable_mask_l = GTX312L_CH_ENABLE_ALL_L;  // 默认启用所有通道
-        channel_enable_mask_h = GTX312L_CH_ENABLE_ALL_H;
-        cal_time = 0x0A;                    // 默认校准时间
-        sen_idle_time = 0x00;               // 默认感应空闲时间
-        sen_idle_time_suffix = 0x01;        // 默认感应空闲时间后缀
-        busy_to_idle_time = 0x03;           // 默认忙碌到空闲时间
-        interrupt_enable = false;           // 默认关闭中断
-        multi_touch_enable = true;          // 默认启用多点触摸
-        exp_enable = false;                 // 默认关闭扩展功能
-        i2c_pullup_disable = false;         // 默认启用I2C上拉
-    }
-};
-
 // 设备信息结构
 struct GTX312L_DeviceInfo {
     uint8_t i2c_address;
@@ -191,6 +171,14 @@ struct GTX312L_DeviceInfo {
     
     GTX312L_DeviceInfo() : i2c_address(0), is_valid(false) {}
 };
+
+typedef union {
+    struct {
+        uint8_t h;
+        uint8_t l;
+    };
+    uint16_t value;
+} GTX312L_SampleData;
 
 // 触摸回调函数类型
 typedef std::function<void(uint8_t device_index, const GTX312L_TouchData& touch_data)> GTX312L_TouchCallback;
@@ -234,7 +222,4 @@ private:
     bool read_register(uint8_t reg, uint8_t& value);
     bool write_registers(uint8_t reg, const uint8_t* data, size_t length);
     bool read_registers(uint8_t reg, uint8_t* data, size_t length);
-    
-    // 配置性能优化设置
-    bool configure_performance_settings();
 };

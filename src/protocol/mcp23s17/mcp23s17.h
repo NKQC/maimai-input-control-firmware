@@ -27,6 +27,7 @@
 #define MCP23S17_REG_INTCONA    0x08  // 中断控制寄存器A
 #define MCP23S17_REG_INTCONB    0x09  // 中断控制寄存器B
 #define MCP23S17_REG_IOCON      0x0A  // 配置寄存器
+#define MCP23S17_REG_IOCON_ALT  0x0B  // 配置寄存器（备用地址）
 #define MCP23S17_REG_GPPUA      0x0C  // 上拉电阻寄存器A
 #define MCP23S17_REG_GPPUB      0x0D  // 上拉电阻寄存器B
 #define MCP23S17_REG_INTFA      0x0E  // 中断标志寄存器A
@@ -39,14 +40,26 @@
 #define MCP23S17_REG_OLATB      0x15  // 输出锁存寄存器B
 
 
+
+// IOCON寄存器位定义
+#define MCP23S17_IOCON_BANK     0x80  // 寄存器地址模式位
+#define MCP23S17_IOCON_MIRROR   0x40  // 中断镜像位
+#define MCP23S17_IOCON_SEQOP    0x20  // 顺序操作位
+#define MCP23S17_IOCON_DISSLW   0x10  // 转换速率控制位
+#define MCP23S17_IOCON_HAEN     0x08  // 硬件地址使能位
+#define MCP23S17_IOCON_ODR      0x04  // 开漏输出位
+#define MCP23S17_IOCON_INTPOL   0x02  // 中断极性位
+
+
+
 // MCP23S17 GPIO枚举 (6-7位 = 11, 即0xC0)
 enum class MCP_GPIO : uint8_t {
-    // GPIOA1-A8 (1-8)
-    GPIOA1 = 0xC1, GPIOA2 = 0xC2, GPIOA3 = 0xC3, GPIOA4 = 0xC4,
-    GPIOA5 = 0xC5, GPIOA6 = 0xC6, GPIOA7 = 0xC7, GPIOA8 = 0xC8,
-    // GPIOB1-B8 (9-16)
-    GPIOB1 = 0xC9, GPIOB2 = 0xCA, GPIOB3 = 0xCB, GPIOB4 = 0xCC,
-    GPIOB5 = 0xCD, GPIOB6 = 0xCE, GPIOB7 = 0xCF, GPIOB8 = 0xD0,
+    // GPIOA0-A7 (1-8)
+    GPIOA0 = 0xC1, GPIOA1 = 0xC2, GPIOA2 = 0xC3, GPIOA3 = 0xC4,
+    GPIOA4 = 0xC5, GPIOA5 = 0xC6, GPIOA6 = 0xC7, GPIOA7 = 0xC8,
+    // GPIOB0-B7 (9-16)
+    GPIOB0 = 0xC9, GPIOB1 = 0xCA, GPIOB2 = 0xCB, GPIOB3 = 0xCC,
+    GPIOB4 = 0xCD, GPIOB5 = 0xCE, GPIOB6 = 0xCF, GPIOB7 = 0xD0,
     GPIO_NONE = 0xFF  // 无效GPIO
 };
 
@@ -141,6 +154,8 @@ public:
     // 配置寄存器操作
     bool configure_iocon(uint8_t config);
     
+
+    
 private:
     HAL_SPI* spi_hal_;
     uint8_t cs_pin_;
@@ -163,6 +178,8 @@ private:
     bool read_register(uint8_t reg, uint8_t& value);
     bool write_register_pair(uint8_t reg_a, uint8_t value_a, uint8_t reg_b, uint8_t value_b);
     bool read_register_pair(uint8_t reg_a, uint8_t& value_a, uint8_t reg_b, uint8_t& value_b);
+    
+
     
     // SPI传输
     bool spi_transfer(const uint8_t* tx_data, uint8_t* rx_data, size_t length);

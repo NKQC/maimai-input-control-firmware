@@ -27,7 +27,7 @@ HAL_UART0::~HAL_UART0() {
     instance_ = nullptr;
 }
 
-bool HAL_UART0::init(uint8_t tx_pin, uint8_t rx_pin, uint32_t baudrate, bool flow_control) {
+bool HAL_UART0::init(uint8_t tx_pin, uint8_t rx_pin, uint32_t baudrate, bool flow_control, uint8_t cts_pin, uint8_t rts_pin) {
     if (initialized_) {
         deinit();
     }
@@ -42,6 +42,12 @@ bool HAL_UART0::init(uint8_t tx_pin, uint8_t rx_pin, uint32_t baudrate, bool flo
     // 设置GPIO功能
     gpio_set_function(tx_pin, GPIO_FUNC_UART);
     gpio_set_function(rx_pin, GPIO_FUNC_UART);
+    
+    // 配置硬件流控引脚
+    if (flow_control && cts_pin != 255 && rts_pin != 255) {
+        gpio_set_function(cts_pin, GPIO_FUNC_UART); // CTS
+        gpio_set_function(rts_pin, GPIO_FUNC_UART); // RTS
+    }
     
     // 配置UART参数
     uart_set_hw_flow(uart0, flow_control, flow_control);
@@ -530,7 +536,7 @@ HAL_UART1::~HAL_UART1() {
     instance_ = nullptr;
 }
 
-bool HAL_UART1::init(uint8_t tx_pin, uint8_t rx_pin, uint32_t baudrate, bool flow_control) {
+bool HAL_UART1::init(uint8_t tx_pin, uint8_t rx_pin, uint32_t baudrate, bool flow_control, uint8_t cts_pin, uint8_t rts_pin) {
     if (initialized_) {
         deinit();
     }
@@ -545,6 +551,12 @@ bool HAL_UART1::init(uint8_t tx_pin, uint8_t rx_pin, uint32_t baudrate, bool flo
     // 设置GPIO功能
     gpio_set_function(tx_pin, GPIO_FUNC_UART);
     gpio_set_function(rx_pin, GPIO_FUNC_UART);
+    
+    // 配置硬件流控引脚
+    if (flow_control && cts_pin != 255 && rts_pin != 255) {
+        gpio_set_function(cts_pin, GPIO_FUNC_UART); // CTS
+        gpio_set_function(rts_pin, GPIO_FUNC_UART); // RTS
+    }
     
     // 配置UART参数
     uart_set_hw_flow(uart1, flow_control, flow_control);

@@ -29,12 +29,24 @@ bool GTX312L::init() {
     if (!read_register(GTX312L_REG_CHIPADDR_VER, chip_id)) {
         return false;
     }
+    uint8_t ret = 0;
+    // 下面是默认设置
+    ret |= !write_register(GTX312L_REG_MON_RST, 0);  // 关闭自复位
+    ret |= !write_register(GTX312L_REG_I2C_PU_DIS, 1);  // 关闭I2C上拉
+    ret |= !write_register(GTX312L_REG_INT_TOUCH_MODE, 0x01);  // 不关心中断 只启用多点触摸
+    ret |= !write_register(GTX312L_REG_EXP_CONFIG, 0x00);  // 关闭触摸超时
+    ret |= !write_register(GTX312L_REG_CAL_TIME, 0x00);  // 单周期校准 我们依靠外部电路的稳定确保采样正确
+    // 关闭空闲时间
+    ret |= !write_register(GTX312L_REG_SEN_IDLE_TIME, 0x00); 
+    ret |= !write_register(GTX312L_REG_SEN_IDLE_SUFFIX, 0x00);
+    ret |= !write_register(GTX312L_REG_BUSY_TO_IDLE, 0x00);
+
+    ret |= !write_register(GTX312L_REG_I2B_MODE, 0x00);  // 自动进入BUSY模式
+    ret |= !write_register(GTX312L_REG_SLIDE_MODE, 0x00);  // 禁用滑动模式
     
-    // 配置性能优化设置：关闭睡眠、关闭采样防抖、最大化采样速度
-    if (!configure_performance_settings()) {
+    if (ret) {
         return false;
     }
-    
     initialized_ = true;
     return true;
 }
@@ -69,28 +81,16 @@ GTX312L_PhysicalAddr GTX312L::get_physical_device_address() const {
     return physical_device_address_;
 }
 
-// 高效采样接口 - 直接与physical_device_address_进行位运算
+// 高效采样接口 没有检查!
 GTX312L_SampleResult GTX312L::sample_touch_data() {
-    if (!initialized_) {
-        GTX312L_SampleResult result(physical_device_address_.mask, 0);
-        return result;
-    }
-    
     // 读取触摸状态寄存器
-    uint8_t touch_low = 0, touch_high = 0;
-    if (!read_register(GTX312L_REG_TOUCH_STATUS_L, touch_low) ||
-        !read_register(GTX312L_REG_TOUCH_STATUS_H, touch_high)) {
-        GTX312L_SampleResult result(physical_device_address_.mask, 0);
-        return result;
+    GTX312L_SampleData bitmap;
+    if (!read_register(GTX312L_REG_TOUCH_STATUS_L, bitmap.l) ||
+        !read_register(GTX312L_REG_TOUCH_STATUS_H, bitmap.h)) {
+        return GTX312L_SampleResult(physical_device_address_.mask, 0);
     }
     
-    // 组合12位触摸状态
-    uint16_t touch_bitmap = (static_cast<uint16_t>(touch_high & 0x0F) << 8) | touch_low;
-    
-    // 直接与physical_device_address_进行位运算以最大化复用
-    // 保持设备地址部分，更新通道部分
-    uint16_t device_mask = physical_device_address_.mask & 0xF000;  // 保留设备地址部分
-    GTX312L_SampleResult result(device_mask, touch_bitmap);
+    GTX312L_SampleResult result(physical_device_address_.mask & 0xF000, bitmap.value);
     return result;
 }
 
@@ -160,24 +160,4 @@ bool GTX312L::read_registers(uint8_t reg, uint8_t* data, size_t length) {
     }
     // 再读取数据
     return i2c_hal_->read(i2c_device_address_, data, length);
-}
-
-// 配置性能优化设置
-bool GTX312L::configure_performance_settings() {
-    // 1. 设置最小感应空闲时间 - 减少扫描间隔
-    if (!write_register(GTX312L_REG_SEN_IDLE_TIME, 0x00)) {
-        return false;
-    }
-    
-    // 2. 设置最小忙碌到空闲时间 - 快速状态切换
-    if (!write_register(GTX312L_REG_BUSY_TO_IDLE, 0x00)) {
-        return false;
-    }
-    
-    // 6. 设置最小校准时间 - 减少校准延迟
-    if (!write_register(GTX312L_REG_CAL_TIME, 0x00)) {
-        return false;
-    }
-    
-    return true;
 }
