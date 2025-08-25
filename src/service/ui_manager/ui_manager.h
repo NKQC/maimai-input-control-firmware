@@ -475,8 +475,8 @@ private:
     void handle_confirm_input();
     
     // 屏保和背光管理
-    void handle_backlight();
-    void handle_screen_timeout();
+    inline void handle_backlight();
+    inline void handle_screen_timeout();
     
     // 工具函数
     bool is_page_valid(UIPage page) const;

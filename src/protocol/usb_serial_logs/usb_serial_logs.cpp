@@ -4,6 +4,7 @@
 #include <cstring>
 #include <cstdarg>
 #include <algorithm>
+#include "pico/stdlib.h"
 
 // 静态全局实例
 USB_SerialLogs* USB_SerialLogs::global_instance_ = nullptr;
@@ -79,7 +80,9 @@ void USB_SerialLogs::deinit() {
 
 // 检查是否就绪
 bool USB_SerialLogs::is_ready() const {
-    return initialized_ && usb_hal_->is_connected();
+    return initialized_ && 
+           usb_hal_ != nullptr && 
+           usb_hal_->is_connected();
 }
 
 // 设置配置
@@ -229,11 +232,12 @@ void USB_SerialLogs::flush() {
     
     // 刷新写缓冲区
     if (buffer_pos_ > 0) {
-        bool result = usb_hal_->cdc_write(write_buffer_, buffer_pos_);
-        if (result) {
+        // 直接发送整个缓冲区，让HAL层处理分块和重试
+        if (usb_hal_->cdc_write(write_buffer_, buffer_pos_)) {
             stats_.bytes_sent += buffer_pos_;
+            buffer_pos_ = 0;
         }
-        buffer_pos_ = 0;
+        // 如果发送失败，保留缓冲区内容，下次再试
     }
     
     last_flush_time_ = time_us_32() / 1000;
@@ -289,11 +293,6 @@ void USB_SerialLogs::task() {
         if (current_time - last_flush_time_ >= config_.flush_interval_ms) {
             flush();
         }
-    }
-    
-    // 处理队列
-    if (!log_queue_.empty()) {
-        process_queue();
     }
 }
 
@@ -422,6 +421,12 @@ bool USB_SerialLogs::send_log_entry(const USB_LogEntry& entry) {
     std::string formatted = format_log_entry(entry);
     formatted += "\r\n";
     
+    // 检查消息长度是否合理
+    if (formatted.length() > USB_LOGS_MAX_LINE_LENGTH) {
+        // 消息过长，截断处理
+        formatted = formatted.substr(0, USB_LOGS_MAX_LINE_LENGTH - 10) + "...\r\n";
+    }
+    
     // 检查是否需要缓冲
     if (config_.enable_buffering && formatted.length() < USB_LOGS_BUFFER_SIZE - buffer_pos_) {
         // 添加到写缓冲区
@@ -435,7 +440,7 @@ bool USB_SerialLogs::send_log_entry(const USB_LogEntry& entry) {
         
         return true;
     } else {
-        // 直接发送
+        // 直接发送，让HAL层处理超时和重试
         return write_string(formatted);
     }
 }

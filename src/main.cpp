@@ -200,14 +200,14 @@
 #define ST7735S_DC_PIN 21
 #define ST7735S_RST_PIN 20
 #define ST7735S_CS_PIN 17
-#define ST7735S_BLK_PIN 22  // 尚未使用
-#define SPI0_FREQ 1000000
+#define ST7735S_BLK_PIN 22  // 背光PWM控制引脚
+#define SPI0_FREQ 4000000
 // MCP23S17
 #define SPI1_MISO_PIN 28
 #define SPI1_MOSI_PIN 27
 #define SPI1_SCK_PIN 26
 #define MCP23S17_CS_PIN 29
-#define SPI1_FREQ 1000000
+#define SPI1_FREQ 10000000
 
 #define UART0_TX_PIN 12
 #define UART0_RX_PIN 13
@@ -226,6 +226,66 @@
 // Watchdog配置
 #define WATCHDOG_TIMEOUT_MS 5000
 #define WATCHDOG_FEED_INTERVAL_MS 1000
+
+// 双核心初始化同步bitmap结构体
+struct CoreInitBitmap {
+    volatile uint32_t core0_hal_ready : 1;
+    volatile uint32_t core1_hal_ready : 1;
+    volatile uint32_t core0_protocol_ready : 1;
+    volatile uint32_t core1_protocol_ready : 1;
+    volatile uint32_t service_ready : 1;
+    volatile uint32_t usb_log_ready : 1;  // USB log可用标志
+    volatile uint32_t core1_failed : 1;   // Core1启动失败标志
+    volatile uint32_t reserved : 25;
+    
+    inline void reset() volatile {
+        *(volatile uint32_t*)this = 0;
+    }
+    
+    // 简化的等待函数，支持USB log flush
+    inline bool wait_for_both_hal(uint32_t timeout_ms = 5000) volatile {
+        uint32_t start = millis();
+        while ((!core0_hal_ready || !core1_hal_ready) && (millis() - start) < timeout_ms) {
+            // 如果当前是Core1且USB log可用，则flush
+            if (get_core_num() == 1 && usb_log_ready) {
+                USB_SerialLogs* logs = USB_SerialLogs::get_global_instance();
+                if (logs) {
+                    logs->flush();
+                }
+            }
+            tight_loop_contents();
+        }
+        return core0_hal_ready && core1_hal_ready;
+    }
+    
+    inline bool wait_for_both_protocol(uint32_t timeout_ms = 5000) volatile {
+        uint32_t start = millis();
+        while ((!core0_protocol_ready || !core1_protocol_ready) && (millis() - start) < timeout_ms) {
+            // 如果当前是Core1且USB log可用，则flush
+            if (get_core_num() == 1 && usb_log_ready) {
+                USB_SerialLogs* logs = USB_SerialLogs::get_global_instance();
+                if (logs) {
+                    logs->flush();
+                }
+            }
+            tight_loop_contents();
+        }
+        return core0_protocol_ready && core1_protocol_ready;
+    }
+    
+    // 检查Core1是否启动失败
+    inline bool is_core1_failed() volatile {
+        return core1_failed;
+    }
+    
+    // 标记Core1启动失败
+    inline void mark_core1_failed() volatile {
+        core1_failed = 1;
+    }
+};
+
+// 全局同步bitmap
+static volatile CoreInitBitmap init_sync;
 
 // 全局对象声明
 static HAL_I2C* hal_i2c0 = nullptr;
@@ -257,12 +317,15 @@ static bool system_error = false;
 static uint32_t last_watchdog_feed[2] = {0, 0};
 
 // 函数声明
-bool init_hal_layer();
-bool init_protocol_layer();
+bool core0_init_hal_layer();
+bool core1_init_hal_layer();
+bool core0_init_protocol_layer();
+bool core1_init_protocol_layer();
 bool init_service_layer();
 void deinit_system();
 void core0_task();
-void core1_task();;
+void core1_task();
+void core1_main();
 void status_update_task();
 void print_system_info();
 void scan_i2c_devices();
@@ -306,6 +369,9 @@ void error_handler(const char* error_msg) {
         char buffer[256];
         snprintf(buffer, sizeof(buffer), "SYSTEM ERROR: %s", error_msg);
         usb_logs->error(std::string(buffer));
+        
+        // 立即flush确保错误信息能够发送
+        usb_logs->flush();
     }
     
     // 如果UI管理器可用，显示错误界面
@@ -332,6 +398,9 @@ void print_system_info() {
 
 /**
  * HAL层初始化
+ */
+/**
+ * Core0 HAL层初始化 - 负责I2C、UART、PIO
  */
 bool core0_init_hal_layer() {
     // 初始化I2C
@@ -366,7 +435,17 @@ bool core0_init_hal_layer() {
         error_handler("Failed to initialize PIO1");
         return false;
     }
+    
+    // 标记Core0 HAL层初始化完成
+    init_sync.core0_hal_ready = 1;
+    
+    return true;
+}
 
+/**
+ * Core1 HAL层初始化 - 负责SPI、USB
+ */
+bool core1_init_hal_layer() {
     // 初始化SPI
     hal_spi0 = HAL_SPI0::getInstance();
     if (!hal_spi0 || !hal_spi0->init(SPI0_SCK_PIN, SPI0_MOSI_PIN, SPI0_MISO_PIN, SPI0_FREQ)) {
@@ -387,42 +466,29 @@ bool core0_init_hal_layer() {
         return false;
     }
     
+    // 标记Core1 HAL层初始化完成
+    init_sync.core1_hal_ready = 1;
+    
     return true;
 }
 
 /**
- * 协议层初始化
+ * Core0 协议层初始化 - 负责GTX312L、NeoPixel、Mai2Serial、Mai2Light
  */
-inline bool init_protocol_layer() {
-    
-    // 初始化USB Serial Logs
-    usb_logs = new USB_SerialLogs(hal_usb);
-    if (!usb_logs || !usb_logs->init()) {
-        error_handler("Failed to initialize USB Serial Logs");
+bool core0_init_protocol_layer() {
+    // 等待两个核心的HAL层都初始化完成
+    if (!init_sync.wait_for_both_hal()) {
+        error_handler("Timeout waiting for HAL layer initialization");
         return false;
     }
     
     // 扫描I2C设备并初始化GTX312L
     scan_i2c_devices();
-
-    // 初始化MCP23S17
-    mcp23s17 = new MCP23S17(hal_spi1, MCP23S17_CS_PIN);
-    if (!mcp23s17 || !mcp23s17->init()) {
-        error_handler("Failed to initialize MCP23S17");
-        return false;
-    }
     
     // 初始化NeoPixel
     neopixel = new NeoPixel(hal_pio1, NEOPIXEL_LEDS_NUM);
     if (!neopixel || !neopixel->init()) {
         error_handler("Failed to initialize NeoPixel");
-        return false;
-    }
-    
-    // 初始化ST7735S
-    st7735s = new ST7735S(hal_spi0, ST7735S_CS_PIN, ST7735S_DC_PIN, ST7735S_RST_PIN);
-    if (!st7735s || !st7735s->init()) {
-        error_handler("Failed to initialize ST7735S");
         return false;
     }
     
@@ -440,6 +506,54 @@ inline bool init_protocol_layer() {
         return false;
     }
     
+    // 标记Core0 协议层初始化完成
+    init_sync.core0_protocol_ready = 1;
+    
+    return true;
+}
+
+/**
+ * Core1 协议层初始化 - 负责USB Serial Logs、ST7735S、HID、MCP23S17
+ */
+bool core1_init_protocol_layer() {
+    // 等待两个核心的HAL层都初始化完成
+    if (!init_sync.wait_for_both_hal()) {
+        error_handler("Timeout waiting for HAL layer initialization");
+        return false;
+    }
+    
+    // 初始化USB Serial Logs
+    usb_logs = new USB_SerialLogs(hal_usb);
+    if (!usb_logs || !usb_logs->init()) {
+        error_handler("Failed to initialize USB Serial Logs");
+        return false;
+    }
+
+    USB_SerialLogs_Config log_config;
+    log_config.enable_colors = true;
+    log_config.enable_buffering = true;
+    log_config.min_level = USB_LogLevel::INFO;
+
+    usb_logs->set_config(log_config);
+    
+    // 设置全局USB logs实例并标记可用
+    USB_SerialLogs::set_global_instance(usb_logs);
+    init_sync.usb_log_ready = 1;
+    
+    // 初始化MCP23S17
+    mcp23s17 = new MCP23S17(hal_spi1, MCP23S17_CS_PIN);
+    if (!mcp23s17 || !mcp23s17->init()) {
+        error_handler("Failed to initialize MCP23S17");
+        return false;
+    }
+    
+    // 初始化ST7735S
+    st7735s = new ST7735S(hal_spi0, ST7735S_CS_PIN, ST7735S_DC_PIN, ST7735S_RST_PIN, ST7735S_BLK_PIN);
+    if (!st7735s || !st7735s->init()) {
+        error_handler("Failed to initialize ST7735S");
+        return false;
+    }
+    
     // 初始化HID (使用单例模式)
     hid = HID::getInstance();
     if (!hid || !hid->init(hal_usb)) {
@@ -447,13 +561,25 @@ inline bool init_protocol_layer() {
         return false;
     }
     
+    // 标记Core1 协议层初始化完成
+    init_sync.core1_protocol_ready = 1;
+    
     return true;
 }
 
 /**
  * 服务层初始化
  */
+/**
+ * 服务层初始化 - 在Core0上运行，等待两个核心的协议层都初始化完成
+ */
 bool init_service_layer() {
+    // 等待两个核心的协议层都初始化完成
+    if (!init_sync.wait_for_both_protocol()) {
+        error_handler("Timeout waiting for protocol layer initialization");
+        return false;
+    }
+    
     // 首先初始化ConfigManager
     config_manager = ConfigManager::getInstance();
     if (!config_manager || !config_manager->initialize()) {
@@ -510,11 +636,14 @@ bool init_service_layer() {
             }
         }
     }
-    
     // 初始化LightManager
     light_manager = LightManager::getInstance();
     
-    if (!light_manager->init()) {
+    LightManager::InitConfig light_config;
+    light_config.mai2light = mai2_light;
+    light_config.neopixel = neopixel; 
+
+    if (!light_manager->init(light_config)) {
         error_handler("Failed to initialize LightManager");
         return false;
     }
@@ -531,6 +660,9 @@ bool init_service_layer() {
         error_handler("Failed to initialize UIManager");
         return false;
     }
+    
+    // 标记服务层初始化完成
+    init_sync.service_ready = 1;
     
     return true;
 }
@@ -767,20 +899,67 @@ void core0_task() {
         input_manager->loop0();
         light_manager->loop();
         watchdog_feed();
-        heartbeat_task();
     }
+}
+
+/**
+ * Core1主函数 - 处理Core1的初始化和任务循环
+ */
+void core1_main() {
+    watchdog_enable(WATCHDOG_TIMEOUT_MS, true);
+    gpio_init(LED_BUILTIN_PIN);
+    gpio_set_dir(LED_BUILTIN_PIN, GPIO_OUT);
+    gpio_put(LED_BUILTIN_PIN, 0);
+    
+    bool init_success = true;
+    
+    // Core1 HAL层初始化
+    if (!core1_init_hal_layer()) {
+        init_success = false;
+    }
+    
+    // Core1 协议层初始化
+    if (init_success && !core1_init_protocol_layer()) {
+        init_success = false;
+    }
+    
+    if (!init_success) {
+        // 标记Core1启动失败
+        init_sync.mark_core1_failed();
+        error_handler("Core1 initialization failed");
+        return;
+    }
+    
+    // 等待服务层初始化完成，期间flush USB logs
+    uint32_t start = millis();
+    while (!init_sync.service_ready && (millis() - start) < 10000) {
+        // 如果USB log可用，则flush
+        if (init_sync.usb_log_ready && usb_logs) {
+            usb_logs->flush();
+        }
+        watchdog_feed();
+    }
+
+    if (!init_sync.service_ready) {
+        init_sync.mark_core1_failed();
+        error_handler("Timeout waiting for service layer initialization");
+        return;
+    }
+    
+    // 进入Core1任务循环
+    core1_task();
 }
 
 /**
  * Core1任务 - InputManager Loop1, UIManager Loop
  */
 void core1_task() {
-    watchdog_enable(WATCHDOG_TIMEOUT_MS, true);
     while (1) {
         input_manager->loop1();
         usb_logs->task();
-        ui_manager->task();
+        //ui_manager->task();
         watchdog_feed();
+        heartbeat_task();
     }
 }
 
@@ -812,26 +991,37 @@ void emergency_shutdown() {
  * Arduino setup函数
  */
 void setup() {
-    gpio_init(LED_BUILTIN_PIN);
-    gpio_set_dir(LED_BUILTIN_PIN, GPIO_OUT);
-    gpio_put(LED_BUILTIN_PIN, 0);
-
     // 启用看门狗
     watchdog_enable(WATCHDOG_TIMEOUT_MS, true);
     
-    // 初始化系统
+    // 重置同步bitmap
+    init_sync.reset();
+    
+    // 启动Core1
+    multicore_launch_core1(core1_main);
+    
+    // Core0初始化流程
     bool init_success = true;
     
-    // 初始化HAL层
+    // Core0 HAL层初始化
     if (!core0_init_hal_layer()) {
         init_success = false;
     }
     
-    // 初始化协议层
-    if (init_success && !init_protocol_layer()) {
+    // Core0 协议层初始化
+    if (init_success && !core0_init_protocol_layer()) {
         init_success = false;
     }
     
+    // 检查Core1是否启动失败
+    if (init_success && init_sync.is_core1_failed()) {
+        init_success = false;
+        if (usb_logs) {
+            usb_logs->error("Core1 initialization failed");
+            usb_logs->flush();
+        }
+    }
+
     // 初始化服务层
     if (init_success && !init_service_layer()) {
         init_success = false;
@@ -842,13 +1032,10 @@ void setup() {
         if (usb_logs) {
             usb_logs->info("System initialization completed successfully");
         }
-        multicore_launch_core1(core1_task);
+        // 进入Core0任务循环
         core0_task();
-
     } else {
-        if (usb_logs) {
-            error_handler("System initialization failed");
-        }
+        error_handler("System initialization failed");
     }
 }
 

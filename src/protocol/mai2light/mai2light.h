@@ -170,7 +170,6 @@ public:
     bool set_led_color(uint8_t led_index, uint8_t r, uint8_t g, uint8_t b);     // 设置单个LED颜色
     bool set_led_brightness(uint8_t led_index, uint8_t brightness);             // 设置单个LED亮度
     bool set_all_leds(const Mai2Light_RGB& color);                             // 设置所有LED颜色
-    bool set_multiple_leds(const std::vector<Mai2Light_RGB>& colors);          // 设置多个LED颜色
     
     // 全局控制
     bool set_global_brightness(uint8_t brightness);                            // 设置全局亮度
@@ -179,6 +178,8 @@ public:
     
     // 状态查询
     bool get_led_status(uint8_t led_index, Mai2Light_LEDStatus& status);       // 获取LED状态
+    bool get_all_led_status(Mai2Light_LEDStatus status_array[MAI2LIGHT_NUM_LEDS]); // 获取所有LED状态
+    const Mai2Light_LEDStatus* get_led_status_array() const;                   // 获取LED状态数组指针
     bool get_board_info(Mai2Light_BoardInfo& info);                           // 获取板卡信息
     uint8_t get_protocol_version();                                            // 获取协议版本
     
@@ -215,6 +216,10 @@ private:
     // 回调函数
     Mai2Light_CommandCallback command_callback_;
     Mai2Light_LogCallback log_callback_;
+    
+    // 虚拟EEPROM存储
+    static const uint16_t EEPROM_SIZE = 256;  // EEPROM大小
+    uint8_t virtual_eeprom_[EEPROM_SIZE];     // 虚拟EEPROM数据
     
     // 内部方法
     bool send_packet(const Mai2Light_PacketReq& packet);

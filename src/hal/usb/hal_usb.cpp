@@ -5,6 +5,7 @@
 #include <class/cdc/cdc_device.h>
 #include <class/hid/hid_device.h>
 #include <cstring>
+#include <algorithm>
 
 // 静态实例指针
 HAL_USB_Device* HAL_USB_Device::instance_ = nullptr;
@@ -240,9 +241,43 @@ bool HAL_USB_Device::configure_device(uint16_t vendor_id, uint16_t product_id, c
 }
 
 bool HAL_USB_Device::cdc_write(const uint8_t* data, size_t length) {
-    if (!is_ready()) return false;
+    if (!is_ready() || !data || length == 0) {
+        return length == 0;
+    }
     
-    return tud_cdc_write(data, length) == length;
+    static uint64_t last_avail_time = 0;
+    const uint64_t TIMEOUT_US = 10000; // 10ms timeout
+    
+    size_t total_written = 0;
+    uint64_t start_time = time_us_64();
+    
+    while (total_written < length) {
+        uint32_t available = tud_cdc_write_available();
+        
+        if (available > 0) {
+            size_t to_write = std::min((size_t)available, length - total_written);
+            uint32_t written = tud_cdc_write(data + total_written, to_write);
+            
+            if (written > 0) {
+                total_written += written;
+                last_avail_time = time_us_64();
+                tud_cdc_write_flush();
+            }
+        } else {
+            // No space available, check timeout
+            uint64_t current_time = time_us_64();
+            if (current_time - start_time > TIMEOUT_US || 
+                (last_avail_time > 0 && current_time - last_avail_time > TIMEOUT_US)) {
+                break; // Timeout reached
+            }
+            
+            // Brief delay and flush
+            sleep_us(100);
+            tud_cdc_write_flush();
+        }
+    }
+    
+    return total_written == length;
 }
 
 size_t HAL_USB_Device::cdc_read(uint8_t* buffer, size_t max_length) {

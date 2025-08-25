@@ -3,7 +3,6 @@
 
 #include "../../protocol/mai2light/mai2light.h"
 #include "../../protocol/neopixel/neopixel.h"
-#include "../../hal/uart/hal_uart.h"
 #include <stdint.h>
 #include <string>
 #include <vector>
@@ -23,129 +22,44 @@ class UIManager;
 #define LIGHTMANAGER_NEOPIXEL_PIN "LIGHTMANAGER_NEOPIXEL_PIN"
 #define LIGHTMANAGER_REGION_MAPPINGS "LIGHTMANAGER_REGION_MAPPINGS"
 
-// 协议常量定义 (基于BD15070_4.h)
-#define BD15070_SYNC 0xE0
-#define BD15070_MARKER 0xD0
-
-// 协议命令定义
-enum BD15070_Command : uint8_t {
-    SetLedGs8Bit = 0x31,
-    SetLedGs8BitMulti = 0x32,
-    SetLedGs8BitMultiFade = 0x33,
-    SetLedFet = 0x39,
-    SetDcUpdate = 0x3B,
-    SetLedGsUpdate = 0x3C,
-    SetDc = 0x3F,
-    SetEEPRom = 0x7B,
-    GetEEPRom = 0x7C,
-    SetEnableResponse = 0x7D,
-    SetDisableResponse = 0x7E,
-    GetBoardInfo = 0xF0,
-    GetBoardStatus = 0xF1,
-    GetFirmSum = 0xF2,
-    GetProtocolVersion = 0xF3
-};
-
-// 应答状态定义
-enum BD15070_AckStatus : uint8_t {
-    AckStatus_Ok = 0x01,
-    AckStatus_SumError = 0x02,
-    AckStatus_ParityError = 0x03,
-    AckStatus_FramingError = 0x04,
-    AckStatus_OverRunError = 0x05,
-    AckStatus_RecvBfOverFlow = 0x06,
-    AckStatus_Invalid = 0xFF
-};
-
-// 应答报告定义
-enum BD15070_AckReport : uint8_t {
-    AckReport_Ok = 0x01,
-    AckReport_Busy = 0x02,
-    AckReport_CommandUnknown = 0x03,
-    AckReport_ParamError = 0x04,
-    AckReport_Invalid = 0xFF
-};
-
 // 数据类型定义
-typedef uint32_t bitmap32_t;
+typedef uint16_t bitmap16_t;  // 16位bitmap，支持最多16个灯
 
-// 请求数据包结构 (基于BD15070_4.h PacketReq)
-struct BD15070_PacketReq {
-    uint8_t dstNodeID;
-    uint8_t srcNodeID;
-    uint8_t length;
-    uint8_t command;
-    
-    union {
-        uint8_t timeout;
-        struct {
-            uint8_t index;
-            uint8_t color[3];
-        } led_gs8bit;
-        struct {
-            uint8_t start;
-            uint8_t end;
-            uint8_t skip;
-            uint8_t Multi_color[3];
-            uint8_t speed;
-        } led_multi;
-        struct {
-            uint8_t BodyLed;
-            uint8_t ExtLed;
-            uint8_t SideLed;
-        } led_fet;
-        struct {
-            uint8_t Set_adress;
-            uint8_t writeData;
-        } eeprom_set;
-        uint8_t Get_adress;
-        uint8_t Direct_color[11][3];
-    } data;
+// 区域枚举定义 (1-11对应原始灯编号)
+enum LightRegion : uint8_t {
+    REGION_1 = 1,
+    REGION_2 = 2,
+    REGION_3 = 3,
+    REGION_4 = 4,
+    REGION_5 = 5,
+    REGION_6 = 6,
+    REGION_7 = 7,
+    REGION_8 = 8,
+    REGION_9 = 9,
+    REGION_10 = 10,
+    REGION_11 = 11,
+    REGION_COUNT = 11
 };
 
-// 应答数据包结构 (基于BD15070_4.h PacketAck)
-struct BD15070_PacketAck {
-    uint8_t dstNodeID;
-    uint8_t srcNodeID;
-    uint8_t length;
-    uint8_t status;
-    uint8_t command;
-    uint8_t report;
+// 简化的区域映射结构
+struct RegionBitmap {
+    bitmap16_t neopixel_bitmap;  // 16位bitmap，表示该区域映射的neopixel位置
+    uint8_t r, g, b;             // 当前颜色值
+    bool enabled;                // 是否启用
     
-    union {
-        uint8_t eepData;
-        struct {
-            uint8_t boardNo[9];
-            uint8_t firmRevision;
-        } board_info;
-        struct {
-            uint8_t timeoutStat;
-            uint8_t timeoutSec;
-            uint8_t pwmIo;
-            uint8_t fetTimeout;
-        } board_status;
-        struct {
-            uint8_t sum_upper;
-            uint8_t sum_lower;
-        } firm_sum;
-        struct {
-            uint8_t appliMode;
-            uint8_t major;
-            uint8_t minor;
-        } protocol_version;
-    } data;
+    RegionBitmap() : neopixel_bitmap(0), r(0), g(0), b(0), enabled(false) {}
 };
 
-// 灯光区域映射结构
-struct LightRegionMapping {
-    std::string name;                    // 区域名称
-    uint8_t mai2light_start_index;       // Mai2Light起始索引
-    uint8_t mai2light_end_index;         // Mai2Light结束索引
-    bitmap32_t neopixel_bitmap;          // Neopixel位置bitmap (最多32个位置)
-    bool enabled;                        // 是否启用映射
+// 时间片调度结构
+struct TimeSliceScheduler {
+    uint32_t slice_start_time;   // 时间片开始时间 (微秒)
+    uint32_t slice_duration_us;  // 时间片持续时间 (微秒，默认100us = 0.1ms)
+    uint8_t current_region;      // 当前处理的区域
+    uint8_t current_led;         // 当前处理的LED
+    bool processing_active;      // 是否正在处理
     
-    LightRegionMapping() : name(), mai2light_start_index(0), 
-                          mai2light_end_index(0), neopixel_bitmap(0), enabled(true) {}
+    TimeSliceScheduler() : slice_start_time(0), slice_duration_us(100), 
+                          current_region(0), current_led(0), processing_active(false) {}
 };
 
 // 灯光管理器私有配置
@@ -157,6 +71,11 @@ struct LightManager_PrivateConfig {
     uint8_t node_id;                     // 节点ID
     uint16_t neopixel_count;             // Neopixel数量
     uint8_t neopixel_pin;                // Neopixel引脚
+    
+    // 区域映射持久化数据
+    bitmap16_t region_bitmaps[REGION_COUNT];     // 区域bitmap映射
+    bool region_enabled[REGION_COUNT];           // 区域启用状态
+    uint8_t region_colors[REGION_COUNT][3];      // 区域颜色 [R,G,B]
 
     LightManager_PrivateConfig()
         : enable(true)
@@ -164,7 +83,16 @@ struct LightManager_PrivateConfig {
         , baud_rate(115200)
         , node_id(1)
         , neopixel_count(128)
-        , neopixel_pin(16) {}
+        , neopixel_pin(16) {
+        // 初始化区域映射数据
+        for (int i = 0; i < REGION_COUNT; i++) {
+            region_bitmaps[i] = 0;
+            region_enabled[i] = false;
+            region_colors[i][0] = 0; // R
+            region_colors[i][1] = 0; // G
+            region_colors[i][2] = 0; // B
+        }
+    }
 };
 
 // 灯光管理器配置 (仅包含服务指针)
@@ -181,13 +109,12 @@ struct LightManager_Config {
 // 配置管理函数声明
 // 遵循服务层规则3: 配置管理函数 - 完全的单数据存储和及时响应配置更变
 void lightmanager_register_default_configs(config_map_t& default_map);     // [默认配置注册函数] 注册默认配置到ConfigManager
-LightManager_Config* lightmanager_get_config_holder();                     // [配置保管函数] 保存静态私有配置变量并返回指针
-bool lightmanager_load_config_from_manager(LightManager_Config* config);   // [配置加载函数] 从ConfigManager获取配置存入指针
-LightManager_PrivateConfig lightmanager_get_config_copy();                 // [配置读取函数] 复制配置副本并返回
-bool lightmanager_write_config_to_manager(const LightManager_PrivateConfig& config); // [配置写入函数] 将参数传回ConfigManager
+LightManager_PrivateConfig* lightmanager_get_config_holder();              // [配置保管函数] 保存静态私有配置变量并返回指针
+bool lightmanager_write_config_to_manager(const LightManager_PrivateConfig& config); // [配置写入函数] 将配置写入到config_holder地址中
+LightManager_PrivateConfig lightmanager_get_config_copy();                 // [配置读取函数] 从config_holder地址读取配置并返回副本
+bool lightmanager_save_config_to_manager(const LightManager_PrivateConfig& config); // [配置保存函数] 将config_holder地址的配置保存到ConfigManager
 
-// Mai2Light命令回调函数类型
-typedef std::function<void(BD15070_Command command, const BD15070_PacketReq& packet)> LightManager_CommandCallback;
+// 协议回调函数已移除 - LightManager不再处理协议指令
 
 // 灯光管理器类 (单例)
 class LightManager {
@@ -197,32 +124,45 @@ public:
     
     // 析构函数
     ~LightManager();
+
+    // 初始化配置结构体
+    struct InitConfig {
+        Mai2Light* mai2light;           // Mai2Light实例指针
+        NeoPixel* neopixel;             // NeoPixel实例指针
+        
+        InitConfig() : mai2light(nullptr), neopixel(nullptr) {}
+        InitConfig(Mai2Light* m2l, NeoPixel* np) : mai2light(m2l), neopixel(np) {}
+    };
     
     // 初始化和释放
-    bool init();
+    bool init(const InitConfig& init_config);
     void deinit();
     bool is_ready() const;
     
-    // 区域映射管理
-    bool add_region_mapping(const LightRegionMapping& mapping);
-    bool remove_region_mapping(const std::string& name);
-    bool get_region_mapping(const std::string& name, LightRegionMapping& mapping) const;
-    std::vector<std::string> get_region_names() const;
-    bool enable_region_mapping(const std::string& name, bool enabled);
+    // 基础灯光控制接口
+    void set_region_color(uint8_t region_id, uint8_t r, uint8_t g, uint8_t b);  // 设置区域颜色
+    void set_single_led(uint8_t led_index, uint8_t r, uint8_t g, uint8_t b);    // 设置单个LED
+    void clear_all_leds();                                                      // 清空所有LED
     
-    // 区域映射配置管理
-    bool save_region_mappings();
-    bool load_region_mappings();
-    bool reset_region_mappings();
+    // 区域映射管理 (简化版)
+    void set_region_bitmap(uint8_t region_id, bitmap16_t bitmap);              // 设置区域bitmap映射
+    bitmap16_t get_region_bitmap(uint8_t region_id) const;                     // 获取区域bitmap映射
+    std::vector<std::string> get_region_names() const;                         // 获取区域名称列表
+    void save_region_mappings();                                               // 保存区域映射
+    void load_region_mappings();                                               // 加载区域映射
     
-    // 手动触发映射接口
-    bool trigger_region_mapping(const std::string& region_name, uint8_t r, uint8_t g, uint8_t b);
+    // 数据同步方法
+    bool sync_mai2light_to_regions();                                          // 从mai2light同步LED数据到区域
+    bool apply_regions_to_neopixel();                                          // 将区域数据应用到neopixel
+    
+    // Mai2Light配置管理
+    bool update_mai2light_config(const Mai2Light_Config& config);              // 更新mai2light配置
+    Mai2Light_Config get_mai2light_config() const;                             // 获取mai2light配置
     
     // Loop接口 - 处理Mai2Light回调
     void loop();
     
-    // 设置回调函数
-    void set_command_callback(LightManager_CommandCallback callback);
+    // 协议回调函数已移除
     
     // 调试功能
     void enable_debug_output(bool enabled);
@@ -241,64 +181,38 @@ private:
     bool initialized_;
     bool debug_enabled_;
     
-    // 协议相关 - 遵循服务层规则3: 服务本身完全不保存配置
-    HAL_UART* uart_hal_;
+    // 配置相关
+    LightManager_PrivateConfig* config_holder_;
+    
+    // 模块实例指针
+    Mai2Light* mai2light_;
     NeoPixel* neopixel_;
-    // node_id_ 已移除 - 通过lightmanager_get_config_copy()获取
     
-    // 接收缓冲区
-    uint8_t rx_buffer_[64];
-    uint8_t rx_buffer_pos_;
-    bool escape_next_;
+    // 区域bitmap数组 (11个区域)
+    RegionBitmap region_bitmaps_[REGION_COUNT];
     
-    // 区域映射
-    std::vector<LightRegionMapping> region_mappings_;
+    // 时间片调度器
+    TimeSliceScheduler scheduler_;
     
-    // 渐变效果状态
-    struct FadeState {
-        bool active;
-        uint32_t start_time;
-        uint32_t end_time;
-        uint8_t start_led;
-        uint8_t end_led;
-        NeoPixel_Color start_color;
-        NeoPixel_Color end_color;
-    } fade_state_;
+    // 协议回调函数已移除
     
-    // 回调函数
-    LightManager_CommandCallback command_callback_;
+    // 指令解析功能已移除 - 所有handle_*函数不再使用
     
-    // 内部方法
-    void process_received_data();
-    bool parse_packet(const uint8_t* buffer, uint8_t length, BD15070_PacketReq& packet);
-    void handle_command(const BD15070_PacketReq& packet);
-    void send_ack(BD15070_Command command, BD15070_AckStatus status = AckStatus_Ok, 
-                  BD15070_AckReport report = AckReport_Ok, const uint8_t* data = nullptr, uint8_t data_length = 0);
-    
-    // 命令处理函数
-    void handle_set_led_gs8bit(const BD15070_PacketReq& packet);
-    void handle_set_led_gs8bit_multi(const BD15070_PacketReq& packet);
-    void handle_set_led_gs8bit_multi_fade(const BD15070_PacketReq& packet);
-    void handle_set_led_fet(const BD15070_PacketReq& packet);
-    void handle_set_led_gs_update(const BD15070_PacketReq& packet);
-    void handle_get_board_info(const BD15070_PacketReq& packet);
-    void handle_get_board_status(const BD15070_PacketReq& packet);
-    void handle_get_firm_sum(const BD15070_PacketReq& packet);
-    void handle_get_protocol_version(const BD15070_PacketReq& packet);
-    void handle_eeprom_commands(const BD15070_PacketReq& packet);
+    // 时间片调度处理
+    void process_time_slice();
+    bool is_time_slice_expired() const;
+    void reset_time_slice();
     
     // 映射和转换函数
     void map_mai2light_to_neopixel(uint8_t mai2light_index, uint8_t r, uint8_t g, uint8_t b);
     void map_range_to_neopixel(uint8_t start_index, uint8_t end_index, uint8_t r, uint8_t g, uint8_t b);
-    bitmap32_t get_neopixel_bitmap_for_mai2light_range(uint8_t start_index, uint8_t end_index) const;
-    
-    // 渐变效果处理
-    void update_fade_effects();
+    void apply_region_to_leds(uint8_t region_id);
+    uint8_t get_region_index(uint8_t region_id) const;  // 将1-11转换为0-10索引
     
     // 工具函数
     uint8_t calculate_checksum(const uint8_t* data, uint8_t length) const;
-    void log_debug(const std::string& message) const;
-    void log_error(const std::string& message) const;
+    inline void log_debug(const std::string& message) const;
+    inline void log_error(const std::string& message) const;
 };
 
 #endif // LIGHT_MANAGER_H

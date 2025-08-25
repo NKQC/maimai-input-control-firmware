@@ -4,6 +4,12 @@
 #include <stdint.h>
 #include <vector>
 #include <functional>
+#include <queue>
+
+// RGB565类型定义
+
+// RGB565别名，保持向后兼容
+using RGB565 = uint16_t;
 
 /**
  * 协议层 - ST7735S TFT LCD显示屏
@@ -74,23 +80,15 @@ enum ST7735S_Rotation {
 
 // 字体大小枚举（已移除，LVGL不需要）
 
-// 颜色结构体（简化，仅保留基础功能）
-struct ST7735S_Color {
-    uint16_t value;
-    
-    ST7735S_Color(uint16_t val = 0) : value(val) {}
-    ST7735S_Color(uint8_t r, uint8_t g, uint8_t b) {
-        value = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
-    }
-};
+// 使用统一的RGB颜色结构体
+using ST7735S_Color = RGB565;
 
-// 矩形和点结构体（已移除，LVGL不需要）
 
 class ST7735S {
 public:
     using dma_callback_t = std::function<void(bool success)>;
     
-    ST7735S(HAL_SPI* spi_hal, uint8_t cs_pin, uint8_t dc_pin, uint8_t rst_pin = 255);
+    ST7735S(HAL_SPI* spi_hal, uint8_t cs_pin, uint8_t dc_pin, uint8_t rst_pin = 255, uint8_t blk_pin = 255);
     ~ST7735S();
     
     // 初始化显示屏
@@ -118,8 +116,6 @@ public:
     
     // 基础像素操作（仅保留LVGL需要的功能）
     bool fill_screen(ST7735S_Color color);
-    bool draw_bitmap_rgb888(int16_t x, int16_t y, uint16_t width, uint16_t height, const uint8_t* bitmap);
-    
     // 像素数据写入（用于LVGL集成）
     bool write_pixel_data(uint16_t color565);
     
@@ -132,18 +128,28 @@ public:
     
     // 背光控制（如果支持）
     bool set_backlight(uint8_t brightness);  // 0-255
+    uint8_t get_backlight() const;           // 获取当前背光亮度
     
-    // DMA异步方法
+    // 异步DMA操作 - 非阻塞接口
     bool write_data_buffer_async(const uint8_t* buffer, size_t length, dma_callback_t callback = nullptr);
     bool fill_screen_async(ST7735S_Color color, dma_callback_t callback = nullptr);
-    bool draw_bitmap_async(int16_t x, int16_t y, uint16_t width, uint16_t height, const uint8_t* bitmap, dma_callback_t callback = nullptr);
+    bool draw_bitmap_rgb565_async(int16_t x, int16_t y, uint16_t width, uint16_t height, const uint8_t* bitmap, dma_callback_t callback = nullptr);
+    
+    // 检查DMA队列状态
+    size_t get_dma_queue_size() const { return dma_queue_count_; }
+    bool has_pending_transfers() const { return dma_queue_count_ > 0; }
+    
+    // 处理DMA队列（需要在主循环中调用）
+    void process_dma_queue();
     
 private:
     HAL_SPI* spi_hal_;
     uint8_t cs_pin_;
     uint8_t dc_pin_;    // 数据/命令选择引脚
     uint8_t rst_pin_;   // 复位引脚（可选）
+    uint8_t blk_pin_;   // 背光引脚（可选）
     bool initialized_;
+    uint8_t current_brightness_;  // 当前背光亮度 (0-255)
     
     // 显示参数
     ST7735S_Rotation rotation_;
@@ -157,6 +163,9 @@ private:
     // DMA异步相关
     volatile bool dma_busy_;
     dma_callback_t current_callback_;
+    
+    // 分块传输状态
+    // DMA传输队列管理
     
     // DMA传输队列优化
     struct DMATransfer {

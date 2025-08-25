@@ -66,6 +66,9 @@ Mai2Light::Mai2Light(HAL_UART* uart_hal, uint8_t node_id)
     board_info_.serial_number = 0x12345678;
     
     memset(rx_buffer_, 0, sizeof(rx_buffer_));
+    
+    // 初始化虚拟EEPROM
+    memset(virtual_eeprom_, 0, EEPROM_SIZE);
 }
 
 // Mai2Light析构函数
@@ -178,20 +181,6 @@ bool Mai2Light::set_all_leds(const Mai2Light_RGB& color) {
     return true;
 }
 
-// 设置多个LED颜色
-bool Mai2Light::set_multiple_leds(const std::vector<Mai2Light_RGB>& colors) {
-    if (!is_ready()) {
-        return false;
-    }
-    
-    size_t count = std::min(colors.size(), (size_t)MAI2LIGHT_NUM_LEDS);
-    for (size_t i = 0; i < count; i++) {
-        set_led_color(i, colors[i]);
-    }
-    
-    return true;
-}
-
 // 设置全局亮度
 bool Mai2Light::set_global_brightness(uint8_t brightness) {
     if (!is_ready()) {
@@ -214,11 +203,6 @@ bool Mai2Light::set_fade_time(uint16_t fade_time_ms) {
     return true;
 }
 
-// 清除所有LED
-bool Mai2Light::clear_all_leds() {
-    return set_all_leds(Mai2Light_RGB(0, 0, 0));
-}
-
 // 获取LED状态
 bool Mai2Light::get_led_status(uint8_t led_index, Mai2Light_LEDStatus& status) {
     if (led_index >= MAI2LIGHT_NUM_LEDS) {
@@ -227,6 +211,23 @@ bool Mai2Light::get_led_status(uint8_t led_index, Mai2Light_LEDStatus& status) {
     
     status = led_status_[led_index];
     return true;
+}
+
+// 获取所有LED状态
+bool Mai2Light::get_all_led_status(Mai2Light_LEDStatus status_array[MAI2LIGHT_NUM_LEDS]) {
+    if (!status_array) {
+        return false;
+    }
+    
+    for (uint8_t i = 0; i < MAI2LIGHT_NUM_LEDS; i++) {
+        status_array[i] = led_status_[i];
+    }
+    return true;
+}
+
+// 获取LED状态数组指针
+const Mai2Light_LEDStatus* Mai2Light::get_led_status_array() const {
+    return led_status_;
 }
 
 // 获取板卡信息
@@ -242,31 +243,112 @@ uint8_t Mai2Light::get_protocol_version() {
 
 // 保存到EEPROM
 bool Mai2Light::save_to_eeprom() {
-    // 这里应该实现EEPROM保存逻辑
-    // 暂时返回true，实际实现需要根据硬件平台
-    log_message("Saving to EEPROM");
+    log_message("Saving configuration to virtual EEPROM");
+    
+    // 将当前配置保存到虚拟EEPROM
+    uint16_t offset = 0;
+    
+    // 保存配置结构体
+    if (offset + sizeof(config_) <= EEPROM_SIZE) {
+        memcpy(&virtual_eeprom_[offset], &config_, sizeof(config_));
+        offset += sizeof(config_);
+    } else {
+        log_message("EEPROM save failed: config too large");
+        return false;
+    }
+    
+    // 保存LED状态
+    if (offset + sizeof(led_status_) <= EEPROM_SIZE) {
+        memcpy(&virtual_eeprom_[offset], led_status_, sizeof(led_status_));
+        offset += sizeof(led_status_);
+    } else {
+        log_message("EEPROM save failed: LED status too large");
+        return false;
+    }
+    
+    // 保存板卡信息
+    if (offset + sizeof(board_info_) <= EEPROM_SIZE) {
+        memcpy(&virtual_eeprom_[offset], &board_info_, sizeof(board_info_));
+        offset += sizeof(board_info_);
+    } else {
+        log_message("EEPROM save failed: board info too large");
+        return false;
+    }
+    
+    log_message("Configuration saved to EEPROM (" + std::to_string(offset) + " bytes)");
     return true;
 }
 
 // 从EEPROM加载
 bool Mai2Light::load_from_eeprom() {
-    // 这里应该实现EEPROM加载逻辑
-    // 暂时返回true，实际实现需要根据硬件平台
-    log_message("Loading from EEPROM");
+    log_message("Loading configuration from virtual EEPROM");
+    
+    uint16_t offset = 0;
+    
+    // 加载配置结构体
+    if (offset + sizeof(config_) <= EEPROM_SIZE) {
+        memcpy(&config_, &virtual_eeprom_[offset], sizeof(config_));
+        offset += sizeof(config_);
+    } else {
+        log_message("EEPROM load failed: config size mismatch");
+        return false;
+    }
+    
+    // 加载LED状态
+    if (offset + sizeof(led_status_) <= EEPROM_SIZE) {
+        memcpy(led_status_, &virtual_eeprom_[offset], sizeof(led_status_));
+        offset += sizeof(led_status_);
+    } else {
+        log_message("EEPROM load failed: LED status size mismatch");
+        return false;
+    }
+    
+    // 加载板卡信息
+    if (offset + sizeof(board_info_) <= EEPROM_SIZE) {
+        memcpy(&board_info_, &virtual_eeprom_[offset], sizeof(board_info_));
+        offset += sizeof(board_info_);
+    } else {
+        log_message("EEPROM load failed: board info size mismatch");
+        return false;
+    }
+    
+    log_message("Configuration loaded from EEPROM (" + std::to_string(offset) + " bytes)");
     return true;
 }
 
 // 设置EEPROM数据
 bool Mai2Light::set_eeprom_data(uint16_t address, const uint8_t* data, uint8_t length) {
-    // 这里应该实现EEPROM写入逻辑
-    log_message("Writing EEPROM at address " + std::to_string(address));
+    if (!data || length == 0) {
+        log_message("EEPROM write failed: invalid parameters");
+        return false;
+    }
+    
+    if (address + length > EEPROM_SIZE) {
+        log_message("EEPROM write failed: address out of range (" + std::to_string(address) + 
+                   " + " + std::to_string(length) + " > " + std::to_string(EEPROM_SIZE) + ")");
+        return false;
+    }
+    
+    memcpy(&virtual_eeprom_[address], data, length);
+    log_message("EEPROM write: " + std::to_string(length) + " bytes at address " + std::to_string(address));
     return true;
 }
 
 // 获取EEPROM数据
 bool Mai2Light::get_eeprom_data(uint16_t address, uint8_t* data, uint8_t length) {
-    // 这里应该实现EEPROM读取逻辑
-    log_message("Reading EEPROM at address " + std::to_string(address));
+    if (!data || length == 0) {
+        log_message("EEPROM read failed: invalid parameters");
+        return false;
+    }
+    
+    if (address + length > EEPROM_SIZE) {
+        log_message("EEPROM read failed: address out of range (" + std::to_string(address) + 
+                   " + " + std::to_string(length) + " > " + std::to_string(EEPROM_SIZE) + ")");
+        return false;
+    }
+    
+    memcpy(data, &virtual_eeprom_[address], length);
+    log_message("EEPROM read: " + std::to_string(length) + " bytes from address " + std::to_string(address));
     return true;
 }
 
@@ -279,6 +361,20 @@ bool Mai2Light::reset_board() {
     
     // 重置配置为默认值
     config_ = Mai2Light_Config();
+    
+    return true;
+}
+
+// 清除所有LED - mai2light只管理自己的LED状态
+bool Mai2Light::clear_all_leds() {
+    log_message("Clearing all LEDs");
+    
+    // 清除mai2light管理的所有LED状态
+    Mai2Light_RGB black_color = {0, 0, 0};
+    for (uint8_t i = 0; i < MAI2LIGHT_NUM_LEDS; i++) {
+        led_status_[i].color = black_color;
+        led_status_[i].brightness = 0;
+    }
     
     return true;
 }

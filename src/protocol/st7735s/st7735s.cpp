@@ -1,14 +1,17 @@
 #include "st7735s.h"
-#include <pico/stdlib.h>
-#include <hardware/gpio.h>
 #include <cstring>
+#include <algorithm>
+#include <cmath>
+#include "hardware/gpio.h"
+#include "hardware/pwm.h"
+#include "pico/time.h"
 
-ST7735S::ST7735S(HAL_SPI* spi_hal, uint8_t cs_pin, uint8_t dc_pin, uint8_t rst_pin)
-    : spi_hal_(spi_hal), cs_pin_(cs_pin), dc_pin_(dc_pin), rst_pin_(rst_pin),
-      initialized_(false), rotation_(ST7735S_ROTATION_0), 
-      width_(ST7735S_WIDTH), height_(ST7735S_HEIGHT),
-      framebuffer_(nullptr), use_framebuffer_(false),
-      dma_busy_(false), dma_queue_head_(0), dma_queue_tail_(0), dma_queue_count_(0) {
+
+ST7735S::ST7735S(HAL_SPI* spi_hal, uint8_t cs_pin, uint8_t dc_pin, uint8_t rst_pin, uint8_t bl_pin)
+    : spi_hal_(spi_hal), cs_pin_(cs_pin), dc_pin_(dc_pin), rst_pin_(rst_pin), blk_pin_(bl_pin),
+      initialized_(false), current_brightness_(255), rotation_(ST7735S_ROTATION_0),
+      width_(ST7735S_WIDTH), height_(ST7735S_HEIGHT), framebuffer_(nullptr), use_framebuffer_(false),
+      dma_busy_(false), current_callback_(nullptr), dma_queue_head_(0), dma_queue_tail_(0), dma_queue_count_(0) {
 }
 
 ST7735S::~ST7735S() {
@@ -38,6 +41,26 @@ bool ST7735S::init() {
         gpio_put(rst_pin_, 1);
     }
     
+    // 配置背光引脚
+    if (blk_pin_ != 255) {
+        gpio_init(blk_pin_);
+        gpio_set_function(blk_pin_, GPIO_FUNC_PWM);
+        
+        // 获取PWM slice和channel
+        uint slice_num = pwm_gpio_to_slice_num(blk_pin_);
+        uint channel = pwm_gpio_to_channel(blk_pin_);
+        
+        // 配置PWM: 125MHz / 62.5 = 2MHz, 2MHz / 1000 = 2kHz PWM频率
+        pwm_set_clkdiv(slice_num, 62.5f);
+        pwm_set_wrap(slice_num, 999);  // 0-999 = 1000 levels
+        
+        // 设置初始亮度为最大
+        pwm_set_chan_level(slice_num, channel, (current_brightness_ * 999) / 255);
+        
+        // 启用PWM
+        pwm_set_enabled(slice_num, true);
+    }
+    
     // 配置SPI
     spi_hal_->set_format(8, 0, 0);  // 8位，模式0
     
@@ -63,6 +86,13 @@ bool ST7735S::init() {
 void ST7735S::deinit() {
     if (initialized_) {
         display_on(false);
+        
+        // 关闭背光
+        if (blk_pin_ != 255) {
+            uint slice_num = pwm_gpio_to_slice_num(blk_pin_);
+            pwm_set_enabled(slice_num, false);
+            gpio_set_function(blk_pin_, GPIO_FUNC_NULL);
+        }
         
         // 重置引脚
         gpio_put(cs_pin_, 1);
@@ -127,24 +157,26 @@ bool ST7735S::set_rotation(ST7735S_Rotation rotation) {
     rotation_ = rotation;
     
     uint8_t madctl = 0;
+    // 根据ST7735S数据手册和参考代码设置MADCTL寄存器
+    // MX, MY, RGB模式控制
     switch (rotation) {
-        case ST7735S_ROTATION_0:
-            madctl = 0x00;
+        case ST7735S_ROTATION_0:    // 竖屏
+            madctl = 0xC8;  // MY=1, MX=1, MV=0, ML=0, RGB=1, MH=0
             width_ = ST7735S_WIDTH;
             height_ = ST7735S_HEIGHT;
             break;
-        case ST7735S_ROTATION_90:
-            madctl = 0x60;
+        case ST7735S_ROTATION_90:   // 横屏
+            madctl = 0xA8;  // MY=1, MX=0, MV=1, ML=0, RGB=1, MH=0
             width_ = ST7735S_HEIGHT;
             height_ = ST7735S_WIDTH;
             break;
-        case ST7735S_ROTATION_180:
-            madctl = 0xC0;
+        case ST7735S_ROTATION_180:  // 竖屏翻转180度
+            madctl = 0x08;  // MY=0, MX=0, MV=0, ML=0, RGB=1, MH=0
             width_ = ST7735S_WIDTH;
             height_ = ST7735S_HEIGHT;
             break;
-        case ST7735S_ROTATION_270:
-            madctl = 0xA0;
+        case ST7735S_ROTATION_270:  // 横屏翻转180度
+            madctl = 0x68;  // MY=0, MX=1, MV=1, ML=0, RGB=1, MH=0
             width_ = ST7735S_HEIGHT;
             height_ = ST7735S_WIDTH;
             break;
@@ -195,13 +227,104 @@ bool ST7735S::write_data(uint8_t data) {
 }
 
 bool ST7735S::init_registers() {
-    // 基本初始化序列
+    // 软件复位
+    write_command(ST7735S_SWRESET);
+    sleep_ms(150);
+    
+    // 退出睡眠模式
     write_command(ST7735S_SLPOUT);
     sleep_ms(120);
     
-    write_command(ST7735S_COLMOD);
-    write_data(0x05);  // 16位颜色
+    // ST7735S 帧速率控制
+    write_command(ST7735S_FRMCTR1);  // 正常模式帧速率
+    write_data(0x01);
+    write_data(0x2C);
+    write_data(0x2D);
     
+    write_command(ST7735S_FRMCTR2);  // 空闲模式帧速率
+    write_data(0x01);
+    write_data(0x2C);
+    write_data(0x2D);
+    
+    write_command(ST7735S_FRMCTR3);  // 部分模式帧速率
+    write_data(0x01);
+    write_data(0x2C);
+    write_data(0x2D);
+    write_data(0x01);
+    write_data(0x2C);
+    write_data(0x2D);
+    
+    write_command(ST7735S_INVCTR);   // 列反转控制
+    write_data(0x07);
+    
+    // ST7735S 电源序列
+    write_command(ST7735S_PWCTR1);
+    write_data(0xA2);
+    write_data(0x02);
+    write_data(0x84);
+    
+    write_command(ST7735S_PWCTR2);
+    write_data(0xC5);
+    
+    write_command(ST7735S_PWCTR3);
+    write_data(0x0A);
+    write_data(0x00);
+    
+    write_command(ST7735S_PWCTR4);
+    write_data(0x8A);
+    write_data(0x2A);
+    
+    write_command(ST7735S_PWCTR5);
+    write_data(0x8A);
+    write_data(0xEE);
+    
+    // VCOM 控制
+    write_command(ST7735S_VMCTR1);
+    write_data(0x0E);
+    
+    // 颜色模式设置为16位
+    write_command(ST7735S_COLMOD);
+    write_data(0x05);  // 16位颜色 RGB565
+    
+    // Gamma 正极性校正
+    write_command(ST7735S_GMCTRP1);
+    write_data(0x0F);
+    write_data(0x1A);
+    write_data(0x0F);
+    write_data(0x18);
+    write_data(0x2F);
+    write_data(0x28);
+    write_data(0x20);
+    write_data(0x22);
+    write_data(0x1F);
+    write_data(0x1B);
+    write_data(0x23);
+    write_data(0x37);
+    write_data(0x00);
+    write_data(0x07);
+    write_data(0x02);
+    write_data(0x10);
+    
+    // Gamma 负极性校正
+    write_command(ST7735S_GMCTRN1);
+    write_data(0x0F);
+    write_data(0x1B);
+    write_data(0x0F);
+    write_data(0x17);
+    write_data(0x33);
+    write_data(0x2C);
+    write_data(0x29);
+    write_data(0x2E);
+    write_data(0x30);
+    write_data(0x30);
+    write_data(0x39);
+    write_data(0x3F);
+    write_data(0x00);
+    write_data(0x07);
+    write_data(0x03);
+    write_data(0x10);
+    
+    // 正常显示模式
     write_command(ST7735S_NORON);
     sleep_ms(10);
     
@@ -256,108 +379,11 @@ bool ST7735S::fill_screen(ST7735S_Color color) {
         if (fill_screen_async(color, nullptr)) {
             return true;  // DMA传输已启动，立即返回
         }
-        // 如果DMA失败，继续使用传统方式
     }
-    
-    // 传统方式：逐个像素填充（DMA忙碌或不可用时）
-    for (uint32_t i = 0; i < width_ * height_; i++) {
-        if (!write_pixel_data(color.value)) {
-            return false;
-        }
-    }
-    
-    return true;
+    return false;
 }
 
-bool ST7735S::draw_bitmap_rgb888(int16_t x, int16_t y, uint16_t width, uint16_t height, const uint8_t* bitmap) {
-    if (!is_ready() || !bitmap) {
-        return false;
-    }
-    
-    // 设置显示窗口
-    if (!set_window(x, y, x + width - 1, y + height - 1)) {
-        return false;
-    }
-    
-    uint32_t pixel_count = width * height;
-    
-    // 对于大图像且DMA可用时，使用DMA优化传输
-    if (pixel_count > 32 && !is_dma_busy()) {
-        // 分配临时缓冲区用于RGB565数据
-        static uint8_t rgb565_buffer[1024];  // 512个像素的RGB565数据
-        const uint32_t buffer_pixels = 512;
-        
-        uint32_t processed_pixels = 0;
-        
-        auto process_chunk = [&]() -> bool {
-            uint32_t chunk_pixels = (pixel_count - processed_pixels > buffer_pixels) ? 
-                                   buffer_pixels : (pixel_count - processed_pixels);
-            
-            // 转换当前块的RGB888到RGB565
-            for (uint32_t i = 0; i < chunk_pixels; i++) {
-                uint32_t src_idx = (processed_pixels + i) * 3;
-                uint8_t r = bitmap[src_idx];
-                uint8_t g = bitmap[src_idx + 1];
-                uint8_t b = bitmap[src_idx + 2];
-                
-                uint16_t color565 = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
-                rgb565_buffer[i * 2] = (color565 >> 8) & 0xFF;
-                rgb565_buffer[i * 2 + 1] = color565 & 0xFF;
-            }
-            
-            // 直接使用DMA异步传输，不等待完成
-            if (write_data_buffer_async(rgb565_buffer, chunk_pixels * 2, nullptr)) {
-                processed_pixels += chunk_pixels;
-                return true;  // DMA传输已启动，立即返回
-            }
-            return false;
-        };
-        
-        // 处理所有块
-        while (processed_pixels < pixel_count) {
-            if (!process_chunk()) {
-                // DMA失败，回退到传统方式处理剩余像素
-                break;
-            }
-        }
-        
-        // 如果全部通过DMA完成
-        if (processed_pixels >= pixel_count) {
-            return true;
-        }
-        
-        // 处理剩余像素（如果有的话）
-        for (uint32_t i = processed_pixels; i < pixel_count; i++) {
-            uint8_t r = bitmap[i * 3];
-            uint8_t g = bitmap[i * 3 + 1];
-            uint8_t b = bitmap[i * 3 + 2];
-            
-            uint16_t color565 = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
-            
-            if (!write_pixel_data(color565)) {
-                return false;
-            }
-        }
-        
-        return true;
-    }
-    
-    // 传统方式：逐个像素转换并发送（小图像或DMA不可用时）
-    for (uint32_t i = 0; i < pixel_count; i++) {
-        uint8_t r = bitmap[i * 3];
-        uint8_t g = bitmap[i * 3 + 1];
-        uint8_t b = bitmap[i * 3 + 2];
-        
-        // 转换为RGB565
-        uint16_t color565 = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
-        
-        if (!write_pixel_data(color565)) {
-            return false;
-        }
-    }
-    
-    return true;
-}
+// RGB888相关函数已移除，现在只支持RGB565格式
 
 bool ST7735S::set_framebuffer(uint16_t* buffer) {
     framebuffer_ = buffer;
@@ -368,7 +394,28 @@ bool ST7735S::set_framebuffer(uint16_t* buffer) {
 // 缓冲区更新函数（已移除，LVGL不需要）
 
 bool ST7735S::set_backlight(uint8_t brightness) {
+    if (blk_pin_ == 255) {
+        // 没有配置背光引脚，直接返回成功
+        current_brightness_ = brightness;
+        return true;
+    }
+    
+    // 获取PWM slice和channel
+    uint slice_num = pwm_gpio_to_slice_num(blk_pin_);
+    uint channel = pwm_gpio_to_channel(blk_pin_);
+    
+    // 将0-255亮度值映射到0-999 PWM级别
+    uint16_t pwm_level = (brightness * 999) / 255;
+    
+    // 设置PWM占空比
+    pwm_set_chan_level(slice_num, channel, pwm_level);
+    
+    current_brightness_ = brightness;
     return true;
+}
+
+uint8_t ST7735S::get_backlight() const {
+    return current_brightness_;
 }
 
 bool ST7735S::write_data_16(uint16_t data) {
@@ -468,7 +515,7 @@ bool ST7735S::fill_screen_async(ST7735S_Color color, dma_callback_t callback) {
     // 准备颜色数据缓冲区 - 增大缓冲区以减少DMA传输次数
     static uint8_t color_buffer[2048];  // 1024个像素的颜色数据
     uint8_t* buffer_ptr = color_buffer;  // 使用指针避免捕获static变量
-    uint16_t color565 = color.value;
+    uint16_t color565 = color;
     
     // 填充缓冲区
     for (int i = 0; i < 1024; i++) {
@@ -508,20 +555,23 @@ bool ST7735S::fill_screen_async(ST7735S_Color color, dma_callback_t callback) {
     return write_data_buffer_async(buffer_ptr, first_bytes, fill_callback);
 }
 
-bool ST7735S::draw_bitmap_async(int16_t x, int16_t y, uint16_t width, uint16_t height, const uint8_t* bitmap, dma_callback_t callback) {
-    if (!is_ready() || is_dma_busy() || !bitmap) {
+
+bool ST7735S::draw_bitmap_rgb565_async(int16_t x, int16_t y, uint16_t width, uint16_t height, const uint8_t* bitmap, dma_callback_t callback) {
+    if (!is_ready() || !bitmap) {
+        if (callback) callback(false);
         return false;
     }
     
-    // 设置绘制窗口
+    // 设置显示窗口
     if (!set_window(x, y, x + width - 1, y + height - 1)) {
+        if (callback) callback(false);
         return false;
     }
     
-    // 计算数据大小（假设是RGB565格式）
+    // 计算数据大小（RGB565格式）
     size_t data_size = width * height * 2;
     
-    // 直接使用DMA异步传输位图数据
+    // 使用异步DMA传输
     return write_data_buffer_async(bitmap, data_size, callback);
 }
 

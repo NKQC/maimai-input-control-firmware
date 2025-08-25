@@ -335,23 +335,22 @@ void UIManager::display_flush_cb(lv_disp_drv_t* disp_drv, const lv_area_t* area,
     // 计算区域尺寸
     uint16_t width = area->x2 - area->x1 + 1;
     uint16_t height = area->y2 - area->y1 + 1;
-    int32_t pixel_count = width * height;
     
-    // 转换LVGL颜色格式到RGB888格式
-    uint8_t* rgb888_buffer = new uint8_t[pixel_count * 3];
-    for (int32_t i = 0; i < pixel_count; i++) {
-        lv_color_t color = color_p[i];
-        // LVGL颜色转换为RGB888
-        rgb888_buffer[i * 3] = (color.ch.red << 3) | (color.ch.red >> 2);     // R
-        rgb888_buffer[i * 3 + 1] = (color.ch.green_h << 2) | (color.ch.green_h >> 4); // G
-        rgb888_buffer[i * 3 + 2] = (color.ch.blue << 3) | (color.ch.blue >> 2);   // B
+    // 零拷贝：直接使用LVGL的RGB565数据，无需转换
+    // LVGL已配置为RGB565格式且启用字节交换，与ST7735S完全兼容
+    uint8_t* rgb565_data = reinterpret_cast<uint8_t*>(color_p);
+    
+    // 直接使用非阻塞DMA传输LVGL framebuffer数据
+    bool success = ui->display_device_->draw_bitmap_rgb565_async(area->x1, area->y1, width, height, rgb565_data, 
+        [disp_drv](bool success) {
+            // DMA传输完成回调，通知LVGL可以渲染下一帧
+            lv_disp_flush_ready(disp_drv);
+        });
+    
+    // 如果启动异步传输失败，立即通知LVGL
+    if (!success) {
+        lv_disp_flush_ready(disp_drv);
     }
-    
-    // 使用draw_bitmap_rgb888一次性绘制整个区域
-    ui->display_device_->draw_bitmap_rgb888(area->x1, area->y1, width, height, rgb888_buffer);
-    
-    delete[] rgb888_buffer;
-    lv_disp_flush_ready(disp_drv);
 }
 
 // 输入读取回调
@@ -1591,7 +1590,12 @@ void UIManager::create_light_mapping_page() {
     // 添加灯光区域选项
     if (light_manager_) {
         // 获取所有可用的灯光区域
-        std::vector<std::string> regions = {"all", "button1", "button2", "button3", "button4", "button5", "button6", "button7", "button8"};
+        std::vector<std::string> regions = light_manager_->get_region_names();
+        
+        // 如果没有现有区域，添加一些默认区域
+        if (regions.empty()) {
+            regions = {"all", "button1", "button2", "button3", "button4", "button5", "button6", "button7", "button8"};
+        }
         
         for (const auto& region : regions) {
             lv_obj_t* btn = lv_list_add_btn(light_region_list_, NULL, region.c_str());
@@ -1823,44 +1827,78 @@ void UIManager::task() {
     
     uint32_t current_time = to_ms_since_boot(get_absolute_time());
     
-    // 处理LVGL任务
-    lv_timer_handler();
-    
     // 处理背光和息屏
     handle_backlight();
     handle_screen_timeout();
     
-    // 处理故障检测
+    // 处理故障检测 - 即使息屏也要检测故障
     handle_error_detection();
     
     // 更新统计信息
     statistics_.uptime_seconds = current_time / 1000;
     
-    // 更新当前页面
-    switch (current_page_) {
-        case UIPage::STATUS:
-            update_status_page();
-            break;
-        case UIPage::SENSITIVITY:
-            update_sensitivity_page();
-            break;
-        case UIPage::TOUCH_MAPPING:
-            update_touch_mapping_page();
-            break;
-        case UIPage::KEY_MAPPING:
-            update_key_mapping_page();
-            break;
-        case UIPage::GUIDED_BINDING:
-            update_guided_binding_page();
-            break;
-        case UIPage::LIGHT_MAPPING:
-            update_light_mapping_page();
-            break;
-        default:
-            break;
+    // 息屏状态下的节能处理
+    if (screen_off_) {
+        // 息屏时只进行必要的检测，不进行渲染
+        // 检查是否有需要唤醒屏幕的条件
+        
+        // 检查摇杆输入
+        if (static_config_.enable_joystick && input_manager_) {
+            // 简单检查摇杆状态，如有输入则唤醒
+            for (int i = 0; i < 3; i++) {
+                if (joystick_buttons_[i]) {
+                    wake_screen();
+                    break;
+                }
+            }
+        }
+
+        // 检查是否有故障需要显示
+        if (has_error_ || global_has_error_) {
+            wake_screen();
+        }
+        
+        // 息屏状态下不进行页面更新和LVGL渲染
+        return;
     }
     
-    last_refresh_time_ = current_time;
+    // 屏幕开启状态下的正常渲染
+    // 限制LVGL任务处理频率，避免过于频繁调用导致阻塞
+    // 最大30FPS (33ms间隔)
+    static uint32_t last_lvgl_time = 0;
+    if (current_time - last_lvgl_time >= 33) {
+        lv_timer_handler();
+        last_lvgl_time = current_time;
+    }
+    
+    // 限制屏幕刷新频率，根据配置的刷新率
+    if (current_time - last_refresh_time_ >= static_config_.refresh_rate_ms) {
+        // 更新当前页面
+        switch (current_page_) {
+            case UIPage::STATUS:
+                update_status_page();
+                break;
+            case UIPage::SENSITIVITY:
+                update_sensitivity_page();
+                break;
+            case UIPage::TOUCH_MAPPING:
+                update_touch_mapping_page();
+                break;
+            case UIPage::KEY_MAPPING:
+                update_key_mapping_page();
+                break;
+            case UIPage::GUIDED_BINDING:
+                update_guided_binding_page();
+                break;
+            case UIPage::LIGHT_MAPPING:
+                update_light_mapping_page();
+                break;
+            default:
+                break;
+        }
+        
+        last_refresh_time_ = current_time;
+    }
 }
 
 // 更新页面
@@ -2117,9 +2155,8 @@ void UIManager::handle_backlight() {
 void UIManager::handle_screen_timeout() {
     uint32_t current_time = to_ms_since_boot(get_absolute_time());
     uint32_t timeout_ms = static_config_.screen_timeout * 1000;
-    
-    if (current_time - last_activity_time_ > timeout_ms) {
-        if (!screen_off_) {
+    if (!screen_off_) {
+        if (current_time - last_activity_time_ > timeout_ms) {
             screen_off_ = true;
             // 息屏：关闭背光但保持显示内容
             if (display_device_) {
@@ -2804,20 +2841,31 @@ bool UIManager::save_light_mapping() {
         return false;
     }
     
-    // 清除该区域的现有映射
-    // light_manager_->clear_region_mapping(selected_light_region_);
-    
-    // 添加新的LED映射
+    // 将选中的neopixel转换为bitmap
+    bitmap16_t neopixel_bitmap = 0;
     for (uint8_t led_index : selected_neopixels_) {
-        (void)led_index;  // 消除未使用变量警告
-        // light_manager_->add_led_to_region(selected_light_region_, led_index);
+        if (led_index < 16) {  // 确保不超出bitmap范围
+            neopixel_bitmap |= (1U << led_index);
+        }
     }
+    
+    // 解析区域名称获取区域ID (假设格式为"Region X")
+    uint8_t region_id = 1;  // 默认区域1
+    if (selected_light_region_.find("Region ") == 0) {
+        std::string num_str = selected_light_region_.substr(7);
+        region_id = std::stoi(num_str);
+    }
+    
+    // 使用新的bitmap接口设置区域映射
+    light_manager_->set_region_bitmap(region_id, neopixel_bitmap);
+    
+    // 保存到配置
+    light_manager_->save_region_mappings();
     
     // 更新状态显示
     if (light_mapping_status_) {
         lv_label_set_text(light_mapping_status_, "Mapping saved successfully!");
     }
-    
     return true;
 }
 
@@ -2826,8 +2874,18 @@ bool UIManager::clear_light_mapping() {
         return false;
     }
     
-    // 清除该区域的所有LED映射
-    // light_manager_->clear_region_mapping(selected_light_region_);
+    // 解析区域名称获取区域ID (假设格式为"Region X")
+    uint8_t region_id = 1;  // 默认区域1
+    if (selected_light_region_.find("Region ") == 0) {
+        std::string num_str = selected_light_region_.substr(7);
+        region_id = std::stoi(num_str);
+    }
+    
+    // 清除该区域的映射 (设置为0)
+    light_manager_->set_region_bitmap(region_id, 0);
+    
+    // 保存配置
+    light_manager_->save_region_mappings();
     
     // 清除UI中的选中状态
     selected_neopixels_.clear();
