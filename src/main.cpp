@@ -154,6 +154,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <hardware/watchdog.h>
+#include <hardware/gpio.h>
 #include <pico/multicore.h>
 #include <pico/stdlib.h>
 
@@ -199,13 +200,14 @@
 #define ST7735S_DC_PIN 21
 #define ST7735S_RST_PIN 20
 #define ST7735S_CS_PIN 17
-#define SPI0_FREQ 12000000
+#define ST7735S_BLK_PIN 22  // 尚未使用
+#define SPI0_FREQ 1000000
 // MCP23S17
 #define SPI1_MISO_PIN 28
 #define SPI1_MOSI_PIN 27
 #define SPI1_SCK_PIN 26
 #define MCP23S17_CS_PIN 29
-#define SPI1_FREQ 10000000
+#define SPI1_FREQ 1000000
 
 #define UART0_TX_PIN 12
 #define UART0_RX_PIN 13
@@ -214,6 +216,7 @@
 #define UART1_TX_PIN 8
 #define UART1_RX_PIN 9
 #define NEOPIXEL_PIN 11
+#define NEOPIXEL_LEDS_NUM 32
 
 // 摇杆引脚定义
 #define JOYSTICK_BUTTON_A_PIN MCU_GPIO::GPIO2    // 摇杆A按钮(上方向)
@@ -231,7 +234,7 @@ static HAL_SPI* hal_spi0 = nullptr;
 static HAL_SPI* hal_spi1 = nullptr;
 static HAL_UART* hal_uart0 = nullptr;
 static HAL_UART* hal_uart1 = nullptr;
-static HAL_PIO* hal_pio0 = nullptr;
+static HAL_PIO* hal_pio1 = nullptr;
 static HAL_USB* hal_usb = nullptr;
 
 static GTX312L* gtx312l_devices[8] = {nullptr}; // 最多8个GTX312L设备
@@ -250,16 +253,8 @@ static LightManager* light_manager = nullptr;
 static UIManager* ui_manager = nullptr;
 
 // 系统状态
-static bool system_initialized = false;
 static bool system_error = false;
-static uint32_t system_uptime = 0;
-static uint32_t last_heartbeat = 0;
-static uint32_t last_watchdog_feed = 0;
-static uint32_t last_status_update = 0;
-
-// Core1任务状态
-static volatile bool core1_running = false;
-static volatile bool core1_error = false;
+static uint32_t last_watchdog_feed[2] = {0, 0};
 
 // 函数声明
 bool init_hal_layer();
@@ -267,20 +262,78 @@ bool init_protocol_layer();
 bool init_service_layer();
 void deinit_system();
 void core0_task();
-void core1_task();
-void core1_entry();
-void heartbeat_task();
-void watchdog_task();
+void core1_task();;
 void status_update_task();
-void error_handler(const char* error_msg);
 void print_system_info();
 void scan_i2c_devices();
 void emergency_shutdown();
 
+
+/**
+ * 心跳任务
+ */
+inline void heartbeat_task() {
+    static uint32_t last_heartbeat = 0;
+    static bool led_state = false;
+    uint32_t current_time = (time_us_32() / 1000);
+    if (current_time - last_heartbeat >= 1000) {
+        // 切换内置LED状态 (使用RP2040 SDK原生函数，多核心安全)
+        gpio_put(LED_BUILTIN_PIN, led_state);
+        led_state = !led_state;
+        last_heartbeat = current_time;
+    }
+}
+
+/**
+ * 看门狗任务
+ */
+inline void watchdog_feed() {
+    uint32_t current_time = (time_us_32() / 1000);
+    uint8_t core = get_core_num();
+    if (current_time - last_watchdog_feed[core] >= WATCHDOG_FEED_INTERVAL_MS) {
+        watchdog_update();
+        last_watchdog_feed[core] = current_time;
+    }
+}
+
+/**
+ * 错误处理函数
+ */
+void error_handler(const char* error_msg) {
+    system_error = true;
+    
+    if (usb_logs) {
+        char buffer[256];
+        snprintf(buffer, sizeof(buffer), "SYSTEM ERROR: %s", error_msg);
+        usb_logs->error(std::string(buffer));
+    }
+    
+    // 如果UI管理器可用，显示错误界面
+    if (ui_manager) {
+        ui_manager->show_status_info();
+    }
+    emergency_shutdown();
+}
+
+/**
+ * 打印系统信息
+ */
+void print_system_info() {
+    if (usb_logs) {
+        usb_logs->infof("=== MaiMai Controller V%s ===", SYSTEM_VERSION);
+        usb_logs->infof("Hardware Version: %s", HARDWARE_VERSION);
+        usb_logs->infof("Build Date: %s %s", BUILD_DATE, BUILD_TIME);
+        usb_logs->infof("CPU Frequency: %lu MHz", rp2040.f_cpu() / 1000000);
+        usb_logs->info("Free Heap: Available", "Memory");
+        usb_logs->info("Flash Size: Available", "Storage");
+        usb_logs->info("==============================");
+    }
+}
+
 /**
  * HAL层初始化
  */
-bool init_hal_layer() {
+bool core0_init_hal_layer() {
     // 初始化I2C
     hal_i2c0 = HAL_I2C0::getInstance();
     if (!hal_i2c0 || !hal_i2c0->init(I2C0_SDA_PIN, I2C0_SCL_PIN, 400000)) {
@@ -291,19 +344,6 @@ bool init_hal_layer() {
     hal_i2c1 = HAL_I2C1::getInstance();
     if (!hal_i2c1 || !hal_i2c1->init(I2C1_SDA_PIN, I2C1_SCL_PIN, 400000)) {
         error_handler("Failed to initialize I2C1");
-        return false;
-    }
-    
-    // 初始化SPI
-    hal_spi0 = HAL_SPI0::getInstance();
-    if (!hal_spi0 || !hal_spi0->init(SPI0_SCK_PIN, SPI0_MOSI_PIN, SPI0_MISO_PIN, SPI0_FREQ)) {
-        error_handler("Failed to initialize SPI0");
-        return false;
-    }
-    
-    hal_spi1 = HAL_SPI1::getInstance();
-    if (!hal_spi1 || !hal_spi1->init(SPI1_SCK_PIN, SPI1_MOSI_PIN, SPI1_MISO_PIN, SPI1_FREQ)) {
-        error_handler("Failed to initialize SPI1");
         return false;
     }
     
@@ -321,12 +361,25 @@ bool init_hal_layer() {
     }
     
     // 初始化PIO
-    hal_pio0 = HAL_PIO0::getInstance();
-    if (!hal_pio0 || !hal_pio0->init()) {
-        error_handler("Failed to initialize PIO0");
+    hal_pio1 = HAL_PIO1::getInstance();
+    if (!hal_pio1 || !hal_pio1->init(NEOPIXEL_PIN)) {
+        error_handler("Failed to initialize PIO1");
+        return false;
+    }
+
+    // 初始化SPI
+    hal_spi0 = HAL_SPI0::getInstance();
+    if (!hal_spi0 || !hal_spi0->init(SPI0_SCK_PIN, SPI0_MOSI_PIN, SPI0_MISO_PIN, SPI0_FREQ)) {
+        error_handler("Failed to initialize SPI0");
         return false;
     }
     
+    hal_spi1 = HAL_SPI1::getInstance();
+    if (!hal_spi1 || !hal_spi1->init(SPI1_SCK_PIN, SPI1_MOSI_PIN, SPI1_MISO_PIN, SPI1_FREQ)) {
+        error_handler("Failed to initialize SPI1");
+        return false;
+    }
+
     // 初始化USB
     hal_usb = HAL_USB_Device::getInstance();
     if (!hal_usb || !hal_usb->init()) {
@@ -340,10 +393,18 @@ bool init_hal_layer() {
 /**
  * 协议层初始化
  */
-bool init_protocol_layer() {
+inline bool init_protocol_layer() {
+    
+    // 初始化USB Serial Logs
+    usb_logs = new USB_SerialLogs(hal_usb);
+    if (!usb_logs || !usb_logs->init()) {
+        error_handler("Failed to initialize USB Serial Logs");
+        return false;
+    }
+    
     // 扫描I2C设备并初始化GTX312L
     scan_i2c_devices();
-    
+
     // 初始化MCP23S17
     mcp23s17 = new MCP23S17(hal_spi1, MCP23S17_CS_PIN);
     if (!mcp23s17 || !mcp23s17->init()) {
@@ -352,7 +413,7 @@ bool init_protocol_layer() {
     }
     
     // 初始化NeoPixel
-    neopixel = new NeoPixel(hal_pio0, NEOPIXEL_PIN, 128);
+    neopixel = new NeoPixel(hal_pio1, NEOPIXEL_LEDS_NUM);
     if (!neopixel || !neopixel->init()) {
         error_handler("Failed to initialize NeoPixel");
         return false;
@@ -376,13 +437,6 @@ bool init_protocol_layer() {
     mai2_light = new Mai2Light(hal_uart1);
     if (!mai2_light || !mai2_light->init()) {
         error_handler("Failed to initialize Mai2Light");
-        return false;
-    }
-    
-    // 初始化USB Serial Logs
-    usb_logs = new USB_SerialLogs(hal_usb);
-    if (!usb_logs || !usb_logs->init()) {
-        error_handler("Failed to initialize USB Serial Logs");
         return false;
     }
     
@@ -425,7 +479,7 @@ bool init_service_layer() {
     // 注册MCP23S17的GPIO 1-11作为键盘
     // 设置GPIOB8为输出模式并输出高电平以点亮LED
     mcp23s17->set_pin_direction(MCP23S17_PORT_B, 7, MCP23S17_OUTPUT); // GPIOB8是端口B的第7位(0-7)
-    mcp23s17->write_pin(MCP23S17_PORT_B, 7, 0); // 输出高电平
+    mcp23s17->write_pin(MCP23S17_PORT_B, 7, 0);
     
     // 注册按键
     input_manager->addPhysicalKeyboard(MCP_GPIO::GPIOA0, HID_KeyCode::KEY_W);
@@ -581,9 +635,6 @@ void scan_i2c_devices() {
  * 系统反初始化
  */
 void deinit_system() {
-    // 停止Core1
-    core1_running = false;
-    
     // 反初始化服务层
     if (ui_manager) {
         ui_manager->deinit();
@@ -665,10 +716,10 @@ void deinit_system() {
         hal_usb = nullptr;
     }
     
-    if (hal_pio0) {
-        hal_pio0->deinit();
-        delete hal_pio0;
-        hal_pio0 = nullptr;
+    if (hal_pio1) {
+        hal_pio1->deinit();
+        delete hal_pio1;
+        hal_pio1 = nullptr;
     }
     
     if (hal_uart1) {
@@ -706,40 +757,17 @@ void deinit_system() {
         delete hal_i2c0;
         hal_i2c0 = nullptr;
     }
-    
-    system_initialized = false;
 }
 
 /**
  * Core0任务 - InputManager Loop0, LightManager Loop
  */
 void core0_task() {
-    uint32_t last_input_update = 0;
-    uint32_t last_light_update = 0;
-    
-    while (system_initialized && !system_error) {
-        uint32_t current_time = millis();
-        
-        // InputManager Loop0 - 每1ms执行一次 (触摸数据处理和Serial模式)
-        if (current_time - last_input_update >= 1) {
-            if (input_manager) {
-                input_manager->loop0();
-            }
-            last_input_update = current_time;
-        }
-        
-        // LightManager Loop - 每10ms执行一次
-        if (current_time - last_light_update >= 10) {
-            if (light_manager) {
-                light_manager->loop();
-            }
-            last_light_update = current_time;
-        }
-        
-        // 心跳和看门狗任务
+    while (1) {
+        input_manager->loop0();
+        light_manager->loop();
+        watchdog_feed();
         heartbeat_task();
-        watchdog_task();
-        status_update_task();
     }
 }
 
@@ -747,128 +775,12 @@ void core0_task() {
  * Core1任务 - InputManager Loop1, UIManager Loop
  */
 void core1_task() {
-    uint32_t last_input_update = 0;
-    uint32_t last_ui_update = 0;
-    
-    core1_running = true;
-    core1_error = false;
-    
-    while (core1_running && !system_error) {
-        uint32_t current_time = millis();
-        
-        // InputManager Loop1 - 每5ms执行一次 (键盘数据处理和HID模式)
-        if (current_time - last_input_update >= 5) {
-            if (input_manager) {
-                input_manager->loop1();
-            }
-            last_input_update = current_time;
-        }
-        
-        // UIManager Loop - 每50ms执行一次
-        if (current_time - last_ui_update >= 50) {
-            if (ui_manager) {
-                ui_manager->task();
-            }
-            last_ui_update = current_time;
-        }
-        
-        // 移除延迟以实现最高速率处理
-    }
-    
-    core1_running = false;
-}
-
-/**
- * Core1入口函数
- */
-void core1_entry() {
-    core1_task();
-}
-
-/**
- * 心跳任务
- */
-void heartbeat_task() {
-    uint32_t current_time = millis();
-    
-    if (current_time - last_heartbeat >= 1000) {
-        // 切换内置LED状态
-        static bool led_state = false;
-        digitalWrite(LED_BUILTIN_PIN, led_state ? HIGH : LOW);
-        led_state = !led_state;
-        
-        // 更新系统运行时间
-        system_uptime = current_time / 1000;
-        
-        last_heartbeat = current_time;
-    }
-}
-
-/**
- * 看门狗任务
- */
-void watchdog_task() {
-    uint32_t current_time = millis();
-    
-    if (current_time - last_watchdog_feed >= WATCHDOG_FEED_INTERVAL_MS) {
-        watchdog_update();
-        last_watchdog_feed = current_time;
-    }
-}
-
-/**
- * 状态更新任务
- */
-void status_update_task() {
-    uint32_t current_time = millis();
-    
-    if (current_time - last_status_update >= 10000) {
-        if (usb_logs) {
-            char buffer[128];
-            snprintf(buffer, sizeof(buffer), "System uptime: %lu seconds", system_uptime);
-            usb_logs->info(std::string(buffer));
-            snprintf(buffer, sizeof(buffer), "Core1 running: %s", core1_running ? "Yes" : "No");
-            usb_logs->info(std::string(buffer));
-            snprintf(buffer, sizeof(buffer), "GTX312L devices: %d", gtx312l_count);
-            usb_logs->info(std::string(buffer));
-        }
-        last_status_update = current_time;
-    }
-}
-
-/**
- * 错误处理函数
- */
-void error_handler(const char* error_msg) {
-    system_error = true;
-    
-    if (usb_logs) {
-        char buffer[256];
-        snprintf(buffer, sizeof(buffer), "SYSTEM ERROR: %s", error_msg);
-        usb_logs->error(std::string(buffer));
-    }
-    
-    // 如果UI管理器可用，显示错误界面
-    if (ui_manager) {
-        ui_manager->show_status_info();
-    }
-    
-    // 紧急关机
-    emergency_shutdown();
-}
-
-/**
- * 打印系统信息
- */
-void print_system_info() {
-    if (usb_logs) {
-        usb_logs->infof("=== MaiMai Controller V%s ===", SYSTEM_VERSION);
-        usb_logs->infof("Hardware Version: %s", HARDWARE_VERSION);
-        usb_logs->infof("Build Date: %s %s", BUILD_DATE, BUILD_TIME);
-        usb_logs->infof("CPU Frequency: %lu MHz", rp2040.f_cpu() / 1000000);
-        usb_logs->info("Free Heap: Available", "Memory");
-        usb_logs->info("Flash Size: Available", "Storage");
-        usb_logs->info("==============================");
+    watchdog_enable(WATCHDOG_TIMEOUT_MS, true);
+    while (1) {
+        input_manager->loop1();
+        usb_logs->task();
+        ui_manager->task();
+        watchdog_feed();
     }
 }
 
@@ -876,9 +788,7 @@ void print_system_info() {
  * 紧急关机
  */
 void emergency_shutdown() {
-    // 停止所有任务
-    core1_running = false;
-    
+    if (usb_logs) usb_logs->flush();
     // 关闭所有LED
     if (neopixel) {
         neopixel->clear_all();
@@ -902,10 +812,10 @@ void emergency_shutdown() {
  * Arduino setup函数
  */
 void setup() {
-    // 初始化内置LED
-    pinMode(LED_BUILTIN_PIN, OUTPUT);
-    digitalWrite(LED_BUILTIN_PIN, LOW);
-    
+    gpio_init(LED_BUILTIN_PIN);
+    gpio_set_dir(LED_BUILTIN_PIN, GPIO_OUT);
+    gpio_put(LED_BUILTIN_PIN, 0);
+
     // 启用看门狗
     watchdog_enable(WATCHDOG_TIMEOUT_MS, true);
     
@@ -913,7 +823,7 @@ void setup() {
     bool init_success = true;
     
     // 初始化HAL层
-    if (!init_hal_layer()) {
+    if (!core0_init_hal_layer()) {
         init_success = false;
     }
     
@@ -926,42 +836,20 @@ void setup() {
     if (init_success && !init_service_layer()) {
         init_success = false;
     }
-    
+
     if (init_success) {
-        system_initialized = true;
         print_system_info();
-        
         if (usb_logs) {
             usb_logs->info("System initialization completed successfully");
         }
-        
-        // 启动Core1任务
-        multicore_launch_core1(core1_entry);
-        
-        // 等待Core1启动
-        while (!core1_running && !system_error) {
-            delay(10);
-        }
-        
-        if (usb_logs) {
-            usb_logs->info("Core1 task started");
-        }
+        multicore_launch_core1(core1_task);
+        core0_task();
+
     } else {
         if (usb_logs) {
-            usb_logs->error("System initialization failed");
+            error_handler("System initialization failed");
         }
-        emergency_shutdown();
     }
 }
 
-/**
- * Arduino loop函数 - Core0主循环
- */
-void loop() {
-    if (system_initialized && !system_error) {
-        core0_task();
-    } else {
-        // 系统未初始化或出现错误，进入紧急模式
-        emergency_shutdown();
-    }
-}
+void loop() {}

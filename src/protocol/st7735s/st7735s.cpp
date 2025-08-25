@@ -39,7 +39,6 @@ bool ST7735S::init() {
     }
     
     // 配置SPI
-    spi_hal_->set_frequency(ST7735S_SPI_SPEED);
     spi_hal_->set_format(8, 0, 0);  // 8位，模式0
     
     // 硬件复位

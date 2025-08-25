@@ -1209,7 +1209,7 @@ void LightManager::update_fade_effects() {
     }
     
     // 注意：这里需要实际的时间函数
-    uint32_t current_time = 0; // millis() 或类似函数
+    uint32_t current_time = 0;
     
     if (current_time >= fade_state_.end_time) {
         // 渐变完成

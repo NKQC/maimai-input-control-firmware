@@ -1,6 +1,5 @@
 #include "neopixel.h"
 #include <pico/stdlib.h>
-#include <hardware/gpio.h>
 #include <hardware/clocks.h>
 #include <cmath>
 #include <algorithm>
@@ -23,8 +22,8 @@ static const struct pio_program neopixel_program = {
 
 const struct pio_program NeoPixel::neopixel_program_ = neopixel_program;
 
-NeoPixel::NeoPixel(HAL_PIO* pio_hal, uint8_t pin, uint16_t num_leds, NeoPixel_Type type)
-    : pio_hal_(pio_hal), pin_(pin), num_leds_(num_leds), type_(type),
+NeoPixel::NeoPixel(HAL_PIO* pio_hal, uint16_t num_leds, NeoPixel_Type type)
+    : pio_hal_(pio_hal), num_leds_(num_leds), type_(type),
       initialized_(false), pio_sm_(0), pio_offset_(0), brightness_(255),
       animation_running_(false), animation_step_(0) {
     
@@ -63,14 +62,6 @@ bool NeoPixel::init() {
         unload_pio_program();
         return false;
     }
-    
-    // 初始化GPIO
-    pio_hal_->gpio_init(pin_);
-    pio_hal_->gpio_set_function(pin_, GPIO_FUNC_PIO0);  // 假设使用PIO0
-    
-    // 清空所有LED
-    clear_all();
-    show();
     
     initialized_ = true;
     return true;
@@ -114,10 +105,6 @@ bool NeoPixel::set_pixel(uint16_t index, uint8_t r, uint8_t g, uint8_t b, uint8_
 }
 
 bool NeoPixel::set_all_pixels(const NeoPixel_Color& color) {
-    if (!is_ready()) {
-        return false;
-    }
-    
     std::fill(pixels_.begin(), pixels_.end(), color);
     return true;
 }
@@ -160,10 +147,6 @@ NeoPixel_Color NeoPixel::get_pixel(uint16_t index) const {
 }
 
 bool NeoPixel::show() {
-    if (!is_ready()) {
-        return false;
-    }
-    
     // 准备像素数据
     prepare_pixel_data();
     
@@ -395,16 +378,22 @@ bool NeoPixel::configure_pio() {
     float clock_freq = clock_get_hz(clk_sys);
     float cycles_per_bit = clock_freq / 800000.0f;  // 800kHz
     
-    // 配置状态机
-    pio_hal_->sm_config_set_wrap(pio_sm_, pio_offset_, pio_offset_ + neopixel_program_.length - 1);
-    pio_hal_->sm_config_set_out_pins(pio_sm_, pin_, 1);
-    pio_hal_->sm_config_set_sideset_pins(pio_sm_, pin_);
-    pio_hal_->sm_config_set_clkdiv(pio_sm_, cycles_per_bit);
+    // 创建统一配置
+    PIOStateMachineConfig config;
+    config.out_base = 0;  // GPIO引脚由PIO HAL管理
+    config.out_count = 1;
+    config.sideset_base = 0;  // GPIO引脚由PIO HAL管理
+    config.sideset_bit_count = 1;
+    config.sideset_optional = false;
+    config.sideset_pindirs = false;
+    config.clkdiv = cycles_per_bit;
+    config.wrap_target = pio_offset_;
+    config.wrap = pio_offset_ + neopixel_program_.length - 1;
+    config.program_offset = pio_offset_;
+    config.enabled = true;  // 直接启用状态机
     
-    // 启动状态机
-    pio_hal_->sm_set_enabled(pio_sm_, true);
-    
-    return true;
+    // 使用统一接口配置状态机
+    return pio_hal_->sm_configure(pio_sm_, config);
 }
 
 void NeoPixel::prepare_pixel_data() {

@@ -27,13 +27,6 @@ public:
     virtual bool read_dma(uint8_t* buffer, size_t length, dma_callback_t callback = nullptr) = 0;
     virtual bool transfer_dma(const uint8_t* tx_data, uint8_t* rx_data, size_t length, dma_callback_t callback = nullptr) = 0;
     
-    // 内联环形缓冲区操作
-    virtual inline size_t write_to_tx_buffer(const uint8_t* data, size_t length) = 0;
-    virtual inline size_t read_from_rx_buffer(uint8_t* buffer, size_t length) = 0;
-    virtual inline void trigger_tx_dma() = 0;
-    virtual inline size_t get_tx_buffer_free_space() const = 0;
-    virtual inline size_t get_rx_buffer_data_count() const = 0;
-    
     // 同步传输方法
     virtual size_t write(const uint8_t* data, size_t length) = 0;
     virtual size_t read(uint8_t* buffer, size_t length) = 0;
@@ -74,11 +67,6 @@ public:
     bool write_async(const uint8_t* data, size_t length, dma_callback_t callback);
     bool read_async(uint8_t* buffer, size_t length, dma_callback_t callback);
     bool transfer_async(const uint8_t* tx_data, uint8_t* rx_data, size_t length, dma_callback_t callback);
-    size_t write_to_tx_buffer(const uint8_t* data, size_t length) override;
-    size_t read_from_rx_buffer(uint8_t* buffer, size_t length) override;
-    void trigger_tx_dma() override;
-    size_t get_tx_buffer_free_space() const override;
-    size_t get_rx_buffer_data_count() const override;
     
     // 同步传输方法
     size_t write(const uint8_t* data, size_t length) override;
@@ -142,11 +130,6 @@ public:
     bool write_dma(const uint8_t* data, size_t length, dma_callback_t callback = nullptr) override;
     bool read_dma(uint8_t* buffer, size_t length, dma_callback_t callback = nullptr) override;
     bool transfer_dma(const uint8_t* tx_data, uint8_t* rx_data, size_t length, dma_callback_t callback = nullptr) override;
-    size_t write_to_tx_buffer(const uint8_t* data, size_t length) override;
-    size_t read_from_rx_buffer(uint8_t* buffer, size_t length) override;
-    void trigger_tx_dma() override;
-    size_t get_tx_buffer_free_space() const override;
-    size_t get_rx_buffer_data_count() const override;
     size_t write(const uint8_t* data, size_t length) override;
     size_t read(uint8_t* buffer, size_t length) override;
     size_t transfer(const uint8_t* tx_data, uint8_t* rx_data, size_t length) override;

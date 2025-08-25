@@ -76,7 +76,7 @@ struct NeoPixel_Animation {
 
 class NeoPixel {
 public:
-    NeoPixel(HAL_PIO* pio_hal, uint8_t pin, uint16_t num_leds, NeoPixel_Type type = NEOPIXEL_RGB);
+    NeoPixel(HAL_PIO* pio_hal, uint16_t num_leds, NeoPixel_Type type = NEOPIXEL_RGB);
     ~NeoPixel();
     
     // 初始化
@@ -134,7 +134,6 @@ public:
     
 private:
     HAL_PIO* pio_hal_;
-    uint8_t pin_;
     uint16_t num_leds_;
     NeoPixel_Type type_;
     bool initialized_;

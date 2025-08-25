@@ -72,6 +72,13 @@
         "typeinfo": "cpp",
         "variant": "cpp",
         "*.inc": "cpp",
-        "*.impl": "cpp"
+        "*.impl": "cpp",
+        "cassert": "cpp",
+        "cerrno": "cpp",
+        "cfloat": "cpp",
+        "ciso646": "cpp",
+        "climits": "cpp",
+        "queue": "cpp",
+        "stack": "cpp"
     }
 }

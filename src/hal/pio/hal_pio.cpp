@@ -24,12 +24,19 @@ HAL_PIO0::~HAL_PIO0() {
     deinit();
 }
 
-bool HAL_PIO0::init() {
+bool HAL_PIO0::init(uint8_t gpio_pin) {
     if (initialized_) {
         return true;
     }
     
+    // 保存GPIO引脚号
+    gpio_pin_ = gpio_pin;
+    
     // PIO0已经在系统启动时初始化，这里只需要标记为已初始化
+    // 同时初始化指定的GPIO引脚
+    pio_gpio_init(pio0, gpio_pin_);
+    gpio_set_function(gpio_pin_, GPIO_FUNC_PIO0);
+    
     initialized_ = true;
     return true;
 }
@@ -84,40 +91,44 @@ void HAL_PIO0::unclaim_sm(uint8_t sm) {
     }
 }
 
-void HAL_PIO0::sm_config_set_out_pins(uint8_t sm, uint8_t out_base, uint8_t out_count) {
-    if (initialized_ && sm < 4) {
-        ::sm_config_set_out_pins(&configs_[sm], out_base, out_count);
+bool HAL_PIO0::sm_configure(uint8_t sm, const PIOStateMachineConfig& config) {
+    if (!initialized_ || sm >= 4) {
+        return false;
     }
-}
-
-void HAL_PIO0::sm_config_set_in_pins(uint8_t sm, uint8_t in_base) {
-    if (initialized_ && sm < 4) {
-        ::sm_config_set_in_pins(&configs_[sm], in_base);
+    
+    // 获取默认配置
+    configs_[sm] = pio_get_default_sm_config();
+    
+    // 配置引脚
+    if (config.out_count > 0) {
+        ::sm_config_set_out_pins(&configs_[sm], config.out_base, config.out_count);
     }
-}
-
-void HAL_PIO0::sm_config_set_set_pins(uint8_t sm, uint8_t set_base, uint8_t set_count) {
-    if (initialized_ && sm < 4) {
-        ::sm_config_set_set_pins(&configs_[sm], set_base, set_count);
+    if (config.in_base != 0) {
+        ::sm_config_set_in_pins(&configs_[sm], config.in_base);
     }
-}
-
-void HAL_PIO0::sm_config_set_sideset_pins(uint8_t sm, uint8_t sideset_base) {
-    if (initialized_ && sm < 4) {
-        ::sm_config_set_sideset_pins(&configs_[sm], sideset_base);
+    if (config.set_count > 0) {
+        ::sm_config_set_set_pins(&configs_[sm], config.set_base, config.set_count);
     }
-}
-
-void HAL_PIO0::sm_config_set_clkdiv(uint8_t sm, float div) {
-    if (initialized_ && sm < 4) {
-        ::sm_config_set_clkdiv(&configs_[sm], div);
+    if (config.sideset_bit_count > 0) {
+        ::sm_config_set_sideset_pins(&configs_[sm], config.sideset_base);
+        ::sm_config_set_sideset(&configs_[sm], config.sideset_bit_count, config.sideset_optional, config.sideset_pindirs);
     }
-}
-
-void HAL_PIO0::sm_config_set_wrap(uint8_t sm, uint8_t wrap_target, uint8_t wrap) {
-    if (initialized_ && sm < 4) {
-        ::sm_config_set_wrap(&configs_[sm], wrap_target, wrap);
+    
+    // 配置时钟
+    ::sm_config_set_clkdiv(&configs_[sm], config.clkdiv);
+    
+    // 配置程序包装
+    ::sm_config_set_wrap(&configs_[sm], config.wrap_target, config.wrap);
+    
+    // 初始化状态机
+    pio_sm_init(pio0, sm, config.program_offset, &configs_[sm]);
+    
+    // 启用状态机（如果配置要求）
+    if (config.enabled) {
+        pio_sm_set_enabled(pio0, sm, true);
     }
+    
+    return true;
 }
 
 void HAL_PIO0::sm_set_enabled(uint8_t sm, bool enabled) {
@@ -153,13 +164,7 @@ bool HAL_PIO0::sm_is_rx_fifo_empty(uint8_t sm) {
     return true;
 }
 
-void HAL_PIO0::gpio_init(uint8_t pin) {
-    pio_gpio_init(pio0, pin);
-}
 
-void HAL_PIO0::gpio_set_function(uint8_t pin, uint8_t func) {
-    gpio_set_function(pin, func);
-}
 
 // HAL_PIO1 静态成员初始化
 HAL_PIO1* HAL_PIO1::instance_ = nullptr;
@@ -182,12 +187,19 @@ HAL_PIO1::~HAL_PIO1() {
     deinit();
 }
 
-bool HAL_PIO1::init() {
+bool HAL_PIO1::init(uint8_t gpio_pin) {
     if (initialized_) {
         return true;
     }
     
+    // 保存GPIO引脚号
+    gpio_pin_ = gpio_pin;
+    
     // PIO1已经在系统启动时初始化，这里只需要标记为已初始化
+    // 同时初始化指定的GPIO引脚
+    pio_gpio_init(pio1, gpio_pin_);
+    gpio_set_function(gpio_pin_, GPIO_FUNC_PIO1);
+    
     initialized_ = true;
     return true;
 }
@@ -242,40 +254,44 @@ void HAL_PIO1::unclaim_sm(uint8_t sm) {
     }
 }
 
-void HAL_PIO1::sm_config_set_out_pins(uint8_t sm, uint8_t out_base, uint8_t out_count) {
-    if (initialized_ && sm < 4) {
-        ::sm_config_set_out_pins(&configs_[sm], out_base, out_count);
+bool HAL_PIO1::sm_configure(uint8_t sm, const PIOStateMachineConfig& config) {
+    if (!initialized_ || sm >= 4) {
+        return false;
     }
-}
-
-void HAL_PIO1::sm_config_set_in_pins(uint8_t sm, uint8_t in_base) {
-    if (initialized_ && sm < 4) {
-        ::sm_config_set_in_pins(&configs_[sm], in_base);
+    
+    // 获取默认配置
+    configs_[sm] = pio_get_default_sm_config();
+    
+    // 配置引脚
+    if (config.out_count > 0) {
+        ::sm_config_set_out_pins(&configs_[sm], config.out_base, config.out_count);
     }
-}
-
-void HAL_PIO1::sm_config_set_set_pins(uint8_t sm, uint8_t set_base, uint8_t set_count) {
-    if (initialized_ && sm < 4) {
-        ::sm_config_set_set_pins(&configs_[sm], set_base, set_count);
+    if (config.in_base != 0) {
+        ::sm_config_set_in_pins(&configs_[sm], config.in_base);
     }
-}
-
-void HAL_PIO1::sm_config_set_sideset_pins(uint8_t sm, uint8_t sideset_base) {
-    if (initialized_ && sm < 4) {
-        ::sm_config_set_sideset_pins(&configs_[sm], sideset_base);
+    if (config.set_count > 0) {
+        ::sm_config_set_set_pins(&configs_[sm], config.set_base, config.set_count);
     }
-}
-
-void HAL_PIO1::sm_config_set_clkdiv(uint8_t sm, float div) {
-    if (initialized_ && sm < 4) {
-        ::sm_config_set_clkdiv(&configs_[sm], div);
+    if (config.sideset_bit_count > 0) {
+        ::sm_config_set_sideset_pins(&configs_[sm], config.sideset_base);
+        ::sm_config_set_sideset(&configs_[sm], config.sideset_bit_count, config.sideset_optional, config.sideset_pindirs);
     }
-}
-
-void HAL_PIO1::sm_config_set_wrap(uint8_t sm, uint8_t wrap_target, uint8_t wrap) {
-    if (initialized_ && sm < 4) {
-        ::sm_config_set_wrap(&configs_[sm], wrap_target, wrap);
+    
+    // 配置时钟
+    ::sm_config_set_clkdiv(&configs_[sm], config.clkdiv);
+    
+    // 配置程序包装
+    ::sm_config_set_wrap(&configs_[sm], config.wrap_target, config.wrap);
+    
+    // 初始化状态机
+    pio_sm_init(pio1, sm, config.program_offset, &configs_[sm]);
+    
+    // 启用状态机（如果配置要求）
+    if (config.enabled) {
+        pio_sm_set_enabled(pio1, sm, true);
     }
+    
+    return true;
 }
 
 void HAL_PIO1::sm_set_enabled(uint8_t sm, bool enabled) {
@@ -309,12 +325,4 @@ bool HAL_PIO1::sm_is_rx_fifo_empty(uint8_t sm) {
         return pio_sm_is_rx_fifo_empty(pio1, sm);
     }
     return true;
-}
-
-void HAL_PIO1::gpio_init(uint8_t pin) {
-    pio_gpio_init(pio1, pin);
-}
-
-void HAL_PIO1::gpio_set_function(uint8_t pin, uint8_t func) {
-    gpio_set_function(pin, func);
 }

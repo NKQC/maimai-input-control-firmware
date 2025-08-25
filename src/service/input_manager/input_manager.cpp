@@ -837,7 +837,6 @@ inline void InputManager::processSerialMode() {
         const uint16_t device_addr = current_touch_states_[i].physical_addr.mask & 0xF000;
         device_mappings[i] = nullptr;
         
-        // 使用指针遍历避免vector访问开销
         const GTX312L_DeviceMapping* mapping_ptr = config_->device_mappings;
         for (int j = 0; j < device_count; j++, mapping_ptr++) {
             if ((mapping_ptr->device_addr & 0xF000) == device_addr) {

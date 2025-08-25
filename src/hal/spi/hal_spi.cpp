@@ -3,11 +3,15 @@
 #include <hardware/gpio.h>
 #include <hardware/dma.h>
 #include <hardware/irq.h>
+#include <hardware/clocks.h>
+#include <hardware/resets.h>
+#include <hardware/adc.h>
 #include <pico/stdlib.h>
 
 // 前向声明DMA完成回调函数
 void dma_spi0_complete();
 void dma_spi1_complete();
+
 
 // HAL_SPI0 静态成员初始化
 HAL_SPI0* HAL_SPI0::instance_ = nullptr;
@@ -230,30 +234,6 @@ bool HAL_SPI0::is_busy() const {
     return dma_busy_;
 }
 
-size_t HAL_SPI0::write_to_tx_buffer(const uint8_t* data, size_t length) {
-    // 简单实现：直接返回0，表示不支持缓冲区操作
-    return 0;
-}
-
-size_t HAL_SPI0::read_from_rx_buffer(uint8_t* buffer, size_t length) {
-    // 简单实现：直接返回0，表示不支持缓冲区操作
-    return 0;
-}
-
-void HAL_SPI0::trigger_tx_dma() {
-    // 简单实现：空函数
-}
-
-size_t HAL_SPI0::get_tx_buffer_free_space() const {
-    // 简单实现：返回0
-    return 0;
-}
-
-size_t HAL_SPI0::get_rx_buffer_data_count() const {
-    // 简单实现：返回0
-    return 0;
-}
-
 bool HAL_SPI0::write_dma(const uint8_t* data, size_t length, dma_callback_t callback) {
     return write_async(data, length, callback);
 }
@@ -297,21 +277,46 @@ bool HAL_SPI1::init(uint8_t sck_pin, uint8_t mosi_pin, uint8_t miso_pin, uint32_
     mosi_pin_ = mosi_pin;
     miso_pin_ = miso_pin;
     frequency_ = frequency;
-    
-    // 初始化SPI1
-    spi_init(spi1, frequency);
-    
+
     // 设置GPIO功能
     gpio_set_function(sck_pin, GPIO_FUNC_SPI);
     gpio_set_function(mosi_pin, GPIO_FUNC_SPI);
     gpio_set_function(miso_pin, GPIO_FUNC_SPI);
     
-    // 设置默认SPI格式 (8位, CPOL=0, CPHA=0)
-    spi_set_format(spi1, 8, SPI_CPOL_0, SPI_CPHA_0, SPI_MSB_FIRST);
+    // 确保SCK引脚驱动强度足够
+    gpio_set_drive_strength(sck_pin, GPIO_DRIVE_STRENGTH_12MA);
+    gpio_set_slew_rate(sck_pin, GPIO_SLEW_RATE_FAST);
+    
+    // 为MOSI引脚也设置合适的驱动强度
+    gpio_set_drive_strength(mosi_pin, GPIO_DRIVE_STRENGTH_12MA);
+    gpio_set_slew_rate(mosi_pin, GPIO_SLEW_RATE_FAST);
+
+    uint32_t actual_freq = spi_init(spi1, frequency);
+    if (actual_freq == 0) {
+        return false;
+    }
+    
+    // 验证SPI硬件是否可用
+    if (!spi_is_writable(spi1)) {
+        spi_deinit(spi1);
+        return false;
+    }
     
     // 分配DMA通道
     dma_tx_channel_ = dma_claim_unused_channel(true);
     dma_rx_channel_ = dma_claim_unused_channel(true);
+    
+    if (dma_tx_channel_ < 0 || dma_rx_channel_ < 0) {
+        spi_deinit(spi1);
+        return false;
+    }
+    
+    // 最终验证：测试SPI通信是否正常
+    // 发送一个dummy字节并检查是否能正常发送
+    uint8_t test_byte = 0x00;
+    if (spi_is_writable(spi1)) {
+        spi_write_blocking(spi1, &test_byte, 1);
+    }
     
     initialized_ = true;
     return true;
@@ -319,15 +324,28 @@ bool HAL_SPI1::init(uint8_t sck_pin, uint8_t mosi_pin, uint8_t miso_pin, uint32_
 
 void HAL_SPI1::deinit() {
     if (initialized_) {
+        // 停止任何正在进行的DMA传输
+        dma_busy_ = false;
+        
         // 释放DMA通道
         if (dma_tx_channel_ >= 0) {
+            dma_channel_abort(dma_tx_channel_);
             dma_channel_unclaim(dma_tx_channel_);
             dma_tx_channel_ = -1;
         }
         if (dma_rx_channel_ >= 0) {
+            dma_channel_abort(dma_rx_channel_);
             dma_channel_unclaim(dma_rx_channel_);
             dma_rx_channel_ = -1;
         }
+        
+        // 重置GPIO引脚为输入模式
+        gpio_set_function(sck_pin_, GPIO_FUNC_SIO);
+        gpio_set_function(mosi_pin_, GPIO_FUNC_SIO);
+        gpio_set_function(miso_pin_, GPIO_FUNC_SIO);
+        gpio_set_dir(sck_pin_, GPIO_IN);
+        gpio_set_dir(mosi_pin_, GPIO_IN);
+        gpio_set_dir(miso_pin_, GPIO_IN);
         
         spi_deinit(spi1);
         initialized_ = false;
@@ -336,6 +354,13 @@ void HAL_SPI1::deinit() {
 
 size_t HAL_SPI1::write(const uint8_t* data, size_t length) {
     if (!initialized_) return 0;
+    if (!data || length == 0) return 0;
+    
+    // 确保SPI1处于正确状态
+    if (!spi_is_writable(spi1)) {
+        // 尝试重新设置SPI格式
+        spi_set_format(spi1, 8, SPI_CPOL_0, SPI_CPHA_0, SPI_MSB_FIRST);
+    }
     
     return spi_write_blocking(spi1, data, length);
 }
@@ -495,30 +520,6 @@ std::string HAL_SPI1::get_name() const {
 
 bool HAL_SPI1::is_ready() const {
     return initialized_;
-}
-
-size_t HAL_SPI1::write_to_tx_buffer(const uint8_t* data, size_t length) {
-    // 简单实现：直接返回0，表示不支持缓冲区操作
-    return 0;
-}
-
-size_t HAL_SPI1::read_from_rx_buffer(uint8_t* buffer, size_t length) {
-    // 简单实现：直接返回0，表示不支持缓冲区操作
-    return 0;
-}
-
-void HAL_SPI1::trigger_tx_dma() {
-    // 简单实现：空函数
-}
-
-size_t HAL_SPI1::get_tx_buffer_free_space() const {
-    // 简单实现：返回0
-    return 0;
-}
-
-size_t HAL_SPI1::get_rx_buffer_data_count() const {
-    // 简单实现：返回0
-    return 0;
 }
 
 bool HAL_SPI1::write_dma(const uint8_t* data, size_t length, dma_callback_t callback) {

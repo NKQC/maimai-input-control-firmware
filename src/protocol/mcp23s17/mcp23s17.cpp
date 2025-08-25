@@ -3,6 +3,7 @@
 #include <hardware/gpio.h>
 #include <cstring>
 
+
 MCP23S17::MCP23S17(HAL_SPI* spi_hal, uint8_t cs_pin, uint8_t device_addr)
     : spi_hal_(spi_hal), cs_pin_(cs_pin), device_addr_(device_addr & 0x07),
       initialized_(false), state_changed_(false), dma_in_progress_(false) {
@@ -18,6 +19,7 @@ bool MCP23S17::init() {
         return true;
     }
     
+    
     if (!spi_hal_ || !spi_hal_->is_ready()) {
         return false;
     }
@@ -28,7 +30,6 @@ bool MCP23S17::init() {
     gpio_put(cs_pin_, 1);  // CS高电平（未选中）
     
     // 配置SPI
-    spi_hal_->set_frequency(MCP23S17_SPI_SPEED);
     spi_hal_->set_format(8, 0, 0);  // 8位，模式0
     
     // 测试设备通信
@@ -417,10 +418,6 @@ void MCP23S17::task() {
 }
 
 bool MCP23S17::configure_iocon(uint8_t config) {
-    if (!is_ready()) {
-        return false;
-    }
-    
     return write_register(MCP23S17_REG_IOCON, config);
 }
 
@@ -523,7 +520,6 @@ bool MCP23S17::spi_transfer_async(const uint8_t* tx_data, uint8_t* rx_data, size
         current_dma_callback_ = nullptr;
         return false;
     }
-    
     return true;
 }
 

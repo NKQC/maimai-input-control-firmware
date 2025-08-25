@@ -125,12 +125,6 @@ bool HID::init(HAL_USB* usb_hal) {
     
     usb_hal_ = usb_hal;
     
-    // 初始化USB HAL
-    if (!usb_hal_->init()) {
-        handle_error("Failed to initialize USB HAL");
-        return false;
-    }
-    
     // 清空报告状态
     clear_keyboard_report();
     clear_touch_report();

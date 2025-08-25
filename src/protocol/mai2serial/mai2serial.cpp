@@ -30,11 +30,6 @@ bool Mai2Serial::init() {
         return false;
     }
     
-    // 配置UART - 使用HAL_UART的正确接口
-    if (!uart_hal_->init(0, 1, config_.baud_rate, false)) {
-        return false;
-    }
-    
     initialized_ = true;
     status_ = Status::READY;
     

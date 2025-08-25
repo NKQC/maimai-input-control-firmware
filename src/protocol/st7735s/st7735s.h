@@ -14,7 +14,6 @@
 // ST7735S显示参数
 #define ST7735S_WIDTH           160
 #define ST7735S_HEIGHT          80
-#define ST7735S_SPI_SPEED       32000000  // 32MHz
 
 // ST7735S命令定义
 #define ST7735S_NOP             0x00
