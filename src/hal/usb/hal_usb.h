@@ -1,144 +1,176 @@
 #pragma once
 
+#include "Adafruit_TinyUSB.h"
 #include <stdint.h>
+#include <stdbool.h>
 #include <string>
-#include <functional>
-#include <tusb.h>
 
 /**
- * HAL层 - USB接口抽象类
- * 提供底层USB接口，支持HID和CDC功能
- * 参考WashingTouch的USB实现
+ * USB HAL 模块 - 基于TinyUSB的简化实现
+ * 提供CDC串口和HID键盘的基础功能
  */
 
-// USB设备描述符配置
+// USB设备配置
 #ifndef USB_VID
-#define USB_VID                 0x0CA3  // 参考WashingTouch
+#define USB_VID                 0x2E8A  // Raspberry Pi Foundation
 #endif
+
 #ifndef USB_PID
-#define USB_PID                 0x0024  // 参考WashingTouch
+#define USB_PID                 0x000A  // Raspberry Pi Pico
 #endif
-#define USB_SERIAL              "01934"
-#define USB_DEVICE_NAME         "HAL_USB_Device"
 
-// HID报告ID
-#define REPORTID_TOUCHPAD       0x01
-#define REPORTID_KEYBOARD_1     0x02
-#define REPORTID_KEYBOARD_2     0x03
+#define CDC_BAUD                115200
 
-// 触摸屏配置
-#define TOUCH_LOCAL_NUM         10      // 最大触摸点数
+#define USB_DEVICE_NAME         "maimai_input_control"
 
-// 触摸点数据结构
-struct TouchPoint {
-    uint8_t id;         // 触摸点ID
-    uint16_t x;         // X坐标
-    uint16_t y;         // Y坐标
-    bool pressed;       // 是否按下
+// HID报告ID定义
+#define HID_REPORTID_KEYBOARD   0x01
+#define HID_REPORTID_TOUCH      0x02
+
+// 键盘按键代码 (USB HID) - 前置定义
+enum class HID_KeyCode : uint8_t {
+    KEY_NONE = 0x00,
+    KEY_A = 0x04,
+    KEY_B,
+    KEY_C,
+    KEY_D,
+    KEY_E,
+    KEY_F,
+    KEY_G,
+    KEY_H,
+    KEY_I,
+    KEY_J,
+    KEY_K,
+    KEY_L,
+    KEY_M,
+    KEY_N,
+    KEY_O,
+    KEY_P,
+    KEY_Q,
+    KEY_R,
+    KEY_S,
+    KEY_T,
+    KEY_U,
+    KEY_V,
+    KEY_W,
+    KEY_X,
+    KEY_Y,
+    KEY_Z,
+    KEY_1,
+    KEY_2,
+    KEY_3,
+    KEY_4,
+    KEY_5,
+    KEY_6,
+    KEY_7,
+    KEY_8,
+    KEY_9,
+    KEY_0,
+    KEY_ENTER,
+    KEY_ESCAPE,
+    KEY_BACKSPACE,
+    KEY_TAB,
+    KEY_SPACE,
+
+    KEY_F1 = 0x3A,
+    KEY_F2,
+    KEY_F3,
+    KEY_F4,
+    KEY_F5,
+    KEY_F6,
+    KEY_F7,
+    KEY_F8,
+    KEY_F9,
+    KEY_F10,
+    KEY_F11,
+    KEY_F12,
+    // HID控制按键
+    KEY_LEFT_CTRL = 0xE0,
+    KEY_LEFT_SHIFT,
+    KEY_LEFT_ALT,
+    KEY_LEFT_GUI,
+    KEY_RIGHT_CTRL,
+    KEY_RIGHT_SHIFT,
+    KEY_RIGHT_ALT,
+    KEY_RIGHT_GUI,
+    // 摇杆专用按键
+    KEY_JOYSTICK_A,      // 摇杆A按钮
+    KEY_JOYSTICK_B,      // 摇杆B按钮
+    KEY_JOYSTICK_CONFIRM, // 摇杆确认按钮
 };
 
-// 键盘数据结构
+// 标准6键键盘报告结构（兼容性）
 struct KeyboardReport {
-    uint8_t modifier;   // 修饰键
-    uint8_t reserved;   // 保留字节
-    uint8_t keys[6];    // 按键码
+    uint8_t modifier;    // 修饰键
+    uint8_t keys[6];     // 按键数组
 };
 
+// 全键无冲（NKRO）键盘报告结构 - 支持104个按键
+struct NKROKeyboardReport {
+    uint8_t modifier;    // 修饰键 (8位)
+    uint8_t keys[13];    // 按键位图 (104位 = 13字节)
+};
+
+// 扩展键盘报告结构 - 支持最多26个同时按下的按键
+struct ExtendedKeyboardReport {
+    uint8_t modifier;    // 修饰键
+    uint8_t key_count;   // 当前按下的按键数量
+    uint8_t keys[26];    // 按键数组，支持26个按键同时按下
+};
+
+// 触摸点结构
+struct TouchPoint {
+    uint16_t x;
+    uint16_t y;
+    uint8_t id;
+    bool pressed;
+};
+
+// HAL_USB类声明
 class HAL_USB {
 public:
-    virtual ~HAL_USB() = default;
+    // 单例模式
+    static HAL_USB* getInstance();
     
-    // 初始化USB接口
-    virtual bool init() = 0;
+    // 禁用拷贝构造和赋值
+    HAL_USB(const HAL_USB&) = delete;
+    HAL_USB& operator=(const HAL_USB&) = delete;
     
-    // 释放USB资源
-    virtual void deinit() = 0;
+    // 初始化和清理
+    bool init();
+    void deinit();
+    bool is_initialized() const;
+    bool is_connected() const;
     
-    // 检查USB是否连接
-    virtual bool is_connected() const = 0;
+    // CDC串口功能
+    bool cdc_write(const uint8_t* data, size_t length);
+    bool cdc_write_string(const std::string& str);
+    size_t cdc_read(uint8_t* buffer, size_t max_length);
+    bool cdc_available();
+    void cdc_flush();
     
-    // 检查USB是否就绪
-    virtual bool is_ready() const = 0;
+    // HID键盘功能 - 全键无冲接口（零拷贝，最低延迟）
+    bool hid_keyboard_nkro_report(const NKROKeyboardReport* report);
     
-    // HID功能
-    virtual bool send_touch_report(const TouchPoint* points, uint8_t count) = 0;
-    virtual bool send_keyboard_report(uint8_t report_id, const KeyboardReport& report) = 0;
-    virtual bool send_hid_report(uint8_t report_id, const uint8_t* data, uint8_t length) = 0;
+    // 直接发送单个按键状态更新 - 立即发送
+    bool hid_keyboard_single_key(HID_KeyCode key, bool pressed, uint8_t modifier = 0);
     
-    // 设备配置
-    virtual bool configure_device(uint16_t vendor_id, uint16_t product_id, const std::string& manufacturer = "", const std::string& product = "", const std::string& serial = "") = 0;
+    // 触摸功能（空实现，保持兼容性）
+    bool hid_touch_report(const TouchPoint* points, uint8_t count);
     
-    // CDC功能
-    virtual bool cdc_write(const uint8_t* data, size_t length) = 0;
-    virtual size_t cdc_read(uint8_t* buffer, size_t max_length) = 0;
-    virtual size_t cdc_available() const = 0;
-    virtual void cdc_flush() = 0;
-    
-    // 设置回调函数
-    virtual void set_cdc_rx_callback(std::function<void(const uint8_t*, size_t)> callback) = 0;
-    virtual void set_hid_get_report_callback(std::function<uint16_t(uint8_t, uint8_t, uint8_t*, uint16_t)> callback) = 0;
-    virtual void set_hid_set_report_callback(std::function<void(uint8_t, uint8_t, const uint8_t*, uint16_t)> callback) = 0;
-    
-    // 获取实例名称
-    virtual std::string get_name() const = 0;
-    
-    // 任务处理（需要在主循环中调用）
-    virtual void task() = 0;
-};
-
-// USB实现类
-class HAL_USB_Device : public HAL_USB {
 public:
-    static HAL_USB_Device* getInstance();
-    ~HAL_USB_Device();
+    ~HAL_USB();
     
-    bool init() override;
-    void deinit() override;
-    bool is_connected() const override;
-    bool is_ready() const override;
-    bool send_touch_report(const TouchPoint* points, uint8_t count) override;
-    bool send_keyboard_report(uint8_t report_id, const KeyboardReport& report) override;
-    bool send_hid_report(uint8_t report_id, const uint8_t* data, uint8_t length) override;
-    bool configure_device(uint16_t vendor_id, uint16_t product_id, const std::string& manufacturer = "", const std::string& product = "", const std::string& serial = "") override;
-    bool cdc_write(const uint8_t* data, size_t length) override;
-    size_t cdc_read(uint8_t* buffer, size_t max_length) override;
-    size_t cdc_available() const override;
-    void cdc_flush() override;
-    void set_cdc_rx_callback(std::function<void(const uint8_t*, size_t)> callback) override;
-    void set_hid_get_report_callback(std::function<uint16_t(uint8_t, uint8_t, uint8_t*, uint16_t)> callback) override;
-    void set_hid_set_report_callback(std::function<void(uint8_t, uint8_t, const uint8_t*, uint16_t)> callback) override;
-    std::string get_name() const override { return USB_DEVICE_NAME; }
-    void task() override;
-    
-    // TinyUSB回调函数 - 需要public访问权限
-    static void tud_cdc_rx_cb(uint8_t itf);
-    static uint16_t tud_hid_get_report_cb(uint8_t instance, uint8_t report_id, hid_report_type_t report_type, uint8_t* buffer, uint16_t reqlen);
-    static void tud_hid_set_report_cb(uint8_t instance, uint8_t report_id, hid_report_type_t report_type, uint8_t const* buffer, uint16_t bufsize);
-
 private:
+    HAL_USB();
+    Adafruit_USBD_HID usb_hid;
+    Adafruit_USBD_CDC usb_cdc;
+
+    static HAL_USB* instance_;
     bool initialized_;
-    bool connected_;
     
-    // 回调函数
-    std::function<void(const uint8_t*, size_t)> cdc_rx_callback_;
-    std::function<uint16_t(uint8_t, uint8_t, uint8_t*, uint16_t)> hid_get_report_callback_;
-    std::function<void(uint8_t, uint8_t, const uint8_t*, uint16_t)> hid_set_report_callback_;
+    // 内部状态
+    KeyboardReport current_keyboard_report_;
+    bool keyboard_report_pending_;
     
-    // CDC缓冲区
-    static const size_t CDC_BUFFER_SIZE = 1024;
-    uint8_t cdc_rx_buffer_[CDC_BUFFER_SIZE];
-    size_t cdc_rx_head_;
-    size_t cdc_rx_tail_;
-    
-    // 内部方法
-    void handle_cdc_rx();
-    void handle_hid_requests();
-    
-    // 静态实例指针（用于回调）
-    static HAL_USB_Device* instance_;
-    
-    // 私有构造函数（单例模式）
-    HAL_USB_Device();
-    HAL_USB_Device(const HAL_USB_Device&) = delete;
-    HAL_USB_Device& operator=(const HAL_USB_Device&) = delete;
 };

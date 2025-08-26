@@ -9,7 +9,7 @@
 
 ST7735S::ST7735S(HAL_SPI* spi_hal, uint8_t cs_pin, uint8_t dc_pin, uint8_t rst_pin, uint8_t bl_pin)
     : spi_hal_(spi_hal), cs_pin_(cs_pin), dc_pin_(dc_pin), rst_pin_(rst_pin), blk_pin_(bl_pin),
-      initialized_(false), current_brightness_(255), rotation_(ST7735S_ROTATION_0),
+      initialized_(false), current_brightness_(255), rotation_(ST7735S_ROTATION_90),
       width_(ST7735S_WIDTH), height_(ST7735S_HEIGHT), framebuffer_(nullptr), use_framebuffer_(false),
       dma_busy_(false), current_callback_(nullptr), dma_queue_head_(0), dma_queue_tail_(0), dma_queue_count_(0) {
 }
@@ -157,28 +157,28 @@ bool ST7735S::set_rotation(ST7735S_Rotation rotation) {
     rotation_ = rotation;
     
     uint8_t madctl = 0;
-    // 根据ST7735S数据手册和参考代码设置MADCTL寄存器
-    // MX, MY, RGB模式控制
+    // 根据厂家程序中的MADCTL设置值
+    // 参考OLED.ino中的USE_HORIZONTAL设置
     switch (rotation) {
-        case ST7735S_ROTATION_0:    // 竖屏
-            madctl = 0xC8;  // MY=1, MX=1, MV=0, ML=0, RGB=1, MH=0
-            width_ = ST7735S_WIDTH;
-            height_ = ST7735S_HEIGHT;
+        case ST7735S_ROTATION_0:    // 竖屏 (USE_HORIZONTAL==0)
+            madctl = 0x08;  // 对应厂家程序的0x08
+            width_ = 80;    // 竖屏时宽度为80
+            height_ = 160;  // 竖屏时高度为160
             break;
-        case ST7735S_ROTATION_90:   // 横屏
-            madctl = 0xA8;  // MY=1, MX=0, MV=1, ML=0, RGB=1, MH=0
-            width_ = ST7735S_HEIGHT;
-            height_ = ST7735S_WIDTH;
+        case ST7735S_ROTATION_90:   // 横屏 (USE_HORIZONTAL==2)
+            madctl = 0x78;  // 对应厂家程序的0x78
+            width_ = 160;   // 横屏时宽度为160
+            height_ = 80;   // 横屏时高度为80
             break;
-        case ST7735S_ROTATION_180:  // 竖屏翻转180度
-            madctl = 0x08;  // MY=0, MX=0, MV=0, ML=0, RGB=1, MH=0
-            width_ = ST7735S_WIDTH;
-            height_ = ST7735S_HEIGHT;
+        case ST7735S_ROTATION_180:  // 竖屏翻转180度 (USE_HORIZONTAL==1)
+            madctl = 0xC8;  // 对应厂家程序的0xC8
+            width_ = 80;
+            height_ = 160;
             break;
-        case ST7735S_ROTATION_270:  // 横屏翻转180度
-            madctl = 0x68;  // MY=0, MX=1, MV=1, ML=0, RGB=1, MH=0
-            width_ = ST7735S_HEIGHT;
-            height_ = ST7735S_WIDTH;
+        case ST7735S_ROTATION_270:  // 横屏翻转180度 (USE_HORIZONTAL==3)
+            madctl = 0xA8;  // 对应厂家程序的0xA8
+            width_ = 160;
+            height_ = 80;
             break;
     }
     
@@ -228,112 +228,117 @@ bool ST7735S::write_data(uint8_t data) {
 
 bool ST7735S::init_registers() {
     // 软件复位
-    write_command(ST7735S_SWRESET);
-    sleep_ms(150);
+    write_command(ST7735S_SLPOUT);  // 0x11
+    sleep_ms(100);
     
-    // 退出睡眠模式
-    write_command(ST7735S_SLPOUT);
-    sleep_ms(120);
+    // 反色显示
+    write_command(ST7735S_INVON);   // 0x21
     
-    // ST7735S 帧速率控制
-    write_command(ST7735S_FRMCTR1);  // 正常模式帧速率
-    write_data(0x01);
-    write_data(0x2C);
-    write_data(0x2D);
+    // 帧速率控制1 - 正常模式
+    write_command(ST7735S_FRMCTR1); // 0xB1
+    write_data(0x05);
+    write_data(0x3A);
+    write_data(0x3A);
     
-    write_command(ST7735S_FRMCTR2);  // 空闲模式帧速率
-    write_data(0x01);
-    write_data(0x2C);
-    write_data(0x2D);
+    // 帧速率控制2 - 空闲模式
+    write_command(ST7735S_FRMCTR2); // 0xB2
+    write_data(0x05);
+    write_data(0x3A);
+    write_data(0x3A);
     
-    write_command(ST7735S_FRMCTR3);  // 部分模式帧速率
-    write_data(0x01);
-    write_data(0x2C);
-    write_data(0x2D);
-    write_data(0x01);
-    write_data(0x2C);
-    write_data(0x2D);
+    // 帧速率控制3 - 部分模式
+    write_command(ST7735S_FRMCTR3); // 0xB3
+    write_data(0x05);
+    write_data(0x3A);
+    write_data(0x3A);
+    write_data(0x05);
+    write_data(0x3A);
+    write_data(0x3A);
     
-    write_command(ST7735S_INVCTR);   // 列反转控制
-    write_data(0x07);
+    // 列反转控制
+    write_command(ST7735S_INVCTR);  // 0xB4
+    write_data(0x03);
     
-    // ST7735S 电源序列
-    write_command(ST7735S_PWCTR1);
-    write_data(0xA2);
+    // 电源控制1
+    write_command(ST7735S_PWCTR1);  // 0xC0
+    write_data(0x62);
     write_data(0x02);
-    write_data(0x84);
+    write_data(0x04);
     
-    write_command(ST7735S_PWCTR2);
-    write_data(0xC5);
+    // 电源控制2
+    write_command(ST7735S_PWCTR2);  // 0xC1
+    write_data(0xC0);
     
-    write_command(ST7735S_PWCTR3);
-    write_data(0x0A);
+    // 电源控制3
+    write_command(ST7735S_PWCTR3);  // 0xC2
+    write_data(0x0D);
     write_data(0x00);
     
-    write_command(ST7735S_PWCTR4);
-    write_data(0x8A);
-    write_data(0x2A);
+    // 电源控制4
+    write_command(ST7735S_PWCTR4);  // 0xC3
+    write_data(0x8D);
+    write_data(0x6A);
     
-    write_command(ST7735S_PWCTR5);
-    write_data(0x8A);
+    // 电源控制5
+    write_command(ST7735S_PWCTR5);  // 0xC4
+    write_data(0x8D);
     write_data(0xEE);
     
-    // VCOM 控制
-    write_command(ST7735S_VMCTR1);
+    // VCOM控制
+    write_command(ST7735S_VMCTR1);  // 0xC5
     write_data(0x0E);
     
-    // 颜色模式设置为16位
-    write_command(ST7735S_COLMOD);
-    write_data(0x05);  // 16位颜色 RGB565
-    
-    // Gamma 正极性校正
-    write_command(ST7735S_GMCTRP1);
-    write_data(0x0F);
-    write_data(0x1A);
-    write_data(0x0F);
-    write_data(0x18);
-    write_data(0x2F);
-    write_data(0x28);
-    write_data(0x20);
-    write_data(0x22);
-    write_data(0x1F);
-    write_data(0x1B);
-    write_data(0x23);
-    write_data(0x37);
-    write_data(0x00);
+    // Gamma正极性校正
+    write_command(ST7735S_GMCTRP1); // 0xE0
+    write_data(0x10);
+    write_data(0x0E);
+    write_data(0x02);
+    write_data(0x03);
+    write_data(0x0E);
     write_data(0x07);
     write_data(0x02);
-    write_data(0x10);
-    
-    // Gamma 负极性校正
-    write_command(ST7735S_GMCTRN1);
-    write_data(0x0F);
-    write_data(0x1B);
-    write_data(0x0F);
-    write_data(0x17);
-    write_data(0x33);
-    write_data(0x2C);
-    write_data(0x29);
-    write_data(0x2E);
-    write_data(0x30);
-    write_data(0x30);
-    write_data(0x39);
-    write_data(0x3F);
-    write_data(0x00);
     write_data(0x07);
-    write_data(0x03);
+    write_data(0x0A);
+    write_data(0x12);
+    write_data(0x27);
+    write_data(0x37);
+    write_data(0x00);
+    write_data(0x0D);
+    write_data(0x0E);
     write_data(0x10);
     
-    // 正常显示模式
-    write_command(ST7735S_NORON);
-    sleep_ms(10);
+    // Gamma负极性校正
+    write_command(ST7735S_GMCTRN1); // 0xE1
+    write_data(0x10);
+    write_data(0x0E);
+    write_data(0x03);
+    write_data(0x03);
+    write_data(0x0F);
+    write_data(0x06);
+    write_data(0x02);
+    write_data(0x08);
+    write_data(0x0A);
+    write_data(0x13);
+    write_data(0x26);
+    write_data(0x36);
+    write_data(0x00);
+    write_data(0x0D);
+    write_data(0x0E);
+    write_data(0x10);
+    
+    // 颜色模式设置为16位
+    write_command(ST7735S_COLMOD);  // 0x3A
+    write_data(0x05);  // 16位颜色 RGB565
+    
+    // 显示开启
+    write_command(ST7735S_DISPON);  // 0x29
     
     return true;
 }
 
 bool ST7735S::configure_display() {
-    // 设置默认方向
-    set_rotation(ST7735S_ROTATION_0);
+    // 设置默认方向为横屏（匹配厂家程序USE_HORIZONTAL=2）
+    set_rotation(ST7735S_ROTATION_90);
     
     // 开启显示
     display_on(true);
@@ -347,15 +352,27 @@ bool ST7735S::set_window(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1) {
         return false;
     }
     
-    // 设置列地址
-    write_command(ST7735S_CASET);
-    write_data_16(x0);
-    write_data_16(x1);
-    
-    // 设置行地址
-    write_command(ST7735S_RASET);
-    write_data_16(y0);
-    write_data_16(y1);
+    // 根据显示方向设置正确的偏移量
+    // 参考厂家程序LCD_Address_Set函数
+    if (rotation_ == ST7735S_ROTATION_0 || rotation_ == ST7735S_ROTATION_180) {
+        // 竖屏模式：列偏移26，行偏移1
+        write_command(ST7735S_CASET);
+        write_data_16(x0 + 26);
+        write_data_16(x1 + 26);
+        
+        write_command(ST7735S_RASET);
+        write_data_16(y0 + 1);
+        write_data_16(y1 + 1);
+    } else {
+        // 横屏模式：列偏移1，行偏移26
+        write_command(ST7735S_CASET);
+        write_data_16(x0 + 1);
+        write_data_16(x1 + 1);
+        
+        write_command(ST7735S_RASET);
+        write_data_16(y0 + 26);
+        write_data_16(y1 + 26);
+    }
     
     // 开始写入RAM
     write_command(ST7735S_RAMWR);

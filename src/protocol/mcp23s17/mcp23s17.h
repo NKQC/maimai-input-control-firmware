@@ -145,11 +145,6 @@ public:
     // 任务处理（需要在主循环中调用）
     void task();
     
-    // DMA异步传输方法
-    bool spi_transfer_async(const uint8_t* tx_data, uint8_t* rx_data, size_t length, dma_callback_t callback = nullptr);
-    bool write_register_async(uint8_t reg, uint8_t value, dma_callback_t callback = nullptr);
-    bool read_register_async(uint8_t reg, uint8_t* value, dma_callback_t callback = nullptr);
-    
     // 配置寄存器操作
     bool configure_iocon(uint8_t config);
     
@@ -168,9 +163,7 @@ private:
     MCP23S17_GPIO_State last_state_;
     bool state_changed_;
     
-    // DMA相关成员
-    dma_callback_t current_dma_callback_;
-    bool dma_in_progress_;
+    
     
     // 内部方法
     bool write_register(uint8_t reg, uint8_t value);

@@ -301,25 +301,6 @@ bool HAL_SPI0::read_dma(uint8_t* buffer, size_t length, dma_callback_t callback)
     return true;
 }
 
-bool HAL_SPI0::transfer_dma(const uint8_t* tx_data, uint8_t* rx_data, size_t length, dma_callback_t callback) {
-    if (!initialized_ || dma_busy_) return false;
-    
-    dma_busy_ = true;
-    dma_callback_ = callback;
-    
-    // 对于简单实现，先使用阻塞方式，后续可优化为真正的DMA
-    size_t result = transfer(tx_data, rx_data, length);
-    
-    dma_busy_ = false;
-    if (dma_callback_) {
-        dma_callback_(result == length);
-    }
-    
-    return result == length;
-}
-
-
-
 // HAL_SPI1 静态成员初始化
 HAL_SPI1* HAL_SPI1::instance_ = nullptr;
 
@@ -659,21 +640,4 @@ bool HAL_SPI1::read_dma(uint8_t* buffer, size_t length, dma_callback_t callback)
     );
     
     return true;
-}
-
-bool HAL_SPI1::transfer_dma(const uint8_t* tx_data, uint8_t* rx_data, size_t length, dma_callback_t callback) {
-    if (!initialized_ || dma_busy_) return false;
-    
-    dma_busy_ = true;
-    dma_callback_ = callback;
-    
-    // 对于简单实现，先使用阻塞方式，后续可优化为真正的DMA
-    size_t result = transfer(tx_data, rx_data, length);
-    
-    dma_busy_ = false;
-    if (dma_callback_) {
-        dma_callback_(result == length);
-    }
-    
-    return result == length;
 }

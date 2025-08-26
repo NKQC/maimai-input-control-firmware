@@ -22,10 +22,7 @@ static const char* ANSI_BRIGHT_RED = "\033[91m";
 USB_SerialLogs::USB_SerialLogs(HAL_USB* usb_hal)
     : usb_hal_(usb_hal)
     , initialized_(false)
-    , buffer_pos_(0)
     , last_flush_time_(0) {
-    
-    memset(write_buffer_, 0, sizeof(write_buffer_));
 }
 
 // 析构函数
@@ -44,11 +41,6 @@ bool USB_SerialLogs::init() {
         return false;
     }
     
-    // 初始化USB HAL（使用现有接口）
-    if (!usb_hal_->init()) {
-        return false;
-    }
-    
     initialized_ = true;
     last_flush_time_ = time_us_32() / 1000;
     
@@ -63,8 +55,7 @@ void USB_SerialLogs::deinit() {
     if (initialized_) {
         // 刷新缓冲区
         flush();
-        
-        usb_hal_->deinit();
+
         initialized_ = false;
         
         // 清理队列
@@ -105,11 +96,7 @@ void USB_SerialLogs::log(USB_LogLevel level, const std::string& message, const s
     
     USB_LogEntry entry(level, message, tag);
     
-    if (config_.enable_buffering) {
-        add_to_queue(entry);
-    } else {
-        send_log_entry(entry);
-    }
+    add_to_queue(entry);
     
     update_statistics(level);
     
@@ -227,36 +214,45 @@ void USB_SerialLogs::flush() {
         return;
     }
     
-    // 处理队列中的日志
-    process_queue();
-    
-    // 刷新写缓冲区
-    if (buffer_pos_ > 0) {
-        // 直接发送整个缓冲区，让HAL层处理分块和重试
-        if (usb_hal_->cdc_write(write_buffer_, buffer_pos_)) {
-            stats_.bytes_sent += buffer_pos_;
-            buffer_pos_ = 0;
+    // 直接从队列发送日志
+    while (!log_queue_.empty()) {
+        const USB_LogEntry& entry = log_queue_.front();
+        // 格式化日志条目
+        std::string formatted = format_log_entry(entry);
+        formatted += "\r\n";
+        
+        // 检查消息长度是否合理
+        if (formatted.length() > USB_LOGS_MAX_LINE_LENGTH) {
+            // 消息过长，截断处理
+            formatted = formatted.substr(0, USB_LOGS_MAX_LINE_LENGTH - 10) + "...\r\n";
         }
-        // 如果发送失败，保留缓冲区内容，下次再试
+        
+        // 直接发送，如果失败则停止处理
+        if (usb_hal_->cdc_write((const uint8_t*)formatted.c_str(), formatted.length())) {
+            stats_.bytes_sent += formatted.length();
+            log_queue_.pop();
+        } else {
+            // 发送失败，停止处理，保留队列中的数据
+            break;
+        }
     }
     
     last_flush_time_ = time_us_32() / 1000;
 }
 
-// 清除缓冲区
+// 清除队列
 void USB_SerialLogs::clear_buffer() {
     while (!log_queue_.empty()) {
         log_queue_.pop();
     }
-    buffer_pos_ = 0;
 }
 
-// 获取缓冲区大小
+// 获取队列大小
 size_t USB_SerialLogs::get_buffer_size() const {
     return log_queue_.size();
 }
 
-// 检查缓冲区是否满
+// 检查队列是否已满
 bool USB_SerialLogs::is_buffer_full() const {
     return log_queue_.size() >= USB_LOGS_QUEUE_SIZE;
 }
@@ -391,7 +387,8 @@ std::string USB_SerialLogs::get_timestamp_string(uint32_t timestamp) const {
 }
 
 void USB_SerialLogs::add_to_queue(const USB_LogEntry& entry) {
-    if (is_buffer_full()) {
+    // 确保队列不超过20个条目
+    while (log_queue_.size() >= USB_LOGS_QUEUE_SIZE) {
         // 队列满，丢弃最旧的日志
         log_queue_.pop();
         stats_.dropped_logs++;
@@ -400,50 +397,9 @@ void USB_SerialLogs::add_to_queue(const USB_LogEntry& entry) {
     log_queue_.push(entry);
 }
 
-void USB_SerialLogs::process_queue() {
-    while (!log_queue_.empty() && is_ready()) {
-        const USB_LogEntry& entry = log_queue_.front();
-        
-        if (send_log_entry(entry)) {
-            log_queue_.pop();
-        } else {
-            // 发送失败，停止处理
-            break;
-        }
-    }
-}
+// process_queue函数已移除，日志直接在flush中处理
 
-bool USB_SerialLogs::send_log_entry(const USB_LogEntry& entry) {
-    if (!is_ready()) {
-        return false;
-    }
-    
-    std::string formatted = format_log_entry(entry);
-    formatted += "\r\n";
-    
-    // 检查消息长度是否合理
-    if (formatted.length() > USB_LOGS_MAX_LINE_LENGTH) {
-        // 消息过长，截断处理
-        formatted = formatted.substr(0, USB_LOGS_MAX_LINE_LENGTH - 10) + "...\r\n";
-    }
-    
-    // 检查是否需要缓冲
-    if (config_.enable_buffering && formatted.length() < USB_LOGS_BUFFER_SIZE - buffer_pos_) {
-        // 添加到写缓冲区
-        memcpy(write_buffer_ + buffer_pos_, formatted.c_str(), formatted.length());
-        buffer_pos_ += formatted.length();
-        
-        // 如果缓冲区接近满，立即刷新
-        if (buffer_pos_ > USB_LOGS_BUFFER_SIZE * 0.8) {
-            flush();
-        }
-        
-        return true;
-    } else {
-        // 直接发送，让HAL层处理超时和重试
-        return write_string(formatted);
-    }
-}
+// send_log_entry函数已移除，日志直接在flush中处理
 
 void USB_SerialLogs::update_statistics(USB_LogLevel level) {
     stats_.total_logs++;

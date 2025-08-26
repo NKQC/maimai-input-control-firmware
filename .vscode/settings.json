@@ -79,6 +79,12 @@
         "ciso646": "cpp",
         "climits": "cpp",
         "queue": "cpp",
-        "stack": "cpp"
+        "stack": "cpp",
+        "msc_device.h": "c",
+        "tusb_option.h": "c",
+        "tusb_common.h": "c",
+        "dcd.h": "c",
+        "cdc_device.h": "c",
+        "usbd_pvt.h": "c"
     }
 }

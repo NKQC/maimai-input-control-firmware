@@ -201,7 +201,7 @@
 #define ST7735S_RST_PIN 20
 #define ST7735S_CS_PIN 17
 #define ST7735S_BLK_PIN 22  // 背光PWM控制引脚
-#define SPI0_FREQ 4000000
+#define SPI0_FREQ 12000000
 // MCP23S17
 #define SPI1_MISO_PIN 28
 #define SPI1_MOSI_PIN 27
@@ -460,12 +460,12 @@ bool core1_init_hal_layer() {
     }
 
     // 初始化USB
-    hal_usb = HAL_USB_Device::getInstance();
+    hal_usb = HAL_USB::getInstance();
     if (!hal_usb || !hal_usb->init()) {
         error_handler("Failed to initialize USB");
         return false;
     }
-    
+    gpio_put(0, 1);
     // 标记Core1 HAL层初始化完成
     init_sync.core1_hal_ready = 1;
     
@@ -531,7 +531,6 @@ bool core1_init_protocol_layer() {
 
     USB_SerialLogs_Config log_config;
     log_config.enable_colors = true;
-    log_config.enable_buffering = true;
     log_config.min_level = USB_LogLevel::INFO;
 
     usb_logs->set_config(log_config);
@@ -601,11 +600,11 @@ bool init_service_layer() {
         error_handler("Failed to initialize InputManager");
         return false;
     }
-    
+
     // 注册MCP23S17的GPIO 1-11作为键盘
     // 设置GPIOB8为输出模式并输出高电平以点亮LED
     mcp23s17->set_pin_direction(MCP23S17_PORT_B, 7, MCP23S17_OUTPUT); // GPIOB8是端口B的第7位(0-7)
-    mcp23s17->write_pin(MCP23S17_PORT_B, 7, 0);
+    
     
     // 注册按键
     input_manager->addPhysicalKeyboard(MCP_GPIO::GPIOA0, HID_KeyCode::KEY_W);
@@ -660,7 +659,7 @@ bool init_service_layer() {
         error_handler("Failed to initialize UIManager");
         return false;
     }
-    
+
     // 标记服务层初始化完成
     init_sync.service_ready = 1;
     
@@ -683,6 +682,16 @@ void scan_i2c_devices() {
     // 扫描I2C0总线
     if (hal_i2c0) {
         std::vector<uint8_t> i2c0_addresses = hal_i2c0->scan_devices();
+        if (usb_logs) {
+            char count_buffer[64];
+            snprintf(count_buffer, sizeof(count_buffer), "scan found %zu i2c0 devices", i2c0_addresses.size());
+            usb_logs->info(std::string(count_buffer));
+            for (uint8_t addr : i2c0_addresses) {
+                char buffer[128];
+                snprintf(buffer, sizeof(buffer), "i2c0 device: 0x%02X", addr);
+                usb_logs->info(std::string(buffer));
+            }
+        }
         for (uint8_t addr : i2c0_addresses) {
             if (gtx312l_count >= 8) break;
             
@@ -715,6 +724,17 @@ void scan_i2c_devices() {
     // 扫描I2C1总线
     if (hal_i2c1 && gtx312l_count < 8) {
         std::vector<uint8_t> i2c1_addresses = hal_i2c1->scan_devices();
+        if (usb_logs) {
+            char count_buffer[64];
+            snprintf(count_buffer, sizeof(count_buffer), "scan found %zu i2c1 devices", i2c1_addresses.size());
+            usb_logs->info(std::string(count_buffer));
+            for (uint8_t addr : i2c1_addresses) {
+                char buffer[128];
+                snprintf(buffer, sizeof(buffer), "i2c1 device: 0x%02X", addr);
+                usb_logs->info(std::string(buffer));
+            }
+        }
+
         for (uint8_t addr : i2c1_addresses) {
             if (gtx312l_count >= 8) break;
             
@@ -945,7 +965,7 @@ void core1_main() {
         error_handler("Timeout waiting for service layer initialization");
         return;
     }
-    
+
     // 进入Core1任务循环
     core1_task();
 }
@@ -956,10 +976,12 @@ void core1_main() {
 void core1_task() {
     while (1) {
         input_manager->loop1();
+        usb_logs->info("TEST");
         usb_logs->task();
         //ui_manager->task();
         watchdog_feed();
         heartbeat_task();
+        
     }
 }
 

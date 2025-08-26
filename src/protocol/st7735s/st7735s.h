@@ -17,9 +17,11 @@ using RGB565 = uint16_t;
  * 支持128x160分辨率，16位RGB565颜色
  */
 
-// ST7735S显示参数
-#define ST7735S_WIDTH           160
-#define ST7735S_HEIGHT          80
+// ST7735S显示参数 - 根据厂家程序更新
+#define ST7735S_WIDTH           160  // 横屏模式宽度
+#define ST7735S_HEIGHT          80   // 横屏模式高度
+#define ST7735S_WIDTH_PORTRAIT  80   // 竖屏模式宽度
+#define ST7735S_HEIGHT_PORTRAIT 160  // 竖屏模式高度
 
 // ST7735S命令定义
 #define ST7735S_NOP             0x00

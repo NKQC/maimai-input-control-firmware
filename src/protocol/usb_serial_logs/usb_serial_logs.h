@@ -9,9 +9,8 @@
 #include "pico/time.h"
 
 // USB串口日志系统配置
-#define USB_LOGS_BUFFER_SIZE 1024
 #define USB_LOGS_MAX_LINE_LENGTH 256
-#define USB_LOGS_QUEUE_SIZE 32
+#define USB_LOGS_QUEUE_SIZE 20
 #define USB_LOGS_DEFAULT_BAUD_RATE 115200
 
 // 日志级别
@@ -36,7 +35,7 @@ struct USB_SerialLogs_Config {
     USB_LogLevel min_level;       // 最小日志级别
     USB_LogFormat format;         // 日志格式
     bool enable_colors;           // 启用颜色输出
-    bool enable_buffering;        // 启用缓冲
+    // 移除缓冲相关配置
     uint16_t flush_interval_ms;   // 刷新间隔
     bool auto_flush;              // 自动刷新
     
@@ -45,7 +44,7 @@ struct USB_SerialLogs_Config {
         , min_level(USB_LogLevel::INFO)
         , format(USB_LogFormat::FULL)
         , enable_colors(true)
-        , enable_buffering(true)
+
         , flush_interval_ms(100)
         , auto_flush(true) {}
 };
@@ -147,10 +146,8 @@ private:
     USB_SerialLogs_Config config_;
     Statistics stats_;
     
-    // 缓冲区
+    // 队列管理
     std::queue<USB_LogEntry> log_queue_;
-    uint8_t write_buffer_[USB_LOGS_BUFFER_SIZE];
-    size_t buffer_pos_;
     uint32_t last_flush_time_;
     
     // 回调
@@ -168,8 +165,6 @@ private:
     std::string get_timestamp_string(uint32_t timestamp) const;
     
     void add_to_queue(const USB_LogEntry& entry);
-    void process_queue();
-    bool send_log_entry(const USB_LogEntry& entry);
     
     void update_statistics(USB_LogLevel level);
     void handle_error(const std::string& error_msg);

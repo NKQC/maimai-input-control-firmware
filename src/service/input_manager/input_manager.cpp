@@ -311,26 +311,13 @@ void InputManager::loop0() {
 
 // CPU1核心循环 - 键盘处理和HID发送
 void InputManager::loop1() {
-    gpio_keyboard_bitmap_.clear();
     updateGPIOStates();
-    processGPIOKeyboard();
+    processGPIOKeyboard(); // 现在直接调用HID的press_key/release_key方法
 
-    gpio_keyboard_bitmap_ |= touch_bitmap_cache_;
-
-    for (size_t i = 0; i < SUPPORTED_KEYS_COUNT; i++) {
-        const HID_KeyCode key = supported_keys[i];
-        const uint8_t key_index = static_cast<uint8_t>(key);
-
-        if (gpio_keyboard_bitmap_.bitmap[key_index >> 6] & (1ULL << (key_index & 0x3F))) {
-            hid_->press_key(key);
-        } else {
-            hid_->release_key(key);
-        }
-    }
-    
     if (config_->work_mode == InputWorkMode::HID_MODE) {
         sendHIDTouchData();
     }
+    // 注意：HID已改为立即发送模式，不再需要调用task方法
 }
 
 // 开始Serial绑定
@@ -957,7 +944,7 @@ inline void InputManager::sendHIDTouchData() {
     
     touch_report.contact_count = point_count;
     
-    // 发送HID报告
+    // 发送HID报告 - 触摸功能未实现 有空再说
     if (hid_) {
         hid_->send_touch_report(touch_report);
     }
@@ -1484,7 +1471,7 @@ void InputManager::processHIDBinding() {
                 touch_report.contacts[0].x = (uint16_t)(hid_binding_x_ * 32767);
                 touch_report.contacts[0].y = (uint16_t)(hid_binding_y_ * 32767);
                 
-                // 发送HID报告
+                // 发送HID报告 - 触摸功能已移除，但保留接口调用以维持兼容性
                 hid_->send_touch_report(touch_report);
             }
             
@@ -1608,7 +1595,8 @@ void InputManager::updateGPIOStates() {
 void InputManager::processGPIOKeyboard() {
     // 高性能GPIO处理：零内存分配，使用类成员缓存变量
     static bool prev_joystick_states[3] = {false, false, false}; // A, B, Confirm
-    
+    static KeyboardBitmap prev_keyboard_state; // 跟踪上一次的按键状态
+    static KeyboardBitmap current_keyboard_state;
     // 零内存分配：使用类成员缓存变量计算所有变化位图和反转位图
     gpio_mcu_changed_ = mcu_gpio_states_ ^ mcu_gpio_previous_states_;
     gpio_mcu_inverted_ = ~mcu_gpio_states_; // 低电平有效
@@ -1621,6 +1609,10 @@ void InputManager::processGPIOKeyboard() {
     if (!gpio_mcu_changed_ && !gpio_mcp_changed_a_ && !gpio_mcp_changed_b_) {
         return;
     }
+    
+    // 清空当前键盘状态，重新构建
+    
+    current_keyboard_state.clear();
     
     // 零内存分配：使用类成员缓存变量获取所有指针和计数
     gpio_mappings_cache_ = config_->physical_keyboard_mappings.data();
@@ -1635,17 +1627,13 @@ void InputManager::processGPIOKeyboard() {
         
         // 使用位运算快速判断GPIO类型和状态
         if ((gpio_pin_cache_ & 0xC0) == 0x00) { // MCU GPIO
-            // 仅处理有变化的引脚
-            if (!(gpio_mcu_changed_ & (1ULL << gpio_pin_num_cache_))) continue;
             gpio_current_state_cache_ = (gpio_mcu_inverted_ >> gpio_pin_num_cache_) & 1;
         } else { // MCP GPIO
             if (gpio_pin_num_cache_ <= 8) { // PORTA
                 gpio_bit_pos_cache_ = gpio_pin_num_cache_ - 1;
-                if (!(gpio_mcp_changed_a_ & (1 << gpio_bit_pos_cache_))) continue;
                 gpio_current_state_cache_ = (gpio_mcp_inverted_a_ >> gpio_bit_pos_cache_) & 1;
             } else { // PORTB
                 gpio_bit_pos_cache_ = gpio_pin_num_cache_ - 9;
-                if (!(gpio_mcp_changed_b_ & (1 << gpio_bit_pos_cache_))) continue;
                 gpio_current_state_cache_ = (gpio_mcp_inverted_b_ >> gpio_bit_pos_cache_) & 1;
             }
         }
@@ -1674,19 +1662,19 @@ void InputManager::processGPIOKeyboard() {
                 break;
                 
             default:
-                // 普通键盘处理：仅在按下时设置
+                // 普通键盘处理：设置当前状态
                 if (gpio_current_state_cache_) {
                     if (gpio_mapping_ptr_cache_->default_key != HID_KeyCode::KEY_NONE) {
-                        gpio_keyboard_bitmap_.setKey(gpio_mapping_ptr_cache_->default_key, true);
+                        current_keyboard_state.setKey(gpio_mapping_ptr_cache_->default_key, true);
                     }
                     // 内联逻辑键处理避免函数调用，使用类成员缓存变量
                     for (size_t j = 0; j < gpio_logical_count_cache_; ++j) {
                         if (gpio_logical_mappings_cache_[j].gpio_id == gpio_pin_cache_) {
                             // 使用类成员缓存指针和位运算展开循环
                             gpio_keys_ptr_cache_ = gpio_logical_mappings_cache_[j].keys;
-                            if (gpio_keys_ptr_cache_[0] != HID_KeyCode::KEY_NONE) gpio_keyboard_bitmap_.setKey(gpio_keys_ptr_cache_[0], true);
-                            if (gpio_keys_ptr_cache_[1] != HID_KeyCode::KEY_NONE) gpio_keyboard_bitmap_.setKey(gpio_keys_ptr_cache_[1], true);
-                            if (gpio_keys_ptr_cache_[2] != HID_KeyCode::KEY_NONE) gpio_keyboard_bitmap_.setKey(gpio_keys_ptr_cache_[2], true);
+                            if (gpio_keys_ptr_cache_[0] != HID_KeyCode::KEY_NONE) current_keyboard_state.setKey(gpio_keys_ptr_cache_[0], true);
+                            if (gpio_keys_ptr_cache_[1] != HID_KeyCode::KEY_NONE) current_keyboard_state.setKey(gpio_keys_ptr_cache_[1], true);
+                            if (gpio_keys_ptr_cache_[2] != HID_KeyCode::KEY_NONE) current_keyboard_state.setKey(gpio_keys_ptr_cache_[2], true);
                             break;
                         }
                     }
@@ -1695,7 +1683,25 @@ void InputManager::processGPIOKeyboard() {
         }
     }
     
+    // 比较当前状态与上一次状态，发送按键变化事件
+    if (hid_) {
+        for (uint8_t i = 0; i < SUPPORTED_KEYS_COUNT; i++) {
+            HID_KeyCode key = supported_keys[i];
+            bool current_pressed = current_keyboard_state.getKey(key);
+            bool prev_pressed = prev_keyboard_state.getKey(key);
+            
+            if (current_pressed != prev_pressed) {
+                if (current_pressed) {
+                    hid_->press_key(key);
+                } else {
+                    hid_->release_key(key);
+                }
+            }
+        }
+    }
+    
     // 更新上一次状态
+    prev_keyboard_state = current_keyboard_state;
     mcu_gpio_previous_states_ = mcu_gpio_states_;
     mcp_gpio_previous_states_ = mcp_gpio_states_;
 }
@@ -1757,16 +1763,11 @@ void InputManager::resetSampleCounter() {
 
 // 获取HID键盘回报速率
 uint8_t InputManager::getHIDReportRate() {
-    if (hid_) {
-        HID_Config config;
-        if (hid_->get_config(config)) {
-            // 返回回报间隔的倒数作为回报速率 (Hz)
-            if (config.report_interval_ms > 0) {
-                return 1000 / config.report_interval_ms;
-            }
-        }
+    if (hid_ && hid_->is_initialized()) {
+        // 返回实际测试的HID报告速率 (Hz)
+        return hid_->get_report_rate();
     }
-    return 0; // HID未初始化或配置无效
+    return 0; // HID未初始化
 }
 
 // 获取物理键盘映射列表

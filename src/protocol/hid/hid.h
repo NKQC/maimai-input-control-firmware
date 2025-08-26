@@ -2,8 +2,8 @@
 #define HID_H
 
 #include "../../hal/usb/hal_usb.h"
-#include <cstdint>
 #include <functional>
+#include <cstdint>
 #include <vector>
 #include <array>
 #include <cstring>
@@ -19,78 +19,6 @@ enum class HID_ReportType : uint8_t {
     INPUT = 1,
     OUTPUT = 2,
     FEATURE = 3
-};
-
-// 键盘按键代码 (USB HID) - 前置定义
-enum class HID_KeyCode : uint8_t {
-    KEY_NONE = 0x00,
-    KEY_A = 0x04,
-    KEY_B,
-    KEY_C,
-    KEY_D,
-    KEY_E,
-    KEY_F,
-    KEY_G,
-    KEY_H,
-    KEY_I,
-    KEY_J,
-    KEY_K,
-    KEY_L,
-    KEY_M,
-    KEY_N,
-    KEY_O,
-    KEY_P,
-    KEY_Q,
-    KEY_R,
-    KEY_S,
-    KEY_T,
-    KEY_U,
-    KEY_V,
-    KEY_W,
-    KEY_X,
-    KEY_Y,
-    KEY_Z,
-    KEY_1,
-    KEY_2,
-    KEY_3,
-    KEY_4,
-    KEY_5,
-    KEY_6,
-    KEY_7,
-    KEY_8,
-    KEY_9,
-    KEY_0,
-    KEY_ENTER,
-    KEY_ESCAPE,
-    KEY_BACKSPACE,
-    KEY_TAB,
-    KEY_SPACE,
-
-    KEY_F1 = 0x3A,
-    KEY_F2,
-    KEY_F3,
-    KEY_F4,
-    KEY_F5,
-    KEY_F6,
-    KEY_F7,
-    KEY_F8,
-    KEY_F9,
-    KEY_F10,
-    KEY_F11,
-    KEY_F12,
-    // HID控制按键
-    KEY_LEFT_CTRL = 0xE0,
-    KEY_LEFT_SHIFT,
-    KEY_LEFT_ALT,
-    KEY_LEFT_GUI,
-    KEY_RIGHT_CTRL,
-    KEY_RIGHT_SHIFT,
-    KEY_RIGHT_ALT,
-    KEY_RIGHT_GUI,
-    // 摇杆专用按键
-    KEY_JOYSTICK_A,      // 摇杆A按钮
-    KEY_JOYSTICK_B,      // 摇杆B按钮
-    KEY_JOYSTICK_CONFIRM, // 摇杆确认按钮
 };
 
 // 遍历所有支持的HID键码
@@ -201,7 +129,7 @@ union KeyboardBitmap {
     }
 
     // 设置按键状态
-    void setKey(HID_KeyCode key, bool pressed) {
+    inline void setKey(HID_KeyCode key, bool pressed) {
         uint8_t bit_index = getBitIndex(key);
         if (bit_index < 64) {
             if (pressed) {
@@ -220,7 +148,7 @@ union KeyboardBitmap {
     }
     
     // volatile版本的setKey方法
-    void setKey(HID_KeyCode key, bool pressed) volatile {
+    inline void setKey(HID_KeyCode key, bool pressed) volatile {
         uint8_t bit_index = getBitIndex(key);
         if (bit_index < 64) {
             if (pressed) {
@@ -239,7 +167,7 @@ union KeyboardBitmap {
     }
     
     // 获取按键状态
-    bool getKey(HID_KeyCode key) const {
+    inline bool getKey(HID_KeyCode key) const {
         uint8_t bit_index = getBitIndex(key);
         if (bit_index < 64) {
             return (bitmap_low & (1ULL << bit_index)) != 0;
@@ -262,24 +190,65 @@ union KeyboardBitmap {
         bitmap_high = 0;
     }
     
-    // 获取HID_KeyCode对应的位索引
-    uint8_t getBitIndex(HID_KeyCode key) const volatile {
-        if ((uint8_t)key < 3) return 0;
-        if ((uint8_t)key < 44) return (uint8_t)key - 3;
-        if ((uint8_t)key < 70) return (uint8_t)key - 16;
-        return (uint8_t)key - 54;
+    // 获取内部位图数据指针，用于位运算优化
+    inline const uint8_t* getData() const {
+        return reinterpret_cast<const uint8_t*>(bitmap);
+    }
+    
+    // 获取HID_KeyCode对应的位索引 - 基于supported_keys数组的索引
+    inline uint8_t getBitIndex(HID_KeyCode key) const volatile {
+        // 遍历supported_keys数组找到对应的索引
+        for (uint8_t i = 0; i < SUPPORTED_KEYS_COUNT; i++) {
+            if (supported_keys[i] == key) {
+                return i;
+            }
+        }
+        return 0; // 如果找不到，返回0（KEY_NONE的位置）
     }
 };
-
-
 
 // 键盘报告结构 (移除reserved字段)
 struct HID_KeyboardReport {
     uint8_t modifier;           // 修饰键 (Ctrl, Shift, Alt, GUI)
+    uint8_t reserved;           // 保留字节
     uint8_t keys[6];           // 同时按下的按键 (最多6个)
     
-    HID_KeyboardReport() : modifier(0) {
+    HID_KeyboardReport() : modifier(0), reserved(0) {
         memset(keys, 0, sizeof(keys));
+    }
+};
+
+// 多键盘报告管理器
+struct HID_MultiKeyboardReport {
+    HID_KeyboardReport keyboards[3];  // 三个键盘实例
+    
+    HID_MultiKeyboardReport() {
+        // 构造函数会自动初始化所有键盘
+    }
+    
+    // 清空所有键盘报告
+    void clear_all() {
+        for (int i = 0; i < 3; i++) {
+            keyboards[i].modifier = 0;
+            keyboards[i].reserved = 0;
+            memset(keyboards[i].keys, 0, sizeof(keyboards[i].keys));
+        }
+    }
+    
+    // 获取指定键盘的报告
+    HID_KeyboardReport& get_keyboard(uint8_t keyboard_id) {
+        return keyboards[keyboard_id % 3];
+    }
+    
+    // 获取总按键数量
+    uint8_t get_total_key_count() const {
+        uint8_t count = 0;
+        for (int i = 0; i < 3; i++) {
+            for (int j = 0; j < 6; j++) {
+                if (keyboards[i].keys[j] != 0) count++;
+            }
+        }
+        return count;
     }
 };
 
@@ -342,94 +311,39 @@ public:
     
     ~HID();
     
-    // 初始化和反初始化
-    bool init(HAL_USB* usb_hal);
+    // 初始化和清理
+    bool init(HAL_USB* hal_usb);
     void deinit();
-    bool is_ready() const;
+    bool is_initialized() const;
     
-    // 配置管理
-    bool set_config(const HID_Config& config);
-    bool get_config(HID_Config& config);
-    
-    // 键盘功能
-    bool send_keyboard_report(const HID_KeyboardReport& report);
-    bool send_keyboard_data(const KeyboardBitmap& bitmap);  // 高效发送键盘bitmap数据
+    // 键盘操作
     bool press_key(HID_KeyCode key, uint8_t modifier = 0);
     bool release_key(HID_KeyCode key);
-    bool release_all_keys();
-    bool type_string(const std::string& text);
     
-    // 触摸功能
+    // 触摸操作 (空实现，保持向后兼容)
     bool send_touch_report(const HID_TouchReport& report);
-    bool set_touch_point(uint8_t contact_id, uint16_t x, uint16_t y, uint8_t pressure = 255);
-    bool release_touch_point(uint8_t contact_id);
-    bool release_all_touch_points();
     
     // 状态查询
-    bool is_connected() const;
-    uint32_t get_report_count() const;
-    uint32_t get_error_count() const;
-    
-    // 回调设置
-    void set_report_callback(HID_ReportCallback callback);
-    void set_connect_callback(HID_ConnectCallback callback);
-    void set_error_callback(HID_ErrorCallback callback);
-    
-    // 任务循环
-    void task();
+    uint8_t get_report_rate() const;
     
     // 静态工具函数
     static HID_KeyCode char_to_keycode(char c);
     static uint8_t char_to_modifier(char c);
-    static std::vector<uint8_t> generate_hid_descriptor(HID_DeviceType device_type);
-    
+
 private:
-    // 私有构造函数
+    // 构造函数
     HID();
     
-    // 单例实例
+    // 静态实例
     static HID* instance_;
     
-    HAL_USB* usb_hal_;
     bool initialized_;
-    HID_Config config_;
-    
-    // 当前报告状态
-    HID_KeyboardReport current_keyboard_report_;
-    HID_TouchReport current_touch_report_;
-    
-    // 统计信息
-    uint32_t report_count_;
-    uint32_t error_count_;
-    uint32_t last_report_time_;
-    
-    // 回调函数
-    HID_ReportCallback report_callback_;
-    HID_ConnectCallback connect_callback_;
-    HID_ErrorCallback error_callback_;
-    
-    // 内部方法
-    bool send_report(HID_ReportType type, uint8_t report_id, const uint8_t* data, uint8_t length);
-    void handle_received_report(HID_ReportType type, const uint8_t* data, uint8_t length);
-    void handle_connection_change(bool connected);
-    void handle_error(const std::string& error);
-    
-    // 描述符生成
-    std::vector<uint8_t> generate_keyboard_descriptor();
-    std::vector<uint8_t> generate_touch_descriptor();
-    
-    // 键盘报告处理
-    bool add_key_to_report(HID_KeyCode key);
-    bool remove_key_from_report(HID_KeyCode key);
-    void clear_keyboard_report();
-    
-    // 触摸报告处理
-    HID_TouchPoint* find_touch_point(uint8_t contact_id);
-    void clear_touch_report();
-};
+    HAL_USB* hal_usb_;
 
-// 便利宏定义
-#define HID_PRESS_KEY(key) HID::getInstance()->press_key(HID_KeyCode::key)
-#define HID_RELEASE_KEY(key) HID::getInstance()->release_key(HID_KeyCode::key)
+    // 回报速率统计
+    uint32_t report_count_;
+    uint32_t last_report_time_;
+    uint8_t cached_report_rate_;
+};
 
 #endif // HID_H

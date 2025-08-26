@@ -25,7 +25,6 @@ public:
     // DMA操作 - 完全DMA化
     virtual bool write_dma(const uint8_t* data, size_t length, dma_callback_t callback = nullptr) = 0;
     virtual bool read_dma(uint8_t* buffer, size_t length, dma_callback_t callback = nullptr) = 0;
-    virtual bool transfer_dma(const uint8_t* tx_data, uint8_t* rx_data, size_t length, dma_callback_t callback = nullptr) = 0;
     
     // 同步传输方法
     virtual size_t write(const uint8_t* data, size_t length) = 0;
@@ -63,7 +62,6 @@ public:
     void deinit() override;
     bool write_dma(const uint8_t* data, size_t length, dma_callback_t callback = nullptr) override;
     bool read_dma(uint8_t* buffer, size_t length, dma_callback_t callback = nullptr) override;
-    bool transfer_dma(const uint8_t* tx_data, uint8_t* rx_data, size_t length, dma_callback_t callback = nullptr) override;
     bool write_async(const uint8_t* data, size_t length, dma_callback_t callback);
     bool read_async(uint8_t* buffer, size_t length, dma_callback_t callback);
     bool transfer_async(const uint8_t* tx_data, uint8_t* rx_data, size_t length, dma_callback_t callback);
@@ -129,7 +127,6 @@ public:
     void deinit() override;
     bool write_dma(const uint8_t* data, size_t length, dma_callback_t callback = nullptr) override;
     bool read_dma(uint8_t* buffer, size_t length, dma_callback_t callback = nullptr) override;
-    bool transfer_dma(const uint8_t* tx_data, uint8_t* rx_data, size_t length, dma_callback_t callback = nullptr) override;
     size_t write(const uint8_t* data, size_t length) override;
     size_t read(uint8_t* buffer, size_t length) override;
     size_t transfer(const uint8_t* tx_data, uint8_t* rx_data, size_t length) override;

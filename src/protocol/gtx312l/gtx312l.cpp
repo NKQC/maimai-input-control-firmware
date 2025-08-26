@@ -2,11 +2,12 @@
 #include <cstring>
 #include <pico/time.h>
 #include <pico/stdlib.h>
+#include "src/protocol/usb_serial_logs/usb_serial_logs.h"
 
 // GTX312L构造函数
 GTX312L::GTX312L(HAL_I2C* i2c_hal, I2C_Bus i2c_bus, uint8_t device_addr)
     : i2c_hal_(i2c_hal), i2c_bus_(i2c_bus), device_addr_(device_addr), 
-      i2c_device_address_(GTX312L_I2C_ADDR_DEFAULT + device_addr), initialized_(false) {
+      i2c_device_address_(device_addr), initialized_(false) {
     // 构造物理设备地址
     physical_device_address_.mask = 0x0000;
     physical_device_address_.i2c_port = static_cast<uint8_t>(i2c_bus);
@@ -27,8 +28,10 @@ bool GTX312L::init() {
     // 简单的设备存在性检查 - 读取芯片ID寄存器
     uint8_t chip_id;
     if (!read_register(GTX312L_REG_CHIPADDR_VER, chip_id)) {
+        USB_LOG_TAG_WARNING("GTX312L", "Chip Init failed %d", i2c_device_address_);
         return false;
     }
+    USB_LOG_TAG_WARNING("GTX312L", "Chip Init Success %d", chip_id);
     uint8_t ret = 0;
     // 下面是默认设置
     ret |= !write_register(GTX312L_REG_MON_RST, 0);  // 关闭自复位
