@@ -165,7 +165,7 @@ union KeyboardBitmap {
         // 遍历supported_keys数组找到对应的索引
         for (uint8_t i = 0; i < SUPPORTED_KEYS_COUNT; i++) {
             if (supported_keys[i] == key) {
-                return i;
+                return i + 1;
             }
         }
         return 0; // 如果找不到，返回0（KEY_NONE的位置）
@@ -189,12 +189,15 @@ public:
     void deinit();
     bool is_initialized() const;
     
-    // 键盘操作
+    // 键盘相关
     bool press_key(HID_KeyCode key);
     bool release_key(HID_KeyCode key);
+    void clear_keyboard_state();  // 清空键盘状态并发送空报文
+    void force_send_keyboard_report(); // 强制发送键盘报文
     
     // 触摸操作
     bool send_touch_report(const HID_TouchPoint& report);
+    void force_send_touch_report(); // 强制发送触摸报文
     
     // 状态查询
     uint8_t get_report_rate() const;
@@ -211,34 +214,134 @@ private:
     
     // 键盘状态
     struct HID_Keyboard_state_t {
-        uint8_t modifier;
-        HID_KeyCode key[KEYBOARD_SIMUL_PRESS];
+        uint8_t key_count;                    // 当前按下的按键数量
+        uint8_t modifier_keys;                // 修饰键状态位图 (Ctrl, Shift, Alt, GUI)
+        HID_KeyCode key[KEYBOARD_SIMUL_PRESS]; // 按键数组
+        
+        // 触发式发送相关
+        bool state_changed;                   // 状态是否发生变化
+        uint8_t last_key_count;              // 上次的按键数量
+        uint8_t last_modifier_keys;          // 上次的修饰键状态
+        HID_KeyCode last_key[KEYBOARD_SIMUL_PRESS]; // 上次的按键数组
 
         void clear() {
+            key_count = 0;
+            modifier_keys = 0;
+            state_changed = true;  // 清空状态时标记为已变化
             for (int i = 0; i < KEYBOARD_SIMUL_PRESS; i++) {
                 key[i] = HID_KeyCode::KEY_NONE;
             }
-            modifier = 0;
+            update_last_state();
         }
+        
         bool add(HID_KeyCode _key) {
-            if (modifier < KEYBOARD_SIMUL_PRESS) {
-                key[modifier] = _key;
-                modifier++;
+            // 避免添加无效按键
+            if (_key == HID_KeyCode::KEY_NONE) {
+                return false;
+            }
+            
+            // 检查是否为修饰键
+            if (isModifierKey(_key)) {
+                uint8_t old_modifier = modifier_keys;
+                setModifierKey(_key, true);
+                if (modifier_keys != old_modifier) {
+                    state_changed = true;
+                }
+                return true;
+            }
+            
+            // 检查是否已存在该按键
+            for (int i = 0; i < key_count; i++) {
+                if (key[i] == _key) {
+                    return true; // 按键已存在，不重复添加
+                }
+            }
+            
+            // 普通按键处理
+            if (key_count < KEYBOARD_SIMUL_PRESS) {
+                key[key_count] = _key;
+                key_count++;
+                state_changed = true;
                 return true;
             }
             return false;
         }
+        
         bool remove(HID_KeyCode _key) {
-            for (int i = 0; i < modifier; i++) {
+            // 避免移除无效按键
+            if (_key == HID_KeyCode::KEY_NONE) {
+                return false;
+            }
+            
+            // 检查是否为修饰键
+            if (isModifierKey(_key)) {
+                uint8_t old_modifier = modifier_keys;
+                setModifierKey(_key, false);
+                if (modifier_keys != old_modifier) {
+                    state_changed = true;
+                }
+                return true;
+            }
+            
+            // 普通按键处理
+            for (int i = 0; i < key_count; i++) {
                 if (key[i] == _key) {
-                    for (int j = i; j < modifier - 1; j++) {
+                    for (int j = i; j < key_count - 1; j++) {
                         key[j] = key[j + 1];
                     }
-                    modifier--;
+                    key[key_count - 1] = HID_KeyCode::KEY_NONE;
+                    key_count--;
+                    state_changed = true;
                     return true;
                 }
             }
             return false;
+        }
+
+        // 检查状态是否发生变化
+        bool has_state_changed() const {
+            return state_changed;
+        }
+
+        // 更新上次状态
+        void update_last_state() {
+            last_key_count = key_count;
+            last_modifier_keys = modifier_keys;
+            for (int i = 0; i < KEYBOARD_SIMUL_PRESS; i++) {
+                last_key[i] = key[i];
+            }
+            state_changed = false;
+        }
+        
+    private:
+        bool isModifierKey(HID_KeyCode _key) const {
+            return (_key >= HID_KeyCode::KEY_LEFT_CTRL && _key <= HID_KeyCode::KEY_RIGHT_GUI);
+        }
+        
+        void setModifierKey(HID_KeyCode _key, bool pressed) {
+            uint8_t bit = 0;
+            switch (_key) {
+                case HID_KeyCode::KEY_LEFT_CTRL:  bit = 0; break;
+                case HID_KeyCode::KEY_LEFT_SHIFT: bit = 1; break;
+                case HID_KeyCode::KEY_LEFT_ALT:   bit = 2; break;
+                case HID_KeyCode::KEY_LEFT_GUI:   bit = 3; break;
+                case HID_KeyCode::KEY_RIGHT_CTRL: bit = 4; break;
+                case HID_KeyCode::KEY_RIGHT_SHIFT:bit = 5; break;
+                case HID_KeyCode::KEY_RIGHT_ALT:  bit = 6; break;
+                case HID_KeyCode::KEY_RIGHT_GUI:  bit = 7; break;
+                default: return;
+            }
+            
+            if (pressed) {
+                modifier_keys |= (1 << bit);
+            } else {
+                modifier_keys &= ~(1 << bit);
+            }
+        }
+        
+        // 检查是否有按键按下
+        bool has_keys_pressed() const {
+            return key_count > 0 || modifier_keys != 0;
         }
     };
 
@@ -261,11 +364,20 @@ private:
         bool release(uint8_t _id) {
             for (int i = 0; i < press_modifier; i++) {
                 if (touch_press[i].id == _id) {
-                    release_modifier++;
+                    // 将触摸点移动到release数组
+                    if (release_modifier < TOUCH_LOCAL_NUM) {
+                        touch_release[release_modifier] = touch_press[i];
+                        release_modifier++;
+                    }
+                    
+                    // 从press数组中移除
                     for (int j = i; j < press_modifier - 1; j++) {
                         touch_press[j] = touch_press[j + 1];
                     }
                     press_modifier--;
+                    
+                    // 清空最后一个位置
+                    touch_press[press_modifier].clear();
                     return true;
                 }
             }
@@ -307,6 +419,12 @@ private:
 
     inline void report_keyboard();
     inline void report_touch(uint32_t _now);
+    
+    // 触发式发送相关
+    bool keyboard_needs_send_;     // 键盘是否需要发送报文
+    bool touch_needs_send_;        // 触摸是否需要发送报文
+    uint32_t last_keyboard_send_;  // 上次键盘报文发送时间
+    uint32_t last_touch_send_;     // 上次触摸报文发送时间
 
 };
 

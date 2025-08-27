@@ -603,7 +603,8 @@ bool init_service_layer() {
     // 注册MCP23S17的GPIO 1-11作为键盘
     // 设置GPIOB8为输出模式并输出高电平以点亮LED
     mcp23s17->set_pin_direction(MCP23S17_PORT_B, 7, MCP23S17_OUTPUT); // GPIOB8是端口B的第7位(0-7)
-    
+    mcp23s17->write_pin(MCP23S17_PORT_B, 7, 0);
+
     // 注册按键
     input_manager->addPhysicalKeyboard(MCP_GPIO::GPIOA0, HID_KeyCode::KEY_W);
     input_manager->addPhysicalKeyboard(MCP_GPIO::GPIOA1, HID_KeyCode::KEY_E);
@@ -976,7 +977,6 @@ void core1_main() {
 void core1_task() {
     while (1) {
         input_manager->loop1();
-        //usb_logs->info("TEST");
         usb_logs->task();
         //ui_manager->task();
         watchdog_feed();

@@ -6,6 +6,7 @@
 #include "hardware/structs/sio.h"
 #include <cstring>
 #include <algorithm>
+#include "src/protocol/usb_serial_logs/usb_serial_logs.h"
 
 // 静态实例
 InputManager* InputManager::instance_ = nullptr;
@@ -1539,8 +1540,6 @@ void InputManager::restoreChannelStates() {
     }
 }
 
-
-
 // 发送Mai2触摸消息
 void InputManager::sendMai2TouchMessage(Mai2_TouchArea area) {
     if (mai2_serial_) {
@@ -1605,8 +1604,6 @@ void InputManager::processGPIOKeyboard() {
         return;
     }
     
-    // 清空当前键盘状态，重新构建
-    
     current_keyboard_state.clear();
     
     // 零内存分配：使用类成员缓存变量获取所有指针和计数
@@ -1668,8 +1665,8 @@ void InputManager::processGPIOKeyboard() {
                             // 使用类成员缓存指针和位运算展开循环
                             gpio_keys_ptr_cache_ = gpio_logical_mappings_cache_[j].keys;
                             if (gpio_keys_ptr_cache_[0] != HID_KeyCode::KEY_NONE) current_keyboard_state.setKey(gpio_keys_ptr_cache_[0], true);
-        if (gpio_keys_ptr_cache_[1] != HID_KeyCode::KEY_NONE) current_keyboard_state.setKey(gpio_keys_ptr_cache_[1], true);
-        if (gpio_keys_ptr_cache_[2] != HID_KeyCode::KEY_NONE) current_keyboard_state.setKey(gpio_keys_ptr_cache_[2], true);
+                            if (gpio_keys_ptr_cache_[1] != HID_KeyCode::KEY_NONE) current_keyboard_state.setKey(gpio_keys_ptr_cache_[1], true);
+                            if (gpio_keys_ptr_cache_[2] != HID_KeyCode::KEY_NONE) current_keyboard_state.setKey(gpio_keys_ptr_cache_[2], true);
                             break;
                         }
                     }
@@ -1700,37 +1697,6 @@ void InputManager::processGPIOKeyboard() {
     mcu_gpio_previous_states_ = mcu_gpio_states_;
     mcp_gpio_previous_states_ = mcp_gpio_states_;
 }
-
-bool InputManager::readMCUGPIO(uint8_t pin, bool& value) {
-    if (pin >= 30) { // RP2040有30个GPIO引脚
-        return false;
-    }
-    
-    value = gpio_get(pin);
-    return true;
-}
-
-bool InputManager::readMCPGPIO(uint8_t pin, bool& value) {
-    if (!mcp23s17_available_ || pin >= 16) { // MCP23S17有16个GPIO引脚
-        return false;
-    }
-    
-    // 将pin转换为port和pin_num
-    MCP23S17_Port port;
-    uint8_t pin_num;
-    
-    if (pin < 8) {
-        port = MCP23S17_PORT_A;
-        pin_num = pin;
-    } else {
-        port = MCP23S17_PORT_B;
-        pin_num = pin - 8;
-    }
-    
-    return mcp23s17_->read_pin(port, pin_num, value);
-}
-
-// setLogicalKeysInBitmap函数已内联到processGPIOKeyboard中以提高性能
 
 // 获取触摸IC采样速率
 uint8_t InputManager::getTouchSampleRate(uint16_t device_addr) {

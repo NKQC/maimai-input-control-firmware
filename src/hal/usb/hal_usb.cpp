@@ -201,7 +201,7 @@ bool HAL_USB_Device::init() {
     if (initialized_) {
         return true;
     }
-    
+    if (tud_connected())    tud_disconnect();
     // 初始化TinyUSB设备栈
     if(!tud_init(BOARD_TUD_RHPORT)) return false;
     

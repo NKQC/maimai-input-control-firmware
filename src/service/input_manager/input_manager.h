@@ -396,9 +396,7 @@ private:
     inline void updateGPIOStates();          // 更新GPIO状态
     inline void processGPIOKeyboard();       // 处理GPIO键盘输入
     inline void processTouchKeyboard();      // 处理触摸键盘映射
-    inline bool readMCUGPIO(uint8_t pin, bool& value);  // 读取MCU GPIO
-    inline bool readMCPGPIO(uint8_t pin, bool& value);  // 读取MCP GPIO
-    
+
     // 设备查找
     int findDeviceIndex(uint16_t device_addr);
     GTX312L_DeviceMapping* findDeviceMapping(uint16_t device_addr);
