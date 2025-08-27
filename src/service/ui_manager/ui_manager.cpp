@@ -894,16 +894,97 @@ const char* UIManager::getKeyName(HID_KeyCode key) {
 }
 
 HID_KeyCode UIManager::getKeyCodeFromName(const char* name) {
-    if (strcmp(name, "A") == 0) return HID_KeyCode::KEY_A;
-    if (strcmp(name, "S") == 0) return HID_KeyCode::KEY_S;
-    if (strcmp(name, "D") == 0) return HID_KeyCode::KEY_D;
-    if (strcmp(name, "F") == 0) return HID_KeyCode::KEY_F;
-    if (strcmp(name, "J") == 0) return HID_KeyCode::KEY_J;
-    if (strcmp(name, "K") == 0) return HID_KeyCode::KEY_K;
-    if (strcmp(name, "L") == 0) return HID_KeyCode::KEY_L;
-    if (strcmp(name, "Space") == 0) return HID_KeyCode::KEY_SPACE;
-    if (strcmp(name, "Enter") == 0) return HID_KeyCode::KEY_ENTER;
-    if (strcmp(name, "Clear") == 0) return HID_KeyCode::KEY_NONE;
+    if (!name || strlen(name) == 0) {
+        return HID_KeyCode::KEY_NONE;
+    }
+    
+    // 单字符处理：A-Z (大写字母)
+    if (strlen(name) == 1) {
+        char c = name[0];
+        
+        // A-Z (ASCII 65-90)
+        if (c >= 'A' && c <= 'Z') {
+            return static_cast<HID_KeyCode>(static_cast<int>(HID_KeyCode::KEY_A) + (c - 'A'));
+        }
+        
+        // a-z (ASCII 97-122) -> 转换为大写
+        if (c >= 'a' && c <= 'z') {
+            return static_cast<HID_KeyCode>(static_cast<int>(HID_KeyCode::KEY_A) + (c - 'a'));
+        }
+        
+        // 0-9 (ASCII 48-57)
+        if (c >= '0' && c <= '9') {
+            return static_cast<HID_KeyCode>(static_cast<int>(HID_KeyCode::KEY_0) + (c - '0'));
+        }
+    }
+    
+    // 特殊按键处理
+    switch (name[0]) {
+        case 'S':
+            if (strcmp(name, "Space") == 0) return HID_KeyCode::KEY_SPACE;
+            if (strcmp(name, "Shift") == 0) return HID_KeyCode::KEY_LEFT_SHIFT;
+            break;
+            
+        case 'E':
+            if (strcmp(name, "Enter") == 0) return HID_KeyCode::KEY_ENTER;
+            if (strcmp(name, "Escape") == 0) return HID_KeyCode::KEY_ESCAPE;
+            break;
+            
+        case 'T':
+            if (strcmp(name, "Tab") == 0) return HID_KeyCode::KEY_TAB;
+            break;
+            
+        case 'B':
+            if (strcmp(name, "Backspace") == 0) return HID_KeyCode::KEY_BACKSPACE;
+            break;
+            
+        case 'C':
+            if (strcmp(name, "Clear") == 0) return HID_KeyCode::KEY_NONE;
+            if (strcmp(name, "Ctrl") == 0) return HID_KeyCode::KEY_LEFT_CTRL;
+            break;
+            
+        case 'A':
+            if (strcmp(name, "Alt") == 0) return HID_KeyCode::KEY_LEFT_ALT;
+            break;
+            
+        case 'F':
+            // 功能键 F1-F12
+            if (strlen(name) >= 2 && name[1] >= '1' && name[1] <= '9') {
+                if (strcmp(name, "F1") == 0) return HID_KeyCode::KEY_F1;
+                if (strcmp(name, "F2") == 0) return HID_KeyCode::KEY_F2;
+                if (strcmp(name, "F3") == 0) return HID_KeyCode::KEY_F3;
+                if (strcmp(name, "F4") == 0) return HID_KeyCode::KEY_F4;
+                if (strcmp(name, "F5") == 0) return HID_KeyCode::KEY_F5;
+                if (strcmp(name, "F6") == 0) return HID_KeyCode::KEY_F6;
+                if (strcmp(name, "F7") == 0) return HID_KeyCode::KEY_F7;
+                if (strcmp(name, "F8") == 0) return HID_KeyCode::KEY_F8;
+                if (strcmp(name, "F9") == 0) return HID_KeyCode::KEY_F9;
+            }
+            if (strcmp(name, "F10") == 0) return HID_KeyCode::KEY_F10;
+            if (strcmp(name, "F11") == 0) return HID_KeyCode::KEY_F11;
+            if (strcmp(name, "F12") == 0) return HID_KeyCode::KEY_F12;
+            break;
+            
+        case 'U':
+            if (strcmp(name, "Up") == 0) return HID_KeyCode::KEY_UP_ARROW;
+            break;
+            
+        case 'D':
+            if (strcmp(name, "Down") == 0) return HID_KeyCode::KEY_DOWN_ARROW;
+            break;
+            
+        case 'L':
+            if (strcmp(name, "Left") == 0) return HID_KeyCode::KEY_LEFT_ARROW;
+            break;
+            
+        case 'R':
+            if (strcmp(name, "Right") == 0) return HID_KeyCode::KEY_RIGHT_ARROW;
+            break;
+            
+        default:
+            break;
+    }
+    
     return HID_KeyCode::KEY_NONE;
 }
 

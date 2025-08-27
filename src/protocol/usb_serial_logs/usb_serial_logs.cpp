@@ -213,7 +213,7 @@ void USB_SerialLogs::flush() {
     if (!is_ready()) {
         return;
     }
-    
+
     // 直接从队列发送日志
     while (!log_queue_.empty()) {
         const USB_LogEntry& entry = log_queue_.front();
@@ -388,12 +388,13 @@ std::string USB_SerialLogs::get_timestamp_string(uint32_t timestamp) const {
 
 void USB_SerialLogs::add_to_queue(const USB_LogEntry& entry) {
     // 确保队列不超过20个条目
+
     while (log_queue_.size() >= USB_LOGS_QUEUE_SIZE) {
         // 队列满，丢弃最旧的日志
         log_queue_.pop();
         stats_.dropped_logs++;
     }
-    
+
     log_queue_.push(entry);
 }
 

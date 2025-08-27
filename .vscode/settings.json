@@ -85,6 +85,9 @@
         "tusb_common.h": "c",
         "dcd.h": "c",
         "cdc_device.h": "c",
-        "usbd_pvt.h": "c"
+        "usbd_pvt.h": "c",
+        "watchdog.h": "c",
+        "bootrom.h": "c",
+        "stdio_uart.h": "c"
     }
 }

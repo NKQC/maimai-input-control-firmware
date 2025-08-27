@@ -317,7 +317,7 @@ void InputManager::loop1() {
     if (config_->work_mode == InputWorkMode::HID_MODE) {
         sendHIDTouchData();
     }
-    // 注意：HID已改为立即发送模式，不再需要调用task方法
+    hid_->task();
 }
 
 // 开始Serial绑定
@@ -893,9 +893,6 @@ inline void InputManager::processSerialMode() {
 inline void InputManager::sendHIDTouchData() {
     InputManager_PrivateConfig* config = inputmanager_get_config_holder();
     
-    HID_TouchReport touch_report = {};
-    uint8_t point_count = 0;
-    
     // 预计算设备映射指针数组，避免重复查找
     GTX312L_DeviceMapping* device_mappings[8] = {nullptr};
     const int device_count = config->device_count;
@@ -915,7 +912,7 @@ inline void InputManager::sendHIDTouchData() {
     }
     
     // 处理所有设备的触摸数据
-    for (int i = 0; i < device_count && point_count < 10; i++) {
+    for (int i = 0; i < device_count; i++) {
         GTX312L_DeviceMapping* mapping = device_mappings[i];
         if (!mapping) continue;
         
@@ -924,29 +921,29 @@ inline void InputManager::sendHIDTouchData() {
         
         // 使用位运算快速处理所有通道
         TouchAxis* hid_area_ptr = mapping->hid_area;
-        for (uint8_t ch = 0; ch < 12 && point_count < 10; ch++, hid_area_ptr++) {
+        for (uint8_t ch = 0; ch < 12; ch++, hid_area_ptr++) {
             if (!(current_mask & (1 << ch))) continue;
             
             // 检查是否有有效映射
             if (hid_area_ptr->x == 0.0f && hid_area_ptr->y == 0.0f) continue;
             
-            // 直接内联设置触摸点数据
-            HID_TouchPoint* contact = &touch_report.contacts[point_count];
-            contact->x = (uint16_t)(hid_area_ptr->x * 65535.0f);
-            contact->y = (uint16_t)(hid_area_ptr->y * 65535.0f);
-            contact->tip_switch = true;
-            contact->contact_id = point_count;
-            contact->in_contact = true;
-            contact->pressure = 255;
-            point_count++;
+            // 计算唯一的触摸点ID：设备索引(4位) + 通道号(4位)
+            uint8_t unique_contact_id = (i << 4) | ch;
+            
+            // 创建触摸点报告
+            HID_TouchPoint touch_point;
+            touch_point.press = true;
+            touch_point.id = unique_contact_id;
+            
+            // 转换坐标到HID范围 (0-65535)
+            touch_point.x = (uint16_t)(hid_area_ptr->x * 65535.0f);
+            touch_point.y = (uint16_t)(hid_area_ptr->y * 65535.0f);
+            
+            // 发送触摸点
+            if (hid_) {
+                hid_->send_touch_report(touch_point);
+            }
         }
-    }
-    
-    touch_report.contact_count = point_count;
-    
-    // 发送HID报告 - 触摸功能未实现 有空再说
-    if (hid_) {
-        hid_->send_touch_report(touch_report);
     }
 }
 
@@ -1463,16 +1460,14 @@ void InputManager::processHIDBinding() {
         case BindingState::HID_BINDING_SET_COORDS:
             // 实时发送HID触摸数据，坐标跟随当前设置
             if (hid_) {
-                // 构造HID触摸报告
-                HID_TouchReport touch_report;
-                touch_report.contact_count = 1;
-                touch_report.contacts[0].contact_id = 1;
-                touch_report.contacts[0].tip_switch = 1;
-                touch_report.contacts[0].x = (uint16_t)(hid_binding_x_ * 32767);
-                touch_report.contacts[0].y = (uint16_t)(hid_binding_y_ * 32767);
-                
-                // 发送HID报告 - 触摸功能已移除，但保留接口调用以维持兼容性
-                hid_->send_touch_report(touch_report);
+                // 构造HID触摸点
+                HID_TouchPoint touch_point;
+                touch_point.press = 1;
+                touch_point.id = 1;
+                touch_point.x = (uint16_t)(hid_binding_x_ * 32767);
+                touch_point.y = (uint16_t)(hid_binding_y_ * 32767);
+
+                hid_->send_touch_report(touch_point);
             }
             
             // 检查是否有新的坐标设置或确认绑定的信号
@@ -1673,8 +1668,8 @@ void InputManager::processGPIOKeyboard() {
                             // 使用类成员缓存指针和位运算展开循环
                             gpio_keys_ptr_cache_ = gpio_logical_mappings_cache_[j].keys;
                             if (gpio_keys_ptr_cache_[0] != HID_KeyCode::KEY_NONE) current_keyboard_state.setKey(gpio_keys_ptr_cache_[0], true);
-                            if (gpio_keys_ptr_cache_[1] != HID_KeyCode::KEY_NONE) current_keyboard_state.setKey(gpio_keys_ptr_cache_[1], true);
-                            if (gpio_keys_ptr_cache_[2] != HID_KeyCode::KEY_NONE) current_keyboard_state.setKey(gpio_keys_ptr_cache_[2], true);
+        if (gpio_keys_ptr_cache_[1] != HID_KeyCode::KEY_NONE) current_keyboard_state.setKey(gpio_keys_ptr_cache_[1], true);
+        if (gpio_keys_ptr_cache_[2] != HID_KeyCode::KEY_NONE) current_keyboard_state.setKey(gpio_keys_ptr_cache_[2], true);
                             break;
                         }
                     }

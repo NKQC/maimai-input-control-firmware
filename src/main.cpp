@@ -458,14 +458,14 @@ bool core1_init_hal_layer() {
         error_handler("Failed to initialize SPI1");
         return false;
     }
-
+    
     // 初始化USB
-    hal_usb = HAL_USB::getInstance();
+    hal_usb = HAL_USB_Device::getInstance();
     if (!hal_usb || !hal_usb->init()) {
         error_handler("Failed to initialize USB");
         return false;
     }
-    gpio_put(0, 1);
+    
     // 标记Core1 HAL层初始化完成
     init_sync.core1_hal_ready = 1;
     
@@ -481,7 +481,7 @@ bool core0_init_protocol_layer() {
         error_handler("Timeout waiting for HAL layer initialization");
         return false;
     }
-    
+
     // 扫描I2C设备并初始化GTX312L
     scan_i2c_devices();
     
@@ -559,7 +559,6 @@ bool core1_init_protocol_layer() {
         error_handler("Failed to initialize HID");
         return false;
     }
-    
     // 标记Core1 协议层初始化完成
     init_sync.core1_protocol_ready = 1;
     
@@ -604,7 +603,6 @@ bool init_service_layer() {
     // 注册MCP23S17的GPIO 1-11作为键盘
     // 设置GPIOB8为输出模式并输出高电平以点亮LED
     mcp23s17->set_pin_direction(MCP23S17_PORT_B, 7, MCP23S17_OUTPUT); // GPIOB8是端口B的第7位(0-7)
-    
     
     // 注册按键
     input_manager->addPhysicalKeyboard(MCP_GPIO::GPIOA0, HID_KeyCode::KEY_W);
@@ -682,15 +680,18 @@ void scan_i2c_devices() {
     // 扫描I2C0总线
     if (hal_i2c0) {
         std::vector<uint8_t> i2c0_addresses = hal_i2c0->scan_devices();
+        
         if (usb_logs) {
             char count_buffer[64];
             snprintf(count_buffer, sizeof(count_buffer), "scan found %zu i2c0 devices", i2c0_addresses.size());
             usb_logs->info(std::string(count_buffer));
+            
             for (uint8_t addr : i2c0_addresses) {
                 char buffer[128];
                 snprintf(buffer, sizeof(buffer), "i2c0 device: 0x%02X", addr);
                 usb_logs->info(std::string(buffer));
             }
+            
         }
         for (uint8_t addr : i2c0_addresses) {
             if (gtx312l_count >= 8) break;
@@ -953,19 +954,18 @@ void core1_main() {
     // 等待服务层初始化完成，期间flush USB logs
     uint32_t start = millis();
     while (!init_sync.service_ready && (millis() - start) < 10000) {
-        // 如果USB log可用，则flush
-        if (init_sync.usb_log_ready && usb_logs) {
+        watchdog_feed();
+        if (usb_logs) {
             usb_logs->flush();
         }
-        watchdog_feed();
     }
-
+    
     if (!init_sync.service_ready) {
         init_sync.mark_core1_failed();
         error_handler("Timeout waiting for service layer initialization");
         return;
     }
-
+    
     // 进入Core1任务循环
     core1_task();
 }
@@ -976,7 +976,7 @@ void core1_main() {
 void core1_task() {
     while (1) {
         input_manager->loop1();
-        usb_logs->info("TEST");
+        //usb_logs->info("TEST");
         usb_logs->task();
         //ui_manager->task();
         watchdog_feed();

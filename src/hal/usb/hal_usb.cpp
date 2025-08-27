@@ -1,268 +1,317 @@
 #include "hal_usb.h"
+#include <pico/stdlib.h>
+#include <tusb.h>
+#include <device/usbd.h>
+#include <class/cdc/cdc_device.h>
+#include <class/hid/hid_device.h>
+#include <pico/stdio.h>
+#include <pico/bootrom.h>
+#include <hardware/irq.h>
 #include <cstring>
 
-// TinyUSB HID报告描述符
-uint8_t const desc_hid_report[] = {
-    TUD_HID_REPORT_DESC_KEYBOARD()
+
+// 静态实例指针
+HAL_USB_Device* HAL_USB_Device::instance_ = nullptr;
+
+// 字符串描述符缓冲区
+static uint16_t desc_str[32];
+
+// USB描述符
+static const tusb_desc_device_t device_descriptor = {
+    .bLength            = sizeof(tusb_desc_device_t),
+    .bDescriptorType    = TUSB_DESC_DEVICE,
+    .bcdUSB             = 0x0200,
+    // Use Interface Association Descriptor (IAD) for CDC
+    // As required by USB Specs IAD's subclass must be common class (2) and protocol must be IAD (1)
+    .bDeviceClass       = TUSB_CLASS_MISC,
+    .bDeviceSubClass    = MISC_SUBCLASS_COMMON,
+    .bDeviceProtocol    = MISC_PROTOCOL_IAD,
+    .bMaxPacketSize0    = CFG_TUD_ENDPOINT0_SIZE,
+    .idVendor           = USB_VID,
+    .idProduct          = USB_PID,
+    .bcdDevice          = 0x0100,
+    .iManufacturer      = 1,
+    .iProduct           = 2,
+    .iSerialNumber      = 3,
+    .bNumConfigurations = 1
 };
 
-// 单例实例
-HAL_USB* HAL_USB::instance_ = nullptr;
+// 配置描述符 - CDC + HID复合设备
+enum {
+    ITF_NUM_CDC = 0,
+    ITF_NUM_CDC_DATA,
+    ITF_NUM_HID,
+    ITF_NUM_TOTAL
+};
 
-// 私有构造函数
-HAL_USB::HAL_USB() 
-    : initialized_(false) {
+#define CONFIG_TOTAL_LEN (TUD_CONFIG_DESC_LEN + TUD_CDC_DESC_LEN + TUD_HID_DESC_LEN)
+
+#define EPNUM_CDC_NOTIF   0x81
+#define EPNUM_CDC_OUT     0x02
+#define EPNUM_CDC_IN      0x83
+#define EPNUM_HID         0x84
+
+#define BOARD_TUD_RHPORT 0
+
+static const uint8_t desc_configuration[] = {
+    // Config number, interface count, string index, total length, attribute, power in mA
+    TUD_CONFIG_DESCRIPTOR(1, ITF_NUM_TOTAL, 0, CONFIG_TOTAL_LEN, TUSB_DESC_CONFIG_ATT_REMOTE_WAKEUP, 100),
+
+    // Interface number, string index, EP notification address and size, EP data address (out, in) and size.
+    TUD_CDC_DESCRIPTOR(ITF_NUM_CDC, 4, EPNUM_CDC_NOTIF, 8, EPNUM_CDC_OUT, EPNUM_CDC_IN, 64),
+
+    // Interface number, string index, protocol, report descriptor len, EP In address, size & polling interval
+    TUD_HID_DESCRIPTOR(ITF_NUM_HID, 5, HID_ITF_PROTOCOL_NONE, sizeof(hid_report_descriptor), EPNUM_HID, CFG_TUD_HID_EP_BUFSIZE, 1)
+};
+
+// 字符串描述符
+static const char* string_desc_arr[] = {
+    (const char[]) { 0x09, 0x04 }, // 0: 支持的语言是英语 (0x0409)
+    "Mai Control",                 // 1: 制造商
+    "Mai Control Device",          // 2: 产品
+    USB_SERIAL,                    // 3: 序列号
+    "Mai Control CDC",             // 4: CDC接口
+    "Mai Control HID",             // 5: HID接口
+};
+
+//--------------------------------------------------------------------+
+// TinyUSB 必需的回调函数 注意 这个地方的模块需要把Adafruit_USBD_HID.cpp的回调移除
+//--------------------------------------------------------------------+
+
+extern "C" {
+
+// USB中断处理函数
+void usb_irq_handler() {
+    tud_int_handler(BOARD_TUD_RHPORT);
 }
 
-// 析构函数
-HAL_USB::~HAL_USB() {
-    deinit();
+// 设备描述符回调
+uint8_t const* tud_descriptor_device_cb(void) {
+    return (uint8_t const*)&device_descriptor;
 }
 
-// 获取单例实例
-HAL_USB* HAL_USB::getInstance() {
+// HID报告描述符回调 - 使用自定义描述符
+uint8_t const* tud_hid_descriptor_report_cb(uint8_t instance) {
+    (void)instance;
+    return hid_report_descriptor;
+}
+
+// 配置描述符回调
+uint8_t const* tud_descriptor_configuration_cb(uint8_t index) {
+    (void)index; // 对于单一配置
+    return desc_configuration;
+}
+
+// 字符串描述符回调
+uint16_t const* tud_descriptor_string_cb(uint8_t index, uint16_t langid) {
+    (void)langid;
+    
+    uint8_t chr_count;
+    
+    if (index == 0) {
+        memcpy(&desc_str[1], string_desc_arr[0], 2);
+        chr_count = 1;
+    } else {
+        // 注意：数组必须是字符串字面量，否则会在栈上分配
+        if (!(index < sizeof(string_desc_arr)/sizeof(string_desc_arr[0]))) return NULL;
+        
+        const char* str = string_desc_arr[index];
+        
+        // 将ASCII转换为UTF-16
+        chr_count = strlen(str);
+        if (chr_count > 31) chr_count = 31;
+        
+        for (uint8_t i = 0; i < chr_count; i++) {
+            desc_str[1+i] = str[i];
+        }
+    }
+    
+    // 第一个字节是长度（包括头部），第二个字节是描述符类型
+    desc_str[0] = (TUSB_DESC_STRING << 8) | (2*chr_count + 2);
+    
+    return desc_str;
+}
+
+// HID获取报告回调
+uint16_t tud_hid_get_report_cb(uint8_t instance, uint8_t report_id, hid_report_type_t report_type, uint8_t* buffer, uint16_t reqlen) {
+    (void)instance;
+    (void)report_id;
+    (void)report_type;
+    (void)buffer;
+    (void)reqlen;
+    
+    return 0;
+}
+
+// HID设置报告回调
+void tud_hid_set_report_cb(uint8_t instance, uint8_t report_id, hid_report_type_t report_type, uint8_t const* buffer, uint16_t bufsize) {
+    (void)instance;
+    (void)report_id;
+    (void)report_type;
+    (void)buffer;
+    (void)bufsize;
+}
+
+// CDC接收回调
+void tud_cdc_rx_cb(uint8_t itf) {
+    HAL_USB_Device::getInstance()->tud_cdc_rx_cb(itf);
+}
+
+// 挂载回调
+void tud_mount_cb(void) {
+    // 设备已连接
+}
+
+// 卸载回调
+void tud_umount_cb(void) {
+    // 设备已断开
+}
+
+// 挂起回调
+void tud_suspend_cb(bool remote_wakeup_en) {
+    (void)remote_wakeup_en;
+}
+
+// 恢复回调
+void tud_resume_cb(void) {
+    // 设备已恢复
+}
+} // extern "C"
+
+// HAL_USB_Device 实现
+HAL_USB_Device* HAL_USB_Device::getInstance() {
     if (instance_ == nullptr) {
-        instance_ = new HAL_USB();
+        instance_ = new HAL_USB_Device();
     }
     return instance_;
 }
 
-// 初始化USB
-bool HAL_USB::init() {
+HAL_USB_Device::HAL_USB_Device() 
+    : initialized_(false), connected_(false), cdc_rx_head_(0), cdc_rx_tail_(0) {
+}
+
+HAL_USB_Device::~HAL_USB_Device() {
+    deinit();
+    if (instance_ == this) {
+        instance_ = nullptr;
+    }
+}
+
+bool HAL_USB_Device::init() {
     if (initialized_) {
         return true;
     }
-
-    usb_cdc.begin(CDC_BAUD);
     
-    // 初始化HID
-    usb_hid.setPollInterval(0);
-    usb_hid.setReportDescriptor(desc_hid_report, sizeof(desc_hid_report));
-    usb_hid.setStringDescriptor(USB_DEVICE_NAME);
-    usb_hid.begin();
+    // 初始化TinyUSB设备栈
+    if(!tud_init(BOARD_TUD_RHPORT)) return false;
     
     initialized_ = true;
     return true;
 }
 
-// 清理USB
-void HAL_USB::deinit() {
-    if (!initialized_) {
-        return;
-    }
-    
-    // TinyUSB会自动处理清理
-    initialized_ = false;
-}
-
-// 检查是否已初始化
-bool HAL_USB::is_initialized() const {
-    return initialized_;
-}
-
-// 检查是否已连接
-bool HAL_USB::is_connected() const {
-    return initialized_ && TinyUSBDevice.mounted();
-}
-
-// CDC写入数据
-bool HAL_USB::cdc_write(const uint8_t* data, size_t length) {
-    if (!is_connected() || !data || length == 0) {
-        return false;
-    }
-    size_t written = usb_cdc.write(data, length);
-    return written == length;
-}
-
-// CDC写入字符串
-bool HAL_USB::cdc_write_string(const std::string& str) {
-    return cdc_write(reinterpret_cast<const uint8_t*>(str.c_str()), str.length());
-}
-
-// CDC读取数据
-size_t HAL_USB::cdc_read(uint8_t* buffer, size_t max_length) {
-    if (!is_connected() || !buffer || max_length == 0) {
-        return 0;
-    }
-    
-    return usb_cdc.read(buffer, max_length);
-}
-
-// 检查CDC是否有数据可读
-bool HAL_USB::cdc_available() {
-    return is_connected() && usb_cdc.available();
-}
-
-// 刷新CDC缓冲区
-void HAL_USB::cdc_flush() {
-    if (is_connected()) {
-        usb_cdc.flush();
+void HAL_USB_Device::deinit() {
+    if (initialized_) {
+        // TinyUSB没有提供deinit函数，这里只标记为未初始化
+        initialized_ = false;
+        connected_ = false;
     }
 }
 
-// 发送NKRO键盘报告（位图模式）
-bool HAL_USB::hid_keyboard_nkro_report(const NKROKeyboardReport* report) {
-    if (!is_connected() || !usb_hid.ready() || !report) {
-        return false;
+bool HAL_USB_Device::is_connected() const {
+    return initialized_ && tud_mounted();
+}
+
+bool HAL_USB_Device::is_ready() const {
+    return initialized_ && tud_ready();
+}
+
+bool HAL_USB_Device::cdc_write(const uint8_t* data, size_t length) {
+    if (!is_ready() || !data || length == 0) {
+        return length == 0;
     }
     
-    // 将位图转换为按键数组（最多6个）
-    uint8_t keys[6] = {0};
-    uint8_t key_index = 0;
+    static uint64_t last_avail_time = 0;
+    const uint64_t TIMEOUT_US = 10000; // 10ms timeout
     
-    // 按键码映射表：位图索引 -> USB HID按键码
-    static const uint8_t keycode_map[] = {
-        0x00, // bit 0: KEY_NONE
-        0x04, // bit 1: KEY_A
-        0x05, // bit 2: KEY_B  
-        0x06, // bit 3: KEY_C
-        0x07, // bit 4: KEY_D
-        0x08, // bit 5: KEY_E
-        0x09, // bit 6: KEY_F
-        0x0A, // bit 7: KEY_G
-        0x0B, // bit 8: KEY_H
-        0x0C, // bit 9: KEY_I
-        0x0D, // bit 10: KEY_J
-        0x0E, // bit 11: KEY_K
-        0x0F, // bit 12: KEY_L
-        0x10, // bit 13: KEY_M
-        0x11, // bit 14: KEY_N
-        0x12, // bit 15: KEY_O
-        0x13, // bit 16: KEY_P
-        0x14, // bit 17: KEY_Q
-        0x15, // bit 18: KEY_R
-        0x16, // bit 19: KEY_S
-        0x17, // bit 20: KEY_T
-        0x18, // bit 21: KEY_U
-        0x19, // bit 22: KEY_V
-        0x1A, // bit 23: KEY_W
-        0x1B, // bit 24: KEY_X
-        0x1C, // bit 25: KEY_Y
-        0x1D, // bit 26: KEY_Z
-        0x1E, // bit 27: KEY_1
-        0x1F, // bit 28: KEY_2
-        0x20, // bit 29: KEY_3
-        0x21, // bit 30: KEY_4
-        0x22, // bit 31: KEY_5
-        0x23, // bit 32: KEY_6
-        0x24, // bit 33: KEY_7
-        0x25, // bit 34: KEY_8
-        0x26, // bit 35: KEY_9
-        0x27, // bit 36: KEY_0
-        0x28, // bit 37: KEY_ENTER
-        0x29, // bit 38: KEY_ESCAPE
-        0x2A, // bit 39: KEY_BACKSPACE
-        0x2B, // bit 40: KEY_TAB
-        0x2C, // bit 41: KEY_SPACE
-        0x3A, // bit 42: KEY_F1
-        0x3B, // bit 43: KEY_F2
-        0x3C, // bit 44: KEY_F3
-        0x3D, // bit 45: KEY_F4
-        0x3E, // bit 46: KEY_F5
-        0x3F, // bit 47: KEY_F6
-        0x40, // bit 48: KEY_F7
-        0x41, // bit 49: KEY_F8
-        0x42, // bit 50: KEY_F9
-        0x43, // bit 51: KEY_F10
-        0x44, // bit 52: KEY_F11
-        0x45, // bit 53: KEY_F12
-        0xE0, // bit 54: KEY_LEFT_CTRL
-        0xE1, // bit 55: KEY_LEFT_SHIFT
-        0xE2, // bit 56: KEY_LEFT_ALT
-        0xE3, // bit 57: KEY_LEFT_GUI
-        0xE4, // bit 58: KEY_RIGHT_CTRL
-        0xE5, // bit 59: KEY_RIGHT_SHIFT
-        0xE6, // bit 60: KEY_RIGHT_ALT
-        0xE7, // bit 61: KEY_RIGHT_GUI
-        0x00, // bit 62: KEY_JOYSTICK_A (自定义，映射为无效)
-        0x00, // bit 63: KEY_JOYSTICK_B (自定义，映射为无效)
-        0x00  // bit 64: KEY_JOYSTICK_CONFIRM (自定义，映射为无效)
-    };
+    size_t total_written = 0;
+    uint64_t start_time = time_us_64();
     
-    for (uint8_t byte_idx = 0; byte_idx < 13 && key_index < 6; byte_idx++) {
-        uint8_t byte_val = report->keys[byte_idx];
-        for (uint8_t bit_idx = 0; bit_idx < 8 && key_index < 6; bit_idx++) {
-            if (byte_val & (1 << bit_idx)) {
-                uint8_t bit_position = byte_idx * 8 + bit_idx;
-                if (bit_position < sizeof(keycode_map)) {
-                    uint8_t keycode = keycode_map[bit_position];
-                    if (keycode != 0x00) { // 跳过无效按键码
-                        keys[key_index++] = keycode;
-                    }
-                }
+    while (total_written < length) {
+        uint32_t available = tud_cdc_write_available();
+        
+        if (available > 0) {
+            size_t to_write = std::min((size_t)available, length - total_written);
+            uint32_t written = tud_cdc_write(data + total_written, to_write);
+            
+            if (written > 0) {
+                total_written += written;
+                last_avail_time = time_us_64();
+                tud_cdc_write_flush();
             }
+        } else {
+            // No space available, check timeout
+            uint64_t current_time = time_us_64();
+            if (current_time - start_time > TIMEOUT_US || 
+                (last_avail_time > 0 && current_time - last_avail_time > TIMEOUT_US)) {
+                break; // Timeout reached
+            }
+            
+            // Brief delay and flush
+            sleep_us(100);
+            tud_cdc_write_flush();
         }
     }
     
-    // 直接发送，无延迟
-    return usb_hid.keyboardReport(0, report->modifier, keys);
+    return total_written == length;
 }
 
-
-
-// 直接发送单个按键状态更新 - 立即发送
-bool HAL_USB::hid_keyboard_single_key(HID_KeyCode key, bool pressed, uint8_t modifier) {
-    if (!is_connected() || !usb_hid.ready()) {
-        return false;
+size_t HAL_USB_Device::cdc_read(uint8_t* buffer, size_t max_length) {
+    if (!initialized_) return 0;
+    
+    size_t count = 0;
+    while (count < max_length && cdc_rx_head_ != cdc_rx_tail_) {
+        buffer[count++] = cdc_rx_buffer_[cdc_rx_tail_];
+        cdc_rx_tail_ = (cdc_rx_tail_ + 1) % CDC_BUFFER_SIZE;
     }
     
-    // 维护当前按键状态（最多6个按键）
-    static uint8_t current_keys[6] = {0};
-    static uint8_t current_modifier = 0;
-    
-    // 更新修饰键
-    current_modifier = modifier;
-    
-    // HID_KeyCode的枚举值本身就是标准的USB HID keycode
-    uint8_t hid_keycode = static_cast<uint8_t>(key);
-    
-    // 跳过自定义摇杆按键（它们不是标准HID按键）
-    if (key == HID_KeyCode::KEY_JOYSTICK_A || 
-        key == HID_KeyCode::KEY_JOYSTICK_B || 
-        key == HID_KeyCode::KEY_JOYSTICK_CONFIRM) {
-        return true; // 摇杆按键不发送HID报告
-    }
-    
-    if (pressed) {
-        // 添加按键（如果不存在且有空位）
-        bool found = false;
-        for (int i = 0; i < 6; i++) {
-            if (current_keys[i] == hid_keycode) {
-                found = true;
-                break;
-            }
-        }
-        if (!found) {
-            for (int i = 0; i < 6; i++) {
-                if (current_keys[i] == 0) {
-                    current_keys[i] = hid_keycode;
-                    break;
-                }
-            }
-        }
+    return count;
+}
+
+size_t HAL_USB_Device::cdc_available() const {
+    if (cdc_rx_head_ >= cdc_rx_tail_) {
+        return cdc_rx_head_ - cdc_rx_tail_;
     } else {
-        // 移除按键
-        for (int i = 0; i < 6; i++) {
-            if (current_keys[i] == hid_keycode) {
-                current_keys[i] = 0;
-                // 压缩数组，将0移到末尾
-                for (int j = i; j < 5; j++) {
-                    current_keys[j] = current_keys[j + 1];
-                }
-                current_keys[5] = 0;
-                break;
+        return CDC_BUFFER_SIZE - cdc_rx_tail_ + cdc_rx_head_;
+    }
+}
+
+void HAL_USB_Device::cdc_flush() {
+    if (initialized_) {
+        tud_cdc_write_flush();
+    }
+}
+
+void HAL_USB_Device::handle_cdc_rx() {
+    if (!tud_cdc_available()) return;
+    
+    uint8_t buffer[64];
+    uint32_t count = tud_cdc_read(buffer, sizeof(buffer));
+    
+    if (count > 0) {
+        // 存储到环形缓冲区
+        for (uint32_t i = 0; i < count; i++) {
+            size_t next_head = (cdc_rx_head_ + 1) % CDC_BUFFER_SIZE;
+            if (next_head != cdc_rx_tail_) {
+                cdc_rx_buffer_[cdc_rx_head_] = buffer[i];
+                cdc_rx_head_ = next_head;
             }
         }
     }
-    
-    // 立即发送
-    return usb_hid.keyboardReport(0, current_modifier, current_keys);
 }
 
-// 发送触摸报告（空实现）
-bool HAL_USB::hid_touch_report(const TouchPoint* points, uint8_t count) {
-    // 空实现，保持兼容性
-    (void)points;
-    (void)count;
-    return true;
+// TinyUSB回调函数实现
+void HAL_USB_Device::tud_cdc_rx_cb(uint8_t itf) {
+    if (instance_) {
+        instance_->handle_cdc_rx();
+    }
 }
