@@ -1,16 +1,18 @@
 #include "hal_spi.h"
 #include <hardware/spi.h>
 #include <hardware/gpio.h>
-#include <hardware/dma.h>
 #include <hardware/irq.h>
+#include <hardware/dma.h>
 #include <hardware/clocks.h>
 #include <hardware/resets.h>
 #include <hardware/adc.h>
 #include <pico/stdlib.h>
 
-// 前向声明DMA完成回调函数
-void dma_spi0_complete();
-void dma_spi1_complete();
+#include "../global_irq.h"
+
+// SPI DMA回调函数声明
+void spi0_dma_callback(bool success);
+void spi1_dma_callback(bool success);
 
 
 // HAL_SPI0 静态成员初始化
@@ -27,7 +29,7 @@ HAL_SPI0* HAL_SPI0::getInstance() {
 HAL_SPI0::HAL_SPI0() 
     : initialized_(false), sck_pin_(0), mosi_pin_(0), miso_pin_(0), 
       cs_pin_(0), cs_active_low_(true), frequency_(1000000),
-      dma_tx_channel_(-1), dma_rx_channel_(-1), dma_busy_(false) {}
+      dma_tx_channel_(-1), dma_rx_channel_(-1), dma_busy_(false), dma_irq_initialized_(false) {}
 
 HAL_SPI0::~HAL_SPI0() {
     deinit();
@@ -58,12 +60,24 @@ bool HAL_SPI0::init(uint8_t sck_pin, uint8_t mosi_pin, uint8_t miso_pin, uint32_
     dma_tx_channel_ = dma_claim_unused_channel(true);
     dma_rx_channel_ = dma_claim_unused_channel(true);
     
+    // 注册DMA回调到global_irq
+    global_irq_register_dma_callback(dma_tx_channel_, spi0_dma_callback);
+    global_irq_register_dma_callback(dma_rx_channel_, spi0_dma_callback);
+    
     initialized_ = true;
     return true;
 }
 
 void HAL_SPI0::deinit() {
     if (initialized_) {
+        // 注销DMA回调
+        if (dma_tx_channel_ >= 0) {
+            global_irq_unregister_dma_callback(dma_tx_channel_);
+        }
+        if (dma_rx_channel_ >= 0) {
+            global_irq_unregister_dma_callback(dma_rx_channel_);
+        }
+        
         // 释放DMA通道
         if (dma_tx_channel_ >= 0) {
             dma_channel_unclaim(dma_tx_channel_);
@@ -139,40 +153,16 @@ void HAL_SPI0::set_frequency(uint32_t frequency) {
 }
 
 bool HAL_SPI0::write_async(const uint8_t* data, size_t length, dma_callback_t callback) {
-    if (!initialized_ || dma_busy_ || dma_tx_channel_ < 0) {
-        return false;
-    }
-    
-    dma_busy_ = true;
-    dma_callback_ = callback;
-    
-    // 配置DMA通道
-    dma_channel_config c = dma_channel_get_default_config(dma_tx_channel_);
-    channel_config_set_transfer_data_size(&c, DMA_SIZE_8);
-    channel_config_set_read_increment(&c, true);
-    channel_config_set_write_increment(&c, false);
-    channel_config_set_dreq(&c, spi_get_dreq(spi0, true)); // TX DREQ
-    
-    // 设置中断
-    dma_channel_set_irq0_enabled(dma_tx_channel_, true);
-    irq_set_exclusive_handler(DMA_IRQ_0, dma_spi0_complete);
-    irq_set_enabled(DMA_IRQ_0, true);
-    
-    // 启动DMA传输
-    dma_channel_configure(
-        dma_tx_channel_,
-        &c,
-        &spi_get_hw(spi0)->dr, // 写入地址
-        data,                  // 读取地址
-        length,                // 传输长度
-        true                   // 立即启动
-    );
-    
-    return true;
+    // 使用新的扁平化接口，避免重复设置IRQ
+    return start_dma_transfer(data, length, callback);
 }
 
 bool HAL_SPI0::read_async(uint8_t* buffer, size_t length, dma_callback_t callback) {
     if (!initialized_ || dma_busy_ || dma_rx_channel_ < 0) {
+        return false;
+    }
+
+    if (spi_is_busy(spi0)) {
         return false;
     }
     
@@ -188,7 +178,7 @@ bool HAL_SPI0::read_async(uint8_t* buffer, size_t length, dma_callback_t callbac
     
     // 设置中断
     dma_channel_set_irq0_enabled(dma_rx_channel_, true);
-    irq_set_exclusive_handler(DMA_IRQ_0, dma_spi0_complete);
+    // DMA中断由global_irq统一管理
     irq_set_enabled(DMA_IRQ_0, true);
     
     // 启动DMA传输
@@ -207,6 +197,10 @@ bool HAL_SPI0::read_async(uint8_t* buffer, size_t length, dma_callback_t callbac
 bool HAL_SPI0::transfer_async(const uint8_t* tx_data, uint8_t* rx_data, size_t length, dma_callback_t callback) {
     if (!initialized_ || dma_busy_) return false;
     
+    if (spi_is_busy(spi0)) {
+        return false;
+    }
+
     dma_busy_ = true;
     dma_callback_ = callback;
     
@@ -221,13 +215,14 @@ bool HAL_SPI0::transfer_async(const uint8_t* tx_data, uint8_t* rx_data, size_t l
     return result == length;
 }
 
-// DMA中断处理函数
-void dma_spi0_complete() {
+// C风格的SPI0 DMA回调函数实现
+void spi0_dma_callback(bool success) {
     HAL_SPI0* instance = HAL_SPI0::getInstance();
-    instance->dma_busy_ = false;
-    if (instance->dma_callback_) {
-        instance->dma_callback_(true);
-        instance->dma_callback_ = nullptr; // 清除回调函数
+    if (instance) {
+        instance->dma_busy_ = false;
+        if (instance->dma_callback_) {
+            instance->dma_callback_(success);
+        }
     }
 }
 
@@ -236,32 +231,77 @@ bool HAL_SPI0::is_busy() const {
 }
 
 bool HAL_SPI0::write_dma(const uint8_t* data, size_t length, dma_callback_t callback) {
-    if (!initialized_ || dma_busy_ || dma_tx_channel_ < 0) {
+    // 使用新的扁平化接口，避免重复设置IRQ
+    return start_dma_transfer(data, length, callback);
+}
+
+// 扁平化DMA接口实现
+bool HAL_SPI0::start_dma_transfer(const uint8_t* data, size_t length, dma_callback_t callback) {
+    if (!initialized_ || dma_busy_ || dma_tx_channel_ < 0 || !data || length == 0) {
         return false;
     }
     
+    if (spi_is_busy(spi0)) {
+        return false;
+    }
+
     dma_busy_ = true;
     dma_callback_ = callback;
     
     // 配置DMA通道
     dma_channel_config c = dma_channel_get_default_config(dma_tx_channel_);
     channel_config_set_transfer_data_size(&c, DMA_SIZE_8);
-    channel_config_set_read_increment(&c, true);
-    channel_config_set_write_increment(&c, false);
+    channel_config_set_read_increment(&c, true);   // 从内存读取时地址递增
+    channel_config_set_write_increment(&c, false); // 写入SPI DR寄存器时地址不变
     channel_config_set_dreq(&c, spi_get_dreq(spi0, true)); // TX DREQ
     
-    // 设置中断
+    // 清除之前的中断状态
+    dma_channel_acknowledge_irq0(dma_tx_channel_);
+    
+    // 启用DMA通道中断（IRQ处理函数已在init时设置）
     dma_channel_set_irq0_enabled(dma_tx_channel_, true);
-    irq_set_exclusive_handler(DMA_IRQ_0, dma_spi0_complete);
-    irq_set_enabled(DMA_IRQ_0, true);
     
     // 启动DMA传输
     dma_channel_configure(
         dma_tx_channel_,
         &c,
-        &spi_get_hw(spi0)->dr, // 写入地址
-        data,                  // 读取地址
-        length,                // 传输长度
+        &spi_get_hw(spi0)->dr, // 写入地址：SPI数据寄存器
+        data,                  // 读取地址：源数据缓冲区
+        length,                // 传输长度（字节数）
+        true                   // 立即启动
+    );
+    
+    return true;
+}
+
+bool HAL_SPI0::continue_dma_transfer(const uint8_t* data, size_t length) {
+    if (!initialized_ || dma_busy_ || dma_tx_channel_ < 0 || !data || length == 0) {
+        return false;
+    }
+    
+    dma_busy_ = true;
+    // 注意：不重新设置callback，使用之前的callback
+    
+    // 配置DMA通道
+    dma_channel_config c = dma_channel_get_default_config(dma_tx_channel_);
+    channel_config_set_transfer_data_size(&c, DMA_SIZE_8);
+    channel_config_set_read_increment(&c, true);   // 从内存读取时地址递增
+    channel_config_set_write_increment(&c, false); // 写入SPI DR寄存器时地址不变
+    channel_config_set_dreq(&c, spi_get_dreq(spi0, true)); // TX DREQ
+    
+    // 清除之前的中断状态
+    dma_channel_acknowledge_irq0(dma_tx_channel_);
+    
+    // 启用DMA通道中断（不重新设置IRQ处理函数）
+    dma_channel_set_irq0_enabled(dma_tx_channel_, true);
+    
+    // 启动DMA传输
+    dma_channel_configure(
+        dma_tx_channel_,
+        &c,
+        &spi_get_hw(spi0)->dr, // 写入地址：SPI数据寄存器
+        data,                  // 读取地址：源数据缓冲区
+        length,                // 传输长度（字节数）
         true                   // 立即启动
     );
     
@@ -285,7 +325,7 @@ bool HAL_SPI0::read_dma(uint8_t* buffer, size_t length, dma_callback_t callback)
     
     // 设置中断
     dma_channel_set_irq0_enabled(dma_rx_channel_, true);
-    irq_set_exclusive_handler(DMA_IRQ_0, dma_spi0_complete);
+    // DMA中断由global_irq统一管理
     irq_set_enabled(DMA_IRQ_0, true);
     
     // 启动DMA传输
@@ -301,7 +341,7 @@ bool HAL_SPI0::read_dma(uint8_t* buffer, size_t length, dma_callback_t callback)
     return true;
 }
 
-// HAL_SPI1 静态成员初始化
+// HAL_SPI1 实现静态成员初始化
 HAL_SPI1* HAL_SPI1::instance_ = nullptr;
 
 // HAL_SPI1 实现
@@ -315,7 +355,7 @@ HAL_SPI1* HAL_SPI1::getInstance() {
 HAL_SPI1::HAL_SPI1() 
     : initialized_(false), sck_pin_(0), mosi_pin_(0), miso_pin_(0), 
       cs_pin_(0), cs_active_low_(true), frequency_(1000000),
-      dma_tx_channel_(-1), dma_rx_channel_(-1), dma_busy_(false) {}
+      dma_tx_channel_(-1), dma_rx_channel_(-1), dma_busy_(false), dma_irq_initialized_(false) {}
 
 HAL_SPI1::~HAL_SPI1() {
     deinit();
@@ -364,6 +404,10 @@ bool HAL_SPI1::init(uint8_t sck_pin, uint8_t mosi_pin, uint8_t miso_pin, uint32_
         return false;
     }
     
+    // 注册DMA回调到global_irq
+    global_irq_register_dma_callback(dma_tx_channel_, spi1_dma_callback);
+    global_irq_register_dma_callback(dma_rx_channel_, spi1_dma_callback);
+    
     // 最终验证：测试SPI通信是否正常
     // 发送一个dummy字节并检查是否能正常发送
     uint8_t test_byte = 0x00;
@@ -379,6 +423,14 @@ void HAL_SPI1::deinit() {
     if (initialized_) {
         // 停止任何正在进行的DMA传输
         dma_busy_ = false;
+        
+        // 注销DMA回调
+        if (dma_tx_channel_ >= 0) {
+            global_irq_unregister_dma_callback(dma_tx_channel_);
+        }
+        if (dma_rx_channel_ >= 0) {
+            global_irq_unregister_dma_callback(dma_rx_channel_);
+        }
         
         // 释放DMA通道
         if (dma_tx_channel_ >= 0) {
@@ -471,47 +523,20 @@ void HAL_SPI1::set_frequency(uint32_t frequency) {
     }
 }
 
-// DMA中断处理函数
-void dma_spi1_complete() {
+// C风格的SPI1 DMA回调函数实现
+void spi1_dma_callback(bool success) {
     HAL_SPI1* instance = HAL_SPI1::getInstance();
-    instance->dma_busy_ = false;
-    if (instance->dma_callback_) {
-        instance->dma_callback_(true);
-        instance->dma_callback_ = nullptr; // 清除回调函数
+    if (instance) {
+        instance->dma_busy_ = false;
+        if (instance->dma_callback_) {
+            instance->dma_callback_(success);
+        }
     }
 }
 
 bool HAL_SPI1::write_async(const uint8_t* data, size_t length, dma_callback_t callback) {
-    if (!initialized_ || dma_busy_ || dma_tx_channel_ < 0) {
-        return false;
-    }
-    
-    dma_busy_ = true;
-    dma_callback_ = callback;
-    
-    // 配置DMA通道
-    dma_channel_config c = dma_channel_get_default_config(dma_tx_channel_);
-    channel_config_set_transfer_data_size(&c, DMA_SIZE_8);
-    channel_config_set_read_increment(&c, true);
-    channel_config_set_write_increment(&c, false);
-    channel_config_set_dreq(&c, spi_get_dreq(spi1, true)); // TX DREQ
-    
-    // 设置中断
-    dma_channel_set_irq0_enabled(dma_tx_channel_, true);
-    irq_set_exclusive_handler(DMA_IRQ_0, dma_spi1_complete);
-    irq_set_enabled(DMA_IRQ_0, true);
-    
-    // 启动DMA传输
-    dma_channel_configure(
-        dma_tx_channel_,
-        &c,
-        &spi_get_hw(spi1)->dr, // 写入地址
-        data,                  // 读取地址
-        length,                // 传输长度
-        true                   // 立即启动
-    );
-    
-    return true;
+    // 使用新的扁平化接口，避免重复设置IRQ
+    return start_dma_transfer(data, length, callback);
 }
 
 bool HAL_SPI1::read_async(uint8_t* buffer, size_t length, dma_callback_t callback) {
@@ -519,6 +544,10 @@ bool HAL_SPI1::read_async(uint8_t* buffer, size_t length, dma_callback_t callbac
         return false;
     }
     
+    if (spi_is_busy(spi1)) {
+        return false;
+    }
+
     dma_busy_ = true;
     dma_callback_ = callback;
     
@@ -531,7 +560,7 @@ bool HAL_SPI1::read_async(uint8_t* buffer, size_t length, dma_callback_t callbac
     
     // 设置中断
     dma_channel_set_irq0_enabled(dma_rx_channel_, true);
-    irq_set_exclusive_handler(DMA_IRQ_0, dma_spi1_complete);
+    // DMA中断由global_irq统一管理
     irq_set_enabled(DMA_IRQ_0, true);
     
     // 启动DMA传输
@@ -550,6 +579,10 @@ bool HAL_SPI1::read_async(uint8_t* buffer, size_t length, dma_callback_t callbac
 bool HAL_SPI1::transfer_async(const uint8_t* tx_data, uint8_t* rx_data, size_t length, dma_callback_t callback) {
     if (!initialized_ || dma_busy_) return false;
     
+    if (spi_is_busy(spi1)) {
+        return false;
+    }
+
     dma_busy_ = true;
     dma_callback_ = callback;
     
@@ -576,8 +609,13 @@ bool HAL_SPI1::is_ready() const {
     return initialized_;
 }
 
-bool HAL_SPI1::write_dma(const uint8_t* data, size_t length, dma_callback_t callback) {
-    if (!initialized_ || dma_busy_ || dma_tx_channel_ < 0) {
+// 扁平化DMA接口实现
+bool HAL_SPI1::start_dma_transfer(const uint8_t* data, size_t length, dma_callback_t callback) {
+    if (!initialized_ || dma_busy_ || dma_tx_channel_ < 0 || !data || length == 0) {
+        return false;
+    }
+
+    if (spi_is_busy(spi1)) {
         return false;
     }
     
@@ -587,26 +625,66 @@ bool HAL_SPI1::write_dma(const uint8_t* data, size_t length, dma_callback_t call
     // 配置DMA通道
     dma_channel_config c = dma_channel_get_default_config(dma_tx_channel_);
     channel_config_set_transfer_data_size(&c, DMA_SIZE_8);
-    channel_config_set_read_increment(&c, true);
-    channel_config_set_write_increment(&c, false);
+    channel_config_set_read_increment(&c, true);   // 从内存读取时地址递增
+    channel_config_set_write_increment(&c, false); // 写入SPI DR寄存器时地址不变
     channel_config_set_dreq(&c, spi_get_dreq(spi1, true)); // TX DREQ
     
-    // 设置中断
-    dma_channel_set_irq0_enabled(dma_tx_channel_, true);
-    irq_set_exclusive_handler(DMA_IRQ_0, dma_spi1_complete);
-    irq_set_enabled(DMA_IRQ_0, true);
+    // 清除之前的中断状态
+    dma_channel_acknowledge_irq1(dma_tx_channel_);
+    
+    // 启用DMA通道中断（IRQ处理函数已在init时设置）
+    dma_channel_set_irq1_enabled(dma_tx_channel_, true);
     
     // 启动DMA传输
     dma_channel_configure(
         dma_tx_channel_,
         &c,
-        &spi_get_hw(spi1)->dr, // 写入地址
-        data,                  // 读取地址
-        length,                // 传输长度
+        &spi_get_hw(spi1)->dr, // 写入地址：SPI数据寄存器
+        data,                  // 读取地址：源数据缓冲区
+        length,                // 传输长度（字节数）
         true                   // 立即启动
     );
     
     return true;
+}
+
+bool HAL_SPI1::continue_dma_transfer(const uint8_t* data, size_t length) {
+    if (!initialized_ || dma_busy_ || dma_tx_channel_ < 0 || !data || length == 0) {
+        return false;
+    }
+    
+    dma_busy_ = true;
+    // 注意：不重新设置callback，使用之前的callback
+    
+    // 配置DMA通道
+    dma_channel_config c = dma_channel_get_default_config(dma_tx_channel_);
+    channel_config_set_transfer_data_size(&c, DMA_SIZE_8);
+    channel_config_set_read_increment(&c, true);   // 从内存读取时地址递增
+    channel_config_set_write_increment(&c, false); // 写入SPI DR寄存器时地址不变
+    channel_config_set_dreq(&c, spi_get_dreq(spi1, true)); // TX DREQ
+    
+    // 清除之前的中断状态
+    dma_channel_acknowledge_irq1(dma_tx_channel_);
+    
+    // 启用DMA通道中断（不重新设置IRQ处理函数）
+    dma_channel_set_irq1_enabled(dma_tx_channel_, true);
+    
+    // 启动DMA传输
+    dma_channel_configure(
+        dma_tx_channel_,
+        &c,
+        &spi_get_hw(spi1)->dr, // 写入地址：SPI数据寄存器
+        data,                  // 读取地址：源数据缓冲区
+        length,                // 传输长度（字节数）
+        true                   // 立即启动
+    );
+    
+    return true;
+}
+
+bool HAL_SPI1::write_dma(const uint8_t* data, size_t length, dma_callback_t callback) {
+    // 使用新的扁平化接口，避免重复设置IRQ
+    return start_dma_transfer(data, length, callback);
 }
 
 bool HAL_SPI1::read_dma(uint8_t* buffer, size_t length, dma_callback_t callback) {
@@ -626,7 +704,7 @@ bool HAL_SPI1::read_dma(uint8_t* buffer, size_t length, dma_callback_t callback)
     
     // 设置中断
     dma_channel_set_irq0_enabled(dma_rx_channel_, true);
-    irq_set_exclusive_handler(DMA_IRQ_0, dma_spi1_complete);
+    // DMA中断由global_irq统一管理
     irq_set_enabled(DMA_IRQ_0, true);
     
     // 启动DMA传输

@@ -17,11 +17,9 @@ using RGB565 = uint16_t;
  * 支持128x160分辨率，16位RGB565颜色
  */
 
-// ST7735S显示参数 - 根据厂家程序更新
+// ST7735S显示参数
 #define ST7735S_WIDTH           160  // 横屏模式宽度
 #define ST7735S_HEIGHT          80   // 横屏模式高度
-#define ST7735S_WIDTH_PORTRAIT  80   // 竖屏模式宽度
-#define ST7735S_HEIGHT_PORTRAIT 160  // 竖屏模式高度
 
 // ST7735S命令定义
 #define ST7735S_NOP             0x00
@@ -75,8 +73,8 @@ using RGB565 = uint16_t;
 // 显示方向
 enum ST7735S_Rotation {
     ST7735S_ROTATION_0 = 0,     // 0度
-    ST7735S_ROTATION_90 = 1,    // 90度
-    ST7735S_ROTATION_180 = 2,   // 180度
+    ST7735S_ROTATION_180 = 1,   // 180度
+    ST7735S_ROTATION_90 = 2,    // 90度
     ST7735S_ROTATION_270 = 3    // 270度
 };
 
@@ -90,7 +88,7 @@ class ST7735S {
 public:
     using dma_callback_t = std::function<void(bool success)>;
     
-    ST7735S(HAL_SPI* spi_hal, uint8_t cs_pin, uint8_t dc_pin, uint8_t rst_pin = 255, uint8_t blk_pin = 255);
+    ST7735S(HAL_SPI* spi_hal, ST7735S_Rotation rotation, uint8_t cs_pin, uint8_t dc_pin, uint8_t rst_pin = 255, uint8_t blk_pin = 255);
     ~ST7735S();
     
     // 初始化显示屏
@@ -112,17 +110,13 @@ public:
     bool invert_display(bool enable);
     
     // 显示方向和区域
-    bool set_rotation(ST7735S_Rotation rotation);
+    
     ST7735S_Rotation get_rotation() const;
-    bool set_window(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1);
     
-    // 基础像素操作（仅保留LVGL需要的功能）
-    bool fill_screen(ST7735S_Color color);
-    // 像素数据写入（用于LVGL集成）
-    bool write_pixel_data(uint16_t color565);
     
-    // 设置帧缓冲区（可选）
-    bool set_framebuffer(uint16_t* buffer);
+    // 直接写入接口 - 传入指针和大小的立即刷写方式
+    bool write_buffer(const uint16_t* buffer, size_t buffer_size, dma_callback_t callback = nullptr);
+    bool write_buffer_region(const uint16_t* buffer, uint16_t x, uint16_t y, uint16_t width, uint16_t height, dma_callback_t callback = nullptr);
     
     // 获取显示尺寸
     uint16_t get_width() const;
@@ -132,17 +126,8 @@ public:
     bool set_backlight(uint8_t brightness);  // 0-255
     uint8_t get_backlight() const;           // 获取当前背光亮度
     
-    // 异步DMA操作 - 非阻塞接口
-    bool write_data_buffer_async(const uint8_t* buffer, size_t length, dma_callback_t callback = nullptr);
-    bool fill_screen_async(ST7735S_Color color, dma_callback_t callback = nullptr);
-    bool draw_bitmap_rgb565_async(int16_t x, int16_t y, uint16_t width, uint16_t height, const uint8_t* bitmap, dma_callback_t callback = nullptr);
-    
-    // 检查DMA队列状态
-    size_t get_dma_queue_size() const { return dma_queue_count_; }
-    bool has_pending_transfers() const { return dma_queue_count_ > 0; }
-    
-    // 处理DMA队列（需要在主循环中调用）
-    void process_dma_queue();
+    // DMA处理
+    void process_dma();  // 处理DMA完成事件
     
 private:
     HAL_SPI* spi_hal_;
@@ -158,40 +143,28 @@ private:
     uint16_t width_;
     uint16_t height_;
     
-    // 帧缓冲区相关
-    uint16_t* framebuffer_;
-    bool use_framebuffer_;
-    
-    // DMA异步相关
+    // DMA传输状态
     volatile bool dma_busy_;
     dma_callback_t current_callback_;
     
-    // 分块传输状态
-    // DMA传输队列管理
-    
-    // DMA传输队列优化
-    struct DMATransfer {
-        const uint8_t* data;
-        size_t length;
-        dma_callback_t callback;
-    };
-    static constexpr size_t MAX_DMA_QUEUE = 4;
-    DMATransfer dma_queue_[MAX_DMA_QUEUE];
-    size_t dma_queue_head_;
-    size_t dma_queue_tail_;
-    size_t dma_queue_count_;
-    
+    inline void select_cmd_mode();
+
+    inline void select_data_mode();
+
+    inline void deselect();
+
     // 私有方法
     bool write_command(uint8_t cmd);
     bool write_data(uint8_t data);
     bool write_data_16(uint16_t data);
     bool write_data_buffer(const uint8_t* buffer, size_t length);
     bool spi_transfer(const uint8_t* tx_data, uint8_t* rx_data, size_t length);
-    
+    bool set_rotation(ST7735S_Rotation rotation);
+    bool set_window(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1);
+
     // DMA回调处理
     void on_dma_complete(bool success);
     
-    // 初始化相关
+    // 显示初始化
     bool init_registers();
-    bool configure_display();
 };

@@ -165,6 +165,10 @@
 #include "hal/pio/hal_pio.h"
 #include "hal/usb/hal_usb.h"
 
+extern "C" {
+#include "hal/global_irq.h"
+}
+
 // 协议层包含
 #include "protocol/gtx312l/gtx312l.h"
 #include "protocol/mcp23s17/mcp23s17.h"
@@ -219,9 +223,9 @@
 #define NEOPIXEL_LEDS_NUM 32
 
 // 摇杆引脚定义
-#define JOYSTICK_BUTTON_A_PIN MCU_GPIO::GPIO2    // 摇杆A按钮(上方向)
-#define JOYSTICK_BUTTON_B_PIN MCU_GPIO::GPIO3    // 摇杆B按钮(下方向)
-#define JOYSTICK_BUTTON_CONFIRM_PIN MCU_GPIO::GPIO1  // 摇杆确认按钮
+#define JOYSTICK_BUTTON_A_PIN 2    // 摇杆A按钮(上方向)
+#define JOYSTICK_BUTTON_B_PIN 3    // 摇杆B按钮(下方向)
+#define JOYSTICK_BUTTON_CONFIRM_PIN 1  // 摇杆确认按钮
 
 // Watchdog配置
 #define WATCHDOG_TIMEOUT_MS 5000
@@ -258,7 +262,7 @@ struct CoreInitBitmap {
         return core0_hal_ready && core1_hal_ready;
     }
     
-    inline bool wait_for_both_protocol(uint32_t timeout_ms = 5000) volatile {
+    inline bool wait_for_both_protocol(uint32_t timeout_ms = 30000) volatile {
         uint32_t start = millis();
         while ((!core0_protocol_ready || !core1_protocol_ready) && (millis() - start) < timeout_ms) {
             // 如果当前是Core1且USB log可用，则flush
@@ -283,6 +287,10 @@ struct CoreInitBitmap {
         core1_failed = 1;
     }
 };
+
+// Core1 stack
+#define CORE1_STACK_SIZE 0x10000
+static uint32_t core1_stack[CORE1_STACK_SIZE / sizeof(uint32_t)];
 
 // 全局同步bitmap
 static volatile CoreInitBitmap init_sync;
@@ -339,8 +347,7 @@ inline void heartbeat_task() {
     static uint32_t last_heartbeat = 0;
     static bool led_state = false;
     uint32_t current_time = (time_us_32() / 1000);
-    if (current_time - last_heartbeat >= 1000) {
-        // 切换内置LED状态 (使用RP2040 SDK原生函数，多核心安全)
+    if (current_time - last_heartbeat > 500) {
         gpio_put(LED_BUILTIN_PIN, led_state);
         led_state = !led_state;
         last_heartbeat = current_time;
@@ -531,7 +538,7 @@ bool core1_init_protocol_layer() {
 
     USB_SerialLogs_Config log_config;
     log_config.enable_colors = true;
-    log_config.min_level = USB_LogLevel::INFO;
+    log_config.min_level = USB_LogLevel::DEBUG;
 
     usb_logs->set_config(log_config);
     
@@ -547,18 +554,19 @@ bool core1_init_protocol_layer() {
     }
     
     // 初始化ST7735S
-    st7735s = new ST7735S(hal_spi0, ST7735S_CS_PIN, ST7735S_DC_PIN, ST7735S_RST_PIN, ST7735S_BLK_PIN);
+    st7735s = new ST7735S(hal_spi0, ST7735S_ROTATION_90, ST7735S_CS_PIN, ST7735S_DC_PIN, ST7735S_RST_PIN, ST7735S_BLK_PIN);
     if (!st7735s || !st7735s->init()) {
         error_handler("Failed to initialize ST7735S");
         return false;
     }
-    
+
     // 初始化HID (使用单例模式)
     hid = HID::getInstance();
     if (!hid || !hid->init(hal_usb)) {
         error_handler("Failed to initialize HID");
         return false;
     }
+    
     // 标记Core1 协议层初始化完成
     init_sync.core1_protocol_ready = 1;
     
@@ -620,11 +628,6 @@ bool init_service_layer() {
     input_manager->addPhysicalKeyboard(MCP_GPIO::GPIOB2, HID_KeyCode::KEY_ENTER);
     input_manager->addPhysicalKeyboard(MCP_GPIO::GPIOB3, HID_KeyCode::KEY_SPACE);
 
-    // 注册摇杆GPIO引脚
-    input_manager->addPhysicalKeyboard(JOYSTICK_BUTTON_A_PIN, HID_KeyCode::KEY_JOYSTICK_A);
-    input_manager->addPhysicalKeyboard(JOYSTICK_BUTTON_B_PIN, HID_KeyCode::KEY_JOYSTICK_B);
-    input_manager->addPhysicalKeyboard(JOYSTICK_BUTTON_CONFIRM_PIN, HID_KeyCode::KEY_JOYSTICK_CONFIRM);
-    
     // 注册GTX312L设备到InputManager
     for (uint8_t i = 0; i < gtx312l_count; i++) {
         if (gtx312l_devices[i]) {
@@ -650,20 +653,23 @@ bool init_service_layer() {
     ui_manager = UIManager::getInstance();
     UIManager_Config ui_config = {};
     ui_config.config_manager = config_manager;
-    ui_config.input_manager = input_manager;
     ui_config.light_manager = light_manager;
     ui_config.st7735s = st7735s;
+    ui_config.joystick_a_pin = JOYSTICK_BUTTON_A_PIN;
+    ui_config.joystick_b_pin = JOYSTICK_BUTTON_B_PIN;
+    ui_config.joystick_confirm_pin = JOYSTICK_BUTTON_CONFIRM_PIN;
     
     if (!ui_manager->init(ui_config)) {
         error_handler("Failed to initialize UIManager");
         return false;
     }
-
+    
     // 标记服务层初始化完成
     init_sync.service_ready = 1;
     
     return true;
 }
+
 
 /**
  * 扫描I2C设备并初始化GTX312L
@@ -682,21 +688,9 @@ void scan_i2c_devices() {
     if (hal_i2c0) {
         std::vector<uint8_t> i2c0_addresses = hal_i2c0->scan_devices();
         
-        if (usb_logs) {
-            char count_buffer[64];
-            snprintf(count_buffer, sizeof(count_buffer), "scan found %zu i2c0 devices", i2c0_addresses.size());
-            usb_logs->info(std::string(count_buffer));
-            
-            for (uint8_t addr : i2c0_addresses) {
-                char buffer[128];
-                snprintf(buffer, sizeof(buffer), "i2c0 device: 0x%02X", addr);
-                usb_logs->info(std::string(buffer));
-            }
-            
-        }
         for (uint8_t addr : i2c0_addresses) {
             if (gtx312l_count >= 8) break;
-            
+            USB_LOG_DEBUG("I2C0 Found:%02x", addr);
             // 尝试创建GTX312L实例
             GTX312L* device = new GTX312L(hal_i2c0, I2C_Bus::I2C0, addr);
 
@@ -726,20 +720,10 @@ void scan_i2c_devices() {
     // 扫描I2C1总线
     if (hal_i2c1 && gtx312l_count < 8) {
         std::vector<uint8_t> i2c1_addresses = hal_i2c1->scan_devices();
-        if (usb_logs) {
-            char count_buffer[64];
-            snprintf(count_buffer, sizeof(count_buffer), "scan found %zu i2c1 devices", i2c1_addresses.size());
-            usb_logs->info(std::string(count_buffer));
-            for (uint8_t addr : i2c1_addresses) {
-                char buffer[128];
-                snprintf(buffer, sizeof(buffer), "i2c1 device: 0x%02X", addr);
-                usb_logs->info(std::string(buffer));
-            }
-        }
-
+        
         for (uint8_t addr : i2c1_addresses) {
             if (gtx312l_count >= 8) break;
-            
+            USB_LOG_DEBUG("I2C1 Found:%02x", addr);
             // 尝试创建GTX312L实例
             GTX312L* device = new GTX312L(hal_i2c1, I2C_Bus::I2C1, addr);
             if (device && device->init()) {
@@ -750,12 +734,6 @@ void scan_i2c_devices() {
                 // 注册到InputManager
                 if (input_manager) {
                     input_manager->registerGTX312L(device);
-                }
-                
-                if (usb_logs) {
-                    char buffer[128];
-                    snprintf(buffer, sizeof(buffer), "Found GTX312L on I2C1: (0x%02X)", addr);
-                    usb_logs->info(std::string(buffer));
                 }
             } else {
                 // 初始化失败，删除实例
@@ -925,63 +903,15 @@ void core0_task() {
 }
 
 /**
- * Core1主函数 - 处理Core1的初始化和任务循环
- */
-void core1_main() {
-    watchdog_enable(WATCHDOG_TIMEOUT_MS, true);
-    gpio_init(LED_BUILTIN_PIN);
-    gpio_set_dir(LED_BUILTIN_PIN, GPIO_OUT);
-    gpio_put(LED_BUILTIN_PIN, 0);
-    
-    bool init_success = true;
-    
-    // Core1 HAL层初始化
-    if (!core1_init_hal_layer()) {
-        init_success = false;
-    }
-    
-    // Core1 协议层初始化
-    if (init_success && !core1_init_protocol_layer()) {
-        init_success = false;
-    }
-    
-    if (!init_success) {
-        // 标记Core1启动失败
-        init_sync.mark_core1_failed();
-        error_handler("Core1 initialization failed");
-        return;
-    }
-    
-    // 等待服务层初始化完成，期间flush USB logs
-    uint32_t start = millis();
-    while (!init_sync.service_ready && (millis() - start) < 10000) {
-        watchdog_feed();
-        if (usb_logs) {
-            usb_logs->flush();
-        }
-    }
-    
-    if (!init_sync.service_ready) {
-        init_sync.mark_core1_failed();
-        error_handler("Timeout waiting for service layer initialization");
-        return;
-    }
-    
-    // 进入Core1任务循环
-    core1_task();
-}
-
-/**
  * Core1任务 - InputManager Loop1, UIManager Loop
  */
 void core1_task() {
     while (1) {
         input_manager->loop1();
         usb_logs->task();
-        //ui_manager->task();
+        ui_manager->task();
         watchdog_feed();
         heartbeat_task();
-        
     }
 }
 
@@ -1013,6 +943,9 @@ void emergency_shutdown() {
  * Arduino setup函数
  */
 void setup() {
+    // 初始化全局DMA中断管理系统
+    global_irq_init();
+    
     // 启用看门狗
     watchdog_enable(WATCHDOG_TIMEOUT_MS, true);
     
@@ -1020,7 +953,7 @@ void setup() {
     init_sync.reset();
     
     // 启动Core1
-    multicore_launch_core1(core1_main);
+    multicore_launch_core1_with_stack(core1_main, core1_stack, CORE1_STACK_SIZE);
     
     // Core0初始化流程
     bool init_success = true;
@@ -1060,5 +993,55 @@ void setup() {
         error_handler("System initialization failed");
     }
 }
+
+
+/**
+ * Core1主函数 - 处理Core1的初始化和任务循环
+ */
+void core1_main() {
+    watchdog_enable(WATCHDOG_TIMEOUT_MS, true);
+    gpio_init(LED_BUILTIN_PIN);
+    gpio_set_dir(LED_BUILTIN_PIN, GPIO_OUT);
+    gpio_put(LED_BUILTIN_PIN, 0);
+    
+    bool init_success = true;
+    
+    // Core1 HAL层初始化
+    if (!core1_init_hal_layer()) {
+        init_success = false;
+    }
+    
+    // Core1 协议层初始化
+    if (init_success && !core1_init_protocol_layer()) {
+        init_success = false;
+    }
+    
+    if (!init_success) {
+        // 标记Core1启动失败
+        init_sync.mark_core1_failed();
+        error_handler("Core1 initialization failed");
+        return;
+    }
+    
+    // 等待服务层初始化完成，期间flush USB logs
+    uint32_t start = millis();
+    while (!init_sync.service_ready && (millis() - start) < 5000) {
+        watchdog_feed();
+        if (usb_logs) {
+            usb_logs->flush();
+        }
+    }
+    
+    if (!init_sync.service_ready) {
+        init_sync.mark_core1_failed();
+        
+        error_handler("Timeout waiting for service layer initialization");
+        return;
+    }
+    
+    // 进入Core1任务循环
+    core1_task();
+}
+
 
 void loop() {}

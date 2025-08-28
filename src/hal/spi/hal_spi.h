@@ -4,6 +4,10 @@
 #include <string>
 #include <functional>
 
+extern "C" {
+#include "../global_irq.h"
+}
+
 /**
  * HAL层 - SPI接口抽象类
  * 提供底层SPI接口，支持SPI0和SPI1两个实例
@@ -25,6 +29,10 @@ public:
     // DMA操作 - 完全DMA化
     virtual bool write_dma(const uint8_t* data, size_t length, dma_callback_t callback = nullptr) = 0;
     virtual bool read_dma(uint8_t* buffer, size_t length, dma_callback_t callback = nullptr) = 0;
+    
+    // 扁平化DMA接口 - 避免重复设置IRQ
+    virtual bool start_dma_transfer(const uint8_t* data, size_t length, dma_callback_t callback = nullptr) = 0;
+    virtual bool continue_dma_transfer(const uint8_t* data, size_t length) = 0;
     
     // 同步传输方法
     virtual size_t write(const uint8_t* data, size_t length) = 0;
@@ -66,6 +74,10 @@ public:
     bool read_async(uint8_t* buffer, size_t length, dma_callback_t callback);
     bool transfer_async(const uint8_t* tx_data, uint8_t* rx_data, size_t length, dma_callback_t callback);
     
+    // 扁平化DMA接口实现
+    bool start_dma_transfer(const uint8_t* data, size_t length, dma_callback_t callback = nullptr) override;
+    bool continue_dma_transfer(const uint8_t* data, size_t length) override;
+    
     // 同步传输方法
     size_t write(const uint8_t* data, size_t length) override;
     size_t read(uint8_t* buffer, size_t length) override;
@@ -81,7 +93,7 @@ public:
     bool is_ready() const override { return initialized_; }
 
     // 友元函数声明
-    friend void dma_spi0_complete();
+    friend void spi0_dma_callback(bool success);
 
 private:
     bool initialized_;
@@ -94,6 +106,7 @@ private:
     int dma_tx_channel_;
     int dma_rx_channel_;
     bool dma_busy_;
+    bool dma_irq_initialized_;
     dma_callback_t dma_callback_;
     
     // TX环形缓冲区
@@ -133,6 +146,10 @@ public:
     bool write_async(const uint8_t* data, size_t length, dma_callback_t callback);
     bool read_async(uint8_t* buffer, size_t length, dma_callback_t callback);
     bool transfer_async(const uint8_t* tx_data, uint8_t* rx_data, size_t length, dma_callback_t callback);
+    
+    // 扁平化DMA接口实现
+    bool start_dma_transfer(const uint8_t* data, size_t length, dma_callback_t callback = nullptr) override;
+    bool continue_dma_transfer(const uint8_t* data, size_t length) override;
     bool is_busy() const override;
     void set_cs_pin(uint8_t cs_pin, bool active_low = true) override;
     void cs_select() override;
@@ -143,7 +160,7 @@ public:
     bool is_ready() const override;
 
     // 友元函数声明
-    friend void dma_spi1_complete();
+    friend void spi1_dma_callback(bool success);
 
 private:
     bool initialized_;
@@ -152,13 +169,14 @@ private:
     uint8_t miso_pin_;
     uint8_t cs_pin_;
     bool cs_active_low_;
-     uint32_t frequency_;
-     int dma_tx_channel_;
-     int dma_rx_channel_;
-     bool dma_busy_;
-     dma_callback_t dma_callback_;
-     
-     static HAL_SPI1* instance_;
+    uint32_t frequency_;
+    int dma_tx_channel_;
+    int dma_rx_channel_;
+    bool dma_busy_;
+    bool dma_irq_initialized_;
+    dma_callback_t dma_callback_;
+    
+    static HAL_SPI1* instance_;
     
     // 私有构造函数（单例模式）
     HAL_SPI1();

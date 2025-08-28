@@ -4,6 +4,11 @@
 #include <string>
 #include <functional>
 
+// 包含全局中断管理头文件
+extern "C" {
+#include "../global_irq.h"
+}
+
 /**
  * HAL层 - UART接口抽象类
  * 提供底层UART接口，支持UART0和UART1两个实例
@@ -93,8 +98,8 @@ private:
     int dma_rx_channel_;
     
     // 友元函数声明，允许DMA回调函数访问私有成员
-    friend void dma_uart0_tx_complete();
-    friend void dma_uart0_rx_complete();
+    friend void uart0_tx_dma_callback(bool success);
+    friend void uart0_rx_dma_callback(bool success);
     
     // RX环形缓冲区
     static constexpr size_t RX_BUFFER_SIZE = 256;
@@ -155,8 +160,8 @@ private:
     int dma_rx_channel_;
     
     // 友元函数声明，允许DMA回调函数访问私有成员
-    friend void dma_uart1_tx_complete();
-    friend void dma_uart1_rx_complete();
+    friend void uart1_tx_dma_callback(bool success);
+    friend void uart1_rx_dma_callback(bool success);
     
     // RX环形缓冲区
     static constexpr size_t RX_BUFFER_SIZE = 256;

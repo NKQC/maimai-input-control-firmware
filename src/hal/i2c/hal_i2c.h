@@ -5,6 +5,10 @@
 #include <vector>
 #include <functional>
 
+extern "C" {
+#include "../global_irq.h"
+}
+
 /**
  * HAL层 - I2C接口抽象类
  * 提供底层I2C接口，支持I2C0和I2C1两个实例
@@ -78,6 +82,10 @@ public:
     std::vector<uint8_t> scan_devices() override;
     std::string get_name() const override { return "I2C0"; }
     
+    // 友元函数声明，允许DMA回调函数访问私有成员
+    friend void i2c0_tx_dma_callback(bool success);
+    friend void i2c0_rx_dma_callback(bool success);
+
 private:
     bool initialized_;
     uint8_t sda_pin_;
@@ -112,8 +120,12 @@ public:
     bool read_register(uint8_t address, uint8_t reg, uint8_t* value) override;
     bool device_exists(uint8_t address) override;
     std::vector<uint8_t> scan_devices() override;
-    std::string get_name() const override { return "I2C1"; }
+    std::string get_name() const override;
     
+    // 友元函数声明，允许DMA回调函数访问私有成员
+    friend void i2c1_tx_dma_callback(bool success);
+    friend void i2c1_rx_dma_callback(bool success);
+
 private:
     bool initialized_;
     uint8_t sda_pin_;

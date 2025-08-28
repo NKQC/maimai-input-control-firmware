@@ -5,6 +5,14 @@
 #include <hardware/dma.h>
 #include <pico/stdlib.h>
 
+// 包含全局中断管理
+#include "../global_irq.h"
+
+// UART DMA回调函数声明
+void uart0_tx_dma_callback(bool success);
+void uart0_rx_dma_callback(bool success);
+void uart1_tx_dma_callback(bool success);
+void uart1_rx_dma_callback(bool success);
 // HAL_UART0 静态成员初始化
 HAL_UART0* HAL_UART0::instance_ = nullptr;
 
@@ -71,6 +79,10 @@ bool HAL_UART0::init(uint8_t tx_pin, uint8_t rx_pin, uint32_t baudrate, bool flo
     dma_tx_channel_ = dma_claim_unused_channel(true);
     dma_rx_channel_ = dma_claim_unused_channel(true);
     
+    // 注册DMA回调到全局中断管理系统
+    global_irq_register_dma_callback(dma_tx_channel_, uart0_tx_dma_callback);
+    global_irq_register_dma_callback(dma_rx_channel_, uart0_rx_dma_callback);
+    
     initialized_ = true;
     return true;
 }
@@ -80,6 +92,22 @@ void HAL_UART0::deinit() {
         // 禁用中断
         uart_set_irq_enables(uart0, false, false);
         irq_set_enabled(UART0_IRQ, false);
+        
+        // 注销DMA回调
+        if (dma_tx_channel_ >= 0) {
+            global_irq_unregister_dma_callback(dma_tx_channel_);
+        }
+        if (dma_rx_channel_ >= 0) {
+            global_irq_unregister_dma_callback(dma_rx_channel_);
+        }
+        
+        // 注销DMA回调
+        if (dma_tx_channel_ >= 0) {
+            global_irq_unregister_dma_callback(dma_tx_channel_);
+        }
+        if (dma_rx_channel_ >= 0) {
+            global_irq_unregister_dma_callback(dma_rx_channel_);
+        }
         
         // 释放DMA通道
         if (dma_tx_channel_ >= 0) {
@@ -187,7 +215,8 @@ void HAL_UART0::handle_rx_irq() {
 }
 
 // DMA中断处理函数
-void dma_uart1_tx_complete() {
+// C风格的UART1 DMA回调函数实现
+void uart1_tx_dma_callback(bool success) {
     HAL_UART1* instance = HAL_UART1::getInstance();
     if (instance) {
         // 更新tx_tail_指针
@@ -202,16 +231,18 @@ void dma_uart1_tx_complete() {
         
         instance->dma_busy_ = false;
         if (instance->dma_callback_) {
-            instance->dma_callback_(true);
+            instance->dma_callback_(success);
         }
     }
 }
 
-void dma_uart1_rx_complete() {
+void uart1_rx_dma_callback(bool success) {
     HAL_UART1* instance = HAL_UART1::getInstance();
-    instance->dma_busy_ = false;
-    if (instance->dma_callback_) {
-        instance->dma_callback_(true);
+    if (instance) {
+        instance->dma_busy_ = false;
+        if (instance->dma_callback_) {
+            instance->dma_callback_(success);
+        }
     }
 }
 
@@ -243,10 +274,7 @@ inline void HAL_UART1::trigger_tx_dma() {
     channel_config_set_write_increment(&c, false);
     channel_config_set_dreq(&c, uart_get_dreq(uart1, true));
     
-    // 设置中断
-    dma_channel_set_irq0_enabled(dma_tx_channel_, true);
-    irq_set_exclusive_handler(DMA_IRQ_0, dma_uart1_tx_complete);
-    irq_set_enabled(DMA_IRQ_0, true);
+    // DMA中断由global_irq统一管理，无需在此设置
     
     // 启动DMA传输
     dma_channel_configure(
@@ -292,10 +320,7 @@ bool HAL_UART1::write_dma(const uint8_t* data, size_t length, dma_callback_t cal
     channel_config_set_write_increment(&c, false);
     channel_config_set_dreq(&c, uart_get_dreq(uart1, true)); // TX DREQ
     
-    // 设置中断
-    dma_channel_set_irq0_enabled(dma_tx_channel_, true);
-    irq_set_exclusive_handler(DMA_IRQ_0, dma_uart1_tx_complete);
-    irq_set_enabled(DMA_IRQ_0, true);
+    // DMA中断由global_irq统一管理，无需在此设置
     
     // 启动DMA传输
     dma_channel_configure(
@@ -325,10 +350,7 @@ bool HAL_UART1::read_dma(uint8_t* buffer, size_t length, dma_callback_t callback
     channel_config_set_write_increment(&c, true);
     channel_config_set_dreq(&c, uart_get_dreq(uart1, false)); // RX DREQ
     
-    // 设置中断
-    dma_channel_set_irq0_enabled(dma_rx_channel_, true);
-    irq_set_exclusive_handler(DMA_IRQ_0, dma_uart1_rx_complete);
-    irq_set_enabled(DMA_IRQ_0, true);
+    // DMA中断由global_irq统一管理，无需在此设置
     
     // 启动DMA传输
     dma_channel_configure(
@@ -349,34 +371,36 @@ bool HAL_UART1::is_busy() const {
 
 // get_name() 和 is_ready() 已在头文件中内联定义
 
-// DMA中断处理函数
-void dma_uart0_tx_complete() {
-    HAL_UART0* instance = HAL_UART0::getInstance();
-    if (instance) {
-        // 更新tx_tail_指针
-        size_t transmitted_length = dma_channel_hw_addr(instance->dma_tx_channel_)->transfer_count;
-        instance->tx_tail_ = (instance->tx_tail_ + transmitted_length) % instance->TX_BUFFER_SIZE;
-        instance->tx_dma_active_ = false;
-        
-        // 如果还有数据需要传输，继续DMA
-        if (instance->tx_head_ != instance->tx_tail_) {
-            instance->trigger_tx_dma();
-        }
-        
-        instance->dma_busy_ = false;
-        if (instance->dma_callback_) {
-            instance->dma_callback_(true);
+// C风格的DMA回调函数实现
+void uart0_tx_dma_callback(bool success) {
+        HAL_UART0* instance = HAL_UART0::getInstance();
+        if (instance) {
+            // 更新tx_tail_指针
+            size_t transmitted_length = dma_channel_hw_addr(instance->dma_tx_channel_)->transfer_count;
+            instance->tx_tail_ = (instance->tx_tail_ + transmitted_length) % instance->TX_BUFFER_SIZE;
+            instance->tx_dma_active_ = false;
+            
+            // 如果还有数据需要传输，继续DMA
+            if (instance->tx_head_ != instance->tx_tail_) {
+                instance->trigger_tx_dma();
+            }
+            
+            instance->dma_busy_ = false;
+            if (instance->dma_callback_) {
+                instance->dma_callback_(success);
+            }
         }
     }
-}
-
-void dma_uart0_rx_complete() {
-    HAL_UART0* instance = HAL_UART0::getInstance();
-    instance->dma_busy_ = false;
-    if (instance->dma_callback_) {
-        instance->dma_callback_(true);
+    
+void uart0_rx_dma_callback(bool success) {
+        HAL_UART0* instance = HAL_UART0::getInstance();
+        if (instance) {
+            instance->dma_busy_ = false;
+            if (instance->dma_callback_) {
+                instance->dma_callback_(success);
+            }
+        }
     }
-}
 
 // HAL_UART0 DMA异步方法
 // 内联函数：触发TX DMA传输
@@ -406,10 +430,7 @@ inline void HAL_UART0::trigger_tx_dma() {
     channel_config_set_write_increment(&c, false);
     channel_config_set_dreq(&c, uart_get_dreq(uart0, true));
     
-    // 设置中断
-    dma_channel_set_irq0_enabled(dma_tx_channel_, true);
-    irq_set_exclusive_handler(DMA_IRQ_0, dma_uart0_tx_complete);
-    irq_set_enabled(DMA_IRQ_0, true);
+    // DMA中断由global_irq统一管理，无需在此设置
     
     // 启动DMA传输
     dma_channel_configure(
@@ -455,10 +476,7 @@ bool HAL_UART0::write_dma(const uint8_t* data, size_t length, dma_callback_t cal
     channel_config_set_write_increment(&c, false);
     channel_config_set_dreq(&c, uart_get_dreq(uart0, true)); // TX DREQ
     
-    // 设置中断
-    dma_channel_set_irq0_enabled(dma_tx_channel_, true);
-    irq_set_exclusive_handler(DMA_IRQ_0, dma_uart0_tx_complete);
-    irq_set_enabled(DMA_IRQ_0, true);
+    // DMA中断由global_irq统一管理，无需在此设置
     
     // 启动DMA传输
     dma_channel_configure(
@@ -488,10 +506,7 @@ bool HAL_UART0::read_dma(uint8_t* buffer, size_t length, dma_callback_t callback
     channel_config_set_write_increment(&c, true);
     channel_config_set_dreq(&c, uart_get_dreq(uart0, false)); // RX DREQ
     
-    // 设置中断
-    dma_channel_set_irq0_enabled(dma_rx_channel_, true);
-    irq_set_exclusive_handler(DMA_IRQ_0, dma_uart0_rx_complete);
-    irq_set_enabled(DMA_IRQ_0, true);
+    // DMA中断由global_irq统一管理，无需在此设置
     
     // 启动DMA传输
     dma_channel_configure(
@@ -579,6 +594,10 @@ bool HAL_UART1::init(uint8_t tx_pin, uint8_t rx_pin, uint32_t baudrate, bool flo
     // 分配DMA通道
     dma_tx_channel_ = dma_claim_unused_channel(true);
     dma_rx_channel_ = dma_claim_unused_channel(true);
+    
+    // 注册DMA回调到global_irq
+    global_irq_register_dma_callback(dma_tx_channel_, uart1_tx_dma_callback);
+    global_irq_register_dma_callback(dma_rx_channel_, uart1_rx_dma_callback);
     
     initialized_ = true;
     return true;

@@ -81,11 +81,7 @@ enum class HID_KeyCode : uint8_t {
     KEY_RIGHT_CTRL,
     KEY_RIGHT_SHIFT,
     KEY_RIGHT_ALT,
-    KEY_RIGHT_GUI,
-    // 摇杆专用按键
-    KEY_JOYSTICK_A,      // 摇杆A按钮
-    KEY_JOYSTICK_B,      // 摇杆B按钮
-    KEY_JOYSTICK_CONFIRM, // 摇杆确认按钮
+    KEY_RIGHT_GUI
 };
 
 // 遍历所有支持的HID键码

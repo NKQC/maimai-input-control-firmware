@@ -1,10 +1,11 @@
 #ifndef UI_MANAGER_H
 #define UI_MANAGER_H
 
-#include "lvgl.h"
 #include "../../protocol/st7735s/st7735s.h"
 #include "../../protocol/hid/hid.h"
 #include "../config_manager/config_types.h"
+#include "graphics_engine.h"
+#include "font_system.h"
 #include <string>
 #include <functional>
 #include <map>
@@ -118,13 +119,15 @@ struct UIManager_PrivateConfig {
 // UI配置结构
 struct UIManager_Config {
     ConfigManager* config_manager;
-    InputManager* input_manager;
     LightManager* light_manager;
     ST7735S* st7735s;
+    
+    uint8_t joystick_a_pin;
+    uint8_t joystick_b_pin;
+    uint8_t joystick_confirm_pin;
 
     UIManager_Config()
         : config_manager(nullptr)
-        , input_manager(nullptr)
         , light_manager(nullptr)
         , st7735s(nullptr) {}
 };
@@ -147,10 +150,22 @@ struct UIStatistics {
         , calibration_progress(0), diagnostic_errors(0), hardware_status(true) {}
 };
 
+// 页面数据结构
+struct PageData {
+    std::string title;                    // 页面标题
+    std::vector<std::string> menu_items;  // 菜单项
+    std::vector<std::string> status_items; // 状态项
+    std::string content;                  // 页面内容
+    int progress_value;                   // 进度值
+    std::vector<bool> button_states;      // 按钮状态
+    size_t selected_index;                // 选中索引
+    
+    PageData() : progress_value(0), selected_index(0) {}
+};
+
 // 回调函数类型
 using UIEventCallback = std::function<void(UIEvent event, const std::string& element_id, int32_t value)>;
 using UIPageCallback = std::function<void(UIPage page)>;
-using UIJoystickCallback = std::function<void(JoystickButton button, bool pressed)>;
 
 // 配置管理函数声明
 void uimanager_register_default_configs(config_map_t& default_map);  // 注册默认配置到ConfigManager
@@ -197,7 +212,6 @@ public:
     bool force_refresh();
     
     // 输入处理
-    bool handle_joystick_input(JoystickButton button, bool pressed);
     bool navigate_menu(bool up);
     
     // 事件处理
@@ -232,7 +246,7 @@ public:
     bool cancel_touch_mapping();
     bool show_mapping_selection_ui(); // 显示映射选择界面
     bool update_mapping_display(); // 更新映射显示
-    bool handle_touch_mapping_selection(lv_event_t* e); // 处理触摸映射选择
+    bool handle_touch_mapping_selection(int selection); // 处理触摸映射选择
     
     // 按键映射页面
     bool show_key_mapping_page();
@@ -241,8 +255,8 @@ public:
     bool update_key_mapping_display(); // 更新键盘映射显示
     const char* getKeyName(HID_KeyCode key); // 获取按键名称
     HID_KeyCode getKeyCodeFromName(const char* name); // 从名称获取按键代码
-    bool handle_hid_key_selection(lv_event_t* e); // 处理HID按键选择
-    bool handle_logical_key_selection(lv_event_t* e, int key_index); // 处理逻辑按键选择
+    bool handle_hid_key_selection(); // 处理HID按键选择
+    bool handle_logical_key_selection(int key_index, const char* key_name); // 处理逻辑按键选择
     bool clear_all_key_mappings(); // 清除所有键盘映射
     bool clear_all_logical_key_mappings(); // 清除所有逻辑按键映射
     
@@ -257,8 +271,8 @@ public:
     bool show_light_region_selection(); // 显示灯光区域选择
     bool show_neopixel_grid(); // 显示Neopixel网格选择
     bool update_light_mapping_display(); // 更新灯光映射显示
-    bool handle_light_region_selection(lv_event_t* e); // 处理灯光区域选择
-    bool handle_neopixel_selection(lv_event_t* e); // 处理Neopixel选择
+    bool handle_light_region_selection(int region_index); // 处理灯光区域选择
+    bool handle_neopixel_selection(int index); // 处理Neopixel选择
     bool save_light_mapping(); // 保存灯光映射
     bool clear_light_mapping(); // 清除灯光映射
     
@@ -298,7 +312,6 @@ public:
     // 回调设置
     void set_event_callback(UIEventCallback callback);
     void set_page_callback(UIPageCallback callback);
-    void set_joystick_callback(UIJoystickCallback callback);
     
     // 主循环
     void task();
@@ -318,98 +331,80 @@ private:
     // 静态实例
     static UIManager* instance_;
     
-    // 成员变量
+    // 成员变量 - 按构造函数初始化顺序排列
     bool initialized_;
     ST7735S* display_device_;
-    InputManager* input_manager_;
     LightManager* light_manager_;
     ConfigManager* config_manager_;
-    
-    // LVGL相关
-    lv_disp_t* lv_display_;
-    lv_indev_t* lv_input_device_;
-    lv_disp_draw_buf_t lv_draw_buf_;
-    lv_color_t* lv_buf1_;
-    lv_color_t* lv_buf2_;
-    
-    // 页面管理
-    std::map<UIPage, lv_obj_t*> pages_;
+    InputManager* input_manager_;
+    GraphicsEngine* graphics_engine_;
+    bool page_needs_redraw_;
+    int16_t current_menu_index_;
+    bool buttons_active_low_;
+    bool framebuffer_dirty_;
     UIPage current_page_;
     UIPage previous_page_;
-    
-    // 状态管理
     bool backlight_enabled_;
     bool screen_off_;
     uint32_t last_activity_time_;
     uint32_t last_refresh_time_;
     bool needs_full_refresh_;
     bool debug_enabled_;
+    uint32_t last_navigation_time_;
+    
+    // GPIO配置
+    uint8_t joystick_a_pin_;
+    uint8_t joystick_b_pin_;
+    uint8_t joystick_confirm_pin_;
+    
+    // 静态framebuffer缓冲区
+    static uint16_t framebuffer_[ST7735S_WIDTH * ST7735S_HEIGHT];
+    static uint16_t static_framebuffer_[ST7735S_WIDTH * ST7735S_HEIGHT];
     
     // 输入状态
     bool joystick_buttons_[3];      // A, B, CONFIRM按钮状态
     uint32_t button_press_times_[3]; // 按钮按下时间
-    uint32_t last_navigation_time_; // 上次导航时间
-    int16_t current_menu_index_;    // 当前菜单索引
-    bool in_menu_mode_;             // 是否在菜单模式
     
     // 灵敏度调整相关
     int selected_device_index_;        // 当前选中的设备索引
     uint8_t selected_channel_;         // 当前选中的通道
-    lv_obj_t* sensitivity_slider_;     // 灵敏度滑块
-    lv_obj_t* device_label_;          // 设备标签
     bool auto_adjust_active_;          // 自动调整是否激活
-    lv_obj_t* auto_adjust_button_;     // 自动调整按钮
     
     // 触摸映射相关
     bool touch_mapping_active_;        // 触摸映射是否激活
     int mapping_step_;                 // 映射步骤
     uint16_t mapping_device_addr_;     // 映射的设备地址
     uint8_t mapping_channel_;          // 映射的通道
-    lv_obj_t* mapping_status_label_;   // 映射状态标签
-    lv_obj_t* mapping_area_list_;      // 映射区域列表
+
     
     // 按键映射相关
     bool key_mapping_active_;          // 按键映射是否激活
     int selected_key_index_;           // 选中的按键索引
-    lv_obj_t* key_list_;              // 按键列表
-    lv_obj_t* hid_key_list_;          // HID按键列表
+
     
     // 逻辑按键映射相关
-    lv_obj_t* gpio_label_;            // GPIO标签
-    lv_obj_t* logical_key1_dropdown_; // 逻辑按键1下拉栏
-    lv_obj_t* logical_key2_dropdown_; // 逻辑按键2下拉栏
-    lv_obj_t* logical_key3_dropdown_; // 逻辑按键3下拉栏
     int selected_gpio_;               // 当前选中的GPIO
     
     // 引导式绑区相关
     bool guided_binding_active_;       // 引导式绑区是否激活
     uint8_t binding_step_;             // 绑区步骤
-    lv_obj_t* binding_progress_bar_;   // 绑区进度条
-    lv_obj_t* binding_step_label_;     // 绑区步骤标签
+
     
     // 灯光映射相关
     bool light_mapping_active_;        // 灯光映射是否激活
     std::string selected_light_region_; // 当前选中的灯光区域
     std::vector<uint8_t> selected_neopixels_; // 选中的Neopixel编号列表
-    lv_obj_t* light_region_list_;      // 灯光区域列表
-    lv_obj_t* neopixel_grid_;          // Neopixel网格
-    lv_obj_t* light_mapping_status_;   // 灯光映射状态标签
-    lv_obj_t* neopixel_buttons_[32];   // Neopixel按钮数组(最多32个)
+
     
     // UART设置相关
-    lv_obj_t* mai2serial_baudrate_dropdown_; // mai2serial波特率下拉框
-    lv_obj_t* mai2light_baudrate_dropdown_;  // mai2light波特率下拉框
-    lv_obj_t* uart_status_label_;            // UART状态标签
+
     uint32_t current_mai2serial_baudrate_;   // 当前mai2serial波特率
     uint32_t current_mai2light_baudrate_;    // 当前mai2light波特率
     
     // 状态页面相关
-    lv_obj_t* status_mode_label_;
-    lv_obj_t* status_touch_label_;
-    lv_obj_t* status_binding_label_;
-    lv_obj_t* status_sensitivity_label_;
-    lv_obj_t* status_light_label_;
-    lv_obj_t* status_system_label_;
+    
+    // 页面数据
+    PageData page_data_;
     
     // 故障管理相关
     ErrorInfo current_error_;          // 当前故障信息
@@ -424,30 +419,38 @@ private:
     // 回调函数
     UIEventCallback event_callback_;
     UIPageCallback page_callback_;
-    UIJoystickCallback joystick_callback_;
     
-    // LVGL初始化和清理
-    bool init_lvgl();
-    void deinit_lvgl();
+    // 显示刷新相关
+    bool init_display();
+    void deinit_display();
+    void refresh_display();
     
-    // 显示驱动回调
-    static void display_flush_cb(lv_disp_drv_t* disp_drv, const lv_area_t* area, lv_color_t* color_p);
-    static void input_read_cb(lv_indev_drv_t* indev_drv, lv_indev_data_t* data);
+    // 页面绘制函数
+    void draw_current_page();
+    void draw_main_page();
+    void draw_status_page();
+    void draw_settings_page();
+    void draw_sensitivity_page();
+    void draw_touch_mapping_page();
+    void draw_key_mapping_page();
+    void draw_guided_binding_page();
+    void draw_uart_settings_page();
+    void draw_calibration_page();
+    void draw_diagnostics_page();
+    void draw_light_mapping_page();
+    void draw_about_page();
+    void draw_error_page();
+    
+    // 页面数据管理
+    void reset_page_data();
+    
+    // 30fps刷新任务
+    void display_refresh_task();
+    void refresh_task_30fps();
+    static void display_refresh_timer_callback(void* arg);
     
     // 页面创建和管理
-    void create_main_page();
-    void create_status_page();
-    void create_settings_page();
-    void create_calibration_page();
-    void create_diagnostics_page();
-    void create_sensitivity_page();
-    void create_touch_mapping_page();
-    void create_key_mapping_page();
-    void create_guided_binding_page();
-    void create_light_mapping_page();
-    void create_uart_settings_page();
-    void create_error_page();
-    void create_about_page();
+    void destroy_current_page();     // 销毁当前页面
     
     // 页面更新
     void update_main_page();
@@ -464,13 +467,8 @@ private:
     void update_error_page();
     
     // 事件回调函数
-    static void button_event_cb(lv_event_t* e);
-    static void dropdown_event_cb(lv_event_t* e);
-    static void slider_event_cb(lv_event_t* e);
-    static void page_event_cb(lv_event_t* e);
     
     // 输入处理
-    void process_joystick_event(JoystickButton button, bool pressed);
     void handle_navigation_input(bool up);
     void handle_confirm_input();
     
@@ -483,6 +481,12 @@ private:
     void mark_page_dirty(UIPage page);
     void log_debug(const std::string& message);
     void log_error(const std::string& message);
+    
+    // GPIO初始化
+    bool init_gpio();
+    
+    // GPIO输入处理
+    void handle_input();
     
     // 故障处理相关
     void handle_error_detection();

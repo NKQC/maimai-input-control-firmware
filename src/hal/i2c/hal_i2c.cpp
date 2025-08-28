@@ -6,6 +6,17 @@
 #include <pico/stdlib.h>
 #include <vector>
 
+extern "C" {
+#include "../global_irq.h"
+}
+
+// C风格DMA回调函数声明
+// I2C DMA回调函数声明
+void i2c0_tx_dma_callback(bool success);
+void i2c0_rx_dma_callback(bool success);
+void i2c1_tx_dma_callback(bool success);
+void i2c1_rx_dma_callback(bool success);
+
 // HAL_I2C0 静态成员初始化
 HAL_I2C0* HAL_I2C0::instance_ = nullptr;
 
@@ -42,12 +53,24 @@ bool HAL_I2C0::init(uint8_t sda_pin, uint8_t scl_pin, uint32_t frequency) {
     dma_tx_channel_ = dma_claim_unused_channel(true);
     dma_rx_channel_ = dma_claim_unused_channel(true);
     
+    // 注册DMA回调到global_irq
+    global_irq_register_dma_callback(dma_tx_channel_, i2c0_tx_dma_callback);
+    global_irq_register_dma_callback(dma_rx_channel_, i2c0_rx_dma_callback);
+    
     initialized_ = true;
     return true;
 }
 
 void HAL_I2C0::deinit() {
     if (initialized_) {
+        // 注销DMA回调
+        if (dma_tx_channel_ >= 0) {
+            global_irq_unregister_dma_callback(dma_tx_channel_);
+        }
+        if (dma_rx_channel_ >= 0) {
+            global_irq_unregister_dma_callback(dma_rx_channel_);
+        }
+        
         // 释放DMA通道
         if (dma_tx_channel_ >= 0) {
             dma_channel_unclaim(dma_tx_channel_);
@@ -118,6 +141,51 @@ std::vector<uint8_t> HAL_I2C0::scan_devices() {
     
     return found_devices;
 }
+
+std::string HAL_I2C1::get_name() const {
+    return "I2C1";
+}
+
+// I2C DMA回调函数实现
+void i2c0_tx_dma_callback(bool success) {
+        HAL_I2C0* instance = HAL_I2C0::getInstance();
+        if (instance != nullptr) {
+            instance->dma_busy_ = false;
+            if (instance->dma_callback_ != nullptr) {
+                instance->dma_callback_(success);
+            }
+        }
+    }
+    
+void i2c0_rx_dma_callback(bool success) {
+        HAL_I2C0* instance = HAL_I2C0::getInstance();
+        if (instance != nullptr) {
+            instance->dma_busy_ = false;
+            if (instance->dma_callback_ != nullptr) {
+                instance->dma_callback_(success);
+            }
+        }
+    }
+    
+void i2c1_tx_dma_callback(bool success) {
+        HAL_I2C1* instance = HAL_I2C1::getInstance();
+        if (instance != nullptr) {
+            instance->dma_busy_ = false;
+            if (instance->dma_callback_ != nullptr) {
+                instance->dma_callback_(success);
+            }
+        }
+    }
+    
+void i2c1_rx_dma_callback(bool success) {
+        HAL_I2C1* instance = HAL_I2C1::getInstance();
+        if (instance != nullptr) {
+            instance->dma_busy_ = false;
+            if (instance->dma_callback_ != nullptr) {
+                instance->dma_callback_(success);
+            }
+        }
+    }
 
 bool HAL_I2C1::read_async(uint8_t address, uint8_t* buffer, size_t length, dma_callback_t callback) {
     if (!initialized_ || dma_busy_) return false;
@@ -231,12 +299,24 @@ bool HAL_I2C1::init(uint8_t sda_pin, uint8_t scl_pin, uint32_t frequency) {
     dma_tx_channel_ = dma_claim_unused_channel(true);
     dma_rx_channel_ = dma_claim_unused_channel(true);
     
+    // 注册DMA回调到global_irq
+    global_irq_register_dma_callback(dma_tx_channel_, i2c1_tx_dma_callback);
+    global_irq_register_dma_callback(dma_rx_channel_, i2c1_rx_dma_callback);
+    
     initialized_ = true;
     return true;
 }
 
 void HAL_I2C1::deinit() {
     if (initialized_) {
+        // 注销DMA回调
+        if (dma_tx_channel_ >= 0) {
+            global_irq_unregister_dma_callback(dma_tx_channel_);
+        }
+        if (dma_rx_channel_ >= 0) {
+            global_irq_unregister_dma_callback(dma_rx_channel_);
+        }
+        
         // 释放DMA通道
         if (dma_tx_channel_ >= 0) {
             dma_channel_unclaim(dma_tx_channel_);

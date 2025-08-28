@@ -34,8 +34,11 @@ bool GTX312L::init() {
     USB_LOG_TAG_WARNING("GTX312L", "Chip Init Success %d", chip_id);
     uint8_t ret = 0;
     // 下面是默认设置
-    ret |= !write_register(GTX312L_REG_MON_RST, 0);  // 关闭自复位
-    ret |= !write_register(GTX312L_REG_I2C_PU_DIS, 1);  // 关闭I2C上拉
+    ret |= !write_register(GTX312L_REG_MON_RST, 1);  // 自复位
+    ret |= !write_register(GTX312L_REG_SLEEP, 0);  // 关闭睡眠模式
+    ret |= !write_register(GTX312L_REG_I2C_PU_DIS, 1);  // I2C上拉
+    ret |= !write_register(GTX312L_REG_WRITE_LOCK, 0x5A);  // I2C上拉
+    
     ret |= !write_register(GTX312L_REG_INT_TOUCH_MODE, 0x01);  // 不关心中断 只启用多点触摸
     ret |= !write_register(GTX312L_REG_EXP_CONFIG, 0x00);  // 关闭触摸超时
     ret |= !write_register(GTX312L_REG_CAL_TIME, 0x00);  // 单周期校准 我们依靠外部电路的稳定确保采样正确
@@ -44,7 +47,7 @@ bool GTX312L::init() {
     ret |= !write_register(GTX312L_REG_SEN_IDLE_SUFFIX, 0x00);
     ret |= !write_register(GTX312L_REG_BUSY_TO_IDLE, 0x00);
 
-    ret |= !write_register(GTX312L_REG_I2B_MODE, 0x00);  // 自动进入BUSY模式
+    ret |= !write_register(GTX312L_REG_I2B_MODE, 0x00);  // 手动进入BUSY模式
     ret |= !write_register(GTX312L_REG_SLIDE_MODE, 0x00);  // 禁用滑动模式
     
     if (ret) {

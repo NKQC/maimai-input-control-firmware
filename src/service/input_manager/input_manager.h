@@ -187,10 +187,10 @@ public:
     struct InitConfig {
         Mai2Serial* mai2_serial;
         HID* hid;
-        UIManager* ui_manager;
         MCP23S17* mcp23s17;
+        UIManager* ui_manager;
         
-        InitConfig() : mai2_serial(nullptr), hid(nullptr), ui_manager(nullptr), mcp23s17(nullptr) {}
+        InitConfig() : mai2_serial(nullptr), hid(nullptr), mcp23s17(nullptr), ui_manager(nullptr) {}
     };
     
     // 初始化和去初始化
@@ -352,10 +352,12 @@ private:
     // 协议模块引用
     Mai2Serial* mai2_serial_;                // Mai2Serial实例引用
     HID* hid_;                               // HID实例引用
-    UIManager* ui_manager_;                  // UIManager实例引用
     MCP23S17* mcp23s17_;                     // MCP23S17实例引用
     InputManager_PrivateConfig* config_;    // 配置指针缓存
     bool mcp23s17_available_;                // MCP23S17是否可用的缓存状态
+
+    // 服务层调用
+    UIManager* ui_manager_;
     
     KeyboardBitmap gpio_keyboard_bitmap_;  // GPIO键盘bitmap（loop1使用，避免跨核竞态）
     KeyboardBitmap touch_bitmap_cache_;    // 触摸键盘bitmap缓存（从loop0共享内存读取）

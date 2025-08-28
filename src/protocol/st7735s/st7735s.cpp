@@ -2,17 +2,18 @@
 #include <cstring>
 #include <algorithm>
 #include <cmath>
+#include <functional>
 #include "hardware/gpio.h"
 #include "hardware/pwm.h"
 #include "pico/time.h"
 
+// 移除静态帧缓冲区，改为直接传入缓冲区
 
-ST7735S::ST7735S(HAL_SPI* spi_hal, uint8_t cs_pin, uint8_t dc_pin, uint8_t rst_pin, uint8_t bl_pin)
+
+ST7735S::ST7735S(HAL_SPI* spi_hal, ST7735S_Rotation rotation, uint8_t cs_pin, uint8_t dc_pin, uint8_t rst_pin, uint8_t bl_pin)
     : spi_hal_(spi_hal), cs_pin_(cs_pin), dc_pin_(dc_pin), rst_pin_(rst_pin), blk_pin_(bl_pin),
-      initialized_(false), current_brightness_(255), rotation_(ST7735S_ROTATION_90),
-      width_(ST7735S_WIDTH), height_(ST7735S_HEIGHT), framebuffer_(nullptr), use_framebuffer_(false),
-      dma_busy_(false), current_callback_(nullptr), dma_queue_head_(0), dma_queue_tail_(0), dma_queue_count_(0) {
-}
+      initialized_(false), current_brightness_(255), rotation_(rotation),
+      dma_busy_(false), current_callback_(nullptr) {}
 
 ST7735S::~ST7735S() {
     deinit();
@@ -73,12 +74,6 @@ bool ST7735S::init() {
     if (!init_registers()) {
         return false;
     }
-    
-    // 配置显示
-    if (!configure_display()) {
-        return false;
-    }
-    
     initialized_ = true;
     return true;
 }
@@ -98,8 +93,6 @@ void ST7735S::deinit() {
         gpio_put(cs_pin_, 1);
         
         initialized_ = false;
-        framebuffer_ = nullptr;
-        use_framebuffer_ = false;
     }
 }
 
@@ -114,9 +107,9 @@ bool ST7735S::is_dma_busy() const {
 bool ST7735S::reset() {
     if (rst_pin_ != 255) {
         gpio_put(rst_pin_, 0);
-        sleep_ms(10);
+        sleep_ms(100);
         gpio_put(rst_pin_, 1);
-        sleep_ms(120);
+        sleep_ms(50);
     } else {
         // 软件复位
         write_command(ST7735S_SWRESET);
@@ -150,35 +143,28 @@ bool ST7735S::invert_display(bool enable) {
 }
 
 bool ST7735S::set_rotation(ST7735S_Rotation rotation) {
-    if (!is_ready()) {
-        return false;
-    }
-    
-    rotation_ = rotation;
-    
     uint8_t madctl = 0;
-    // 根据厂家程序中的MADCTL设置值
-    // 参考OLED.ino中的USE_HORIZONTAL设置
+
     switch (rotation) {
         case ST7735S_ROTATION_0:    // 竖屏 (USE_HORIZONTAL==0)
             madctl = 0x08;  // 对应厂家程序的0x08
-            width_ = 80;    // 竖屏时宽度为80
-            height_ = 160;  // 竖屏时高度为160
+            width_ = ST7735S_HEIGHT;    // 竖屏时宽度为80
+            height_ = ST7735S_WIDTH;  // 竖屏时高度为160
             break;
         case ST7735S_ROTATION_90:   // 横屏 (USE_HORIZONTAL==2)
             madctl = 0x78;  // 对应厂家程序的0x78
-            width_ = 160;   // 横屏时宽度为160
-            height_ = 80;   // 横屏时高度为80
+            width_ = ST7735S_WIDTH;   // 横屏时宽度为160
+            height_ = ST7735S_HEIGHT;   // 横屏时高度为80
             break;
         case ST7735S_ROTATION_180:  // 竖屏翻转180度 (USE_HORIZONTAL==1)
             madctl = 0xC8;  // 对应厂家程序的0xC8
-            width_ = 80;
-            height_ = 160;
+            width_ = ST7735S_HEIGHT;
+            height_ = ST7735S_WIDTH;
             break;
         case ST7735S_ROTATION_270:  // 横屏翻转180度 (USE_HORIZONTAL==3)
             madctl = 0xA8;  // 对应厂家程序的0xA8
-            width_ = 160;
-            height_ = 80;
+            width_ = ST7735S_WIDTH;
+            height_ = ST7735S_HEIGHT;
             break;
     }
     
@@ -203,9 +189,15 @@ bool ST7735S::write_command(uint8_t cmd) {
         return false;
     }
     
+    // 检查DMA状态，如果忙碌则立即失败，让调用方稍后重试
+    if (is_dma_busy()) {
+        return false;
+    }
+    
     gpio_put(dc_pin_, 0);  // 命令模式
     gpio_put(cs_pin_, 0);  // 选中设备
     
+    // 命令始终使用同步传输
     bool result = spi_hal_->write(&cmd, 1) == 1;
     
     gpio_put(cs_pin_, 1);  // 取消选中
@@ -217,9 +209,15 @@ bool ST7735S::write_data(uint8_t data) {
         return false;
     }
     
+    // 检查DMA状态，如果忙碌则立即失败，让调用方稍后重试
+    if (is_dma_busy()) {
+        return false;
+    }
+    
     gpio_put(dc_pin_, 1);  // 数据模式
     gpio_put(cs_pin_, 0);  // 选中设备
     
+    // 单字节数据使用同步传输
     bool result = spi_hal_->write(&data, 1) == 1;
     
     gpio_put(cs_pin_, 1);  // 取消选中
@@ -229,9 +227,10 @@ bool ST7735S::write_data(uint8_t data) {
 bool ST7735S::init_registers() {
     // 软件复位
     write_command(ST7735S_SLPOUT);  // 0x11
-    sleep_ms(100);
+    sleep_ms(120);
     
     // 反色显示
+    write_command(ST7735S_INVON);   // 0x21
     write_command(ST7735S_INVON);   // 0x21
     
     // 帧速率控制1 - 正常模式
@@ -330,19 +329,8 @@ bool ST7735S::init_registers() {
     write_command(ST7735S_COLMOD);  // 0x3A
     write_data(0x05);  // 16位颜色 RGB565
     
-    // 显示开启
-    write_command(ST7735S_DISPON);  // 0x29
-    
-    return true;
-}
-
-bool ST7735S::configure_display() {
-    // 设置默认方向为横屏（匹配厂家程序USE_HORIZONTAL=2）
-    set_rotation(ST7735S_ROTATION_90);
-    
-    // 开启显示
-    display_on(true);
-    
+    set_rotation(rotation_);
+    write_command(ST7735S_DISPON);
     return true;
 }
 
@@ -354,61 +342,134 @@ bool ST7735S::set_window(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1) {
     
     // 根据显示方向设置正确的偏移量
     // 参考厂家程序LCD_Address_Set函数
-    if (rotation_ == ST7735S_ROTATION_0 || rotation_ == ST7735S_ROTATION_180) {
+    if (rotation_ > ST7735S_ROTATION_180) {
         // 竖屏模式：列偏移26，行偏移1
         write_command(ST7735S_CASET);
-        write_data_16(x0 + 26);
-        write_data_16(x1 + 26);
+        write_data(0x00);
+        write_data(x0+1);
+        write_data(0x00);
+        write_data(x1+1);
         
         write_command(ST7735S_RASET);
-        write_data_16(y0 + 1);
-        write_data_16(y1 + 1);
+        write_data(0x00);
+        write_data(y0+0x1A);
+        write_data(0x00);
+        write_data(y1+0x1A);
+
+        write_command(ST7735S_RAMWR);
     } else {
         // 横屏模式：列偏移1，行偏移26
         write_command(ST7735S_CASET);
-        write_data_16(x0 + 1);
-        write_data_16(x1 + 1);
+        write_data(0x00);
+        write_data(x0+0x1A);
+        write_data(0x00);
+        write_data(x1+0x1A);
         
         write_command(ST7735S_RASET);
-        write_data_16(y0 + 26);
-        write_data_16(y1 + 26);
+        write_data(0x00);
+        write_data(y0+1);
+        write_data(0x00);
+        write_data(y1+1);
     }
-    
     // 开始写入RAM
     write_command(ST7735S_RAMWR);
-    
+
     return true;
 }
 
-bool ST7735S::fill_screen(ST7735S_Color color) {
-    if (!is_ready()) {
+// 新的直接写入接口实现
+bool ST7735S::write_buffer(const uint16_t* buffer, size_t buffer_size, dma_callback_t callback) {
+    if (!is_ready() || !buffer || buffer_size == 0) {
         return false;
     }
     
-    // 设置全屏窗口
+    // 如果DMA忙碌，返回false
+    if (is_dma_busy()) {
+        return false;
+    }
+
+    // 设置全屏窗口（此处会使用同步SPI命令，不能在dma_busy_置位后调用）
     if (!set_window(0, 0, width_ - 1, height_ - 1)) {
         return false;
     }
     
-    // 如果DMA不忙，使用DMA异步填充以提高效率
-    if (!is_dma_busy()) {
-        // 直接使用DMA异步填充，不等待完成
-        if (fill_screen_async(color, nullptr)) {
-            return true;  // DMA传输已启动，立即返回
-        }
+    // 选择数据模式
+    select_data_mode();
+    
+    // 保存回调函数
+    current_callback_ = callback;
+    
+    // 创建DMA完成回调，确保传输完成后取消片选
+    auto dma_callback = [this](bool success) {
+        this->on_dma_complete(success);
+    };
+    
+    // 启动一次性DMA传输
+    const uint8_t* data = reinterpret_cast<const uint8_t*>(buffer);
+    size_t data_size = buffer_size * sizeof(uint16_t);
+    
+    bool result = spi_hal_->start_dma_transfer(data, data_size, dma_callback);
+    
+    if (result) {
+        // 仅在DMA成功启动后，才标记为忙碌，避免阻塞后续同步命令
+        dma_busy_ = true;
+    } else {
+        // 传输启动失败，取消片选并清理状态
+        deselect();
+        current_callback_ = nullptr;
+        dma_busy_ = false;
     }
-    return false;
+    
+    return result;
 }
 
-// RGB888相关函数已移除，现在只支持RGB565格式
+bool ST7735S::write_buffer_region(const uint16_t* buffer, uint16_t x, uint16_t y, uint16_t width, uint16_t height, dma_callback_t callback) {
+    if (!is_ready() || !buffer || width == 0 || height == 0) {
+        return false;
+    }
+    
+    // 检查边界
+    if (x >= width_ || y >= height_ || (x + width) > width_ || (y + height) > height_) {
+        return false;
+    }
+    
+    // 如果DMA忙碌，返回false
+    if (is_dma_busy()) {
+        return false;
+    }
+    
+    // 设置指定区域窗口
+    if (!set_window(x, y, x + width - 1, y + height - 1)) {
+        return false;
+    }
 
-bool ST7735S::set_framebuffer(uint16_t* buffer) {
-    framebuffer_ = buffer;
-    use_framebuffer_ = (buffer != nullptr);
-    return true;
+    // 选择数据模式
+    select_data_mode();
+    
+    // 保存回调函数
+    current_callback_ = callback;
+    
+    // 创建DMA完成回调，确保传输完成后取消片选
+    auto dma_callback = [this](bool success) {
+        this->on_dma_complete(success);
+    };
+    
+    // 启动一次性DMA传输
+    const uint8_t* data = reinterpret_cast<const uint8_t*>(buffer);
+    size_t data_size = width * height * sizeof(uint16_t);
+    
+    bool result = spi_hal_->start_dma_transfer(data, data_size, dma_callback);
+    
+    if (result) {
+        dma_busy_ = true;
+    } else {
+        // 传输启动失败，取消片选
+        deselect();
+        current_callback_ = nullptr;
+    }
+    
+    return result;
 }
-
-// 缓冲区更新函数（已移除，LVGL不需要）
 
 bool ST7735S::set_backlight(uint8_t brightness) {
     if (blk_pin_ == 255) {
@@ -446,16 +507,7 @@ bool ST7735S::write_data_buffer(const uint8_t* buffer, size_t length) {
         return false;
     }
     
-    // 对于大数据量（>64字节）且DMA可用时，尝试使用DMA异步传输
-    if (length > 64 && !is_dma_busy()) {
-        // 直接使用DMA异步传输，不等待完成
-        if (write_data_buffer_async(buffer, length, nullptr)) {
-            return true;  // DMA传输已启动，立即返回
-        }
-        // 如果DMA失败，继续使用同步方式
-    }
-    
-    // 使用同步SPI传输（小数据量或DMA不可用）
+    // 简化版本：直接使用同步传输
     gpio_put(dc_pin_, 1);  // 数据模式
     gpio_put(cs_pin_, 0);  // 选中设备
     
@@ -465,10 +517,7 @@ bool ST7735S::write_data_buffer(const uint8_t* buffer, size_t length) {
     return result;
 }
 
-// 写入像素数据（用于LVGL集成）
-bool ST7735S::write_pixel_data(uint16_t color565) {
-    return write_data_16(color565);
-}
+// 旧的write_framebuffer_dma函数已移除，使用新的write_buffer接口
 
 bool ST7735S::spi_transfer(const uint8_t* tx_data, uint8_t* rx_data, size_t length) {
     if (!spi_hal_) {
@@ -485,111 +534,32 @@ bool ST7735S::spi_transfer(const uint8_t* tx_data, uint8_t* rx_data, size_t leng
 
 void ST7735S::on_dma_complete(bool success) {
     dma_busy_ = false;
-    gpio_put(cs_pin_, 1);  // 取消选中设备
+    deselect();  // 取消片选
     
     if (current_callback_) {
-        current_callback_(success);
+        auto callback = current_callback_;
         current_callback_ = nullptr;
+        callback(success);
     }
 }
 
-bool ST7735S::write_data_buffer_async(const uint8_t* buffer, size_t length, dma_callback_t callback) {
-    if (!is_ready() || is_dma_busy() || !buffer || length == 0) {
-        return false;
-    }
-    
-    dma_busy_ = true;
-    current_callback_ = callback;
-    
-    gpio_put(dc_pin_, 1);  // 数据模式
-    gpio_put(cs_pin_, 0);  // 选中设备
-    
-    // 使用DMA异步写入
-    auto dma_callback = [this](bool success) {
-        this->on_dma_complete(success);
-    };
-    
-    if (!spi_hal_->write_dma(buffer, length, dma_callback)) {
-        dma_busy_ = false;
-        current_callback_ = nullptr;
-        gpio_put(cs_pin_, 1);  // 取消选中
-        return false;
-    }
-    
-    return true;
-}
-
-bool ST7735S::fill_screen_async(ST7735S_Color color, dma_callback_t callback) {
-    if (!is_ready() || is_dma_busy()) {
-        return false;
-    }
-    
-    // 设置全屏窗口
-    if (!set_window(0, 0, width_ - 1, height_ - 1)) {
-        return false;
-    }
-    
-    // 准备颜色数据缓冲区 - 增大缓冲区以减少DMA传输次数
-    static uint8_t color_buffer[2048];  // 1024个像素的颜色数据
-    uint8_t* buffer_ptr = color_buffer;  // 使用指针避免捕获static变量
-    uint16_t color565 = color;
-    
-    // 填充缓冲区
-    for (int i = 0; i < 1024; i++) {
-        color_buffer[i * 2] = (color565 >> 8) & 0xFF;
-        color_buffer[i * 2 + 1] = color565 & 0xFF;
-    }
-    
-    // 计算需要发送的次数
-    uint32_t total_pixels = width_ * height_;
-    uint32_t buffer_pixels = 1024;  // 增大缓冲区像素数
-    uint32_t remaining_pixels = total_pixels;
-    
-    // 创建一个递归回调来处理多次DMA传输
-    std::function<void(bool)> fill_callback = [this, buffer_ptr, buffer_pixels, remaining_pixels, callback, &fill_callback](bool success) mutable {
-        if (!success) {
-            if (callback) callback(false);
-            return;
-        }
-        
-        remaining_pixels -= buffer_pixels;
-        if (remaining_pixels > 0) {
-            uint32_t next_pixels = (remaining_pixels > buffer_pixels) ? buffer_pixels : remaining_pixels;
-            uint32_t next_bytes = next_pixels * 2;
-            
-            // 继续下一次DMA传输
-            this->write_data_buffer_async(buffer_ptr, next_bytes, fill_callback);
-        } else {
-            // 全部完成
-            if (callback) callback(true);
-        }
-    };
-    
-    // 开始第一次DMA传输
-    uint32_t first_pixels = (remaining_pixels > buffer_pixels) ? buffer_pixels : remaining_pixels;
-    uint32_t first_bytes = first_pixels * 2;
-    
-    return write_data_buffer_async(buffer_ptr, first_bytes, fill_callback);
+void ST7735S::process_dma() {
+    // 简化版本：DMA完成事件由HAL层的回调自动处理
+    // 这个方法保留用于兼容性，实际不需要在主循环中调用
 }
 
 
-bool ST7735S::draw_bitmap_rgb565_async(int16_t x, int16_t y, uint16_t width, uint16_t height, const uint8_t* bitmap, dma_callback_t callback) {
-    if (!is_ready() || !bitmap) {
-        if (callback) callback(false);
-        return false;
-    }
-    
-    // 设置显示窗口
-    if (!set_window(x, y, x + width - 1, y + height - 1)) {
-        if (callback) callback(false);
-        return false;
-    }
-    
-    // 计算数据大小（RGB565格式）
-    size_t data_size = width * height * 2;
-    
-    // 使用异步DMA传输
-    return write_data_buffer_async(bitmap, data_size, callback);
+
+void ST7735S::select_cmd_mode() {
+    gpio_put(cs_pin_, 0);
+    gpio_put(dc_pin_, 0);
 }
 
-// 辅助绘制函数和字体数据（已移除，LVGL不需要）
+void ST7735S::select_data_mode() {
+    gpio_put(cs_pin_, 0);
+    gpio_put(dc_pin_, 1);
+}
+
+void ST7735S::deselect() {
+    gpio_put(cs_pin_, 1);
+}

@@ -88,6 +88,7 @@
         "usbd_pvt.h": "c",
         "watchdog.h": "c",
         "bootrom.h": "c",
-        "stdio_uart.h": "c"
+        "stdio_uart.h": "c",
+        "global_irq.h": "c"
     }
 }

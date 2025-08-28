@@ -35,7 +35,6 @@ InputManager::InputManager()
     , hid_binding_y_(0.0f)
     , mai2_serial_(nullptr)
     , hid_(nullptr)
-    , ui_manager_(nullptr)
     , mcp23s17_(nullptr)
     , config_(inputmanager_get_config_holder())
     , mcp23s17_available_(false)
@@ -71,10 +70,9 @@ bool InputManager::init(const InitConfig& config) {
     // 设置外部实例引用
     mai2_serial_ = config.mai2_serial;
     hid_ = config.hid;
-    ui_manager_ = config.ui_manager;
     mcp23s17_ = config.mcp23s17;
     mcp23s17_available_ = (mcp23s17_ != nullptr);
-    
+    ui_manager_ = config.ui_manager;
     // 初始化触摸状态数组
     for (int i = 0; i < 8; i++) {
         current_touch_states_[i] = {};
@@ -1588,7 +1586,6 @@ void InputManager::updateGPIOStates() {
 
 void InputManager::processGPIOKeyboard() {
     // 高性能GPIO处理：零内存分配，使用类成员缓存变量
-    static bool prev_joystick_states[3] = {false, false, false}; // A, B, Confirm
     static KeyboardBitmap prev_keyboard_state; // 跟踪上一次的按键状态
     static KeyboardBitmap current_keyboard_state;
     // 零内存分配：使用类成员缓存变量计算所有变化位图和反转位图
@@ -1630,48 +1627,22 @@ void InputManager::processGPIOKeyboard() {
             }
         }
         
-        // 使用switch跳表处理摇杆按键（高频操作优化）
-        switch (gpio_mapping_ptr_cache_->default_key) {
-            case HID_KeyCode::KEY_JOYSTICK_A:
-                if (gpio_current_state_cache_ != prev_joystick_states[0] && ui_manager_) {
-                    ui_manager_->handle_joystick_input(JoystickButton::BUTTON_A, gpio_current_state_cache_);
-                    prev_joystick_states[0] = gpio_current_state_cache_;
+        // 普通键盘处理：设置当前状态
+        if (gpio_current_state_cache_) {
+            if (gpio_mapping_ptr_cache_->default_key != HID_KeyCode::KEY_NONE) {
+                current_keyboard_state.setKey(gpio_mapping_ptr_cache_->default_key, true);
+            }
+            // 内联逻辑键处理避免函数调用，使用类成员缓存变量
+            for (size_t j = 0; j < gpio_logical_count_cache_; ++j) {
+                if (gpio_logical_mappings_cache_[j].gpio_id == gpio_pin_cache_) {
+                    // 使用类成员缓存指针和位运算展开循环
+                    gpio_keys_ptr_cache_ = gpio_logical_mappings_cache_[j].keys;
+                    if (gpio_keys_ptr_cache_[0] != HID_KeyCode::KEY_NONE) current_keyboard_state.setKey(gpio_keys_ptr_cache_[0], true);
+                    if (gpio_keys_ptr_cache_[1] != HID_KeyCode::KEY_NONE) current_keyboard_state.setKey(gpio_keys_ptr_cache_[1], true);
+                    if (gpio_keys_ptr_cache_[2] != HID_KeyCode::KEY_NONE) current_keyboard_state.setKey(gpio_keys_ptr_cache_[2], true);
+                    break;
                 }
-                break;
-                
-            case HID_KeyCode::KEY_JOYSTICK_B:
-                if (gpio_current_state_cache_ != prev_joystick_states[1] && ui_manager_) {
-                    ui_manager_->handle_joystick_input(JoystickButton::BUTTON_B, gpio_current_state_cache_);
-                    prev_joystick_states[1] = gpio_current_state_cache_;
-                }
-                break;
-                
-            case HID_KeyCode::KEY_JOYSTICK_CONFIRM:
-                if (gpio_current_state_cache_ != prev_joystick_states[2] && ui_manager_) {
-                    ui_manager_->handle_joystick_input(JoystickButton::BUTTON_CONFIRM, gpio_current_state_cache_);
-                    prev_joystick_states[2] = gpio_current_state_cache_;
-                }
-                break;
-                
-            default:
-                // 普通键盘处理：设置当前状态
-                if (gpio_current_state_cache_) {
-                    if (gpio_mapping_ptr_cache_->default_key != HID_KeyCode::KEY_NONE) {
-                        current_keyboard_state.setKey(gpio_mapping_ptr_cache_->default_key, true);
-                    }
-                    // 内联逻辑键处理避免函数调用，使用类成员缓存变量
-                    for (size_t j = 0; j < gpio_logical_count_cache_; ++j) {
-                        if (gpio_logical_mappings_cache_[j].gpio_id == gpio_pin_cache_) {
-                            // 使用类成员缓存指针和位运算展开循环
-                            gpio_keys_ptr_cache_ = gpio_logical_mappings_cache_[j].keys;
-                            if (gpio_keys_ptr_cache_[0] != HID_KeyCode::KEY_NONE) current_keyboard_state.setKey(gpio_keys_ptr_cache_[0], true);
-                            if (gpio_keys_ptr_cache_[1] != HID_KeyCode::KEY_NONE) current_keyboard_state.setKey(gpio_keys_ptr_cache_[1], true);
-                            if (gpio_keys_ptr_cache_[2] != HID_KeyCode::KEY_NONE) current_keyboard_state.setKey(gpio_keys_ptr_cache_[2], true);
-                            break;
-                        }
-                    }
-                }
-                break;
+            }
         }
     }
     
