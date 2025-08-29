@@ -2,12 +2,13 @@
 #include <cstring>
 #include <pico/time.h>
 #include <pico/stdlib.h>
-#include "src/protocol/usb_serial_logs/usb_serial_logs.h"
+#include "../../../protocol/usb_serial_logs/usb_serial_logs.h"
 
 // GTX312L构造函数
 GTX312L::GTX312L(HAL_I2C* i2c_hal, I2C_Bus i2c_bus, uint8_t device_addr)
-    : i2c_hal_(i2c_hal), i2c_bus_(i2c_bus), device_addr_(device_addr), 
-      i2c_device_address_(device_addr), initialized_(false) {
+    : TouchSensor(GTX312L_MAX_CHANNELS), i2c_hal_(i2c_hal), i2c_bus_(i2c_bus), 
+      device_addr_(device_addr), i2c_device_address_(device_addr), initialized_(false),
+      module_id_(device_addr), enabled_channels_mask_(0), last_touch_state_(0) {
     // 构造物理设备地址
     physical_device_address_.mask = 0x0000;
     physical_device_address_.i2c_port = static_cast<uint8_t>(i2c_bus);
@@ -53,6 +54,17 @@ bool GTX312L::init() {
     if (ret) {
         return false;
     }
+    
+    // 读取当前启用的通道掩码
+    uint8_t ch_enable_l, ch_enable_h;
+    if (read_register(GTX312L_REG_CH_ENABLE_L, ch_enable_l) &&
+        read_register(GTX312L_REG_CH_ENABLE_H, ch_enable_h)) {
+        enabled_channels_mask_ = static_cast<uint32_t>(ch_enable_l) | 
+                                (static_cast<uint32_t>(ch_enable_h & 0x0F) << 8);
+    } else {
+        enabled_channels_mask_ = 0x0FFF;  // 默认全部启用
+    }
+    
     initialized_ = true;
     return true;
 }
@@ -126,8 +138,15 @@ bool GTX312L::set_channel_enable(uint8_t channel, bool enabled) {
     enable_low = enable_mask & 0xFF;
     enable_high = (enable_mask >> 8) & 0x0F;  // 只有低4位有效
     
-    return write_register(GTX312L_REG_CH_ENABLE_L, enable_low) &&
-           write_register(GTX312L_REG_CH_ENABLE_H, enable_high);
+    bool result = write_register(GTX312L_REG_CH_ENABLE_L, enable_low) &&
+                  write_register(GTX312L_REG_CH_ENABLE_H, enable_high);
+    
+    // 更新启用通道掩码
+    if (result) {
+        enabled_channels_mask_ = enable_mask & 0x0FFF;
+    }
+    
+    return result;
 }
 
 // 设置通道灵敏度
@@ -166,4 +185,48 @@ bool GTX312L::read_registers(uint8_t reg, uint8_t* data, size_t length) {
     }
     // 再读取数据
     return i2c_hal_->read(i2c_device_address_, data, length);
+}
+
+// TouchSensor接口实现
+uint32_t GTX312L::getEnabledModuleMask() const {
+    if (!initialized_) {
+        return 0;
+    }
+    return generateFullMask(module_id_, enabled_channels_mask_);
+}
+
+uint32_t GTX312L::getCurrentTouchState() const {
+    if (!initialized_) {
+        return 0;
+    }
+    
+    // 读取当前触摸状态
+    GTX312L_SampleData bitmap;
+    if (!const_cast<GTX312L*>(this)->read_register(GTX312L_REG_TOUCH_STATUS_L, bitmap.l) ||
+        !const_cast<GTX312L*>(this)->read_register(GTX312L_REG_TOUCH_STATUS_H, bitmap.h)) {
+        return generateFullMask(module_id_, 0);  // 读取失败返回无触摸状态
+    }
+    
+    // 缓存触摸状态并返回完整掩码
+    last_touch_state_ = static_cast<uint32_t>(bitmap.value) & 0x0FFF;  // GTX312L只有12位
+    return generateFullMask(module_id_, last_touch_state_);
+}
+
+uint32_t GTX312L::getSupportedChannelCount() const {
+    return static_cast<uint32_t>(max_channels_);
+}
+
+uint32_t GTX312L::getModuleIdMask() const {
+    if (!initialized_) {
+        return 0;
+    }
+    return generateIdMask(module_id_);
+}
+
+std::string GTX312L::getDeviceName() const {
+    return get_device_name();
+}
+
+bool GTX312L::isInitialized() const {
+    return initialized_;
 }

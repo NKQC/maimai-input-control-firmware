@@ -1,6 +1,7 @@
 #pragma once
 
-#include "../../hal/i2c/hal_i2c.h"
+#include "../../../hal/i2c/hal_i2c.h"
+#include "../touch_sensor.h"
 #include <stdint.h>
 #include <vector>
 #include <functional>
@@ -183,14 +184,21 @@ typedef union {
 // 触摸回调函数类型
 typedef std::function<void(uint8_t device_index, const GTX312L_TouchData& touch_data)> GTX312L_TouchCallback;
 
-class GTX312L {
+class GTX312L : public TouchSensor {
 public:
     GTX312L(HAL_I2C* i2c_hal, I2C_Bus i2c_bus, uint8_t device_addr);
-    ~GTX312L();
+    ~GTX312L() override;
     
     // 初始化和清理
-    bool init();
-    void deinit();
+    // TouchSensor接口实现
+    uint32_t getEnabledModuleMask() const override;
+    uint32_t getCurrentTouchState() const override;
+    uint32_t getSupportedChannelCount() const override;
+    uint32_t getModuleIdMask() const override;
+    bool init() override;
+    void deinit() override;
+    std::string getDeviceName() const override;
+    bool isInitialized() const override;
     
     // 物理地址相关
     GTX312L_PhysicalAddr get_physical_device_address() const;  // 获取16位物理设备地址（通道bitmap为0）
@@ -200,7 +208,8 @@ public:
     
     // 设备信息
     bool read_device_info(GTX312L_DeviceInfo& info);
-    std::string get_device_name() const;
+    // GTX312L特有接口
+    std::string get_device_name() const;  // 保持向后兼容
     
     // 核心功能接口
     bool set_channel_enable(uint8_t channel, bool enabled);            // 设置单个通道使能状态
@@ -216,6 +225,9 @@ private:
     
     // 设备状态
     bool initialized_;
+    uint8_t module_id_;                      // 模块ID（0-15）
+    uint32_t enabled_channels_mask_;         // 启用的通道掩码
+    mutable uint32_t last_touch_state_;      // 最后一次触摸状态缓存
     
     // 内部辅助函数
     bool write_register(uint8_t reg, uint8_t value);

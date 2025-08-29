@@ -110,25 +110,27 @@ void InputManager::deinit() {
 }
 
 // 注册GTX312L设备
-bool InputManager::registerGTX312L(GTX312L* device) {
+// TouchSensor统一接口实现
+bool InputManager::registerTouchSensor(TouchSensor* device) {
     InputManager_PrivateConfig* config = inputmanager_get_config_holder();
     
     if (!device || config->device_count >= 8) {
         return false;
     }
     
-    // 获取设备地址
-    uint16_t device_addr = device->get_physical_device_address().get_device_mask();
+    // 获取设备ID掩码
+    uint32_t module_id_mask = device->getModuleIdMask();
+    uint16_t device_addr = (module_id_mask >> 16) & 0xFFFF;
     
     // 检查是否已经注册
-    for (const auto& registered_device : gtx312l_devices_) {
-        if (registered_device->get_physical_device_address().get_device_mask() == device_addr) {
+    for (const auto& registered_device : touch_sensor_devices_) {
+        if (registered_device->getModuleIdMask() == module_id_mask) {
             return false; // 已经注册
         }
     }
     
-    // 添加到设备列表
-    gtx312l_devices_.push_back(device);
+    // 添加到TouchSensor设备列表
+    touch_sensor_devices_.push_back(device);
     
     // 初始化设备映射
     config->device_mappings[config->device_count].device_addr = device_addr;
@@ -138,16 +140,16 @@ bool InputManager::registerGTX312L(GTX312L* device) {
     return true;
 }
 
-// 注销GTX312L设备
-void InputManager::unregisterGTX312L(GTX312L* device) {
+void InputManager::unregisterTouchSensor(TouchSensor* device) {
     if (!device) return;
     
-    uint16_t device_addr = device->get_physical_device_address().get_device_mask();
+    uint32_t module_id_mask = device->getModuleIdMask();
+    uint16_t device_addr = (module_id_mask >> 16) & 0xFFFF;
     
-    // 从设备列表中移除
-    auto it = std::find(gtx312l_devices_.begin(), gtx312l_devices_.end(), device);
-    if (it != gtx312l_devices_.end()) {
-        gtx312l_devices_.erase(it);
+    // 从TouchSensor设备列表中移除
+    auto it = std::find(touch_sensor_devices_.begin(), touch_sensor_devices_.end(), device);
+    if (it != touch_sensor_devices_.end()) {
+        touch_sensor_devices_.erase(it);
         
         // 重新整理设备映射数组
         int removed_index = findDeviceIndex(device_addr);
@@ -157,6 +159,33 @@ void InputManager::unregisterGTX312L(GTX312L* device) {
             }
             config_->device_count--;
         }
+    }
+}
+
+// 保持向后兼容的GTX312L接口
+bool InputManager::registerGTX312L(GTX312L* device) {
+    // 直接调用TouchSensor接口
+    bool result = registerTouchSensor(static_cast<TouchSensor*>(device));
+    
+    if (result) {
+        // 同时添加到GTX312L设备列表以保持兼容性
+        gtx312l_devices_.push_back(device);
+    }
+    
+    return result;
+}
+
+// 注销GTX312L设备 - 保持向后兼容
+void InputManager::unregisterGTX312L(GTX312L* device) {
+    if (!device) return;
+    
+    // 调用TouchSensor接口
+    unregisterTouchSensor(static_cast<TouchSensor*>(device));
+    
+    // 从GTX312L设备列表中移除以保持兼容性
+    auto it = std::find(gtx312l_devices_.begin(), gtx312l_devices_.end(), device);
+    if (it != gtx312l_devices_.end()) {
+        gtx312l_devices_.erase(it);
     }
 }
 
@@ -722,21 +751,76 @@ HID_KeyCode InputManager::getTouchKeyboardMapping(uint16_t device_addr, uint8_t 
     return mapping ? mapping->keyboard_keys[channel] : HID_KeyCode::KEY_NONE;
 }
 
-// 启用所有通道
+// 启用所有通道 - 支持TouchSensor统一接口
 void InputManager::enableAllChannels() {
+    // 优先使用TouchSensor接口
+    for (auto* device : touch_sensor_devices_) {
+        uint32_t supported_channels = device->getSupportedChannelCount();
+        
+        // 尝试转换为GTX312L以使用特定接口
+        GTX312L* gtx_device = static_cast<GTX312L*>(device);
+        if (gtx_device) {
+            for (uint8_t ch = 0; ch < supported_channels && ch < 12; ch++) {
+                gtx_device->set_channel_enable(ch, true);
+            }
+        }
+        // 对于其他TouchSensor类型，可以在此添加相应的处理逻辑
+    }
+    
+    // 保持向后兼容性 - 处理未通过TouchSensor接口注册的GTX312L设备
     for (auto* device : gtx312l_devices_) {
-        for (uint8_t ch = 0; ch < 12; ch++) {
-            device->set_channel_enable(ch, true);
+        // 检查是否已通过TouchSensor接口处理
+        bool already_processed = false;
+        for (auto* ts_device : touch_sensor_devices_) {
+            if (static_cast<TouchSensor*>(device) == ts_device) {
+                already_processed = true;
+                break;
+            }
+        }
+        
+        if (!already_processed) {
+            for (uint8_t ch = 0; ch < 12; ch++) {
+                device->set_channel_enable(ch, true);
+            }
         }
     }
 }
 
-// 仅启用已映射的通道
+// 仅启用已映射的通道 - 支持TouchSensor统一接口
 void InputManager::enableMappedChannels() {
     InputManager_PrivateConfig* config = inputmanager_get_config_holder();
     InputWorkMode work_mode = getWorkMode();
     
-    for (int i = 0; i < config->device_count; i++) {
+    // 优先使用TouchSensor接口
+    for (int i = 0; i < config->device_count && i < touch_sensor_devices_.size(); i++) {
+        auto* device = touch_sensor_devices_[i];
+        auto& mapping = config->device_mappings[i];
+        uint32_t supported_channels = device->getSupportedChannelCount();
+        
+        // 尝试转换为GTX312L以使用特定接口
+         GTX312L* gtx_device = static_cast<GTX312L*>(device);
+         if (gtx_device) {
+            for (uint8_t ch = 0; ch < supported_channels && ch < 12; ch++) {
+                bool has_mapping = false;
+                
+                if (work_mode == InputWorkMode::SERIAL_MODE) {
+                    has_mapping = (mapping.serial_area[ch] != MAI2_NO_USED);
+                } else if (work_mode == InputWorkMode::HID_MODE) {
+                    has_mapping = (mapping.hid_area[ch].x != 0.0f || mapping.hid_area[ch].y != 0.0f);
+                }
+                
+                // 只有在CH_available中启用且有映射的通道才启用
+                bool ch_available = (mapping.CH_available.value & (1 << ch)) != 0;
+                bool enabled = ch_available && has_mapping;
+                gtx_device->set_channel_enable(ch, enabled);
+            }
+        }
+        // 对于其他TouchSensor类型，可以在此添加相应的处理逻辑
+    }
+    
+    // 保持向后兼容性 - 处理未通过TouchSensor接口注册的GTX312L设备
+    int touch_sensor_count = touch_sensor_devices_.size();
+    for (int i = touch_sensor_count; i < config->device_count && i < gtx312l_devices_.size(); i++) {
         auto* device = gtx312l_devices_[i];
         auto& mapping = config->device_mappings[i];
         
@@ -751,8 +835,8 @@ void InputManager::enableMappedChannels() {
             
             // 只有在CH_available中启用且有映射的通道才启用
             bool ch_available = (mapping.CH_available.value & (1 << ch)) != 0;
-                bool enabled = ch_available && has_mapping;
-                device->set_channel_enable(ch, enabled);
+            bool enabled = ch_available && has_mapping;
+            device->set_channel_enable(ch, enabled);
         }
     }
 }
@@ -789,7 +873,27 @@ inline void InputManager::updateTouchStates() {
     InputManager_PrivateConfig* config = inputmanager_get_config_holder();
     millis_t current_time = to_ms_since_boot(get_absolute_time());
     
-    for (int i = 0; i < config->device_count; i++) {
+    // 使用TouchSensor统一接口更新触摸状态
+    for (int i = 0; i < config->device_count && i < touch_sensor_devices_.size(); i++) {
+        auto* device = touch_sensor_devices_[i];
+        
+        // 保存之前的状态
+        previous_touch_states_[i] = current_touch_states_[i];
+        
+        // 使用TouchSensor统一接口获取触摸状态
+        uint32_t touch_state = device->getCurrentTouchState();
+        
+        // 构造GTX312L_SampleResult结构体以保持兼容性
+        current_touch_states_[i].physical_addr.mask = touch_state & 0xFFFF;
+        current_touch_states_[i].timestamp = current_time;
+        
+        // 增加采样计数器
+        incrementSampleCounter();
+    }
+    
+    // 如果还有GTX312L设备未通过TouchSensor接口注册，保持兼容性
+    int touch_sensor_count = touch_sensor_devices_.size();
+    for (int i = touch_sensor_count; i < config->device_count && i < gtx312l_devices_.size(); i++) {
         auto* device = gtx312l_devices_[i];
         
         // 保存之前的状态

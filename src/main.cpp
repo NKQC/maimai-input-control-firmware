@@ -170,7 +170,7 @@ extern "C" {
 }
 
 // 协议层包含
-#include "protocol/gtx312l/gtx312l.h"
+#include "protocol/touch_sensor/gtx312l/gtx312l.h"
 #include "protocol/mcp23s17/mcp23s17.h"
 #include "protocol/neopixel/neopixel.h"
 #include "protocol/st7735s/st7735s.h"

@@ -10,7 +10,8 @@
 #include "../../hal/i2c/hal_i2c.h"
 #include "../../protocol/mai2serial/mai2serial.h"
 #include "../../protocol/hid/hid.h"
-#include "../../protocol/gtx312l/gtx312l.h"
+#include "../../protocol/touch_sensor/gtx312l/gtx312l.h"
+#include "../../protocol/touch_sensor/touch_sensor.h"
 #include "../../protocol/mcp23s17/mcp23s17.h"
 #include "../ui_manager/ui_manager.h"
 
@@ -197,7 +198,11 @@ public:
     bool init(const InitConfig& config);
     void deinit();
     
-    // 设备管理
+    // 设备注册 - TouchSensor统一接口
+    bool registerTouchSensor(TouchSensor* device);
+    void unregisterTouchSensor(TouchSensor* device);
+    
+    // 设备注册 - 向后兼容接口
     bool registerGTX312L(GTX312L* device);
     void unregisterGTX312L(GTX312L* device);
     
@@ -294,7 +299,8 @@ private:
     static InputManager* instance_;
     
     // 设备管理
-    std::vector<GTX312L*> gtx312l_devices_;                    // 注册的GTX312L设备列表
+    std::vector<TouchSensor*> touch_sensor_devices_;           // 注册的TouchSensor设备列表
+    std::vector<GTX312L*> gtx312l_devices_;                    // 注册的GTX312L设备列表（向后兼容）
 
     
     // 触摸状态管理
