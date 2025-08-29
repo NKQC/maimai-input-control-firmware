@@ -3,23 +3,9 @@
 
 #include <stdint.h>
 #include "graphics_engine.h"
+#include "fonts/font_data.h"
 
 // FontSize枚举已在graphics_engine.h中定义
-
-// 字符点阵数据结构
-struct CharBitmap {
-    uint8_t width;
-    uint8_t height;
-    const uint8_t* data;
-};
-
-// ASCII字符范围
-#define ASCII_START 32
-#define ASCII_END 126
-#define ASCII_COUNT (ASCII_END - ASCII_START + 1)
-
-// 常用中文字符数量（可根据需要调整）
-#define CHINESE_CHAR_COUNT 500
 
 // 中文字符映射结构
 struct ChineseCharMap {
@@ -55,18 +41,7 @@ private:
     static const CharBitmap* find_chinese_char(uint32_t unicode, FontSize size);
 };
 
-// 字体数据声明（在font_data.cpp中定义）
-extern const CharBitmap ascii_font_small[ASCII_COUNT];
-extern const CharBitmap ascii_font_medium[ASCII_COUNT];
-extern const CharBitmap ascii_font_large[ASCII_COUNT];
-
-extern const ChineseCharMap chinese_font_small[CHINESE_CHAR_COUNT];
-extern const ChineseCharMap chinese_font_medium[CHINESE_CHAR_COUNT];
-extern const ChineseCharMap chinese_font_large[CHINESE_CHAR_COUNT];
-
-// 默认字符点阵（用于未找到的字符）
-extern const CharBitmap default_char_small;
-extern const CharBitmap default_char_medium;
-extern const CharBitmap default_char_large;
+// 字体数据现在使用namespace格式存储在fonts/目录中
+// 不再需要外部声明，通过namespace访问
 
 #endif // FONT_SYSTEM_H

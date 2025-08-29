@@ -1,6 +1,8 @@
 #include "font_system.h"
 #include "graphics_engine.h"
+#include "fonts/font_data.h"
 #include <cstring>
+#include <avr/pgmspace.h>
 
 void FontSystem::draw_ascii_char(char c, int16_t x, int16_t y, Color color, FontSize size, GraphicsEngine* engine) {
     if (!engine || c < ASCII_START || c > ASCII_END) return;
@@ -21,18 +23,8 @@ int16_t FontSystem::get_ascii_char_width(char c, FontSize size) {
 const CharBitmap* FontSystem::get_ascii_char_bitmap(char c, FontSize size) {
     if (c < ASCII_START || c > ASCII_END) return nullptr;
     
-    int index = c - ASCII_START;
-    
-    switch (size) {
-        case FontSize::SMALL:
-            return &ascii_font_small[index];
-        case FontSize::MEDIUM:
-            return &ascii_font_medium[index];
-        case FontSize::LARGE:
-            return &ascii_font_large[index];
-        default:
-            return &ascii_font_medium[index];
-    }
+    // 使用新的namespace格式字库
+    return FontData::ASCII::get_char_data(c);
 }
 
 void FontSystem::draw_chinese_char(uint32_t unicode, int16_t x, int16_t y, Color color, FontSize size, GraphicsEngine* engine) {
@@ -42,18 +34,13 @@ void FontSystem::draw_chinese_char(uint32_t unicode, int16_t x, int16_t y, Color
     if (bitmap) {
         draw_char_bitmap(bitmap, x, y, color, engine);
     } else {
-        // 使用默认字符
-        const CharBitmap* default_bitmap = nullptr;
-        switch (size) {
-            case FontSize::SMALL:
-                default_bitmap = &default_char_small;
-                break;
-            case FontSize::MEDIUM:
-                default_bitmap = &default_char_medium;
-                break;
-            case FontSize::LARGE:
-                default_bitmap = &default_char_large;
-                break;
+        // 使用默认字符 - 使用空格字符作为默认
+        const CharBitmap* default_bitmap = FontData::ASCII::get_char_data(' ');
+        if (!default_bitmap) {
+            // 如果找不到空格字符，创建一个简单的默认字符
+            static const uint8_t default_data[] = {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00};
+            static const CharBitmap default_char = {8, 14, default_data};
+            default_bitmap = &default_char;
         }
         if (default_bitmap) {
             draw_char_bitmap(default_bitmap, x, y, color, engine);
@@ -67,17 +54,10 @@ int16_t FontSystem::get_chinese_char_width(uint32_t unicode, FontSize size) {
         return bitmap->width;
     }
     
-    // 返回默认中文字符宽度
-    switch (size) {
-        case FontSize::SMALL:
-            return 8;
-        case FontSize::MEDIUM:
-            return 12;
-        case FontSize::LARGE:
-            return 16;
-        default:
-            return 12;
-    }
+    // 返回默认中文字符宽度 - 统一使用12px宽度
+    // 由于FontSize枚举已统一为14px高度，这里也统一宽度
+    (void)size; // 避免未使用参数警告
+    return 12; // 统一使用12px宽度，与中文字体文件中的FONT_WIDTH保持一致
 }
 
 const CharBitmap* FontSystem::get_chinese_char_bitmap(uint32_t unicode, FontSize size) {
@@ -129,16 +109,8 @@ int FontSystem::utf8_char_length(const char* utf8) {
 }
 
 const CharBitmap* FontSystem::get_font_data(FontSize size) {
-    switch (size) {
-        case FontSize::SMALL:
-            return ascii_font_small;
-        case FontSize::MEDIUM:
-            return ascii_font_medium;
-        case FontSize::LARGE:
-            return ascii_font_large;
-        default:
-            return ascii_font_medium;
-    }
+    // 返回默认的ASCII字符数据 - 这个函数可能需要重新设计
+    return FontData::ASCII::get_char_data('A'); // 临时返回字符A作为示例
 }
 
 void FontSystem::draw_char_bitmap(const CharBitmap* bitmap, int16_t x, int16_t y, Color color, GraphicsEngine* engine) {
@@ -160,35 +132,26 @@ void FontSystem::draw_char_bitmap(const CharBitmap* bitmap, int16_t x, int16_t y
 }
 
 const CharBitmap* FontSystem::find_chinese_char(uint32_t unicode, FontSize size) {
-    const ChineseCharMap* char_map = nullptr;
-    int count = CHINESE_CHAR_COUNT;
+    // 使用新的namespace格式中文字库
+    const ChineseChar* chinese_char = FontData::Chinese::find_chinese_char(unicode);
     
-    switch (size) {
-        case FontSize::SMALL:
-            char_map = chinese_font_small;
-            break;
-        case FontSize::MEDIUM:
-            char_map = chinese_font_medium;
-            break;
-        case FontSize::LARGE:
-            char_map = chinese_font_large;
-            break;
-        default:
-            char_map = chinese_font_medium;
-            break;
+    if (chinese_char) {
+        // 创建临时CharBitmap结构
+        static CharBitmap temp_bitmap;
+        temp_bitmap.width = chinese_char->width;
+        temp_bitmap.height = chinese_char->height;
+        temp_bitmap.data = chinese_char->data;
+        return &temp_bitmap;
     }
     
-    if (!char_map) return nullptr;
-    
-    // 线性搜索（可以优化为二分搜索如果字符按Unicode排序）
-    for (int i = 0; i < count; i++) {
-        if (char_map[i].unicode == unicode) {
-            return char_map[i].bitmap;
-        }
-        // 如果遇到0，说明到了数组末尾
-        if (char_map[i].unicode == 0) {
-            break;
-        }
+    // 如果找不到字符，返回默认字符
+    const ChineseChar* default_char = FontData::Chinese::get_default_chinese_char();
+    if (default_char) {
+        static CharBitmap default_bitmap;
+        default_bitmap.width = default_char->width;
+        default_bitmap.height = default_char->height;
+        default_bitmap.data = default_char->data;
+        return &default_bitmap;
     }
     
     return nullptr;

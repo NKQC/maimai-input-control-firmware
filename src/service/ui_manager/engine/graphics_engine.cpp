@@ -425,7 +425,8 @@ int16_t GraphicsEngine::get_chinese_text_width(const char* utf8_text, FontSize s
 }
 
 int16_t GraphicsEngine::get_font_height(FontSize size) const {
-    return (int16_t)size;
+    // 统一使用14px高度标准字库
+    return 14;
 }
 
 Color GraphicsEngine::rgb_to_color(uint8_t r, uint8_t g, uint8_t b) {

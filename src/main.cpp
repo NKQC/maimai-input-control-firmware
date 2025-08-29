@@ -381,10 +381,6 @@ void error_handler(const char* error_msg) {
         usb_logs->flush();
     }
     
-    // 如果UI管理器可用，显示错误界面
-    if (ui_manager) {
-        ui_manager->show_status_info();
-    }
     emergency_shutdown();
 }
 

@@ -35,6 +35,7 @@ typedef uint16_t Color;
 #define COLOR_SUCCESS     0x07E0  // 成功绿色
 #define COLOR_WARNING     0xFFE0  // 警告黄色
 #define COLOR_ERROR       0xF800  // 错误红色
+#define COLOR_INFO        0x06BF  // 信息蓝色 (与PRIMARY相同)
 
 // 点结构
 struct Point {
@@ -49,11 +50,11 @@ struct Rect {
         : x(x), y(y), width(w), height(h) {}
 };
 
-// 字体大小枚举
+// 字体大小枚举 - 统一使用14px高度标准
 enum class FontSize {
-    SMALL = 8,   // 8x8像素
-    MEDIUM = 12, // 12x12像素
-    LARGE = 16   // 16x16像素
+    SMALL = 14,   // 标准14px高度，小字体
+    MEDIUM = 14,  // 标准14px高度，中等字体（默认）
+    LARGE = 14    // 标准14px高度，大字体
 };
 
 // 文本对齐方式

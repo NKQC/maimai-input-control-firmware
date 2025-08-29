@@ -434,11 +434,6 @@ void InputManager::cancelBinding() {
         // 恢复原始通道状态
         restoreChannelStates();
         
-        // 清除UI绑定状态
-        if (ui_manager_) {
-            ui_manager_->clear_binding_status();
-        }
-        
         // 重置绑定状态
         binding_active_ = false;
         binding_callback_ = nullptr;
@@ -1296,8 +1291,6 @@ void InputManager::processSerialBinding() {
                  if (ui_manager_) {
                      char message[64];
                      snprintf(message, sizeof(message), "绑定区域: %s (%d/34)", getMai2AreaName(current_area), current_binding_index_ + 1);
-                     ui_manager_->show_binding_status(message, false);
-                     ui_manager_->update_binding_progress(current_binding_index_ + 1, "Serial绑定进行中");
                  }
             } else {
                 // 所有区域绑定完成
@@ -1346,11 +1339,6 @@ void InputManager::processSerialBinding() {
                 
                 if (binding_callback_) {
                     binding_callback_(true, "Serial binding completed successfully");
-                }
-                
-                // 清除UI绑定状态
-                if (ui_manager_) {
-                    ui_manager_->clear_binding_status();
                 }
                 
                 // 恢复原始通道状态
@@ -1477,11 +1465,6 @@ void InputManager::processAutoSerialBinding() {
                     binding_callback_(true, message);
                 }
                 
-                // 清除UI绑定状态
-                if (ui_manager_) {
-                    ui_manager_->clear_binding_status();
-                }
-                
                 // 恢复原始通道状态
                 restoreChannelStates();
                 
@@ -1591,11 +1574,6 @@ void InputManager::processHIDBinding() {
                     char message[128];
                     snprintf(message, sizeof(message), "HID绑定完成，坐标:(%.2f,%.2f)", hid_binding_x_, hid_binding_y_);
                     binding_callback_(true, message);
-                }
-                
-                // 清除UI绑定状态
-                if (ui_manager_) {
-                    ui_manager_->clear_binding_status();
                 }
                 
                 // 恢复原始通道状态
