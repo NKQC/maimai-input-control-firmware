@@ -1,12 +1,14 @@
 #include "ui_manager.h"
-#include "page/page_types.h"
+#include "page_registry.h"
+#include "page/main_page.h"
+
 #include "../../service/input_manager/input_manager.h"
 #include "../../service/light_manager/light_manager.h"
 #include "../../service/config_manager/config_manager.h"
 #include "../../protocol/usb_serial_logs/usb_serial_logs.h"
 #include "../../protocol/st7735s/st7735s.h"
-#include "engine/font_system.h"
-#include "page/page_template.h"
+#include "engine/fonts/font_data.h"
+#include "engine/page_construction/page_template.h"
 #include "pico/time.h"
 #include "pico/stdlib.h"
 #include "hardware/gpio.h"
@@ -65,13 +67,18 @@ bool ui_manager_load_config_from_manager(ConfigManager* config_manager) {
 }
 
 // PageManager访问方法
-ui::PageManager* UIManager::get_page_manager() const {
-    return page_manager_;
+// 新页面引擎相关函数
+bool UIManager::switch_to_page(const std::string& page_name) {
+    // 简化的页面切换，直接更新页面名称
+    current_page_name_ = page_name;
+    current_menu_index_ = 0;
+    last_activity_time_ = to_ms_since_boot(get_absolute_time());
+    log_debug("Switched to page: " + page_name);
+    return true;
 }
 
-// 辅助函数：将UIPage枚举转换为字符串
-std::string UIManager::page_id_to_string(ui::UIPage page_id) const {
-    return ui::page_id_to_string(page_id);
+const std::string& UIManager::get_current_page_name() const {
+    return current_page_name_;
 }
 
 // 配置读取函数 - 返回当前配置的副本
@@ -120,13 +127,8 @@ UIManager::UIManager()
     , input_manager_(nullptr)
     , graphics_engine_(nullptr)
     , page_template_(nullptr)
-    , use_page_template_(true)
-    , page_needs_redraw_(true)
     , current_menu_index_(0)
     , buttons_active_low_(true)
-    , framebuffer_dirty_(true)
-    , current_page_(UIPage::STATUS)
-    , previous_page_(UIPage::STATUS)
     , backlight_enabled_(true)
     , screen_off_(false)
     , last_activity_time_(0)
@@ -134,10 +136,11 @@ UIManager::UIManager()
     , needs_full_refresh_(true)
     , debug_enabled_(false)
     , last_navigation_time_(0)
-    , menu_system_(nullptr)
-    , nav_manager_(nullptr)
-    , page_manager_(nullptr)
+    , cursor_blink_timer_(0)
+    , cursor_visible_(true)
+    , current_page_name_("status")
     , has_error_(false)
+    , binding_step_(0)
     {
     
     // 初始化按钮状态
@@ -191,21 +194,12 @@ bool UIManager::init(const UIManager_Config& config) {
         return false;
     }
     
-    // 初始化构造体系统
-    menu_system_ = &MenuInteractionSystem::getInstance();
-    nav_manager_ = &PageNavigationManager::getInstance();
+    // 初始化页面注册系统
+    ui::PageRegistry::get_instance().register_default_pages();
+    log_debug("Page registry initialized with default pages");
     
-    // 创建并初始化PageManager
-    page_manager_ = new ui::PageManager();
-    if (!page_manager_->init(graphics_engine_)) {
-        log_error("Failed to initialize page manager");
-        return false;
-    }
-    
-    log_debug("Construct system initialized with predefined pages");
-    
-    // 设置初始页面为状态页面
-    set_current_page(UIPage::STATUS);
+    // 切换到主界面
+    switch_to_page("main");
     
     initialized_ = true;
     last_activity_time_ = to_ms_since_boot(get_absolute_time());
@@ -256,33 +250,34 @@ void UIManager::handle_input() {
     // 处理所有按钮状态变化
     for (int i = 0; i < 3; i++) {
         if (button_states[i] != joystick_buttons_[i]) {
+            bool was_pressed = joystick_buttons_[i];
             joystick_buttons_[i] = button_states[i];
             
             if (button_states[i]) { // 按钮按下
                 button_press_times_[i] = current_time;
-                statistics_.joystick_events++;
                 last_activity_time_ = current_time;
                 
                 // 如果息屏，先唤醒屏幕
                 if (screen_off_) {
                     wake_screen();
-                } else {
-                    // 使用统一的摇杆输入处理接口
-                    ui::JoystickButton button;
-                    switch (i) {
-                        case 0: // A按钮 - 向上导航
-                            button = ui::JoystickButton::BUTTON_A;
-                            break;
-                        case 1: // B按钮 - 向下导航
-                            button = ui::JoystickButton::BUTTON_B;
-                            break;
-                        case 2: // 确认按钮
-                            button = ui::JoystickButton::BUTTON_CONFIRM;
-                            break;
-                        default:
-                            continue;
+                }
+                // 按下时不触发操作，等待释放
+            } else if (was_pressed) { // 按钮释放（从按下状态变为释放状态）
+                last_activity_time_ = current_time;
+                
+                // 只有在屏幕开启时才处理按钮释放事件
+                if (!screen_off_) {
+                    // 计算按下持续时间
+                    uint32_t press_duration = current_time - button_press_times_[i];
+                    
+                    // 防抖处理：只有按下时间超过最小阈值才处理
+                    if (press_duration >= 30) { // 减少防抖时间提高响应性
+                        // 调用统一的摇杆输入处理接口
+                        bool handled = handle_joystick_input(i);
+                        if (handled) {
+                            log_debug("Joystick input handled: button " + std::to_string(i));
+                        }
                     }
-                    handle_joystick_input(button);
                 }
             }
         }
@@ -294,6 +289,8 @@ void UIManager::deinit() {
     if (!initialized_) {
         return;
     }
+    
+    // 页面注册器已移除，无需清理
     
     // 清理显示系统
     deinit_display();
@@ -341,8 +338,6 @@ bool UIManager::init_display() {
     
     // 清空framebuffer
     graphics_engine_->clear(COLOR_BLACK);
-    framebuffer_dirty_ = true;
-    
     // 初始化页面模板系统
     if (!init_page_template()) {
         log_error("Failed to initialize page template system");
@@ -369,23 +364,24 @@ void UIManager::deinit_display() {
 
 // 显示刷新函数
 void UIManager::refresh_display() {
-    if (!framebuffer_dirty_) return;
-
-    bool result = display_device_->write_buffer(framebuffer_, SCREEN_BUFFER_SIZE);
-    if (result) {
-        framebuffer_dirty_ = false;
-    }
+    display_device_->write_buffer(framebuffer_, SCREEN_BUFFER_SIZE);
 }
 
 // 30fps刷新任务
 void UIManager::refresh_task_30fps() {
+    if (!initialized_ || !display_device_) {
+        return;
+    }
+    
     uint32_t current_time = to_ms_since_boot(get_absolute_time());
     // 30fps = 33.33ms间隔
     if (current_time - last_refresh_time_ >= 33) {
-        // 检查是否需要重绘页面
-        if (page_needs_redraw_) {
-            page_needs_redraw_ = false;
-            framebuffer_dirty_ = true;
+        // 屏幕亮起时始终刷新，对于主页面也需要重绘以更新运行时长
+
+        if (page_template_) {
+            draw_page_with_template();
+            // 渲染光标指示器
+            render_cursor_indicator();
         }
         
         // 刷新显示
@@ -396,145 +392,28 @@ void UIManager::refresh_task_30fps() {
 }
 
 // 设置当前页面
-bool UIManager::set_current_page(UIPage page) {
-    if (!is_page_valid(page)) {
-        return false;
-    }
-    
-    if (current_page_ == page) {
-        return true;
-    }
-    
-    // 更新页面状态
-    previous_page_ = current_page_;
-    current_page_ = page;
-    
-    // 重置光标位置到第一项
-    current_menu_index_ = 0;
-    
-    // 更新菜单系统的当前页面
-    if (menu_system_) {
-        menu_system_->switch_to_page(page);
-    }
-    
-    // 更新页面模板的选中索引
-    if (use_page_template_ && page_template_) {
-        page_template_->set_selected_index(current_menu_index_);
-    }
-    
-    // 标记需要重绘
-    page_needs_redraw_ = true;
-    
-    // 重置页面数据
-    reset_page_data();
-    
-    // 记录活动时间
-    last_activity_time_ = to_ms_since_boot(get_absolute_time());
-    
-    log_debug("Page switched from " + std::to_string(static_cast<int>(previous_page_)) + 
-              " to " + std::to_string(static_cast<int>(current_page_)));
-    
-    return true;
-}
+// set_current_page函数已删除，页面切换已改为面向对象方式
 
 // 重置页面数据
 void UIManager::reset_page_data() {
+    // 清空页面数据，让页面组件自己管理内容
     page_data_.title = "";
     page_data_.menu_items.clear();
-    page_data_.status_items.clear();
     page_data_.content = "";
     page_data_.progress_value = 0;
-    page_data_.button_states.clear();
     page_data_.selected_index = current_menu_index_; // 与当前菜单索引保持同步
     
-    // 根据页面类型设置默认数据
-    switch (current_page_) {
-        case UIPage::MAIN:
-            page_data_.title = "Main Menu";
-            page_data_.menu_items = {"Status", "Settings", "Calibration", "Diagnostics"};
-            break;
-        case UIPage::STATUS:
-            page_data_.title = "System Status";
-            page_data_.status_items = {
-                "Input Mgr: OK",
-                "Light Mgr: OK", 
-                "Display: OK",
-                "Config: OK",
-                "Touch Poll: 0/s",
-                "Key Poll: 0/s",
-                "Touch Active: 0",
-                "Key Active: 0",
-                "Uptime: 0s",
-                "Memory: OK"
-            };
-            break;
-        case UIPage::SETTINGS:
-            page_data_.title = "Settings";
-            page_data_.menu_items = {"Sensitivity", "Touch Map", "Key Map", "Guide Bind", "UART Config", "Light Map", "About"};
-            break;
-        case UIPage::SENSITIVITY:
-            page_data_.title = "Sensitivity Settings";
-            page_data_.content = "Adjust touch sensitivity";
-            // 灵敏度页面不使用菜单项，而是直接调整数值
-            break;
-        case UIPage::TOUCH_MAPPING:
-            page_data_.title = "Touch Mapping";
-            page_data_.content = "Configure touch mappings";
-            break;
-        case UIPage::KEY_MAPPING:
-            page_data_.title = "Key Mapping";
-            page_data_.content = "Configure key mappings";
-            break;
-        case UIPage::GUIDED_BINDING:
-            page_data_.title = "Guided Binding";
-            page_data_.content = "Follow the binding guide";
-            break;
-        case UIPage::LIGHT_MAPPING:
-            page_data_.title = "Light Mapping";
-            page_data_.content = "Configure light mappings";
-            break;
-        case UIPage::UART_SETTINGS:
-            page_data_.title = "UART Settings";
-            page_data_.menu_items = {"Mai2Serial Baud", "Mai2Light Baud", "Save Settings", "Reset Settings"};
-            break;
-        case UIPage::CALIBRATION:
-            page_data_.title = "Calibration";
-            page_data_.content = "Touch calibration in progress";
-            break;
-        case UIPage::DIAGNOSTICS:
-            page_data_.title = "Diagnostics";
-            page_data_.content = "System diagnostics";
-            break;
-        case UIPage::ABOUT:
-            page_data_.title = "About";
-            page_data_.content = "Maimai Input Control Firmware v3.0";
-            break;
-        case UIPage::ERROR:
-            page_data_.title = "Error";
-            page_data_.content = "System error occurred";
-            break;
-        default:
-            page_data_.title = "Unknown Page";
-            break;
-    }
+    // 重置光标位置：根据用户需求设置初始光标位置
+    // 滚动时光标在第一行(索引0)，无滚动时光标在第一个可选内容
+    current_menu_index_ = 0;
+    page_data_.selected_index = 0;
     
     // 确保选中索引在有效范围内
-    int menu_count = get_menu_item_count();
+    int menu_count = page_template_ ? page_template_->get_menu_item_count() : 0;
     if (menu_count > 0 && current_menu_index_ >= menu_count) {
         current_menu_index_ = 0;
         page_data_.selected_index = 0;
     }
-}
-
-// 销毁当前页面（已不需要，保留空函数以兼容）
-void UIManager::destroy_current_page() {
-    // 静态framebuffer模式下不需要销毁页面对象
-    // 页面数据已通过reset_page_data()重置
-}
-
-// 获取当前页面
-UIPage UIManager::get_current_page() const {
-    return current_page_;
 }
 
 // 处理导航输入
@@ -542,7 +421,7 @@ void UIManager::handle_navigation_input(bool up) {
     uint32_t current_time = to_ms_since_boot(get_absolute_time());
     
     // 防抖处理
-    if (current_time - last_navigation_time_ < 150) { // 减少防抖时间以提高响应性
+    if (current_time - last_navigation_time_ < 150) {
         return;
     }
     last_navigation_time_ = current_time;
@@ -553,82 +432,193 @@ void UIManager::handle_navigation_input(bool up) {
     // 如果屏幕关闭，唤醒屏幕
     if (screen_off_) {
         wake_screen();
-        return; // 唤醒后不处理导航，避免意外操作
+        return;
     }
     
-    // 通用菜单导航逻辑
-    int menu_count = get_menu_item_count();
-    if (menu_count <= 0) {
-        return; // 当前页面没有菜单项
+    if (!page_template_) {
+        return;
     }
     
-    // 确保当前索引在有效范围内
-    if (current_menu_index_ < 0 || current_menu_index_ >= menu_count) {
-        current_menu_index_ = 0;
+    // 获取目标行数据
+    const auto& target_lines = page_template_->is_scroll_enabled() ? 
+                              page_template_->get_all_lines() : page_template_->get_lines();
+    
+    if (target_lines.empty()) {
+        return;
     }
     
-    // 执行导航
-    if (up) {
-        current_menu_index_--;
-        if (current_menu_index_ < 0) {
-            current_menu_index_ = menu_count - 1; // 循环到最后一项
+    bool is_scrollable = page_template_->is_scroll_enabled();
+    int max_index;
+    
+    if (is_scrollable) {
+        // 可滚动模式：Z字型选择所有区域
+        max_index = target_lines.size() - 1;
+        
+        // 确保当前索引在有效范围内
+        if (current_menu_index_ < 0 || current_menu_index_ > max_index) {
+            current_menu_index_ = 0;
         }
-    } else {
-        current_menu_index_++;
-        if (current_menu_index_ >= menu_count) {
-            current_menu_index_ = 0; // 循环到第一项
+        
+        // 执行导航
+        if (up) {
+            current_menu_index_--;
+            if (current_menu_index_ < 0) {
+                current_menu_index_ = max_index; // 循环到最后一项
+            }
+        } else {
+            current_menu_index_++;
+            if (current_menu_index_ > max_index) {
+                current_menu_index_ = 0; // 循环到第一项
+            }
         }
-    }
-    
-    // 更新页面模板的选中索引
-    if (use_page_template_ && page_template_) {
+        
+        // 让滚动跟随光标：使用新的 set_visible_end_line 方法
+        // 这样光标始终可见，滚动会自动调整以跟随光标位置
+        page_template_->set_visible_end_line(current_menu_index_);
         page_template_->set_selected_index(current_menu_index_);
-    }
-    
-    // 标记页面需要重绘
-    page_needs_redraw_ = true;
-    
-    // 触发导航事件
-    if (event_callback_) {
-        UIEvent event = up ? UIEvent::JOYSTICK_UP : UIEvent::JOYSTICK_DOWN;
-        event_callback_(event, "menu_navigation", current_menu_index_);
+        
+    } else {
+        // 不可滚动模式：只选择可触发区域
+        int menu_count = page_template_->get_menu_item_count();
+        if (menu_count <= 0) {
+            return;
+        }
+        
+        // 确保当前索引在有效范围内
+        if (current_menu_index_ < 0 || current_menu_index_ >= menu_count) {
+            current_menu_index_ = 0;
+        }
+        
+        // 执行导航
+        if (up) {
+            current_menu_index_--;
+            if (current_menu_index_ < 0) {
+                current_menu_index_ = menu_count - 1;
+            }
+        } else {
+            current_menu_index_++;
+            if (current_menu_index_ >= menu_count) {
+                current_menu_index_ = 0;
+            }
+        }
+        
+        // 更新页面模板的选中索引
+        page_template_->set_selected_index(current_menu_index_);
     }
     
     log_debug("Navigation: " + std::string(up ? "UP" : "DOWN") + 
               ", Index: " + std::to_string(current_menu_index_) + 
-              "/" + std::to_string(menu_count));
+              ", Scrollable: " + (is_scrollable ? "true" : "false"));
 }
 
 // 处理确认输入
 void UIManager::handle_confirm_input() {
-    switch (current_page_) {
-        case UIPage::MAIN:
-            // 根据菜单索引切换页面
-            switch (current_menu_index_) {
-                case 0: set_current_page(UIPage::STATUS); break;
-                case 1: set_current_page(UIPage::SETTINGS); break;
-                case 2: set_current_page(UIPage::CALIBRATION); break;
-                case 3: set_current_page(UIPage::DIAGNOSTICS); break;
-                case 4: set_current_page(UIPage::SENSITIVITY); break;
-                case 5: set_current_page(UIPage::LIGHT_MAPPING); break;
-                case 6: set_current_page(UIPage::ABOUT); break;
-                case 7: /* 退出或其他操作 */ break;
+    // 使用PageTemplate的LineConfig跳转机制
+    if (page_template_) {
+        bool is_scrollable = page_template_->is_scroll_enabled();
+        
+        if (is_scrollable) {
+            // 可滚动模式：需要从所有行中找到当前选中行的配置
+            const auto& all_lines = page_template_->get_all_lines();
+            if (current_menu_index_ >= 0 && current_menu_index_ < (int)all_lines.size()) {
+                LineConfig line_config = all_lines[current_menu_index_];
+                
+                // 检查是否是菜单跳转类型
+                if (line_config.type == LineType::MENU_JUMP && !line_config.target_page_name.empty()) {
+                    // 检查目标页面是否存在
+                    std::vector<std::string> available_pages = get_available_pages();
+                    bool page_exists = std::find(available_pages.begin(), available_pages.end(), line_config.target_page_name) != available_pages.end();
+                    
+                    if (!page_exists) {
+                        log_error("Target page does not exist: " + line_config.target_page_name + ", switching to main page");
+                        switch_to_page("main");
+                        return;
+                    }
+                    
+                    // 保存当前页面状态到导航管理器
+                    if (nav_manager_) {
+                        int scroll_pos = page_template_->get_scroll_position();
+                        nav_manager_->push_page(current_page_name_, current_menu_index_, scroll_pos);
+                    }
+                    // 使用LineConfig的target_page_name进行跳转
+                    switch_to_page(line_config.target_page_name);
+                    return;
+                }
+                // 检查是否是返回项类型
+                else if (line_config.type == LineType::BACK_ITEM) {
+                    // 处理返回操作，恢复上一页状态
+                    if (nav_manager_ && nav_manager_->can_go_back()) {
+                        PageState prev_state = nav_manager_->pop_page();
+                        current_page_name_ = prev_state.page_name;
+                        current_menu_index_ = prev_state.cursor_position;
+                        
+                        // 重置页面数据并恢复状态
+                        reset_page_data();
+                        
+                        // 恢复光标和滚动位置
+                        if (page_template_) {
+                            page_template_->set_selected_index(current_menu_index_);
+                            page_template_->set_scroll_position(prev_state.scroll_position);
+                        }
+                        
+                        last_activity_time_ = to_ms_since_boot(get_absolute_time());
+                        log_debug("Returned to page: " + current_page_name_ + 
+                                 ", cursor: " + std::to_string(current_menu_index_) + 
+                                 ", scroll: " + std::to_string(prev_state.scroll_position));
+                    }
+                    return;
+                }
             }
-            break;
+        } else {
+            // 不可滚动模式：使用原有逻辑
+            int menu_count = page_template_->get_menu_item_count();
+            if (menu_count > 0 && current_menu_index_ >= 0 && current_menu_index_ < menu_count) {
+                // 获取当前选中的菜单项配置
+                LineConfig line_config = page_template_->get_line_config(current_menu_index_);
             
-        case UIPage::SETTINGS:
-            // 根据菜单索引切换到设置子页面
-            switch (current_menu_index_) {
-                case 0: set_current_page(UIPage::UART_SETTINGS); break;
-                // 可以在这里添加更多设置子页面
-                default: break;
+                // 检查是否是菜单跳转类型
+                if (line_config.type == LineType::MENU_JUMP && !line_config.target_page_name.empty()) {
+                // 保存当前页面状态到导航管理器
+                if (nav_manager_) {
+                    int scroll_pos = page_template_->get_scroll_position();
+                    nav_manager_->push_page(current_page_name_, current_menu_index_, scroll_pos);
+                }
+                // 使用LineConfig的target_page_name进行跳转
+                switch_to_page(line_config.target_page_name);
+                return;
             }
-            break;
-            
-        default:
-            // 其他页面返回主页面
-            set_current_page(UIPage::MAIN);
-            break;
+            // 检查是否是返回项类型
+            else if (line_config.type == LineType::BACK_ITEM) {
+                // 处理返回操作，恢复上一页状态
+                if (nav_manager_ && nav_manager_->can_go_back()) {
+                    PageState prev_state = nav_manager_->pop_page();
+                    current_page_name_ = prev_state.page_name;
+                    current_menu_index_ = prev_state.cursor_position;
+                    
+                    // 重置页面数据并恢复状态
+                    reset_page_data();
+                    
+                    // 恢复光标和滚动位置
+                    if (page_template_) {
+                        page_template_->set_selected_index(current_menu_index_);
+                        page_template_->set_scroll_position(prev_state.scroll_position);
+                    }
+                    
+                    last_activity_time_ = to_ms_since_boot(get_absolute_time());
+                    log_debug("Returned to page: " + current_page_name_ + 
+                             ", cursor: " + std::to_string(current_menu_index_) + 
+                             ", scroll: " + std::to_string(prev_state.scroll_position));
+                }
+                return;
+            }
+            }
+        }
+    }
+    
+    // 如果没有找到跳转目标或不是跳转类型，使用默认行为
+    if (current_page_name_ != "main") {
+        // 非主页面默认返回主页面
+        switch_to_page("main");
     }
 }
 
@@ -657,7 +647,7 @@ void UIManager::deinit_page_template() {
 }
 
 void UIManager::draw_page_with_template() {
-    if (!page_template_ || !use_page_template_) {
+    if (!page_template_) {
         return;
     }
     
@@ -670,50 +660,31 @@ void UIManager::update_page_template_content() {
         return;
     }
     
-    // 根据当前页面更新模板内容
-    switch (current_page_) {
-        case UIPage::MAIN:
-            PageTemplates::create_main_menu_page(*page_template_);
-            break;
-        case UIPage::STATUS:
-            PageTemplates::create_status_page(*page_template_);
-            break;
-        case UIPage::SETTINGS:
-            PageTemplates::create_settings_page(*page_template_);
-            break;
-        case UIPage::SENSITIVITY:
-            PageTemplates::create_progress_page(*page_template_, 50.0f);
-            break;
-        case UIPage::TOUCH_MAPPING:
-            PageTemplates::create_dynamic_menu_page(*page_template_, 0);
-            break;
-        case UIPage::KEY_MAPPING:
-            PageTemplates::create_dynamic_menu_page(*page_template_, 0);
-            break;
-        case UIPage::GUIDED_BINDING:
-            PageTemplates::create_progress_page(*page_template_, binding_step_ * 10.0f);
-            break;
-        case UIPage::ERROR:
-            if (has_error_) {
-                PageTemplates::create_error_page(*page_template_);
-            }
-            break;
-        default:
-            PageTemplates::create_info_page(*page_template_);
-            break;
+    // 使用PageRegistry获取页面构造器并渲染
+    auto& registry = ui::PageRegistry::get_instance();
+    
+    // 安全检查：确保页面存在
+    if (!registry.has_page(current_page_name_)) {
+        log_error("Page not found: " + current_page_name_ + ", switching to main page");
+        current_page_name_ = "main";
+        current_menu_index_ = 0;
+        return;
     }
-}
-
-bool UIManager::enable_page_template_system(bool enable) {
-    use_page_template_ = enable;
-    if (enable && !page_template_) {
-        return init_page_template();
+    
+    auto page_constructor = registry.get_page(current_page_name_);
+    
+    if (page_constructor) {
+        // 使用面向对象的页面构造器渲染页面
+        page_constructor->render(*page_template_);
+    } else if (current_page_name_ == "error" && has_error_) {
+        // 错误页面的后备处理
+        PageTemplates::create_error_page(*page_template_);
+    } else if (current_page_name_ != "error") {
+        // 如果页面构造器为空且不是错误页面，切换到主页面
+        log_error("Page constructor is null for: " + current_page_name_);
+        current_page_name_ = "main";
+        current_menu_index_ = 0;
     }
-    return true;
-}
-
-bool UIManager::is_page_template_enabled() const {
-    return use_page_template_;
 }
 
 PageTemplate* UIManager::get_page_template() const {
@@ -732,8 +703,7 @@ void UIManager::task() {
     handle_backlight();
     handle_screen_timeout();
     
-    // 处理故障检测 - 即使息屏也要检测故障
-    handle_error_detection();
+    // 故障检测已简化，不再需要专门的处理函数
     
     // 更新统计信息
     statistics_.uptime_seconds = current_time / 1000;
@@ -747,13 +717,11 @@ void UIManager::task() {
         // 检查是否有需要唤醒屏幕的条件
         
         // 检查摇杆输入
-        if (static_config_.enable_joystick) {
-            // 简单检查摇杆状态，如有输入则唤醒
-            for (int i = 0; i < 3; i++) {
-                if (joystick_buttons_[i]) {
-                    wake_screen();
-                    break;
-                }
+        // 简单检查摇杆状态，如有输入则唤醒
+        for (int i = 0; i < 3; i++) {
+            if (joystick_buttons_[i]) {
+                wake_screen();
+                break;
             }
         }
 
@@ -868,7 +836,7 @@ bool UIManager::refresh_screen() {
     const size_t buffer_size = ST7735S_WIDTH * ST7735S_HEIGHT;
     display_device_->write_buffer(framebuffer_, buffer_size);
 
-    statistics_.total_refreshes++;
+    // 统计信息已简化，不再记录刷新次数
     return true;
 }
 
@@ -876,11 +844,6 @@ bool UIManager::refresh_screen() {
 bool UIManager::force_refresh() {
     needs_full_refresh_ = true;
     return refresh_screen();
-}
-
-// 摇杆回调已移除，简化输入处理 工具函数
-bool UIManager::is_page_valid(UIPage page) const {
-    return static_cast<int>(page) >= 0 && static_cast<int>(page) <= 7;
 }
 
 void UIManager::log_debug(const std::string& message) {
@@ -893,6 +856,21 @@ void UIManager::log_debug(const std::string& message) {
 }
 
 void UIManager::log_error(const std::string& message) {
+    auto* logger = USB_SerialLogs::get_global_instance();
+    if (logger) {
+        logger->error(message, "UIManager");
+    }
+}
+
+// 静态日志方法实现
+void UIManager::log_debug_static(const std::string& message) {
+    auto* logger = USB_SerialLogs::get_global_instance();
+    if (logger) {
+        logger->debug(message, "UIManager");
+    }
+}
+
+void UIManager::log_error_static(const std::string& message) {
     auto* logger = USB_SerialLogs::get_global_instance();
     if (logger) {
         logger->error(message, "UIManager");
@@ -924,69 +902,65 @@ bool UIManager::set_config_manager(ConfigManager* config_manager) {
     return true;
 }
 
-std::vector<UIPage> UIManager::get_available_pages() {
-    return {UIPage::MAIN, UIPage::STATUS, UIPage::SETTINGS, 
-            UIPage::CALIBRATION, UIPage::DIAGNOSTICS, 
-            UIPage::SENSITIVITY, UIPage::ABOUT};
+std::vector<std::string> UIManager::get_available_pages() {
+    // 从PageRegistry获取动态注册的页面列表
+    auto& registry = ui::PageRegistry::get_instance();
+    std::vector<std::string> registered_pages = registry.get_all_page_names();
+    
+    if (!registered_pages.empty()) {
+        return registered_pages;
+    }
+    
+    // 如果注册表为空，返回默认页面列表（包含main_menu）
+    return {"main", "main_menu", "status", "settings", 
+            "calibration", "diagnostics", 
+            "sensitivity", "about"};
 }
 
 // 统一的摇杆输入处理接口
-bool UIManager::handle_joystick_input(ui::JoystickButton button) {
+bool UIManager::handle_joystick_input(int button) {
     // 更新活动时间
     last_activity_time_ = to_ms_since_boot(get_absolute_time());
-    
-    // 优先使用MenuInteractionSystem处理
-    if (menu_system_) {
-        switch (button) {
-            case ui::JoystickButton::BUTTON_A:
-                return menu_system_->handle_joystick_up();
-            case ui::JoystickButton::BUTTON_B:
-                return menu_system_->handle_joystick_down();
-            case ui::JoystickButton::BUTTON_CONFIRM:
-                return menu_system_->handle_joystick_confirm();
-        }
-    }
-    
-    // 回退到传统处理方式
     switch (button) {
-        case ui::JoystickButton::BUTTON_A:
-            return navigate_menu(true);
-        case ui::JoystickButton::BUTTON_B:
+        case 0: // 数组索引0 = joystick_a_pin_ = GPIO 2 (下方向)
+            log_debug("Joystick DOWN pressed (GPIO 2)");
             return navigate_menu(false);
-        case ui::JoystickButton::BUTTON_CONFIRM:
+        case 1: // 数组索引1 = joystick_b_pin_ = GPIO 3 (上方向)
+            log_debug("Joystick UP pressed (GPIO 3)");
+            return navigate_menu(true);
+        case 2: // 数组索引2 = joystick_confirm_pin_ = GPIO 1 (确认)
+            log_debug("Joystick CONFIRM pressed (GPIO 1)");
             return confirm_selection();
+        default:
+            log_debug("Unknown joystick button index: " + std::to_string(button));
+            return false;
     }
-    
-    return false;
 }
 
 bool UIManager::navigate_menu(bool up) {
     handle_navigation_input(up);
-    page_needs_redraw_ = true;
     return true;
 }
 
 bool UIManager::navigate_menu_horizontal(bool right) {
     // 水平导航逻辑（用于某些页面的左右选择）
     // 目前大多数页面不需要水平导航，可以根据需要扩展
-    page_needs_redraw_ = true;
     return true;
 }
 
 bool UIManager::confirm_selection() {
     handle_confirm_input();
-    page_needs_redraw_ = true;
     return true;
 }
 
 bool UIManager::handle_back_navigation() {
     // 统一的返回导航处理
     if (nav_manager_ && nav_manager_->can_go_back()) {
-        ui::UIPage target_page = nav_manager_->pop_page();
-        return set_current_page(target_page);
+        PageState prev_state = nav_manager_->pop_page();
+        return switch_to_page(prev_state.page_name);
     } else {
         // 默认返回主页面
-        return set_current_page(UIPage::MAIN);
+        return switch_to_page("main");
     }
 }
 
@@ -996,21 +970,140 @@ void UIManager::render_cursor_indicator() {
         return;
     }
     
-    // 根据当前菜单索引渲染光标指示
-    int menu_count = get_menu_item_count();
-    if (menu_count > 0 && current_menu_index_ >= 0 && current_menu_index_ < menu_count) {
-        // 使用PageTemplate的静态方法计算光标位置
-        int16_t cursor_y = PageTemplate::get_line_y_position(current_menu_index_);
+    // 更新光标闪烁状态 (500ms闪烁，更快响应)
+    uint32_t current_time = to_ms_since_boot(get_absolute_time());
+    if (current_time - cursor_blink_timer_ >= 500) {
+        cursor_visible_ = !cursor_visible_;
+        cursor_blink_timer_ = current_time;
+    }
+    
+    if (!cursor_visible_) {
+        return;
+    }
+    
+    // 获取目标行数据
+    const auto& target_lines = page_template_->is_scroll_enabled() ? 
+                              page_template_->get_all_lines() : page_template_->get_lines();
+    
+    if (target_lines.empty()) {
+        return;
+    }
+    
+    // 实现两种光标模式
+    bool is_scrollable = page_template_->is_scroll_enabled();
+    int actual_line_index = -1;
+    
+    if (is_scrollable) {
+        // 可滚动模式：Z字型选择所有区域（包括文本）
+        if (current_menu_index_ >= 0 && current_menu_index_ < (int)target_lines.size()) {
+            actual_line_index = current_menu_index_;
+        }
+    } else {
+        // 不可滚动模式：只选择可触发区域
+        int menu_item_counter = 0;
+        for (int i = 0; i < (int)target_lines.size(); ++i) {
+            if (!target_lines[i].text.empty() && 
+                (target_lines[i].type == LineType::MENU_JUMP || 
+                 target_lines[i].type == LineType::INT_SETTING || 
+                 target_lines[i].type == LineType::BUTTON_ITEM || 
+                 target_lines[i].type == LineType::BACK_ITEM)) {
+                if (menu_item_counter == current_menu_index_) {
+                    actual_line_index = i;
+                    break;
+                }
+                menu_item_counter++;
+            }
+        }
+    }
+    
+    // 只有找到有效行时才显示光标
+    if (actual_line_index >= 0 && actual_line_index < (int)target_lines.size()) {
+        // 在滚动模式下，需要转换为可见行索引
+        int visible_line_index = actual_line_index;
+        if (page_template_->is_scroll_enabled()) {
+            int display_start = page_template_->get_scroll_start_index();
+            visible_line_index = actual_line_index - display_start;
+            
+            // 光标应该始终渲染，因为滚动会跟随光标确保其可见
+            // 如果计算出的可见行索引超出范围，则进行边界限制
+            if (visible_line_index < 0) {
+                visible_line_index = 0;
+            } else if (visible_line_index >= page_template_->get_visible_lines_count()) {
+                visible_line_index = page_template_->get_visible_lines_count() - 1;
+            }
+        }
         
-        // 绘制光标指示符 - 使用更醒目的样式
-        // 方案1: 左侧箭头指示符
-        graphics_engine_->draw_text(">", 2, cursor_y + 1, COLOR_PRIMARY, FontSize::MEDIUM);
+        // 获取行矩形区域
+        Rect line_rect;
+        if (page_template_->is_split_screen_enabled()) {
+            // 分屏模式下需要正确判断光标在左侧还是右侧
+            // 需要根据菜单项索引来确定是在左侧还是右侧内容中
+            
+            // 计算左侧可交互菜单项数量
+            const auto& left_lines = page_template_->get_left_lines();
+            int left_menu_count = 0;
+            for (const auto& line : left_lines) {
+                if (!line.text.empty() && 
+                    (line.type == LineType::MENU_JUMP || 
+                     line.type == LineType::INT_SETTING || 
+                     line.type == LineType::BUTTON_ITEM || 
+                     line.type == LineType::BACK_ITEM)) {
+                    left_menu_count++;
+                }
+            }
+            
+            bool is_left_side = (current_menu_index_ < left_menu_count);
+            int local_line_index;
+            
+            if (is_left_side) {
+                // 在左侧内容中，找到对应的行索引
+                local_line_index = 0;
+                int menu_counter = 0;
+                for (int i = 0; i < (int)left_lines.size() && i < 4; i++) {
+                    if (!left_lines[i].text.empty() && 
+                        (left_lines[i].type == LineType::MENU_JUMP || 
+                         left_lines[i].type == LineType::INT_SETTING || 
+                         left_lines[i].type == LineType::BUTTON_ITEM || 
+                         left_lines[i].type == LineType::BACK_ITEM)) {
+                        if (menu_counter == current_menu_index_) {
+                            local_line_index = i;
+                            break;
+                        }
+                        menu_counter++;
+                    }
+                }
+                line_rect = page_template_->get_split_left_rect(local_line_index);
+            } else {
+                // 在右侧内容中，找到对应的行索引
+                const auto& right_lines = page_template_->get_right_lines();
+                local_line_index = 0;
+                int menu_counter = 0;
+                int right_menu_index = current_menu_index_ - left_menu_count;
+                for (int i = 0; i < (int)right_lines.size() && i < 4; i++) {
+                    if (!right_lines[i].text.empty() && 
+                        (right_lines[i].type == LineType::MENU_JUMP || 
+                         right_lines[i].type == LineType::INT_SETTING || 
+                         right_lines[i].type == LineType::BUTTON_ITEM || 
+                         right_lines[i].type == LineType::BACK_ITEM)) {
+                        if (menu_counter == right_menu_index) {
+                            local_line_index = i;
+                            break;
+                        }
+                        menu_counter++;
+                    }
+                }
+                line_rect = page_template_->get_split_right_rect(local_line_index);
+            }
+        } else {
+            line_rect = PageTemplate::get_line_rect(visible_line_index);
+        }
         
-        // 方案2: 可选的高亮背景框（注释掉，可根据需要启用）
-        // graphics_engine_->draw_rect(line_rect.x, line_rect.y, line_rect.width, line_rect.height, COLOR_SELECTION_BG, false);
+        // 扩展光标区域，上下各扩展2像素，避免遮挡字体
+        line_rect.y -= 2;
+        line_rect.height += 4;
         
-        // 方案3: 右侧状态指示器（注释掉，可根据需要启用）
-        // graphics_engine_->draw_status_indicator(line_rect.x + line_rect.width - 8, cursor_y + 2, 4, COLOR_PRIMARY, true);
+        // 绘制包围框光标
+        graphics_engine_->draw_rect(line_rect, COLOR_WHITE);
     }
 }
 
@@ -1018,43 +1111,7 @@ int UIManager::get_current_menu_index() const {
     return current_menu_index_;
 }
 
-int UIManager::get_menu_item_count() const {
-    // 如果使用页面模板系统，从模板获取菜单项数量
-    if (use_page_template_ && page_template_) {
-        return page_template_->get_menu_item_count();
-    }
-    
-    // 回退到基于页面类型的静态菜单项数量
-    switch (current_page_) {
-        case UIPage::MAIN:
-            return 7; // 主菜单: 状态、设置、灵敏度、触摸映射、按键映射、校准、关于
-        case UIPage::SETTINGS:
-            return 6; // 设置菜单: UART设置、灯光映射、引导绑定、诊断、重置、返回
-        case UIPage::SENSITIVITY:
-            return 4; // 灵敏度页面: 自动调节、手动调节、保存设置、返回
-        case UIPage::TOUCH_MAPPING:
-            return 3; // 触摸映射: 开始映射、清除映射、返回
-        case UIPage::KEY_MAPPING:
-            return 4; // 按键映射: 开始映射、清除所有映射、清除逻辑映射、返回
-        case UIPage::UART_SETTINGS:
-            return 4; // UART设置: Mai2Serial波特率、Mai2Light波特率、保存、返回
-        case UIPage::GUIDED_BINDING:
-            return 2; // 引导绑定: 开始绑定、返回
-        case UIPage::LIGHT_MAPPING:
-            return 4; // 灯光映射: 选择区域、保存映射、清除映射、返回
-        case UIPage::CALIBRATION:
-            return 2; // 校准页面: 开始校准、返回
-        case UIPage::DIAGNOSTICS:
-            return 3; // 诊断页面: 刷新数据、测试显示、返回
-        case UIPage::ABOUT:
-            return 1; // 关于页面: 返回
-        case UIPage::ERROR:
-            return 2; // 错误页面: 重试、返回
-        case UIPage::STATUS:
-        default:
-            return 0; // 状态页面和其他页面通常没有菜单项
-    }
-}
+
 
 bool UIManager::set_screen_timeout(uint16_t timeout_seconds) {
     static_config_.screen_timeout = timeout_seconds;
@@ -1080,33 +1137,6 @@ bool UIManager::wake_screen() {
 
 void UIManager::enable_debug_output(bool enabled) {
     debug_enabled_ = enabled;
-}
-
-void UIManager::handle_error_detection() {
-    // 检查全局故障状态
-    if (global_has_error_ && !has_error_) {
-        has_error_ = true;
-        current_error_ = global_error_;
-        add_error_to_history(current_error_);
-        set_current_page(UIPage::ERROR);
-    }
-}
- 
-std::string UIManager::error_type_to_string(ErrorType type) const {
-    switch (type) {
-        case ErrorType::NONE: return "None";
-        case ErrorType::HARDWARE_INIT: return "Hardware Init";
-        case ErrorType::DISPLAY_ERROR: return "Display Error";
-        case ErrorType::INPUT_ERROR: return "Input Error";
-        case ErrorType::LIGHT_ERROR: return "Light Error";
-        case ErrorType::CONFIG_ERROR: return "Config Error";
-        case ErrorType::COMMUNICATION_ERROR: return "Communication Error";
-        case ErrorType::MEMORY_ERROR: return "Memory Error";
-        case ErrorType::SENSOR_ERROR: return "Sensor Error";
-        case ErrorType::CALIBRATION_ERROR: return "Calibration Error";
-        case ErrorType::UNKNOWN_ERROR: return "Unknown Error";
-        default: return "Unknown";
-    }
 }
 
 void UIManager::add_error_to_history(const ErrorInfo& error) {

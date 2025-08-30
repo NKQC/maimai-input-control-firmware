@@ -364,11 +364,6 @@ void InputManager::startSerialBinding(InteractiveBindingCallback callback) {
     current_binding_index_ = 0;
     binding_start_time_ = to_ms_since_boot(get_absolute_time());
     
-    // 通过UI管理器显示绑定开始状态
-    if (ui_manager_) {
-        ui_manager_->show_binding_status("开始Serial绑定", false);
-    }
-    
     // 备份当前通道状态并启用所有通道
     backupChannelStates();
     enableAllChannels();
@@ -392,12 +387,7 @@ void InputManager::startHIDBinding(InteractiveBindingCallback callback) {
     hid_binding_channel_ = 0;
     hid_binding_x_ = 0.0f;
     hid_binding_y_ = 0.0f;
-    
-    // 通过UI管理器显示HID绑定开始状态
-    if (ui_manager_) {
-        ui_manager_->show_binding_status("开始HID绑定", false);
-    }
-    
+
     // 备份当前通道状态并启用所有通道
     backupChannelStates();
     enableAllChannels();
@@ -415,11 +405,6 @@ bool InputManager::startAutoSerialBinding() {
     binding_state_ = BindingState::AUTO_SERIAL_BINDING_INIT;
     current_binding_index_ = 0;
     binding_start_time_ = to_ms_since_boot(get_absolute_time());
-    
-    // 通过UI管理器显示自动绑定开始状态
-    if (ui_manager_) {
-        ui_manager_->show_binding_status("开始自动Serial绑定", false);
-    }
     
     // 备份当前通道状态并启用所有通道
     backupChannelStates();
@@ -1369,11 +1354,6 @@ void InputManager::processAutoSerialBinding() {
                 binding_callback_(true, "开始扫描触摸输入，请按顺序触摸所有区域");
             }
             
-            // 通过UI管理器显示扫描状态
-            if (ui_manager_) {
-                ui_manager_->show_binding_status("扫描模式：请按顺序触摸所有区域", false);
-                ui_manager_->update_guided_binding_progress(0, "开始扫描触摸输入");
-            }
             break;
             
         case BindingState::AUTO_SERIAL_BINDING_SCAN:
@@ -1404,15 +1384,6 @@ void InputManager::processAutoSerialBinding() {
                                     current_binding_index_++;
                                     touch_detected = true;
                                     
-                                    // 更新UI显示
-                                    if (ui_manager_) {
-                                        char message[128];
-                                        snprintf(message, sizeof(message), "检测到触摸：设备%04X 通道%d -> %s", 
-                                                device_addr, ch, getMai2AreaName(target_area));
-                                        ui_manager_->show_binding_status(message, false);
-                                        ui_manager_->update_guided_binding_progress(current_binding_index_, "自动绑定进行中");
-                                    }
-                                    
                                     if (binding_callback_) {
                                         char message[128];
                                         snprintf(message, sizeof(message), "绑定成功：%s (%d/34)", 
@@ -1423,11 +1394,7 @@ void InputManager::processAutoSerialBinding() {
                                     // 如果所有区域都已绑定，进入等待确认状态
                                     if (current_binding_index_ >= 34) {
                                         binding_state_ = BindingState::AUTO_SERIAL_BINDING_WAIT;
-                                        
-                                        if (ui_manager_) {
-                                            ui_manager_->show_binding_status("自动绑定完成，请确认", true);
-                                        }
-                                        
+        
                                         if (binding_callback_) {
                                             binding_callback_(true, "自动绑定完成，请确认保存");
                                         }
@@ -1491,10 +1458,6 @@ void InputManager::processHIDBinding() {
                 binding_callback_(false, "开始HID绑定，请按下要绑定的区域");
             }
             
-            // 通过UI管理器显示HID绑定状态
-             if (ui_manager_) {
-                 ui_manager_->show_binding_status("等待触摸输入...", false);
-             }
             break;
             
         case BindingState::HID_BINDING_WAIT_TOUCH:
@@ -1530,12 +1493,6 @@ void InputManager::processHIDBinding() {
                                 binding_callback_(false, message);
                             }
                             
-                            // 通过UI管理器显示坐标设置界面
-                             if (ui_manager_) {
-                                 char message[64];
-                                 snprintf(message, sizeof(message), "设置坐标 - 设备:0x%04X 通道:%d", hid_binding_device_addr_, ch);
-                                 ui_manager_->show_binding_status(message, false);
-                             }
                             return;
                         }
                     }

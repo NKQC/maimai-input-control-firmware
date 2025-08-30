@@ -79,7 +79,7 @@ public:
     bool is_ready() const;
     
     // 配置管理
-    bool set_config(const USB_SerialLogs_Config& config);
+    bool set_config(const USB_SerialLogs_Config config);
     bool get_config(USB_SerialLogs_Config& config);
     
     // 日志输出方法

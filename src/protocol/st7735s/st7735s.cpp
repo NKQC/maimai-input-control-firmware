@@ -63,7 +63,7 @@ bool ST7735S::init() {
     }
     
     // 配置SPI
-    spi_hal_->set_format(8, 0, 0);  // 8位，模式0
+    spi_hal_->set_format(8, 0, 0, 1);  // 8位，模式0，LSB优先
     
     // 硬件复位
     if (!reset()) {
@@ -143,26 +143,26 @@ bool ST7735S::invert_display(bool enable) {
 }
 
 bool ST7735S::set_rotation(ST7735S_Rotation rotation) {
-    uint8_t madctl = 0x08;  // 设置BGR位(bit 3)，使用BGR颜色顺序
+    uint8_t madctl = 0x0;
 
     switch (rotation) {
         case ST7735S_ROTATION_0:    // 竖屏 (USE_HORIZONTAL==0)
-            madctl = 0x08;  // 对应厂家程序的0x08
+            madctl = 0x00;  // 对应厂家程序的0x08
             width_ = ST7735S_HEIGHT;    // 竖屏时宽度为80
             height_ = ST7735S_WIDTH;  // 竖屏时高度为160
             break;
         case ST7735S_ROTATION_90:   // 横屏 (USE_HORIZONTAL==2)
-            madctl = 0x78;  // 对应厂家程序的0x78
+            madctl = 0x70;  // 对应厂家程序的0x78
             width_ = ST7735S_WIDTH;   // 横屏时宽度为160
             height_ = ST7735S_HEIGHT;   // 横屏时高度为80
             break;
         case ST7735S_ROTATION_180:  // 竖屏翻转180度 (USE_HORIZONTAL==1)
-            madctl = 0xC8;  // 对应厂家程序的0xC8
+            madctl = 0xC0;  // 对应厂家程序的0xC8
             width_ = ST7735S_HEIGHT;
             height_ = ST7735S_WIDTH;
             break;
         case ST7735S_ROTATION_270:  // 横屏翻转180度 (USE_HORIZONTAL==3)
-            madctl = 0xA8;  // 对应厂家程序的0xA8
+            madctl = 0xA0;  // 对应厂家程序的0xA8
             width_ = ST7735S_WIDTH;
             height_ = ST7735S_HEIGHT;
             break;
@@ -229,9 +229,8 @@ bool ST7735S::init_registers() {
     write_command(ST7735S_SLPOUT);  // 0x11
     sleep_ms(120);
     
-    // 反色显示
-    write_command(ST7735S_INVON);   // 0x21
-    write_command(ST7735S_INVON);   // 0x21
+    // 显示模式
+    write_command(ST7735S_INVON);  // 0x21
     
     // 帧速率控制1 - 正常模式
     write_command(ST7735S_FRMCTR1); // 0xB1
@@ -327,7 +326,7 @@ bool ST7735S::init_registers() {
     
     // 颜色模式设置为16位
     write_command(ST7735S_COLMOD);  // 0x3A
-    write_data(0x05);  // 16位颜色 RGB565
+    write_data(0x55);  // 16位颜色 RGB565
     
     set_rotation(rotation_);
     write_command(ST7735S_DISPON);

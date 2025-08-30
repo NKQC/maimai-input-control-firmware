@@ -49,8 +49,8 @@ public:
     virtual void cs_select() = 0;
     virtual void cs_deselect() = 0;
     
-    // 设置SPI模式和频率
-    virtual void set_format(uint8_t data_bits, uint8_t cpol, uint8_t cpha) = 0;
+    // 设置SPI格式 (bit_order: 0=MSB_FIRST, 1=LSB_FIRST)
+    virtual void set_format(uint8_t data_bits, uint8_t cpol, uint8_t cpha, uint8_t bit_order = 0) = 0;
     virtual void set_frequency(uint32_t frequency) = 0;
     
     // 获取实例名称
@@ -87,7 +87,7 @@ public:
     void set_cs_pin(uint8_t cs_pin, bool active_low = true) override;
     void cs_select() override;
     void cs_deselect() override;
-    void set_format(uint8_t data_bits, uint8_t cpol, uint8_t cpha) override;
+    void set_format(uint8_t data_bits, uint8_t cpol, uint8_t cpha, uint8_t bit_order = 0) override;
     void set_frequency(uint32_t frequency) override;
     std::string get_name() const override { return "SPI0"; }
     bool is_ready() const override { return initialized_; }
@@ -154,7 +154,7 @@ public:
     void set_cs_pin(uint8_t cs_pin, bool active_low = true) override;
     void cs_select() override;
     void cs_deselect() override;
-    void set_format(uint8_t data_bits, uint8_t cpol, uint8_t cpha) override;
+    void set_format(uint8_t data_bits, uint8_t cpol, uint8_t cpha, uint8_t bit_order = 0) override;
     void set_frequency(uint32_t frequency) override;
     std::string get_name() const override;
     bool is_ready() const override;

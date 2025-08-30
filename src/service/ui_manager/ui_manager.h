@@ -4,12 +4,10 @@
 #include "../../protocol/st7735s/st7735s.h"
 #include "../../protocol/hid/hid.h"
 #include "../config_manager/config_types.h"
-#include "engine/graphics_engine.h"
-#include "engine/font_system.h"
-#include "page/page_template.h"
-#include "engine/ui_constructs.h"
-#include "page/page_manager.h"
-#include "page/page_types.h"
+#include "engine/graphics_rendering/graphics_engine.h"
+#include "engine/fonts/font_data.h"
+#include "engine/page_construction/page_template.h"
+#include "engine/page_construction/ui_constructs.h"
 #include <string>
 #include <functional>
 #include <map>
@@ -29,17 +27,52 @@ class ConfigManager;
 #define UIMANAGER_ENABLE_JOYSTICK "UIMANAGER_ENABLE_JOYSTICK"
 #define UIMANAGER_JOYSTICK_SENSITIVITY "UIMANAGER_JOYSTICK_SENSITIVITY"
 
-// UI页面类型
-// 使用page模块中的类型定义
-using UIPage = ui::UIPage;
-using UIEvent = ui::UIEvent;
-using JoystickButton = ui::JoystickButton;
-using ErrorType = ui::ErrorType;
-using ErrorInfo = ui::ErrorInfo;
-using PageData = ui::PageData;
-using UIStatistics = ui::UIStatistics;
-using UIEventCallback = ui::UIEventCallback;
-using UIPageCallback = ui::UIPageCallback;
+// 简化的UI类型定义
+struct ErrorInfo {
+    std::string message;
+    uint32_t timestamp = 0;
+    
+    ErrorInfo() = default;
+    explicit ErrorInfo(const std::string& msg) : message(msg) {}
+};
+
+struct PageData {
+    std::string title;
+    std::string content;
+    std::vector<std::string> menu_items;
+    int32_t selected_index = 0;
+    bool has_progress = false;
+    float progress_value = 0.0f;
+    
+    void clear() {
+        title.clear();
+        content.clear();
+        menu_items.clear();
+        selected_index = 0;
+        has_progress = false;
+        progress_value = 0.0f;
+    }
+};
+
+struct UIStatistics {
+    uint32_t page_switches = 0;
+    uint32_t input_events = 0;
+    uint32_t render_frames = 0;
+    uint32_t error_count = 0;
+    uint32_t uptime_seconds = 0;
+    
+    void reset() {
+        page_switches = 0;
+        input_events = 0;
+        render_frames = 0;
+        error_count = 0;
+        uptime_seconds = 0;
+    }
+};
+
+// 简化的回调函数类型
+using InputCallback = std::function<void(const std::string& action)>;
+using PageCallback = std::function<void(const std::string& from_page, const std::string& to_page)>;
 
 
 // UI配置结构
@@ -108,10 +141,17 @@ public:
     bool set_light_manager(LightManager* light_manager);
     bool set_config_manager(ConfigManager* config_manager);
     
-    // 页面管理
-    bool set_current_page(UIPage page);
-    UIPage get_current_page() const;
-    std::vector<UIPage> get_available_pages();
+    // 页面切换和管理
+    bool set_current_page(const std::string& page_name);
+    std::string get_current_page() const;
+    std::vector<std::string> get_available_pages();
+    
+    // 新页面引擎接口
+    bool switch_to_page(const std::string& page_name);
+    const std::string& get_current_page_name() const;
+    // Removed PageBase and PageConstructor - using simplified approach
+    bool register_main_page();
+    bool register_main_menu_page();
     
     // 显示控制
     bool set_brightness(uint8_t brightness);
@@ -123,18 +163,17 @@ public:
     bool force_refresh();
     
     // 页面模板控制
-    bool enable_page_template_system(bool enable);
-    bool is_page_template_enabled() const;
     PageTemplate* get_page_template() const;
-    
-    // 页面管理器访问
-    ui::PageManager* get_page_manager() const;
 
-    // 页面ID转换辅助函数
-    std::string page_id_to_string(ui::UIPage page_id) const;
+    // 页面名称处理函数
+    std::string get_page_display_name(const std::string& page_name) const;
 
-    // 统一的摇杆和菜单交互接口
-    bool handle_joystick_input(ui::JoystickButton button);
+    // 简化的输入处理接口（直接函数调用）
+    // 简化的摇杆输入处理（仅A和B方向）
+    void handle_joystick_a();
+    void handle_joystick_b();
+    void handle_confirm_input();
+    bool handle_joystick_input(int button);
     bool navigate_menu(bool up);
     bool navigate_menu_horizontal(bool right);
     bool confirm_selection();
@@ -143,7 +182,6 @@ public:
     // 动态光标渲染
     void render_cursor_indicator();
     int get_current_menu_index() const;
-    int get_menu_item_count() const;
     
     // 息屏管理
     bool set_screen_timeout(uint16_t timeout_seconds);
@@ -155,6 +193,11 @@ public:
     
     // 调试功能
     void enable_debug_output(bool enabled);
+
+    // 给其他子模块提供的静态日志方法
+    static void log_debug_static(const std::string& message);
+    static void log_error_static(const std::string& message);
+
 private:
     // 私有构造函数（单例模式）
     UIManager();
@@ -172,13 +215,9 @@ private:
     InputManager* input_manager_;
     GraphicsEngine* graphics_engine_;
     PageTemplate* page_template_;       // 页面模板实例
-    bool use_page_template_;            // 是否使用页面模板系统
-    bool page_needs_redraw_;
     int16_t current_menu_index_;
     bool buttons_active_low_;
-    bool framebuffer_dirty_;
-    UIPage current_page_;
-    UIPage previous_page_;
+
     bool backlight_enabled_;
     bool screen_off_;
     uint32_t last_activity_time_;
@@ -186,6 +225,10 @@ private:
     bool needs_full_refresh_;
     bool debug_enabled_;
     uint32_t last_navigation_time_;
+    
+    // 光标闪烁相关
+    uint32_t cursor_blink_timer_;
+    bool cursor_visible_;
     
     // GPIO配置
     uint8_t joystick_a_pin_;
@@ -203,24 +246,31 @@ private:
     // 页面数据
     PageData page_data_;
     
-    // 构造体系统 - 引擎核心组件，始终启用
+    // 页面管理相关
     MenuInteractionSystem* menu_system_;     // 菜单交互系统
     PageNavigationManager* nav_manager_;     // 页面导航管理器
-    ui::PageManager* page_manager_;          // 页面管理器
+    // Removed page_manager - using simplified approach
     
-    // 故障管理
+    // 新页面引擎
+    // Removed page_registry - using simplified approach
+    std::string current_page_name_;                // 当前页面名称
+    
+    // 故障处理相关
     ErrorInfo current_error_;          // 当前故障信息
     std::vector<ErrorInfo> error_history_; // 故障历史记录
     bool has_error_;                   // 是否有故障
     static ErrorInfo global_error_;    // 全局故障信息
     static bool global_has_error_;     // 全局故障标志
     
+    // 绑定进度相关
+    int binding_step_;                 // 绑定步骤
+    
     // 统计信息
     UIStatistics statistics_;
     
-    // 回调函数
-    UIEventCallback event_callback_;
-    UIPageCallback page_callback_;
+    // 回调函数（简化版）
+    InputCallback input_callback_;
+    PageCallback page_callback_;
     
     // 显示刷新相关
     bool init_display();
@@ -237,23 +287,17 @@ private:
     void reset_page_data();
     
     // 30fps刷新任务
-    void display_refresh_task();
     void refresh_task_30fps();
     static void display_refresh_timer_callback(void* arg);
     
-    // 页面创建和管理
-    void destroy_current_page();     // 销毁当前页面
-    
     // 输入处理
     void handle_navigation_input(bool up);
-    void handle_confirm_input();
     
     // 屏保和背光管理
     inline void handle_backlight();
     inline void handle_screen_timeout();
     
     // 工具函数
-    bool is_page_valid(UIPage page) const;
     void log_debug(const std::string& message);
     void log_error(const std::string& message);
     
@@ -263,9 +307,9 @@ private:
     // GPIO输入处理
     void handle_input();
     
-    // 故障处理相关
-    void handle_error_detection();
-    std::string error_type_to_string(ErrorType type) const;
+    // 异常处理相关（简化版）
+    void show_error(const std::string& error_message);
+    void clear_error();
     void add_error_to_history(const ErrorInfo& error);
 };
 

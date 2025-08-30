@@ -137,11 +137,12 @@ void HAL_SPI0::cs_deselect() {
     }
 }
 
-void HAL_SPI0::set_format(uint8_t data_bits, uint8_t cpol, uint8_t cpha) {
+void HAL_SPI0::set_format(uint8_t data_bits, uint8_t cpol, uint8_t cpha, uint8_t bit_order) {
     if (initialized_) {
         spi_cpol_t spi_cpol = (cpol == 0) ? SPI_CPOL_0 : SPI_CPOL_1;
         spi_cpha_t spi_cpha = (cpha == 0) ? SPI_CPHA_0 : SPI_CPHA_1;
-        spi_set_format(spi0, data_bits, spi_cpol, spi_cpha, SPI_MSB_FIRST);
+        spi_order_t spi_order = (bit_order == 0) ? SPI_MSB_FIRST : SPI_LSB_FIRST;
+        spi_set_format(spi0, data_bits, spi_cpol, spi_cpha, spi_order);
     }
 }
 
@@ -508,11 +509,12 @@ void HAL_SPI1::cs_deselect() {
     }
 }
 
-void HAL_SPI1::set_format(uint8_t data_bits, uint8_t cpol, uint8_t cpha) {
+void HAL_SPI1::set_format(uint8_t data_bits, uint8_t cpol, uint8_t cpha, uint8_t bit_order) {
     if (initialized_) {
         spi_cpol_t spi_cpol = (cpol == 0) ? SPI_CPOL_0 : SPI_CPOL_1;
         spi_cpha_t spi_cpha = (cpha == 0) ? SPI_CPHA_0 : SPI_CPHA_1;
-        spi_set_format(spi1, data_bits, spi_cpol, spi_cpha, SPI_MSB_FIRST);
+        spi_order_t spi_order = (bit_order == 0) ? SPI_MSB_FIRST : SPI_LSB_FIRST;
+        spi_set_format(spi1, data_bits, spi_cpol, spi_cpha, spi_order);
     }
 }
 

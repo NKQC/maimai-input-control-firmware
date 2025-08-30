@@ -77,7 +77,7 @@ bool USB_SerialLogs::is_ready() const {
 }
 
 // 设置配置
-bool USB_SerialLogs::set_config(const USB_SerialLogs_Config& config) {
+bool USB_SerialLogs::set_config(const USB_SerialLogs_Config config) {
     config_ = config;
     return true;
 }

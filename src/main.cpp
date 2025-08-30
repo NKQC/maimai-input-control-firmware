@@ -289,7 +289,7 @@ struct CoreInitBitmap {
 };
 
 // Core1 stack
-#define CORE1_STACK_SIZE 0x10000
+#define CORE1_STACK_SIZE 0x11000
 static uint32_t core1_stack[CORE1_STACK_SIZE / sizeof(uint32_t)];
 
 // 全局同步bitmap
@@ -533,7 +533,7 @@ bool core1_init_protocol_layer() {
     }
 
     USB_SerialLogs_Config log_config;
-    log_config.enable_colors = true;
+    log_config.enable_colors = false;
     log_config.min_level = USB_LogLevel::DEBUG;
 
     usb_logs->set_config(log_config);
@@ -659,7 +659,7 @@ bool init_service_layer() {
         error_handler("Failed to initialize UIManager");
         return false;
     }
-    
+    ui_manager->enable_debug_output(true); // DEBUG
     // 标记服务层初始化完成
     init_sync.service_ready = 1;
     

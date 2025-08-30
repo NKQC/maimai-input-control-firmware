@@ -32,6 +32,14 @@ struct ChineseChar {
     const uint8_t* data;  // 点阵数据指针
 };
 
+// 统一字符查找结果结构
+struct FontSearchResult {
+    const uint8_t* bitmap_data;  // 点阵数据指针
+    uint8_t width;               // 字符宽度
+    uint8_t height;              // 字符高度
+    bool found;                  // 是否找到字符
+};
+
 // 字体数据命名空间
 namespace FontData {
     // ASCII字体数据命名空间
@@ -44,14 +52,11 @@ namespace FontData {
         extern const uint8_t FONT_CHAR_COUNT;
         extern const bool FONT_MONOSPACE;
         
+        // ASCII字符索引字符串
+        extern const char PROGMEM ascii_index_string[];
+        
         // 字符点阵数据数组
         extern const uint8_t char_bits[ASCII_COUNT][14];
-        
-        // 获取ASCII字符数据
-        const CharBitmap* get_char_data(char c);
-        
-        // 获取字符索引
-        int get_char_index(char c);
     }
     
     // 中文字体数据命名空间
@@ -64,21 +69,18 @@ namespace FontData {
         extern const uint16_t FONT_CHAR_COUNT;
         extern const bool FONT_MONOSPACE;
         
+        // 中文字符索引字符串
+        extern const char PROGMEM chinese_index_string[];
+        
         // 字符点阵数据数组
         extern const uint8_t char_bits[CHINESE_CHAR_COUNT][28];
-        
-        // 中文字符映射数组
-        extern const ChineseChar chinese_chars[CHINESE_CHAR_COUNT];
-        
-        // 查找中文字符
-        const ChineseChar* find_chinese_char(uint16_t unicode);
-        
-        // 获取默认中文字符
-        const ChineseChar* get_default_chinese_char();
-        
-        // 获取字符索引
-        int get_char_index(uint16_t unicode);
     }
+    
+    // 统一字库搜索接口
+    FontSearchResult find_character(const char* utf8_char);
+    
+    // 创建默认方框字符(14x14)
+    void create_default_box_char(uint8_t* buffer);
 }
 
 #endif // FONT_DATA_H
