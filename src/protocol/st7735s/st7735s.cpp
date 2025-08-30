@@ -143,7 +143,7 @@ bool ST7735S::invert_display(bool enable) {
 }
 
 bool ST7735S::set_rotation(ST7735S_Rotation rotation) {
-    uint8_t madctl = 0;
+    uint8_t madctl = 0x08;  // 设置BGR位(bit 3)，使用BGR颜色顺序
 
     switch (rotation) {
         case ST7735S_ROTATION_0:    // 竖屏 (USE_HORIZONTAL==0)
