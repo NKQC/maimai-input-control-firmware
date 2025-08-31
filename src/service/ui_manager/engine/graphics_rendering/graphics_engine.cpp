@@ -1,5 +1,6 @@
 #include "graphics_engine.h"
 #include "../fonts/font_data.h"
+#include "../../ui_manager.h"
 #include <algorithm>
 #include <cmath>
 #ifdef __AVR__
@@ -367,17 +368,17 @@ void GraphicsEngine::draw_button(const Rect& rect, const char* text, Color bg_co
     }
 }
 
-void GraphicsEngine::draw_progress_bar(const Rect& rect, float progress, Color bg_color, Color fill_color) {
-    // 绘制外边框
-    draw_rounded_rect(rect, 2, COLOR_TEXT_GRAY);
+void GraphicsEngine::draw_progress_bar(const Rect& rect, uint8_t progress, Color bg_color, Color fill_color) {
+    // 绘制外边框 - 使用更明显的边框颜色
+    draw_rounded_rect(rect, 2, COLOR_WHITE);
     
-    // 绘制背景（内部区域）
+    // 绘制背景（内部区域）- 使用深色背景确保对比度
     Rect inner_rect(rect.x + 1, rect.y + 1, rect.width - 2, rect.height - 2);
-    fill_rounded_rect(inner_rect, 1, bg_color);
+    fill_rounded_rect(inner_rect, 1, COLOR_BLACK);
     
-    // 绘制进度填充
-    if (progress > 0.0f) {
-        int16_t fill_width = (int16_t)((inner_rect.width) * std::min(1.0f, std::max(0.0f, progress)));
+    if (progress > 0) {
+        // 使用整数运算: fill_width = inner_rect.width * progress / 255
+        int16_t fill_width = (inner_rect.width * progress) / 255;
         if (fill_width > 0) {
             Rect fill_rect(inner_rect.x, inner_rect.y, fill_width, inner_rect.height);
             fill_rounded_rect(fill_rect, 1, fill_color);

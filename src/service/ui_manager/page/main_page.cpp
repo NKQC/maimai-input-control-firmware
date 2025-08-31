@@ -50,9 +50,6 @@ void MainPage::render(PageTemplate& page_template) {
     ADD_MENU("调试信息", "debug", COLOR_TEXT_WHITE)
     
     PAGE_END()
-
-    // 绘制页面
-    page_template.draw();
 }
 
 void MainPage::update_uptime(uint32_t uptime_ms) {

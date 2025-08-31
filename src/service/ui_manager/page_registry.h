@@ -74,6 +74,11 @@ public:
      */
     void register_default_pages();
     
+    /**
+     * 注册内部模板页面
+     */
+    void register_internal_pages();
+    
 private:
     // 私有构造函数（单例模式）
     PageRegistry() = default;

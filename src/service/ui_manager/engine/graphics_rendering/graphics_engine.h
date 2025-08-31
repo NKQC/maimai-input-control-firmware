@@ -107,7 +107,7 @@ public:
     
     // UI组件绘制
     void draw_button(const Rect& rect, const char* text, Color bg_color, Color text_color, bool pressed = false);
-    void draw_progress_bar(const Rect& rect, float progress, Color bg_color, Color fill_color);
+    void draw_progress_bar(const Rect& rect, uint8_t progress, Color bg_color, Color fill_color);
     void draw_slider(const Rect& rect, float value, Color bg_color, Color handle_color);
     void draw_checkbox(int16_t x, int16_t y, int16_t size, bool checked, Color color);
     

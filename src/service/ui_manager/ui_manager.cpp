@@ -1,6 +1,8 @@
 #include "ui_manager.h"
 #include "page_registry.h"
 #include "engine/page_construction/page_manager.h"
+#include "engine/template_page/int_setting_page.h"
+#include "engine/template_page/error_page.h"
 #include "../../service/input_manager/input_manager.h"
 #include "../../service/light_manager/light_manager.h"
 #include "../../service/config_manager/config_manager.h"
@@ -142,6 +144,9 @@ UIManager::UIManager()
     , cursor_visible_(true)
     , has_error_(false)
     , binding_step_(0)
+    , is_popup_active_(false)
+    , popup_caller_page_("")
+    , popup_caller_index_(0)
     {
     
     // 初始化按钮状态
@@ -394,28 +399,6 @@ void UIManager::refresh_task_30fps() {
     }
 }
 
-// 重置页面数据
-void UIManager::reset_page_data() {
-    // 清空页面数据，让页面组件自己管理内容
-    page_data_.title = "";
-    page_data_.menu_items.clear();
-    page_data_.content = "";
-    page_data_.progress_value = 0;
-    page_data_.selected_index = current_menu_index_; // 与当前菜单索引保持同步
-    
-    // 重置光标位置：根据用户需求设置初始光标位置
-    // 滚动时光标在第一行(索引0)，无滚动时光标在第一个可选内容
-    current_menu_index_ = 0;
-    page_data_.selected_index = 0;
-    
-    // 确保选中索引在有效范围内
-    int menu_count = page_template_ ? page_template_->get_menu_item_count() : 0;
-    if (menu_count > 0 && current_menu_index_ >= menu_count) {
-        current_menu_index_ = 0;
-        page_data_.selected_index = 0;
-    }
-}
-
 // 处理导航输入
 void UIManager::handle_navigation_input(bool up) {
     uint32_t current_time = to_ms_since_boot(get_absolute_time());
@@ -440,8 +423,7 @@ void UIManager::handle_navigation_input(bool up) {
     }
     
     // 获取目标行数据
-    const auto& target_lines = page_template_->is_scroll_enabled() ? 
-                              page_template_->get_all_lines() : page_template_->get_lines();
+    const auto& target_lines = page_template_->get_all_lines();
     
     if (target_lines.empty()) {
         return;
@@ -525,13 +507,13 @@ void UIManager::handle_confirm_input() {
     bool is_scrollable = page_template_->is_scroll_enabled();
     
     if (is_scrollable) {
-        // 可滚动模式：从所有行中获取当前选中行
-        const auto& all_lines = page_template_->get_all_lines();
+        // 可滚动模式：从可变的所有行中获取当前选中行
+        auto& all_lines = page_template_->get_mutable_all_lines();
         if (current_menu_index_ < 0 || current_menu_index_ >= (int)all_lines.size()) {
             return;
         }
-        line_config = const_cast<LineConfig*>(&all_lines[current_menu_index_]);
-        mutable_line = const_cast<LineConfig*>(&all_lines[current_menu_index_]);
+        line_config = &all_lines[current_menu_index_];
+        mutable_line = &all_lines[current_menu_index_];
     } else {
         // 不可滚动模式：从菜单项中获取
         int menu_count = page_template_->get_menu_item_count();
@@ -539,8 +521,8 @@ void UIManager::handle_confirm_input() {
             return;
         }
         line_config = const_cast<LineConfig*>(&page_template_->get_line_config(current_menu_index_));
-        const auto& lines = page_template_->get_lines();
-        mutable_line = const_cast<LineConfig*>(&lines[current_menu_index_]);
+        auto& lines = page_template_->get_mutable_all_lines();
+        mutable_line = &lines[current_menu_index_];
     }
 
     // 使用switch跳表处理不同类型
@@ -599,28 +581,42 @@ void UIManager::handle_menu_jump(const LineConfig* line_config) {
 }
 
 void UIManager::handle_int_setting(const LineConfig* line_config) {
-    // 保存当前页面状态到导航管理器
-    int scroll_pos = page_template_->get_scroll_position();
-    PageNavigationManager::getInstance().push_page(current_page_name_, current_menu_index_, scroll_pos);
+    // 保存当前页面状态作为弹窗调用者
+    popup_caller_page_ = current_page_name_;
+    popup_caller_index_ = current_menu_index_;
+    is_popup_active_ = true;
     
-    // 准备回调函数
-    std::function<void(int)> value_change_cb;
-    std::function<void()> complete_cb;
+    // 获取INT设置页面构造器并设置参数
+    auto& registry = ui::PageRegistry::get_instance();
+    auto int_setting_page = std::static_pointer_cast<ui::IntSettingPage>(registry.get_page("__int_setting__"));
     
-    if (line_config->callback_type == LineConfig::CallbackType::VALUE_CHANGE && line_config->callback_data.value_change_callback) {
-        value_change_cb = line_config->callback_data.value_change_callback;
+    if (int_setting_page) {
+        // 准备回调函数 - 从callback_data联合体中获取
+        std::function<void(int)> value_change_cb;
+        std::function<void()> complete_cb;
+        
+        if (line_config->callback_type == LineConfig::CallbackType::VALUE_CHANGE) {
+            value_change_cb = line_config->callback_data.value_change_callback;
+        } else if (line_config->callback_type == LineConfig::CallbackType::COMPLETE) {
+            complete_cb = line_config->callback_data.complete_callback;
+        }
+        
+        // 设置页面参数
+        int_setting_page->setup_data(line_config->setting_title,
+                               line_config->data.int_setting.int_value_ptr,
+                               line_config->data.int_setting.min_value,
+                               line_config->data.int_setting.max_value,
+                               value_change_cb,
+                               complete_cb);
+        popup_int_setting_data_.int_setting_value_ptr_ = line_config->data.int_setting.int_value_ptr;
+        popup_int_setting_data_.min_value = line_config->data.int_setting.min_value;
+        popup_int_setting_data_.max_value = line_config->data.int_setting.max_value;
+        popup_int_setting_data_.value_change_cb = line_config->callback_data.value_change_callback;
+        popup_int_setting_data_.complete_cb = line_config->callback_data.complete_callback;
+
+        // 切换到INT设置页面（作为弹窗）
+        current_page_name_ = "__int_setting__";
     }
-    if (line_config->callback_type == LineConfig::CallbackType::COMPLETE && line_config->callback_data.complete_callback) {
-        complete_cb = line_config->callback_data.complete_callback;
-    }
-    
-    // 使用setup_int_setting_page创建INT设置页面
-    PageTemplates::setup_int_setting_page(*page_template_, line_config->setting_title,
-                                         line_config->data.int_setting.int_value_ptr,
-                                         line_config->data.int_setting.min_value,
-                                         line_config->data.int_setting.max_value,
-                                         value_change_cb,
-                                         complete_cb);
 }
 
 void UIManager::handle_selector_item(const LineConfig* line_config, LineConfig* mutable_line) {
@@ -628,37 +624,52 @@ void UIManager::handle_selector_item(const LineConfig* line_config, LineConfig* 
         return;
     }
     
-    // 切换选择器锁定状态
-    mutable_line->data.selector.is_locked = !mutable_line->data.selector.is_locked;
+    line_state_.is_locked = true;
     
     // 调用锁定状态回调
     if (line_config->lock_callback) {
         line_config->lock_callback();
     }
     
-    log_debug(std::string("Selector ") + (mutable_line->data.selector.is_locked ? "locked" : "unlocked"));
+    log_debug("current_line=" + std::to_string(current_menu_index_) + " Set locked=" + std::to_string(line_state_.is_locked));
 }
 
 void UIManager::handle_back_item() {
-    // 处理返回操作，恢复上一页状态
-    if (PageNavigationManager::getInstance().can_go_back()) {
-        PageState prev_state = PageNavigationManager::getInstance().pop_page();
-        current_page_name_ = prev_state.page_name;
-        current_menu_index_ = prev_state.cursor_position;
+    // 检查是否是弹窗模式
+    if (is_popup_active_) {
+        // 弹窗模式：直接返回到调用页面
+        current_page_name_ = popup_caller_page_;
+        current_menu_index_ = popup_caller_index_;
+        is_popup_active_ = false;
+        popup_caller_page_ = "";
+        popup_caller_index_ = 0;
         
-        // 重置页面数据并恢复状态
-        reset_page_data();
-        
-        // 恢复光标和滚动位置
+        // 恢复光标位置
         if (page_template_) {
             page_template_->set_selected_index(current_menu_index_);
-            page_template_->set_scroll_position(prev_state.scroll_position);
         }
         
         last_activity_time_ = to_ms_since_boot(get_absolute_time());
-        log_debug("Returned to page: " + current_page_name_ + 
+        log_debug("Returned from popup to page: " + current_page_name_ +
+                 " with index: " + std::to_string(current_menu_index_));
+    } else {
+        // 普通模式：使用导航管理器
+        if (PageNavigationManager::getInstance().can_go_back()) {
+            PageState prev_state = PageNavigationManager::getInstance().pop_page();
+            current_page_name_ = prev_state.page_name;
+            current_menu_index_ = prev_state.cursor_position;
+            
+            // 恢复光标和滚动位置
+            if (page_template_) {
+                page_template_->set_selected_index(current_menu_index_);
+                page_template_->set_scroll_position(prev_state.scroll_position);
+            }
+            
+            last_activity_time_ = to_ms_since_boot(get_absolute_time());
+            log_debug("Returned to page: " + current_page_name_ + 
                  ", cursor: " + std::to_string(current_menu_index_) + 
                  ", scroll: " + std::to_string(prev_state.scroll_position));
+        }
     }
 }
 
@@ -716,11 +727,33 @@ void UIManager::update_page_template_content() {
     if (page_constructor) {
         // 使用面向对象的页面构造器渲染页面
         page_constructor->render(*page_template_);
-    } else if (current_page_name_ == "error" && has_error_) {
-        // 错误页面的后备处理
-        PageTemplates::create_error_page(*page_template_);
-    } else if (current_page_name_ != "error") {
-        // 如果页面构造器为空且不是错误页面，切换到主页面
+        
+        // 页面内容更新后，验证并调整current_menu_index_的边界
+        const auto& lines = page_template_->get_all_lines();
+        if (!lines.empty()) {
+            bool is_scrollable = page_template_->is_scroll_enabled();
+            int max_valid_index;
+            
+            if (is_scrollable) {
+                // 可滚动模式：索引范围是0到lines.size()-1
+                max_valid_index = static_cast<int>(lines.size()) - 1;
+            } else {
+                // 不可滚动模式：索引范围是0到menu_item_count-1
+                int menu_count = page_template_->get_menu_item_count();
+                max_valid_index = menu_count > 0 ? menu_count - 1 : 0;
+            }
+            
+            // 确保current_menu_index_在有效范围内
+            if (current_menu_index_ < 0 || current_menu_index_ > max_valid_index) {
+                current_menu_index_ = 0;
+                log_debug("Adjusted current_menu_index_ to 0, max_valid_index: " + std::to_string(max_valid_index));
+            }
+        } else {
+            // 如果没有行内容，重置索引为0
+            current_menu_index_ = 0;
+        }
+    } else {
+        // 如果页面构造器为空，切换到主页面
         log_error("Page constructor is null for: " + current_page_name_);
         current_page_name_ = "main";
         current_menu_index_ = 0;
@@ -940,50 +973,30 @@ std::vector<std::string> UIManager::get_available_pages() {
     return registered_pages;
 }
 
-// 检测当前是否在INT设置页面
-bool UIManager::is_in_int_setting_page() const {
-    if (!page_template_) return false;
-    
-    // 检查当前选中的行是否是INT_SETTING类型且被选中
-    if (current_menu_index_ >= 0 && current_menu_index_ < page_template_->get_visible_lines_count()) {
-        LineConfig line_config = page_template_->get_line_config(current_menu_index_);
-        return (line_config.type == LineType::INT_SETTING && line_config.selected);
-    }
-    return false;
-}
-
 // 调整INT设置值
 bool UIManager::adjust_int_setting_value(bool increase) {
     if (!page_template_) return false;
     
-    LineConfig line_config = page_template_->get_line_config(current_menu_index_);
-    if (line_config.type != LineType::INT_SETTING || !line_config.data.int_setting.int_value_ptr) {
-        return false;
-    }
-    
-    int32_t* value_ptr = line_config.data.int_setting.int_value_ptr;
-    int32_t current_value = *value_ptr;
+    int32_t current_value = *popup_int_setting_data_.int_setting_value_ptr_;
     int32_t new_value = current_value;
-    
+    log_debug("current_value=" + std::to_string(current_value));
     if (increase) {
-        if (current_value < line_config.data.int_setting.max_value) {
+        if (current_value < popup_int_setting_data_.max_value) {
             new_value = current_value + 1;
         }
     } else {
-        if (current_value > line_config.data.int_setting.min_value) {
+        if (current_value > popup_int_setting_data_.min_value) {
             new_value = current_value - 1;
         }
     }
     
     if (new_value != current_value) {
-        *value_ptr = new_value;
+        *popup_int_setting_data_.int_setting_value_ptr_ = new_value;
         
         // 调用值变更回调
-        if (line_config.callback_type == LineConfig::CallbackType::VALUE_CHANGE && line_config.callback_data.value_change_callback) {
-            line_config.callback_data.value_change_callback(*line_config.data.int_setting.int_value_ptr);
+        if (popup_int_setting_data_.value_change_cb) {
+            popup_int_setting_data_.value_change_cb(new_value);
         }
-        
-        // 强制刷新显示
 
         log_debug("INT setting value adjusted to: " + std::to_string(new_value));
         return true;
@@ -993,30 +1006,40 @@ bool UIManager::adjust_int_setting_value(bool increase) {
 }
 
 // 获取当前页面类型
-PageType UIManager::get_current_page_type() const {
-    if (!page_template_) {
-        return PageType::NORMAL;
-    }
-    
-    // 检查是否在INT设置页面
-    if (is_in_int_setting_page()) {
+PageType UIManager::get_current_page_type() {
+    // 通过页面名称判断内部页面类型
+    if (current_page_name_ == "__int_setting__") {
         return PageType::INT_SETTING;
+    }
+    if (current_page_name_ == "__error__") {
+        return PageType::ERROR;
     }
     
     // 检查是否有选择器项处于锁定状态
-    const auto& lines = page_template_->get_lines();
-    for (const auto& line : lines) {
-        if (line.type == LineType::SELECTOR_ITEM && line.data.selector.is_locked) {
-            return PageType::SELECTOR;
-        }
+    if (!page_template_) {
+        log_debug("page_template_ is null");
+        return PageType::NORMAL;
     }
     
+    const auto& lines = page_template_->get_all_lines();
+    if (lines.empty() || current_menu_index_ < 0 || current_menu_index_ >= static_cast<int>(lines.size())) {
+        log_debug("this lines is invalid state turn NORMAL mode");
+        return PageType::NORMAL;
+    }
+    
+    const auto& current_line = lines[current_menu_index_];
+    if (current_line.type == LineType::SELECTOR_ITEM && line_state_.is_locked) {
+        log_debug("current line is locked");
+        return PageType::SELECTOR;
+    }
+    log_debug("current page_type is NORMAL");
     return PageType::NORMAL;
 }
 
 // 检查是否需要特殊摇杆处理
-bool UIManager::needs_special_joystick_handling() const {
-    return get_current_page_type() != PageType::NORMAL;
+bool UIManager::needs_special_joystick_handling() {
+    PageType page_type = get_current_page_type();
+    return page_type != PageType::NORMAL;
 }
 
 // 处理特殊摇杆输入
@@ -1051,18 +1074,24 @@ bool UIManager::handle_selector_input(JoystickState state) {
         return false;
     }
     
-    const auto& lines = page_template_->get_lines();
+    // 获取可变的lines引用以便修改选择器状态
+    auto& lines = page_template_->get_mutable_all_lines();
     if (current_menu_index_ < 0 || current_menu_index_ >= static_cast<int>(lines.size())) {
         return false;
     }
     
-    const auto& current_line = lines[current_menu_index_];
+    auto& current_line = lines[current_menu_index_];
     if (current_line.type != LineType::SELECTOR_ITEM) {
         return false;
     }
-    
+
+    if (state == JoystickState::CONFIRM) {
+        line_state_.is_locked = false;
+        return true;
+    }
+
     // 如果处于锁定状态，调用选择器回调处理摇杆输入
-    if (current_line.data.selector.is_locked && 
+    if (line_state_.is_locked && 
         current_line.callback_type == LineConfig::CallbackType::SELECTOR &&
         current_line.callback_data.selector_callback) {
         current_line.callback_data.selector_callback(state);
@@ -1099,9 +1128,11 @@ bool UIManager::handle_joystick_input(int button) {
     
     // 检查是否需要特殊处理
     if (needs_special_joystick_handling()) {
+        log_debug("current page name: " + current_page_name_);
+        log_debug("Special joystick handling needed");
         return handle_special_joystick_input(state);
     }
-    
+    log_debug("Normal joystick handling");
     // 普通页面处理
     switch (state) {
         case JoystickState::UP:
@@ -1120,6 +1151,18 @@ bool UIManager::handle_joystick_input(int button) {
 
 bool UIManager::handle_back_navigation() {
     // 统一的返回导航处理
+    if (is_popup_active_) {
+        current_page_name_ = popup_caller_page_;
+        current_menu_index_ = popup_caller_index_;
+        is_popup_active_ = false;
+        popup_caller_page_ = "";
+        popup_caller_index_ = 0;
+        popup_int_setting_data_.clear();
+        if (popup_int_setting_data_.complete_cb) {
+            popup_int_setting_data_.complete_cb();
+        }
+        return true;
+    }
     if (PageNavigationManager::getInstance().can_go_back()) {
         PageState prev_state = PageNavigationManager::getInstance().pop_page();
         return switch_to_page(prev_state.page_name);
@@ -1147,8 +1190,7 @@ void UIManager::render_cursor_indicator() {
     }
     
     // 获取目标行数据
-    const auto& target_lines = page_template_->is_scroll_enabled() ? 
-                              page_template_->get_all_lines() : page_template_->get_lines();
+    const auto& target_lines = page_template_->get_all_lines();
     
     if (target_lines.empty()) {
         return;

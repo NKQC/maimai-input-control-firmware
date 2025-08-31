@@ -188,8 +188,7 @@ PageTemplate::PageTemplate(GraphicsEngine* graphics_engine)
     : graphics_engine_(graphics_engine)
     , title_("")
     , title_color_(COLOR_WHITE)
-    , lines_()  // 动态初始化行内容
-    , all_lines_()  // 所有行内容（用于滚动）
+    , all_lines_()  // 所有行内容（统一管理）
     , visible_lines_count_(5)
     , selected_menu_index_(0)
     , scroll_bar_()  // 使用默认构造函数
@@ -200,8 +199,8 @@ PageTemplate::PageTemplate(GraphicsEngine* graphics_engine)
     , split_borders_enabled_(true)
     , split_ratio_(0.5f) {
     
-    // 初始化lines_容器大小
-    lines_.resize(visible_lines_count_);
+    // 初始化all_lines_容器大小
+    all_lines_.resize(visible_lines_count_);
     
     // 配置滚动条位置和样式 - 右侧纵向圆弧条
     ui::ScrollBar::Config scroll_config;
@@ -217,9 +216,6 @@ PageTemplate::PageTemplate(GraphicsEngine* graphics_engine)
 }
 
 void PageTemplate::flush() {
-    // 只清空行缓存，保留滚动状态和选中索引
-    lines_.clear();
-    
     // 重置状态跟踪变量
     has_title_ = false;
     has_split_screen_ = false;
@@ -242,41 +238,32 @@ void PageTemplate::set_title(const std::string& title, Color color) {
     has_title_ = !title.empty();
     // 更新可见行数缓存
     visible_lines_count_ = has_title_ ? 4 : 5;
-    // 重新调整lines_容器大小
-    lines_.resize(visible_lines_count_);
 }
 
 void PageTemplate::set_line(int line_index, const LineConfig& config) {
-    // 如果当前是滚动模式，操作all_lines_
-    if (scroll_enabled_ && !all_lines_.empty()) {
-        if (line_index >= 0 && line_index < (int)all_lines_.size()) {
-            all_lines_[line_index] = config;
-            update_scroll_display(); // 更新显示
-        }
-    } else {
-        // 非滚动模式，操作lines_
-        if (line_index >= 0 && line_index < 4) {
-            lines_[line_index] = config;
+    // 统一使用all_lines_管理所有行内容
+    if (line_index >= 0 && line_index < (int)all_lines_.size()) {
+        all_lines_[line_index] = config;
+        if (scroll_enabled_) {
+            update_scroll_display(); // 滚动模式下更新显示
         }
     }
 }
 
 void PageTemplate::set_lines(const std::vector<LineConfig>& lines) {
-    // 直接设置可见行，避免递归调用set_all_lines
-    lines_.clear();
-    lines_.resize(visible_lines_count_);
+    // 直接设置all_lines_，避免递归调用set_all_lines
+    all_lines_.clear();
+    all_lines_.resize(visible_lines_count_);
     
-    // 复制传入的行到可见行数组
+    // 复制传入的行到all_lines_数组
     for (size_t i = 0; i < lines.size() && i < visible_lines_count_; ++i) {
-        lines_[i] = lines[i];
+        all_lines_[i] = lines[i];
     }
 }
 
 void PageTemplate::set_all_lines(const std::vector<LineConfig>& lines) {
     // 根据是否有标题动态设置可见行数
     visible_lines_count_ = has_title_ ? 4 : 5;
-    lines_.clear();
-    lines_.resize(visible_lines_count_);
     
     // 保存当前选中项的文本标识（而非索引）
     std::string selected_item_text = "";
@@ -296,11 +283,9 @@ void PageTemplate::set_all_lines(const std::vector<LineConfig>& lines) {
         update_scroll_display();
     } else {
         scroll_enabled_ = false;
-        // 直接设置行内容，避免递归调用
-        lines_.clear();
-        lines_.resize(visible_lines_count_);
-        for (int i = 0; i < visible_lines_count_ && i < (int)lines.size(); ++i) {
-            lines_[i] = lines[i];
+        // 确保all_lines_大小符合可见行数
+        if (all_lines_.size() < visible_lines_count_) {
+            all_lines_.resize(visible_lines_count_);
         }
         // 重置选中索引
         selected_menu_index_ = 0;
@@ -310,7 +295,7 @@ void PageTemplate::set_all_lines(const std::vector<LineConfig>& lines) {
 void PageTemplate::clear() {
     title_.clear();
     title_color_ = COLOR_WHITE;
-    for (auto& line : lines_) {
+    for (auto& line : all_lines_) {
         line.text.clear();
         line.type = LineType::TEXT_ITEM;
         line.color = COLOR_TEXT_WHITE;
@@ -321,10 +306,10 @@ void PageTemplate::clear() {
 }
 
 void PageTemplate::clear_line(int line_index) {
-    if (line_index >= 0 && line_index < 4) {
-        lines_[line_index].text.clear();
-        lines_[line_index].type = LineType::TEXT_ITEM;
-        lines_[line_index].selected = false;
+    if (line_index >= 0 && line_index < (int)all_lines_.size()) {
+        all_lines_[line_index].text.clear();
+        all_lines_[line_index].type = LineType::TEXT_ITEM;
+        all_lines_[line_index].selected = false;
         // Union数据会通过重新赋值自动重置
     }
 }
@@ -343,8 +328,12 @@ void PageTemplate::draw() {
         
         // 绘制内容行
         for (int i = 0; i < visible_lines_count_; i++) {
-            if (!lines_[i].text.empty()) {
-                draw_line(i, lines_[i]);
+            int actual_index = scroll_enabled_ ? scroll_bar_.get_display_start_index() + i : i;
+            if (actual_index < (int)all_lines_.size()) {
+                // 对于进度条，即使text为空也要绘制
+                if (all_lines_[actual_index].type == LineType::PROGRESS_BAR || !all_lines_[actual_index].text.empty()) {
+                    draw_line(i, all_lines_[actual_index]);
+                }
             }
         }
         
@@ -362,52 +351,16 @@ void PageTemplate::draw_background(Color bg_color) {
 }
 
 void PageTemplate::set_selected_index(int index) {
-    // 在不可滚动模式下，只处理可交互菜单项
-    if (!scroll_enabled_) {
-        int menu_count = get_menu_item_count();
-        if (index >= 0 && index < menu_count) {
-            // 统一使用all_lines_处理，在非滚动模式下all_lines_和lines_内容相同
-            const auto& target_lines = all_lines_.empty() ? lines_ : all_lines_;
-            auto& mutable_target_lines = all_lines_.empty() ? lines_ : all_lines_;
-            
-            // 找到第index个可交互菜单项的实际行索引
-            int actual_line_index = -1;
-            int menu_item_counter = 0;
-            for (int i = 0; i < (int)target_lines.size(); ++i) {
-                if (!target_lines[i].text.empty() && 
-                    (target_lines[i].type == LineType::MENU_JUMP || 
-                     target_lines[i].type == LineType::INT_SETTING || 
-                     target_lines[i].type == LineType::BUTTON_ITEM || 
-                     target_lines[i].type == LineType::BACK_ITEM || 
-                     target_lines[i].type == LineType::SELECTOR_ITEM)) {
-                    if (menu_item_counter == index) {
-                        actual_line_index = i;
-                        break;
-                    }
-                    menu_item_counter++;
-                }
-            }
-            
-            if (actual_line_index == -1) return; // 未找到有效的菜单项
-            
-            // 清除旧选中状态
-            if (selected_menu_index_ >= 0 && selected_menu_index_ < (int)target_lines.size()) {
-                mutable_target_lines[selected_menu_index_].selected = false;
-                if (mutable_target_lines[selected_menu_index_].type == LineType::MENU_JUMP) {
-                    mutable_target_lines[selected_menu_index_].color = COLOR_TEXT_WHITE;
-                }
-            }
-            
-            // 设置新选中状态
-            selected_menu_index_ = actual_line_index;
-            
-            if (actual_line_index < (int)target_lines.size()) {
-                mutable_target_lines[actual_line_index].selected = true;
-                mutable_target_lines[actual_line_index].color = COLOR_PRIMARY;
-            }
-        }
+    // 清除所有选中状态
+    for (auto& line : all_lines_) {
+        line.selected = false;
     }
-    // 在可滚动模式下，UIManager直接管理current_menu_index_，不需要在这里处理
+    
+    // 设置新的选中状态
+    if (index >= 0 && index < (int)all_lines_.size()) {
+        selected_menu_index_ = index;
+        all_lines_[index].selected = true;
+    }
 }
 
 bool PageTemplate::scroll_up() {
@@ -443,15 +396,12 @@ void PageTemplate::update_scroll_display() {
         return;
     }
     
-    std::vector<LineConfig> visible_lines;
-    scroll_bar_.get_visible_lines(visible_lines);
+    // 滚动显示逻辑现在直接在draw()方法中处理
+    // 不再需要单独的visible_lines数组
     
     // // 添加调试日志
     // UIManager::log_debug_static("update_scroll_display: start_index=" + std::to_string(scroll_bar_.get_display_start_index()) + 
-    //                            ", visible_lines_size=" + std::to_string(visible_lines.size()) + 
     //                            ", visible_lines_count=" + std::to_string(visible_lines_count_));
-    
-    set_lines(visible_lines);
 }
 
 void PageTemplate::set_visible_end_line(int target_line_index) {
@@ -494,11 +444,11 @@ void PageTemplate::set_visible_end_line(int target_line_index) {
 }
 
 void PageTemplate::set_progress(int line_index, float progress, const std::string& text) {
-    if (line_index >= 0 && line_index < 4) {
-        lines_[line_index].type = LineType::PROGRESS_BAR;
+    if (line_index >= 0 && line_index < (int)all_lines_.size()) {
+        all_lines_[line_index].type = LineType::PROGRESS_BAR;
         // Note: progress value should be handled via progress_ptr in LineConfig
-        lines_[line_index].text = text;
-        lines_[line_index].color = COLOR_SUCCESS;
+        all_lines_[line_index].text = text;
+        all_lines_[line_index].color = COLOR_SUCCESS;
     }
 }
 
@@ -655,36 +605,56 @@ void PageTemplate::draw_menu_jump(int line_index, const LineConfig& config) {
 
 // 进度条项渲染
 void PageTemplate::draw_progress_bar(int line_index, const LineConfig& config) {
-    if (!graphics_engine_ || !config.data.progress.progress_ptr) return;
+    if (!graphics_engine_) {
+        return;
+    }
     
     Rect line_rect = get_line_rect(line_index);
-    uint8_t progress_value = *config.data.progress.progress_ptr;
-    float progress = progress_value / 255.0f; // 转换0-255到0.0-1.0
     
-    // 确保progress值在有效范围内
-    if (progress < 0.0f) progress = 0.0f;
-    if (progress > 1.0f) progress = 1.0f;
+    // 获取进度值，检查指针是否有效
+    uint8_t progress_value = 0;
+    bool has_valid_data = false;
+    if (config.data.progress.progress_ptr) {
+        progress_value = *config.data.progress.progress_ptr;
+        has_valid_data = true;
+    }
     
-    // 计算百分比文本
-    char percent_str[8];
-    int progress_percent = (int)(progress * 100.0f); // 转换为整数避免浮点数问题
-    snprintf(percent_str, sizeof(percent_str), "%d%%", progress_percent);
-    int16_t percent_width = graphics_engine_->get_text_width(percent_str);
+    // 计算百分比文本或错误信息
+    char display_str[8];
+    if (has_valid_data) {
+        // 使用整数运算计算百分比: percentage = progress_value * 100 / 255
+        int progress_percent = (progress_value * 100) / 255;
+        snprintf(display_str, sizeof(display_str), "%d%%", progress_percent);
+    } else {
+        snprintf(display_str, sizeof(display_str), "ERR");
+    }
+    int16_t text_width = graphics_engine_->get_text_width(display_str);
     
-    // 为百分比文本预留空间，进度条宽度减去百分比文本宽度和间距
-    int16_t text_margin = 6; // 百分比文本与进度条的间距
-    int16_t progress_width = line_rect.width - percent_width - text_margin - 8; // 8是左右边距
+    // 为文本预留空间，进度条宽度减去文本宽度和间距
+    int16_t text_margin = 6; // 文本与进度条的间距
+    int16_t progress_width = line_rect.width - text_width - text_margin - 8; // 8是左右边距
     
-    // 绘制进度条（带外边框，高度增加）
-    Rect progress_rect(line_rect.x + 4, line_rect.y + 1, progress_width, 8);
-    graphics_engine_->draw_progress_bar(progress_rect, progress, COLOR_BG_CARD, config.color);
+    // 确保进度条宽度不会太小
+    if (progress_width < 20) {
+        progress_width = 20;
+    }
     
-    // 绘制百分比文本，始终在右侧
-    int16_t percent_x = line_rect.x + line_rect.width - percent_width - 4;
-    int16_t percent_y = line_rect.y + 6; // 垂直居中
+    uint8_t progress_for_engine = has_valid_data ? progress_value : 0;
+    
+    // 绘制进度条（高度14，在行内垂直居中）- 始终绘制边框和背景
+    // 行高12，进度条高度14，所以Y偏移 = (12-14)/2 = -1，使进度条在行内居中
+    Rect progress_rect(line_rect.x + 4, line_rect.y - 1, progress_width, 14);
+    
+    graphics_engine_->draw_progress_bar(progress_rect, progress_for_engine, COLOR_BG_CARD, config.color);
+    
+    // 绘制文本，始终在右侧显示
+    int16_t text_x = line_rect.x + line_rect.width - text_width - 4;
+    // 计算文字Y坐标，使其与进度条中线对齐
+    // 进度条: y=line_rect.y - 1, height=14, 中线=line_rect.y - 1 + 7 = line_rect.y + 6
+    // 文字高度14，所以文字Y坐标应该是中线位置
+    int16_t text_y = line_rect.y - 2;
 
-    graphics_engine_->draw_text(percent_str, percent_x, percent_y, COLOR_TEXT_GRAY);
-    
+    graphics_engine_->draw_text(display_str, text_x, text_y, COLOR_WHITE);
 }
 
 // INT设置项渲染
@@ -698,30 +668,25 @@ void PageTemplate::draw_int_setting(int line_index, const LineConfig& config) {
         graphics_engine_->fill_rect(line_rect, COLOR_BG_CARD);
     }
     
-    // 第二行：标题居中显示
-    if (line_index == 1 && !config.setting_title.empty()) {
-        int16_t title_x = get_text_x_position(config.setting_title, LineAlign::CENTER, line_rect);
-        int16_t title_y = line_rect.y + (line_rect.height - 14) / 2;
-        graphics_engine_->draw_chinese_text(config.setting_title.c_str(), title_x, title_y, config.color);
+    // 构建显示文本："标题: 当前值 (min-max)"
+    char display_str[64];
+    if (!config.setting_title.empty()) {
+        snprintf(display_str, sizeof(display_str), "%s: %ld (%ld-%ld)", 
+                config.setting_title.c_str(),
+                (long)*config.data.int_setting.int_value_ptr,
+                (long)config.data.int_setting.min_value,
+                (long)config.data.int_setting.max_value);
+    } else {
+        snprintf(display_str, sizeof(display_str), "%ld (%ld-%ld)", 
+                (long)*config.data.int_setting.int_value_ptr,
+                (long)config.data.int_setting.min_value,
+                (long)config.data.int_setting.max_value);
     }
     
-    // 第四行：当前值动态显示
-    if (line_index == 3) {
-        char value_str[16];
-        snprintf(value_str, sizeof(value_str), "%ld", (long)*config.data.int_setting.int_value_ptr);
-        int16_t value_x = get_text_x_position(value_str, LineAlign::CENTER, line_rect);
-        int16_t value_y = line_rect.y + (line_rect.height - 14) / 2;
-        graphics_engine_->draw_text(value_str, value_x, value_y, config.color);
-    }
-    
-    // 第五行："{min} - {max}"居中显示
-    if (line_index == 4) {
-        char range_str[32];
-        snprintf(range_str, sizeof(range_str), "%ld - %ld", (long)config.data.int_setting.min_value, (long)config.data.int_setting.max_value);
-        int16_t range_x = get_text_x_position(range_str, LineAlign::CENTER, line_rect);
-        int16_t range_y = line_rect.y + (line_rect.height - 14) / 2;
-        graphics_engine_->draw_text(range_str, range_x, range_y, COLOR_TEXT_GRAY);
-    }
+    // 绘制文本
+    int16_t text_x = get_text_x_position(display_str, config.align, line_rect);
+    int16_t text_y = line_rect.y + (line_rect.height - 14) / 2;
+    graphics_engine_->draw_text(display_str, text_x, text_y, config.color);
 }
 
 // 按钮项渲染
@@ -904,63 +869,3 @@ void PageTemplate::draw_selection_indicator(int line_index) {
     
     graphics_engine_->draw_icon_arrow_right(indicator_x, indicator_y - 3, 6, COLOR_PRIMARY);
 }
-
-// 预定义模板实现
-namespace PageTemplates {
-
-
-void setup_error_page(PageTemplate& page, const std::string& error_message, const std::string& action_hint) {
-    page.clear();
-    page.set_title("错误", COLOR_ERROR);
-    
-    // 错误信息
-    LineConfig error_config(error_message, COLOR_ERROR, LineAlign::CENTER);
-    page.set_line(0, error_config);
-    
-    // 操作提示
-    LineConfig hint_config = LineConfig::create_status_line(action_hint, COLOR_TEXT_WHITE, LineAlign::CENTER);
-    page.set_line(2, hint_config);
-}
-
-// 保留错误页面创建函数，其他页面应在page目录中实现
-void create_error_page(PageTemplate& page) {
-    setup_error_page(page, "系统错误", "按任意键返回");
-}
-
-// INT设置页面模板
-void setup_int_setting_page(PageTemplate& page, const std::string& title, 
-                           int32_t* value_ptr, int32_t min_val, int32_t max_val,
-                           std::function<void(int32_t)> change_cb,
-                           std::function<void()> complete_cb) {
-    page.clear();
-    page.set_title(title, COLOR_WHITE);
-    
-    // 第一行：空行
-    LineConfig empty_line("", COLOR_TEXT_WHITE, LineAlign::CENTER);
-    page.set_line(0, empty_line);
-    
-    // 第二行：设置标题
-    LineConfig title_line = LineConfig::create_int_setting(value_ptr, min_val, max_val, 
-                                                          "", title, change_cb, complete_cb, COLOR_TEXT_WHITE);
-    page.set_line(1, title_line);
-    
-    // 第三行：操作提示
-    LineConfig hint_line("← → 调整值", COLOR_TEXT_GRAY, LineAlign::CENTER);
-    page.set_line(2, hint_line);
-    
-    // 第四行：当前值显示
-    LineConfig value_line = LineConfig::create_int_setting(value_ptr, min_val, max_val, 
-                                                          "", title, change_cb, complete_cb, COLOR_TEXT_WHITE);
-    value_line.selected = true;  // 标记为选中状态
-    page.set_line(3, value_line);
-    
-    // 第五行：范围显示
-    LineConfig range_line = LineConfig::create_int_setting(value_ptr, min_val, max_val, 
-                                                          "", title, change_cb, complete_cb, COLOR_TEXT_GRAY);
-    page.set_line(4, range_line);
-    
-    // 设置选中索引为值显示行
-    page.set_selected_index(3);
-}
-
-} // namespace PageTemplates

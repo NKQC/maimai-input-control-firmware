@@ -8,6 +8,7 @@
 #include <functional>
 #include <cstring>  // for memset
 
+
 // 前向声明摇杆状态枚举
 enum class JoystickState;
 using SelectorCallback = std::function<void(JoystickState state)>;
@@ -283,13 +284,13 @@ public:
     
     // 数据访问方法
     const std::vector<LineConfig>& get_all_lines() const { return all_lines_; }
-    const std::vector<LineConfig>& get_lines() const { return lines_; }
+    std::vector<LineConfig>& get_mutable_all_lines() { return all_lines_; }
     int get_scroll_start_index() const { return scroll_bar_.get_display_start_index(); }
     int get_visible_lines_count() const { return visible_lines_count_; }
     
     int get_menu_item_count() const {
-        // 统一使用all_lines_，在非滚动模式下all_lines_和lines_内容相同
-        const auto& target_lines = all_lines_.empty() ? lines_ : all_lines_;
+        // 统一使用all_lines_管理所有行内容
+        const auto& target_lines = all_lines_;
         int count = 0;
         for (const auto& line : target_lines) {
             // 只计算可交互的菜单项，不包括普通文本
@@ -307,19 +308,8 @@ public:
     
     // 获取行配置
     const LineConfig& get_line_config(int line_index) const {
-        if (!all_lines_.empty()) {
-            if (scroll_enabled_) {
-                // 滚动模式下，需要根据滚动位置计算实际索引
-                int actual_index = scroll_bar_.get_display_start_index() + line_index;
-                if (actual_index >= 0 && actual_index < (int)all_lines_.size()) {
-                    return all_lines_[actual_index];
-                }
-            } else {
-                // 非滚动模式，直接从all_lines_获取
-                if (line_index >= 0 && line_index < (int)all_lines_.size()) {
-                    return all_lines_[line_index];
-                }
-            }
+        if (!all_lines_.empty() && line_index >= 0 && line_index < (int)all_lines_.size()) {
+            return all_lines_[line_index];
         }
         static LineConfig empty_config;
         return empty_config;
@@ -363,8 +353,7 @@ private:
     // 页面内容
     std::string title_;
     Color title_color_;
-    std::vector<LineConfig> lines_;  // 4行内容 (第2-5行)
-    std::vector<LineConfig> all_lines_;  // 所有行内容（用于滚动）
+    std::vector<LineConfig> all_lines_;  // 所有行内容（统一管理）
 
     // 状态跟踪变量
     static bool has_title_;          // 是否设置了标题
@@ -407,16 +396,9 @@ private:
     void draw_selection_indicator(int line_index);
 };
 
-// 预定义的页面模板
-namespace PageTemplates {
-    // 保留错误页面创建函数，其他页面应在page目录中实现
-    void create_error_page(PageTemplate& page);
-    
-    // INT设置页面模板
-    void setup_int_setting_page(PageTemplate& page, const std::string& title, 
-                               int32_t* value_ptr, int32_t min_val, int32_t max_val,
-                               std::function<void(int32_t)> change_cb = nullptr,
-                               std::function<void()> complete_cb = nullptr);
-}
+// 预定义模板实现已迁移到template_page目录中的PageConstructor派生类
+// 使用PageRegistry注册的内部页面：
+// - "__error__" : ErrorPage
+// - "__int_setting__" : IntSettingPage
 
 #endif // PAGE_TEMPLATE_H

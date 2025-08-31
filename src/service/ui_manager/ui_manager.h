@@ -26,6 +26,9 @@ class ConfigManager;
 #define UIMANAGER_ENABLE_JOYSTICK "UIMANAGER_ENABLE_JOYSTICK"
 #define UIMANAGER_JOYSTICK_SENSITIVITY "UIMANAGER_JOYSTICK_SENSITIVITY"
 
+// 内置模板页构造 设置该名字时必须设置对应的模板构造器 否则崩溃
+#define _TEMPLATE_PAGE_NAME "__template_page__"
+
 // 简化的UI类型定义
 struct ErrorInfo {
     std::string message;
@@ -70,10 +73,11 @@ struct UIStatistics {
 };
 
 // 页面类型枚举 - 用于特殊页面处理
-enum class PageType {
+enum class PageType: uint8_t {
     NORMAL,         // 普通页面，使用标准导航
     INT_SETTING,    // INT设置页面，上下调整数值
-    SELECTOR        // 选择器页面，摇杆触发回调
+    SELECTOR,       // 选择器页面，摇杆触发回调
+    ERROR           // 错误页面
 };
 
 // 摇杆输入状态枚举
@@ -253,9 +257,6 @@ private:
     // 输入状态
     bool joystick_buttons_[3];      // A, B, CONFIRM按钮状态
     uint32_t button_press_times_[3]; // 按钮按下时间
-    
-    // 页面数据
-    PageData page_data_;
 
     // 新页面引擎
     static std::string current_page_name_;                // 当前页面名称
@@ -267,9 +268,37 @@ private:
     static ErrorInfo global_error_;    // 全局故障信息
     static bool global_has_error_;     // 全局故障标志
     
-    // 绑定进度相关
+    // 绑定步骤
     int binding_step_;                 // 绑定步骤
     
+    // 弹窗状态管理
+    bool is_popup_active_;             // 是否有弹窗激活
+    std::string popup_caller_page_;    // 调用弹窗的页面名称
+    int popup_caller_index_;           // 调用弹窗时的菜单索引
+
+    // 储存按键特殊状态
+    struct {
+        bool is_locked = false;
+        void clear() {
+            is_locked = false;
+        }
+    } line_state_;
+    
+    struct {
+        int32_t* int_setting_value_ptr_ = nullptr;
+        int32_t min_value = 0;
+        int32_t max_value = 0;
+        std::function<void(int32_t)> value_change_cb;
+        std::function<void()> complete_cb;
+        void clear() {
+            int_setting_value_ptr_ = nullptr;
+            min_value = 0;
+            max_value = 0;
+            value_change_cb = nullptr;
+            complete_cb = nullptr;
+        }
+    } popup_int_setting_data_;
+
     // 统计信息
     UIStatistics statistics_;
     
@@ -288,9 +317,6 @@ private:
     void draw_page_with_template();
     void update_page_template_content();
     
-    // 页面数据管理
-    void reset_page_data();
-    
     // 30fps刷新任务
     void refresh_task_30fps();
     static void display_refresh_timer_callback(void* arg);
@@ -299,12 +325,11 @@ private:
     void handle_navigation_input(bool up);
     
     // 页面特殊处理接口
-    PageType get_current_page_type() const;
-    bool needs_special_joystick_handling() const;
+    PageType get_current_page_type();
+    bool needs_special_joystick_handling();
     bool handle_special_joystick_input(JoystickState state);
     
     // 私有成员函数
-    bool is_in_int_setting_page() const;
     bool adjust_int_setting_value(bool increase);
     bool handle_selector_input(JoystickState state);
     

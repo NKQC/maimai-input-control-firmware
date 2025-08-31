@@ -9,6 +9,8 @@ namespace ui {
 
 MainMenu::MainMenu() 
     : progress_(0), progress_data_(0) {
+    // 初始化progress_data_与progress_同步
+    progress_data_ = (uint8_t)((progress_ * 255) / 100);
 }
 
 void MainMenu::render(PageTemplate& page_template) {
@@ -32,8 +34,7 @@ void MainMenu::render(PageTemplate& page_template) {
     ADD_MENU("选择器测试", "selector_test", COLOR_TEXT_WHITE)
     
     // 第六行：进度条测试 - 使用ADD_PROGRESS宏
-    // 将progress_转换为uint8_t供进度条使用
-    progress_data_ = (uint8_t)((progress_ * 255) / 100);  // 转换0-100到0-255
+    // progress_data_已在set_progress方法中更新，这里直接使用
     ADD_PROGRESS(&progress_data_, COLOR_TEXT_WHITE)
     
     // 第七行：进度控制设置 - 使用ADD_INT_SETTING宏
@@ -54,9 +55,6 @@ void MainMenu::render(PageTemplate& page_template) {
     ADD_BACK_ITEM("返回主界面", COLOR_TEXT_WHITE)
     
     PAGE_END()
-    
-    // 绘制页面
-    page_template.draw();
 }
 
 void MainMenu::set_progress(int progress) {

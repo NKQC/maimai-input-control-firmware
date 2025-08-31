@@ -14,6 +14,10 @@
     page_template.flush(); \
     std::vector<LineConfig> all_lines;
 
+// 设置标题
+#define SET_TITLE(title, color) \
+    page_template.set_title(title, color);
+
 // 添加行宏 - 向页面添加一行内容
 #define ADD_LINE(line_config) \
     all_lines.push_back(line_config);

@@ -2,6 +2,8 @@
 #include "page/main_page.h"
 #include "page/main_menu.h"
 #include "page/selector_test.h"
+#include "engine/template_page/error_page.h"
+#include "engine/template_page/int_setting_page.h"
 #include <algorithm>
 
 namespace ui {
@@ -76,7 +78,19 @@ void PageRegistry::register_default_pages() {
     // 可以在这里添加更多默认页面的注册
     // REGISTER_PAGE("settings", SettingsPage);
     // REGISTER_PAGE("status", StatusPage);
-    // REGISTER_PAGE("error", ErrorPage);
+    
+    // 注册内部模板页面
+    register_internal_pages();
+}
+
+void PageRegistry::register_internal_pages() {
+    // 注册错误页面
+    auto error_page = std::make_shared<ErrorPage>();
+    register_page("__error__", error_page);
+    
+    // 注册INT设置页面
+    auto int_setting_page = std::make_shared<IntSettingPage>();
+    register_page("__int_setting__", int_setting_page);
 }
 
 } // namespace ui
