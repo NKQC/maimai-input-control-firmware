@@ -8,6 +8,10 @@
 #include <functional>
 #include <cstring>  // for memset
 
+// 前向声明摇杆状态枚举
+enum class JoystickState;
+using SelectorCallback = std::function<void(JoystickState state)>;
+
 /**
  * 5行字符显示架构的标准页面模板
  * 屏幕尺寸: 160x80像素
@@ -27,7 +31,8 @@ enum class LineType {
     PROGRESS_BAR,   // 进度条项 - 接收uint8_t指针(0-255对应0%-100%)
     INT_SETTING,    // INT设置项 - 包含值变更回调和完成回调
     BUTTON_ITEM,    // 按钮项 - 支持文本构造和点击回调
-    BACK_ITEM       // 返回项 - 返回上一页并恢复状态
+    BACK_ITEM,      // 返回项 - 返回上一页并恢复状态
+    SELECTOR_ITEM   // 选择器项 - 摇杆功能切换到回调触发模式
 };
 
 // 文本对齐方式
@@ -44,44 +49,72 @@ struct LineConfig {
     Color color;
     LineAlign align;
     bool selected;      // 用于菜单项选中状态
+
+    std::string setting_title;     // 设置项标题
+    std::string target_page_name;  // 目标页面名称
     
     // 使用union节省内存 - 不同类型的数据不会同时使用
     union TypeSpecificData {
         // 进度条相关
         struct {
-            uint8_t* progress_ptr;  // 进度条数据指针 (0-255对应0%-100%)
+            uint8_t* progress_ptr = nullptr;  // 进度条数据指针 (0-255对应0%-100%)
         } progress;
         
         // INT设置项相关
         struct {
-            int32_t* int_value_ptr; // INT值指针
-            int32_t min_value;      // 最小值
-            int32_t max_value;      // 最大值
+            int32_t* int_value_ptr = nullptr; // INT值指针
+            int32_t min_value = 0;      // 最小值
+            int32_t max_value = 0;      // 最大值
         } int_setting;
         
-        // 默认构造函数
-        TypeSpecificData() { memset(this, 0, sizeof(TypeSpecificData)); }
+        // 选择器相关
+        struct {
+            bool is_locked = false;         // 是否处于锁定状态
+        } selector;
+        TypeSpecificData() {}
+        ~TypeSpecificData() {}
+
     } data;
     
-    // 字符串数据 - 需要单独存储因为union不能包含非POD类型
-    std::string setting_title;     // 设置项标题
-    std::string target_page_name;  // 目标页面名称
+    // 回调函数union - 优化内存占用，每个LineConfig实例只使用其中一个回调
+    union CallbackData {
+        std::function<void(int32_t)> value_change_callback = nullptr; // INT设置值变更回调
+        std::function<void()> complete_callback;            // INT设置完成回调
+        std::function<void()> click_callback;               // 按钮点击回调
+        SelectorCallback selector_callback;                 // 选择器回调
+        CallbackData() {}
+        ~CallbackData() {}
+    } callback_data;
+
+    // 选择器锁定回调
+    std::function<void()> lock_callback = nullptr;
+
+    // 回调类型标识，用于正确调用和析构
+    enum class CallbackType {
+        NONE,
+        VALUE_CHANGE,
+        COMPLETE,
+        CLICK,
+        SELECTOR
+    } callback_type;
     
-    // 回调函数 - 需要单独存储
-    std::function<void(int32_t)> value_change_callback; // 值变更回调
-    std::function<void()> complete_callback;            // 完成回调
-    std::function<void()> click_callback;               // 点击回调
+    // 添加拷贝构造函数和赋值操作符
+    LineConfig(const LineConfig& other);
+    LineConfig(LineConfig&& other) noexcept;
+    LineConfig& operator=(const LineConfig& other);
+    LineConfig& operator=(LineConfig&& other) noexcept;
+    ~LineConfig();
     
     // 基础构造函数 - 文本项
     LineConfig(const std::string& txt, 
                Color c = COLOR_TEXT_WHITE,
                LineAlign a = LineAlign::LEFT)
-        : type(LineType::TEXT_ITEM), text(txt), color(c), align(a), selected(false), data() {}
+        : type(LineType::TEXT_ITEM), text(txt), color(c), align(a), selected(false) {}
     
     // 标题行与内容行合并构造 - 文本项
     LineConfig(const std::string& title, const std::string& content,
                Color c = COLOR_TEXT_WHITE, LineAlign a = LineAlign::LEFT)
-        : type(LineType::TEXT_ITEM), text(title + ": " + content), color(c), align(a), selected(false), data() {}
+        : type(LineType::TEXT_ITEM), text(title + ": " + content), color(c), align(a), selected(false) {}
     
     // 状态行构造
     static LineConfig create_status_line(const std::string& txt, 
@@ -93,6 +126,7 @@ struct LineConfig {
         config.color = c;
         config.align = a;
         config.selected = false;
+        config.callback_type = CallbackType::NONE;
         return config;
     }
     
@@ -106,20 +140,20 @@ struct LineConfig {
         config.color = c;
         config.align = LineAlign::LEFT;
         config.selected = false;
+        config.callback_type = CallbackType::NONE;
         // union数据会通过构造函数自动初始化为0
         return config;
     }
     
     // 进度条项构造
-    static LineConfig create_progress_bar(uint8_t* progress_data_ptr, const std::string& txt = "",
-                                         Color c = COLOR_TEXT_WHITE) {
+    static LineConfig create_progress_bar(uint8_t* progress_data_ptr, Color c = COLOR_TEXT_WHITE) {
         LineConfig config;
         config.type = LineType::PROGRESS_BAR;
-        config.text = txt;
         config.data.progress.progress_ptr = progress_data_ptr;
         config.color = c;
         config.align = LineAlign::LEFT;
         config.selected = false;
+        config.callback_type = CallbackType::NONE;
         return config;
     }
     
@@ -136,8 +170,15 @@ struct LineConfig {
         config.data.int_setting.int_value_ptr = value_ptr;
         config.data.int_setting.min_value = min_val;
         config.data.int_setting.max_value = max_val;
-        config.value_change_callback = change_cb;
-        config.complete_callback = complete_cb;
+        if (change_cb) {
+            config.callback_data.value_change_callback = change_cb;
+            config.callback_type = CallbackType::VALUE_CHANGE;
+        } else if (complete_cb) {
+            config.callback_data.complete_callback = complete_cb;
+            config.callback_type = CallbackType::COMPLETE;
+        } else {
+            config.callback_type = CallbackType::NONE;
+        }
         config.color = c;
         config.align = LineAlign::CENTER;
         config.selected = false;
@@ -150,7 +191,8 @@ struct LineConfig {
         LineConfig config;
         config.type = LineType::BUTTON_ITEM;
         config.text = txt;
-        config.click_callback = callback;
+        config.callback_data.click_callback = callback;
+        config.callback_type = CallbackType::CLICK;
         config.color = c;
         config.align = a;
         config.selected = false;
@@ -167,13 +209,33 @@ struct LineConfig {
         config.color = c;
         config.align = LineAlign::LEFT;
         config.selected = false;
+        config.callback_type = CallbackType::NONE;
         // union数据会通过构造函数自动初始化为0
+        return config;
+    }
+    
+    // 选择器构造函数
+    static LineConfig create_selector(const std::string& txt,
+                                    SelectorCallback selector_callback,
+                                    std::function<void()> lock_callback = nullptr,
+                                    Color c = COLOR_TEXT_WHITE,
+                                    LineAlign a = LineAlign::LEFT) {
+        LineConfig config;
+        config.type = LineType::SELECTOR_ITEM;
+        config.text = txt;
+        config.callback_data.selector_callback = selector_callback;
+        config.callback_type = CallbackType::SELECTOR;
+        config.lock_callback = lock_callback;
+        config.color = c;
+        config.align = a;
+        config.selected = false;
+        config.data.selector.is_locked = false;
         return config;
     }
     
     // 默认构造函数
     LineConfig() : type(LineType::TEXT_ITEM), color(COLOR_TEXT_WHITE), align(LineAlign::LEFT),
-                   selected(false), data() {}
+                   selected(false) {}
 };
 
 // 页面模板类
@@ -235,7 +297,8 @@ public:
                 (line.type == LineType::MENU_JUMP || 
                  line.type == LineType::INT_SETTING || 
                  line.type == LineType::BUTTON_ITEM || 
-                 line.type == LineType::BACK_ITEM)) {
+                 line.type == LineType::BACK_ITEM || 
+                 line.type == LineType::SELECTOR_ITEM)) {
                 count++;
             }
         }
@@ -256,11 +319,6 @@ public:
                 if (line_index >= 0 && line_index < (int)all_lines_.size()) {
                     return all_lines_[line_index];
                 }
-            }
-        } else {
-            // 回退到lines_（兼容性）
-            if (line_index >= 0 && line_index < (int)lines_.size()) {
-                return lines_[line_index];
             }
         }
         static LineConfig empty_config;
@@ -294,10 +352,10 @@ public:
     const std::vector<LineConfig>& get_right_lines() const { return right_lines_; }
     
     // 工具函数
-    static int16_t get_line_y_position(int line_index);  // 获取行的Y坐标
-    static Rect get_line_rect(int line_index);           // 获取行的矩形区域
-    Rect get_split_left_rect(int line_index);            // 获取左半屏行区域
-    Rect get_split_right_rect(int line_index);           // 获取右半屏行区域
+    static int16_t get_line_y_position(int line_index);     // 获取行的Y坐标
+    static Rect get_line_rect(int line_index);              // 获取行的矩形区域
+    Rect get_split_left_rect(int line_index);               // 获取左半屏行区域
+    Rect get_split_right_rect(int line_index);              // 获取右半屏行区域
     
 private:
     GraphicsEngine* graphics_engine_;
@@ -309,8 +367,8 @@ private:
     std::vector<LineConfig> all_lines_;  // 所有行内容（用于滚动）
 
     // 状态跟踪变量
-    bool has_title_;          // 是否设置了标题
-    bool has_split_screen_;   // 是否启用分屏模式
+    static bool has_title_;          // 是否设置了标题
+    static bool has_split_screen_;   // 是否启用分屏模式
     int visible_lines_count_; // 当前可见行数缓存
 
     // 选中状态
@@ -342,6 +400,7 @@ private:
     void draw_int_setting(int line_index, const LineConfig& config);
     void draw_button_item(int line_index, const LineConfig& config);
     void draw_back_item(int line_index, const LineConfig& config);
+    void draw_selector_item(int line_index, const LineConfig& config);
 
     // 辅助方法
     int16_t get_text_x_position(const std::string& text, LineAlign align, const Rect& rect);

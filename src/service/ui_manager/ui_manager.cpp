@@ -1,7 +1,6 @@
 #include "ui_manager.h"
 #include "page_registry.h"
-#include "page/main_page.h"
-
+#include "engine/page_construction/page_manager.h"
 #include "../../service/input_manager/input_manager.h"
 #include "../../service/light_manager/light_manager.h"
 #include "../../service/config_manager/config_manager.h"
@@ -16,6 +15,7 @@
 #include <cstring>
 #include <cstdio>
 #include <algorithm>
+#include <string>
 
 // 静态实例变量定义
 UIManager* UIManager::instance_ = nullptr;
@@ -30,6 +30,9 @@ bool UIManager::global_has_error_ = false;
 // 静态framebuffer定义
 uint16_t UIManager::framebuffer_[ST7735S_WIDTH * ST7735S_HEIGHT];
 uint16_t UIManager::static_framebuffer_[ST7735S_WIDTH * ST7735S_HEIGHT];
+
+// 静态当前页面名称 预分配32字节
+std::string UIManager::current_page_name_;
 
 // 配置管理函数实现
 UIManager_PrivateConfig* ui_manager_get_config_holder() {
@@ -66,14 +69,14 @@ bool ui_manager_load_config_from_manager(ConfigManager* config_manager) {
     return true;
 }
 
-// PageManager访问方法
-// 新页面引擎相关函数
+// 切换页面
 bool UIManager::switch_to_page(const std::string& page_name) {
-    // 简化的页面切换，直接更新页面名称
+    // 更新页面名称
     current_page_name_ = page_name;
     current_menu_index_ = 0;
+    page_template_->set_visible_end_line(current_menu_index_);
     last_activity_time_ = to_ms_since_boot(get_absolute_time());
-    log_debug("Switched to page: " + page_name);
+    
     return true;
 }
 
@@ -133,12 +136,10 @@ UIManager::UIManager()
     , screen_off_(false)
     , last_activity_time_(0)
     , last_refresh_time_(0)
-    , needs_full_refresh_(true)
     , debug_enabled_(false)
     , last_navigation_time_(0)
     , cursor_blink_timer_(0)
     , cursor_visible_(true)
-    , current_page_name_("status")
     , has_error_(false)
     , binding_step_(0)
     {
@@ -198,6 +199,8 @@ bool UIManager::init(const UIManager_Config& config) {
     ui::PageRegistry::get_instance().register_default_pages();
     log_debug("Page registry initialized with default pages");
     
+    current_page_name_.reserve(32);
+
     // 切换到主界面
     switch_to_page("main");
     
@@ -260,6 +263,7 @@ void UIManager::handle_input() {
                 // 如果息屏，先唤醒屏幕
                 if (screen_off_) {
                     wake_screen();
+                    return;
                 }
                 // 按下时不触发操作，等待释放
             } else if (was_pressed) { // 按钮释放（从按下状态变为释放状态）
@@ -271,7 +275,7 @@ void UIManager::handle_input() {
                     uint32_t press_duration = current_time - button_press_times_[i];
                     
                     // 防抖处理：只有按下时间超过最小阈值才处理
-                    if (press_duration >= 30) { // 减少防抖时间提高响应性
+                    if (press_duration >= 50) { // 减少防抖时间提高响应性
                         // 调用统一的摇杆输入处理接口
                         bool handled = handle_joystick_input(i);
                         if (handled) {
@@ -300,8 +304,7 @@ void UIManager::deinit() {
     
     // 清理构造体系统
     // 构造体页面已由page_manager管理，无需手动清理
-    menu_system_ = nullptr;
-    nav_manager_ = nullptr;
+    // menu_system_ 和 nav_manager_ 现在是直接实例化的对象，不需要设置为nullptr
     // 构造体系统作为引擎核心组件，无需禁用
     
     display_device_ = nullptr;
@@ -391,9 +394,6 @@ void UIManager::refresh_task_30fps() {
     }
 }
 
-// 设置当前页面
-// set_current_page函数已删除，页面切换已改为面向对象方式
-
 // 重置页面数据
 void UIManager::reset_page_data() {
     // 清空页面数据，让页面组件自己管理内容
@@ -475,8 +475,6 @@ void UIManager::handle_navigation_input(bool up) {
         // 让滚动跟随光标：使用新的 set_visible_end_line 方法
         // 这样光标始终可见，滚动会自动调整以跟随光标位置
         page_template_->set_visible_end_line(current_menu_index_);
-        page_template_->set_selected_index(current_menu_index_);
-        
     } else {
         // 不可滚动模式：只选择可触发区域
         int menu_count = page_template_->get_menu_item_count();
@@ -513,112 +511,154 @@ void UIManager::handle_navigation_input(bool up) {
 
 // 处理确认输入
 void UIManager::handle_confirm_input() {
-    // 使用PageTemplate的LineConfig跳转机制
-    if (page_template_) {
-        bool is_scrollable = page_template_->is_scroll_enabled();
-        
-        if (is_scrollable) {
-            // 可滚动模式：需要从所有行中找到当前选中行的配置
-            const auto& all_lines = page_template_->get_all_lines();
-            if (current_menu_index_ >= 0 && current_menu_index_ < (int)all_lines.size()) {
-                LineConfig line_config = all_lines[current_menu_index_];
-                
-                // 检查是否是菜单跳转类型
-                if (line_config.type == LineType::MENU_JUMP && !line_config.target_page_name.empty()) {
-                    // 检查目标页面是否存在
-                    std::vector<std::string> available_pages = get_available_pages();
-                    bool page_exists = std::find(available_pages.begin(), available_pages.end(), line_config.target_page_name) != available_pages.end();
-                    
-                    if (!page_exists) {
-                        log_error("Target page does not exist: " + line_config.target_page_name + ", switching to main page");
-                        switch_to_page("main");
-                        return;
-                    }
-                    
-                    // 保存当前页面状态到导航管理器
-                    if (nav_manager_) {
-                        int scroll_pos = page_template_->get_scroll_position();
-                        nav_manager_->push_page(current_page_name_, current_menu_index_, scroll_pos);
-                    }
-                    // 使用LineConfig的target_page_name进行跳转
-                    switch_to_page(line_config.target_page_name);
-                    return;
-                }
-                // 检查是否是返回项类型
-                else if (line_config.type == LineType::BACK_ITEM) {
-                    // 处理返回操作，恢复上一页状态
-                    if (nav_manager_ && nav_manager_->can_go_back()) {
-                        PageState prev_state = nav_manager_->pop_page();
-                        current_page_name_ = prev_state.page_name;
-                        current_menu_index_ = prev_state.cursor_position;
-                        
-                        // 重置页面数据并恢复状态
-                        reset_page_data();
-                        
-                        // 恢复光标和滚动位置
-                        if (page_template_) {
-                            page_template_->set_selected_index(current_menu_index_);
-                            page_template_->set_scroll_position(prev_state.scroll_position);
-                        }
-                        
-                        last_activity_time_ = to_ms_since_boot(get_absolute_time());
-                        log_debug("Returned to page: " + current_page_name_ + 
-                                 ", cursor: " + std::to_string(current_menu_index_) + 
-                                 ", scroll: " + std::to_string(prev_state.scroll_position));
-                    }
-                    return;
-                }
-            }
-        } else {
-            // 不可滚动模式：使用原有逻辑
-            int menu_count = page_template_->get_menu_item_count();
-            if (menu_count > 0 && current_menu_index_ >= 0 && current_menu_index_ < menu_count) {
-                // 获取当前选中的菜单项配置
-                LineConfig line_config = page_template_->get_line_config(current_menu_index_);
-            
-                // 检查是否是菜单跳转类型
-                if (line_config.type == LineType::MENU_JUMP && !line_config.target_page_name.empty()) {
-                // 保存当前页面状态到导航管理器
-                if (nav_manager_) {
-                    int scroll_pos = page_template_->get_scroll_position();
-                    nav_manager_->push_page(current_page_name_, current_menu_index_, scroll_pos);
-                }
-                // 使用LineConfig的target_page_name进行跳转
-                switch_to_page(line_config.target_page_name);
-                return;
-            }
-            // 检查是否是返回项类型
-            else if (line_config.type == LineType::BACK_ITEM) {
-                // 处理返回操作，恢复上一页状态
-                if (nav_manager_ && nav_manager_->can_go_back()) {
-                    PageState prev_state = nav_manager_->pop_page();
-                    current_page_name_ = prev_state.page_name;
-                    current_menu_index_ = prev_state.cursor_position;
-                    
-                    // 重置页面数据并恢复状态
-                    reset_page_data();
-                    
-                    // 恢复光标和滚动位置
-                    if (page_template_) {
-                        page_template_->set_selected_index(current_menu_index_);
-                        page_template_->set_scroll_position(prev_state.scroll_position);
-                    }
-                    
-                    last_activity_time_ = to_ms_since_boot(get_absolute_time());
-                    log_debug("Returned to page: " + current_page_name_ + 
-                             ", cursor: " + std::to_string(current_menu_index_) + 
-                             ", scroll: " + std::to_string(prev_state.scroll_position));
-                }
-                return;
-            }
-            }
+    if (!page_template_) {
+        // 如果没有找到跳转目标或不是跳转类型，使用默认行为
+        if (current_page_name_ != "main") {
+            switch_to_page("main");
         }
+        return;
+    }
+
+    // 前置处理：获取当前行配置
+    LineConfig* line_config = nullptr;
+    LineConfig* mutable_line = nullptr;
+    bool is_scrollable = page_template_->is_scroll_enabled();
+    
+    if (is_scrollable) {
+        // 可滚动模式：从所有行中获取当前选中行
+        const auto& all_lines = page_template_->get_all_lines();
+        if (current_menu_index_ < 0 || current_menu_index_ >= (int)all_lines.size()) {
+            return;
+        }
+        line_config = const_cast<LineConfig*>(&all_lines[current_menu_index_]);
+        mutable_line = const_cast<LineConfig*>(&all_lines[current_menu_index_]);
+    } else {
+        // 不可滚动模式：从菜单项中获取
+        int menu_count = page_template_->get_menu_item_count();
+        if (menu_count <= 0 || current_menu_index_ < 0 || current_menu_index_ >= menu_count) {
+            return;
+        }
+        line_config = const_cast<LineConfig*>(&page_template_->get_line_config(current_menu_index_));
+        const auto& lines = page_template_->get_lines();
+        mutable_line = const_cast<LineConfig*>(&lines[current_menu_index_]);
+    }
+
+    // 使用switch跳表处理不同类型
+    switch (line_config->type) {
+        case LineType::MENU_JUMP:
+            handle_menu_jump(line_config);
+            break;
+            
+        case LineType::INT_SETTING:
+            handle_int_setting(line_config);
+            break;
+            
+        case LineType::SELECTOR_ITEM:
+            handle_selector_item(line_config, mutable_line);
+            break;
+            
+        case LineType::BACK_ITEM:
+            handle_back_item();
+            break;
+            
+        default:
+            // 什么都不做
+            log_debug("Unknown line type: " + std::to_string(static_cast<int>(line_config->type)));
+            break;
+    }
+}
+
+// handle_confirm_input的辅助函数实现
+void UIManager::handle_menu_jump(const LineConfig* line_config) {
+    if (line_config->target_page_name.empty()) {
+        log_debug("Menu jump target page name is empty \nTargetPage=" + 
+            std::string(line_config->target_page_name) +
+            "\nCurrentPage=" + current_page_name_ +
+            "\nCurrentIndex=" + std::to_string(current_menu_index_) + 
+            "\nLineText=" + line_config->text
+        );
+        return;
     }
     
-    // 如果没有找到跳转目标或不是跳转类型，使用默认行为
-    if (current_page_name_ != "main") {
-        // 非主页面默认返回主页面
+    // 检查目标页面是否存在
+    std::vector<std::string> available_pages = get_available_pages();
+    bool page_exists = std::find(available_pages.begin(), available_pages.end(), line_config->target_page_name) != available_pages.end();
+   
+    if (!page_exists) {
+        log_error("Target page does not exist: " + line_config->target_page_name + ", switching to main page");
         switch_to_page("main");
+        return;
+    }
+    
+    // 保存当前页面状态到导航管理器
+    int scroll_pos = page_template_->get_scroll_position();
+    
+    PageNavigationManager::getInstance().push_page(current_page_name_, current_menu_index_, scroll_pos);
+    // 使用LineConfig的target_page_name进行跳转
+    switch_to_page(line_config->target_page_name);
+}
+
+void UIManager::handle_int_setting(const LineConfig* line_config) {
+    // 保存当前页面状态到导航管理器
+    int scroll_pos = page_template_->get_scroll_position();
+    PageNavigationManager::getInstance().push_page(current_page_name_, current_menu_index_, scroll_pos);
+    
+    // 准备回调函数
+    std::function<void(int)> value_change_cb;
+    std::function<void()> complete_cb;
+    
+    if (line_config->callback_type == LineConfig::CallbackType::VALUE_CHANGE && line_config->callback_data.value_change_callback) {
+        value_change_cb = line_config->callback_data.value_change_callback;
+    }
+    if (line_config->callback_type == LineConfig::CallbackType::COMPLETE && line_config->callback_data.complete_callback) {
+        complete_cb = line_config->callback_data.complete_callback;
+    }
+    
+    // 使用setup_int_setting_page创建INT设置页面
+    PageTemplates::setup_int_setting_page(*page_template_, line_config->setting_title,
+                                         line_config->data.int_setting.int_value_ptr,
+                                         line_config->data.int_setting.min_value,
+                                         line_config->data.int_setting.max_value,
+                                         value_change_cb,
+                                         complete_cb);
+}
+
+void UIManager::handle_selector_item(const LineConfig* line_config, LineConfig* mutable_line) {
+    if (!mutable_line) {
+        return;
+    }
+    
+    // 切换选择器锁定状态
+    mutable_line->data.selector.is_locked = !mutable_line->data.selector.is_locked;
+    
+    // 调用锁定状态回调
+    if (line_config->lock_callback) {
+        line_config->lock_callback();
+    }
+    
+    log_debug(std::string("Selector ") + (mutable_line->data.selector.is_locked ? "locked" : "unlocked"));
+}
+
+void UIManager::handle_back_item() {
+    // 处理返回操作，恢复上一页状态
+    if (PageNavigationManager::getInstance().can_go_back()) {
+        PageState prev_state = PageNavigationManager::getInstance().pop_page();
+        current_page_name_ = prev_state.page_name;
+        current_menu_index_ = prev_state.cursor_position;
+        
+        // 重置页面数据并恢复状态
+        reset_page_data();
+        
+        // 恢复光标和滚动位置
+        if (page_template_) {
+            page_template_->set_selected_index(current_menu_index_);
+            page_template_->set_scroll_position(prev_state.scroll_position);
+        }
+        
+        last_activity_time_ = to_ms_since_boot(get_absolute_time());
+        log_debug("Returned to page: " + current_page_name_ + 
+                 ", cursor: " + std::to_string(current_menu_index_) + 
+                 ", scroll: " + std::to_string(prev_state.scroll_position));
     }
 }
 
@@ -737,15 +777,6 @@ void UIManager::task() {
     // 屏幕开启状态下的正常渲染
     // 使用30fps刷新任务进行页面渲染
     refresh_task_30fps();
-    
-    // 使用构造引擎统一处理页面更新
-    if (current_time - last_refresh_time_ >= static_config_.refresh_rate_ms) {
-        // 构造引擎会自动处理所有页面的更新和渲染
-        if (menu_system_) {
-            menu_system_->update();
-        }
-        last_refresh_time_ = current_time;
-    }
 }
 
 // 背光管理
@@ -842,7 +873,6 @@ bool UIManager::refresh_screen() {
 
 // 强制刷新
 bool UIManager::force_refresh() {
-    needs_full_refresh_ = true;
     return refresh_screen();
 }
 
@@ -906,57 +936,192 @@ std::vector<std::string> UIManager::get_available_pages() {
     // 从PageRegistry获取动态注册的页面列表
     auto& registry = ui::PageRegistry::get_instance();
     std::vector<std::string> registered_pages = registry.get_all_page_names();
+
+    return registered_pages;
+}
+
+// 检测当前是否在INT设置页面
+bool UIManager::is_in_int_setting_page() const {
+    if (!page_template_) return false;
     
-    if (!registered_pages.empty()) {
-        return registered_pages;
+    // 检查当前选中的行是否是INT_SETTING类型且被选中
+    if (current_menu_index_ >= 0 && current_menu_index_ < page_template_->get_visible_lines_count()) {
+        LineConfig line_config = page_template_->get_line_config(current_menu_index_);
+        return (line_config.type == LineType::INT_SETTING && line_config.selected);
+    }
+    return false;
+}
+
+// 调整INT设置值
+bool UIManager::adjust_int_setting_value(bool increase) {
+    if (!page_template_) return false;
+    
+    LineConfig line_config = page_template_->get_line_config(current_menu_index_);
+    if (line_config.type != LineType::INT_SETTING || !line_config.data.int_setting.int_value_ptr) {
+        return false;
     }
     
-    // 如果注册表为空，返回默认页面列表（包含main_menu）
-    return {"main", "main_menu", "status", "settings", 
-            "calibration", "diagnostics", 
-            "sensitivity", "about"};
+    int32_t* value_ptr = line_config.data.int_setting.int_value_ptr;
+    int32_t current_value = *value_ptr;
+    int32_t new_value = current_value;
+    
+    if (increase) {
+        if (current_value < line_config.data.int_setting.max_value) {
+            new_value = current_value + 1;
+        }
+    } else {
+        if (current_value > line_config.data.int_setting.min_value) {
+            new_value = current_value - 1;
+        }
+    }
+    
+    if (new_value != current_value) {
+        *value_ptr = new_value;
+        
+        // 调用值变更回调
+        if (line_config.callback_type == LineConfig::CallbackType::VALUE_CHANGE && line_config.callback_data.value_change_callback) {
+            line_config.callback_data.value_change_callback(*line_config.data.int_setting.int_value_ptr);
+        }
+        
+        // 强制刷新显示
+
+        log_debug("INT setting value adjusted to: " + std::to_string(new_value));
+        return true;
+    }
+    
+    return false;
+}
+
+// 获取当前页面类型
+PageType UIManager::get_current_page_type() const {
+    if (!page_template_) {
+        return PageType::NORMAL;
+    }
+    
+    // 检查是否在INT设置页面
+    if (is_in_int_setting_page()) {
+        return PageType::INT_SETTING;
+    }
+    
+    // 检查是否有选择器项处于锁定状态
+    const auto& lines = page_template_->get_lines();
+    for (const auto& line : lines) {
+        if (line.type == LineType::SELECTOR_ITEM && line.data.selector.is_locked) {
+            return PageType::SELECTOR;
+        }
+    }
+    
+    return PageType::NORMAL;
+}
+
+// 检查是否需要特殊摇杆处理
+bool UIManager::needs_special_joystick_handling() const {
+    return get_current_page_type() != PageType::NORMAL;
+}
+
+// 处理特殊摇杆输入
+bool UIManager::handle_special_joystick_input(JoystickState state) {
+    PageType page_type = get_current_page_type();
+    
+    switch (page_type) {
+        case PageType::INT_SETTING:
+            if (state == JoystickState::UP) {
+                return adjust_int_setting_value(true);
+            } else if (state == JoystickState::DOWN) {
+                return adjust_int_setting_value(false);
+            } else if (state == JoystickState::CONFIRM) {
+                return handle_back_navigation();
+            }
+            break;
+            
+        case PageType::SELECTOR:
+            return handle_selector_input(state);
+            
+        case PageType::NORMAL:
+        default:
+            return false;
+    }
+    
+    return false;
+}
+
+// 处理选择器输入
+bool UIManager::handle_selector_input(JoystickState state) {
+    if (!page_template_) {
+        return false;
+    }
+    
+    const auto& lines = page_template_->get_lines();
+    if (current_menu_index_ < 0 || current_menu_index_ >= static_cast<int>(lines.size())) {
+        return false;
+    }
+    
+    const auto& current_line = lines[current_menu_index_];
+    if (current_line.type != LineType::SELECTOR_ITEM) {
+        return false;
+    }
+    
+    // 如果处于锁定状态，调用选择器回调处理摇杆输入
+    if (current_line.data.selector.is_locked && 
+        current_line.callback_type == LineConfig::CallbackType::SELECTOR &&
+        current_line.callback_data.selector_callback) {
+        current_line.callback_data.selector_callback(state);
+        return true;
+    }
+    
+    return false;
 }
 
 // 统一的摇杆输入处理接口
 bool UIManager::handle_joystick_input(int button) {
     // 更新活动时间
     last_activity_time_ = to_ms_since_boot(get_absolute_time());
+    
+    // 将按钮索引映射到摇杆状态
+    JoystickState state;
     switch (button) {
         case 0: // 数组索引0 = joystick_a_pin_ = GPIO 2 (下方向)
             log_debug("Joystick DOWN pressed (GPIO 2)");
-            return navigate_menu(false);
+            state = JoystickState::DOWN;
+            break;
         case 1: // 数组索引1 = joystick_b_pin_ = GPIO 3 (上方向)
             log_debug("Joystick UP pressed (GPIO 3)");
-            return navigate_menu(true);
+            state = JoystickState::UP;
+            break;
         case 2: // 数组索引2 = joystick_confirm_pin_ = GPIO 1 (确认)
             log_debug("Joystick CONFIRM pressed (GPIO 1)");
-            return confirm_selection();
+            state = JoystickState::CONFIRM;
+            break;
         default:
             log_debug("Unknown joystick button index: " + std::to_string(button));
             return false;
     }
-}
-
-bool UIManager::navigate_menu(bool up) {
-    handle_navigation_input(up);
-    return true;
-}
-
-bool UIManager::navigate_menu_horizontal(bool right) {
-    // 水平导航逻辑（用于某些页面的左右选择）
-    // 目前大多数页面不需要水平导航，可以根据需要扩展
-    return true;
-}
-
-bool UIManager::confirm_selection() {
-    handle_confirm_input();
-    return true;
+    
+    // 检查是否需要特殊处理
+    if (needs_special_joystick_handling()) {
+        return handle_special_joystick_input(state);
+    }
+    
+    // 普通页面处理
+    switch (state) {
+        case JoystickState::UP:
+            handle_navigation_input(true);
+            return true;
+        case JoystickState::DOWN:
+            handle_navigation_input(false);
+            return true;
+        case JoystickState::CONFIRM:
+            handle_confirm_input();
+            return true;
+        default:
+            return false;
+    }
 }
 
 bool UIManager::handle_back_navigation() {
     // 统一的返回导航处理
-    if (nav_manager_ && nav_manager_->can_go_back()) {
-        PageState prev_state = nav_manager_->pop_page();
+    if (PageNavigationManager::getInstance().can_go_back()) {
+        PageState prev_state = PageNavigationManager::getInstance().pop_page();
         return switch_to_page(prev_state.page_name);
     } else {
         // 默认返回主页面
@@ -1003,10 +1168,11 @@ void UIManager::render_cursor_indicator() {
         int menu_item_counter = 0;
         for (int i = 0; i < (int)target_lines.size(); ++i) {
             if (!target_lines[i].text.empty() && 
-                (target_lines[i].type == LineType::MENU_JUMP || 
-                 target_lines[i].type == LineType::INT_SETTING || 
-                 target_lines[i].type == LineType::BUTTON_ITEM || 
-                 target_lines[i].type == LineType::BACK_ITEM)) {
+                (target_lines[i].type == LineType::MENU_JUMP ||
+                 target_lines[i].type == LineType::INT_SETTING ||
+                 target_lines[i].type == LineType::BUTTON_ITEM ||
+                 target_lines[i].type == LineType::BACK_ITEM ||
+                 target_lines[i].type == LineType::SELECTOR_ITEM)) {
                 if (menu_item_counter == current_menu_index_) {
                     actual_line_index = i;
                     break;
@@ -1047,7 +1213,8 @@ void UIManager::render_cursor_indicator() {
                     (line.type == LineType::MENU_JUMP || 
                      line.type == LineType::INT_SETTING || 
                      line.type == LineType::BUTTON_ITEM || 
-                     line.type == LineType::BACK_ITEM)) {
+                     line.type == LineType::BACK_ITEM || 
+                     line.type == LineType::SELECTOR_ITEM)) {
                     left_menu_count++;
                 }
             }
@@ -1064,7 +1231,8 @@ void UIManager::render_cursor_indicator() {
                         (left_lines[i].type == LineType::MENU_JUMP || 
                          left_lines[i].type == LineType::INT_SETTING || 
                          left_lines[i].type == LineType::BUTTON_ITEM || 
-                         left_lines[i].type == LineType::BACK_ITEM)) {
+                         left_lines[i].type == LineType::BACK_ITEM || 
+                         left_lines[i].type == LineType::SELECTOR_ITEM)) {
                         if (menu_counter == current_menu_index_) {
                             local_line_index = i;
                             break;
@@ -1084,7 +1252,8 @@ void UIManager::render_cursor_indicator() {
                         (right_lines[i].type == LineType::MENU_JUMP || 
                          right_lines[i].type == LineType::INT_SETTING || 
                          right_lines[i].type == LineType::BUTTON_ITEM || 
-                         right_lines[i].type == LineType::BACK_ITEM)) {
+                         right_lines[i].type == LineType::BACK_ITEM || 
+                         right_lines[i].type == LineType::SELECTOR_ITEM)) {
                         if (menu_counter == right_menu_index) {
                             local_line_index = i;
                             break;

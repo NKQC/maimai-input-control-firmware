@@ -129,6 +129,7 @@ void ScrollBar::clamp_display_index() {
 }
 
 void ScrollBar::set_display_start_index(int index) {
+
     page_scroll_state_.display_start_index = index;
     clamp_display_index();
     update_scroll_info_from_page_state();

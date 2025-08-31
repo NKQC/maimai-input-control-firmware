@@ -8,7 +8,7 @@
 namespace ui {
 
 MainMenu::MainMenu() 
-    : progress_(0) {
+    : progress_(0), progress_data_(0) {
 }
 
 void MainMenu::render(PageTemplate& page_template) {
@@ -28,13 +28,15 @@ void MainMenu::render(PageTemplate& page_template) {
     // 第四行：诊断菜单项
     ADD_MENU("诊断", "diagnostics", COLOR_TEXT_WHITE)
     
-    // 第五行：进度条测试 - 使用ADD_PROGRESS宏
-    // 将progress_转换为uint8_t指针供进度条使用
-    static uint8_t progress_data = 0;
-    progress_data = (uint8_t)((progress_ * 255) / 100);  // 转换0-100到0-255
-    ADD_PROGRESS(&progress_data, "进度测试", COLOR_TEXT_WHITE)  // 存在卡死异常
+    // 第五行：选择器测试菜单项
+    ADD_MENU("选择器测试", "selector_test", COLOR_TEXT_WHITE)
     
-    // 第六行：进度控制设置 - 使用ADD_INT_SETTING宏
+    // 第六行：进度条测试 - 使用ADD_PROGRESS宏
+    // 将progress_转换为uint8_t供进度条使用
+    progress_data_ = (uint8_t)((progress_ * 255) / 100);  // 转换0-100到0-255
+    ADD_PROGRESS(&progress_data_, COLOR_TEXT_WHITE)
+    
+    // 第七行：进度控制设置 - 使用ADD_INT_SETTING宏
     static int32_t progress_int = progress_;
     progress_int = progress_;
     ADD_INT_SETTING(&progress_int, 0, 100, "进度控制", "设置进度值", 
@@ -48,7 +50,7 @@ void MainMenu::render(PageTemplate& page_template) {
                    }, 
                    COLOR_TEXT_WHITE)
     
-    // 第七行：返回项
+    // 第八行：返回项
     ADD_BACK_ITEM("返回主界面", COLOR_TEXT_WHITE)
     
     PAGE_END()
@@ -66,6 +68,9 @@ void MainMenu::set_progress(int progress) {
     } else {
         progress_ = progress;
     }
+    
+    // 同步更新progress_data_成员变量
+    progress_data_ = (uint8_t)((progress_ * 255) / 100);
     
     // 将进度存储到共享数据中，供宏控制使用
     char progress_str[16];

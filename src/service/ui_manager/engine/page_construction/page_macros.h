@@ -20,19 +20,19 @@
 
 // 添加文本行宏 - 快速添加文本行
 #define ADD_TEXT(text, color, align) \
-    all_lines.push_back(LineConfig(text, color, align));
+    all_lines.push_back(LineConfig(text, color, static_cast<LineAlign>(align)));
 
 // 添加状态行宏 - 快速添加状态行
 #define ADD_STATUS(text, color, align) \
-    all_lines.push_back(LineConfig::create_status_line(text, color, align));
+    all_lines.push_back(LineConfig::create_status_line(text, color, static_cast<LineAlign>(align)));
 
 // 添加菜单项宏 - 快速添加菜单跳转项
 #define ADD_MENU(text, target_page, color) \
     all_lines.push_back(LineConfig::create_menu_jump(text, target_page, color));
 
 // 添加进度条宏 - 快速添加进度条
-#define ADD_PROGRESS(progress_ptr, text, color) \
-    all_lines.push_back(LineConfig::create_progress_bar(progress_ptr, text, color));
+#define ADD_PROGRESS(progress_ptr, color) \
+    all_lines.push_back(LineConfig::create_progress_bar(progress_ptr, color));
 
 // 添加整数设置宏 - 快速添加整数设置项
 #define ADD_INT_SETTING(value_ptr, min_val, max_val, display_text, title, change_cb, complete_cb, color) \
@@ -40,11 +40,19 @@
 
 // 添加按钮宏 - 快速添加按钮项
 #define ADD_BUTTON(text, callback, color, align) \
-    all_lines.push_back(LineConfig::create_button(text, callback, color, align));
+    all_lines.push_back(LineConfig::create_button(text, callback, color, static_cast<LineAlign>(align)));
 
 // 添加返回项宏 - 快速添加返回项
 #define ADD_BACK_ITEM(text, color) \
     all_lines.push_back(LineConfig::create_back_item(text, color));
+
+// 添加选择器宏 - 快速添加选择器项
+#define ADD_SELECTOR(text, selector_cb, lock_cb, color, align) \
+    all_lines.push_back(LineConfig::create_selector(text, selector_cb, lock_cb, color, static_cast<LineAlign>(align)));
+
+// 添加简单选择器宏 - 快速添加选择器项（无锁定回调）
+#define ADD_SIMPLE_SELECTOR(text, selector_cb, color) \
+    all_lines.push_back(LineConfig::create_selector(text, selector_cb, nullptr, color, LineAlign::LEFT));
 
 // 页面结束宏 - 设置所有行并启用滚动
 #define PAGE_END() \

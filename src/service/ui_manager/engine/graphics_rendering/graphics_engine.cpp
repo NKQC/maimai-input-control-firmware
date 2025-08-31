@@ -368,12 +368,20 @@ void GraphicsEngine::draw_button(const Rect& rect, const char* text, Color bg_co
 }
 
 void GraphicsEngine::draw_progress_bar(const Rect& rect, float progress, Color bg_color, Color fill_color) {
-    fill_rounded_rect(rect, 2, bg_color);
+    // 绘制外边框
+    draw_rounded_rect(rect, 2, COLOR_TEXT_GRAY);
     
+    // 绘制背景（内部区域）
+    Rect inner_rect(rect.x + 1, rect.y + 1, rect.width - 2, rect.height - 2);
+    fill_rounded_rect(inner_rect, 1, bg_color);
+    
+    // 绘制进度填充
     if (progress > 0.0f) {
-        int16_t fill_width = (int16_t)(rect.width * std::min(1.0f, std::max(0.0f, progress)));
-        Rect fill_rect(rect.x, rect.y, fill_width, rect.height);
-        fill_rounded_rect(fill_rect, 2, fill_color);
+        int16_t fill_width = (int16_t)((inner_rect.width) * std::min(1.0f, std::max(0.0f, progress)));
+        if (fill_width > 0) {
+            Rect fill_rect(inner_rect.x, inner_rect.y, fill_width, inner_rect.height);
+            fill_rounded_rect(fill_rect, 1, fill_color);
+        }
     }
 }
 

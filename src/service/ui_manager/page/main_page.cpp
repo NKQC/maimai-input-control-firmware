@@ -1,5 +1,4 @@
 #include "main_page.h"
-#include "../ui_manager.h"
 #include "src/service/config_manager/config_manager.h"
 #include "../engine/page_construction/page_macros.h"
 #include "pico/time.h"

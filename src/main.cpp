@@ -289,7 +289,7 @@ struct CoreInitBitmap {
 };
 
 // Core1 stack
-#define CORE1_STACK_SIZE 0x11000
+#define CORE1_STACK_SIZE 0x10000
 static uint32_t core1_stack[CORE1_STACK_SIZE / sizeof(uint32_t)];
 
 // 全局同步bitmap

@@ -1,6 +1,7 @@
 #include "page_registry.h"
 #include "page/main_page.h"
 #include "page/main_menu.h"
+#include "page/selector_test.h"
 #include <algorithm>
 
 namespace ui {
@@ -67,6 +68,10 @@ void PageRegistry::register_default_pages() {
     // 注册主菜单页面
     auto main_menu_page = std::make_shared<MainMenu>();
     register_page("main_menu", main_menu_page);
+    
+    // 注册选择器测试页面
+    auto selector_test_page = std::make_shared<SelectorTest>();
+    register_page("selector_test", selector_test_page);
     
     // 可以在这里添加更多默认页面的注册
     // REGISTER_PAGE("settings", SettingsPage);

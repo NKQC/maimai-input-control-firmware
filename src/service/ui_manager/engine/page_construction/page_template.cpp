@@ -4,9 +4,180 @@
 #include <algorithm>
 #include <cstdio>
 
+// LineConfig拷贝构造函数实现
+LineConfig::LineConfig(const LineConfig& other)
+    : type(other.type)
+    , text(other.text)
+    , color(other.color)
+    , align(other.align)
+    , selected(other.selected)
+    , setting_title(other.setting_title)
+    , target_page_name(other.target_page_name)
+    , callback_type(other.callback_type) {
+    // 复制类型特定数据（union）
+    data = other.data;
+
+    // 根据callback_type复制union中的回调数据
+    switch (callback_type) {
+        case CallbackType::VALUE_CHANGE:
+            callback_data.value_change_callback = other.callback_data.value_change_callback;
+            break;
+        case CallbackType::COMPLETE:
+            callback_data.complete_callback = other.callback_data.complete_callback;
+            break;
+        case CallbackType::CLICK:
+            callback_data.click_callback = other.callback_data.click_callback;
+            break;
+        case CallbackType::SELECTOR:
+            callback_data.selector_callback = other.callback_data.selector_callback;
+            break;
+        case CallbackType::NONE:
+        default:
+            // 对于NONE类型，不需要复制任何数据
+            break;
+    }
+    
+    // 复制独立的lock_callback
+    lock_callback = other.lock_callback;
+}
+
+// LineConfig赋值操作符实现
+LineConfig& LineConfig::operator=(const LineConfig& other) {
+    if (this != &other) {
+        text = other.text;
+        type = other.type;
+        color = other.color;
+        align = other.align;
+        selected = other.selected;
+        setting_title = other.setting_title;
+        target_page_name = other.target_page_name;
+        callback_type = other.callback_type;
+
+        // 复制类型特定数据（union）
+        data = other.data;
+        
+        // 根据callback_type复制union中的回调数据
+        switch (callback_type) {
+            case CallbackType::VALUE_CHANGE:
+                callback_data.value_change_callback = other.callback_data.value_change_callback;
+                break;
+            case CallbackType::COMPLETE:
+                callback_data.complete_callback = other.callback_data.complete_callback;
+                break;
+            case CallbackType::CLICK:
+                callback_data.click_callback = other.callback_data.click_callback;
+                break;
+            case CallbackType::SELECTOR:
+                callback_data.selector_callback = other.callback_data.selector_callback;
+                break;
+            case CallbackType::NONE:
+            default:
+                // 对于NONE类型，不需要复制任何数据
+                break;
+        }
+        
+        // 复制独立的lock_callback
+        lock_callback = other.lock_callback;
+    }
+    return *this;
+}
+
+// LineConfig移动构造函数实现
+LineConfig::LineConfig(LineConfig&& other) noexcept
+    : type(other.type)
+    , text(std::move(other.text))
+    , color(other.color)
+    , align(other.align)
+    , selected(other.selected)
+    , setting_title(std::move(other.setting_title))
+    , target_page_name(std::move(other.target_page_name))
+    , callback_type(other.callback_type) {
+    // 移动类型特定数据（union）
+    data = other.data;
+    
+    // 根据callback_type移动union中的回调数据
+    switch (callback_type) {
+        case CallbackType::VALUE_CHANGE:
+            callback_data.value_change_callback = std::move(other.callback_data.value_change_callback);
+            break;
+        case CallbackType::COMPLETE:
+            callback_data.complete_callback = std::move(other.callback_data.complete_callback);
+            break;
+        case CallbackType::CLICK:
+            callback_data.click_callback = std::move(other.callback_data.click_callback);
+            break;
+        case CallbackType::SELECTOR:
+            callback_data.selector_callback = std::move(other.callback_data.selector_callback);
+            break;
+        case CallbackType::NONE:
+        default:
+            break;
+    }
+    
+    // 移动独立的lock_callback
+    lock_callback = std::move(other.lock_callback);
+    
+    // 重置源对象
+    other.callback_type = CallbackType::NONE;
+}
+
+// LineConfig析构函数实现
+LineConfig::~LineConfig() {
+    // 由于使用std::function，析构函数会自动处理回调函数的清理
+    // 不需要显式清理
+}
+
+// LineConfig移动赋值操作符实现
+LineConfig& LineConfig::operator=(LineConfig&& other) noexcept {
+    if (this != &other) {
+        text = std::move(other.text);
+        type = other.type;
+        color = other.color;
+        align = other.align;
+        selected = other.selected;
+        setting_title = std::move(other.setting_title);
+        target_page_name = std::move(other.target_page_name);
+        callback_type = other.callback_type;
+        
+        // 移动类型特定数据（union）
+        data = other.data;
+        
+        // 根据callback_type移动union中的回调数据
+        switch (callback_type) {
+            case CallbackType::VALUE_CHANGE:
+                callback_data.value_change_callback = std::move(other.callback_data.value_change_callback);
+                break;
+            case CallbackType::COMPLETE:
+                callback_data.complete_callback = std::move(other.callback_data.complete_callback);
+                break;
+            case CallbackType::CLICK:
+                callback_data.click_callback = std::move(other.callback_data.click_callback);
+                break;
+            case CallbackType::SELECTOR:
+                callback_data.selector_callback = std::move(other.callback_data.selector_callback);
+                break;
+            case CallbackType::NONE:
+            default:
+                break;
+        }
+        
+        // 移动独立的lock_callback
+        lock_callback = std::move(other.lock_callback);
+        
+        // 重置源对象
+        other.callback_type = CallbackType::NONE;
+    }
+    return *this;
+}
+
+// 静态成员
+bool PageTemplate::has_title_ = false;
+bool PageTemplate::has_split_screen_ = false;
+
 // 页面布局常量
 static const int16_t TITLE_Y = 2;
 static const int16_t TITLE_HEIGHT = 16;
+static const int16_t LINE_WEIGHT = ST7735S_WIDTH - 5;
 static const int16_t LINE_HEIGHT = 12;
 static const int16_t LINE_SPACING = 2;
 static const int16_t CONTENT_START_Y = TITLE_Y + TITLE_HEIGHT + LINE_SPACING;
@@ -19,8 +190,6 @@ PageTemplate::PageTemplate(GraphicsEngine* graphics_engine)
     , title_color_(COLOR_WHITE)
     , lines_()  // 动态初始化行内容
     , all_lines_()  // 所有行内容（用于滚动）
-    , has_title_(false)
-    , has_split_screen_(false)
     , visible_lines_count_(5)
     , selected_menu_index_(0)
     , scroll_bar_()  // 使用默认构造函数
@@ -98,7 +267,7 @@ void PageTemplate::set_lines(const std::vector<LineConfig>& lines) {
     lines_.resize(visible_lines_count_);
     
     // 复制传入的行到可见行数组
-    for (size_t i = scroll_bar_.get_display_start_index(); i < lines.size() && i < visible_lines_count_; ++i) {
+    for (size_t i = 0; i < lines.size() && i < visible_lines_count_; ++i) {
         lines_[i] = lines[i];
     }
 }
@@ -130,7 +299,7 @@ void PageTemplate::set_all_lines(const std::vector<LineConfig>& lines) {
         // 直接设置行内容，避免递归调用
         lines_.clear();
         lines_.resize(visible_lines_count_);
-        for (int i = scroll_bar_.get_display_start_index(); i < visible_lines_count_; ++i) {
+        for (int i = 0; i < visible_lines_count_ && i < (int)lines.size(); ++i) {
             lines_[i] = lines[i];
         }
         // 重置选中索引
@@ -173,7 +342,7 @@ void PageTemplate::draw() {
         draw_title();
         
         // 绘制内容行
-    for (int i = 0; i < visible_lines_count_; i++) {
+        for (int i = 0; i < visible_lines_count_; i++) {
             if (!lines_[i].text.empty()) {
                 draw_line(i, lines_[i]);
             }
@@ -209,7 +378,8 @@ void PageTemplate::set_selected_index(int index) {
                     (target_lines[i].type == LineType::MENU_JUMP || 
                      target_lines[i].type == LineType::INT_SETTING || 
                      target_lines[i].type == LineType::BUTTON_ITEM || 
-                     target_lines[i].type == LineType::BACK_ITEM)) {
+                     target_lines[i].type == LineType::BACK_ITEM || 
+                     target_lines[i].type == LineType::SELECTOR_ITEM)) {
                     if (menu_item_counter == index) {
                         actual_line_index = i;
                         break;
@@ -296,6 +466,7 @@ void PageTemplate::set_visible_end_line(int target_line_index) {
     
     // 计算新的滚动起始位置
     int new_start_index;
+    int max_start = std::max(0, (int)all_lines_.size() - visible_lines_count_);
     
     if (target_line_index < visible_lines_count_) {
         // 如果目标行在前几行，直接从第0行开始显示
@@ -303,13 +474,14 @@ void PageTemplate::set_visible_end_line(int target_line_index) {
     } else {
         // 计算使目标行成为可见区域最后一行的起始位置
         new_start_index = target_line_index - visible_lines_count_ + 1;
-        
         // 确保不会超出范围
-        int max_start = (int)all_lines_.size() - visible_lines_count_;
         if (new_start_index > max_start) {
             new_start_index = max_start;
         }
     }
+    
+    // 额外的边界检查，确保new_start_index不会为负数
+    new_start_index = std::max(0, std::min(new_start_index, max_start));
     
     // 设置新的滚动位置
     scroll_bar_.set_display_start_index(new_start_index);
@@ -379,16 +551,14 @@ void PageTemplate::set_split_ratio(float ratio) {
     }
 }
 
-
-
 int16_t PageTemplate::get_line_y_position(int line_index) {
-    if (line_index < 0 || line_index >= 4) return 0;
-    return CONTENT_START_Y + line_index * (LINE_HEIGHT + LINE_SPACING);
+    if (line_index < 0 || line_index >= 5) return 0;
+    return (has_title_ ? CONTENT_START_Y : LINE_SPACING) + line_index * (LINE_HEIGHT + LINE_SPACING);
 }
 
 Rect PageTemplate::get_line_rect(int line_index) {
     int16_t y = get_line_y_position(line_index);
-    return Rect(0, y, 128, LINE_HEIGHT);
+    return Rect(0, y, LINE_WEIGHT, LINE_HEIGHT);
 }
 
 Rect PageTemplate::get_split_left_rect(int line_index) {
@@ -406,9 +576,9 @@ Rect PageTemplate::get_split_right_rect(int line_index) {
 void PageTemplate::draw_title() {
     if (!graphics_engine_ || title_.empty()) return;
     
-    Rect title_rect(0, TITLE_Y, 128, TITLE_HEIGHT);
-    graphics_engine_->draw_text_aligned(title_.c_str(), title_rect, title_color_, 
-                                       TextAlign::CENTER);
+    Rect title_rect(0, TITLE_Y, LINE_WEIGHT, TITLE_HEIGHT);
+    graphics_engine_->draw_chinese_text_aligned(title_.c_str(), title_rect, title_color_, 
+                                               TextAlign::CENTER);
 }
 
 void PageTemplate::draw_line(int line_index, const LineConfig& config) {
@@ -435,6 +605,9 @@ void PageTemplate::draw_line(int line_index, const LineConfig& config) {
             break;
         case LineType::BACK_ITEM:
             draw_back_item(line_index, config);
+            break;
+        case LineType::SELECTOR_ITEM:
+            draw_selector_item(line_index, config);
             break;
     }
 }
@@ -485,25 +658,33 @@ void PageTemplate::draw_progress_bar(int line_index, const LineConfig& config) {
     if (!graphics_engine_ || !config.data.progress.progress_ptr) return;
     
     Rect line_rect = get_line_rect(line_index);
-    float progress = (*config.data.progress.progress_ptr) / 255.0f; // 转换0-255到0.0-1.0
+    uint8_t progress_value = *config.data.progress.progress_ptr;
+    float progress = progress_value / 255.0f; // 转换0-255到0.0-1.0
     
-    // 绘制进度条
-    Rect progress_rect(line_rect.x + 4, line_rect.y + 2, line_rect.width - 8, 6);
+    // 确保progress值在有效范围内
+    if (progress < 0.0f) progress = 0.0f;
+    if (progress > 1.0f) progress = 1.0f;
+    
+    // 计算百分比文本
+    char percent_str[8];
+    int progress_percent = (int)(progress * 100.0f); // 转换为整数避免浮点数问题
+    snprintf(percent_str, sizeof(percent_str), "%d%%", progress_percent);
+    int16_t percent_width = graphics_engine_->get_text_width(percent_str);
+    
+    // 为百分比文本预留空间，进度条宽度减去百分比文本宽度和间距
+    int16_t text_margin = 6; // 百分比文本与进度条的间距
+    int16_t progress_width = line_rect.width - percent_width - text_margin - 8; // 8是左右边距
+    
+    // 绘制进度条（带外边框，高度增加）
+    Rect progress_rect(line_rect.x + 4, line_rect.y + 1, progress_width, 8);
     graphics_engine_->draw_progress_bar(progress_rect, progress, COLOR_BG_CARD, config.color);
     
-    // 绘制进度文本
-    if (!config.text.empty()) {
-        int16_t text_y = line_rect.y + 8;
-        graphics_engine_->draw_chinese_text(config.text.c_str(), line_rect.x + 4, text_y, COLOR_TEXT_WHITE);
-    }
-    
-    // 绘制百分比
-    char percent_str[8];
-    snprintf(percent_str, sizeof(percent_str), "%.0f%%", progress * 100);
-    int16_t percent_width = graphics_engine_->get_text_width(percent_str);
+    // 绘制百分比文本，始终在右侧
     int16_t percent_x = line_rect.x + line_rect.width - percent_width - 4;
-    int16_t percent_y = line_rect.y + 8;
+    int16_t percent_y = line_rect.y + 6; // 垂直居中
+
     graphics_engine_->draw_text(percent_str, percent_x, percent_y, COLOR_TEXT_GRAY);
+    
 }
 
 // INT设置项渲染
@@ -588,6 +769,35 @@ void PageTemplate::draw_back_item(int line_index, const LineConfig& config) {
     if (config.selected) {
         draw_selection_indicator(line_index);
     }
+}
+
+// 选择器项渲染
+void PageTemplate::draw_selector_item(int line_index, const LineConfig& config) {
+    if (!graphics_engine_) return;
+    
+    Rect line_rect = get_line_rect(line_index);
+    
+    // 绘制选中背景
+    if (config.selected) {
+        graphics_engine_->fill_rect(line_rect, COLOR_BG_CARD);
+        draw_selection_indicator(line_index);
+    }
+    
+    // 绘制锁定状态指示器
+    if (config.data.selector.is_locked) {
+        // 绘制锁定图标或符号
+        int16_t lock_x = line_rect.x + line_rect.width - 16;
+        int16_t lock_y = line_rect.y + (line_rect.height - 8) / 2;
+        graphics_engine_->draw_chinese_text("🔒", lock_x, lock_y, COLOR_PRIMARY);
+    }
+    
+    // 绘制选择器文本
+    int16_t text_x = line_rect.x + (config.selected ? SELECTION_INDICATOR_WIDTH + 4 : 8);
+    int16_t text_y = line_rect.y + (line_rect.height - 14) / 2;
+    
+    // 根据锁定状态调整文本颜色
+    Color text_color = config.data.selector.is_locked ? COLOR_PRIMARY : config.color;
+    graphics_engine_->draw_chinese_text(config.text.c_str(), text_x, text_y, text_color);
 }
 
 void PageTemplate::draw_split_screen() {

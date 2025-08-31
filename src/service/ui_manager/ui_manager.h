@@ -7,7 +7,6 @@
 #include "engine/graphics_rendering/graphics_engine.h"
 #include "engine/fonts/font_data.h"
 #include "engine/page_construction/page_template.h"
-#include "engine/page_construction/ui_constructs.h"
 #include <string>
 #include <functional>
 #include <map>
@@ -69,6 +68,23 @@ struct UIStatistics {
         uptime_seconds = 0;
     }
 };
+
+// 页面类型枚举 - 用于特殊页面处理
+enum class PageType {
+    NORMAL,         // 普通页面，使用标准导航
+    INT_SETTING,    // INT设置页面，上下调整数值
+    SELECTOR        // 选择器页面，摇杆触发回调
+};
+
+// 摇杆输入状态枚举
+enum class JoystickState {
+    UP,
+    DOWN,
+    CONFIRM
+};
+
+// 选择器回调函数类型
+using SelectorCallback = std::function<void(JoystickState state)>;
 
 // 简化的回调函数类型
 using InputCallback = std::function<void(const std::string& action)>;
@@ -142,12 +158,11 @@ public:
     bool set_config_manager(ConfigManager* config_manager);
     
     // 页面切换和管理
-    bool set_current_page(const std::string& page_name);
     std::string get_current_page() const;
     std::vector<std::string> get_available_pages();
     
     // 新页面引擎接口
-    bool switch_to_page(const std::string& page_name);
+    inline bool switch_to_page(const std::string& page_name);
     const std::string& get_current_page_name() const;
     // Removed PageBase and PageConstructor - using simplified approach
     bool register_main_page();
@@ -174,9 +189,6 @@ public:
     void handle_joystick_b();
     void handle_confirm_input();
     bool handle_joystick_input(int button);
-    bool navigate_menu(bool up);
-    bool navigate_menu_horizontal(bool right);
-    bool confirm_selection();
     bool handle_back_navigation();
     
     // 动态光标渲染
@@ -222,7 +234,6 @@ private:
     bool screen_off_;
     uint32_t last_activity_time_;
     uint32_t last_refresh_time_;
-    bool needs_full_refresh_;
     bool debug_enabled_;
     uint32_t last_navigation_time_;
     
@@ -245,15 +256,9 @@ private:
     
     // 页面数据
     PageData page_data_;
-    
-    // 页面管理相关
-    MenuInteractionSystem* menu_system_;     // 菜单交互系统
-    PageNavigationManager* nav_manager_;     // 页面导航管理器
-    // Removed page_manager - using simplified approach
-    
+
     // 新页面引擎
-    // Removed page_registry - using simplified approach
-    std::string current_page_name_;                // 当前页面名称
+    static std::string current_page_name_;                // 当前页面名称
     
     // 故障处理相关
     ErrorInfo current_error_;          // 当前故障信息
@@ -290,10 +295,26 @@ private:
     void refresh_task_30fps();
     static void display_refresh_timer_callback(void* arg);
     
-    // 输入处理
+    // 处理输入相关
     void handle_navigation_input(bool up);
     
-    // 屏保和背光管理
+    // 页面特殊处理接口
+    PageType get_current_page_type() const;
+    bool needs_special_joystick_handling() const;
+    bool handle_special_joystick_input(JoystickState state);
+    
+    // 私有成员函数
+    bool is_in_int_setting_page() const;
+    bool adjust_int_setting_value(bool increase);
+    bool handle_selector_input(JoystickState state);
+    
+    // handle_confirm_input的辅助函数
+    inline void handle_menu_jump(const LineConfig* line_config);
+    inline void handle_int_setting(const LineConfig* line_config);
+    inline void handle_selector_item(const LineConfig* line_config, LineConfig* mutable_line);
+    inline void handle_back_item();
+    
+    // 背光和屏幕超时处理
     inline void handle_backlight();
     inline void handle_screen_timeout();
     
