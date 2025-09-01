@@ -3,6 +3,9 @@
 #include <stdint.h>
 #include "../config_manager/config_types.h"
 
+// 时间类型定义
+typedef uint32_t millis_t;
+
 // InputManager配置键定义 - 移除重复定义，使用下方统一定义
 #include <functional>
 #include <array>
@@ -10,13 +13,22 @@
 #include "../../hal/i2c/hal_i2c.h"
 #include "../../protocol/mai2serial/mai2serial.h"
 #include "../../protocol/hid/hid.h"
-#include "../../protocol/touch_sensor/gtx312l/gtx312l.h"
+// 统一使用TouchSensor接口
 #include "../../protocol/touch_sensor/touch_sensor.h"
 #include "../../protocol/mcp23s17/mcp23s17.h"
 #include "../ui_manager/ui_manager.h"
 
 // 触摸键盘映射预处理定义
 #define TOUCH_KEYBOARD_KEY HID_KeyCode::KEY_SPACE  // 默认触摸映射按键
+
+// 触摸坐标结构体 - 前向声明，供TouchDeviceMapping使用
+struct TouchAxis {
+    float x;
+    float y;
+    
+    TouchAxis() : x(0.0f), y(0.0f) {}
+    TouchAxis(float x_val, float y_val) : x(x_val), y(y_val) {}
+};
 
 // GPIO枚举定义 - 使用6-7位区分类型，0-5位存储引脚编号
 // MCU GPIO枚举 (6-7位 = 00)
@@ -71,6 +83,27 @@ struct LogicalKeyMapping {
     }
 };
 
+// 32位触摸设备映射结构体
+struct TouchDeviceMapping {
+    uint32_t device_id_mask;                        // 32位设备ID掩码（TouchSensor基类格式）
+    uint8_t max_channels;                           // 设备支持的最大通道数
+    uint8_t sensitivity[28];                        // 每个通道的灵敏度设置（支持最大28通道）
+    uint32_t enabled_channels_mask;                 // 启用通道的32位掩码
+    Mai2_TouchArea serial_area[28];                 // 通道对应的Mai2区域映射
+    TouchAxis hid_area[28];                         // 通道对应的HID坐标映射
+    HID_KeyCode keyboard_keys[28];                  // 通道对应的HID键盘按键映射
+    
+    TouchDeviceMapping() : device_id_mask(0), max_channels(0), enabled_channels_mask(0) {
+        // 初始化灵敏度为默认值
+        for (int i = 0; i < 28; i++) {
+            sensitivity[i] = 15;  // 默认灵敏度
+            serial_area[i] = MAI2_NO_USED;
+            hid_area[i] = {0.0f, 0.0f};
+            keyboard_keys[i] = HID_KeyCode::KEY_NONE;
+        }
+    }
+};
+
 // 触摸键盘映射模式
 enum class TouchKeyboardMode : uint8_t {
     KEY_ONLY = 0,      // 仅按键触发
@@ -80,26 +113,19 @@ enum class TouchKeyboardMode : uint8_t {
 
 // 配置键预处理定义
 #define INPUTMANAGER_WORK_MODE "input_manager_work_mode"
-#define INPUTMANAGER_GTX312L_DEVICES "input_manager_gtx312l_devices"
+#define INPUTMANAGER_TOUCH_DEVICES "input_manager_touch_devices"
+#define INPUTMANAGER_MAX_TOUCH_DEVICES 8
 #define INPUTMANAGER_TOUCH_KEYBOARD_ENABLED "input_manager_touch_keyboard_enabled"
 #define INPUTMANAGER_TOUCH_KEYBOARD_MODE "input_manager_touch_keyboard_mode"
 #define INPUTMANAGER_DEVICE_COUNT "input_manager_device_count"
 #define INPUTMANAGER_PHYSICAL_KEYBOARDS "input_manager_physical_keyboards"
 #define INPUTMANAGER_LOGICAL_MAPPINGS "input_manager_logical_mappings"
+#define INPUTMANAGER_TOUCH_RESPONSE_DELAY "input_manager_touch_response_delay"
 
 // 工作模式枚举
 enum class InputWorkMode : uint8_t {
     SERIAL_MODE = 0,  // Mai2Serial模式
     HID_MODE = 1      // HID模式
-};
-
-// 触摸坐标结构体
-struct TouchAxis {
-    float x;
-    float y;
-    
-    TouchAxis() : x(0.0f), y(0.0f) {}
-    TouchAxis(float x_val, float y_val) : x(x_val), y(y_val) {}
 };
 
 // 绑定状态枚举
@@ -119,31 +145,12 @@ enum class BindingState : uint8_t {
     AUTO_SERIAL_BINDING_COMPLETE // 自动绑定完成
 };
 
-// GTX312L设备映射结构体 - 基于模块地址的统一结构
-struct GTX312L_DeviceMapping {
-    uint16_t device_addr;                           // GTX312L_PhysicalAddr的get_device_mask()返回值
-    uint8_t sensitivity[12];                        // 每个通道的灵敏度设置
-    GTX312L_PortEnableBitmap CH_available;          // 通道是否启用bitmap 启用为1
-    Mai2_TouchArea serial_area[12];                 // 12个通道对应的Mai2区域映射
-    TouchAxis hid_area[12];                         // 12个通道对应的HID坐标映射
-    HID_KeyCode keyboard_keys[12];                  // 12个通道对应的HID键盘按键映射
-    
-    GTX312L_DeviceMapping() : device_addr(0) {
-        // 初始化serial_area为未使用状态
-        for (int i = 0; i < 12; i++) {
-            sensitivity[i] = 15;                        // 默认灵敏度
-            serial_area[i] = MAI2_NO_USED;
-            hid_area[i] = TouchAxis(0.0f, 0.0f);
-            keyboard_keys[i] = HID_KeyCode::KEY_NONE;   // 默认无按键映射
-        }
-        CH_available.value = 0x0FFF;  // 启用所有12个通道
-    }
-};
+// 统一使用TouchDeviceMapping
 
 // 私有配置结构体
 struct InputManager_PrivateConfig {
     InputWorkMode work_mode;
-    GTX312L_DeviceMapping device_mappings[8];
+    TouchDeviceMapping touch_device_mappings[8];    // 32位触摸设备映射
     uint8_t device_count;
     
     // 物理键盘映射配置
@@ -156,15 +163,15 @@ struct InputManager_PrivateConfig {
     TouchKeyboardMode touch_keyboard_mode;
     bool touch_keyboard_enabled;
     
+    // 触摸响应延迟配置 (0-100ms)
+    uint8_t touch_response_delay_ms;
+    
     InputManager_PrivateConfig() 
         : work_mode(InputWorkMode::SERIAL_MODE)
         , device_count(0)
         , touch_keyboard_mode(TouchKeyboardMode::BOTH)
-        , touch_keyboard_enabled(false) {
-        // 初始化设备映射
-        for (int i = 0; i < 8; i++) {
-            device_mappings[i] = GTX312L_DeviceMapping();
-        }
+        , touch_keyboard_enabled(false)
+        , touch_response_delay_ms(0) {
     }
 };
 
@@ -202,10 +209,6 @@ public:
     bool registerTouchSensor(TouchSensor* device);
     void unregisterTouchSensor(TouchSensor* device);
     
-    // 设备注册 - 向后兼容接口
-    bool registerGTX312L(GTX312L* device);
-    void unregisterGTX312L(GTX312L* device);
-    
     // 工作模式设置
     inline bool setWorkMode(InputWorkMode mode);
     inline InputWorkMode getWorkMode() const {
@@ -213,7 +216,7 @@ public:
     }
     
     // 核心循环函数
-    void loop0();  // CPU0：GTX312L触摸采样和Serial/HID处理
+    void loop0();  // CPU0：TouchSensor触摸采样和Serial/HID处理
     void loop1();  // CPU1：键盘处理和HID发送
     
     // 交互式绑定
@@ -230,31 +233,31 @@ public:
     void setHIDCoordinates(float x, float y);  // 设置HID绑定坐标
     void confirmHIDBinding();                  // 确认HID绑定
     
-    // 灵敏度调整接口
-    uint8_t autoAdjustSensitivity(uint16_t device_addr, uint8_t channel); // 指定通道的灵敏度调整
-    void setSensitivity(uint16_t device_addr, uint8_t channel, uint8_t sensitivity);
-    uint8_t getSensitivity(uint16_t device_addr, uint8_t channel);
-    bool set_channel_sensitivity_by_name(const std::string& device_name, uint8_t channel, uint8_t sensitivity);
+    // 灵敏度管理
+    uint8_t autoAdjustSensitivity(uint32_t device_id_mask, uint8_t channel); // 指定通道的灵敏度调整
+    void setSensitivity(uint32_t device_id_mask, uint8_t channel, uint8_t sensitivity);
+    uint8_t getSensitivity(uint32_t device_id_mask, uint8_t channel);
+    bool setSensitivityByDeviceName(const std::string& device_name, uint8_t channel, uint8_t sensitivity);
     
     // UI专用接口 - 获取所有设备状态
     struct TouchDeviceStatus {
-        GTX312L_DeviceMapping device;
-        uint16_t touch_states;
+        TouchDeviceMapping touch_device;           // 32位设备映射
+        uint32_t touch_states_32bit;              // 32位触摸状态
         std::string device_name;
         bool is_connected;
         
-        TouchDeviceStatus() : touch_states(0), is_connected(false) {}
+        TouchDeviceStatus() : touch_states_32bit(0), is_connected(false) {}
     };
     
     void get_all_device_status(TouchDeviceStatus data[8], int& device_count);
     
-    // 映射设置方法
-    void setSerialMapping(uint16_t device_addr, uint8_t channel, Mai2_TouchArea area);
-    void setHIDMapping(uint16_t device_addr, uint8_t channel, float x, float y);
-    void setTouchKeyboardMapping(uint16_t device_addr, uint8_t channel, HID_KeyCode key); // 设置键盘映射
-    Mai2_TouchArea getSerialMapping(uint16_t device_addr, uint8_t channel);
-
-    HID_KeyCode getTouchKeyboardMapping(uint16_t device_addr, uint8_t channel);          // 获取键盘映射
+    // 映射管理
+    void setSerialMapping(uint32_t device_id_mask, uint8_t channel, Mai2_TouchArea area);
+    void setHIDMapping(uint32_t device_id_mask, uint8_t channel, float x, float y);
+    void setTouchKeyboardMapping(uint32_t device_id_mask, uint8_t channel, HID_KeyCode key);
+    Mai2_TouchArea getSerialMapping(uint32_t device_id_mask, uint8_t channel);
+    TouchAxis getHIDMapping(uint32_t device_id_mask, uint8_t channel);
+    HID_KeyCode getTouchKeyboardMapping(uint32_t device_id_mask, uint8_t channel);
     
     // 物理键盘GPIO映射方法
     bool addPhysicalKeyboard(MCU_GPIO gpio, HID_KeyCode default_key = HID_KeyCode::KEY_NONE);
@@ -281,12 +284,16 @@ public:
     void enableMappedChannels(); // 仅启用已映射的通道
     void updateChannelStatesAfterBinding();  // 绑定后更新通道状态
     
-    // 性能监控接口
-    uint8_t getTouchSampleRate(uint16_t device_addr);  // 获取触摸IC采样速率
-    uint8_t getHIDReportRate();                        // 获取HID键盘回报速率
+    // 性能监控
+    uint8_t getTouchSampleRate(uint32_t device_id_mask);  // 获取触摸IC采样速率
+    uint8_t getHIDReportRate();                           // 获取HID键盘回报速率
     
-    // 采样计数器（用于实际测量采样频率）
-    void incrementSampleCounter();
+    // 触摸响应延迟管理
+    void setTouchResponseDelay(uint8_t delay_ms);  // 设置触摸响应延迟 (0-100ms)
+    uint8_t getTouchResponseDelay() const;         // 获取当前延迟设置
+    
+    // 采样计数器管理
+    inline void incrementSampleCounter();
     void resetSampleCounter();
     
 private:
@@ -300,12 +307,36 @@ private:
     
     // 设备管理
     std::vector<TouchSensor*> touch_sensor_devices_;           // 注册的TouchSensor设备列表
-    std::vector<GTX312L*> gtx312l_devices_;                    // 注册的GTX312L设备列表（向后兼容）
 
     
-    // 触摸状态管理
-    GTX312L_SampleResult current_touch_states_[8];     // 每个设备的当前触摸状态(包含时间戳)
-    GTX312L_SampleResult previous_touch_states_[8];    // 每个设备的上一次触摸状态
+    // 32位触摸状态管理
+    struct TouchDeviceState {
+        uint32_t device_id_mask;        // 32位设备ID掩码
+        uint32_t current_touch_mask;    // 当前触摸状态掩码
+        uint32_t previous_touch_mask;   // 上一次触摸状态掩码
+        uint32_t timestamp_us;          // 微秒级时间戳
+        bool is_valid;                  // 状态是否有效
+        
+        TouchDeviceState() : device_id_mask(0), current_touch_mask(0), 
+                           previous_touch_mask(0), timestamp_us(0), is_valid(false) {}
+    };
+    TouchDeviceState touch_device_states_[8];          // 每个设备的触摸状态
+    
+    // 统一使用TouchDeviceState
+
+    // 延迟缓冲区管理 - 优化为只存储Serial数据
+    static constexpr uint8_t DELAY_BUFFER_SIZE = 32;   // 缓冲区大小，支持最大100ms延迟
+    struct DelayedSerialState {
+        Mai2Serial_TouchState serial_touch_state;  // 只存储36位Serial触摸状态
+        uint32_t timestamp_us;                     // 微秒级时间戳
+    };
+    DelayedSerialState delay_buffer_[DELAY_BUFFER_SIZE]; // 延迟缓冲区
+    uint8_t delay_buffer_head_;                         // 缓冲区头指针
+    uint8_t delay_buffer_count_;                        // 缓冲区中的有效数据数量
+    
+    // GPIO状态管理
+    uint32_t mcu_gpio_states_;               // MCU GPIO状态位图
+    uint32_t mcu_gpio_previous_states_;      // MCU GPIO上一次状态
     
     // 采样频率测量相关
     uint32_t sample_counter_;           // 采样计数器
@@ -322,7 +353,7 @@ private:
     bool original_channels_backup_[8][12];   // 原始通道启用状态备份
     
     // HID绑定相关变量
-    uint16_t hid_binding_device_addr_;       // HID绑定的设备地址
+    uint32_t hid_binding_device_addr_;       // HID绑定的设备ID掩码(32位)
     uint8_t hid_binding_channel_;            // HID绑定的通道
     float hid_binding_x_, hid_binding_y_;    // HID绑定的坐标
     
@@ -338,7 +369,7 @@ private:
     };
     
     struct AutoAdjustContext {
-        uint16_t device_addr;
+        uint32_t device_id_mask;
         uint8_t channel;
         uint8_t original_sensitivity;
         uint8_t current_sensitivity;
@@ -349,7 +380,7 @@ private:
         millis_t stabilize_duration;
         bool active;
         
-        AutoAdjustContext() : device_addr(0), channel(0), original_sensitivity(0), 
+        AutoAdjustContext() : device_id_mask(0), channel(0), original_sensitivity(0), 
                              current_sensitivity(0), touch_found_sensitivity(0), 
                              touch_lost_sensitivity(0), state(AutoAdjustState::IDLE), 
                              state_start_time(0), stabilize_duration(100), active(false) {}
@@ -367,10 +398,6 @@ private:
     
     KeyboardBitmap gpio_keyboard_bitmap_;  // GPIO键盘bitmap（loop1使用，避免跨核竞态）
     KeyboardBitmap touch_bitmap_cache_;    // 触摸键盘bitmap缓存（从loop0共享内存读取）
-    
-    // GPIO状态管理
-    uint32_t mcu_gpio_states_;               // MCU GPIO状态位图
-    uint32_t mcu_gpio_previous_states_;      // MCU GPIO上一次状态
     MCP23S17_GPIO_State mcp_gpio_states_;    // MCP GPIO状态
     MCP23S17_GPIO_State mcp_gpio_previous_states_; // MCP GPIO上一次状态
     
@@ -397,6 +424,11 @@ private:
     inline void processSerialMode();
     inline void sendHIDTouchData();
     
+    // 触摸响应延迟管理私有方法
+    inline void storeDelayedSerialState();                     // 存储当前Serial状态到延迟缓冲区
+    bool getDelayedSerialState(Mai2Serial_TouchState& delayed_state); // 获取延迟后的Serial状态
+    inline void processSerialModeWithDelay();          // 带延迟的Serial模式处理
+    
     // 统一键盘处理函数
     void processAutoAdjustSensitivity();
     
@@ -405,9 +437,10 @@ private:
     inline void processGPIOKeyboard();       // 处理GPIO键盘输入
     inline void processTouchKeyboard();      // 处理触摸键盘映射
 
-    // 设备查找
-    int findDeviceIndex(uint16_t device_addr);
-    GTX312L_DeviceMapping* findDeviceMapping(uint16_t device_addr);
+    // 地址处理辅助方法
+    int findTouchDeviceIndex(uint32_t device_id_mask);
+    TouchDeviceMapping* findTouchDeviceMapping(uint32_t device_id_mask);
+    TouchSensor* findTouchSensorByIdMask(uint32_t device_id_mask);
     
     // 绑定处理函数
     void processBinding();

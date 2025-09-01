@@ -125,8 +125,8 @@ struct Mai2Serial_Config {
     }
 };
 
-// 命令回调函数类型
-typedef std::function<void(const char* cmd, uint8_t* params, uint8_t param_count)> Mai2Serial_CommandCallback;
+// 回调函数类型定义
+typedef std::function<void(Mai2Serial_Command cmd, uint8_t* params, uint8_t param_count)> Mai2Serial_CommandCallback;
 typedef std::function<void(const std::string& message)> Mai2Serial_LogCallback;
 typedef std::function<void(const Mai2Serial_TouchData& touch_data)> Mai2Serial_TouchCallback;
 

@@ -35,6 +35,7 @@ enum class Mai2Light_Command : uint8_t {
     GET_EEPROM              = 0x21,     // 获取EEPROM
     SAVE_TO_EEPROM          = 0x22,     // 保存到EEPROM
     LOAD_FROM_EEPROM        = 0x23,     // 从EEPROM加载
+    GET_HELP                = 0x2F,     // 获取帮助信息
     RESET_BOARD             = 0x30,     // 重置板卡
     ENTER_BOOTLOADER        = 0x31,     // 进入引导程序
     UNKNOWN                 = 0xFF      // 未知命令
@@ -147,9 +148,8 @@ struct Mai2Light_Config {
     }
 };
 
-// 回调函数类型
+// 回调函数类型定义
 typedef std::function<void(Mai2Light_Command command, const uint8_t* data, uint8_t length)> Mai2Light_CommandCallback;
-typedef std::function<void(const std::string& message)> Mai2Light_LogCallback;
 
 class Mai2Light {
 public:
@@ -195,7 +195,6 @@ public:
     
     // 回调设置
     void set_command_callback(Mai2Light_CommandCallback callback);
-    void set_log_callback(Mai2Light_LogCallback callback);
     
     // 任务处理
     void task();
@@ -215,7 +214,6 @@ private:
     
     // 回调函数
     Mai2Light_CommandCallback command_callback_;
-    Mai2Light_LogCallback log_callback_;
     
     // 虚拟EEPROM存储
     static const uint16_t EEPROM_SIZE = 256;  // EEPROM大小
@@ -223,7 +221,6 @@ private:
     
     // 内部方法
     bool send_packet(const Mai2Light_PacketReq& packet);
-    bool receive_packet(Mai2Light_PacketAck& packet, uint32_t timeout_ms = 1000);
     bool send_command(Mai2Light_Command command, const uint8_t* data = nullptr, uint8_t data_length = 0);
     
     // 数据包处理
@@ -247,7 +244,13 @@ private:
                   const uint8_t* data = nullptr, uint8_t data_length = 0);
     
     // 日志输出
-    void log_message(const std::string& message);
+    void log_debug(const std::string& message);
+    void log_error(const std::string& message);
+    
+    // 字符串指令解析
+    void process_string_commands(const uint8_t* buffer, size_t length);
+    void parse_string_command(const std::string& command_str);
+    bool send_string_response(const std::string& response);
     
     // 渐变效果
     void update_fade_effects();
@@ -255,4 +258,8 @@ private:
     uint32_t fade_start_time_;
     Mai2Light_RGB fade_start_colors_[MAI2LIGHT_NUM_LEDS];
     Mai2Light_RGB fade_target_colors_[MAI2LIGHT_NUM_LEDS];
+    
+    // 字符串指令缓冲区
+    char string_cmd_buffer_[64];
+    uint8_t string_cmd_pos_;
 };

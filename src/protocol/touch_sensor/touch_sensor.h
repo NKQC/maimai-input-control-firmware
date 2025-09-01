@@ -68,6 +68,15 @@ public:
      * @return true=已初始化，false=未初始化
      */
     virtual bool isInitialized() const = 0;
+    
+    // 通道控制接口 - 子类可选实现
+    virtual bool setChannelEnabled(uint8_t channel, bool enabled) { return false; }  // 设置单个通道使能
+    virtual bool getChannelEnabled(uint8_t channel) const { return false; }     // 获取单个通道使能状态
+    virtual uint32_t getEnabledChannelMask() const { return (1UL << max_channels_) - 1; }  // 获取启用通道掩码，基于max_channels_自动生成
+    
+    // 灵敏度控制接口 - 子类可选实现 (统一使用0-99范围)
+    virtual bool setChannelSensitivity(uint8_t channel, uint8_t sensitivity) { return false; }  // 设置通道灵敏度 (0-99)
+    virtual uint8_t getChannelSensitivity(uint8_t channel) const { return 50; }  // 获取通道灵敏度 (0-99，默认50)
 
 protected:
     uint8_t max_channels_;  // 该IC支持的最大通道数

@@ -220,16 +220,49 @@ void PageTemplate::flush() {
     has_title_ = false;
     has_split_screen_ = false;
     
-    // 清空标题但不重置滚动状态
+    // 使用单个静态容量变量依次处理所有容器
+    static size_t capacity_buffer;
+    
+    // 清空标题但保留内存容量
+    capacity_buffer = title_.capacity();
     title_.clear();
+    title_.reserve(capacity_buffer);
     title_color_ = COLOR_WHITE;
     
-    // 清空分屏相关但不重置滚动
+    // 清空分屏相关但保留内存容量
     split_screen_enabled_ = false;
+    
+    // 依次处理vector容器，复用capacity_buffer
+    capacity_buffer = left_lines_.capacity();
     left_lines_.clear();
+    left_lines_.reserve(capacity_buffer);
+    
+    capacity_buffer = right_lines_.capacity();
     right_lines_.clear();
+    right_lines_.reserve(capacity_buffer);
+    
+    capacity_buffer = left_header_.capacity();
     left_header_.clear();
+    left_header_.reserve(capacity_buffer);
+    
+    capacity_buffer = right_header_.capacity();
     right_header_.clear();
+    right_header_.reserve(capacity_buffer);
+    
+    // 对于all_lines_，由于在构造函数中已经resize过，这里只需要重置内容
+    // 不清空all_lines_以保持已分配的内存，只重置每个元素为默认状态
+    for (auto& line : all_lines_) {
+        // 依次保存和恢复字符串容量，复用capacity_buffer
+        capacity_buffer = line.text.capacity();
+        line = LineConfig();  // 重置为默认状态
+        line.text.reserve(capacity_buffer);
+        
+        capacity_buffer = line.setting_title.capacity();
+        line.setting_title.reserve(capacity_buffer);
+        
+        capacity_buffer = line.target_page_name.capacity();
+        line.target_page_name.reserve(capacity_buffer);
+    }
 }
 
 void PageTemplate::set_title(const std::string& title, Color color) {

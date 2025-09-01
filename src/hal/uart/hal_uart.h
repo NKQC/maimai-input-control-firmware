@@ -4,8 +4,11 @@
 #include <string>
 #include <functional>
 
-// 包含全局中断管理头文件
+// 包含Pico SDK头文件
 extern "C" {
+#include "pico/stdlib.h"
+#include "hardware/dma.h"
+#include "hardware/uart.h"
 #include "../global_irq.h"
 }
 
@@ -27,14 +30,9 @@ public:
     // 释放UART资源
     virtual void deinit() = 0;
     
-    // DMA操作 - 完全DMA化
-    virtual bool write_dma(const uint8_t* data, size_t length, dma_callback_t callback = nullptr) = 0;
-    virtual bool read_dma(uint8_t* buffer, size_t length, dma_callback_t callback = nullptr) = 0;
-    
-    // 内联环形缓冲区操作
+    // 缓冲区操作接口 - 自动处理DMA传输
     virtual inline size_t write_to_tx_buffer(const uint8_t* data, size_t length) = 0;
     virtual inline size_t read_from_rx_buffer(uint8_t* buffer, size_t length) = 0;
-    virtual inline void trigger_tx_dma() = 0;
     virtual inline size_t get_tx_buffer_free_space() const = 0;
     virtual inline size_t get_rx_buffer_data_count() const = 0;
     
@@ -58,6 +56,11 @@ public:
     
     // 检查UART是否就绪
     virtual bool is_ready() const = 0;
+
+    struct DmaControlBlock {
+        uint32_t len = 1;
+        char* data;
+    };
 };
 
 // UART0实例
@@ -68,14 +71,13 @@ public:
     
     bool init(uint8_t tx_pin, uint8_t rx_pin, uint32_t baudrate = 115200, bool flow_control = false, uint8_t cts_pin = 255, uint8_t rts_pin = 255) override;
     void deinit() override;
-    bool write_dma(const uint8_t* data, size_t length, dma_callback_t callback = nullptr) override;
-    bool read_dma(uint8_t* buffer, size_t length, dma_callback_t callback = nullptr) override;
+
     inline size_t write_to_tx_buffer(const uint8_t* data, size_t length) override;
     inline size_t read_from_rx_buffer(uint8_t* buffer, size_t length) override;
-    inline void trigger_tx_dma() override;
     inline size_t get_tx_buffer_free_space() const override;
     inline size_t get_rx_buffer_data_count() const override;
     bool is_busy() const override;
+
     size_t available() override;
     void flush_rx() override;
     void flush_tx() override;
@@ -86,6 +88,7 @@ public:
 private:
     static void irq_handler();
     void handle_rx_irq();
+    inline void trigger_tx_dma(size_t length); // 内部私有方法，自动处理DMA传输
     
     bool initialized_;
     uint8_t tx_pin_;
@@ -95,24 +98,26 @@ private:
     bool dma_busy_;
     dma_callback_t dma_callback_;
     int dma_tx_channel_;
-    int dma_rx_channel_;
+    int dma_ctrl_channel_;  // DMA控制通道
     
-    // 友元函数声明，允许DMA回调函数访问私有成员
+    // 友元函数声明，仅保留TX回调
     friend void uart0_tx_dma_callback(bool success);
-    friend void uart0_rx_dma_callback(bool success);
     
-    // RX环形缓冲区
-    static constexpr size_t RX_BUFFER_SIZE = 256;
-    uint8_t rx_buffer_[RX_BUFFER_SIZE];
-    volatile size_t rx_head_;
-    volatile size_t rx_tail_;
+    // RX静态缓冲区结构体
+    struct RxBuffer {
+        static constexpr size_t BUFFER_SIZE = 256;
+        static uint8_t buffer[BUFFER_SIZE];
+        static uint8_t* write_ptr;
+        static uint8_t* read_ptr;
+        static size_t data_count;
+    } rx_buffer_;
     
-    // TX环形缓冲区
-    static constexpr size_t TX_BUFFER_SIZE = 256;
-    uint8_t tx_buffer_[TX_BUFFER_SIZE];
-    volatile size_t tx_head_;
-    volatile size_t tx_tail_;
-    volatile bool tx_dma_active_;
+    // TX DMA缓冲区结构体 这是罕见级DMA的必要操作 必须构造一个管道去操作第二个管道循环运行
+    struct TxBuffer {
+        static constexpr size_t BUFFER_SIZE = 256;
+        static char data_buffer[BUFFER_SIZE];
+        static DmaControlBlock control_buffer[BUFFER_SIZE + 1];
+    } tx_buffer_;
     
     static HAL_UART0* instance_;
     
@@ -130,11 +135,9 @@ public:
     
     bool init(uint8_t tx_pin, uint8_t rx_pin, uint32_t baudrate = 115200, bool flow_control = false, uint8_t cts_pin = 255, uint8_t rts_pin = 255) override;
     void deinit() override;
-    bool write_dma(const uint8_t* data, size_t length, dma_callback_t callback = nullptr) override;
-    bool read_dma(uint8_t* buffer, size_t length, dma_callback_t callback = nullptr) override;
+
     inline size_t write_to_tx_buffer(const uint8_t* data, size_t length) override;
     inline size_t read_from_rx_buffer(uint8_t* buffer, size_t length) override;
-    inline void trigger_tx_dma() override;
     inline size_t get_tx_buffer_free_space() const override;
     inline size_t get_rx_buffer_data_count() const override;
     bool is_busy() const override;
@@ -148,6 +151,7 @@ public:
 private:
     static void irq_handler();
     void handle_rx_irq();
+    inline void trigger_tx_dma(size_t length); // 内部私有方法，自动处理DMA传输
     
     bool initialized_;
     uint8_t tx_pin_;
@@ -157,24 +161,26 @@ private:
     bool dma_busy_;
     dma_callback_t dma_callback_;
     int dma_tx_channel_;
-    int dma_rx_channel_;
-    
-    // 友元函数声明，允许DMA回调函数访问私有成员
+    int dma_ctrl_channel_;  // DMA控制通道
+
+    // 友元函数声明，仅保留TX回调
     friend void uart1_tx_dma_callback(bool success);
-    friend void uart1_rx_dma_callback(bool success);
     
-    // RX环形缓冲区
-    static constexpr size_t RX_BUFFER_SIZE = 256;
-    uint8_t rx_buffer_[RX_BUFFER_SIZE];
-    volatile size_t rx_head_;
-    volatile size_t rx_tail_;
+    // RX静态缓冲区结构体
+    struct RxBuffer {
+        static constexpr size_t BUFFER_SIZE = 256;
+        static uint8_t buffer[BUFFER_SIZE];
+        static uint8_t* write_ptr;
+        static uint8_t* read_ptr;
+        static size_t data_count;
+    } rx_buffer_;
     
-    // TX环形缓冲区
-    static constexpr size_t TX_BUFFER_SIZE = 256;
-    uint8_t tx_buffer_[TX_BUFFER_SIZE];
-    volatile size_t tx_head_;
-    volatile size_t tx_tail_;
-    volatile bool tx_dma_active_;
+    // TX DMA缓冲区结构体
+    struct TxBuffer {
+        static constexpr size_t BUFFER_SIZE = 256;
+        static char data_buffer[BUFFER_SIZE];
+        static DmaControlBlock control_buffer[BUFFER_SIZE + 1];
+    } tx_buffer_;
     
     static HAL_UART1* instance_;
     

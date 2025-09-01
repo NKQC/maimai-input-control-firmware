@@ -406,19 +406,7 @@ void print_system_info() {
  * Core0 HAL层初始化 - 负责I2C、UART、PIO
  */
 bool core0_init_hal_layer() {
-    // 初始化I2C
-    hal_i2c0 = HAL_I2C0::getInstance();
-    if (!hal_i2c0 || !hal_i2c0->init(I2C0_SDA_PIN, I2C0_SCL_PIN, 400000)) {
-        error_handler("Failed to initialize I2C0");
-        return false;
-    }
-    
-    hal_i2c1 = HAL_I2C1::getInstance();
-    if (!hal_i2c1 || !hal_i2c1->init(I2C1_SDA_PIN, I2C1_SCL_PIN, 400000)) {
-        error_handler("Failed to initialize I2C1");
-        return false;
-    }
-    
+
     // 初始化UART
     hal_uart0 = HAL_UART0::getInstance();
     if (!hal_uart0 || !hal_uart0->init(UART0_TX_PIN, UART0_RX_PIN, 9600, true, UART0_CTS_PIN, UART0_RTS_PIN)) {
@@ -429,6 +417,19 @@ bool core0_init_hal_layer() {
     hal_uart1 = HAL_UART1::getInstance();
     if (!hal_uart1 || !hal_uart1->init(UART1_TX_PIN, UART1_RX_PIN, 9600)) {
         error_handler("Failed to initialize UART1");
+        return false;
+    }
+
+    // 初始化I2C
+    hal_i2c0 = HAL_I2C0::getInstance();
+    if (!hal_i2c0 || !hal_i2c0->init(I2C0_SDA_PIN, I2C0_SCL_PIN, 400000)) {
+        error_handler("Failed to initialize I2C0");
+        return false;
+    }
+    
+    hal_i2c1 = HAL_I2C1::getInstance();
+    if (!hal_i2c1 || !hal_i2c1->init(I2C1_SDA_PIN, I2C1_SCL_PIN, 400000)) {
+        error_handler("Failed to initialize I2C1");
         return false;
     }
     
@@ -624,11 +625,11 @@ bool init_service_layer() {
     input_manager->addPhysicalKeyboard(MCP_GPIO::GPIOB2, HID_KeyCode::KEY_ENTER);
     input_manager->addPhysicalKeyboard(MCP_GPIO::GPIOB3, HID_KeyCode::KEY_SPACE);
 
-    // 注册GTX312L设备到InputManager
+    // 注册TouchSensor设备到InputManager
     for (uint8_t i = 0; i < gtx312l_count; i++) {
         if (gtx312l_devices[i]) {
-            if (!input_manager->registerGTX312L(gtx312l_devices[i])) {
-                error_handler("Failed to register GTX312L device");
+            if (!input_manager->registerTouchSensor(gtx312l_devices[i])) {
+                error_handler("Failed to register TouchSensor device");
                 return false;
             }
         }
@@ -644,6 +645,7 @@ bool init_service_layer() {
         error_handler("Failed to initialize LightManager");
         return false;
     }
+    light_manager->enable_debug_output(true);
     
     // 初始化UIManager
     ui_manager = UIManager::getInstance();
@@ -697,7 +699,7 @@ void scan_i2c_devices() {
                 
                 // 注册到InputManager
                 if (input_manager) {
-                    input_manager->registerGTX312L(device);
+                    input_manager->registerTouchSensor(device);
                 }
                 
                 if (usb_logs) {
@@ -729,7 +731,7 @@ void scan_i2c_devices() {
                 
                 // 注册到InputManager
                 if (input_manager) {
-                    input_manager->registerGTX312L(device);
+                    input_manager->registerTouchSensor(device);
                 }
             } else {
                 // 初始化失败，删除实例
@@ -888,12 +890,14 @@ void deinit_system() {
 }
 
 /**
- * Core0任务 - InputManager Loop0, LightManager Loop
+ * Core0任务 - UART透传测试功能
+ * 实现UART0和UART1之间的双向透传
  */
 void core0_task() {
     while (1) {
         input_manager->loop0();
         light_manager->loop();
+        heartbeat_task();
         watchdog_feed();
     }
 }
@@ -907,7 +911,6 @@ void core1_task() {
         usb_logs->task();
         ui_manager->task();
         watchdog_feed();
-        heartbeat_task();
     }
 }
 

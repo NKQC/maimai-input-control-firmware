@@ -4,17 +4,32 @@
 #include <hardware/irq.h>
 #include <hardware/dma.h>
 #include <pico/stdlib.h>
+#include <cstring>
 
 // 包含全局中断管理
 #include "../global_irq.h"
 
-// UART DMA回调函数声明
+// 仅保留TX DMA回调函数声明
 void uart0_tx_dma_callback(bool success);
-void uart0_rx_dma_callback(bool success);
 void uart1_tx_dma_callback(bool success);
-void uart1_rx_dma_callback(bool success);
 // HAL_UART0 静态成员初始化
 HAL_UART0* HAL_UART0::instance_ = nullptr;
+
+// UART0
+uint8_t HAL_UART0::RxBuffer::buffer[HAL_UART0::RxBuffer::BUFFER_SIZE];
+uint8_t* HAL_UART0::RxBuffer::write_ptr = HAL_UART0::RxBuffer::buffer;
+uint8_t* HAL_UART0::RxBuffer::read_ptr = HAL_UART0::RxBuffer::buffer;
+size_t HAL_UART0::RxBuffer::data_count = 0;
+char HAL_UART0::TxBuffer::data_buffer[HAL_UART0::TxBuffer::BUFFER_SIZE];
+HAL_UART0::DmaControlBlock HAL_UART0::TxBuffer::control_buffer[HAL_UART0::TxBuffer::BUFFER_SIZE + 1];
+
+// UART1
+uint8_t HAL_UART1::RxBuffer::buffer[HAL_UART1::RxBuffer::BUFFER_SIZE];
+uint8_t* HAL_UART1::RxBuffer::write_ptr = HAL_UART1::RxBuffer::buffer;
+uint8_t* HAL_UART1::RxBuffer::read_ptr = HAL_UART1::RxBuffer::buffer;
+size_t HAL_UART1::RxBuffer::data_count = 0;
+char HAL_UART1::TxBuffer::data_buffer[HAL_UART1::TxBuffer::BUFFER_SIZE];
+HAL_UART1::DmaControlBlock HAL_UART1::TxBuffer::control_buffer[HAL_UART1::TxBuffer::BUFFER_SIZE + 1];
 
 // HAL_UART0 实现
 HAL_UART0* HAL_UART0::getInstance() {
@@ -26,8 +41,8 @@ HAL_UART0* HAL_UART0::getInstance() {
 
 HAL_UART0::HAL_UART0() 
     : initialized_(false), tx_pin_(0), rx_pin_(0), baudrate_(115200),
-      dma_busy_(false), dma_tx_channel_(-1), dma_rx_channel_(-1),
-      rx_head_(0), rx_tail_(0), tx_head_(0), tx_tail_(0), tx_dma_active_(false) {
+      dma_busy_(false), dma_tx_channel_(-1), dma_ctrl_channel_(-1) {
+    // 缓冲区结构体会自动初始化
 }
 
 HAL_UART0::~HAL_UART0() {
@@ -64,27 +79,28 @@ bool HAL_UART0::init(uint8_t tx_pin, uint8_t rx_pin, uint32_t baudrate, bool flo
     // 启用FIFO
     uart_set_fifo_enabled(uart0, true);
     
-    // 清空缓冲区
-    rx_head_ = 0;
-    rx_tail_ = 0;
-    
-    // 设置中断
+    // 重置缓冲区状态
+    rx_buffer_.write_ptr = rx_buffer_.buffer;
+    rx_buffer_.read_ptr = rx_buffer_.buffer;
+    rx_buffer_.data_count = 0;
+
+    // 设置中断（仅用于接收）
     irq_set_exclusive_handler(UART0_IRQ, irq_handler);
     irq_set_enabled(UART0_IRQ, true);
     
     // 启用接收中断
     uart_set_irq_enables(uart0, true, false);
     
-    // 分配DMA通道
+    // 分配DMA通道 - 数据通道和控制通道
     dma_tx_channel_ = dma_claim_unused_channel(true);
-    dma_rx_channel_ = dma_claim_unused_channel(true);
+    dma_ctrl_channel_ = dma_claim_unused_channel(true);
+
+    // 仅为TX通道注册DMA回调到全局中断管理系统
+    bool tx_registered = global_irq_register_dma_callback(dma_tx_channel_, uart0_tx_dma_callback);
     
-    // 注册DMA回调到全局中断管理系统
-    global_irq_register_dma_callback(dma_tx_channel_, uart0_tx_dma_callback);
-    global_irq_register_dma_callback(dma_rx_channel_, uart0_rx_dma_callback);
+    initialized_ = tx_registered && dma_tx_channel_ >= 0 && dma_ctrl_channel_ >= 0;
     
-    initialized_ = true;
-    return true;
+    return initialized_;
 }
 
 void HAL_UART0::deinit() {
@@ -93,20 +109,9 @@ void HAL_UART0::deinit() {
         uart_set_irq_enables(uart0, false, false);
         irq_set_enabled(UART0_IRQ, false);
         
-        // 注销DMA回调
+        // 注销DMA回调（仅TX）
         if (dma_tx_channel_ >= 0) {
             global_irq_unregister_dma_callback(dma_tx_channel_);
-        }
-        if (dma_rx_channel_ >= 0) {
-            global_irq_unregister_dma_callback(dma_rx_channel_);
-        }
-        
-        // 注销DMA回调
-        if (dma_tx_channel_ >= 0) {
-            global_irq_unregister_dma_callback(dma_tx_channel_);
-        }
-        if (dma_rx_channel_ >= 0) {
-            global_irq_unregister_dma_callback(dma_rx_channel_);
         }
         
         // 释放DMA通道
@@ -114,9 +119,9 @@ void HAL_UART0::deinit() {
             dma_channel_unclaim(dma_tx_channel_);
             dma_tx_channel_ = -1;
         }
-        if (dma_rx_channel_ >= 0) {
-            dma_channel_unclaim(dma_rx_channel_);
-            dma_rx_channel_ = -1;
+        if (dma_ctrl_channel_ >= 0) {
+            dma_channel_unclaim(dma_ctrl_channel_);
+            dma_ctrl_channel_ = -1;
         }
         
         // 反初始化UART
@@ -126,55 +131,79 @@ void HAL_UART0::deinit() {
     }
 }
 
-// 内联函数：写入数据到TX环形缓冲区
+// 内联函数：写入数据到TX单缓冲区并直接发起DMA传输
 inline size_t HAL_UART0::write_to_tx_buffer(const uint8_t* data, size_t length) {
-    if (!initialized_ || !data) {
+    if (!initialized_ || !data || length == 0) {
         return 0;
     }
     
-    size_t written = 0;
-    for (size_t i = 0; i < length && written < length; i++) {
-        size_t next_head = (tx_head_ + 1) % TX_BUFFER_SIZE;
-        if (next_head == tx_tail_) {
-            break; // 缓冲区满
-        }
-        tx_buffer_[tx_head_] = data[i];
-        tx_head_ = next_head;
-        written++;
+    // 如果DMA忙，直接返回0，不缓存数据
+    if (dma_busy_) {
+        return 0;
     }
     
-    return written;
+    // 限制传输长度不超过缓冲区大小
+    size_t to_write = (length > TxBuffer::BUFFER_SIZE) ? TxBuffer::BUFFER_SIZE : length;
+    
+    // 复制数据到缓冲区
+    for (size_t i = 0; i < to_write; i++) {
+        tx_buffer_.data_buffer[i] = data[i];
+        tx_buffer_.control_buffer[i].len = 1;
+        tx_buffer_.control_buffer[i].data = &tx_buffer_.data_buffer[i];
+    }
+    
+    // 直接发起DMA传输
+    trigger_tx_dma(to_write);
+    
+    return to_write;
 }
 
-// 内联函数：从RX环形缓冲区读取数据
+// 内联函数：从RX静态缓冲区读取数据
 inline size_t HAL_UART0::read_from_rx_buffer(uint8_t* buffer, size_t length) {
     if (!initialized_ || !buffer) {
         return 0;
     }
     
-    size_t read_count = 0;
-    while (read_count < length && rx_head_ != rx_tail_) {
-        buffer[read_count] = rx_buffer_[rx_tail_];
-        rx_tail_ = (rx_tail_ + 1) % RX_BUFFER_SIZE;
-        read_count++;
+    size_t to_read = (length > rx_buffer_.data_count) ? rx_buffer_.data_count : length;
+    
+    if (to_read == 0) {
+        return 0; // 没有数据可读
     }
     
-    return read_count;
+    // 计算从读指针到缓冲区末尾的数据长度
+    size_t end_length = rx_buffer_.buffer + RxBuffer::BUFFER_SIZE - rx_buffer_.read_ptr;
+    
+    if (to_read <= end_length) {
+        // 数据不跨越缓冲区边界
+        memcpy(buffer, (void*)rx_buffer_.read_ptr, to_read);
+        rx_buffer_.read_ptr += to_read;
+    } else {
+        // 数据跨越缓冲区边界
+        memcpy(buffer, (void*)rx_buffer_.read_ptr, end_length);
+        memcpy(buffer + end_length, rx_buffer_.buffer, to_read - end_length);
+        rx_buffer_.read_ptr = rx_buffer_.buffer + (to_read - end_length);
+    }
+    
+    // 处理读指针回绕
+    if (rx_buffer_.read_ptr >= rx_buffer_.buffer + RxBuffer::BUFFER_SIZE) {
+        rx_buffer_.read_ptr = rx_buffer_.buffer;
+    }
+    
+    rx_buffer_.data_count -= to_read;
+    
+    return to_read;
 }
 
 size_t HAL_UART0::available() {
     if (!initialized_) return 0;
     
-    if (rx_head_ >= rx_tail_) {
-        return rx_head_ - rx_tail_;
-    } else {
-        return RX_BUFFER_SIZE - rx_tail_ + rx_head_;
-    }
+    return rx_buffer_.data_count;
 }
 
 void HAL_UART0::flush_rx() {
-    rx_head_ = 0;
-    rx_tail_ = 0;
+    rx_buffer_.write_ptr = rx_buffer_.buffer;
+    rx_buffer_.read_ptr = rx_buffer_.buffer;
+    rx_buffer_.data_count = 0;
 }
 
 void HAL_UART0::flush_tx() {
@@ -200,11 +229,17 @@ void HAL_UART0::handle_rx_irq() {
     while (uart_is_readable(uart0)) {
         uint8_t ch = uart_getc(uart0);
         
-        // 存储到环形缓冲区
-        size_t next_head = (rx_head_ + 1) % RX_BUFFER_SIZE;
-        if (next_head != rx_tail_) {
-            rx_buffer_[rx_head_] = ch;
-            rx_head_ = next_head;
+        // 存储到静态缓冲区（如果有空间）
+        if (rx_buffer_.data_count < RxBuffer::BUFFER_SIZE) {
+            *rx_buffer_.write_ptr = ch;
+            rx_buffer_.write_ptr++;
+            
+            // 处理写指针回绕
+            if (rx_buffer_.write_ptr >= rx_buffer_.buffer + RxBuffer::BUFFER_SIZE) {
+                rx_buffer_.write_ptr = rx_buffer_.buffer;
+            }
+            
+            rx_buffer_.data_count++;
         }
         
         // 调用回调函数
@@ -218,316 +253,159 @@ void HAL_UART0::handle_rx_irq() {
 // C风格的UART1 DMA回调函数实现
 void uart1_tx_dma_callback(bool success) {
     HAL_UART1* instance = HAL_UART1::getInstance();
-    if (instance) {
-        // 更新tx_tail_指针
-        size_t transmitted_length = dma_channel_hw_addr(instance->dma_tx_channel_)->transfer_count;
-        instance->tx_tail_ = (instance->tx_tail_ + transmitted_length) % instance->TX_BUFFER_SIZE;
-        instance->tx_dma_active_ = false;
-        
-        // 如果还有数据需要传输，继续DMA
-        if (instance->tx_head_ != instance->tx_tail_) {
-            instance->trigger_tx_dma();
-        }
-        
-        instance->dma_busy_ = false;
-        if (instance->dma_callback_) {
-            instance->dma_callback_(success);
-        }
+    if (!instance || instance->dma_tx_channel_ < 0) {
+        return;
     }
-}
 
-void uart1_rx_dma_callback(bool success) {
-    HAL_UART1* instance = HAL_UART1::getInstance();
-    if (instance) {
-        instance->dma_busy_ = false;
-        if (instance->dma_callback_) {
-            instance->dma_callback_(success);
-        }
+    // 清除DMA忙标志
+    instance->dma_busy_ = false;
+    
+    // 调用用户回调
+    if (instance->dma_callback_) {
+        instance->dma_callback_(success);
     }
 }
 
 // HAL_UART1 DMA异步方法
-// 内联函数：触发TX DMA传输
-inline void HAL_UART1::trigger_tx_dma() {
-    if (!initialized_ || tx_dma_active_ || tx_head_ == tx_tail_) {
+// 内联函数：触发TX DMA传输（单缓冲区模式）
+// 触发TX DMA传输（双通道控制模式）
+inline void HAL_UART1::trigger_tx_dma(size_t length) {
+    if (!initialized_ || dma_busy_ || length == 0) {
         return;
     }
     
-    // 计算可传输的数据长度
-    size_t data_length;
-    if (tx_head_ > tx_tail_) {
-        data_length = tx_head_ - tx_tail_;
-    } else {
-        data_length = TX_BUFFER_SIZE - tx_tail_;
-    }
-    
-    if (data_length == 0) {
-        return;
-    }
-    
-    tx_dma_active_ = true;
-    
-    // 配置DMA通道
-    dma_channel_config c = dma_channel_get_default_config(dma_tx_channel_);
-    channel_config_set_transfer_data_size(&c, DMA_SIZE_8);
-    channel_config_set_read_increment(&c, true);
-    channel_config_set_write_increment(&c, false);
-    channel_config_set_dreq(&c, uart_get_dreq(uart1, true));
-    
-    // DMA中断由global_irq统一管理，无需在此设置
-    
-    // 启动DMA传输
+    dma_busy_ = true;
+
+    tx_buffer_.control_buffer[length].len = 0;
+    tx_buffer_.control_buffer[length].data = NULL;
+
+    // 控制通道配置：32位、读写自增，写指针按8字节环绕，写入data通道别名3的TRANS_COUNT和READ_ADDR
+    dma_channel_config c_ctrl = dma_channel_get_default_config(dma_ctrl_channel_);
+    channel_config_set_transfer_data_size(&c_ctrl, DMA_SIZE_32);
+    channel_config_set_read_increment(&c_ctrl, true);
+    channel_config_set_write_increment(&c_ctrl, true);
+    channel_config_set_ring(&c_ctrl, true, 3); // 1<<3 = 8字节边界
+
+    dma_channel_configure(
+        dma_ctrl_channel_,
+        &c_ctrl,
+        &dma_hw->ch[dma_tx_channel_].al3_transfer_count,
+        &tx_buffer_.control_buffer[0],
+        2,      // 每次写两个32位词：len -> TRANS_COUNT, data -> READ_ADDR
+        false   // 暂不启动
+    );
+
+    // 数据通道配置：8位、读自增、写不增、按UART TX DREQ节流；完成后链回控制通道；quiet以便在结束块触发IRQ
+    dma_channel_config c_data = dma_channel_get_default_config(dma_tx_channel_);
+    channel_config_set_transfer_data_size(&c_data, DMA_SIZE_8);
+    channel_config_set_dreq(&c_data, uart_get_dreq(uart1, true));
+    channel_config_set_chain_to(&c_data, dma_ctrl_channel_);
+    channel_config_set_irq_quiet(&c_data, true);
+
     dma_channel_configure(
         dma_tx_channel_,
-        &c,
+        &c_data,
         &uart_get_hw(uart1)->dr,
-        &tx_buffer_[tx_tail_],
-        data_length,
-        true
+        NULL,   // READ_ADDR和TRANS_COUNT由控制通道装载
+        0,
+        false
     );
+
+    // 启动控制通道装载首个控制块
+    dma_start_channel_mask(1u << dma_ctrl_channel_);
 }
 
-// 内联函数：获取TX缓冲区空闲空间
+// 内联函数：获取TX缓冲区剩余空间
 inline size_t HAL_UART1::get_tx_buffer_free_space() const {
-    if (tx_head_ >= tx_tail_) {
-        return TX_BUFFER_SIZE - (tx_head_ - tx_tail_) - 1;
-    } else {
-        return tx_tail_ - tx_head_ - 1;
-    }
+    return dma_busy_ ? 0 : TxBuffer::BUFFER_SIZE;
 }
 
 // 内联函数：获取RX缓冲区数据数量
 inline size_t HAL_UART1::get_rx_buffer_data_count() const {
-    if (rx_head_ >= rx_tail_) {
-        return rx_head_ - rx_tail_;
-    } else {
-        return RX_BUFFER_SIZE - (rx_tail_ - rx_head_);
-    }
-}
-
-bool HAL_UART1::write_dma(const uint8_t* data, size_t length, dma_callback_t callback) {
-    if (!initialized_ || dma_busy_ || dma_tx_channel_ < 0) {
-        return false;
-    }
-    
-    dma_busy_ = true;
-    dma_callback_ = callback;
-    
-    // 配置DMA通道
-    dma_channel_config c = dma_channel_get_default_config(dma_tx_channel_);
-    channel_config_set_transfer_data_size(&c, DMA_SIZE_8);
-    channel_config_set_read_increment(&c, true);
-    channel_config_set_write_increment(&c, false);
-    channel_config_set_dreq(&c, uart_get_dreq(uart1, true)); // TX DREQ
-    
-    // DMA中断由global_irq统一管理，无需在此设置
-    
-    // 启动DMA传输
-    dma_channel_configure(
-        dma_tx_channel_,
-        &c,
-        &uart_get_hw(uart1)->dr, // 写入地址
-        data,                    // 读取地址
-        length,                  // 传输长度
-        true                     // 立即启动
-    );
-    
-    return true;
-}
-
-bool HAL_UART1::read_dma(uint8_t* buffer, size_t length, dma_callback_t callback) {
-    if (!initialized_ || dma_busy_ || dma_rx_channel_ < 0) {
-        return false;
-    }
-    
-    dma_busy_ = true;
-    dma_callback_ = callback;
-    
-    // 配置DMA通道
-    dma_channel_config c = dma_channel_get_default_config(dma_rx_channel_);
-    channel_config_set_transfer_data_size(&c, DMA_SIZE_8);
-    channel_config_set_read_increment(&c, false);
-    channel_config_set_write_increment(&c, true);
-    channel_config_set_dreq(&c, uart_get_dreq(uart1, false)); // RX DREQ
-    
-    // DMA中断由global_irq统一管理，无需在此设置
-    
-    // 启动DMA传输
-    dma_channel_configure(
-        dma_rx_channel_,
-        &c,
-        buffer,                   // 写入地址
-        &uart_get_hw(uart1)->dr, // 读取地址
-        length,                   // 传输长度
-        true                      // 立即启动
-    );
-    
-    return true;
+    return rx_buffer_.data_count;
 }
 
 bool HAL_UART1::is_busy() const {
     return dma_busy_;
 }
 
-// get_name() 和 is_ready() 已在头文件中内联定义
-
 // C风格的DMA回调函数实现
 void uart0_tx_dma_callback(bool success) {
-        HAL_UART0* instance = HAL_UART0::getInstance();
-        if (instance) {
-            // 更新tx_tail_指针
-            size_t transmitted_length = dma_channel_hw_addr(instance->dma_tx_channel_)->transfer_count;
-            instance->tx_tail_ = (instance->tx_tail_ + transmitted_length) % instance->TX_BUFFER_SIZE;
-            instance->tx_dma_active_ = false;
-            
-            // 如果还有数据需要传输，继续DMA
-            if (instance->tx_head_ != instance->tx_tail_) {
-                instance->trigger_tx_dma();
-            }
-            
-            instance->dma_busy_ = false;
-            if (instance->dma_callback_) {
-                instance->dma_callback_(success);
-            }
-        }
-    }
-    
-void uart0_rx_dma_callback(bool success) {
-        HAL_UART0* instance = HAL_UART0::getInstance();
-        if (instance) {
-            instance->dma_busy_ = false;
-            if (instance->dma_callback_) {
-                instance->dma_callback_(success);
-            }
-        }
-    }
-
-// HAL_UART0 DMA异步方法
-// 内联函数：触发TX DMA传输
-inline void HAL_UART0::trigger_tx_dma() {
-    if (!initialized_ || tx_dma_active_ || tx_head_ == tx_tail_) {
+    HAL_UART0* instance = HAL_UART0::getInstance();
+    if (!instance || instance->dma_tx_channel_ < 0) {
         return;
     }
     
-    // 计算可传输的数据长度
-    size_t data_length;
-    if (tx_head_ > tx_tail_) {
-        data_length = tx_head_ - tx_tail_;
-    } else {
-        data_length = TX_BUFFER_SIZE - tx_tail_;
+    // 清除DMA忙标志
+    instance->dma_busy_ = false;
+    
+    // 调用用户回调
+    if (instance->dma_callback_) {
+        instance->dma_callback_(success);
     }
-    
-    if (data_length == 0) {
-        return;
-    }
-    
-    tx_dma_active_ = true;
-    
-    // 配置DMA通道
-    dma_channel_config c = dma_channel_get_default_config(dma_tx_channel_);
-    channel_config_set_transfer_data_size(&c, DMA_SIZE_8);
-    channel_config_set_read_increment(&c, true);
-    channel_config_set_write_increment(&c, false);
-    channel_config_set_dreq(&c, uart_get_dreq(uart0, true));
-    
-    // DMA中断由global_irq统一管理，无需在此设置
-    
-    // 启动DMA传输
-    dma_channel_configure(
-        dma_tx_channel_,
-        &c,
-        &uart_get_hw(uart0)->dr,
-        &tx_buffer_[tx_tail_],
-        data_length,
-        true
-    );
 }
 
-// 内联函数：获取TX缓冲区空闲空间
-inline size_t HAL_UART0::get_tx_buffer_free_space() const {
-    if (tx_head_ >= tx_tail_) {
-        return TX_BUFFER_SIZE - (tx_head_ - tx_tail_) - 1;
-    } else {
-        return tx_tail_ - tx_head_ - 1;
+// 触发TX DMA传输（双通道控制模式）
+inline void HAL_UART0::trigger_tx_dma(size_t length) {
+    if (!initialized_ || dma_busy_ || length == 0) {
+        return;
     }
+    
+    // 设置DMA忙标志
+    dma_busy_ = true;
+
+    tx_buffer_.control_buffer[length].len = 0;
+    tx_buffer_.control_buffer[length].data = NULL;
+
+    // 控制通道配置：32位、读写自增，写指针按8字节环绕，写入data通道别名3的TRANS_COUNT和READ_ADDR
+    dma_channel_config c_ctrl = dma_channel_get_default_config(dma_ctrl_channel_);
+    channel_config_set_transfer_data_size(&c_ctrl, DMA_SIZE_32);
+    channel_config_set_read_increment(&c_ctrl, true);
+    channel_config_set_write_increment(&c_ctrl, true);
+    channel_config_set_ring(&c_ctrl, true, 3); // 1<<3 = 8字节边界
+
+    dma_channel_configure(
+        dma_ctrl_channel_,
+        &c_ctrl,
+        &dma_hw->ch[dma_tx_channel_].al3_transfer_count,
+        &tx_buffer_.control_buffer[0],
+        2,      // 每次写两个32位词：len -> TRANS_COUNT, data -> READ_ADDR
+        false   // 暂不启动
+    );
+    
+    // 数据通道配置：8位、读自增、写不增、按UART TX DREQ节流；完成后链回控制通道；quiet以便在结束块触发IRQ
+    dma_channel_config c_data = dma_channel_get_default_config(dma_tx_channel_);
+    channel_config_set_transfer_data_size(&c_data, DMA_SIZE_8);
+    channel_config_set_dreq(&c_data, uart_get_dreq(uart0, true));
+    channel_config_set_chain_to(&c_data, dma_ctrl_channel_);
+    channel_config_set_irq_quiet(&c_data, true);
+
+    dma_channel_configure(
+        dma_tx_channel_,
+        &c_data,
+        &uart_get_hw(uart0)->dr,
+        NULL,   // READ_ADDR和TRANS_COUNT由控制通道装载
+        0,
+        false
+    );
+ 
+    // 启动控制通道装载首个控制块
+    dma_start_channel_mask(1u << dma_ctrl_channel_);
+}
+
+// 内联函数：获取TX缓冲区剩余空间
+inline size_t HAL_UART0::get_tx_buffer_free_space() const {
+    return dma_busy_ ? 0 : TxBuffer::BUFFER_SIZE;
 }
 
 // 内联函数：获取RX缓冲区数据数量
 inline size_t HAL_UART0::get_rx_buffer_data_count() const {
-    if (rx_head_ >= rx_tail_) {
-        return rx_head_ - rx_tail_;
-    } else {
-        return RX_BUFFER_SIZE - (rx_tail_ - rx_head_);
-    }
-}
-
-bool HAL_UART0::write_dma(const uint8_t* data, size_t length, dma_callback_t callback) {
-    if (!initialized_ || dma_busy_ || dma_tx_channel_ < 0) {
-        return false;
-    }
-    
-    dma_busy_ = true;
-    dma_callback_ = callback;
-    
-    // 配置DMA通道
-    dma_channel_config c = dma_channel_get_default_config(dma_tx_channel_);
-    channel_config_set_transfer_data_size(&c, DMA_SIZE_8);
-    channel_config_set_read_increment(&c, true);
-    channel_config_set_write_increment(&c, false);
-    channel_config_set_dreq(&c, uart_get_dreq(uart0, true)); // TX DREQ
-    
-    // DMA中断由global_irq统一管理，无需在此设置
-    
-    // 启动DMA传输
-    dma_channel_configure(
-        dma_tx_channel_,
-        &c,
-        &uart_get_hw(uart0)->dr, // 写入地址
-        data,                    // 读取地址
-        length,                  // 传输长度
-        true                     // 立即启动
-    );
-    
-    return true;
-}
-
-bool HAL_UART0::read_dma(uint8_t* buffer, size_t length, dma_callback_t callback) {
-    if (!initialized_ || dma_busy_ || dma_rx_channel_ < 0) {
-        return false;
-    }
-    
-    dma_busy_ = true;
-    dma_callback_ = callback;
-    
-    // 配置DMA通道
-    dma_channel_config c = dma_channel_get_default_config(dma_rx_channel_);
-    channel_config_set_transfer_data_size(&c, DMA_SIZE_8);
-    channel_config_set_read_increment(&c, false);
-    channel_config_set_write_increment(&c, true);
-    channel_config_set_dreq(&c, uart_get_dreq(uart0, false)); // RX DREQ
-    
-    // DMA中断由global_irq统一管理，无需在此设置
-    
-    // 启动DMA传输
-    dma_channel_configure(
-        dma_rx_channel_,
-        &c,
-        buffer,                   // 写入地址
-        &uart_get_hw(uart0)->dr, // 读取地址
-        length,                   // 传输长度
-        true                      // 立即启动
-    );
-    
-    return true;
+    return rx_buffer_.data_count;
 }
 
 bool HAL_UART0::is_busy() const {
     return dma_busy_;
 }
-
-// get_name() is already defined inline in header
-
-// is_ready() is already defined inline in header
 
 // HAL_UART1 静态成员初始化
 HAL_UART1* HAL_UART1::instance_ = nullptr;
@@ -542,8 +420,8 @@ HAL_UART1* HAL_UART1::getInstance() {
 
 HAL_UART1::HAL_UART1() 
     : initialized_(false), tx_pin_(0), rx_pin_(0), baudrate_(115200),
-      dma_busy_(false), dma_tx_channel_(-1), dma_rx_channel_(-1),
-      rx_head_(0), rx_tail_(0), tx_head_(0), tx_tail_(0), tx_dma_active_(false) {
+      dma_busy_(false), dma_tx_channel_(-1), dma_ctrl_channel_(-1) {
+    // 缓冲区结构体会自动初始化
 }
 
 HAL_UART1::~HAL_UART1() {
@@ -580,27 +458,28 @@ bool HAL_UART1::init(uint8_t tx_pin, uint8_t rx_pin, uint32_t baudrate, bool flo
     // 启用FIFO
     uart_set_fifo_enabled(uart1, true);
     
-    // 清空缓冲区
-    rx_head_ = 0;
-    rx_tail_ = 0;
-    
-    // 设置中断
+    // 重置缓冲区状态
+    rx_buffer_.write_ptr = rx_buffer_.buffer;
+    rx_buffer_.read_ptr = rx_buffer_.buffer;
+    rx_buffer_.data_count = 0;
+
+    // 设置中断（仅用于接收）
     irq_set_exclusive_handler(UART1_IRQ, irq_handler);
     irq_set_enabled(UART1_IRQ, true);
     
     // 启用接收中断
     uart_set_irq_enables(uart1, true, false);
     
-    // 分配DMA通道
+    // 分配DMA通道 - 数据通道和控制通道
     dma_tx_channel_ = dma_claim_unused_channel(true);
-    dma_rx_channel_ = dma_claim_unused_channel(true);
+    dma_ctrl_channel_ = dma_claim_unused_channel(true);
     
-    // 注册DMA回调到global_irq
-    global_irq_register_dma_callback(dma_tx_channel_, uart1_tx_dma_callback);
-    global_irq_register_dma_callback(dma_rx_channel_, uart1_rx_dma_callback);
+    // 仅为TX通道注册DMA回调
+    bool tx_registered = global_irq_register_dma_callback(dma_tx_channel_, uart1_tx_dma_callback);
     
-    initialized_ = true;
-    return true;
+    initialized_ = tx_registered && dma_tx_channel_ >= 0 && dma_ctrl_channel_ >= 0;
+    
+    return initialized_;
 }
 
 void HAL_UART1::deinit() {
@@ -609,14 +488,19 @@ void HAL_UART1::deinit() {
         uart_set_irq_enables(uart1, false, false);
         irq_set_enabled(UART1_IRQ, false);
         
+        // 注销DMA回调（仅TX）
+        if (dma_tx_channel_ >= 0) {
+            global_irq_unregister_dma_callback(dma_tx_channel_);
+        }
+        
         // 释放DMA通道
         if (dma_tx_channel_ >= 0) {
             dma_channel_unclaim(dma_tx_channel_);
             dma_tx_channel_ = -1;
         }
-        if (dma_rx_channel_ >= 0) {
-            dma_channel_unclaim(dma_rx_channel_);
-            dma_rx_channel_ = -1;
+        if (dma_ctrl_channel_ >= 0) {
+            dma_channel_unclaim(dma_ctrl_channel_);
+            dma_ctrl_channel_ = -1;
         }
         
         // 反初始化UART
@@ -626,38 +510,58 @@ void HAL_UART1::deinit() {
     }
 }
 
-// 内联函数：写入数据到TX环形缓冲区
+// 内联函数：写入数据到TX单缓冲区并直接发起DMA传输
 inline size_t HAL_UART1::write_to_tx_buffer(const uint8_t* data, size_t length) {
-    if (!initialized_ || !data) {
+    if (!initialized_ || !data || length == 0) {
         return 0;
     }
     
-    size_t written = 0;
-    for (size_t i = 0; i < length && written < length; i++) {
-        size_t next_head = (tx_head_ + 1) % TX_BUFFER_SIZE;
-        if (next_head == tx_tail_) {
-            break; // 缓冲区满
-        }
-        tx_buffer_[tx_head_] = data[i];
-        tx_head_ = next_head;
-        written++;
+    // 如果DMA忙，直接返回0，不缓存数据
+    if (dma_busy_) {
+        return 0;
     }
     
-    return written;
+    // 限制传输长度不超过缓冲区大小
+    size_t to_write = (length > TxBuffer::BUFFER_SIZE) ? TxBuffer::BUFFER_SIZE : length;
+    
+    // 复制数据到缓冲区
+    for (size_t i = 0; i < to_write; i++) {
+        tx_buffer_.data_buffer[i] = data[i];
+        tx_buffer_.control_buffer[i].len = 1;
+        tx_buffer_.control_buffer[i].data = &tx_buffer_.data_buffer[i];
+    }
+    
+    // 直接发起DMA传输
+    trigger_tx_dma(to_write);
+    
+    return to_write;
 }
 
-// 内联函数：从RX环形缓冲区读取数据
+// 内联函数：从RX静态缓冲区读取数据
 inline size_t HAL_UART1::read_from_rx_buffer(uint8_t* buffer, size_t length) {
     if (!initialized_ || !buffer) {
         return 0;
     }
     
-    size_t read_count = 0;
-    while (read_count < length && rx_head_ != rx_tail_) {
-        buffer[read_count] = rx_buffer_[rx_tail_];
-        rx_tail_ = (rx_tail_ + 1) % RX_BUFFER_SIZE;
-        read_count++;
+    size_t to_read = (length > rx_buffer_.data_count) ? rx_buffer_.data_count : length;
+    if (to_read == 0) {
+        return 0;
     }
+    
+    size_t read_count = 0;
+    while (read_count < to_read) {
+        buffer[read_count] = *rx_buffer_.read_ptr;
+        read_count++;
+        
+        // 更新读指针，处理环绕
+        rx_buffer_.read_ptr++;
+        if (rx_buffer_.read_ptr >= rx_buffer_.buffer + RxBuffer::BUFFER_SIZE) {
+            rx_buffer_.read_ptr = rx_buffer_.buffer;
+        }
+    }
+    
+    // 更新数据计数
+    rx_buffer_.data_count -= read_count;
     
     return read_count;
 }
@@ -665,16 +569,13 @@ inline size_t HAL_UART1::read_from_rx_buffer(uint8_t* buffer, size_t length) {
 size_t HAL_UART1::available() {
     if (!initialized_) return 0;
     
-    if (rx_head_ >= rx_tail_) {
-        return rx_head_ - rx_tail_;
-    } else {
-        return RX_BUFFER_SIZE - rx_tail_ + rx_head_;
-    }
+    return rx_buffer_.data_count;
 }
 
 void HAL_UART1::flush_rx() {
-    rx_head_ = 0;
-    rx_tail_ = 0;
+    rx_buffer_.write_ptr = rx_buffer_.buffer;
+    rx_buffer_.read_ptr = rx_buffer_.buffer;
+    rx_buffer_.data_count = 0;
 }
 
 void HAL_UART1::flush_tx() {
@@ -700,11 +601,16 @@ void HAL_UART1::handle_rx_irq() {
     while (uart_is_readable(uart1)) {
         uint8_t ch = uart_getc(uart1);
         
-        // 存储到环形缓冲区
-        size_t next_head = (rx_head_ + 1) % RX_BUFFER_SIZE;
-        if (next_head != rx_tail_) {
-            rx_buffer_[rx_head_] = ch;
-            rx_head_ = next_head;
+        // 存储到静态缓冲区（如果有空间）
+        if (rx_buffer_.data_count < RxBuffer::BUFFER_SIZE) {
+            *rx_buffer_.write_ptr = ch;
+            rx_buffer_.data_count++;
+            
+            // 更新写指针，处理环绕
+            rx_buffer_.write_ptr++;
+            if (rx_buffer_.write_ptr >= rx_buffer_.buffer + RxBuffer::BUFFER_SIZE) {
+                rx_buffer_.write_ptr = rx_buffer_.buffer;
+            }
         }
         
         // 调用回调函数

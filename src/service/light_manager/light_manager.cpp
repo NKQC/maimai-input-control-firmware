@@ -136,7 +136,7 @@ bool LightManager::init(const InitConfig& init_config) {
     for (int i = 0; i < REGION_COUNT; i++) {
         region_bitmaps_[i].neopixel_bitmap = (1 << i); // 每个区域对应一个LED
     }
-    
+    initialized_ = true;
     log_debug("LightManager initialized successfully");
     return true;
 }
@@ -414,9 +414,7 @@ void LightManager::loop() {
     }
     
     // 代为执行mai2light模块的loop
-    if (mai2light_) {
-        mai2light_->task();
-    }
+    mai2light_->task();
     
     // 时间片调度处理
     process_time_slice();

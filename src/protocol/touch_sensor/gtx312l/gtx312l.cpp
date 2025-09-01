@@ -230,3 +230,43 @@ std::string GTX312L::getDeviceName() const {
 bool GTX312L::isInitialized() const {
     return initialized_;
 }
+
+// TouchSensor新接口实现
+bool GTX312L::setChannelEnabled(uint8_t channel, bool enabled) {
+    return set_channel_enable(channel, enabled);
+}
+
+bool GTX312L::getChannelEnabled(uint8_t channel) const {
+    if (channel >= GTX312L_MAX_CHANNELS) {
+        return false;
+    }
+    return (enabled_channels_mask_ & (1 << channel)) != 0;
+}
+
+uint32_t GTX312L::getEnabledChannelMask() const {
+    return enabled_channels_mask_;
+}
+
+bool GTX312L::setChannelSensitivity(uint8_t channel, uint8_t sensitivity) {
+    if (sensitivity > 99) {
+        return false;
+    }
+    // 将0-99范围转换为GTX312L的0-255范围
+    uint8_t gtx_sensitivity = (sensitivity * GTX312L_SENSITIVITY_MAX) / 99;
+    return set_sensitivity(channel, gtx_sensitivity);
+}
+
+uint8_t GTX312L::getChannelSensitivity(uint8_t channel) const {
+    if (channel >= GTX312L_MAX_CHANNELS || !initialized_) {
+        return 50;  // 默认值
+    }
+    
+    // 读取GTX312L的灵敏度寄存器
+    uint8_t gtx_sensitivity;
+    if (!const_cast<GTX312L*>(this)->read_register(GTX312L_REG_SENSITIVITY_1 + channel, gtx_sensitivity)) {
+        return 50;  // 读取失败返回默认值
+    }
+    
+    // 将GTX312L的0-255范围转换为0-99范围
+    return (gtx_sensitivity * 99) / GTX312L_SENSITIVITY_MAX;
+}

@@ -340,7 +340,6 @@ private:
     inline void handle_back_item();
     
     // 背光和屏幕超时处理
-    inline void handle_backlight();
     inline void handle_screen_timeout();
     
     // 工具函数

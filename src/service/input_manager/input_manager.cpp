@@ -21,10 +21,15 @@ InputManager* InputManager::getInstance() {
 
 // 私有构造函数
 InputManager::InputManager() 
-    : sample_counter_(0)
+    : delay_buffer_head_(0)
+    , delay_buffer_count_(0)
+    , mcu_gpio_states_(0)
+    , mcu_gpio_previous_states_(0)
+    , sample_counter_(0)
     , last_reset_time_(0)
     , current_sample_rate_(0)
     , binding_active_(false)
+    , binding_callback_()
     , binding_state_(BindingState::IDLE)
     , current_binding_index_(0)
     , binding_start_time_(0)
@@ -33,23 +38,22 @@ InputManager::InputManager()
     , hid_binding_channel_(0)
     , hid_binding_x_(0.0f)
     , hid_binding_y_(0.0f)
+    , auto_adjust_context_()
     , mai2_serial_(nullptr)
     , hid_(nullptr)
     , mcp23s17_(nullptr)
     , config_(inputmanager_get_config_holder())
     , mcp23s17_available_(false)
+    , ui_manager_(nullptr)
     , gpio_keyboard_bitmap_()
     , touch_bitmap_cache_()
-    , mcu_gpio_states_(0)
-    , mcu_gpio_previous_states_(0)
+    , mcp_gpio_states_()
+    , mcp_gpio_previous_states_()
     {
     
-    // 初始化触摸状态数组
+    // 初始化32位触摸状态数组
     for (int i = 0; i < 8; i++) {
-        current_touch_states_[i].physical_addr = 0;
-        current_touch_states_[i].timestamp = 0;
-        previous_touch_states_[i].physical_addr = 0;
-        previous_touch_states_[i].timestamp = 0;
+        touch_device_states_[i] = TouchDeviceState();
     }
     memset(original_channels_backup_, 0, sizeof(original_channels_backup_));
     
@@ -73,10 +77,9 @@ bool InputManager::init(const InitConfig& config) {
     mcp23s17_ = config.mcp23s17;
     mcp23s17_available_ = (mcp23s17_ != nullptr);
     ui_manager_ = config.ui_manager;
-    // 初始化触摸状态数组
+    // 初始化32位触摸状态数组
     for (int i = 0; i < 8; i++) {
-        current_touch_states_[i] = {};
-        previous_touch_states_[i] = {};
+        touch_device_states_[i] = TouchDeviceState();
     }
     
     // 初始化GPIO状态
@@ -103,13 +106,13 @@ void InputManager::deinit() {
     cancelBinding();
     
     // 清空设备列表
-    gtx312l_devices_.clear();
+    touch_sensor_devices_.clear();
     
     // 重置配置中的设备计数
     config->device_count = 0;
 }
 
-// 注册GTX312L设备
+// 注册TouchSensor设备
 // TouchSensor统一接口实现
 bool InputManager::registerTouchSensor(TouchSensor* device) {
     InputManager_PrivateConfig* config = inputmanager_get_config_holder();
@@ -120,7 +123,7 @@ bool InputManager::registerTouchSensor(TouchSensor* device) {
     
     // 获取设备ID掩码
     uint32_t module_id_mask = device->getModuleIdMask();
-    uint16_t device_addr = (module_id_mask >> 16) & 0xFFFF;
+    uint32_t supported_channels = device->getSupportedChannelCount();
     
     // 检查是否已经注册
     for (const auto& registered_device : touch_sensor_devices_) {
@@ -132,9 +135,19 @@ bool InputManager::registerTouchSensor(TouchSensor* device) {
     // 添加到TouchSensor设备列表
     touch_sensor_devices_.push_back(device);
     
-    // 初始化设备映射
-    config->device_mappings[config->device_count].device_addr = device_addr;
-    // 默认灵敏度已在构造函数中设置
+    // 初始化TouchDeviceMapping
+    TouchDeviceMapping& touch_mapping = config->touch_device_mappings[config->device_count];
+    touch_mapping.device_id_mask = module_id_mask;
+    touch_mapping.max_channels = std::min((uint8_t)supported_channels, (uint8_t)28u); // 最大28通道
+    
+    // 初始化默认映射
+    for (uint8_t i = 0; i < touch_mapping.max_channels; i++) {
+        touch_mapping.serial_area[i] = MAI2_NO_USED;
+        touch_mapping.hid_area[i] = {0.0f, 0.0f};
+        touch_mapping.keyboard_keys[i] = HID_KeyCode::KEY_NONE;
+        touch_mapping.sensitivity[i] = 15; // 默认灵敏度
+    }
+    touch_mapping.enabled_channels_mask = (1u << touch_mapping.max_channels) - 1; // 启用所有支持的通道
     
     config->device_count++;
     return true;
@@ -144,7 +157,6 @@ void InputManager::unregisterTouchSensor(TouchSensor* device) {
     if (!device) return;
     
     uint32_t module_id_mask = device->getModuleIdMask();
-    uint16_t device_addr = (module_id_mask >> 16) & 0xFFFF;
     
     // 从TouchSensor设备列表中移除
     auto it = std::find(touch_sensor_devices_.begin(), touch_sensor_devices_.end(), device);
@@ -152,42 +164,19 @@ void InputManager::unregisterTouchSensor(TouchSensor* device) {
         touch_sensor_devices_.erase(it);
         
         // 重新整理设备映射数组
-        int removed_index = findDeviceIndex(device_addr);
+        int removed_index = findTouchDeviceIndex(module_id_mask);
         if (removed_index >= 0) {
             for (int i = removed_index; i < config_->device_count - 1; i++) {
-                config_->device_mappings[i] = config_->device_mappings[i + 1];
+                config_->touch_device_mappings[i] = config_->touch_device_mappings[i + 1];
             }
             config_->device_count--;
         }
     }
 }
 
-// 保持向后兼容的GTX312L接口
-bool InputManager::registerGTX312L(GTX312L* device) {
-    // 直接调用TouchSensor接口
-    bool result = registerTouchSensor(static_cast<TouchSensor*>(device));
-    
-    if (result) {
-        // 同时添加到GTX312L设备列表以保持兼容性
-        gtx312l_devices_.push_back(device);
-    }
-    
-    return result;
-}
+// GTX312L接口已移除 - 统一使用TouchSensor接口
 
-// 注销GTX312L设备 - 保持向后兼容
-void InputManager::unregisterGTX312L(GTX312L* device) {
-    if (!device) return;
-    
-    // 调用TouchSensor接口
-    unregisterTouchSensor(static_cast<TouchSensor*>(device));
-    
-    // 从GTX312L设备列表中移除以保持兼容性
-    auto it = std::find(gtx312l_devices_.begin(), gtx312l_devices_.end(), device);
-    if (it != gtx312l_devices_.end()) {
-        gtx312l_devices_.erase(it);
-    }
-}
+// GTX312L接口已移除 - 统一使用TouchSensor接口
 
 // 物理键盘映射管理方法
 bool InputManager::addPhysicalKeyboard(MCU_GPIO gpio, HID_KeyCode default_key) {
@@ -217,6 +206,22 @@ bool InputManager::removePhysicalKeyboard(uint8_t gpio_pin) {
     }
     
     return false;
+}
+
+inline void InputManager::processSerialModeWithDelay() {
+    Mai2Serial_TouchState delayed_serial_state;
+    
+    // 获取延迟后的Serial状态
+    if (!getDelayedSerialState(delayed_serial_state)) {
+        // 获取失败，使用当前状态
+        processSerialMode();
+        return;
+    }
+    
+    // 直接发送延迟后的Serial状态，无需重新计算
+    if (mai2_serial_) {
+        mai2_serial_->send_touch_state(delayed_serial_state.parts.state1, delayed_serial_state.parts.state2);
+    }
 }
 
 void InputManager::clearPhysicalKeyboards() {
@@ -317,11 +322,11 @@ inline bool InputManager::setWorkMode(InputWorkMode mode) {
     return true;
 }
 
-// CPU0核心循环 - GTX312L触摸采样和Serial/HID处理
+// CPU0核心循环 - TouchSensor触摸采样和Serial/HID处理
 void InputManager::loop0() {
     // 更新所有设备的触摸状态
     updateTouchStates();
-    
+    mai2_serial_->task();
     // 处理自动灵敏度调整状态机
     if (auto_adjust_context_.active) {
         processAutoAdjustSensitivity();
@@ -333,7 +338,7 @@ void InputManager::loop0() {
         return;
     }
     if (getWorkMode() == InputWorkMode::SERIAL_MODE) {
-        processSerialMode();
+        processSerialModeWithDelay();
     }
 }
 
@@ -464,19 +469,13 @@ void InputManager::confirmAutoSerialBinding() {
 }
 
 // 自动调整指定通道的灵敏度
-uint8_t InputManager::autoAdjustSensitivity(uint16_t device_addr, uint8_t channel) {
-    if (channel >= 12) {
+uint8_t InputManager::autoAdjustSensitivity(uint32_t device_id_mask, uint8_t channel) {
+    if (channel > 28) {
         return 0; // 无效通道
     }
     
-    // 查找设备
-    GTX312L* device = nullptr;
-    for (auto* dev : gtx312l_devices_) {
-        if (dev->get_physical_device_address().get_device_mask() == device_addr) {
-            device = dev;
-            break;
-        }
-    }
+    // 查找TouchSensor设备
+    TouchSensor* device = findTouchSensorByIdMask(device_id_mask);
     
     if (!device) {
         return 0; // 设备未找到
@@ -484,13 +483,13 @@ uint8_t InputManager::autoAdjustSensitivity(uint16_t device_addr, uint8_t channe
     
     // 如果状态机正在运行，返回当前灵敏度
     if (auto_adjust_context_.active) {
-        return getSensitivity(device_addr, channel);
+        return getSensitivity(device_id_mask, channel);
     }
     
     // 初始化状态机
-    auto_adjust_context_.device_addr = device_addr;
+    auto_adjust_context_.device_id_mask = device_id_mask;
     auto_adjust_context_.channel = channel;
-    auto_adjust_context_.original_sensitivity = getSensitivity(device_addr, channel);
+    auto_adjust_context_.original_sensitivity = getSensitivity(device_id_mask, channel);
     auto_adjust_context_.current_sensitivity = 1;
     auto_adjust_context_.touch_found_sensitivity = 0;
     auto_adjust_context_.touch_lost_sensitivity = 0;
@@ -506,33 +505,12 @@ void InputManager::processAutoAdjustSensitivity() {
     millis_t current_time = to_ms_since_boot(get_absolute_time());
     millis_t elapsed = current_time - auto_adjust_context_.state_start_time;
     
-    // 优化设备查找 - 使用缓存的设备指针或快速查找
-    GTX312L* device = nullptr;
-    static GTX312L* cached_device = nullptr;
-    static uint16_t cached_device_addr = 0;
-    
-    // 检查缓存是否有效
-    if (cached_device && cached_device_addr == auto_adjust_context_.device_addr) {
-        device = cached_device;
-    } else {
-        // 使用指针遍历避免迭代器开销
-        GTX312L** device_ptr = gtx312l_devices_.data();
-        const size_t device_count = gtx312l_devices_.size();
-        
-        for (size_t i = 0; i < device_count; i++, device_ptr++) {
-            if ((*device_ptr)->get_physical_device_address().get_device_mask() == auto_adjust_context_.device_addr) {
-                device = *device_ptr;
-                cached_device = device;
-                cached_device_addr = auto_adjust_context_.device_addr;
-                break;
-            }
-        }
-    }
+    // 查找TouchSensor设备
+    TouchSensor* device = nullptr;
+    device = findTouchSensorByIdMask(auto_adjust_context_.device_id_mask);
     
     if (!device) {
-        // 设备未找到，清除缓存并结束状态机
-        cached_device = nullptr;
-        cached_device_addr = 0;
+        // 设备未找到，结束状态机
         auto_adjust_context_.active = false;
         return;
     }
@@ -540,7 +518,7 @@ void InputManager::processAutoAdjustSensitivity() {
     switch (auto_adjust_context_.state) {
         case AutoAdjustState::FIND_TOUCH_START:
             // 设置当前灵敏度并开始等待稳定
-            setSensitivity(auto_adjust_context_.device_addr, auto_adjust_context_.channel, 
+            setSensitivity(auto_adjust_context_.device_id_mask, auto_adjust_context_.channel, 
                           auto_adjust_context_.current_sensitivity);
             auto_adjust_context_.state = AutoAdjustState::FIND_TOUCH_WAIT;
             auto_adjust_context_.state_start_time = current_time;
@@ -549,8 +527,8 @@ void InputManager::processAutoAdjustSensitivity() {
         case AutoAdjustState::FIND_TOUCH_WAIT:
             if (elapsed >= auto_adjust_context_.stabilize_duration) {
                 // 检查是否检测到触摸
-                GTX312L_SampleResult result = device->sample_touch_data();
-                if (result.physical_addr.mask & (1 << auto_adjust_context_.channel)) {
+                uint32_t current_touch_state = device->getCurrentTouchState();
+                if (current_touch_state & (1 << auto_adjust_context_.channel)) {
                     // 找到触摸，记录灵敏度
                     auto_adjust_context_.touch_found_sensitivity = auto_adjust_context_.current_sensitivity;
                     auto_adjust_context_.current_sensitivity = auto_adjust_context_.touch_found_sensitivity;
@@ -561,7 +539,7 @@ void InputManager::processAutoAdjustSensitivity() {
                     auto_adjust_context_.current_sensitivity++;
                     if (auto_adjust_context_.current_sensitivity > 255) {
                         // 未找到触摸，恢复原始灵敏度并结束
-                        setSensitivity(auto_adjust_context_.device_addr, auto_adjust_context_.channel, 
+                        setSensitivity(auto_adjust_context_.device_id_mask, auto_adjust_context_.channel, 
                                       auto_adjust_context_.original_sensitivity);
                         auto_adjust_context_.active = false;
                         return;
@@ -574,7 +552,7 @@ void InputManager::processAutoAdjustSensitivity() {
             
         case AutoAdjustState::FIND_RELEASE_START:
             // 设置当前灵敏度并开始等待稳定
-            setSensitivity(auto_adjust_context_.device_addr, auto_adjust_context_.channel, 
+            setSensitivity(auto_adjust_context_.device_id_mask, auto_adjust_context_.channel, 
                           auto_adjust_context_.current_sensitivity);
             auto_adjust_context_.state = AutoAdjustState::FIND_RELEASE_WAIT;
             auto_adjust_context_.state_start_time = current_time;
@@ -583,8 +561,8 @@ void InputManager::processAutoAdjustSensitivity() {
         case AutoAdjustState::FIND_RELEASE_WAIT:
             if (elapsed >= auto_adjust_context_.stabilize_duration) {
                 // 检查是否失去触摸
-                GTX312L_SampleResult result = device->sample_touch_data();
-                if (!(result.physical_addr.mask & (1 << auto_adjust_context_.channel))) {
+                uint32_t current_touch_state = device->getCurrentTouchState();
+                if (!(current_touch_state & (1 << auto_adjust_context_.channel))) {
                     // 失去触摸，记录灵敏度
                     auto_adjust_context_.touch_lost_sensitivity = auto_adjust_context_.current_sensitivity;
                     auto_adjust_context_.state = AutoAdjustState::VERIFY_THRESHOLD;
@@ -595,7 +573,7 @@ void InputManager::processAutoAdjustSensitivity() {
                     if (auto_adjust_context_.current_sensitivity < 1) {
                         // 无法找到释放点，使用中间值
                         uint8_t middle_sensitivity = (auto_adjust_context_.touch_found_sensitivity + 1) / 2;
-                        setSensitivity(auto_adjust_context_.device_addr, auto_adjust_context_.channel, middle_sensitivity);
+                        setSensitivity(auto_adjust_context_.device_id_mask, auto_adjust_context_.channel, middle_sensitivity);
                         auto_adjust_context_.active = false;
                         return;
                     }
@@ -609,7 +587,7 @@ void InputManager::processAutoAdjustSensitivity() {
             // 验证临界点
             {
                 uint8_t critical_sensitivity = auto_adjust_context_.touch_lost_sensitivity + 1;
-                setSensitivity(auto_adjust_context_.device_addr, auto_adjust_context_.channel, critical_sensitivity);
+                setSensitivity(auto_adjust_context_.device_id_mask, auto_adjust_context_.channel, critical_sensitivity);
                 auto_adjust_context_.state = AutoAdjustState::COMPLETE;
                 auto_adjust_context_.state_start_time = current_time;
             }
@@ -618,10 +596,10 @@ void InputManager::processAutoAdjustSensitivity() {
         case AutoAdjustState::COMPLETE:
             if (elapsed >= auto_adjust_context_.stabilize_duration) {
                 // 最终验证
-                GTX312L_SampleResult result = device->sample_touch_data();
+                uint32_t current_touch_state = device->getCurrentTouchState();
                 uint8_t final_sensitivity;
                 
-                if (result.physical_addr.mask & (1 << auto_adjust_context_.channel)) {
+                if (current_touch_state & (1 << auto_adjust_context_.channel)) {
                     // 找到了临界点
                     final_sensitivity = auto_adjust_context_.touch_lost_sensitivity + 1;
                 } else {
@@ -629,7 +607,7 @@ void InputManager::processAutoAdjustSensitivity() {
                     final_sensitivity = (auto_adjust_context_.touch_lost_sensitivity + auto_adjust_context_.touch_found_sensitivity) / 2;
                 }
                 
-                setSensitivity(auto_adjust_context_.device_addr, auto_adjust_context_.channel, final_sensitivity);
+                setSensitivity(auto_adjust_context_.device_id_mask, auto_adjust_context_.channel, final_sensitivity);
                 auto_adjust_context_.active = false;
             }
             break;
@@ -643,168 +621,107 @@ void InputManager::processAutoAdjustSensitivity() {
 
 
 // 设置灵敏度
-void InputManager::setSensitivity(uint16_t device_addr, uint8_t channel, uint8_t sensitivity) {
-    if (channel >= 12) return;
-    
-    GTX312L_DeviceMapping* mapping = findDeviceMapping(device_addr);
-    if (mapping) {
+// 32位地址灵敏度管理
+void InputManager::setSensitivity(uint32_t device_id_mask, uint8_t channel, uint8_t sensitivity) {
+    TouchDeviceMapping* mapping = findTouchDeviceMapping(device_id_mask);
+    if (mapping && channel < mapping->max_channels) {
         mapping->sensitivity[channel] = sensitivity;
         
-        // 应用到实际设备
-        for (auto* device : gtx312l_devices_) {
-            if (device->get_physical_device_address().get_device_mask() == device_addr) {
-                device->set_sensitivity(channel, sensitivity);
-                break;
-            }
+        // 使用新的TouchSensor接口设置通道灵敏度
+        TouchSensor* device = findTouchSensorByIdMask(device_id_mask);
+        if (device) {
+            // 将内部灵敏度值转换为0-99范围
+            uint8_t normalized_sensitivity = (sensitivity > 99) ? 99 : sensitivity;
+            device->setChannelSensitivity(channel, normalized_sensitivity);
         }
     }
 }
 
-// 获取灵敏度
-uint8_t InputManager::getSensitivity(uint16_t device_addr, uint8_t channel) {
-    if (channel >= 12) return 15;
-    
-    GTX312L_DeviceMapping* mapping = findDeviceMapping(device_addr);
-    return mapping ? mapping->sensitivity[channel] : 15;
+uint8_t InputManager::getSensitivity(uint32_t device_id_mask, uint8_t channel) {
+    TouchDeviceMapping* mapping = findTouchDeviceMapping(device_id_mask);
+    return (mapping && channel < mapping->max_channels) ? mapping->sensitivity[channel] : 15;
 }
 
-// 通过设备名称设置通道灵敏度
-bool InputManager::set_channel_sensitivity_by_name(const std::string& device_name, uint8_t channel, uint8_t sensitivity) {
-    if (channel >= 12) return false;
-    
-    // 遍历所有设备找到匹配的设备名称
-    for (auto* device : gtx312l_devices_) {
-        if (device && device->get_device_name() == device_name) {
-            uint16_t device_addr = device->get_physical_device_address().get_device_mask();
-            setSensitivity(device_addr, channel, sensitivity);
+bool InputManager::setSensitivityByDeviceName(const std::string& device_name, uint8_t channel, uint8_t sensitivity) {
+    // 通过设备名称设置灵敏度
+    for (auto* device : touch_sensor_devices_) {
+        if (device && device->getDeviceName() == device_name) {
+            uint32_t device_id_mask = device->getModuleIdMask();
+            setSensitivity(device_id_mask, channel, sensitivity);
             return true;
         }
     }
     return false;
 }
 
+// 16位地址兼容性方法已移除 - 统一使用32位地址处理
+
+// 16位地址兼容性方法已移除 - 统一使用32位地址处理
+// 使用setSensitivityByDeviceName替代set_channel_sensitivity_by_name
+
 // 设置Serial映射
-void InputManager::setSerialMapping(uint16_t device_addr, uint8_t channel, Mai2_TouchArea area) {
-    if (channel >= 12) return;
-    
-    GTX312L_DeviceMapping* mapping = findDeviceMapping(device_addr);
-    if (mapping) {
+// 32位地址映射管理
+void InputManager::setSerialMapping(uint32_t device_id_mask, uint8_t channel, Mai2_TouchArea area) {
+    TouchDeviceMapping* mapping = findTouchDeviceMapping(device_id_mask);
+    if (mapping && channel < mapping->max_channels) {
         mapping->serial_area[channel] = area;
         updateChannelStatesAfterBinding();
     }
 }
 
-// 设置HID映射
-void InputManager::setHIDMapping(uint16_t device_addr, uint8_t channel, float x, float y) {
-    if (channel >= 12) return;
-    
-    GTX312L_DeviceMapping* mapping = findDeviceMapping(device_addr);
-    if (mapping) {
-        mapping->hid_area[channel] = TouchAxis(x, y);
+void InputManager::setHIDMapping(uint32_t device_id_mask, uint8_t channel, float x, float y) {
+    TouchDeviceMapping* mapping = findTouchDeviceMapping(device_id_mask);
+    if (mapping && channel < mapping->max_channels) {
+        mapping->hid_area[channel] = {x, y};
         updateChannelStatesAfterBinding();
     }
 }
 
-// 获取Serial映射
-Mai2_TouchArea InputManager::getSerialMapping(uint16_t device_addr, uint8_t channel) {
-    if (channel >= 12) return MAI2_NO_USED;
-    
-    GTX312L_DeviceMapping* mapping = findDeviceMapping(device_addr);
-    return mapping ? mapping->serial_area[channel] : MAI2_NO_USED;
+Mai2_TouchArea InputManager::getSerialMapping(uint32_t device_id_mask, uint8_t channel) {
+    TouchDeviceMapping* mapping = findTouchDeviceMapping(device_id_mask);
+    return (mapping && channel < mapping->max_channels) ? mapping->serial_area[channel] : MAI2_NO_USED;
 }
 
-// 设置键盘映射
-void InputManager::setTouchKeyboardMapping(uint16_t device_addr, uint8_t channel, HID_KeyCode key) {
-    if (channel >= 12) return;
-    
-    GTX312L_DeviceMapping* mapping = findDeviceMapping(device_addr);
-    if (mapping) {
+TouchAxis InputManager::getHIDMapping(uint32_t device_id_mask, uint8_t channel) {
+    TouchDeviceMapping* mapping = findTouchDeviceMapping(device_id_mask);
+    return (mapping && channel < mapping->max_channels) ? mapping->hid_area[channel] : TouchAxis{0.0f, 0.0f};
+}
+
+void InputManager::setTouchKeyboardMapping(uint32_t device_id_mask, uint8_t channel, HID_KeyCode key) {
+    TouchDeviceMapping* mapping = findTouchDeviceMapping(device_id_mask);
+    if (mapping && channel < mapping->max_channels) {
         mapping->keyboard_keys[channel] = key;
     }
 }
 
-// 获取触摸键盘映射
-HID_KeyCode InputManager::getTouchKeyboardMapping(uint16_t device_addr, uint8_t channel) {
-    if (channel >= 12) return HID_KeyCode::KEY_NONE;
-    
-    GTX312L_DeviceMapping* mapping = findDeviceMapping(device_addr);
-    return mapping ? mapping->keyboard_keys[channel] : HID_KeyCode::KEY_NONE;
+HID_KeyCode InputManager::getTouchKeyboardMapping(uint32_t device_id_mask, uint8_t channel) {
+    TouchDeviceMapping* mapping = findTouchDeviceMapping(device_id_mask);
+    return (mapping && channel < mapping->max_channels) ? mapping->keyboard_keys[channel] : HID_KeyCode::KEY_NONE;
 }
 
-// 启用所有通道 - 支持TouchSensor统一接口
+// 启用所有通道 - 使用TouchSensor统一接口
 void InputManager::enableAllChannels() {
-    // 优先使用TouchSensor接口
+    // 使用新的TouchSensor接口启用所有通道
     for (auto* device : touch_sensor_devices_) {
         uint32_t supported_channels = device->getSupportedChannelCount();
         
-        // 尝试转换为GTX312L以使用特定接口
-        GTX312L* gtx_device = static_cast<GTX312L*>(device);
-        if (gtx_device) {
-            for (uint8_t ch = 0; ch < supported_channels && ch < 12; ch++) {
-                gtx_device->set_channel_enable(ch, true);
-            }
-        }
-        // 对于其他TouchSensor类型，可以在此添加相应的处理逻辑
-    }
-    
-    // 保持向后兼容性 - 处理未通过TouchSensor接口注册的GTX312L设备
-    for (auto* device : gtx312l_devices_) {
-        // 检查是否已通过TouchSensor接口处理
-        bool already_processed = false;
-        for (auto* ts_device : touch_sensor_devices_) {
-            if (static_cast<TouchSensor*>(device) == ts_device) {
-                already_processed = true;
-                break;
-            }
-        }
-        
-        if (!already_processed) {
-            for (uint8_t ch = 0; ch < 12; ch++) {
-                device->set_channel_enable(ch, true);
-            }
+        for (uint8_t ch = 0; ch < supported_channels; ch++) {
+            device->setChannelEnabled(ch, true);
         }
     }
 }
 
-// 仅启用已映射的通道 - 支持TouchSensor统一接口
+// 仅启用已映射的通道 - 使用TouchSensor统一接口
 void InputManager::enableMappedChannels() {
     InputManager_PrivateConfig* config = inputmanager_get_config_holder();
     InputWorkMode work_mode = getWorkMode();
     
-    // 优先使用TouchSensor接口
-    for (int i = 0; i < config->device_count && i < touch_sensor_devices_.size(); i++) {
+    for (int i = 0; i < INPUTMANAGER_MAX_TOUCH_DEVICES && i < touch_sensor_devices_.size(); i++) {
         auto* device = touch_sensor_devices_[i];
-        auto& mapping = config->device_mappings[i];
+        auto& mapping = config->touch_device_mappings[i];
         uint32_t supported_channels = device->getSupportedChannelCount();
         
-        // 尝试转换为GTX312L以使用特定接口
-         GTX312L* gtx_device = static_cast<GTX312L*>(device);
-         if (gtx_device) {
-            for (uint8_t ch = 0; ch < supported_channels && ch < 12; ch++) {
-                bool has_mapping = false;
-                
-                if (work_mode == InputWorkMode::SERIAL_MODE) {
-                    has_mapping = (mapping.serial_area[ch] != MAI2_NO_USED);
-                } else if (work_mode == InputWorkMode::HID_MODE) {
-                    has_mapping = (mapping.hid_area[ch].x != 0.0f || mapping.hid_area[ch].y != 0.0f);
-                }
-                
-                // 只有在CH_available中启用且有映射的通道才启用
-                bool ch_available = (mapping.CH_available.value & (1 << ch)) != 0;
-                bool enabled = ch_available && has_mapping;
-                gtx_device->set_channel_enable(ch, enabled);
-            }
-        }
-        // 对于其他TouchSensor类型，可以在此添加相应的处理逻辑
-    }
-    
-    // 保持向后兼容性 - 处理未通过TouchSensor接口注册的GTX312L设备
-    int touch_sensor_count = touch_sensor_devices_.size();
-    for (int i = touch_sensor_count; i < config->device_count && i < gtx312l_devices_.size(); i++) {
-        auto* device = gtx312l_devices_[i];
-        auto& mapping = config->device_mappings[i];
-        
-        for (uint8_t ch = 0; ch < 12; ch++) {
+        for (uint8_t ch = 0; ch < supported_channels && ch < mapping.max_channels; ch++) {
             bool has_mapping = false;
             
             if (work_mode == InputWorkMode::SERIAL_MODE) {
@@ -813,10 +730,12 @@ void InputManager::enableMappedChannels() {
                 has_mapping = (mapping.hid_area[ch].x != 0.0f || mapping.hid_area[ch].y != 0.0f);
             }
             
-            // 只有在CH_available中启用且有映射的通道才启用
-            bool ch_available = (mapping.CH_available.value & (1 << ch)) != 0;
+            // 只有在enabled_channels_mask中启用且有映射的通道才启用
+            bool ch_available = (mapping.enabled_channels_mask & (1 << ch)) != 0;
             bool enabled = ch_available && has_mapping;
-            device->set_channel_enable(ch, enabled);
+            
+            // 使用新的TouchSensor接口设置通道使能状态
+            device->setChannelEnabled(ch, enabled);
         }
     }
 }
@@ -825,10 +744,10 @@ void InputManager::updateChannelStatesAfterBinding() {
     InputManager_PrivateConfig* config = inputmanager_get_config_holder();
     InputWorkMode work_mode = getWorkMode();
     
-    for (int i = 0; i < config->device_count; i++) {
-        auto& mapping = config->device_mappings[i];
+    for (int i = 0; i < INPUTMANAGER_MAX_TOUCH_DEVICES; i++) {
+        auto& mapping = config->touch_device_mappings[i];
         
-        for (uint8_t ch = 0; ch < 12; ch++) {
+        for (uint8_t ch = 0; ch < mapping.max_channels; ch++) {
             bool has_mapping = false;
             
             if (work_mode == InputWorkMode::SERIAL_MODE) {
@@ -837,9 +756,9 @@ void InputManager::updateChannelStatesAfterBinding() {
                 has_mapping = (mapping.hid_area[ch].x != 0.0f || mapping.hid_area[ch].y != 0.0f);
             }
             
-            // 如果没有映射，自动关闭CH_available中的对应通道
+            // 如果没有映射，自动关闭enabled_channels_mask中的对应通道
             if (!has_mapping) {
-                mapping.CH_available.value &= ~(1 << ch);  // 清除对应位
+                mapping.enabled_channels_mask &= ~(1 << ch);  // 清除对应位
             }
         }
     }
@@ -850,45 +769,30 @@ void InputManager::updateChannelStatesAfterBinding() {
 
 // 更新触摸状态
 inline void InputManager::updateTouchStates() {
-    InputManager_PrivateConfig* config = inputmanager_get_config_holder();
     millis_t current_time = to_ms_since_boot(get_absolute_time());
     
     // 使用TouchSensor统一接口更新触摸状态
-    for (int i = 0; i < config->device_count && i < touch_sensor_devices_.size(); i++) {
+    for (int i = 0; i < touch_sensor_devices_.size(); i++) {
         auto* device = touch_sensor_devices_[i];
         
-        // 保存之前的状态
-        previous_touch_states_[i] = current_touch_states_[i];
+        // 保存之前的触摸状态到结构内部
+        touch_device_states_[i].previous_touch_mask = touch_device_states_[i].current_touch_mask;
         
         // 使用TouchSensor统一接口获取触摸状态
         uint32_t touch_state = device->getCurrentTouchState();
-        
-        // 构造GTX312L_SampleResult结构体以保持兼容性
-        current_touch_states_[i].physical_addr.mask = touch_state & 0xFFFF;
-        current_touch_states_[i].timestamp = current_time;
+        touch_device_states_[i].device_id_mask = device->getModuleIdMask();
+        touch_device_states_[i].current_touch_mask = touch_state;
+        touch_device_states_[i].timestamp_us = current_time;
         
         // 增加采样计数器
         incrementSampleCounter();
     }
     
-    // 如果还有GTX312L设备未通过TouchSensor接口注册，保持兼容性
-    int touch_sensor_count = touch_sensor_devices_.size();
-    for (int i = touch_sensor_count; i < config->device_count && i < gtx312l_devices_.size(); i++) {
-        auto* device = gtx312l_devices_[i];
-        
-        // 保存之前的状态
-        previous_touch_states_[i] = current_touch_states_[i];
-        
-        // 获取当前触摸状态，直接存储GTX312L_SampleResult
-        current_touch_states_[i] = device->sample_touch_data();
-        
-        // 增加采样计数器
-        incrementSampleCounter();
-        current_touch_states_[i].timestamp = current_time;
-    }
+    // 存储当前Serial状态到延迟缓冲区
+    storeDelayedSerialState();
 }
 
-// 处理Serial模式 - 高性能优化版本
+// 处理Serial模式 - 使用32位TouchSensor接口的统一实现
 inline void InputManager::processSerialMode() {
     Mai2Serial_TouchState touch_state;
     touch_state.parts.state1 = 0;
@@ -898,35 +802,28 @@ inline void InputManager::processSerialMode() {
     static KeyboardBitmap touch_keyboard_bitmap;
     touch_keyboard_bitmap.clear();
     
-    // 预计算设备映射指针数组，避免重复查找
-    GTX312L_DeviceMapping* device_mappings[8];
-    const int device_count = config_->device_count;
+    // 预计算32位触摸设备映射指针数组，避免重复查找
+    TouchDeviceMapping* touch_mappings[8];
+    const int touch_device_count = config_->device_count;
     
-    // 预处理设备映射，建立快速查找表
-    for (int i = 0; i < device_count; i++) {
-        const uint16_t device_addr = current_touch_states_[i].physical_addr.mask & 0xF000;
-        device_mappings[i] = nullptr;
-        
-        const GTX312L_DeviceMapping* mapping_ptr = config_->device_mappings;
-        for (int j = 0; j < device_count; j++, mapping_ptr++) {
-            if ((mapping_ptr->device_addr & 0xF000) == device_addr) {
-                device_mappings[i] = const_cast<GTX312L_DeviceMapping*>(mapping_ptr);
-                break;
-            }
-        }
+    // 预处理32位触摸设备映射，建立快速查找表
+    for (int i = 0; i < touch_device_count; i++) {
+        const uint32_t device_id_mask = touch_device_states_[i].device_id_mask;
+        touch_mappings[i] = findTouchDeviceMapping(device_id_mask);
     }
     
-    // 主处理循环 - 优化版本
-    for (int i = 0; i < device_count; i++) {
-        const GTX312L_DeviceMapping* mapping = device_mappings[i];
+    // 主处理循环 - 32位TouchSensor接口版本
+    for (int i = 0; i < touch_device_count; i++) {
+        const TouchDeviceMapping* mapping = touch_mappings[i];
         if (!mapping) continue;
         
-        const uint16_t current_mask = current_touch_states_[i].physical_addr.mask;
+        const uint32_t current_touch_mask = touch_device_states_[i].current_touch_mask;
+        const uint8_t max_channels = mapping->max_channels;
         
-        // 使用位运算批量处理12个通道
-        for (uint8_t ch = 0; ch < 12; ch++) {
-            const uint16_t ch_mask = (1 << ch);
-            const bool touched = (current_mask & ch_mask) != 0;
+        // 处理所有可用通道
+        for (uint8_t ch = 0; ch < max_channels && ch < 32; ch++) {
+            const uint32_t ch_mask = (1UL << ch);
+            const bool touched = (current_touch_mask & ch_mask) != 0;
             
             // 处理Serial触摸映射 - 使用位运算优化
             const Mai2_TouchArea area = mapping->serial_area[ch];
@@ -972,46 +869,41 @@ inline void InputManager::processSerialMode() {
     }
 }
 
-// 发送HID触摸数据
+// 发送HID触摸数据 - 使用32位TouchSensor接口的统一实现
 inline void InputManager::sendHIDTouchData() {
     InputManager_PrivateConfig* config = inputmanager_get_config_holder();
     
-    // 预计算设备映射指针数组，避免重复查找
-    GTX312L_DeviceMapping* device_mappings[8] = {nullptr};
-    const int device_count = config->device_count;
+    // 预计算32位触摸设备映射指针数组，避免重复查找
+    TouchDeviceMapping* touch_mappings[8] = {nullptr};
+    const int touch_device_count = config->device_count;
     
-    // 预处理设备映射，建立快速查找表
-    for (int i = 0; i < device_count; i++) {
-        uint16_t device_addr = current_touch_states_[i].physical_addr.mask & 0xF000;
-        
-        // 查找对应的映射配置
-        GTX312L_DeviceMapping* mapping_ptr = config->device_mappings;
-        for (int j = 0; j < device_count; j++, mapping_ptr++) {
-            if ((mapping_ptr->device_addr & 0xF000) == device_addr) {
-                device_mappings[i] = mapping_ptr;
-                break;
-            }
-        }
+    // 预处理32位触摸设备映射，建立快速查找表
+    for (int i = 0; i < touch_device_count; i++) {
+        const uint32_t device_id_mask = touch_device_states_[i].device_id_mask;
+        touch_mappings[i] = findTouchDeviceMapping(device_id_mask);
     }
     
-    // 处理所有设备的触摸数据
-    for (int i = 0; i < device_count; i++) {
-        GTX312L_DeviceMapping* mapping = device_mappings[i];
+    // 处理所有32位触摸设备的HID数据
+    for (int i = 0; i < touch_device_count; i++) {
+        const TouchDeviceMapping* mapping = touch_mappings[i];
         if (!mapping) continue;
         
-        uint16_t current_mask = current_touch_states_[i].physical_addr.mask;
-        if (!current_mask) continue; // 无触摸数据
+        const uint32_t current_touch_mask = touch_device_states_[i].current_touch_mask;
+        if (!current_touch_mask) continue; // 无触摸数据
         
-        // 使用位运算快速处理所有通道
-        TouchAxis* hid_area_ptr = mapping->hid_area;
-        for (uint8_t ch = 0; ch < 12; ch++, hid_area_ptr++) {
-            if (!(current_mask & (1 << ch))) continue;
+        const uint8_t max_channels = mapping->max_channels;
+        
+        // 使用位运算快速处理所有可用通道
+        for (uint8_t ch = 0; ch < max_channels && ch < 32; ch++) {
+            const uint32_t ch_mask = (1UL << ch);
+            if (!(current_touch_mask & ch_mask)) continue;
             
-            // 检查是否有有效映射
-            if (hid_area_ptr->x == 0.0f && hid_area_ptr->y == 0.0f) continue;
+            // 检查是否有有效HID映射
+            const TouchAxis& hid_area = mapping->hid_area[ch];
+            if (hid_area.x == 0.0f && hid_area.y == 0.0f) continue;
             
-            // 计算唯一的触摸点ID：设备索引(4位) + 通道号(4位)
-            uint8_t unique_contact_id = (i << 4) | ch;
+            // 计算唯一的触摸点ID：设备索引(4位) + 通道号(5位)
+            uint8_t unique_contact_id = (i << 5) | ch;
             
             // 创建触摸点报告
             HID_TouchPoint touch_point;
@@ -1019,8 +911,8 @@ inline void InputManager::sendHIDTouchData() {
             touch_point.id = unique_contact_id;
             
             // 转换坐标到HID范围 (0-65535)
-            touch_point.x = (uint16_t)(hid_area_ptr->x * 65535.0f);
-            touch_point.y = (uint16_t)(hid_area_ptr->y * 65535.0f);
+            touch_point.x = (uint16_t)(hid_area.x * 65535.0f);
+            touch_point.y = (uint16_t)(hid_area.y * 65535.0f);
             
             // 发送触摸点
             if (hid_) {
@@ -1030,24 +922,35 @@ inline void InputManager::sendHIDTouchData() {
     }
 }
 
-// 查找设备索引
-int InputManager::findDeviceIndex(uint16_t device_addr) {
+// 16位地址兼容性方法已移除，统一使用32位地址处理方法
+
+// 32位地址处理辅助方法
+int InputManager::findTouchDeviceIndex(uint32_t device_id_mask) {
     InputManager_PrivateConfig* config = inputmanager_get_config_holder();
-    
     for (int i = 0; i < config->device_count; i++) {
-        if (config->device_mappings[i].device_addr == device_addr) {
+        if (config->touch_device_mappings[i].device_id_mask == device_id_mask) {
             return i;
         }
     }
     return -1;
 }
 
-// 查找设备映射
-GTX312L_DeviceMapping* InputManager::findDeviceMapping(uint16_t device_addr) {
+TouchDeviceMapping* InputManager::findTouchDeviceMapping(uint32_t device_id_mask) {
     InputManager_PrivateConfig* config = inputmanager_get_config_holder();
-    int index = findDeviceIndex(device_addr);
-    return (index >= 0) ? &config->device_mappings[index] : nullptr;
+    int index = findTouchDeviceIndex(device_id_mask);
+    return (index >= 0) ? &config->touch_device_mappings[index] : nullptr;
 }
+
+TouchSensor* InputManager::findTouchSensorByIdMask(uint32_t device_id_mask) {
+    for (auto* device : touch_sensor_devices_) {
+        if (device && device->getModuleIdMask() == device_id_mask) {
+            return device;
+        }
+    }
+    return nullptr;
+}
+
+// 地址转换方法已移除，统一使用TouchSensor接口
 
 // 静态配置变量
 static InputManager_PrivateConfig static_config_;
@@ -1058,9 +961,10 @@ void inputmanager_register_default_configs(config_map_t& default_map) {
     default_map[INPUTMANAGER_WORK_MODE] = ConfigValue((uint8_t)0);  // 默认工作模式
     default_map[INPUTMANAGER_TOUCH_KEYBOARD_ENABLED] = ConfigValue(true);  // 默认启用触摸键盘
     default_map[INPUTMANAGER_DEVICE_COUNT] = ConfigValue((uint8_t)0);  // 默认设备数量
+    default_map[INPUTMANAGER_TOUCH_RESPONSE_DELAY] = ConfigValue((uint8_t)0);  // 默认触摸响应延迟
     
     // 二进制数据配置使用空字符串作为默认值
-    default_map[INPUTMANAGER_GTX312L_DEVICES] = ConfigValue(std::string(""));
+    // GTX312L配置项已移除 - 统一使用TouchDeviceMapping
     default_map[INPUTMANAGER_PHYSICAL_KEYBOARDS] = ConfigValue(std::string(""));
     default_map[INPUTMANAGER_LOGICAL_MAPPINGS] = ConfigValue(std::string(""));
 }
@@ -1089,12 +993,15 @@ bool inputmanager_load_config_from_manager() {
     // 加载设备数量
     static_config_.device_count = config_mgr->get_uint8(INPUTMANAGER_DEVICE_COUNT);
     
-    // 加载GTX312L设备映射数据
-    std::string devices_str = config_mgr->get_string(INPUTMANAGER_GTX312L_DEVICES);
+    // 加载触摸响应延迟
+    static_config_.touch_response_delay_ms = config_mgr->get_uint8(INPUTMANAGER_TOUCH_RESPONSE_DELAY);
+    
+    // 加载TouchDevice设备映射数据
+    std::string devices_str = config_mgr->get_string(INPUTMANAGER_TOUCH_DEVICES);
     if (!devices_str.empty()) {
-        size_t expected_size = sizeof(GTX312L_DeviceMapping) * static_config_.device_count;
+        size_t expected_size = sizeof(TouchDeviceMapping) * static_config_.device_count;
         if (devices_str.size() >= expected_size) {
-            std::memcpy(static_config_.device_mappings, devices_str.data(), expected_size);
+            std::memcpy(static_config_.touch_device_mappings, devices_str.data(), expected_size);
         }
     }
     
@@ -1130,18 +1037,18 @@ void InputManager::get_all_device_status(TouchDeviceStatus data[8], int& device_
     
     for (int i = 0; i < device_count && i < 8; i++) {
         // 复制设备映射配置
-        data[i].device = config->device_mappings[i];
+        data[i].touch_device = config->touch_device_mappings[i];
         
         // 获取当前触摸状态
-        data[i].touch_states = previous_touch_states_[i].physical_addr.mask;
+        data[i].touch_states_32bit = touch_device_states_[i].current_touch_mask;
         
         // 设置连接状态（假设所有配置的设备都已连接）
         data[i].is_connected = true;
         
-        // 生成设备名称（16位地址转换为HEX）
-        uint16_t device_addr = data[i].device.device_addr;
-        char hex_name[8];
-        snprintf(hex_name, sizeof(hex_name), "%04X", device_addr);
+        // 生成设备名称（32位ID掩码转换为HEX）
+        uint32_t device_id_mask = data[i].touch_device.device_id_mask;
+        char hex_name[12];
+        snprintf(hex_name, sizeof(hex_name), "%08lX", device_id_mask);
         data[i].device_name = std::string(hex_name);
     }
 }
@@ -1170,12 +1077,15 @@ bool inputmanager_write_config_to_manager(const InputManager_PrivateConfig& conf
     // 写入设备数量
     config_mgr->set_uint8(INPUTMANAGER_DEVICE_COUNT, config.device_count);
     
-    // 写入GTX312L设备映射数据
+    // 写入触摸响应延迟
+    config_mgr->set_uint8(INPUTMANAGER_TOUCH_RESPONSE_DELAY, config.touch_response_delay_ms);
+    
+    // 写入TouchDevice设备映射数据
     if (config.device_count > 0) {
-        size_t devices_size = sizeof(GTX312L_DeviceMapping) * config.device_count;
+        size_t devices_size = sizeof(TouchDeviceMapping) * config.device_count;
         std::string devices_data(devices_size, '\0');
-        std::memcpy(&devices_data[0], config.device_mappings, devices_size);
-        config_mgr->set_string(INPUTMANAGER_GTX312L_DEVICES, devices_data);
+        std::memcpy(&devices_data[0], config.touch_device_mappings, devices_size);
+        config_mgr->set_string(INPUTMANAGER_TOUCH_DEVICES, devices_data);
     }
     
     // 写入物理键盘映射数据
@@ -1284,27 +1194,29 @@ void InputManager::processSerialBinding() {
             break;
             
         case BindingState::SERIAL_BINDING_WAIT_TOUCH:
-            // 检测触摸输入
-            for (size_t dev_idx = 0; dev_idx < gtx312l_devices_.size(); dev_idx++) {
-                uint16_t current_state = current_touch_states_[dev_idx].physical_addr.mask;
-                uint16_t previous_state = previous_touch_states_[dev_idx].physical_addr.mask;
-                uint16_t new_touches = current_state & ~previous_state;
+            // 检测触摸输入 - 使用32位TouchSensor接口
+            for (int dev_idx = 0; dev_idx < config_->device_count; dev_idx++) {
+                const uint32_t current_state = touch_device_states_[dev_idx].current_touch_mask;
+                const uint32_t previous_state = touch_device_states_[dev_idx].previous_touch_mask;
+                const uint32_t new_touches = current_state & ~previous_state;
                 
                 if (new_touches != 0) {
+                    const uint32_t device_id_mask = touch_device_states_[dev_idx].device_id_mask;
+                    TouchDeviceMapping* mapping = findTouchDeviceMapping(device_id_mask);
+                    if (!mapping) continue;
+                    
+                    const uint8_t max_channels = mapping->max_channels;
+                    
                     // 找到第一个新触摸的通道
-                    for (uint8_t ch = 0; ch < 12; ch++) {
-                        if (new_touches & (1 << ch)) {
+                    for (uint8_t ch = 0; ch < max_channels && ch < 32; ch++) {
+                        const uint32_t ch_mask = (1UL << ch);
+                        if (new_touches & ch_mask) {
                             // 绑定当前区域到这个通道
                             Mai2_TouchArea current_area = getSerialBindingArea(current_binding_index_);
-                            uint16_t device_addr = gtx312l_devices_[dev_idx]->get_physical_device_address().get_device_mask();
-                            setSerialMapping(device_addr, ch, current_area);
+                            setSerialMapping(device_id_mask, ch, current_area);
                             
                             // 禁用这个通道以避免重复触发
-                            GTX312L_DeviceMapping* mapping = findDeviceMapping(device_addr);
-                            if (mapping) {
-                                mapping->CH_available.value &= ~(1 << ch);  // 清除对应位
-                                gtx312l_devices_[dev_idx]->set_channel_enable(ch, false);
-                            }
+                            mapping->enabled_channels_mask &= ~ch_mask;  // 清除对应位
                             
                             // 进入下一个区域绑定
                             current_binding_index_++;
@@ -1361,25 +1273,29 @@ void InputManager::processAutoSerialBinding() {
             {
                 bool touch_detected = false;
                 
-                // 检查所有设备的触摸状态
-                for (size_t dev_idx = 0; dev_idx < gtx312l_devices_.size(); dev_idx++) {
-                    uint16_t current_state = current_touch_states_[dev_idx].physical_addr.mask;
-                    uint16_t previous_state = previous_touch_states_[dev_idx].physical_addr.mask;
-                    uint16_t new_touches = current_state & ~previous_state;
+                // 检查所有设备的触摸状态 - 使用32位TouchSensor接口
+                for (int dev_idx = 0; dev_idx < config_->device_count; dev_idx++) {
+                    const uint32_t current_state = touch_device_states_[dev_idx].current_touch_mask;
+                    const uint32_t previous_state = touch_device_states_[dev_idx].previous_touch_mask;
+                    const uint32_t new_touches = current_state & ~previous_state;
                     
                     if (new_touches != 0) {
+                        const uint32_t device_id_mask = touch_device_states_[dev_idx].device_id_mask;
+                        TouchDeviceMapping* mapping = findTouchDeviceMapping(device_id_mask);
+                        if (!mapping) continue;
+                        
+                        const uint8_t max_channels = mapping->max_channels;
+                        
                         // 找到第一个新触摸的通道
-                        for (uint8_t ch = 0; ch < 12; ch++) {
-                            if (new_touches & (1 << ch)) {
-                                // 获取设备地址
-                                uint16_t device_addr = gtx312l_devices_[dev_idx]->get_physical_device_address().get_device_mask();
-                                
+                        for (uint8_t ch = 0; ch < max_channels && ch < 32; ch++) {
+                            const uint32_t ch_mask = (1UL << ch);
+                            if (new_touches & ch_mask) {
                                 // 检查这个通道是否已经被绑定
-                                Mai2_TouchArea existing_area = getSerialMapping(device_addr, ch);
+                                Mai2_TouchArea existing_area = getSerialMapping(device_id_mask, ch);
                                 if (existing_area == MAI2_NO_USED && current_binding_index_ < 34) {
                                     // 自动分配下一个可用的Mai2区域
                                     Mai2_TouchArea target_area = getSerialBindingArea(current_binding_index_);
-                                    setSerialMapping(device_addr, ch, target_area);
+                                    setSerialMapping(device_id_mask, ch, target_area);
                                     
                                     current_binding_index_++;
                                     touch_detected = true;
@@ -1470,17 +1386,24 @@ void InputManager::processHIDBinding() {
                 return;
             }
             
-            // 检测触摸输入
-            for (size_t dev_idx = 0; dev_idx < gtx312l_devices_.size(); dev_idx++) {
-                uint16_t current_state = current_touch_states_[dev_idx].physical_addr.mask;
-                uint16_t previous_state = previous_touch_states_[dev_idx].physical_addr.mask;
-                uint16_t new_touches = current_state & ~previous_state;
+            // 检测触摸输入 - 使用32位TouchSensor接口
+            for (int dev_idx = 0; dev_idx < config_->device_count; dev_idx++) {
+                const uint32_t current_state = touch_device_states_[dev_idx].current_touch_mask;
+                const uint32_t previous_state = touch_device_states_[dev_idx].previous_touch_mask;
+                const uint32_t new_touches = current_state & ~previous_state;
                 
                 if (new_touches != 0) {
+                    const uint32_t device_id_mask = touch_device_states_[dev_idx].device_id_mask;
+                    TouchDeviceMapping* mapping = findTouchDeviceMapping(device_id_mask);
+                    if (!mapping) continue;
+                    
+                    const uint8_t max_channels = mapping->max_channels;
+                    
                     // 找到第一个新触摸的通道
-                    for (uint8_t ch = 0; ch < 12; ch++) {
-                        if (new_touches & (1 << ch)) {
-                            hid_binding_device_addr_ = gtx312l_devices_[dev_idx]->get_physical_device_address().get_device_mask();
+                    for (uint8_t ch = 0; ch < max_channels && ch < 32; ch++) {
+                        const uint32_t ch_mask = (1UL << ch);
+                        if (new_touches & ch_mask) {
+                            hid_binding_device_addr_ = device_id_mask;
                             hid_binding_channel_ = ch;
                             hid_binding_x_ = 0.5f;  // 默认中心坐标
                             hid_binding_y_ = 0.5f;
@@ -1488,7 +1411,7 @@ void InputManager::processHIDBinding() {
                             
                             if (binding_callback_) {
                                 char message[128];
-                                snprintf(message, sizeof(message), "检测到触摸点位，设备:0x%04X 通道:%d，请在屏幕上设置X Y坐标", 
+                                snprintf(message, sizeof(message), "检测到触摸点位，设备:0x%08lX 通道:%d，请在屏幕上设置X Y坐标",
                                         hid_binding_device_addr_, ch);
                                 binding_callback_(false, message);
                             }
@@ -1553,7 +1476,7 @@ void InputManager::backupChannelStates() {
     InputManager_PrivateConfig* config = inputmanager_get_config_holder();
     for (uint8_t i = 0; i < config->device_count && i < 8; i++) {
         for (uint8_t ch = 0; ch < 12; ch++) {
-            original_channels_backup_[i][ch] = (config->device_mappings[i].CH_available.value & (1 << ch)) ? 1 : 0;
+            original_channels_backup_[i][ch] = (config->touch_device_mappings[i].enabled_channels_mask & (1 << ch)) ? 1 : 0;
         }
     }
 }
@@ -1561,18 +1484,21 @@ void InputManager::backupChannelStates() {
 // 恢复通道状态
 void InputManager::restoreChannelStates() {
     InputManager_PrivateConfig* config = inputmanager_get_config_holder();
-    for (uint8_t i = 0; i < config->device_count && i < 8; i++) {
-        for (uint8_t ch = 0; ch < 12; ch++) {
-            if (original_channels_backup_[i][ch] != 0) {
-                config->device_mappings[i].CH_available.value |= (1 << ch);  // 设置位
+    for (uint8_t i = 0; i < config->device_count && i < 8 && i < touch_sensor_devices_.size(); i++) {
+        auto* device = touch_sensor_devices_[i];
+        uint32_t supported_channels = device->getSupportedChannelCount();
+        
+        for (uint8_t ch = 0; ch < supported_channels && ch < 12; ch++) {
+            bool enabled = (original_channels_backup_[i][ch] != 0);
+            
+            if (enabled) {
+                config->touch_device_mappings[i].enabled_channels_mask |= (1 << ch);  // 设置位
             } else {
-                config->device_mappings[i].CH_available.value &= ~(1 << ch); // 清除位
+                config->touch_device_mappings[i].enabled_channels_mask &= ~(1 << ch); // 清除位
             }
             
-            // 更新硬件设备状态
-            if (i < gtx312l_devices_.size()) {
-                gtx312l_devices_[i]->set_channel_enable(ch, original_channels_backup_[i][ch]);
-            }
+            // 使用新的TouchSensor接口恢复通道使能状态
+            device->setChannelEnabled(ch, enabled);
         }
     }
 }
@@ -1709,12 +1635,12 @@ void InputManager::processGPIOKeyboard() {
 }
 
 // 获取触摸IC采样速率
-uint8_t InputManager::getTouchSampleRate(uint16_t device_addr) {
+uint8_t InputManager::getTouchSampleRate(uint32_t device_id_mask) {
     // 返回实际测量的采样频率
     return static_cast<uint8_t>(current_sample_rate_);
 }
 
-void InputManager::incrementSampleCounter() {
+inline void InputManager::incrementSampleCounter() {
     sample_counter_++;
     
     // 检查是否需要重置计数器（每秒一次）
@@ -1755,4 +1681,169 @@ void InputManager::clearAllLogicalKeyMappings() {
 // 获取逻辑按键映射列表
 const std::vector<LogicalKeyMapping>& InputManager::getLogicalKeyMappings() const {
     return config_->logical_key_mappings;
+}
+
+// 触摸响应延迟管理实现
+void InputManager::setTouchResponseDelay(uint8_t delay_ms) {
+    if (delay_ms > 100) delay_ms = 100;  // 限制最大延迟为100ms
+    config_->touch_response_delay_ms = delay_ms;
+    
+    // 清空延迟缓冲区
+    delay_buffer_head_ = 0;
+    delay_buffer_count_ = 0;
+    
+    // 持久化保存配置
+    inputmanager_write_config_to_manager(*config_);
+}
+
+uint8_t InputManager::getTouchResponseDelay() const {
+    return config_->touch_response_delay_ms;
+}
+
+inline void InputManager::storeDelayedSerialState() {
+    // 获取当前时间戳（微秒）
+    const uint32_t current_time_us = time_us_32();
+    
+    // 计算当前Serial状态
+    Mai2Serial_TouchState serial_state;
+    serial_state.parts.state1 = 0;
+    serial_state.parts.state2 = 0;
+    
+    const int device_count = config_->device_count;
+    
+    // 计算Serial触摸状态
+    for (int i = 0; i < device_count; i++) {
+        const uint32_t device_id_mask = touch_device_states_[i].device_id_mask;
+        TouchDeviceMapping* mapping = findTouchDeviceMapping(device_id_mask);
+        if (!mapping) continue;
+        
+        const uint32_t current_mask = touch_device_states_[i].current_touch_mask;
+        
+        // 处理所有支持的通道
+        for (uint8_t ch = 0; ch < mapping->max_channels; ch++) {
+            const uint32_t ch_mask = (1UL << ch);
+            const bool touched = (current_mask & ch_mask) != 0;
+            
+            // 处理Serial触摸映射
+            const Mai2_TouchArea area = mapping->serial_area[ch];
+            if (area != MAI2_NO_USED && area >= 1 && area <= 34) {
+                const uint8_t bit_index = area - 1;
+                const uint32_t bit_mask = (1UL << (bit_index & 31));
+                
+                if (bit_index < 32) {
+                    serial_state.parts.state1 = touched ? 
+                        (serial_state.parts.state1 | bit_mask) : 
+                        (serial_state.parts.state1 & ~bit_mask);
+                } else {
+                    serial_state.parts.state2 = touched ? 
+                        (serial_state.parts.state2 | bit_mask) : 
+                        (serial_state.parts.state2 & ~bit_mask);
+                }
+            }
+        }
+    }
+    
+    // 存储计算好的Serial状态到缓冲区
+    DelayedSerialState& current_entry = delay_buffer_[delay_buffer_head_];
+    current_entry.timestamp_us = current_time_us;
+    current_entry.serial_touch_state = serial_state;
+    
+    // 更新缓冲区指针
+    delay_buffer_head_ = (delay_buffer_head_ + 1) % DELAY_BUFFER_SIZE;
+    if (delay_buffer_count_ < DELAY_BUFFER_SIZE) {
+        delay_buffer_count_++;
+    }
+}
+
+bool InputManager::getDelayedSerialState(Mai2Serial_TouchState& delayed_state) {
+    if (delay_buffer_count_ == 0 || config_->touch_response_delay_ms == 0) {
+        // 无延迟或缓冲区为空，计算并返回当前Serial状态
+        Mai2Serial_TouchState current_serial_state;
+        current_serial_state.parts.state1 = 0;
+        current_serial_state.parts.state2 = 0;
+        
+        const int device_count = config_->device_count;
+        
+        // 计算当前Serial触摸状态
+        for (int i = 0; i < device_count; i++) {
+            const uint32_t device_id_mask = touch_device_states_[i].device_id_mask;
+            TouchDeviceMapping* mapping = findTouchDeviceMapping(device_id_mask);
+            if (!mapping) continue;
+            
+            const uint32_t current_mask = touch_device_states_[i].current_touch_mask;
+            
+            // 处理所有支持的通道
+            for (uint8_t ch = 0; ch < mapping->max_channels; ch++) {
+                const uint32_t ch_mask = (1UL << ch);
+                const bool touched = (current_mask & ch_mask) != 0;
+                
+                // 处理Serial触摸映射
+                const Mai2_TouchArea area = mapping->serial_area[ch];
+                if (area != MAI2_NO_USED && area >= 1 && area <= 34) {
+                    const uint8_t bit_index = area - 1;
+                    const uint32_t bit_mask = (1UL << (bit_index & 31));
+                    
+                    if (bit_index < 32) {
+                        current_serial_state.parts.state1 = touched ? 
+                            (current_serial_state.parts.state1 | bit_mask) : 
+                            (current_serial_state.parts.state1 & ~bit_mask);
+                    } else {
+                        current_serial_state.parts.state2 = touched ? 
+                            (current_serial_state.parts.state2 | bit_mask) : 
+                            (current_serial_state.parts.state2 & ~bit_mask);
+                    }
+                }
+            }
+        }
+        
+        delayed_state = current_serial_state;
+        return true;
+    }
+    
+    const uint32_t current_time_us = time_us_32();
+    const uint32_t target_delay_us = config_->touch_response_delay_ms * 1000;
+    
+    // 查找最接近目标延迟时间的数据
+    int best_index = -1;
+    uint32_t best_time_diff = UINT32_MAX;
+    
+    for (int i = 0; i < delay_buffer_count_; i++) {
+        const int buffer_index = (delay_buffer_head_ - 1 - i + DELAY_BUFFER_SIZE) % DELAY_BUFFER_SIZE;
+        const DelayedSerialState& entry = delay_buffer_[buffer_index];
+        
+        // 计算时间差（处理时间戳溢出）
+        uint32_t time_diff;
+        if (current_time_us >= entry.timestamp_us) {
+            time_diff = current_time_us - entry.timestamp_us;
+        } else {
+            // 处理时间戳溢出情况
+            time_diff = (UINT32_MAX - entry.timestamp_us) + current_time_us + 1;
+        }
+        
+        // 查找最接近目标延迟的数据
+        if (time_diff >= target_delay_us) {
+            const uint32_t diff_from_target = time_diff - target_delay_us;
+            if (diff_from_target < best_time_diff) {
+                best_time_diff = diff_from_target;
+                best_index = buffer_index;
+            }
+        }
+    }
+    
+    if (best_index >= 0) {
+        // 找到合适的延迟数据
+        const DelayedSerialState& best_entry = delay_buffer_[best_index];
+        delayed_state = best_entry.serial_touch_state;
+        return true;
+    } else {
+        // 没有找到合适的延迟数据，使用最旧的数据
+        if (delay_buffer_count_ > 0) {
+            const int oldest_index = (delay_buffer_head_ - delay_buffer_count_ + DELAY_BUFFER_SIZE) % DELAY_BUFFER_SIZE;
+            const DelayedSerialState& oldest_entry = delay_buffer_[oldest_index];
+            delayed_state = oldest_entry.serial_touch_state;
+            return true;
+        }
+    }
+    
+    return false;
 }

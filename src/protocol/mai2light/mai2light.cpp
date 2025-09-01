@@ -1,5 +1,6 @@
 #include "mai2light.h"
 #include "pico/time.h"
+#include "../../protocol/usb_serial_logs/usb_serial_logs.h"
 #include <cstring>
 #include <cstdio>
 #include <algorithm>
@@ -47,7 +48,8 @@ Mai2Light::Mai2Light(HAL_UART* uart_hal, uint8_t node_id)
     , initialized_(false)
     , rx_buffer_pos_(0)
     , is_fading_(false)
-    , fade_start_time_(0) {
+    , fade_start_time_(0)
+    , string_cmd_pos_(0) {
     
     config_.node_id = node_id;
     
@@ -66,6 +68,7 @@ Mai2Light::Mai2Light(HAL_UART* uart_hal, uint8_t node_id)
     board_info_.serial_number = 0x12345678;
     
     memset(rx_buffer_, 0, sizeof(rx_buffer_));
+    memset(string_cmd_buffer_, 0, sizeof(string_cmd_buffer_));
     
     // 初始化虚拟EEPROM
     memset(virtual_eeprom_, 0, EEPROM_SIZE);
@@ -85,7 +88,7 @@ bool Mai2Light::init() {
     initialized_ = true;
     
     // 发送初始化完成消息
-    log_message("Mai2Light initialized");
+    log_debug("Mai2Light initialized");
     
     return true;
 }
@@ -101,7 +104,6 @@ void Mai2Light::deinit() {
         
         // 清理回调
         command_callback_ = nullptr;
-        log_callback_ = nullptr;
     }
 }
 
@@ -243,7 +245,7 @@ uint8_t Mai2Light::get_protocol_version() {
 
 // 保存到EEPROM
 bool Mai2Light::save_to_eeprom() {
-    log_message("Saving configuration to virtual EEPROM");
+    log_debug("Saving configuration to virtual EEPROM");
     
     // 将当前配置保存到虚拟EEPROM
     uint16_t offset = 0;
@@ -253,7 +255,7 @@ bool Mai2Light::save_to_eeprom() {
         memcpy(&virtual_eeprom_[offset], &config_, sizeof(config_));
         offset += sizeof(config_);
     } else {
-        log_message("EEPROM save failed: config too large");
+        log_error("EEPROM save failed: config too large");
         return false;
     }
     
@@ -262,7 +264,7 @@ bool Mai2Light::save_to_eeprom() {
         memcpy(&virtual_eeprom_[offset], led_status_, sizeof(led_status_));
         offset += sizeof(led_status_);
     } else {
-        log_message("EEPROM save failed: LED status too large");
+        log_error("EEPROM save failed: LED status too large");
         return false;
     }
     
@@ -271,17 +273,17 @@ bool Mai2Light::save_to_eeprom() {
         memcpy(&virtual_eeprom_[offset], &board_info_, sizeof(board_info_));
         offset += sizeof(board_info_);
     } else {
-        log_message("EEPROM save failed: board info too large");
+        log_error("EEPROM save failed: board info too large");
         return false;
     }
     
-    log_message("Configuration saved to EEPROM (" + std::to_string(offset) + " bytes)");
+    log_debug("Configuration saved to EEPROM (" + std::to_string(offset) + " bytes)");
     return true;
 }
 
 // 从EEPROM加载
 bool Mai2Light::load_from_eeprom() {
-    log_message("Loading configuration from virtual EEPROM");
+    log_debug("Loading configuration from virtual EEPROM");
     
     uint16_t offset = 0;
     
@@ -290,7 +292,7 @@ bool Mai2Light::load_from_eeprom() {
         memcpy(&config_, &virtual_eeprom_[offset], sizeof(config_));
         offset += sizeof(config_);
     } else {
-        log_message("EEPROM load failed: config size mismatch");
+        log_error("EEPROM load failed: config size mismatch");
         return false;
     }
     
@@ -299,7 +301,7 @@ bool Mai2Light::load_from_eeprom() {
         memcpy(led_status_, &virtual_eeprom_[offset], sizeof(led_status_));
         offset += sizeof(led_status_);
     } else {
-        log_message("EEPROM load failed: LED status size mismatch");
+        log_error("EEPROM load failed: LED status size mismatch");
         return false;
     }
     
@@ -308,53 +310,53 @@ bool Mai2Light::load_from_eeprom() {
         memcpy(&board_info_, &virtual_eeprom_[offset], sizeof(board_info_));
         offset += sizeof(board_info_);
     } else {
-        log_message("EEPROM load failed: board info size mismatch");
+        log_error("EEPROM load failed: board info size mismatch");
         return false;
     }
     
-    log_message("Configuration loaded from EEPROM (" + std::to_string(offset) + " bytes)");
+    log_debug("Configuration loaded from EEPROM (" + std::to_string(offset) + " bytes)");
     return true;
 }
 
 // 设置EEPROM数据
 bool Mai2Light::set_eeprom_data(uint16_t address, const uint8_t* data, uint8_t length) {
     if (!data || length == 0) {
-        log_message("EEPROM write failed: invalid parameters");
+        log_error("EEPROM write failed: invalid parameters");
         return false;
     }
     
     if (address + length > EEPROM_SIZE) {
-        log_message("EEPROM write failed: address out of range (" + std::to_string(address) + 
-                   " + " + std::to_string(length) + " > " + std::to_string(EEPROM_SIZE) + ")");
+        log_error("EEPROM write failed: address out of range (" + std::to_string(address) +
+                   " + " + std::to_string(length) + " > " + std::to_string(sizeof(virtual_eeprom_)) + ")");
         return false;
     }
     
     memcpy(&virtual_eeprom_[address], data, length);
-    log_message("EEPROM write: " + std::to_string(length) + " bytes at address " + std::to_string(address));
+    log_debug("EEPROM write: " + std::to_string(length) + " bytes at address " + std::to_string(address));
     return true;
 }
 
 // 获取EEPROM数据
 bool Mai2Light::get_eeprom_data(uint16_t address, uint8_t* data, uint8_t length) {
     if (!data || length == 0) {
-        log_message("EEPROM read failed: invalid parameters");
+        log_error("EEPROM read failed: invalid parameters");
         return false;
     }
     
     if (address + length > EEPROM_SIZE) {
-        log_message("EEPROM read failed: address out of range (" + std::to_string(address) + 
-                   " + " + std::to_string(length) + " > " + std::to_string(EEPROM_SIZE) + ")");
+        log_error("EEPROM read failed: address out of range (" + std::to_string(address) +
+                   " + " + std::to_string(length) + " > " + std::to_string(sizeof(virtual_eeprom_)) + ")");
         return false;
     }
     
     memcpy(data, &virtual_eeprom_[address], length);
-    log_message("EEPROM read: " + std::to_string(length) + " bytes from address " + std::to_string(address));
+    log_debug("EEPROM read: " + std::to_string(length) + " bytes from address " + std::to_string(address));
     return true;
 }
 
 // 重置板卡
 bool Mai2Light::reset_board() {
-    log_message("Resetting board");
+    log_debug("Resetting board");
     
     // 清除所有LED
     clear_all_leds();
@@ -367,7 +369,7 @@ bool Mai2Light::reset_board() {
 
 // 清除所有LED - mai2light只管理自己的LED状态
 bool Mai2Light::clear_all_leds() {
-    log_message("Clearing all LEDs");
+    log_debug("Clearing all LEDs");
     
     // 清除mai2light管理的所有LED状态
     Mai2Light_RGB black_color = {0, 0, 0};
@@ -381,7 +383,7 @@ bool Mai2Light::clear_all_leds() {
 
 // 进入引导程序
 bool Mai2Light::enter_bootloader() {
-    log_message("Entering bootloader mode");
+    log_debug("Entering bootloader mode");
     // 这里应该实现进入引导程序的逻辑
     return true;
 }
@@ -389,10 +391,6 @@ bool Mai2Light::enter_bootloader() {
 // 设置回调
 void Mai2Light::set_command_callback(Mai2Light_CommandCallback callback) {
     command_callback_ = callback;
-}
-
-void Mai2Light::set_log_callback(Mai2Light_LogCallback callback) {
-    log_callback_ = callback;
 }
 
 // 任务处理
@@ -433,57 +431,9 @@ bool Mai2Light::send_packet(const Mai2Light_PacketReq& packet) {
     buffer[pos] = calculate_checksum(buffer, pos);
     pos++;
     
-    // 使用新的DMA接口：先写入TX缓冲区，然后触发DMA传输
-    size_t bytes_written = uart_hal_->write_to_tx_buffer(buffer, pos);
-    if (bytes_written > 0) {
-        uart_hal_->trigger_tx_dma();
-    }
-    return bytes_written == pos;
-}
-
-// 接收数据包
-bool Mai2Light::receive_packet(Mai2Light_PacketAck& packet, uint32_t timeout_ms) {
-    uint32_t start_time = time_us_32() / 1000;
-    uint8_t buffer[MAI2LIGHT_MAX_PACKET_SIZE];
-    uint8_t pos = 0;
-    
-    while ((time_us_32() / 1000) - start_time < timeout_ms) {
-        uint8_t byte;
-        
-        size_t bytes_read = uart_hal_->read_from_rx_buffer(&byte, 1);
-    if (bytes_read > 0) {
-            buffer[pos++] = byte;
-            
-            // 检查是否接收完整数据包
-            if (pos >= 4 && pos >= buffer[2] + 5) { // sync + node_id + length + command + data + checksum
-                // 验证校验和
-                if (verify_checksum(buffer, pos - 1, buffer[pos - 1])) {
-                    // 解析数据包
-                    packet.sync = buffer[0];
-                    packet.node_id = buffer[1];
-                    packet.length = buffer[2];
-                    packet.command = (Mai2Light_Command)buffer[3];
-                    packet.status = (Mai2Light_AckStatus)buffer[4];
-                    packet.report = (Mai2Light_AckReport)buffer[5];
-                    
-                    // 复制数据
-                    for (int i = 0; i < packet.length - 2 && i < sizeof(packet.data); i++) {
-                        packet.data[i] = buffer[6 + i];
-                    }
-                    
-                    packet.checksum = buffer[pos - 1];
-                    return true;
-                }
-                pos = 0; // 重置缓冲区
-            }
-            
-            if (pos >= sizeof(buffer)) {
-                pos = 0; // 防止缓冲区溢出
-            }
-        }
-    }
-    
-    return false;
+    // 使用新的DMA接口：写入TX缓冲区会自动处理DMA传输
+    uart_hal_->write_to_tx_buffer(buffer, pos);
+    return true;
 }
 
 // 发送命令
@@ -505,7 +455,11 @@ void Mai2Light::process_received_data() {
     uint8_t buffer[32];
     
     size_t bytes_read = uart_hal_->read_from_rx_buffer(buffer, sizeof(buffer));
+    log_debug("Received " + std::to_string(bytes_read) + " bytes");
     if (bytes_read > 0) {
+        // 先处理字符串指令
+        process_string_commands(buffer, bytes_read);
+        
         for (size_t i = 0; i < bytes_read; i++) {
             rx_buffer_[rx_buffer_pos_++] = buffer[i];
             
@@ -561,6 +515,10 @@ void Mai2Light::process_packet(const Mai2Light_PacketReq& packet) {
         case Mai2Light_Command::SAVE_TO_EEPROM:
         case Mai2Light_Command::LOAD_FROM_EEPROM:
             handle_eeprom_command(packet);
+            break;
+            
+        case Mai2Light_Command::GET_HELP:
+            handle_get_status_command(packet);
             break;
             
         case Mai2Light_Command::RESET_BOARD:
@@ -703,6 +661,15 @@ void Mai2Light::handle_get_status_command(const Mai2Light_PacketReq& packet) {
             }
             break;
             
+        case Mai2Light_Command::GET_HELP: {
+            const char* help_text = "Mai2Light Module Commands: SET_LED_RGB(0x03), SET_ALL_LEDS(0x05), SET_BRIGHTNESS(0x06), GET_LED_STATUS(0x10), GET_BOARD_INFO(0x11), RESET_BOARD(0x30), GET_HELP(0x2F)";
+            uint8_t help_len = strlen(help_text);
+            if (help_len > 32) help_len = 32; // 限制长度
+            memcpy(response_data, help_text, help_len);
+            response_length = help_len;
+            break;
+        }
+            
         default:
             break;
     }
@@ -804,18 +771,71 @@ void Mai2Light::send_ack(Mai2Light_Command command, Mai2Light_AckStatus status,
     buffer[pos] = calculate_checksum(buffer, pos);
     pos++;
     
-    // 使用新的DMA接口：先写入TX缓冲区，然后触发DMA传输
-    size_t bytes_written = uart_hal_->write_to_tx_buffer(buffer, pos);
-    if (bytes_written > 0) {
-        uart_hal_->trigger_tx_dma();
-    }
+    // 使用新的DMA接口：写入TX缓冲区会自动处理DMA传输
+    (void)uart_hal_->write_to_tx_buffer(buffer, pos);
 }
 
 // 日志输出
-void Mai2Light::log_message(const std::string& message) {
-    if (log_callback_) {
-        log_callback_(message);
+void Mai2Light::log_debug(const std::string& message) {
+    auto* logger = USB_SerialLogs::get_global_instance();
+    if (logger) {
+        logger->debug(message, "Mai2Light");
     }
+}
+
+void Mai2Light::log_error(const std::string& message) {
+    auto* logger = USB_SerialLogs::get_global_instance();
+    if (logger) {
+        logger->error(message, "Mai2Light");
+    }
+}
+
+// 字符串指令解析实现
+void Mai2Light::process_string_commands(const uint8_t* buffer, size_t length) {
+    for (size_t i = 0; i < length; i++) {
+        char c = (char)buffer[i];
+        
+        // 处理换行符，解析完整指令
+        if (c == '\n' || c == '\r') {
+            if (string_cmd_pos_ > 0) {
+                string_cmd_buffer_[string_cmd_pos_] = '\0';
+                std::string command_str(string_cmd_buffer_);
+                parse_string_command(command_str);
+                string_cmd_pos_ = 0;
+            }
+        }
+        // 累积字符到缓冲区
+        else if (string_cmd_pos_ < sizeof(string_cmd_buffer_) - 1) {
+            string_cmd_buffer_[string_cmd_pos_++] = c;
+        }
+        // 缓冲区溢出，重置
+        else {
+            string_cmd_pos_ = 0;
+        }
+    }
+}
+
+void Mai2Light::parse_string_command(const std::string& command_str) {
+    // 检查是否为/help指令
+    if (command_str == "/help") {
+        std::string help_text = "Mai2Light Help:\n";
+        help_text += "SET_LED_RGB - Set LED RGB color\n";
+        help_text += "SET_ALL_LEDS - Set all LEDs color\n";
+        help_text += "GET_LED_STATUS - Get LED status\n";
+        help_text += "GET_BOARD_INFO - Get board information\n";
+        help_text += "RESET_BOARD - Reset the board\n";
+        help_text += "GET_HELP - Show this help message\n";
+        
+        send_string_response(help_text);
+    }
+}
+
+bool Mai2Light::send_string_response(const std::string& response) {
+    if (uart_hal_) {
+        size_t written = uart_hal_->write_to_tx_buffer((const uint8_t*)response.c_str(), response.length());
+        return written == response.length();
+    }
+    return false;
 }
 
 // 更新渐变效果

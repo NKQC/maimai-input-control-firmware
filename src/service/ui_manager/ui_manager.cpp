@@ -772,8 +772,7 @@ void UIManager::task() {
     
     uint32_t current_time = to_ms_since_boot(get_absolute_time());
     
-    // 处理背光和息屏
-    handle_backlight();
+    // 处理息屏
     handle_screen_timeout();
     
     // 故障检测已简化，不再需要专门的处理函数
@@ -810,26 +809,6 @@ void UIManager::task() {
     // 屏幕开启状态下的正常渲染
     // 使用30fps刷新任务进行页面渲染
     refresh_task_30fps();
-}
-
-// 背光管理
-void UIManager::handle_backlight() {
-    if (!static_config_.enable_backlight) {
-        return;
-    }
-    
-    uint32_t current_time = to_ms_since_boot(get_absolute_time());
-    uint32_t timeout_ms = static_config_.backlight_timeout * 1000;
-    
-    if (current_time - last_activity_time_ > timeout_ms) {
-        if (backlight_enabled_) {
-            set_backlight(false);
-        }
-    } else {
-        if (!backlight_enabled_) {
-            set_backlight(true);
-        }
-    }
 }
 
 // 息屏管理
