@@ -219,6 +219,19 @@ void HAL_UART0::set_rx_callback(std::function<void(uint8_t)> callback) {
     rx_callback_ = callback;
 }
 
+bool HAL_UART0::set_baudrate(uint32_t baudrate) {
+    if (!initialized_) {
+        return false;
+    }
+    // 设置新的波特率
+    uint32_t actual_baudrate = uart_set_baudrate(uart0, baudrate);
+    
+    // 更新内部波特率记录
+    baudrate_ = actual_baudrate;
+
+    return (actual_baudrate == baudrate);
+}
+
 void HAL_UART0::irq_handler() {
     if (instance_) {
         instance_->handle_rx_irq();
@@ -544,26 +557,33 @@ inline size_t HAL_UART1::read_from_rx_buffer(uint8_t* buffer, size_t length) {
     }
     
     size_t to_read = (length > rx_buffer_.data_count) ? rx_buffer_.data_count : length;
+    
     if (to_read == 0) {
-        return 0;
+        return 0; // 没有数据可读
     }
     
-    size_t read_count = 0;
-    while (read_count < to_read) {
-        buffer[read_count] = *rx_buffer_.read_ptr;
-        read_count++;
-        
-        // 更新读指针，处理环绕
-        rx_buffer_.read_ptr++;
-        if (rx_buffer_.read_ptr >= rx_buffer_.buffer + RxBuffer::BUFFER_SIZE) {
-            rx_buffer_.read_ptr = rx_buffer_.buffer;
-        }
+    // 计算从读指针到缓冲区末尾的数据长度
+    size_t end_length = rx_buffer_.buffer + RxBuffer::BUFFER_SIZE - rx_buffer_.read_ptr;
+    
+    if (to_read <= end_length) {
+        // 数据不跨越缓冲区边界
+        memcpy(buffer, (void*)rx_buffer_.read_ptr, to_read);
+        rx_buffer_.read_ptr += to_read;
+    } else {
+        // 数据跨越缓冲区边界
+        memcpy(buffer, (void*)rx_buffer_.read_ptr, end_length);
+        memcpy(buffer + end_length, rx_buffer_.buffer, to_read - end_length);
+        rx_buffer_.read_ptr = rx_buffer_.buffer + (to_read - end_length);
     }
     
-    // 更新数据计数
-    rx_buffer_.data_count -= read_count;
+    // 处理读指针回绕
+    if (rx_buffer_.read_ptr >= rx_buffer_.buffer + RxBuffer::BUFFER_SIZE) {
+        rx_buffer_.read_ptr = rx_buffer_.buffer;
+    }
     
-    return read_count;
+    rx_buffer_.data_count -= to_read;
+    
+    return to_read;
 }
 
 size_t HAL_UART1::available() {
@@ -589,6 +609,20 @@ void HAL_UART1::flush_tx() {
 
 void HAL_UART1::set_rx_callback(std::function<void(uint8_t)> callback) {
     rx_callback_ = callback;
+}
+
+bool HAL_UART1::set_baudrate(uint32_t baudrate) {
+    if (!initialized_) {
+        return false;
+    }
+
+    // 设置新的波特率
+    uint32_t actual_baudrate = uart_set_baudrate(uart1, baudrate);
+    
+    // 更新内部波特率记录
+    baudrate_ = actual_baudrate;
+
+    return (actual_baudrate == baudrate);
 }
 
 void HAL_UART1::irq_handler() {

@@ -85,12 +85,13 @@ bool Mai2Light::init() {
         return false;
     }
     
+    uart_hal_->set_baudrate(config_.baud_rate);
     initialized_ = true;
-    
+
     // 发送初始化完成消息
     log_debug("Mai2Light initialized");
     
-    return true;
+    return initialized_;
 }
 
 // 释放资源
@@ -120,7 +121,7 @@ bool Mai2Light::set_config(const Mai2Light_Config& config) {
         // 重新配置UART波特率 - HAL_UART不支持动态重配置
         // 需要重新初始化UART
         uart_hal_->deinit();
-        return uart_hal_->init(0, 1, config.baud_rate, false);
+        return uart_hal_->set_baudrate(config.baud_rate);
     }
     
     return true;
@@ -455,8 +456,13 @@ void Mai2Light::process_received_data() {
     uint8_t buffer[32];
     
     size_t bytes_read = uart_hal_->read_from_rx_buffer(buffer, sizeof(buffer));
-    log_debug("Received " + std::to_string(bytes_read) + " bytes");
+    
     if (bytes_read > 0) {
+        std::string hex_str;
+        for(size_t i = 0; i < bytes_read; i++) {
+            hex_str += buffer[i];
+        }
+        log_debug("Received=" + hex_str  + " bytes=" + std::to_string(bytes_read));
         // 先处理字符串指令
         process_string_commands(buffer, bytes_read);
         
@@ -795,6 +801,8 @@ void Mai2Light::process_string_commands(const uint8_t* buffer, size_t length) {
     for (size_t i = 0; i < length; i++) {
         char c = (char)buffer[i];
         
+        log_debug("Char: '" + std::string(1, c) + "' (0x" + std::to_string((uint8_t)c) + "), pos=" + std::to_string(string_cmd_pos_));
+        
         // 处理换行符，解析完整指令
         if (c == '\n' || c == '\r') {
             if (string_cmd_pos_ > 0) {
@@ -805,36 +813,79 @@ void Mai2Light::process_string_commands(const uint8_t* buffer, size_t length) {
             }
         }
         // 累积字符到缓冲区
-        else if (string_cmd_pos_ < sizeof(string_cmd_buffer_) - 1) {
+        else if (string_cmd_pos_ < 63) {  // 64-1，为null终止符预留空间
             string_cmd_buffer_[string_cmd_pos_++] = c;
         }
         // 缓冲区溢出，重置
         else {
+            log_error("String command buffer overflow, resetting");
             string_cmd_pos_ = 0;
         }
     }
 }
 
 void Mai2Light::parse_string_command(const std::string& command_str) {
+    // 去除命令字符串的前后空白字符
+    std::string trimmed_cmd = command_str;
+    // 去除尾部空白字符
+    trimmed_cmd.erase(trimmed_cmd.find_last_not_of(" \t\r\n") + 1);
+    // 去除头部空白字符
+    trimmed_cmd.erase(0, trimmed_cmd.find_first_not_of(" \t\r\n"));
+    
     // 检查是否为/help指令
-    if (command_str == "/help") {
-        std::string help_text = "Mai2Light Help:\n";
-        help_text += "SET_LED_RGB - Set LED RGB color\n";
-        help_text += "SET_ALL_LEDS - Set all LEDs color\n";
-        help_text += "GET_LED_STATUS - Get LED status\n";
-        help_text += "GET_BOARD_INFO - Get board information\n";
-        help_text += "RESET_BOARD - Reset the board\n";
-        help_text += "GET_HELP - Show this help message\n";
+    if (trimmed_cmd == "/help") {
+        std::string help_text = "Mai2Light Help:\r\n";
+        help_text += "Commands:\r\n";
+        help_text += "  /help - Show this help message\r\n";
+        help_text += "  /status - Get board status\r\n";
+        help_text += "  /reset - Reset the board\r\n";
+        help_text += "  /version - Get firmware version\r\n";
+        help_text += "Protocol Commands:\r\n";
+        help_text += "  SET_LED_RGB - Set LED RGB color\r\n";
+        help_text += "  SET_ALL_LEDS - Set all LEDs color\r\n";
+        help_text += "  GET_LED_STATUS - Get LED status\r\n";
+        help_text += "  GET_BOARD_INFO - Get board information\r\n";
+        help_text += "  RESET_BOARD - Reset the board\r\n";
+        help_text += "\r\n";
         
         send_string_response(help_text);
+    }
+    // 添加其他字符串命令处理
+    else if (trimmed_cmd == "/status") {
+        std::string status_text = "Board Status: OK\r\n";
+        status_text += "Node ID: " + std::to_string(config_.node_id) + "\r\n";
+        status_text += "Initialized: " + std::string(initialized_ ? "Yes" : "No") + "\r\n";
+        send_string_response(status_text);
+    }
+    else if (trimmed_cmd == "/version") {
+        std::string version_text = "Mai2Light Firmware v1.0\r\n";
+        version_text += "Protocol Version: " + std::to_string(get_protocol_version()) + "\r\n";
+        send_string_response(version_text);
+    }
+    else if (trimmed_cmd == "/reset") {
+        send_string_response("Resetting board...\r\n");
+        reset_board();
+    }
+    else {
+        send_string_response("Unknown command: " + trimmed_cmd + "\r\nType /help for available commands\r\n");
     }
 }
 
 bool Mai2Light::send_string_response(const std::string& response) {
+    log_debug("Sending string response: '" + response + "' (" + std::to_string(response.length()) + " bytes)");
+    
     if (uart_hal_) {
         size_t written = uart_hal_->write_to_tx_buffer((const uint8_t*)response.c_str(), response.length());
+        log_debug("UART write result: " + std::to_string(written) + "/" + std::to_string(response.length()) + " bytes");
+        
+        if (written != response.length()) {
+            log_error("Failed to write all bytes to UART TX buffer");
+        }
+        
         return written == response.length();
     }
+    
+    log_error("UART HAL is null, cannot send response");
     return false;
 }
 

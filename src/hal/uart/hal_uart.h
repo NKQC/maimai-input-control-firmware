@@ -48,6 +48,9 @@ public:
     // 清空发送缓冲区
     virtual void flush_tx() = 0;
     
+    // 设置波特率（即时生效）
+    virtual bool set_baudrate(uint32_t baudrate) = 0;
+    
     // 设置接收回调函数
     virtual void set_rx_callback(std::function<void(uint8_t)> callback) = 0;
     
@@ -82,6 +85,7 @@ public:
     void flush_rx() override;
     void flush_tx() override;
     void set_rx_callback(std::function<void(uint8_t)> callback) override;
+    bool set_baudrate(uint32_t baudrate) override;
     std::string get_name() const override { return "UART0"; }
     bool is_ready() const override { return initialized_; }
     
@@ -145,6 +149,7 @@ public:
     void flush_rx() override;
     void flush_tx() override;
     void set_rx_callback(std::function<void(uint8_t)> callback) override;
+    bool set_baudrate(uint32_t baudrate) override;
     std::string get_name() const override { return "UART1"; }
     bool is_ready() const override { return initialized_; }
     

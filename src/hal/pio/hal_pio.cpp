@@ -143,6 +143,16 @@ void HAL_PIO0::sm_put_blocking(uint8_t sm, uint32_t data) {
     }
 }
 
+bool HAL_PIO0::sm_put_nonblocking(uint8_t sm, uint32_t data) {
+    if (initialized_ && sm < 4) {
+        if (!pio_sm_is_tx_fifo_full(pio0, sm)) {
+            pio_sm_put(pio0, sm, data);
+            return true;
+        }
+    }
+    return false;
+}
+
 uint32_t HAL_PIO0::sm_get_blocking(uint8_t sm) {
     if (initialized_ && sm < 4) {
         return pio_sm_get_blocking(pio0, sm);
@@ -304,6 +314,16 @@ void HAL_PIO1::sm_put_blocking(uint8_t sm, uint32_t data) {
     if (initialized_ && sm < 4) {
         pio_sm_put_blocking(pio1, sm, data);
     }
+}
+
+bool HAL_PIO1::sm_put_nonblocking(uint8_t sm, uint32_t data) {
+    if (initialized_ && sm < 4) {
+        if (!pio_sm_is_tx_fifo_full(pio1, sm)) {
+            pio_sm_put(pio1, sm, data);
+            return true;
+        }
+    }
+    return false;
 }
 
 uint32_t HAL_PIO1::sm_get_blocking(uint8_t sm) {

@@ -150,17 +150,19 @@ bool NeoPixel::show() {
     // 准备像素数据
     prepare_pixel_data();
     
-    // 发送数据到PIO
+    // 使用完全非阻塞的方式发送数据
     for (uint16_t i = 0; i < num_leds_; i++) {
-        // 等待FIFO有空间
+        uint32_t wait_start = time_us_32();
         while (pio_hal_->sm_is_tx_fifo_full(pio_sm_)) {
+            // 检查是否超时
+            if (time_us_32() - wait_start > NEOPIXEL_WAIT_TIMEOUT_US) return false;  // 等待超时，返回失败
+            // 短暂让步CPU
             tight_loop_contents();
         }
-        
-        pio_hal_->sm_put_blocking(pio_sm_, pixel_data_[i]);
+        pio_hal_->sm_put_nonblocking(pio_sm_, pixel_data_[i]);
     }
     
-    return true;
+    return true;  // 所有数据发送成功
 }
 
 void NeoPixel::set_brightness(uint8_t brightness) {
@@ -374,9 +376,21 @@ void NeoPixel::unload_pio_program() {
 }
 
 bool NeoPixel::configure_pio() {
-    // 计算时钟分频
+    // WS2812时序要求：
+    // T0H = 0.4us, T0L = 0.85us (总周期 1.25us)
+    // T1H = 0.8us, T1L = 0.45us (总周期 1.25us)
+    // 每个bit周期 = 1.25us = 800kHz
+    // PIO程序中每个指令的延迟周期数：
+    // side 0 [2]: 3个周期 (0.375us @ 8MHz)
+    // side 1 [1]: 2个周期 (0.25us @ 8MHz) 
+    // side 1 [4]: 5个周期 (0.625us @ 8MHz)
+    // side 0 [4]: 5个周期 (0.625us @ 8MHz)
+    
     float clock_freq = clock_get_hz(clk_sys);
-    float cycles_per_bit = clock_freq / 800000.0f;  // 800kHz
+    // 目标频率8MHz，使PIO指令周期为125ns
+    // 这样[2]延迟=375ns, [4]延迟=625ns, [1]延迟=250ns
+    float target_freq = 8000000.0f;  // 8MHz
+    float clkdiv = clock_freq / target_freq;
     
     // 创建统一配置
     PIOStateMachineConfig config;
@@ -386,7 +400,7 @@ bool NeoPixel::configure_pio() {
     config.sideset_bit_count = 1;
     config.sideset_optional = false;
     config.sideset_pindirs = false;
-    config.clkdiv = cycles_per_bit;
+    config.clkdiv = clkdiv;
     config.wrap_target = pio_offset_;
     config.wrap = pio_offset_ + neopixel_program_.length - 1;
     config.program_offset = pio_offset_;

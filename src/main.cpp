@@ -345,11 +345,11 @@ void emergency_shutdown();
  */
 inline void heartbeat_task() {
     static uint32_t last_heartbeat = 0;
-    static bool led_state = false;
+    static uint8_t next_core = 0;
     uint32_t current_time = (time_us_32() / 1000);
-    if (current_time - last_heartbeat > 500) {
-        gpio_put(LED_BUILTIN_PIN, led_state);
-        led_state = !led_state;
+    if (current_time - last_heartbeat > 500 && get_core_num() == next_core) {
+        gpio_put(LED_BUILTIN_PIN, next_core);
+        next_core = !next_core;
         last_heartbeat = current_time;
     }
 }
@@ -910,6 +910,7 @@ void core1_task() {
         input_manager->loop1();
         usb_logs->task();
         ui_manager->task();
+        heartbeat_task();
         watchdog_feed();
     }
 }

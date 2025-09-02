@@ -70,6 +70,7 @@ public:
     
     // 数据传输
     virtual void sm_put_blocking(uint8_t sm, uint32_t data) = 0;
+    virtual bool sm_put_nonblocking(uint8_t sm, uint32_t data) = 0;  // 非阻塞发送，成功返回true
     virtual uint32_t sm_get_blocking(uint8_t sm) = 0;
     virtual bool sm_is_tx_fifo_full(uint8_t sm) = 0;
     virtual bool sm_is_rx_fifo_empty(uint8_t sm) = 0;
@@ -96,6 +97,7 @@ public:
     bool sm_configure(uint8_t sm, const PIOStateMachineConfig& config) override;
     void sm_set_enabled(uint8_t sm, bool enabled) override;
     void sm_put_blocking(uint8_t sm, uint32_t data) override;
+    bool sm_put_nonblocking(uint8_t sm, uint32_t data) override;
     uint32_t sm_get_blocking(uint8_t sm) override;
     bool sm_is_tx_fifo_full(uint8_t sm) override;
     bool sm_is_rx_fifo_empty(uint8_t sm) override;
@@ -132,6 +134,7 @@ public:
     bool sm_configure(uint8_t sm, const PIOStateMachineConfig& config) override;
     void sm_set_enabled(uint8_t sm, bool enabled) override;
     void sm_put_blocking(uint8_t sm, uint32_t data) override;
+    bool sm_put_nonblocking(uint8_t sm, uint32_t data) override;
     uint32_t sm_get_blocking(uint8_t sm) override;
     bool sm_is_tx_fifo_full(uint8_t sm) override;
     bool sm_is_rx_fifo_empty(uint8_t sm) override;

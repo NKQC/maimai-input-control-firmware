@@ -16,6 +16,7 @@
 #define NEOPIXEL_T1H_NS     700   // 1码高电平时间 (ns)
 #define NEOPIXEL_T1L_NS     600   // 1码低电平时间 (ns)
 #define NEOPIXEL_RESET_US   50    // 复位时间 (us)
+#define NEOPIXEL_WAIT_TIMEOUT_US 1000   // 等待超时时间 (us)
 
 // LED类型定义
 enum NeoPixel_Type {

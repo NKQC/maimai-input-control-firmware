@@ -418,7 +418,7 @@ void LightManager::loop() {
     
     // 时间片调度处理
     process_time_slice();
-    
+
     // 更新neopixel动画
     if (neopixel_) {
         neopixel_->task();
