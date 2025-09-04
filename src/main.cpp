@@ -149,7 +149,8 @@
  * 交互式Serial分区绑定: 临时启用全部触摸点 -> 按mai2触摸区域从A1开始准备绑定 -> 屏幕提示绑定区域A1 提示按下A1区域 -> mai2直接发送A1被按下的消息 -> 按下A1区域 -> 读取到是哪个区域被触发 -> A1被绑定到该区域 -> 关闭该区域的触控输入 -> 接着下一个区域 -> ...... -> 直到全部的mai2区被绑定完成 提示保存结束 -> 恢复原触摸点启用设置
  * 交互式HID绑定分区: 临时启用全部触摸点 -> 按下需要绑定的区域 -> 屏幕显示按下的点位名称 -> 设置绑定到逻辑X点位 -> 构造HID触摸点位并发送 -> 屏幕设置X Y坐标 点位实时跟随 -> 直到实际点位坐标满足需求 -> 保存结束 -> 恢复原触摸点启用设置
  */
-
+//#define LFS_TEST  // 针对神金LFS的官方测试
+#ifndef LFS_TEST
 #include <Arduino.h>
 #include <stdio.h>
 #include <string.h>
@@ -171,6 +172,7 @@ extern "C" {
 
 // 协议层包含
 #include "protocol/touch_sensor/gtx312l/gtx312l.h"
+#include "protocol/touch_sensor/touch_sensor.h"
 #include "protocol/mcp23s17/mcp23s17.h"
 #include "protocol/neopixel/neopixel.h"
 #include "protocol/st7735s/st7735s.h"
@@ -186,6 +188,8 @@ extern "C" {
 #include "service/ui_manager/ui_manager.h"
 
 // 系统配置
+#define DEBUG_UIMANAGER_LOG false
+
 #define SYSTEM_VERSION "3.0.1"
 #define HARDWARE_VERSION "3.0"
 #define BUILD_DATE __DATE__
@@ -305,8 +309,7 @@ static HAL_UART* hal_uart1 = nullptr;
 static HAL_PIO* hal_pio1 = nullptr;
 static HAL_USB* hal_usb = nullptr;
 
-static GTX312L* gtx312l_devices[8] = {nullptr}; // 最多8个GTX312L设备
-static uint8_t gtx312l_count = 0;
+static TouchSensorManager* touch_sensor_manager = nullptr; // 新的触摸传感器管理器
 static MCP23S17* mcp23s17 = nullptr;
 static NeoPixel* neopixel = nullptr;
 static ST7735S* st7735s = nullptr;
@@ -330,13 +333,14 @@ bool core1_init_hal_layer();
 bool core0_init_protocol_layer();
 bool core1_init_protocol_layer();
 bool init_service_layer();
+inline bool init_basic();
 void deinit_system();
 void core0_task();
 void core1_task();
 void core1_main();
 void status_update_task();
 void print_system_info();
-void scan_i2c_devices();
+void AutoRegisterTouchSensor();
 void emergency_shutdown();
 
 
@@ -376,12 +380,87 @@ void error_handler(const char* error_msg) {
         char buffer[256];
         snprintf(buffer, sizeof(buffer), "SYSTEM ERROR: %s", error_msg);
         usb_logs->error(std::string(buffer));
-        
-        // 立即flush确保错误信息能够发送
-        usb_logs->flush();
+        ui_manager->show_error(std::string(buffer));
     }
     
-    emergency_shutdown();
+    while (1) {
+        ui_manager->task(); 
+        usb_logs->task();
+        watchdog_feed();
+    }
+}
+
+/**
+ * 基础初始化
+ * 失败时直接重启系统
+ */
+inline bool init_basic() {
+    gpio_put(LED_BUILTIN_PIN, 1);
+    // 初始化USB
+    hal_usb = HAL_USB_Device::getInstance();
+    if (!hal_usb || !hal_usb->init()) {
+        watchdog_reboot(0, 0, 0);
+        return false;
+    }
+    
+    // 初始化USB Serial Logs
+    usb_logs = new USB_SerialLogs(hal_usb);
+    if (!usb_logs || !usb_logs->init()) {
+        watchdog_reboot(0, 0, 0);
+        return false;
+    }
+
+    USB_SerialLogs_Config log_config;
+    log_config.enable_colors = false;
+    log_config.min_level = USB_LogLevel::DEBUG;
+    usb_logs->set_config(log_config);
+    
+    // 设置全局USB logs实例并标记可用
+    USB_SerialLogs::set_global_instance(usb_logs);
+    init_sync.usb_log_ready = 1;
+
+    // 初始化SPI
+    hal_spi0 = HAL_SPI0::getInstance();
+    if (!hal_spi0 || !hal_spi0->init(SPI0_SCK_PIN, SPI0_MOSI_PIN, SPI0_MISO_PIN, SPI0_FREQ)) {
+        error_handler("Failed to initialize SPI0");
+        return false;
+    }
+
+    // 初始化ST7735S
+    st7735s = new ST7735S(hal_spi0, ST7735S_ROTATION_90, ST7735S_CS_PIN, ST7735S_DC_PIN, ST7735S_RST_PIN, ST7735S_BLK_PIN);
+    if (!st7735s || !st7735s->init()) {
+        error_handler("Failed to initialize ST7735S");
+        return false;
+    }
+
+    // 初始化ConfigManager
+    config_manager = ConfigManager::getInstance();
+    if (!config_manager || !config_manager->initialize()) {
+        error_handler("Failed to initialize ConfigManager");
+    }
+    
+    ui_manager = UIManager::getInstance();
+    if (!ui_manager) {
+        error_handler("Failed to create UIManager");
+        return false;
+    }
+    
+    UIManager_Config ui_config = {};
+    ui_config.config_manager = config_manager;
+    ui_config.light_manager = light_manager;
+    ui_config.st7735s = st7735s;
+    ui_config.joystick_a_pin = JOYSTICK_BUTTON_A_PIN;
+    ui_config.joystick_b_pin = JOYSTICK_BUTTON_B_PIN;
+    ui_config.joystick_confirm_pin = JOYSTICK_BUTTON_CONFIRM_PIN;
+    
+    if (!ui_manager->init(ui_config)) {
+        error_handler("Failed to initialize UIManager");
+        return false;
+    }
+    
+    ui_manager->enable_debug_output(DEBUG_UIMANAGER_LOG);
+    gpio_put(LED_BUILTIN_PIN, 0);
+    return true;
 }
 
 /**
@@ -450,23 +529,9 @@ bool core0_init_hal_layer() {
  * Core1 HAL层初始化 - 负责SPI、USB
  */
 bool core1_init_hal_layer() {
-    // 初始化SPI
-    hal_spi0 = HAL_SPI0::getInstance();
-    if (!hal_spi0 || !hal_spi0->init(SPI0_SCK_PIN, SPI0_MOSI_PIN, SPI0_MISO_PIN, SPI0_FREQ)) {
-        error_handler("Failed to initialize SPI0");
-        return false;
-    }
-    
     hal_spi1 = HAL_SPI1::getInstance();
     if (!hal_spi1 || !hal_spi1->init(SPI1_SCK_PIN, SPI1_MOSI_PIN, SPI1_MISO_PIN, SPI1_FREQ)) {
         error_handler("Failed to initialize SPI1");
-        return false;
-    }
-    
-    // 初始化USB
-    hal_usb = HAL_USB_Device::getInstance();
-    if (!hal_usb || !hal_usb->init()) {
-        error_handler("Failed to initialize USB");
         return false;
     }
     
@@ -485,9 +550,6 @@ bool core0_init_protocol_layer() {
         error_handler("Timeout waiting for HAL layer initialization");
         return false;
     }
-
-    // 扫描I2C设备并初始化GTX312L
-    scan_i2c_devices();
     
     // 初始化NeoPixel
     neopixel = new NeoPixel(hal_pio1, NEOPIXEL_LEDS_NUM);
@@ -526,34 +588,10 @@ bool core1_init_protocol_layer() {
         return false;
     }
     
-    // 初始化USB Serial Logs
-    usb_logs = new USB_SerialLogs(hal_usb);
-    if (!usb_logs || !usb_logs->init()) {
-        error_handler("Failed to initialize USB Serial Logs");
-        return false;
-    }
-
-    USB_SerialLogs_Config log_config;
-    log_config.enable_colors = false;
-    log_config.min_level = USB_LogLevel::DEBUG;
-
-    usb_logs->set_config(log_config);
-    
-    // 设置全局USB logs实例并标记可用
-    USB_SerialLogs::set_global_instance(usb_logs);
-    init_sync.usb_log_ready = 1;
-    
     // 初始化MCP23S17
     mcp23s17 = new MCP23S17(hal_spi1, MCP23S17_CS_PIN);
     if (!mcp23s17 || !mcp23s17->init()) {
         error_handler("Failed to initialize MCP23S17");
-        return false;
-    }
-    
-    // 初始化ST7735S
-    st7735s = new ST7735S(hal_spi0, ST7735S_ROTATION_90, ST7735S_CS_PIN, ST7735S_DC_PIN, ST7735S_RST_PIN, ST7735S_BLK_PIN);
-    if (!st7735s || !st7735s->init()) {
-        error_handler("Failed to initialize ST7735S");
         return false;
     }
 
@@ -580,13 +618,6 @@ bool init_service_layer() {
     // 等待两个核心的协议层都初始化完成
     if (!init_sync.wait_for_both_protocol()) {
         error_handler("Timeout waiting for protocol layer initialization");
-        return false;
-    }
-    
-    // 首先初始化ConfigManager
-    config_manager = ConfigManager::getInstance();
-    if (!config_manager || !config_manager->initialize()) {
-        error_handler("Failed to initialize ConfigManager");
         return false;
     }
     
@@ -625,15 +656,6 @@ bool init_service_layer() {
     input_manager->addPhysicalKeyboard(MCP_GPIO::GPIOB2, HID_KeyCode::KEY_ENTER);
     input_manager->addPhysicalKeyboard(MCP_GPIO::GPIOB3, HID_KeyCode::KEY_SPACE);
 
-    // 注册TouchSensor设备到InputManager
-    for (uint8_t i = 0; i < gtx312l_count; i++) {
-        if (gtx312l_devices[i]) {
-            if (!input_manager->registerTouchSensor(gtx312l_devices[i])) {
-                error_handler("Failed to register TouchSensor device");
-                return false;
-            }
-        }
-    }
     // 初始化LightManager
     light_manager = LightManager::getInstance();
     
@@ -646,22 +668,10 @@ bool init_service_layer() {
         return false;
     }
     light_manager->enable_debug_output(true);
+
+    // 扫描I2C设备并初始化触摸设备
+    AutoRegisterTouchSensor();
     
-    // 初始化UIManager
-    ui_manager = UIManager::getInstance();
-    UIManager_Config ui_config = {};
-    ui_config.config_manager = config_manager;
-    ui_config.light_manager = light_manager;
-    ui_config.st7735s = st7735s;
-    ui_config.joystick_a_pin = JOYSTICK_BUTTON_A_PIN;
-    ui_config.joystick_b_pin = JOYSTICK_BUTTON_B_PIN;
-    ui_config.joystick_confirm_pin = JOYSTICK_BUTTON_CONFIRM_PIN;
-    
-    if (!ui_manager->init(ui_config)) {
-        error_handler("Failed to initialize UIManager");
-        return false;
-    }
-    ui_manager->enable_debug_output(true); // DEBUG
     // 标记服务层初始化完成
     init_sync.service_ready = 1;
     
@@ -670,95 +680,33 @@ bool init_service_layer() {
 
 
 /**
- * 扫描I2C设备并初始化GTX312L
+ * 扫描I2C设备并初始化触摸传感器
  */
-void scan_i2c_devices() {
-    gtx312l_count = 0;
+void AutoRegisterTouchSensor() {
     
     if (usb_logs) {
         usb_logs->info("Starting I2C device scan...");
     }
     
-    // GTX312L自动发现实现: I2C_HAL扫描总线 -> 发现总线设备 -> 按发现的所有总线地址依次 GTX312L构造实例 传入对应总线HAL和地址 尝试初始化 -> 初始化成功 加入注册组
-    //                                                                                                             -> 初始化失败 删除实例
+    // 创建TouchSensorManager实例
+    if (!touch_sensor_manager) {
+        touch_sensor_manager = new TouchSensorManager();
+    }
     
-    // 扫描I2C0总线
-    if (hal_i2c0) {
-        std::vector<uint8_t> i2c0_addresses = hal_i2c0->scan_devices();
-        
-        for (uint8_t addr : i2c0_addresses) {
-            if (gtx312l_count >= 8) break;
-            USB_LOG_DEBUG("I2C0 Found:%02x", addr);
-            // 尝试创建GTX312L实例
-            GTX312L* device = new GTX312L(hal_i2c0, I2C_Bus::I2C0, addr);
+    // 使用新的统一扫描接口
+    uint8_t total_devices = touch_sensor_manager->scanAndRegisterAll(hal_i2c0, hal_i2c1, 8);
 
-            if (device && device->init()) {
-                // 初始化成功，加入注册组
-                gtx312l_devices[gtx312l_count] = device;
-                gtx312l_count++;
-                
-                // 注册到InputManager
-                if (input_manager) {
-                    input_manager->registerTouchSensor(device);
-                }
-                
-                if (usb_logs) {
-                    char buffer[128];
-                    snprintf(buffer, sizeof(buffer), "Found GTX312L on I2C0: %s (0x%02X)", 
-                            device->get_device_name().c_str(), addr);
-                    usb_logs->info(std::string(buffer));
-                }
-            } else {
-                // 初始化失败，删除实例
-                delete device;
+    for (uint8_t i = 0; i < total_devices; i++) {
+        TouchSensor* sensor = touch_sensor_manager->getSensor(i);
+        if (sensor) {
+            USB_LOG_DEBUG("TouchSensor ID: %0x found", sensor->getModuleMask());
+            // 注册到InputManager
+            if (input_manager) {
+                input_manager->registerTouchSensor(sensor);
             }
         }
     }
     
-    // 扫描I2C1总线
-    if (hal_i2c1 && gtx312l_count < 8) {
-        std::vector<uint8_t> i2c1_addresses = hal_i2c1->scan_devices();
-        
-        for (uint8_t addr : i2c1_addresses) {
-            if (gtx312l_count >= 8) break;
-            USB_LOG_DEBUG("I2C1 Found:%02x", addr);
-            // 尝试创建GTX312L实例
-            GTX312L* device = new GTX312L(hal_i2c1, I2C_Bus::I2C1, addr);
-            if (device && device->init()) {
-                // 初始化成功，加入注册组
-                gtx312l_devices[gtx312l_count] = device;
-                gtx312l_count++;
-                
-                // 注册到InputManager
-                if (input_manager) {
-                    input_manager->registerTouchSensor(device);
-                }
-            } else {
-                // 初始化失败，删除实例
-                delete device;
-            }
-        }
-    }
-    
-    if (usb_logs) {
-        char buffer[128];
-        snprintf(buffer, sizeof(buffer), "I2C scan completed. Total GTX312L devices found: %d", gtx312l_count);
-        usb_logs->info(std::string(buffer));
-        
-        // 输出设备详细信息
-        for (uint8_t i = 0; i < gtx312l_count; i++) {
-            if (gtx312l_devices[i]) {
-                GTX312L_DeviceInfo info;
-                if (gtx312l_devices[i]->read_device_info(info)) {
-                    char buffer[256];
-                    snprintf(buffer, sizeof(buffer), "Device %d: %s, I2C=0x%02X, Valid=%s", 
-                            i, gtx312l_devices[i]->get_device_name().c_str(),
-                            info.i2c_address, info.is_valid ? "Yes" : "No");
-                    usb_logs->info(std::string(buffer));
-                }
-            }
-        }
-    }
 }
 
 /**
@@ -829,15 +777,11 @@ void deinit_system() {
         mcp23s17 = nullptr;
     }
     
-    // 反初始化GTX312L设备
-    for (uint8_t i = 0; i < gtx312l_count; i++) {
-        if (gtx312l_devices[i]) {
-            gtx312l_devices[i]->deinit();
-            delete gtx312l_devices[i];
-            gtx312l_devices[i] = nullptr;
-        }
+    // 反初始化触摸传感器管理器（包含所有触摸传感器设备）
+    if (touch_sensor_manager) {
+        delete touch_sensor_manager;
+        touch_sensor_manager = nullptr;
     }
-    gtx312l_count = 0;
     
     // 反初始化HAL层
     if (hal_usb) {
@@ -895,8 +839,8 @@ void deinit_system() {
  */
 void core0_task() {
     while (1) {
-        input_manager->loop0();
-        light_manager->loop();
+        input_manager->task0();
+        config_manager->save_config_task();  // 处理配置保存请求
         heartbeat_task();
         watchdog_feed();
     }
@@ -907,9 +851,10 @@ void core0_task() {
  */
 void core1_task() {
     while (1) {
-        input_manager->loop1();
+        input_manager->task1();
         usb_logs->task();
         ui_manager->task();
+        light_manager->task();
         heartbeat_task();
         watchdog_feed();
     }
@@ -951,13 +896,16 @@ void setup() {
     
     // 重置同步bitmap
     init_sync.reset();
+
+    // 提前初始化USB和usblog
+    if (!init_basic()) {
+        error_handler("Failed to initialize basic layer (USB, USB logs, UI)");
+    }
     
     // 启动Core1
     multicore_launch_core1_with_stack(core1_main, core1_stack, CORE1_STACK_SIZE);
-    
     // Core0初始化流程
     bool init_success = true;
-    
     // Core0 HAL层初始化
     if (!core0_init_hal_layer()) {
         init_success = false;
@@ -999,6 +947,7 @@ void setup() {
  * Core1主函数 - 处理Core1的初始化和任务循环
  */
 void core1_main() {
+    multicore_lockout_victim_init();
     watchdog_enable(WATCHDOG_TIMEOUT_MS, true);
     gpio_init(LED_BUILTIN_PIN);
     gpio_set_dir(LED_BUILTIN_PIN, GPIO_OUT);
@@ -1045,3 +994,155 @@ void core1_main() {
 
 
 void loop() {}
+
+#else
+// Simple speed test for filesystem objects
+// Released to the public domain by Earle F. Philhower, III
+
+#include <FS.h>
+#include <LittleFS.h>
+#include <SDFS.h>
+
+// Choose the filesystem to test
+// WARNING:  The filesystem will be formatted at the start of the test!
+
+#define TESTFS LittleFS
+//#define TESTFS SDFS
+
+// How large of a file to test
+#define TESTSIZEKB 256
+
+// Format speed in bytes/second.  Static buffer so not re-entrant safe
+const char *rate(unsigned long start, unsigned long stop, unsigned long bytes) {
+  static char buff[64];
+  if (stop == start) {
+    strcpy_P(buff, PSTR("Inf b/s"));
+  } else {
+    unsigned long delta = stop - start;
+    float r = 1000.0 * (float)bytes / (float)delta;
+    if (r >= 1000000.0) {
+      sprintf_P(buff, PSTR("%0.2f MB/s"), r / 1000000.0);
+    } else if (r >= 1000.0) {
+      sprintf_P(buff, PSTR("%0.2f KB/s"), r / 1000.0);
+    } else {
+      sprintf_P(buff, PSTR("%d bytes/s"), (int)r);
+    }
+  }
+  return buff;
+}
+
+void DoTest(FS *fs) {
+  if (!fs->format()) {
+    Serial.printf("Unable to format(), aborting\n");
+    return;
+  }
+  if (!fs->begin()) {
+    Serial.printf("Unable to begin(), aborting\n");
+    return;
+  }
+
+  uint8_t data[256];
+  for (int i = 0; i < 256; i++) {
+    data[i] = (uint8_t) i;
+  }
+  Serial.printf("file_exits %d", fs->exists("/testwrite.bin"));
+  Serial.printf("Creating %dKB file, may take a while...\n", TESTSIZEKB);
+  unsigned long start = millis();
+  File f = fs->open("/testwrite.bin", "w");
+  if (!f) {
+    Serial.printf("Unable to open file for writing, aborting\n");
+    return;
+  }
+  for (int i = 0; i < TESTSIZEKB; i++) {
+    for (int j = 0; j < 4; j++) {
+      f.write(data, 256);
+    }
+  }
+  f.close();
+  unsigned long stop = millis();
+  Serial.printf("==> Time to write %dKB in 256b chunks = %lu milliseconds\n", TESTSIZEKB, stop - start);
+
+  f = fs->open("/testwrite.bin", "r");
+  Serial.printf("==> Created file size = %zu\n", f.size());
+  f.close();
+
+  Serial.printf("Reading %dKB file sequentially in 256b chunks\n", TESTSIZEKB);
+  start = millis();
+  f = fs->open("/testwrite.bin", "r");
+  for (int i = 0; i < TESTSIZEKB; i++) {
+    for (int j = 0; j < 4; j++) {
+      f.read(data, 256);
+    }
+  }
+  f.close();
+  stop = millis();
+  Serial.printf("==> Time to read %dKB sequentially in 256b chunks = %lu milliseconds = %s\n", TESTSIZEKB, stop - start, rate(start, stop, TESTSIZEKB * 1024));
+
+  Serial.printf("Reading %dKB file MISALIGNED in flash and RAM sequentially in 256b chunks\n", TESTSIZEKB);
+  start = millis();
+  f = fs->open("/testwrite.bin", "r");
+  f.read();
+  for (int i = 0; i < TESTSIZEKB; i++) {
+    for (int j = 0; j < 4; j++) {
+      f.read(data + 1, 256);
+    }
+  }
+  f.close();
+  stop = millis();
+  Serial.printf("==> Time to read %dKB sequentially MISALIGNED in flash and RAM in 256b chunks = %lu milliseconds = %s\n", TESTSIZEKB, stop - start, rate(start, stop, TESTSIZEKB * 1024));
+
+  Serial.printf("Reading %dKB file in reverse by 256b chunks\n", TESTSIZEKB);
+  start = millis();
+  f = fs->open("/testwrite.bin", "r");
+  for (int i = 0; i < TESTSIZEKB; i++) {
+    for (int j = 0; j < 4; j++) {
+      if (!f.seek(256 + 256 * j * i, SeekEnd)) {
+        Serial.printf("Unable to seek to %d, aborting\n", -256 - 256 * j * i);
+        return;
+      }
+      if (256 != f.read(data, 256)) {
+        Serial.printf("Unable to read 256 bytes, aborting\n");
+        return;
+      }
+    }
+  }
+  f.close();
+  stop = millis();
+  Serial.printf("==> Time to read %dKB in reverse in 256b chunks = %lu milliseconds = %s\n", TESTSIZEKB, stop - start, rate(start, stop, TESTSIZEKB * 1024));
+
+  Serial.printf("Writing 64K file in 1-byte chunks\n");
+  start = millis();
+  f = fs->open("/test1b.bin", "w");
+  for (int i = 0; i < 65536; i++) {
+    f.write((uint8_t*)&i, 1);
+  }
+  f.close();
+  stop = millis();
+  Serial.printf("==> Time to write 64KB in 1b chunks = %lu milliseconds = %s\n", stop - start, rate(start, stop, 65536));
+
+  Serial.printf("Reading 64K file in 1-byte chunks\n");
+  start = millis();
+  f = fs->open("/test1b.bin", "r");
+  for (int i = 0; i < 65536; i++) {
+    char c;
+    f.read((uint8_t*)&c, 1);
+  }
+  f.close();
+  stop = millis();
+  Serial.printf("==> Time to read 64KB in 1b chunks = %lu milliseconds = %s\n", stop - start, rate(start, stop, 65536));
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(5000);
+  Serial.printf("Beginning test\n");
+  Serial.flush();
+  DoTest(&TESTFS);
+  Serial.println("done");
+}
+
+void loop() {
+  delay(10000);
+}
+
+#endif

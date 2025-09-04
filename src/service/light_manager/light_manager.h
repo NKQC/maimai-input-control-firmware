@@ -113,6 +113,7 @@ LightManager_PrivateConfig* lightmanager_get_config_holder();              // [�
 bool lightmanager_write_config_to_manager(const LightManager_PrivateConfig& config); // [配置写入函数] 将配置写入到config_holder地址中
 LightManager_PrivateConfig lightmanager_get_config_copy();                 // [配置读取函数] 从config_holder地址读取配置并返回副本
 bool lightmanager_save_config_to_manager(const LightManager_PrivateConfig& config); // [配置保存函数] 将config_holder地址的配置保存到ConfigManager
+bool lightmanager_load_config_from_manager();                              // [配置加载函数] 从ConfigManager加载配置到config_holder并应用
 
 // 协议回调函数已移除 - LightManager不再处理协议指令
 
@@ -160,7 +161,7 @@ public:
     Mai2Light_Config get_mai2light_config() const;                             // 获取mai2light配置
     
     // Loop接口 - 处理Mai2Light回调
-    void loop();
+    void task();
     
     // 协议回调函数已移除
     

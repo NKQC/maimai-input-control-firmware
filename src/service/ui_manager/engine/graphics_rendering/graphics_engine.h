@@ -32,6 +32,8 @@ typedef uint16_t Color;
 #define COLOR_PRIMARY     0xF800  // 主色调 #0080ff (RGB565格式)
 #define COLOR_TEXT_WHITE  0xFFFF  // 白色文字
 #define COLOR_TEXT_GRAY   0x8410  // 灰色文字
+#define COLOR_TEXT_YELLOW 0x07FF  // 黄色文字
+#define COLOR_TEXT_GREEN  0x07E0  // 绿色文字
 #define COLOR_SUCCESS     0x07E0  // 成功绿色
 #define COLOR_WARNING     0x07FF  // 警告黄色 (RGB565格式)
 #define COLOR_ERROR       0x001F  // 错误红色 (RGB565格式)

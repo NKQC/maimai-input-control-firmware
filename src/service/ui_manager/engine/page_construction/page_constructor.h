@@ -23,6 +23,16 @@ public:
     virtual void render(PageTemplate& page_template) = 0;
     
     /**
+     * 可选的跳转字符串接收接口
+     * 当页面通过ADD_MENU_WITH_STR跳转时，会调用此函数传递额外字符串
+     * 派生类可以重写此函数来接收和处理跳转字符串
+     * @param jump_str 跳转时传递的字符串参数
+     */
+    virtual void jump_str(const std::string& jump_str) {
+        // 默认实现：什么都不做，派生类可以选择性重写
+    }
+    
+    /**
      * 设置页面上下文信息
      * @param page_name 当前页面名称
      * @param current_time 当前时间戳

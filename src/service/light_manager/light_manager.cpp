@@ -60,7 +60,8 @@ bool lightmanager_save_config_to_manager(const LightManager_PrivateConfig& confi
         config_mgr->set_uint8(LIGHTMANAGER_NEOPIXEL_PIN, config.neopixel_pin);
         
         // 保存配置到Flash，ConfigManager内置数据类型天然检查边界
-        return config_mgr->save_config();
+        config_mgr->save_config();
+        return true;  // 信号机制下立即返回成功
     }
     return false;
 }
@@ -72,6 +73,42 @@ bool lightmanager_write_config_to_manager(const LightManager_PrivateConfig& conf
     
     // 将配置写入到config_holder地址
     *holder = config;
+    
+    return true;
+}
+
+// [配置加载函数] 从ConfigManager加载配置到config_holder并应用
+bool lightmanager_load_config_from_manager() {
+    ConfigManager* config_mgr = ConfigManager::getInstance();
+    if (!config_mgr) {
+        return false;
+    }
+    
+    LightManager_PrivateConfig* holder = lightmanager_get_config_holder();
+    if (!holder) {
+        return false;
+    }
+    
+    // 从ConfigManager加载配置
+    holder->enable = config_mgr->get_bool(LIGHTMANAGER_ENABLE);
+    holder->uart_device = config_mgr->get_string(LIGHTMANAGER_UART_DEVICE);
+    holder->baud_rate = config_mgr->get_uint32(LIGHTMANAGER_BAUD_RATE);
+    holder->node_id = config_mgr->get_uint8(LIGHTMANAGER_NODE_ID);
+    holder->neopixel_count = config_mgr->get_uint16(LIGHTMANAGER_NEOPIXEL_COUNT);
+    holder->neopixel_pin = config_mgr->get_uint8(LIGHTMANAGER_NEOPIXEL_PIN);
+    
+    // 应用加载的配置到实际硬件
+    LightManager* instance = LightManager::getInstance();
+    if (instance && instance->is_ready()) {
+        // 加载区域映射配置
+        instance->load_region_mappings();
+        
+        // 应用Mai2Light配置（使用公有方法）
+        Mai2Light_Config mai2light_config;
+        mai2light_config.node_id = holder->node_id;
+        mai2light_config.baud_rate = holder->baud_rate;
+        instance->update_mai2light_config(mai2light_config);
+    }
     
     return true;
 }
@@ -136,7 +173,15 @@ bool LightManager::init(const InitConfig& init_config) {
     for (int i = 0; i < REGION_COUNT; i++) {
         region_bitmaps_[i].neopixel_bitmap = (1 << i); // 每个区域对应一个LED
     }
+    
     initialized_ = true;
+    
+    // 加载并应用配置
+    if (!lightmanager_load_config_from_manager()) {
+        log_error("Failed to load configuration from ConfigManager");
+        // 继续初始化，使用默认配置
+    }
+    
     log_debug("LightManager initialized successfully");
     return true;
 }
@@ -408,7 +453,7 @@ Mai2Light_Config LightManager::get_mai2light_config() const {
 // Loop接口 - 处理Mai2Light回调
 // ============================================================================
 
-void LightManager::loop() {
+void LightManager::task() {
     if (!is_ready()) {
         return;
     }

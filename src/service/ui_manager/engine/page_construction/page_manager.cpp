@@ -13,37 +13,50 @@ PageNavigationManager& PageNavigationManager::getInstance() {
 }
 
 void PageNavigationManager::push_page(const std::string& page, int cursor_pos, int scroll_pos) {
-    previous_page_state_ = PageState(page, cursor_pos, scroll_pos);
-    has_previous_page_ = true;
+    PageState new_page(page, cursor_pos, scroll_pos);
+    
+    // 检查是否存在跳跃式回环 (A->B->C->D->B)
+    for (auto it = page_history_.begin(); it != page_history_.end(); ++it) {
+        if (it->page_name == page) {
+            // 找到重复页面，清空该页面后续的所有路径
+            page_history_.erase(it + 1, page_history_.end());
+            return; // 不添加重复页面，直接返回
+        }
+    }
+    
+    // 正常添加新页面到历史记录
+    page_history_.push_back(new_page);
 }
 
 PageState PageNavigationManager::pop_page() {
-    if (has_previous_page_) {
-        PageState state = previous_page_state_;
-        has_previous_page_ = false;
-        previous_page_state_ = PageState(main_page_, 0, 0);
+    if (!page_history_.empty()) {
+        PageState state = page_history_.back();
+        page_history_.pop_back();
         return state;
     }
     return PageState(main_page_, 0, 0);
 }
 
 std::string PageNavigationManager::get_current_page() const {
-    return has_previous_page_ ? previous_page_state_.page_name : main_page_;
+    return !page_history_.empty() ? page_history_.back().page_name : main_page_;
 }
 
 std::string PageNavigationManager::get_previous_page() const {
-    return has_previous_page_ ? previous_page_state_.page_name : main_page_;
+    if (page_history_.size() >= 2) {
+        return page_history_[page_history_.size() - 2].page_name;
+    }
+    return main_page_;
 }
 
 PageState PageNavigationManager::get_previous_page_state() const {
-    if (has_previous_page_) {
-        return previous_page_state_;
+    if (page_history_.size() >= 2) {
+        return page_history_[page_history_.size() - 2];
     }
     return PageState(main_page_, 0, 0);
 }
 
 bool PageNavigationManager::can_go_back() const {
-    return has_previous_page_;
+    return !page_history_.empty();
 }
 
 std::string PageNavigationManager::handle_back_navigation(bool has_interactive_content) {
@@ -66,6 +79,5 @@ std::string PageNavigationManager::handle_back_navigation(bool has_interactive_c
 }
 
 void PageNavigationManager::clear_stack() {
-    has_previous_page_ = false;
-    previous_page_state_ = PageState(main_page_, 0, 0);
+    page_history_.clear();
 }

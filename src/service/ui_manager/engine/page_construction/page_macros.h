@@ -34,6 +34,10 @@
 #define ADD_MENU(text, target_page, color) \
     all_lines.push_back(LineConfig::create_menu_jump(text, target_page, color));
 
+// 添加带额外字符串参数的菜单项宏
+#define ADD_MENU_WITH_STR(text, target_page, jump_str, color) \
+    all_lines.push_back(LineConfig::create_menu_jump(text, target_page, color, jump_str));
+
 // 添加进度条宏 - 快速添加进度条
 #define ADD_PROGRESS(progress_ptr, color) \
     all_lines.push_back(LineConfig::create_progress_bar(progress_ptr, color));

@@ -214,6 +214,9 @@ public:
     static void log_debug_static(const std::string& message);
     static void log_error_static(const std::string& message);
 
+    // 故障显示
+    static void show_error(const std::string& error_message);
+
 private:
     // 私有构造函数（单例模式）
     UIManager();
@@ -238,8 +241,14 @@ private:
     bool screen_off_;
     uint32_t last_activity_time_;
     uint32_t last_refresh_time_;
-    bool debug_enabled_;
+    static bool debug_enabled_;
     uint32_t last_navigation_time_;
+    
+    // 滚轮加速相关
+    uint32_t navigation_start_time_;     // 开始连续导航的时间
+    bool navigation_direction_up_;       // 当前导航方向
+    bool is_accelerating_;               // 是否处于加速状态
+    uint32_t last_acceleration_time_;    // 上次加速响应时间
     
     // 光标闪烁相关
     uint32_t cursor_blink_timer_;
@@ -262,9 +271,6 @@ private:
     static std::string current_page_name_;                // 当前页面名称
     
     // 故障处理相关
-    ErrorInfo current_error_;          // 当前故障信息
-    std::vector<ErrorInfo> error_history_; // 故障历史记录
-    bool has_error_;                   // 是否有故障
     static ErrorInfo global_error_;    // 全局故障信息
     static bool global_has_error_;     // 全局故障标志
     
@@ -351,11 +357,6 @@ private:
     
     // GPIO输入处理
     void handle_input();
-    
-    // 异常处理相关（简化版）
-    void show_error(const std::string& error_message);
-    void clear_error();
-    void add_error_to_history(const ErrorInfo& error);
 };
 
 #endif // UI_MANAGER_H

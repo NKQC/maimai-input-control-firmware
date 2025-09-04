@@ -10,6 +10,7 @@ typedef uint32_t millis_t;
 #include <functional>
 #include <array>
 #include <vector>
+#include <map>
 #include "../../hal/i2c/hal_i2c.h"
 #include "../../protocol/mai2serial/mai2serial.h"
 #include "../../protocol/hid/hid.h"
@@ -20,6 +21,9 @@ typedef uint32_t millis_t;
 
 // 触摸键盘映射预处理定义
 #define TOUCH_KEYBOARD_KEY HID_KeyCode::KEY_SPACE  // 默认触摸映射按键
+
+// 灵敏度设置定义
+#define DEFAULT_TOUCH_SENSITIVITY 49  // 默认触摸灵敏度 (0-99范围)
 
 // 触摸坐标结构体 - 前向声明，供TouchDeviceMapping使用
 struct TouchAxis {
@@ -83,23 +87,61 @@ struct LogicalKeyMapping {
     }
 };
 
-// 32位触摸设备映射结构体
+// 触摸设备映射结构体 - 8位设备掩码版本
 struct TouchDeviceMapping {
-    uint32_t device_id_mask;                        // 32位设备ID掩码（TouchSensor基类格式）
+    uint8_t device_id_mask;                         // 8位设备ID掩码
     uint8_t max_channels;                           // 设备支持的最大通道数
-    uint8_t sensitivity[28];                        // 每个通道的灵敏度设置（支持最大28通道）
-    uint32_t enabled_channels_mask;                 // 启用通道的32位掩码
-    Mai2_TouchArea serial_area[28];                 // 通道对应的Mai2区域映射
-    TouchAxis hid_area[28];                         // 通道对应的HID坐标映射
-    HID_KeyCode keyboard_keys[28];                  // 通道对应的HID键盘按键映射
+    uint8_t sensitivity[24];                        // 每个物理通道的灵敏度设置（以设备为单位统一管理）
+    uint32_t enabled_channels_mask;                  // 启用的通道掩码（位图，仅低24位有效）
+    
+    // 反向映射：逻辑区域 -> 物理通道
+    // 每个逻辑区域只能绑定一个通道，但一个通道可以被多个逻辑区域绑定
+    // 灵敏度数据与逻辑区域无关，统一由设备的sensitivity数组管理
+    struct AreaChannelMapping {
+        uint32_t channel;                           // 32位物理通道地址：高8位设备掩码+低24位bitmap
+        
+        AreaChannelMapping() : channel(0xFFFFFFFF) {}    // 0xFFFFFFFF表示未映射
+    };
+    
+    // Serial模式：Mai2区域 -> 通道映射（反向映射）
+    AreaChannelMapping serial_mappings[35];         // Mai2区域1-34的映射（索引0未使用）
+    
+    // HID模式：坐标区域 -> 通道映射（支持多个HID触摸点）
+    struct HIDAreaMapping {
+        uint32_t channel;                           // 32位物理通道地址：高8位设备掩码+低24位bitmap
+        TouchAxis coordinates;                      // HID坐标
+        
+        HIDAreaMapping() : channel(0xFFFFFFFF), coordinates({0.0f, 0.0f}) {}  // 0xFFFFFFFF表示未映射
+    };
+    HIDAreaMapping hid_mappings[10];                // 支持最多10个HID触摸区域
+    
+    // 键盘映射：按键 -> 通道
+    struct KeyboardMapping {
+        uint32_t channel;                           // 32位物理通道地址：高8位设备掩码+低24位bitmap
+        
+        KeyboardMapping() : channel(0xFFFFFFFF) {}       // 0xFFFFFFFF表示未映射
+    };
+    std::map<HID_KeyCode, KeyboardMapping> keyboard_mappings; // 按键到通道的映射
     
     TouchDeviceMapping() : device_id_mask(0), max_channels(0), enabled_channels_mask(0) {
-        // 初始化灵敏度为默认值
-        for (int i = 0; i < 28; i++) {
-            sensitivity[i] = 15;  // 默认灵敏度
-            serial_area[i] = MAI2_NO_USED;
-            hid_area[i] = {0.0f, 0.0f};
-            keyboard_keys[i] = HID_KeyCode::KEY_NONE;
+        // 初始化物理通道灵敏度为默认值
+        for (int i = 0; i < 24; i++) {
+            sensitivity[i] = DEFAULT_TOUCH_SENSITIVITY;
+        }
+    }
+    
+    // 根据通道编号获取灵敏度
+    uint8_t getChannelSensitivity(uint8_t channel) const {
+        if (channel < 24) {
+            return sensitivity[channel];
+        }
+        return DEFAULT_TOUCH_SENSITIVITY;  // 默认值
+    }
+    
+    // 设置物理通道的灵敏度
+    void setChannelSensitivity(uint8_t channel, uint8_t sens) {
+        if (channel < 24) {
+            sensitivity[channel] = sens;
         }
     }
 };
@@ -150,7 +192,7 @@ enum class BindingState : uint8_t {
 // 私有配置结构体
 struct InputManager_PrivateConfig {
     InputWorkMode work_mode;
-    TouchDeviceMapping touch_device_mappings[8];    // 32位触摸设备映射
+    TouchDeviceMapping touch_device_mappings[8];    // 8位触摸设备映射
     uint8_t device_count;
     
     // 物理键盘映射配置
@@ -216,8 +258,8 @@ public:
     }
     
     // 核心循环函数
-    void loop0();  // CPU0：TouchSensor触摸采样和Serial/HID处理
-    void loop1();  // CPU1：键盘处理和HID发送
+    void task0();  // CPU0：TouchSensor触摸采样和Serial/HID处理
+    void task1();  // CPU1：键盘处理和HID发送
     
     // 交互式绑定
     void startSerialBinding(InteractiveBindingCallback callback);
@@ -229,14 +271,17 @@ public:
     bool isAutoSerialBindingComplete() const;  // 检查自动绑区是否完成
     void confirmAutoSerialBinding();           // 确认自动绑区结果
     
-    // HID绑定辅助方法
+    // 绑定状态查询
+    BindingState getBindingState() const;      // 获取当前绑定状态
+    
+    // HID绑定相关方法
     void setHIDCoordinates(float x, float y);  // 设置HID绑定坐标
     void confirmHIDBinding();                  // 确认HID绑定
     
     // 灵敏度管理
-    uint8_t autoAdjustSensitivity(uint32_t device_id_mask, uint8_t channel); // 指定通道的灵敏度调整
-    void setSensitivity(uint32_t device_id_mask, uint8_t channel, uint8_t sensitivity);
-    uint8_t getSensitivity(uint32_t device_id_mask, uint8_t channel);
+    uint8_t autoAdjustSensitivity(uint8_t device_id_mask, uint8_t channel); // 指定通道的灵敏度调整
+    void setSensitivity(uint8_t device_id_mask, uint8_t channel, uint8_t sensitivity);
+    uint8_t getSensitivity(uint8_t device_id_mask, uint8_t channel);
     bool setSensitivityByDeviceName(const std::string& device_name, uint8_t channel, uint8_t sensitivity);
     
     // UI专用接口 - 获取所有设备状态
@@ -251,13 +296,22 @@ public:
     
     void get_all_device_status(TouchDeviceStatus data[8], int& device_count);
     
-    // 映射管理
-    void setSerialMapping(uint32_t device_id_mask, uint8_t channel, Mai2_TouchArea area);
-    void setHIDMapping(uint32_t device_id_mask, uint8_t channel, float x, float y);
-    void setTouchKeyboardMapping(uint32_t device_id_mask, uint8_t channel, HID_KeyCode key);
-    Mai2_TouchArea getSerialMapping(uint32_t device_id_mask, uint8_t channel);
-    TouchAxis getHIDMapping(uint32_t device_id_mask, uint8_t channel);
-    HID_KeyCode getTouchKeyboardMapping(uint32_t device_id_mask, uint8_t channel);
+    // 设置Serial映射
+    void setSerialMapping(uint8_t device_id_mask, uint8_t channel, Mai2_TouchArea area);
+    
+    // 设备通道灵敏度管理
+    void setDeviceChannelSensitivity(uint8_t device_id_mask, uint8_t channel, uint8_t sensitivity);
+    uint8_t getDeviceChannelSensitivity(uint8_t device_id_mask, uint8_t channel);
+    
+    // 通过逻辑区域映射设置物理通道灵敏度
+    void setSerialAreaSensitivity(Mai2_TouchArea area, uint8_t sensitivity);
+    void setHIDAreaSensitivity(uint8_t hid_area_index, uint8_t sensitivity);
+    void setKeyboardSensitivity(HID_KeyCode key, uint8_t sensitivity);
+    void setHIDMapping(uint8_t device_id_mask, uint8_t channel, float x, float y);
+    void setTouchKeyboardMapping(uint8_t device_id_mask, uint8_t channel, HID_KeyCode key);
+    Mai2_TouchArea getSerialMapping(uint8_t device_id_mask, uint8_t channel);
+    TouchAxis getHIDMapping(uint8_t device_id_mask, uint8_t channel);
+    HID_KeyCode getTouchKeyboardMapping(uint8_t device_id_mask, uint8_t channel);
     
     // 物理键盘GPIO映射方法
     bool addPhysicalKeyboard(MCU_GPIO gpio, HID_KeyCode default_key = HID_KeyCode::KEY_NONE);
@@ -285,12 +339,15 @@ public:
     void updateChannelStatesAfterBinding();  // 绑定后更新通道状态
     
     // 性能监控
-    uint8_t getTouchSampleRate(uint32_t device_id_mask);  // 获取触摸IC采样速率
-    uint8_t getHIDReportRate();                           // 获取HID键盘回报速率
+    uint32_t getTouchSampleRate();  // 获取触摸IC采样速率
+    uint32_t getHIDReportRate();                           // 获取HID键盘回报速率
     
     // 触摸响应延迟管理
     void setTouchResponseDelay(uint8_t delay_ms);  // 设置触摸响应延迟 (0-100ms)
     uint8_t getTouchResponseDelay() const;         // 获取当前延迟设置
+    
+    // 配置管理
+    InputManager_PrivateConfig getConfig() const;  // 获取当前配置副本
     
     // 采样计数器管理
     inline void incrementSampleCounter();
@@ -308,16 +365,20 @@ private:
     // 设备管理
     std::vector<TouchSensor*> touch_sensor_devices_;           // 注册的TouchSensor设备列表
 
-    
     // 32位触摸状态管理
     struct TouchDeviceState {
-        uint32_t device_id_mask;        // 32位设备ID掩码
-        uint32_t current_touch_mask;    // 当前触摸状态掩码
+        union {
+            uint32_t current_touch_mask;    // 完整的32位触摸状态掩码
+            struct {
+                uint32_t channel_mask : 24;    // 低24位：通道掩码
+                uint8_t device_mask : 8;      // 高8位：设备掩码
+            } parts;
+        };
         uint32_t previous_touch_mask;   // 上一次触摸状态掩码
         uint32_t timestamp_us;          // 微秒级时间戳
         bool is_valid;                  // 状态是否有效
         
-        TouchDeviceState() : device_id_mask(0), current_touch_mask(0), 
+        TouchDeviceState() : current_touch_mask(0), 
                            previous_touch_mask(0), timestamp_us(0), is_valid(false) {}
     };
     TouchDeviceState touch_device_states_[8];          // 每个设备的触摸状态
@@ -369,7 +430,7 @@ private:
     };
     
     struct AutoAdjustContext {
-        uint32_t device_id_mask;
+        uint8_t device_id_mask;
         uint8_t channel;
         uint8_t original_sensitivity;
         uint8_t current_sensitivity;
@@ -429,6 +490,30 @@ private:
     bool getDelayedSerialState(Mai2Serial_TouchState& delayed_state); // 获取延迟后的Serial状态
     inline void processSerialModeWithDelay();          // 带延迟的Serial模式处理
     
+    // 通道mask辅助函数
+    static uint32_t generateChannelMask(uint8_t ic_id, uint8_t channel) {
+        return ((uint32_t)ic_id << 24) | (1UL << channel);
+    }
+    
+    static uint8_t getICFromChannelMask(uint32_t channel_mask) {
+        return (uint8_t)(channel_mask >> 24);
+    }
+    
+    static uint8_t getChannelFromChannelMask(uint32_t channel_mask) {
+        uint32_t channel_bitmap = channel_mask & 0x00FFFFFF;
+        for (uint8_t i = 0; i < 24; i++) {
+            if (channel_bitmap & (1UL << i)) {
+                return i;
+            }
+        }
+        return 0xFF; // 无效通道
+    }
+    
+    static bool isChannelMaskValid(uint32_t channel_mask) {
+        uint32_t channel_bitmap = channel_mask & 0x00FFFFFF;
+        return (channel_mask != 0) && (__builtin_popcount(channel_bitmap) == 1);
+    }
+    
     // 统一键盘处理函数
     void processAutoAdjustSensitivity();
     
@@ -437,10 +522,32 @@ private:
     inline void processGPIOKeyboard();       // 处理GPIO键盘输入
     inline void processTouchKeyboard();      // 处理触摸键盘映射
 
+    // 32位物理通道地址处理辅助函数
+    static uint32_t encodePhysicalChannelAddress(uint8_t device_mask, uint32_t channel_mask) {
+        if (channel_mask == 0 || channel_mask >= (1UL << 24)) return 0xFFFFFFFF;  // 无效通道掩码
+        return (static_cast<uint32_t>(device_mask) << 24) | channel_mask;
+    }
+    
+    static uint8_t decodeDeviceMask(uint32_t physical_address) {
+        return static_cast<uint8_t>((physical_address >> 24) & 0xFF);
+    }
+    
+    static uint8_t decodeChannelNumber(uint32_t physical_address) {
+        uint32_t bitmap = physical_address & 0x00FFFFFF;
+        if (bitmap == 0) return 0xFF;  // 无效
+        return static_cast<uint8_t>(__builtin_ctz(bitmap));  // 找到第一个置位的位置
+    }
+    
+    static bool isValidPhysicalAddress(uint32_t physical_address) {
+        if (physical_address == 0xFFFFFFFF) return false;  // 未映射标识
+        uint32_t bitmap = physical_address & 0x00FFFFFF;
+        return bitmap != 0 && __builtin_popcount(bitmap) == 1;  // 确保只有一个位被设置
+    }
+    
     // 地址处理辅助方法
-    int findTouchDeviceIndex(uint32_t device_id_mask);
-    TouchDeviceMapping* findTouchDeviceMapping(uint32_t device_id_mask);
-    TouchSensor* findTouchSensorByIdMask(uint32_t device_id_mask);
+    int findTouchDeviceIndex(uint8_t device_id_mask);
+    TouchDeviceMapping* findTouchDeviceMapping(uint8_t device_id_mask);
+    TouchSensor* findTouchSensorByIdMask(uint8_t device_id_mask);
     
     // 绑定处理函数
     void processBinding();
@@ -451,4 +558,10 @@ private:
     void restoreChannelStates();
     void sendMai2TouchMessage(Mai2_TouchArea area);
     const char* getMai2AreaName(Mai2_TouchArea area);
+
+    // LOG
+    static void log_debug(std::string msg);
+    static void log_info(std::string msg);
+    static void log_warn(std::string msg);
+    static void log_error(std::string msg);
 };

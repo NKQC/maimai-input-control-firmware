@@ -27,7 +27,7 @@
 
 // HID设置
 
-#define TOUCH_LOCAL_NUM         40      // 最大触摸点数
+#define TOUCH_LOCAL_NUM         64      // 最大触摸点数
 #define KEYBOARD_NUM            3       // 键盘数量 要和描述符保持一致
 #define KEYBOARD_SIMUL_PRESS    12      // 键盘最大同时报告数
 

@@ -1,6 +1,8 @@
 #include "main_menu.h"
 #include "../ui_manager.h"
 #include "src/service/config_manager/config_manager.h"
+#include "src/service/input_manager/input_manager.h"
+#include "src/service/light_manager/light_manager.h"
 #include "../engine/page_construction/page_macros.h"
 #include "../engine/page_construction/page_template.h"
 #include <cstdio>
@@ -16,43 +18,18 @@ MainMenu::MainMenu()
 void MainMenu::render(PageTemplate& page_template) {
     // 主菜单页面 - 使用页面构造宏
     PAGE_START()
+
+    ADD_BACK_ITEM("返回", COLOR_WHITE)
+
     SET_TITLE("主菜单", COLOR_WHITE)
     
-    // 第一行：系统状态菜单项
-    ADD_MENU("系统状态", "status", COLOR_TEXT_WHITE)
+    ADD_MENU("触摸设置", "touch_settings_main", COLOR_TEXT_WHITE)
+
+    ADD_MENU("绑定设置", "binding_settings", COLOR_TEXT_WHITE)
     
-    // 第二行：设置菜单项
-    ADD_MENU("设置", "settings", COLOR_TEXT_WHITE)
+    ADD_MENU("通用设置", "general_settings", COLOR_TEXT_WHITE)
     
-    // 第三行：校准菜单项
-    ADD_MENU("校准", "calibration", COLOR_TEXT_WHITE)
-    
-    // 第四行：诊断菜单项
-    ADD_MENU("诊断", "diagnostics", COLOR_TEXT_WHITE)
-    
-    // 第五行：选择器测试菜单项
-    ADD_MENU("选择器测试", "selector_test", COLOR_TEXT_WHITE)
-    
-    // 第六行：进度条测试 - 使用ADD_PROGRESS宏
-    // progress_data_已在set_progress方法中更新，这里直接使用
-    ADD_PROGRESS(&progress_data_, COLOR_TEXT_WHITE)
-    
-    // 第七行：进度控制设置 - 使用ADD_INT_SETTING宏
-    static int32_t progress_int = progress_;
-    progress_int = progress_;
-    ADD_INT_SETTING(&progress_int, 0, 100, "进度控制", "设置进度值", 
-                   [this](int32_t new_value) { 
-                       // 值变更回调
-                       this->set_progress((int)new_value);
-                   },
-                   []() { 
-                       // 完成回调
-                       // 可以在这里添加保存配置等操作
-                   }, 
-                   COLOR_TEXT_WHITE)
-    
-    // 第八行：返回项
-    ADD_BACK_ITEM("返回主界面", COLOR_TEXT_WHITE)
+    ADD_BUTTON("保存设置", [this]() {this->save_config();}, COLOR_WHITE, LineAlign::LEFT)
     
     PAGE_END()
 }
@@ -79,5 +56,25 @@ void MainMenu::set_progress(int progress) {
 int MainMenu::get_progress() const {
     return progress_;
 }
+
+void MainMenu::save_config() {
+    // 获取各服务的当前配置并写入到ConfigManager
+    ConfigManager* config_mgr = ConfigManager::getInstance();
+    if (config_mgr) {
+        // 调用各服务的配置写入函数
+        InputManager_PrivateConfig input_config = inputmanager_get_config_copy();
+        inputmanager_write_config_to_manager(input_config);
+        
+        UIManager_PrivateConfig ui_config = ui_manager_get_config_copy();
+        ui_manager_write_config_to_manager(config_mgr, ui_config);
+        
+        LightManager_PrivateConfig light_config = lightmanager_get_config_copy();
+        lightmanager_write_config_to_manager(light_config);
+        
+        // 统一保存所有配置到存储
+        ConfigManager::save_config();
+    }
+}
+
 
 } // namespace ui

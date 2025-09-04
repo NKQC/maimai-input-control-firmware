@@ -13,6 +13,7 @@ LineConfig::LineConfig(const LineConfig& other)
     , selected(other.selected)
     , setting_title(other.setting_title)
     , target_page_name(other.target_page_name)
+    , jump_str(other.jump_str)
     , callback_type(other.callback_type) {
     // 复制类型特定数据（union）
     data = other.data;
@@ -51,6 +52,7 @@ LineConfig& LineConfig::operator=(const LineConfig& other) {
         selected = other.selected;
         setting_title = other.setting_title;
         target_page_name = other.target_page_name;
+        jump_str = other.jump_str;
         callback_type = other.callback_type;
 
         // 复制类型特定数据（union）
@@ -91,6 +93,7 @@ LineConfig::LineConfig(LineConfig&& other) noexcept
     , selected(other.selected)
     , setting_title(std::move(other.setting_title))
     , target_page_name(std::move(other.target_page_name))
+    , jump_str(std::move(other.jump_str))
     , callback_type(other.callback_type) {
     // 移动类型特定数据（union）
     data = other.data;
@@ -137,6 +140,7 @@ LineConfig& LineConfig::operator=(LineConfig&& other) noexcept {
         selected = other.selected;
         setting_title = std::move(other.setting_title);
         target_page_name = std::move(other.target_page_name);
+        jump_str = std::move(other.jump_str);
         callback_type = other.callback_type;
         
         // 移动类型特定数据（union）
@@ -733,10 +737,12 @@ void PageTemplate::draw_button_item(int line_index, const LineConfig& config) {
         graphics_engine_->fill_rect(line_rect, COLOR_BG_CARD);
         // 绘制按钮边框
         graphics_engine_->draw_rect(line_rect, config.color);
+        // 绘制选中指示器
+        draw_selection_indicator(line_index);
     }
     
-    // 绘制按钮文本
-    int16_t text_x = get_text_x_position(config.text, config.align, line_rect);
+    // 绘制按钮文本 - 与菜单项保持一致的对齐方式
+    int16_t text_x = line_rect.x + (config.selected ? SELECTION_INDICATOR_WIDTH + 4 : 8);
     int16_t text_y = line_rect.y + (line_rect.height - 14) / 2;
     
     graphics_engine_->draw_chinese_text(config.text.c_str(), text_x, text_y, config.color);
@@ -756,7 +762,7 @@ void PageTemplate::draw_back_item(int line_index, const LineConfig& config) {
     // 绘制返回箭头符号
     int16_t arrow_x = line_rect.x + 2;
     int16_t arrow_y = line_rect.y + (line_rect.height - 8) / 2;
-    graphics_engine_->draw_chinese_text("←", arrow_x, arrow_y, config.color);
+    graphics_engine_->draw_chinese_text("<<", arrow_x, arrow_y, config.color);
     
     // 绘制文本（在箭头右侧）
     int16_t text_x = arrow_x + 12; // 箭头宽度 + 间距

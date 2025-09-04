@@ -48,8 +48,7 @@ public:
     
 private:
     PageNavigationManager() = default;
-    PageState previous_page_state_;  // 只保存上一个页面状态
-    bool has_previous_page_ = false; // 是否有上一个页面
+    std::vector<PageState> page_history_;  // 存储完整的页面历史路径
     std::string main_page_ = "main";
 };
 #endif // UI_CONSTRUCTS_H

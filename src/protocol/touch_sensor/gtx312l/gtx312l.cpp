@@ -8,11 +8,10 @@
 GTX312L::GTX312L(HAL_I2C* i2c_hal, I2C_Bus i2c_bus, uint8_t device_addr)
     : TouchSensor(GTX312L_MAX_CHANNELS), i2c_hal_(i2c_hal), i2c_bus_(i2c_bus), 
       device_addr_(device_addr), i2c_device_address_(device_addr), initialized_(false),
-      module_id_(device_addr), enabled_channels_mask_(0), last_touch_state_(0) {
-    // 构造物理设备地址
-    physical_device_address_.mask = 0x0000;
-    physical_device_address_.i2c_port = static_cast<uint8_t>(i2c_bus);
-    physical_device_address_.addr = device_addr;
+      i2c_bus_enum_(i2c_bus), enabled_channels_mask_(0), last_touch_state_(0) {
+    // 生成模块掩码：bit7=I2C总线编号，bit6-0=I2C地址
+    module_name = "GTX312L";
+    module_mask_ = generateModuleMask(static_cast<uint8_t>(i2c_bus), device_addr);
 }
 
 // GTX312L析构函数
@@ -86,77 +85,24 @@ bool GTX312L::read_device_info(GTX312L_DeviceInfo& info) {
     return true;
 }
 
-// 获取设备名称
-std::string GTX312L::get_device_name() const {
-    char name[32];
-    snprintf(name, sizeof(name), "GTX312L_I2C%d_0x%02X", 
-             static_cast<int>(i2c_bus_), i2c_device_address_);
-    return std::string(name);
-}
+TouchSampleResult GTX312L::sample() {
+    TouchSampleResult result = {0, 0};
+    
+    if (!initialized_) {
+        result.timestamp_us = time_us_32();
+        return result;
+    }
 
-// 获取16位物理设备地址（通道bitmap为0）
-GTX312L_PhysicalAddr GTX312L::get_physical_device_address() const {
-    return physical_device_address_;
-}
-
-// 高效采样接口 没有检查!
-GTX312L_SampleResult GTX312L::sample_touch_data() {
-    // 读取触摸状态寄存器
-    GTX312L_SampleData bitmap;
-    if (!read_register(GTX312L_REG_TOUCH_STATUS_L, bitmap.l) ||
-        !read_register(GTX312L_REG_TOUCH_STATUS_H, bitmap.h)) {
-        return GTX312L_SampleResult(physical_device_address_.mask, 0);
+    GTX312L_SampleData bitmap{};
+    if (read_register(GTX312L_REG_TOUCH_STATUS_L, bitmap.l) &&
+        read_register(GTX312L_REG_TOUCH_STATUS_H, bitmap.h)) {
+        result.channel_mask = (static_cast<uint32_t>(bitmap.value) & 0x0FFFu) & enabled_channels_mask_; // 12位通道掩码，自动限制在24位内
+        result.module_mask = module_mask_;
+        last_touch_state_ = result.channel_mask;
     }
     
-    GTX312L_SampleResult result(physical_device_address_.mask & 0xF000, bitmap.value);
+    result.timestamp_us = time_us_32();
     return result;
-}
-
-// 设置单个通道使能状态
-bool GTX312L::set_channel_enable(uint8_t channel, bool enabled) {
-    if (channel >= GTX312L_MAX_CHANNELS) {
-        return false;
-    }
-    
-    // 读取当前使能寄存器
-    uint8_t enable_low = 0, enable_high = 0;
-    if (!read_register(GTX312L_REG_CH_ENABLE_L, enable_low) ||
-        !read_register(GTX312L_REG_CH_ENABLE_H, enable_high)) {
-        return false;
-    }
-    
-    // 组合16位使能掩码
-    uint16_t enable_mask = (static_cast<uint16_t>(enable_high) << 8) | enable_low;
-    
-    if (enabled) {
-        enable_mask |= (1 << channel);
-    } else {
-        enable_mask &= ~(1 << channel);
-    }
-    
-    // 写回使能寄存器
-    enable_low = enable_mask & 0xFF;
-    enable_high = (enable_mask >> 8) & 0x0F;  // 只有低4位有效
-    
-    bool result = write_register(GTX312L_REG_CH_ENABLE_L, enable_low) &&
-                  write_register(GTX312L_REG_CH_ENABLE_H, enable_high);
-    
-    // 更新启用通道掩码
-    if (result) {
-        enabled_channels_mask_ = enable_mask & 0x0FFF;
-    }
-    
-    return result;
-}
-
-// 设置通道灵敏度
-bool GTX312L::set_sensitivity(uint8_t channel, uint8_t sensitivity) {
-    if (channel >= GTX312L_MAX_CHANNELS || sensitivity > GTX312L_SENSITIVITY_MAX) {
-        return false;
-    }
-    
-    // 灵敏度寄存器从GTX312L_REG_SENSITIVITY_1开始，每个通道一个字节
-    return write_register(GTX312L_REG_SENSITIVITY_1 + channel, sensitivity);
 }
 
 bool GTX312L::write_register(uint8_t reg, uint8_t value) {
@@ -188,43 +134,10 @@ bool GTX312L::read_registers(uint8_t reg, uint8_t* data, size_t length) {
 }
 
 // TouchSensor接口实现
-uint32_t GTX312L::getEnabledModuleMask() const {
-    if (!initialized_) {
-        return 0;
-    }
-    return generateFullMask(module_id_, enabled_channels_mask_);
-}
 
-uint32_t GTX312L::getCurrentTouchState() const {
-    if (!initialized_) {
-        return 0;
-    }
-    
-    // 读取当前触摸状态
-    GTX312L_SampleData bitmap;
-    if (!const_cast<GTX312L*>(this)->read_register(GTX312L_REG_TOUCH_STATUS_L, bitmap.l) ||
-        !const_cast<GTX312L*>(this)->read_register(GTX312L_REG_TOUCH_STATUS_H, bitmap.h)) {
-        return generateFullMask(module_id_, 0);  // 读取失败返回无触摸状态
-    }
-    
-    // 缓存触摸状态并返回完整掩码
-    last_touch_state_ = static_cast<uint32_t>(bitmap.value) & 0x0FFF;  // GTX312L只有12位
-    return generateFullMask(module_id_, last_touch_state_);
-}
 
 uint32_t GTX312L::getSupportedChannelCount() const {
     return static_cast<uint32_t>(max_channels_);
-}
-
-uint32_t GTX312L::getModuleIdMask() const {
-    if (!initialized_) {
-        return 0;
-    }
-    return generateIdMask(module_id_);
-}
-
-std::string GTX312L::getDeviceName() const {
-    return get_device_name();
 }
 
 bool GTX312L::isInitialized() const {
@@ -233,7 +146,17 @@ bool GTX312L::isInitialized() const {
 
 // TouchSensor新接口实现
 bool GTX312L::setChannelEnabled(uint8_t channel, bool enabled) {
-    return set_channel_enable(channel, enabled);
+    if (!initialized_ || channel >= GTX312L_MAX_CHANNELS) {
+        return false;
+    }
+    
+    if (enabled) {
+        enabled_channels_mask_ |= (1UL << channel);
+    } else {
+        enabled_channels_mask_ &= ~(1UL << channel);
+    }
+    
+    return true;
 }
 
 bool GTX312L::getChannelEnabled(uint8_t channel) const {
@@ -248,12 +171,13 @@ uint32_t GTX312L::getEnabledChannelMask() const {
 }
 
 bool GTX312L::setChannelSensitivity(uint8_t channel, uint8_t sensitivity) {
-    if (sensitivity > 99) {
+    if (!initialized_ || channel >= GTX312L_MAX_CHANNELS || sensitivity > 99) {
         return false;
     }
-    // 将0-99范围转换为GTX312L的0-255范围
+    // 将0-99范围转换为GTX312L的0-63范围
     uint8_t gtx_sensitivity = (sensitivity * GTX312L_SENSITIVITY_MAX) / 99;
-    return set_sensitivity(channel, gtx_sensitivity);
+    // 直接写入灵敏度寄存器
+    return write_register(GTX312L_REG_SENSITIVITY_1 + channel, gtx_sensitivity);
 }
 
 uint8_t GTX312L::getChannelSensitivity(uint8_t channel) const {

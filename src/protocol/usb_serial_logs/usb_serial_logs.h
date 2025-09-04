@@ -10,8 +10,7 @@
 
 // USB串口日志系统配置
 #define USB_LOGS_MAX_LINE_LENGTH 256
-#define USB_LOGS_QUEUE_SIZE 20
-#define USB_LOGS_DEFAULT_BAUD_RATE 115200
+#define USB_LOGS_QUEUE_SIZE 200
 
 // 日志级别
 enum class USB_LogLevel : uint8_t {
@@ -31,7 +30,6 @@ enum class USB_LogFormat : uint8_t {
 
 // 日志配置结构
 struct USB_SerialLogs_Config {
-    uint32_t baud_rate;           // 波特率
     USB_LogLevel min_level;       // 最小日志级别
     USB_LogFormat format;         // 日志格式
     bool enable_colors;           // 启用颜色输出
@@ -40,8 +38,7 @@ struct USB_SerialLogs_Config {
     bool auto_flush;              // 自动刷新
     
     USB_SerialLogs_Config() 
-        : baud_rate(USB_LOGS_DEFAULT_BAUD_RATE)
-        , min_level(USB_LogLevel::INFO)
+        : min_level(USB_LogLevel::INFO)
         , format(USB_LogFormat::FULL)
         , enable_colors(true)
 

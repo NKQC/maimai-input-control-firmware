@@ -17,6 +17,10 @@ Mai2Serial::Mai2Serial(HAL_UART* uart_hal)
         command_buffer_[i] = 0;
     }
     last_touch_data_ = Mai2Serial_TouchData();
+
+    // 新增：初始化流式接收缓冲区
+    rx_stream_pos_ = 0;
+    std::memset(rx_stream_buffer_, 0, sizeof(rx_stream_buffer_));
 }
 
 // Mai2Serial析构函数
@@ -71,19 +75,7 @@ Mai2Serial_Config Mai2Serial::get_config() const {
     return config_;
 }
 
-// 保存配置
-bool Mai2Serial::save_config() {
-    // 这里应该保存到EEPROM或Flash
-    // 暂时返回true，实际实现需要根据硬件平台
-    return true;
-}
 
-// 加载配置
-bool Mai2Serial::load_config() {
-    // 这里应该从EEPROM或Flash加载
-    // 暂时返回true，使用默认配置
-    return true;
-}
 
 // 发送触摸数据
 bool Mai2Serial::send_touch_data(const Mai2Serial_TouchData& touch_data) {
@@ -166,9 +158,6 @@ bool Mai2Serial::start() {
     
     status_ = Status::RUNNING;
     
-    // 启动DMA接收模式
-    start_dma_receive();
-    
     send_response("OK");
     return true;
 }
@@ -201,8 +190,6 @@ bool Mai2Serial::set_baud_rate(uint32_t baud_rate) {
     if (!initialized_) {
         return false;
     }
-    
-    // 检查波特率是否有效
     const uint32_t valid_baud_rates[] = {9600, 115200, 250000, 500000, 1000000, 1500000, 2000000};
     bool valid_baud = false;
     for (size_t i = 0; i < sizeof(valid_baud_rates)/sizeof(valid_baud_rates[0]); i++) {
@@ -211,55 +198,12 @@ bool Mai2Serial::set_baud_rate(uint32_t baud_rate) {
             break;
         }
     }
-    
     if (!valid_baud) {
         return false;
     }
-    
     config_.baud_rate = baud_rate;
-    
-    // 重新初始化UART以应用新的波特率
-    uart_hal_->deinit();
-    return uart_hal_->init(0, 1, baud_rate, false);
-}
-
-bool Mai2Serial::set_sample_time(uint16_t sample_time_ms) {
-    config_.sample_time = (uint8_t)(sample_time_ms / 10); // 转换为内部单位
-    
-    // 通知回调
-    if (command_callback_) {
-        uint8_t sample_time_val = config_.sample_time;
-        command_callback_(MAI2SERIAL_CMD_SENS, &sample_time_val, 1);
-    }
-    
+    uart_hal_->set_baudrate(baud_rate);
     return true;
-}
-
-// 显示信息
-void Mai2Serial::show_bind_info() {
-    send_response("=== Touch Point Binding ===");
-    for (int i = 0; i < 34; i++) {  // 34个触摸点
-        char info[64];
-        snprintf(info, sizeof(info), "Point %d: ACTIVE", i);
-        send_response(info);
-    }
-}
-
-// 移除了show_sensitivity_info函数
-
-void Mai2Serial::show_status_info() {
-    const char* status_str = "UNKNOWN";
-    switch (status_) {
-        case Status::STOPPED: status_str = "STOPPED"; break;
-        case Status::READY: status_str = "READY"; break;
-        case Status::RUNNING: status_str = "RUNNING"; break;
-        case Status::ERROR: status_str = "ERROR"; break;
-    }
-    
-    char info[128];
-    snprintf(info, sizeof(info), "Status: %s, Baud: %lu", 
-             status_str, static_cast<unsigned long>(config_.baud_rate));
-    send_response(info);
 }
 
 // 任务处理
@@ -267,18 +211,12 @@ void Mai2Serial::task() {
     if (!initialized_) {
         return;
     }
-    
-    // 处理接收到的命令
     process_commands();
-    
-    // 如果有触摸回调且状态为运行，定期检查触摸数据
     if (status_ == Status::RUNNING && touch_callback_) {
         static uint32_t last_check_time = 0;
         uint32_t current_time = time_us_32() / 1000;
-        
-        if (current_time - last_check_time >= config_.sample_time_ms) {
-            // 这里可以主动请求触摸数据
-            // 实际实现中，触摸数据通常由外部模块推送
+    
+        if (current_time - last_check_time >= 10) {
             last_check_time = current_time;
         }
     }
@@ -391,45 +329,53 @@ void Mai2Serial::send_command_response(uint8_t lr, uint8_t sensor, uint8_t cmd, 
     (void)uart_hal_->write_to_tx_buffer(response, sizeof(response));
 }
 
-// 启动DMA接收
-void Mai2Serial::start_dma_receive() {
-    if (!is_ready()) {
-        return;
-    }
-    
-    // 启动DMA接收模式 - 使用环形缓冲区持续接收
-    // HAL_UART已经在初始化时启用了中断接收到环形缓冲区
-    // 这里不需要额外操作，数据会自动进入缓冲区
-}
-
-// 处理DMA接收的数据
+// 处理DMA接收的数据（流式解析，逐字节滑动窗口）
 void Mai2Serial::process_dma_received_data(const uint8_t* data, size_t length) {
     if (!data || length == 0) {
         return;
     }
-    
-    // 按照mai_com.cpp的实现方式，首先处理标准数据包指令，然后处理字符串指令
-    // 1. 优先处理数据包格式：{...}
-    bool packet_processed = false;
-    for (size_t i = 0; i < length; i++) {
-        if (data[i] == MAI2SERIAL_CMD_START_BYTE) {
-            // 找到数据包格式指令开始，处理这个包
-            size_t remaining = length - i;
-            if (remaining >= MAI2SERIAL_COMMAND_LENGTH) {
-                process_command_packet(&data[i], MAI2SERIAL_COMMAND_LENGTH);
-                packet_processed = true;
-                break; // 处理完数据包后退出，不再处理字符串指令
-            }
+
+    // 先将所有数据追加到内部流式缓冲区，若溢出则丢弃最旧的1字节以腾出空间
+    for (size_t i = 0; i < length; ++i) {
+        if (rx_stream_pos_ >= MAI2SERIAL_STREAM_BUFFER_SIZE) {
+            // 丢弃最前面1字节，整体左移
+            std::memmove(rx_stream_buffer_, rx_stream_buffer_ + 1, MAI2SERIAL_STREAM_BUFFER_SIZE - 1);
+            rx_stream_pos_ = MAI2SERIAL_STREAM_BUFFER_SIZE - 1;
         }
+        rx_stream_buffer_[rx_stream_pos_++] = data[i];
     }
-    
-    // 2. 只有在没有处理数据包指令的情况下，才处理字符串格式指令
-    if (!packet_processed) {
-        for (size_t i = 0; i < length; i++) {
-            if (data[i] != MAI2SERIAL_CMD_START_BYTE) {
-                process_received_byte(data[i]);
+
+    // 滑动窗口按字节解析
+    while (rx_stream_pos_ > 0) {
+        // 若遇到'{'则等待凑齐固定长度再处理
+        if (rx_stream_buffer_[0] == (uint8_t)MAI2SERIAL_CMD_START_BYTE) {
+            if (rx_stream_pos_ < MAI2SERIAL_COMMAND_LENGTH) {
+                // 数据不足，等待下次DMA补齐
+                break;
             }
+            // 检查前8字节内是否包含结束符'}'，若没有则认为还未凑齐（避免误消费）
+            bool has_end = false;
+            for (int i = 1; i < MAI2SERIAL_COMMAND_LENGTH; ++i) {
+                if (rx_stream_buffer_[i] == (uint8_t)MAI2SERIAL_CMD_END_BYTE) { has_end = true; break; }
+            }
+            if (!has_end) {
+                // 仍未完整，等待更多字节
+                break;
+            }
+            // 处理完整的固定长度指令
+            process_command_packet(rx_stream_buffer_, MAI2SERIAL_COMMAND_LENGTH);
+            // 丢弃整个指令长度，继续解析后续数据
+            std::memmove(rx_stream_buffer_, rx_stream_buffer_ + MAI2SERIAL_COMMAND_LENGTH,
+                         rx_stream_pos_ - MAI2SERIAL_COMMAND_LENGTH);
+            rx_stream_pos_ -= MAI2SERIAL_COMMAND_LENGTH;
+            continue;
         }
+
+        // 非'{'开头的字节作为字符串命令流式传入
+        process_received_byte(rx_stream_buffer_[0]);
+        // 丢弃最前面1字节
+        std::memmove(rx_stream_buffer_, rx_stream_buffer_ + 1, rx_stream_pos_ - 1);
+        rx_stream_pos_ -= 1;
     }
 }
 
@@ -458,58 +404,19 @@ void Mai2Serial::parse_command(const std::string& command_str) {
     std::string param = command_str.length() > 1 ? command_str.substr(1) : "";
     
     switch (cmd) {
-        case 'E': // 重置指令 (commandRSET)
-            reset();
-            serial_ok_ = false;  // 重置时停止发送触摸数据
-            // 通知命令回调
-            if (command_callback_) {
-                command_callback_(MAI2SERIAL_CMD_RSET, nullptr, 0);
-            }
-            break;
-            
-        case 'L': // 停止指令 (commandHALT)
-            stop();
-            serial_ok_ = false;  // 进入设置模式，停止发送触摸数据
-            // 通知命令回调
-            if (command_callback_) {
-                command_callback_(MAI2SERIAL_CMD_HALT, nullptr, 0);
-            }
-            break;
-            
-        case 'A': // 状态指令 (commandSTAT)
-            start();
-            serial_ok_ = true;   // 开始发送触摸数据
-            // 通知命令回调
-            if (command_callback_) {
-                command_callback_(MAI2SERIAL_CMD_STAT, nullptr, 0);
-            }
-            break;
-            
-        case 'r': // 比例指令 (commandRatio)
-            // 字符串格式的比例指令，发送简单确认
-            send_response("OK");
-            // 通知命令回调
-            if (command_callback_) {
-                command_callback_(MAI2SERIAL_CMD_RATIO, nullptr, 0);
-            }
-            break;
-            
-        case 'k': // 灵敏度指令 (commandSens) - 不实际执行灵敏度设置
-            // 字符串格式的灵敏度指令，发送简单确认
-            if (!param.empty()) {
-                send_response("OK");
-            } else {
-                send_response("ERROR: Missing parameter");
-            }
-            // 通知命令回调
-            if (command_callback_) {
-                command_callback_(MAI2SERIAL_CMD_SENS, nullptr, 0);
-            }
-            break;
-            
         case '/': // help指令
             if (param == "help") {
-                send_response("Mai2Serial Module Commands:\nE - Reset\nL - Halt\nA - Start\nr - Ratio\nk - Sensitivity\n//help - Show this help");
+                send_response("Mai2Serial Module Commands:\n"
+                    "1=L/R\n"
+                    "2=sensor\n"
+                    "3=cmd\n"
+                    "4=value\n"
+                    "{  E } - Reset\n"
+                    "{  L } - Halt\n"
+                    "{  A } - Start\n"
+                    "{  r } - Ratio\n"
+                    "{  k } - Sensitivity\n"
+                    "/help - Show this help");
             }
             break;
             

@@ -31,10 +31,14 @@ public:
      * @return 当前进度值 (0-100)
      */
     int get_progress() const;
+
+    void save_config();
     
 private:
     int progress_;  // 进度条进度 (0-100)
     uint8_t progress_data_;  // 进度条数据 (0-255)，用于ADD_PROGRESS宏
+
+    
 };
 
 } // namespace ui

@@ -200,7 +200,7 @@ public:
     void force_send_touch_report(); // 强制发送触摸报文
     
     // 状态查询
-    uint8_t get_report_rate() const;
+    uint32_t get_report_rate() const;
 
     void task();
     
@@ -415,7 +415,7 @@ private:
     // 回报速率统计
     uint32_t report_count_;
     uint32_t last_report_time_;
-    uint8_t cached_report_rate_;
+    uint32_t cached_report_rate_;
 
     inline void report_keyboard();
     inline void report_touch(uint32_t _now);

@@ -53,6 +53,7 @@ struct LineConfig {
 
     std::string setting_title;     // 设置项标题
     std::string target_page_name;  // 目标页面名称
+    std::string jump_str;          // 页面跳转时传递的额外字符串参数
     
     // 使用union节省内存 - 不同类型的数据不会同时使用
     union TypeSpecificData {
@@ -133,11 +134,12 @@ struct LineConfig {
     
     // 菜单跳转项构造
     static LineConfig create_menu_jump(const std::string& txt, const std::string& target_page,
-                                     Color c = COLOR_TEXT_WHITE) {
+                                     Color c = COLOR_TEXT_WHITE, const std::string& jump_str = "") {
         LineConfig config;
         config.type = LineType::MENU_JUMP;
         config.text = txt;
         config.target_page_name = target_page;
+        config.jump_str = jump_str;
         config.color = c;
         config.align = LineAlign::LEFT;
         config.selected = false;

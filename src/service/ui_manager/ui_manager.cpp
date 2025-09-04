@@ -36,6 +36,9 @@ uint16_t UIManager::static_framebuffer_[ST7735S_WIDTH * ST7735S_HEIGHT];
 // 静态当前页面名称 预分配32字节
 std::string UIManager::current_page_name_;
 
+// DEBUG
+bool UIManager::debug_enabled_ = false;
+
 // 配置管理函数实现
 UIManager_PrivateConfig* ui_manager_get_config_holder() {
     return &static_config_;
@@ -56,8 +59,11 @@ void uimanager_register_default_configs(config_map_t& default_map) {
 // 配置加载函数 - 从ConfigManager加载配置到静态配置变量
 bool ui_manager_load_config_from_manager(ConfigManager* config_manager) {
     if (config_manager == nullptr) {
+        UIManager::log_error_static("ConfigManager is null in load_config_from_manager");
         return false;
     }
+    
+    UIManager::log_debug_static("Loading configuration from ConfigManager...");
     
     // 从ConfigManager加载各项配置
     static_config_.refresh_rate_ms = config_manager->get_uint16("UIMANAGER_REFRESH_RATE");
@@ -67,6 +73,22 @@ bool ui_manager_load_config_from_manager(ConfigManager* config_manager) {
     static_config_.screen_timeout = config_manager->get_uint16("UIMANAGER_SCREEN_TIMEOUT");
     static_config_.enable_joystick = config_manager->get_bool("UIMANAGER_ENABLE_JOYSTICK");
     static_config_.joystick_sensitivity = config_manager->get_uint8("UIMANAGER_JOYSTICK_SENSITIVITY");
+    
+    UIManager::log_debug_static("Loaded brightness: " + std::to_string(static_config_.brightness));
+    UIManager::log_debug_static("Loaded refresh_rate_ms: " + std::to_string(static_config_.refresh_rate_ms));
+    UIManager::log_debug_static("Loaded enable_backlight: " + std::string(static_config_.enable_backlight ? "true" : "false"));
+    
+    // 应用加载的配置设置
+    UIManager* instance = UIManager::getInstance();
+    if (instance && instance->is_ready()) {
+        // 应用亮度设置
+        instance->set_brightness(static_config_.brightness);
+        // 应用背光设置
+        instance->set_backlight(static_config_.enable_backlight);
+        UIManager::log_debug_static("Applied loaded configuration settings");
+    }
+    
+    UIManager::log_debug_static("Configuration loaded successfully");
     
     return true;
 }
@@ -109,9 +131,6 @@ bool ui_manager_write_config_to_manager(ConfigManager* config_manager, const UIM
     config_manager->set_bool("UIMANAGER_ENABLE_JOYSTICK", config.enable_joystick);
     config_manager->set_uint8("UIMANAGER_JOYSTICK_SENSITIVITY", config.joystick_sensitivity);
     
-    // 保存所有配置到存储
-    config_manager->save_config();
-    
     return true;
 }
 
@@ -138,11 +157,13 @@ UIManager::UIManager()
     , screen_off_(false)
     , last_activity_time_(0)
     , last_refresh_time_(0)
-    , debug_enabled_(false)
     , last_navigation_time_(0)
+    , navigation_start_time_(0)
+    , navigation_direction_up_(false)
+    , is_accelerating_(false)
+    , last_acceleration_time_(0)
     , cursor_blink_timer_(0)
     , cursor_visible_(true)
-    , has_error_(false)
     , binding_step_(0)
     , is_popup_active_(false)
     , popup_caller_page_("")
@@ -208,6 +229,15 @@ bool UIManager::init(const UIManager_Config& config) {
 
     // 切换到主界面
     switch_to_page("main");
+    
+    // 加载并应用配置
+    if (config_manager_) {
+        if (!ui_manager_load_config_from_manager(config_manager_)) {
+            log_error("Failed to load UIManager configuration");
+            return false;
+        }
+        log_debug("UIManager configuration loaded and applied");
+    }
     
     initialized_ = true;
     last_activity_time_ = to_ms_since_boot(get_absolute_time());
@@ -403,11 +433,52 @@ void UIManager::refresh_task_30fps() {
 void UIManager::handle_navigation_input(bool up) {
     uint32_t current_time = to_ms_since_boot(get_absolute_time());
     
-    // 防抖处理
-    if (current_time - last_navigation_time_ < 150) {
-        return;
+    // 检查方向是否改变或是否是新的导航序列
+    bool direction_changed = (navigation_direction_up_ != up);
+    bool is_new_sequence = (current_time - last_navigation_time_ > 1000); // 超过1秒视为新序列
+    
+    if (direction_changed || is_new_sequence) {
+        // 重置加速状态
+        navigation_start_time_ = current_time;
+        navigation_direction_up_ = up;
+        is_accelerating_ = false;
+        last_acceleration_time_ = current_time;
+        
+        log_debug("Navigation sequence " + std::string(is_new_sequence ? "started" : "direction changed") + 
+                 ": " + std::string(up ? "UP" : "DOWN"));
+    } else {
+        // 连续同方向导航，检查加速条件
+        uint32_t sequence_duration = current_time - navigation_start_time_;
+        uint32_t acceleration_interval;
+        
+        if (sequence_duration >= 3000) {
+            // 3秒后：每秒10次 = 100ms间隔
+            acceleration_interval = 100;
+            if (!is_accelerating_) {
+                is_accelerating_ = true;
+                log_debug("Navigation acceleration: Stage 2 (10Hz)");
+            }
+        } else if (sequence_duration >= 1000) {
+            // 1-3秒：每秒5次 = 200ms间隔
+            acceleration_interval = 200;
+            if (!is_accelerating_) {
+                is_accelerating_ = true;
+                log_debug("Navigation acceleration: Stage 1 (5Hz)");
+            }
+        } else {
+            // 1秒内：正常防抖 150ms
+            acceleration_interval = 150;
+        }
+        
+        // 检查是否满足加速间隔
+        if (current_time - last_acceleration_time_ < acceleration_interval) {
+            return;
+        }
     }
+    
+    // 更新时间戳
     last_navigation_time_ = current_time;
+    last_acceleration_time_ = current_time;
     
     // 记录活动时间
     last_activity_time_ = current_time;
@@ -520,9 +591,33 @@ void UIManager::handle_confirm_input() {
         if (menu_count <= 0 || current_menu_index_ < 0 || current_menu_index_ >= menu_count) {
             return;
         }
-        line_config = const_cast<LineConfig*>(&page_template_->get_line_config(current_menu_index_));
+        
+        // 找到第current_menu_index_个可交互项在all_lines_中的实际索引
         auto& lines = page_template_->get_mutable_all_lines();
-        mutable_line = &lines[current_menu_index_];
+        int actual_line_index = -1;
+        int menu_item_counter = 0;
+        
+        for (int i = 0; i < (int)lines.size(); ++i) {
+            if (!lines[i].text.empty() && 
+                (lines[i].type == LineType::MENU_JUMP ||
+                 lines[i].type == LineType::INT_SETTING ||
+                 lines[i].type == LineType::BUTTON_ITEM ||
+                 lines[i].type == LineType::BACK_ITEM ||
+                 lines[i].type == LineType::SELECTOR_ITEM)) {
+                if (menu_item_counter == current_menu_index_) {
+                    actual_line_index = i;
+                    break;
+                }
+                menu_item_counter++;
+            }
+        }
+        
+        if (actual_line_index == -1 || actual_line_index >= (int)lines.size()) {
+            return;
+        }
+        
+        line_config = &lines[actual_line_index];
+        mutable_line = &lines[actual_line_index];
     }
 
     // 使用switch跳表处理不同类型
@@ -541,6 +636,15 @@ void UIManager::handle_confirm_input() {
             
         case LineType::BACK_ITEM:
             handle_back_item();
+            break;
+            
+        case LineType::BUTTON_ITEM:
+            // 处理按钮点击
+            if (line_config->callback_type == LineConfig::CallbackType::CLICK &&
+                line_config->callback_data.click_callback) {
+                line_config->callback_data.click_callback();
+                log_debug("Button clicked: " + line_config->text);
+            }
             break;
             
         default:
@@ -576,8 +680,18 @@ void UIManager::handle_menu_jump(const LineConfig* line_config) {
     int scroll_pos = page_template_->get_scroll_position();
     
     PageNavigationManager::getInstance().push_page(current_page_name_, current_menu_index_, scroll_pos);
+    
     // 使用LineConfig的target_page_name进行跳转
     switch_to_page(line_config->target_page_name);
+    
+    // 如果有jump_str参数，则调用目标页面的jump_str函数
+    if (!line_config->jump_str.empty()) {
+        auto& registry = ui::PageRegistry::get_instance();
+        auto page_constructor = registry.get_page(line_config->target_page_name);
+        if (page_constructor) {
+            page_constructor->jump_str(line_config->jump_str);
+        }
+    }
 }
 
 void UIManager::handle_int_setting(const LineConfig* line_config) {
@@ -774,9 +888,7 @@ void UIManager::task() {
     
     // 处理息屏
     handle_screen_timeout();
-    
-    // 故障检测已简化，不再需要专门的处理函数
-    
+
     // 更新统计信息
     statistics_.uptime_seconds = current_time / 1000;
     
@@ -798,7 +910,7 @@ void UIManager::task() {
         }
 
         // 检查是否有故障需要显示
-        if (has_error_ || global_has_error_) {
+        if (global_has_error_) {
             wake_screen();
         }
         
@@ -843,6 +955,7 @@ bool UIManager::get_backlight() const {
 // 设置亮度
 bool UIManager::set_brightness(uint8_t brightness) {
     static_config_.brightness = brightness;
+    
     if (display_device_) {
         return display_device_->set_backlight(brightness);
     }
@@ -906,9 +1019,11 @@ void UIManager::log_error(const std::string& message) {
 
 // 静态日志方法实现
 void UIManager::log_debug_static(const std::string& message) {
-    auto* logger = USB_SerialLogs::get_global_instance();
-    if (logger) {
-        logger->debug(message, "UIManager");
+    if (debug_enabled_) {
+        auto* logger = USB_SerialLogs::get_global_instance();
+        if (logger) {
+            logger->debug(message, "UIManager");
+        }
     }
 }
 
@@ -958,14 +1073,29 @@ bool UIManager::adjust_int_setting_value(bool increase) {
     
     int32_t current_value = *popup_int_setting_data_.int_setting_value_ptr_;
     int32_t new_value = current_value;
-    log_debug("current_value=" + std::to_string(current_value));
+    
+    // 根据摇杆灵敏度配置计算步长
+    int32_t step = 1;
+    if (static_config_.joystick_sensitivity > 5) {
+        // 高灵敏度：步长更大
+        step = static_config_.joystick_sensitivity - 4; // 灵敏度6-10对应步长2-6
+    } else if (static_config_.joystick_sensitivity < 3) {
+        // 低灵敏度：保持步长为1，但可以考虑更慢的响应
+        step = 1;
+    } else {
+        // 中等灵敏度：默认步长
+        step = 1;
+    }
+    
+    log_debug("current_value=" + std::to_string(current_value) + ", sensitivity=" + std::to_string(static_config_.joystick_sensitivity) + ", step=" + std::to_string(step));
+    
     if (increase) {
         if (current_value < popup_int_setting_data_.max_value) {
-            new_value = current_value + 1;
+            new_value = std::min(current_value + step, popup_int_setting_data_.max_value);
         }
     } else {
         if (current_value > popup_int_setting_data_.min_value) {
-            new_value = current_value - 1;
+            new_value = std::max(current_value - step, popup_int_setting_data_.min_value);
         }
     }
     
@@ -1318,7 +1448,7 @@ bool UIManager::wake_screen() {
         last_activity_time_ = to_ms_since_boot(get_absolute_time());
         // 唤醒屏幕：恢复背光
         if (display_device_ && backlight_enabled_) {
-            display_device_->set_backlight(true);
+            display_device_->set_backlight(255);
         }
         return true;
     }
@@ -1329,12 +1459,7 @@ void UIManager::enable_debug_output(bool enabled) {
     debug_enabled_ = enabled;
 }
 
-void UIManager::add_error_to_history(const ErrorInfo& error) {
-    error_history_.push_back(error);
-    
-    // 限制历史记录数量，避免内存溢出
-    const size_t MAX_ERROR_HISTORY = 50;
-    if (error_history_.size() > MAX_ERROR_HISTORY) {
-        error_history_.erase(error_history_.begin());
-    }
+void UIManager::show_error(const std::string& error_message) {
+    global_error_.message = error_message;
+    global_has_error_ = true;
 }

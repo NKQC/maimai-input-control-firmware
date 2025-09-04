@@ -1,7 +1,13 @@
 #include "page_registry.h"
 #include "page/main_page.h"
 #include "page/main_menu.h"
-#include "page/selector_test.h"
+#include "page/touch_settings/touch_settings_main.h"
+#include "page/touch_settings/touch_ic_status.h"
+#include "page/touch_settings/sensitivity_main.h"
+#include "page/touch_settings/sensitivity_device.h"
+#include "page/touch_settings/interactive_sensitivity.h"
+#include "page/binding_settings/binding_settings.h"
+#include "page/general_settings/general_settings.h"
 #include "engine/template_page/error_page.h"
 #include "engine/template_page/int_setting_page.h"
 #include <algorithm>
@@ -71,9 +77,29 @@ void PageRegistry::register_default_pages() {
     auto main_menu_page = std::make_shared<MainMenu>();
     register_page("main_menu", main_menu_page);
     
-    // 注册选择器测试页面
-    auto selector_test_page = std::make_shared<SelectorTest>();
-    register_page("selector_test", selector_test_page);
+    // 注册触摸设置相关页面
+    auto touch_settings_main_page = std::make_shared<TouchSettingsMain>();
+    register_page("touch_settings_main", touch_settings_main_page);
+    
+    auto touch_ic_status_page = std::make_shared<TouchICStatus>();
+    register_page("touch_ic_status", touch_ic_status_page);
+    
+    auto sensitivity_main_page = std::make_shared<SensitivityMain>();
+    register_page("sensitivity_main", sensitivity_main_page);
+    
+    auto sensitivity_device_page = std::make_shared<SensitivityDevice>();
+    register_page("sensitivity_device", sensitivity_device_page);
+    
+    auto interactive_sensitivity_page = std::make_shared<InteractiveSensitivity>();
+    register_page("interactive_sensitivity", interactive_sensitivity_page);
+    
+    // 注册绑区设置页面
+    auto binding_settings_page = std::make_shared<BindingSettings>();
+    register_page("binding_settings", binding_settings_page);
+    
+    // 注册通用设置页面
+    auto general_settings_page = std::make_shared<GeneralSettings>();
+    register_page("general_settings", general_settings_page);
     
     // 可以在这里添加更多默认页面的注册
     // REGISTER_PAGE("settings", SettingsPage);

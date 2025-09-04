@@ -13,7 +13,8 @@ extern "C" {
  * HAL层 - I2C接口抽象类
  * 提供底层I2C接口，支持I2C0和I2C1两个实例
  * 使用DMA实现高效的数据传输
- * 只负责提供I2C通道枚举，不管理其他业务逻辑
+ * TODO: DMA尚未跑通 参考
+ * https://github.com/fivdi/pico-i2c-dma/blob/master/src/i2c_dma.c
  */
 
 // I2C总线枚举 - HAL层只提供通道信息

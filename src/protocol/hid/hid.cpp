@@ -111,7 +111,7 @@ void HID::force_send_keyboard_report() {
 }
 
 // 获取实际回报速率
-uint8_t HID::get_report_rate() const {
+uint32_t HID::get_report_rate() const {
     return cached_report_rate_;
 }
 

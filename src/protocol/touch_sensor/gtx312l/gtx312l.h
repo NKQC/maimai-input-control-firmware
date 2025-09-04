@@ -16,69 +16,6 @@
  */
 typedef uint32_t millis_t;
 
-// 16位物理地址掩码和反馈结构体 - 使用union和位域
-union GTX312L_PhysicalAddr {
-    struct {
-        uint16_t CH0: 1;     // 通道0状态
-        uint16_t CH1: 1;     // 通道1状态
-        uint16_t CH2: 1;     // 通道2状态
-        uint16_t CH3: 1;     // 通道3状态
-        uint16_t CH4: 1;     // 通道4状态
-        uint16_t CH5: 1;     // 通道5状态
-        uint16_t CH6: 1;     // 通道6状态
-        uint16_t CH7: 1;     // 通道7状态
-        uint16_t CH8: 1;     // 通道8状态
-        uint16_t CH9: 1;     // 通道9状态
-        uint16_t CH10: 1;    // 通道10状态
-        uint16_t CH11: 1;    // 通道11状态
-        uint16_t addr: 2;    // GTX312L设备地址 (13-12位)
-        uint16_t i2c_port: 2; // I2C端口 (15-14位)
-    };
-    uint16_t mask;           // 完整的16位掩码
-    
-    // 构造函数
-    GTX312L_PhysicalAddr(uint8_t i2c_addr = 0, uint8_t gtx_addr = 0, uint16_t channel_bitmap = 0) {
-        mask = ((uint16_t)(i2c_addr & 0x03) << 14) | 
-               ((uint16_t)(gtx_addr & 0x03) << 12) | 
-               (channel_bitmap & 0x0FFF);
-    }
-    
-    // 获取设备掩码 (通道bitmap为0时的地址)
-    uint16_t get_device_mask() const {
-        return mask & 0xF000;
-    }
-};
-
-union GTX312L_PortEnableBitmap {
-    struct {
-        uint16_t CH0: 1;     // 通道0状态
-        uint16_t CH1: 1;     // 通道1状态
-        uint16_t CH2: 1;     // 通道2状态
-        uint16_t CH3: 1;     // 通道3状态
-        uint16_t CH4: 1;     // 通道4状态
-        uint16_t CH5: 1;     // 通道5状态
-        uint16_t CH6: 1;     // 通道6状态
-        uint16_t CH7: 1;     // 通道7状态
-        uint16_t CH8: 1;     // 通道8状态
-        uint16_t CH9: 1;     // 通道9状态
-        uint16_t CH10: 1;    // 通道10状态
-        uint16_t CH11: 1;    // 通道11状态
-    } port_enable;
-    uint16_t value;
-};
-
-// GTX312L采样结果结构体
-struct GTX312L_SampleResult {
-    GTX312L_PhysicalAddr physical_addr;  // 包含设备地址和触摸bitmap的完整16位数据
-    millis_t timestamp;                  // 时间戳
-    
-    // 默认构造函数
-    GTX312L_SampleResult() : physical_addr(0, 0, 0), timestamp(0) {}
-    
-    GTX312L_SampleResult(uint16_t device_mask, uint16_t touch_bitmap) 
-        : physical_addr((device_mask | (touch_bitmap & 0x0FFF))), timestamp(0) {}
-};
-
 // https://www.cpbay.com/Uploads/20210128/601279b9b90ec.pdf
 
 // GTX312L I2C地址范围（可配置）
@@ -140,30 +77,7 @@ struct GTX312L_SampleResult {
 #define GTX312L_EXP_EN              0x02    // 扩展功能使能位
 #define GTX312L_EXP_MODE            0x01    // 扩展模式位
 
-// 触摸数据结构（12个通道的状态）
-struct GTX312L_TouchData {
-    uint16_t touch_status;                      // 12位触摸状态（位0-11对应通道0-11）
-    uint32_t timestamp;                         // 时间戳
-    bool valid;                                 // 数据是否有效
-    
-    GTX312L_TouchData() : touch_status(0), timestamp(0), valid(false) {
-    }
-    
-    // 检查指定通道是否被触摸
-    bool is_channel_touched(uint8_t channel) const {
-        if (channel >= GTX312L_MAX_CHANNELS) return false;
-        return (touch_status & (1 << channel)) != 0;
-    }
-    
-    // 获取被触摸的通道数量
-    uint8_t get_touched_count() const {
-        uint8_t count = 0;
-        for (int i = 0; i < GTX312L_MAX_CHANNELS; i++) {
-            if (touch_status & (1 << i)) count++;
-        }
-        return count;
-    }
-};
+
 
 // 设备信息结构
 struct GTX312L_DeviceInfo {
@@ -181,8 +95,7 @@ typedef union {
     uint16_t value;
 } GTX312L_SampleData;
 
-// 触摸回调函数类型
-typedef std::function<void(uint8_t device_index, const GTX312L_TouchData& touch_data)> GTX312L_TouchCallback;
+
 
 class GTX312L : public TouchSensor {
 public:
@@ -191,29 +104,14 @@ public:
     
     // 初始化和清理
     // TouchSensor接口实现
-    uint32_t getEnabledModuleMask() const override;
-    uint32_t getCurrentTouchState() const override;
+    TouchSampleResult sample() override; // 统一采样接口
     uint32_t getSupportedChannelCount() const override;
-    uint32_t getModuleIdMask() const override;
     bool init() override;
     void deinit() override;
-    std::string getDeviceName() const override;
     bool isInitialized() const override;
     
-    // 物理地址相关
-    GTX312L_PhysicalAddr get_physical_device_address() const;  // 获取16位物理设备地址（通道bitmap为0）
-    
-    // 触摸数据读取 - 返回设备地址+采样bitmap
-    GTX312L_SampleResult sample_touch_data();  // 高效采样接口
-    
-    // 设备信息
-    bool read_device_info(GTX312L_DeviceInfo& info);
     // GTX312L特有接口
-    std::string get_device_name() const;  // 保持向后兼容
-    
-    // 核心功能接口
-    bool set_channel_enable(uint8_t channel, bool enabled);            // 设置单个通道使能状态
-    bool set_sensitivity(uint8_t channel, uint8_t sensitivity);        // 设置通道灵敏度
+    bool read_device_info(GTX312L_DeviceInfo& info);
     
     // TouchSensor新接口实现
     bool setChannelEnabled(uint8_t channel, bool enabled) override;    // 设置单个通道使能
@@ -228,11 +126,10 @@ private:
     I2C_Bus i2c_bus_;
     uint8_t device_addr_;                    // GTX312L设备地址 (0-3)
     uint8_t i2c_device_address_;             // 实际I2C设备地址 (0x14 + device_addr_)
-    GTX312L_PhysicalAddr physical_device_address_;  // 16位物理设备地址
     
     // 设备状态
     bool initialized_;
-    uint8_t module_id_;                      // 模块ID（0-15）
+    I2C_Bus i2c_bus_enum_;                   // I2C总线枚举
     uint32_t enabled_channels_mask_;         // 启用的通道掩码
     mutable uint32_t last_touch_state_;      // 最后一次触摸状态缓存
     

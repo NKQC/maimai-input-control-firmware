@@ -10,6 +10,7 @@
  * 基于I2C通信的电容式触摸控制器
  * 支持最多13个触摸通道
  * 工作电压：2.6V-5.5V，支持I2C接口
+ * https://www.analog.com/media/en/technical-documentation/data-sheets/ad7147.pdf
  */
 
 // AD7147寄存器定义
@@ -17,40 +18,35 @@
 #define AD7147_MAX_CHANNELS         13      // 最大触摸通道数
 
 // 主要寄存器地址
-#define AD7147_REG_PWR_CONTROL      0x00    // 电源控制寄存器
-#define AD7147_REG_STAGE_CAL_EN     0x01    // 阶段校准使能寄存器
-#define AD7147_REG_AMB_COMP_CTRL0   0x02    // 环境补偿控制寄存器0
-#define AD7147_REG_AMB_COMP_CTRL1   0x03    // 环境补偿控制寄存器1
-#define AD7147_REG_AMB_COMP_CTRL2   0x04    // 环境补偿控制寄存器2
-#define AD7147_REG_STAGE_LOW_INT_EN 0x05    // 阶段低中断使能寄存器
-#define AD7147_REG_STAGE_HIGH_INT_EN 0x06   // 阶段高中断使能寄存器
-#define AD7147_REG_STAGE_COMPLETE_INT_EN 0x07 // 阶段完成中断使能寄存器
-#define AD7147_REG_STAGE_LOW_LIMIT_INT 0x08   // 阶段低限制中断寄存器
-#define AD7147_REG_STAGE_HIGH_LIMIT_INT 0x09  // 阶段高限制中断寄存器
-#define AD7147_REG_STAGE_COMPLETE_LIMIT_INT 0x0A // 阶段完成限制中断寄存器
+#define AD7147_REG_PWR_CONTROL      0x0000  // 电源控制寄存器
+#define AD7147_REG_STAGE_CAL_EN     0x0001  // 阶段校准使能寄存器
+#define AD7147_REG_AMB_COMP_CTRL0   0x0002  // 环境补偿控制寄存器0
+#define AD7147_REG_AMB_COMP_CTRL1   0x0003  // 环境补偿控制寄存器1
+#define AD7147_REG_AMB_COMP_CTRL2   0x0004  // 环境补偿控制寄存器2
+#define AD7147_REG_STAGE_LOW_INT_EN 0x0005  // 阶段低中断使能寄存器
+#define AD7147_REG_STAGE_HIGH_INT_EN 0x0006 // 阶段高中断使能寄存器
+#define AD7147_REG_STAGE_COMPLETE_INT_EN 0x0007 // 阶段完成中断使能寄存器
 
-// 触摸数据结构体
-struct AD7147_TouchData {
-    uint16_t touch_status;      // 13位触摸状态（位0-12对应通道0-12）
-    uint32_t timestamp;         // 时间戳
-    bool valid;                 // 数据是否有效
-    
-    AD7147_TouchData() : touch_status(0), timestamp(0), valid(false) {}
-    
-    bool is_channel_touched(uint8_t channel) const {
-        return (channel < AD7147_MAX_CHANNELS) && ((touch_status >> channel) & 0x01);
-    }
-    
-    uint8_t get_touched_count() const {
-        uint8_t count = 0;
-        for (uint8_t i = 0; i < AD7147_MAX_CHANNELS; i++) {
-            if ((touch_status >> i) & 0x01) {
-                count++;
-            }
-        }
-        return count;
-    }
-};
+// 状态寄存器（读取将清除已置位的状态位）
+#define AD7147_REG_STAGE_LOW_INT_STATUS      0x0008    // 阶段低中断状态寄存器
+#define AD7147_REG_STAGE_HIGH_INT_STATUS     0x0009    // 阶段高中断状态寄存器
+#define AD7147_REG_STAGE_COMPLETE_INT_STATUS 0x000A    // 阶段完成中断状态寄存器
+
+// Stage配置寄存器基地址（每个stage占用8个16位寄存器）
+#define AD7147_REG_STAGE0_CONNECTION         0x0080   // Stage 0连接寄存器
+#define AD7147_REG_STAGE_SIZE                8        // 每个stage占用的寄存器数量
+
+// Stage寄存器偏移（相对于STAGEx_CONNECTION基地址）
+#define AD7147_STAGE_CONNECTION_OFFSET       0        // 连接配置寄存器偏移
+#define AD7147_STAGE_AFE_OFFSET_OFFSET       2        // AFE偏移寄存器偏移
+#define AD7147_STAGE_SENSITIVITY_OFFSET      3        // 灵敏度寄存器偏移
+#define AD7147_STAGE_OFFSET_LOW_OFFSET       4        // 低偏移寄存器偏移
+#define AD7147_STAGE_OFFSET_HIGH_OFFSET      5        // 高偏移寄存器偏移
+#define AD7147_STAGE_OFFSET_HIGH_CLAMP_OFFSET 6       // 高偏移钳位寄存器偏移
+#define AD7147_STAGE_OFFSET_LOW_CLAMP_OFFSET 7        // 低偏移钳位寄存器偏移
+
+// 灵敏度寄存器默认值
+#define AD7147_SENSITIVITY_DEFAULT           0x2626   // 默认灵敏度值
 
 // 设备信息结构体
 struct AD7147_DeviceInfo {
@@ -66,20 +62,18 @@ public:
     ~AD7147() override;
     
     // TouchSensor接口实现
-    uint32_t getEnabledModuleMask() const override;
-    uint32_t getCurrentTouchState() const override;
     uint32_t getSupportedChannelCount() const override;
-    uint32_t getModuleIdMask() const override;
     bool init() override;
     void deinit() override;
-    std::string getDeviceName() const override;
     bool isInitialized() const override;
+    bool setChannelSensitivity(uint8_t channel, uint8_t sensitivity) override;  // 设置通道灵敏度 (0-99)
+    TouchSampleResult sample() override; // 统一采样接口
+    bool setChannelEnabled(uint8_t channel, bool enabled) override;    // 设置单个通道使能
+    bool getChannelEnabled(uint8_t channel) const override;            // 获取单个通道使能状态
+    uint32_t getEnabledChannelMask() const override;                   // 获取启用通道掩码
     
     // AD7147特有接口
     bool read_device_info(AD7147_DeviceInfo& info);
-    AD7147_TouchData sample_touch_data();
-    bool set_channel_enable(uint8_t channel, bool enabled);
-    bool set_sensitivity(uint8_t channel, uint8_t sensitivity);
     
 private:
     // 硬件接口
@@ -90,13 +84,16 @@ private:
     
     // 设备状态
     bool initialized_;
-    uint8_t module_id_;                      // 模块ID（0-15）
+    I2C_Bus i2c_bus_enum_;                   // I2C总线枚举
     uint32_t enabled_channels_mask_;         // 启用的通道掩码
     mutable uint32_t last_touch_state_;      // 最后一次触摸状态缓存
-    
-    // 内部辅助函数
-    bool write_register(uint8_t reg, uint16_t value);
-    bool read_register(uint8_t reg, uint16_t& value);
-    bool write_registers(uint8_t reg, const uint16_t* data, size_t length);
-    bool read_registers(uint8_t reg, uint16_t* data, size_t length);
+
+    // 将启用通道掩码实时下发到硬件，使对应Stage的校准/中断启用或关闭
+    bool applyEnabledChannelsToHardware();
+
+    // 内部辅助函数（16位寄存器地址 + 16位数据）
+    bool write_register(uint16_t reg, uint16_t value);
+    bool read_register(uint16_t reg, uint16_t& value);
+    bool write_registers(uint16_t start_reg, const uint16_t* data, size_t length);
+    bool read_registers(uint16_t start_reg, uint16_t* data, size_t length);
 };

@@ -387,7 +387,6 @@ std::string USB_SerialLogs::get_timestamp_string(uint32_t timestamp) const {
 }
 
 void USB_SerialLogs::add_to_queue(const USB_LogEntry& entry) {
-    // 确保队列不超过20个条目
 
     while (log_queue_.size() >= USB_LOGS_QUEUE_SIZE) {
         // 队列满，丢弃最旧的日志
@@ -397,10 +396,6 @@ void USB_SerialLogs::add_to_queue(const USB_LogEntry& entry) {
 
     log_queue_.push(entry);
 }
-
-// process_queue函数已移除，日志直接在flush中处理
-
-// send_log_entry函数已移除，日志直接在flush中处理
 
 void USB_SerialLogs::update_statistics(USB_LogLevel level) {
     stats_.total_logs++;

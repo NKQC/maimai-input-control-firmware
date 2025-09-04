@@ -3,6 +3,7 @@
 #include "../engine/page_construction/page_macros.h"
 #include "pico/time.h"
 #include "pico/stdlib.h"
+#include "../../input_manager/input_manager.h"
 #include <cstdio>
 
 namespace ui {
@@ -19,35 +20,34 @@ void MainPage::render(PageTemplate& page_template) {
     uint32_t current_time_ms = to_ms_since_boot(get_absolute_time());
     update_uptime(current_time_ms);
 
+    // 获取InputManager实例来获取回报率信息
+    InputManager* input_manager = InputManager::getInstance();
+    
     // 主界面页面 - 使用页面构造宏简化代码
     PAGE_START()
     SET_TITLE("主界面", COLOR_WHITE)
     
-    // 第一行：运行时长
-    std::string uptime_text = "运行时长: " + format_uptime(uptime_ms_);
-    ADD_TEXT(uptime_text, COLOR_TEXT_WHITE, LineAlign::LEFT)
+    // 第一行：触摸轮询回报率
+    std::string touch_rate_text = "触摸轮询: ";
+    if (input_manager) {
+        // 获取实际的采样率（不依赖特定设备ID）
+        touch_rate_text += std::to_string(input_manager->getTouchSampleRate()) + "Hz";
+    } else {
+        touch_rate_text += "N/A";
+    }
+    ADD_TEXT(touch_rate_text, COLOR_TEXT_WHITE, LineAlign::LEFT)
     
-    // 第二行：系统状态
-    std::string status_text = "状态: " + system_status_;
-    Color status_color = (system_status_ == "系统正常") ? COLOR_SUCCESS : COLOR_ERROR;
-    ADD_TEXT(status_text, status_color, LineAlign::LEFT)
-    
-    // 第三行：连接状态
-    std::string connection_text = "连接: " + get_connection_text();
-    Color connection_color = connection_status_ ? COLOR_SUCCESS : COLOR_WARNING;
-    ADD_TEXT(connection_text, connection_color, LineAlign::LEFT)
-    
-    // 第四行：隐藏的菜单跳转项，用于按钮A跳转到主菜单
-    ADD_MENU("A:菜单 B:设置", "main_menu", COLOR_TEXT_WHITE)
-    
-    // 第五行：额外信息行（用于测试滚动条）
-    ADD_TEXT("内存使用: 45%", COLOR_TEXT_WHITE, LineAlign::LEFT)
-    
-    // 第六行：额外信息行
-    ADD_TEXT("CPU温度: 42°C", COLOR_TEXT_WHITE, LineAlign::LEFT)
-    
-    // 第七行：额外菜单项
-    ADD_MENU("调试信息", "debug", COLOR_TEXT_WHITE)
+    // 第二行：键盘回报率
+    std::string keyboard_rate_text = "键盘回报: ";
+    if (input_manager) {
+        keyboard_rate_text += std::to_string(input_manager->getHIDReportRate()) + "Hz";
+    } else {
+        keyboard_rate_text += "N/A";
+    }
+    ADD_TEXT(keyboard_rate_text, COLOR_TEXT_WHITE, LineAlign::LEFT)
+
+    // 第五行：主菜单跳转
+    ADD_MENU(">> 主菜单", "main_menu", COLOR_TEXT_WHITE)
     
     PAGE_END()
 }

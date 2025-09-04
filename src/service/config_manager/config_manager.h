@@ -2,20 +2,83 @@
 
 #include <string>
 #include <map>
-#include <mutex>
-#ifdef PICO_PLATFORM
-#include "pico/mutex.h"
-#endif
 #include <functional>
 #include "config_types.h"
 #include "config_crc.h"
-#include <mutex>
+
+#ifdef PICO_PLATFORM
+#include "LittleFS.h"
+#endif
 
 // 配置键常量
 #define CONFIG_KEY_CRC "__crc32__"
 
 // 配置初始化函数类型
 using ConfigInitFunction = std::function<void(config_map_t&)>;
+
+// 流式JSON解析器状态
+enum class JsonParseState {
+    EXPECT_OBJECT_START,    // 期待对象开始 '{'
+    EXPECT_KEY,             // 期待键
+    EXPECT_COLON,           // 期待冒号 ':'
+    EXPECT_VALUE,           // 期待值
+    EXPECT_COMMA_OR_END,    // 期待逗号或结束
+    PARSING_OBJECT_VALUE,   // 解析对象值
+    COMPLETE                // 解析完成
+};
+
+// 流式JSON解析器
+class StreamingJsonParser {
+public:
+    StreamingJsonParser();
+    void reset();
+    bool parse_chunk(const std::string& chunk);
+    bool is_complete() const { return state_ == JsonParseState::COMPLETE; }
+    std::map<std::string, std::string> get_parsed_data() const { return parsed_data_; }
+    
+private:
+    JsonParseState state_;
+    std::string buffer_;
+    std::string current_key_;
+    std::string current_value_;
+    int brace_depth_;
+    std::map<std::string, std::string> parsed_data_;
+    
+    void process_buffer();
+    bool extract_key();
+    bool extract_value();
+    void skip_whitespace(size_t& pos);
+};
+
+// 流式JSON序列化器
+class StreamingJsonSerializer {
+public:
+    StreamingJsonSerializer();
+    ~StreamingJsonSerializer();
+    bool start_object();
+    bool add_key_value(const char* key, const char* value);
+    bool end_object();
+    bool is_complete() const { return complete_; }
+    
+private:
+    std::string buffer_;
+    bool first_item_;
+    bool complete_;
+    bool file_opened_;
+    static const size_t BUFFER_SIZE = 256;
+    
+#ifdef PICO_PLATFORM
+    File file_handle_;
+#endif
+    
+    // 静态分配的uint8_t缓冲区
+    static uint8_t write_buffer_[BUFFER_SIZE];
+    
+    bool open_file();
+    bool close_file();
+    bool flush_buffer();
+    bool write_to_file(const char* data, size_t length);
+};
 
 /**
  * ConfigManager - 配置文件管理类
@@ -38,7 +101,8 @@ public:
     static void deinit();
     
     // 保存配置到文件
-    static bool save_config();
+    static bool save_config_task();
+    static void save_config();  // 置位保存信号
     
     // 重置到默认配置
     static bool reset_to_defaults();
@@ -84,15 +148,32 @@ public:
     
     // 调试接口
     static void debug_print_all_configs();
+    
+    // 内部日志接口
+    static void log_debug(const std::string& message);
+    static void log_info(const std::string& message);
+    static void log_error(const std::string& message);
+    
+    // LittleFS状态访问
+    static bool is_littlefs_ready();
+
+    // 文件操作封装方法（供StreamingJsonSerializer使用）
+    static bool open_file_for_read(File& file);
+    static bool open_file_for_write(File& file);
+    static void close_file(File& file);
 
 private:
     // 私有构造函数
     ConfigManager();
     ConfigManager(const ConfigManager&) = delete;
     ConfigManager& operator=(const ConfigManager&) = delete;
+
+    // LittleFS操作
+    static bool littlefs_init();
+    static bool littlefs_file_exists();
     
     // 常量定义
-    static const char* CONFIG_FILE_PATH;
+    static const char CONFIG_FILE_PATH[];
     
     // 静态成员变量 - 双map架构
     static bool _initialized;
@@ -101,28 +182,28 @@ private:
     static config_map_t _default_map;      // 默认配置map（只读）
     static config_map_t _runtime_map;      // 运行时配置map（可读写）
     static std::map<std::string, std::string> _string_cache;
-    // static std::mutex _default_map_mutex;  // 默认map的读写锁
     static std::vector<ConfigInitFunction> _init_functions; // 初始化函数列表
+    
+    // 核心私有成员
+    static bool _littlefs_ready;            // LittleFS就绪状态
+    static volatile bool _save_requested;    // 保存请求信号
     
     // 单例实例
     static ConfigManager* _instance;
     
     // 私有文件操作接口（不对外访问）
-    static bool config_save(const config_map_t* config_map, const std::string& file_path);
-    static void config_read(config_map_t* config_map, const std::string& file_path);
+    static bool config_save(const config_map_t* config_map);
+    static bool config_read(config_map_t* config_map);
     
     // 辅助函数
     static void initialize_defaults();
-    static void handle_config_exception();
     static uint32_t calculate_crc32(const config_map_t& config_map);
     static bool is_valid_string(const std::string& str);
     
-    // LittleFS操作
-    static bool littlefs_init();
-    static bool littlefs_file_exists(const std::string& path);
-    static bool littlefs_read_file(const std::string& path, std::string& content);
-    static bool littlefs_write_file(const std::string& path, const std::string& content);
+    // 流式读写操作
+    static bool config_read_streaming(config_map_t* config_map);
+    static bool config_save_streaming(const config_map_t* config_map);
+    static void process_config_item(config_map_t* config_map, const std::string& key, const std::string& obj_str);
+    static std::string serialize_config_value(const ConfigValue& value);
     
-    // 预定义配置注册函数
-
 };
