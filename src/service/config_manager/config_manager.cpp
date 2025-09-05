@@ -32,6 +32,8 @@ std::vector<ConfigInitFunction> ConfigManager::_init_functions;
 bool ConfigManager::_littlefs_ready = false;
 volatile bool ConfigManager::_save_requested = false;
 ConfigManager* ConfigManager::_instance = nullptr;
+// DEBUG
+bool ConfigManager::_debug_output_enabled = false;
 
 // StreamingJsonSerializer静态缓冲区定义
 uint8_t StreamingJsonSerializer::write_buffer_[StreamingJsonSerializer::BUFFER_SIZE];
@@ -1251,6 +1253,10 @@ bool ConfigManager::reset_to_defaults() {
     return save_config_task();
 }
 
+void ConfigManager::enable_debug_output(bool enable) {
+    _debug_output_enabled = enable;
+}
+
 // 调试接口
 void ConfigManager::debug_print_all_configs() {
     log_debug("===== DEBUG: All Configurations =====");
@@ -1298,6 +1304,7 @@ bool ConfigManager::is_valid_string(const std::string& str) {
 
 // 内部日志接口实现
 void ConfigManager::log_debug(const std::string& message) {
+    if (!_debug_output_enabled) return;
     auto* logger = USB_SerialLogs::get_global_instance();
     if (logger) {
         logger->debug(message, "ConfigManager");

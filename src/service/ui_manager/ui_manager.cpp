@@ -705,15 +705,15 @@ void UIManager::handle_int_setting(const LineConfig* line_config) {
     auto int_setting_page = std::static_pointer_cast<ui::IntSettingPage>(registry.get_page("__int_setting__"));
     
     if (int_setting_page) {
-        // 准备回调函数 - 从callback_data联合体中获取
         std::function<void(int)> value_change_cb;
         std::function<void()> complete_cb;
         
         if (line_config->callback_type == LineConfig::CallbackType::VALUE_CHANGE) {
             value_change_cb = line_config->callback_data.value_change_callback;
-        } else if (line_config->callback_type == LineConfig::CallbackType::COMPLETE) {
-            complete_cb = line_config->callback_data.complete_callback;
         }
+        
+        // 从独立字段获取完成回调
+        complete_cb = line_config->int_complete_callback;
         
         // 设置页面参数
         int_setting_page->setup_data(line_config->setting_title,
@@ -726,7 +726,7 @@ void UIManager::handle_int_setting(const LineConfig* line_config) {
         popup_int_setting_data_.min_value = line_config->data.int_setting.min_value;
         popup_int_setting_data_.max_value = line_config->data.int_setting.max_value;
         popup_int_setting_data_.value_change_cb = line_config->callback_data.value_change_callback;
-        popup_int_setting_data_.complete_cb = line_config->callback_data.complete_callback;
+        popup_int_setting_data_.complete_cb = line_config->int_complete_callback;
 
         // 切换到INT设置页面（作为弹窗）
         current_page_name_ = "__int_setting__";
@@ -1074,18 +1074,10 @@ bool UIManager::adjust_int_setting_value(bool increase) {
     int32_t current_value = *popup_int_setting_data_.int_setting_value_ptr_;
     int32_t new_value = current_value;
     
-    // 根据摇杆灵敏度配置计算步长
+    /** 根据摇杆灵敏度配置计算步长 
+     * TODO: 根据摇杆时间增加调整速度
+     */
     int32_t step = 1;
-    if (static_config_.joystick_sensitivity > 5) {
-        // 高灵敏度：步长更大
-        step = static_config_.joystick_sensitivity - 4; // 灵敏度6-10对应步长2-6
-    } else if (static_config_.joystick_sensitivity < 3) {
-        // 低灵敏度：保持步长为1，但可以考虑更慢的响应
-        step = 1;
-    } else {
-        // 中等灵敏度：默认步长
-        step = 1;
-    }
     
     log_debug("current_value=" + std::to_string(current_value) + ", sensitivity=" + std::to_string(static_config_.joystick_sensitivity) + ", step=" + std::to_string(step));
     
@@ -1261,15 +1253,15 @@ bool UIManager::handle_joystick_input(int button) {
 bool UIManager::handle_back_navigation() {
     // 统一的返回导航处理
     if (is_popup_active_) {
+        if (popup_int_setting_data_.complete_cb)
+            popup_int_setting_data_.complete_cb();
+
         current_page_name_ = popup_caller_page_;
         current_menu_index_ = popup_caller_index_;
         is_popup_active_ = false;
         popup_caller_page_ = "";
         popup_caller_index_ = 0;
         popup_int_setting_data_.clear();
-        if (popup_int_setting_data_.complete_cb) {
-            popup_int_setting_data_.complete_cb();
-        }
         return true;
     }
     if (PageNavigationManager::getInstance().can_go_back()) {

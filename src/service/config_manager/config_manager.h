@@ -148,6 +148,7 @@ public:
     
     // 调试接口
     static void debug_print_all_configs();
+    static void enable_debug_output(bool enable);
     
     // 内部日志接口
     static void log_debug(const std::string& message);
@@ -190,6 +191,9 @@ private:
     
     // 单例实例
     static ConfigManager* _instance;
+
+    // DEBUG
+    static bool _debug_output_enabled;
     
     // 私有文件操作接口（不对外访问）
     static bool config_save(const config_map_t* config_map);

@@ -16,7 +16,6 @@ Mai2Serial::Mai2Serial(HAL_UART* uart_hal)
     for (int i = 0; i < MAI2SERIAL_COMMAND_LENGTH; i++) {
         command_buffer_[i] = 0;
     }
-    last_touch_data_ = Mai2Serial_TouchData();
 
     // 新增：初始化流式接收缓冲区
     rx_stream_pos_ = 0;
@@ -48,14 +47,13 @@ void Mai2Serial::deinit() {
         status_ = Status::STOPPED;
         
         // 清理回调
-        touch_callback_ = nullptr;
         command_callback_ = nullptr;
     }
 }
 
 // 检查是否就绪
 bool Mai2Serial::is_ready() const {
-    return initialized_ && (status_ == Status::READY || status_ == Status::RUNNING);
+    return status_ > Status::STOPPED;
 }
 
 // 设置配置
@@ -75,41 +73,23 @@ Mai2Serial_Config Mai2Serial::get_config() const {
     return config_;
 }
 
-
-
 // 发送触摸数据
-bool Mai2Serial::send_touch_data(const Mai2Serial_TouchData& touch_data) {
-    if (!is_ready()) {
+bool Mai2Serial::send_touch_data(Mai2Serial_TouchState& touch_data) {
+    if (!is_ready() || !serial_ok_) {
         return false;
     }
     
-    // 检查串口发送状态，只有在收到STAT命令后才发送触摸数据
-    if (!serial_ok_) {
-        return false;
-    }
-    
-    uint32_t send1 = touch_data.touch_state.parts.state1;
-    uint32_t send2 = (uint32_t)touch_data.touch_state.parts.state2;
+    touch_data.raw |= triggle_touch_data_.raw;
     
     // 按照标准实现：预先组装完整数据包，避免循环和多次write调用
-    uint8_t packet[9] = {
-        '(',
-        (uint8_t)(send1 & 0b11111),
-        (uint8_t)((send1 >> 5) & 0b11111),
-        (uint8_t)((send1 >> 10) & 0b11111),
-        (uint8_t)((send1 >> 15) & 0b11111),
-        (uint8_t)((send1 >> 20) & 0b11111),
-        (uint8_t)(send2 & 0b11111),
-        (uint8_t)((send2 >> 5) & 0b11111),
-        ')'
-    };
-    
+    static touch_data_packet _packet;
+    _packet.parts.state1 = touch_data.parts.state1;
+    _packet.parts.state2 = touch_data.parts.state2;
+
+
     // 使用新的DMA接口：写入TX缓冲区会自动处理DMA传输
-    size_t bytes_written = uart_hal_->write_to_tx_buffer(packet, 9);
+    size_t bytes_written = uart_hal_->write_to_tx_buffer(_packet.data, 9);
     bool result = (bytes_written == 9);
-    if (result) {
-        last_touch_data_ = touch_data;
-    }
     return result;
 }
 
@@ -118,14 +98,14 @@ void Mai2Serial::process_commands() {
     if (!is_ready()) {
         return;
     }
-    
+    static uint8_t size;
+    static uint8_t buffer[MAI2SERIAL_COMMAND_LENGTH * 4];  // 支持多个指令包
+    size = uart_hal_->read_from_rx_buffer(buffer, sizeof(buffer));
     // 检查接收缓冲区 - 使用新的DMA接口
-    uint8_t buffer[MAI2SERIAL_COMMAND_LENGTH * 4];  // 支持多个指令包
-    size_t bytes_received = uart_hal_->read_from_rx_buffer(buffer, sizeof(buffer));
     
-    if (bytes_received > 0) {
+    if (size) {
         // 处理接收到的数据
-        process_dma_received_data(buffer, bytes_received);
+        process_dma_received_data(buffer, size);
     }
 }
 
@@ -139,11 +119,6 @@ bool Mai2Serial::send_response(const std::string& response) {
     // 使用新的DMA接口：写入TX缓冲区会自动处理DMA传输
     size_t bytes_written = uart_hal_->write_to_tx_buffer((uint8_t*)full_response.c_str(), full_response.length());
     return (bytes_written == full_response.length());
-}
-
-// 设置回调
-void Mai2Serial::set_touch_callback(Mai2Serial_TouchCallback callback) {
-    touch_callback_ = callback;
 }
 
 void Mai2Serial::set_command_callback(Mai2Serial_CommandCallback callback) {
@@ -204,29 +179,6 @@ bool Mai2Serial::set_baud_rate(uint32_t baud_rate) {
     config_.baud_rate = baud_rate;
     uart_hal_->set_baudrate(baud_rate);
     return true;
-}
-
-// 任务处理
-void Mai2Serial::task() {
-    if (!initialized_) {
-        return;
-    }
-    process_commands();
-    if (status_ == Status::RUNNING && touch_callback_) {
-        static uint32_t last_check_time = 0;
-        uint32_t current_time = time_us_32() / 1000;
-    
-        if (current_time - last_check_time >= 10) {
-            last_check_time = current_time;
-        }
-    }
-}
-
-// 发送触摸状态 - 使用新的bitmap数据结构
-bool Mai2Serial::send_touch_state(uint32_t state1, uint32_t state2) {
-    // 直接创建Mai2Serial_TouchData对象并调用send_touch_data
-    Mai2Serial_TouchData touch_data(state1, (uint8_t)(state2 & 0x0F));
-    return send_touch_data(touch_data);
 }
 
 // 处理指令包
@@ -449,4 +401,23 @@ void Mai2Serial::set_serial_ok(bool ok) {
 // 获取串口发送状态
 bool Mai2Serial::get_serial_ok() const {
     return serial_ok_;
+}
+
+void Mai2Serial::manually_triggle_area(Mai2_TouchArea area) {
+    triggle_touch_data_.parts.state1 = 0;
+    triggle_touch_data_.parts.state2 = 0;
+    if (area >= 1 && area <= 34) {
+        uint8_t bit_index = area - 1;
+        if (bit_index < 32) {
+            triggle_touch_data_.parts.state1 |= (1UL << bit_index);
+        } else {
+            bit_index -= 32;
+            triggle_touch_data_.parts.state2 |= (1 << bit_index);
+        }
+    }
+}
+
+void Mai2Serial::clear_manually_triggle_area() {
+    triggle_touch_data_.parts.state1 = 0;
+    triggle_touch_data_.parts.state2 = 0;
 }

@@ -133,11 +133,26 @@ bool InputManager::registerTouchSensor(TouchSensor* device) {
     // 通过新的sample()接口获取设备信息
     uint32_t supported_channels = device->getSupportedChannelCount();
     
-    // 检查是否已经注册（基于配置映射）
+    // 检查是否已经在配置中存在该设备映射
     for (int i = 0; i < config->device_count; ++i) {
         if (config->touch_device_mappings[i].device_id_mask == device_id_mask) {
-            log_error("Failed to register touch sensor: device with id_mask 0x" + std::to_string(device_id_mask) + " already registered");
-            return false; // 已经注册
+            // 设备映射已存在，更新连接状态为已连接
+            config->touch_device_mappings[i].is_connected = true;
+            
+            // 添加到TouchSensor设备列表（如果尚未添加）
+            bool device_in_list = false;
+            for (auto* existing_device : touch_sensor_devices_) {
+                if (existing_device == device) {
+                    device_in_list = true;
+                    break;
+                }
+            }
+            if (!device_in_list) {
+                touch_sensor_devices_.push_back(device);
+            }
+            
+            log_info("设备已连接: " + device->getDeviceName() + " (ID掩码: 0x" + std::to_string(device_id_mask) + ")");
+            return true; // 成功更新连接状态
         }
     }
     
@@ -148,6 +163,7 @@ bool InputManager::registerTouchSensor(TouchSensor* device) {
     TouchDeviceMapping& touch_mapping = config->touch_device_mappings[config->device_count];
     touch_mapping.device_id_mask = device_id_mask;
     touch_mapping.max_channels = std::min((uint8_t)supported_channels, (uint8_t)24u); // 最大24通道
+    touch_mapping.is_connected = true; // 新注册的设备标记为已连接
     
     // 初始化默认映射
     for (uint8_t i = 0; i < touch_mapping.max_channels; i++) {
@@ -165,18 +181,22 @@ bool InputManager::registerTouchSensor(TouchSensor* device) {
 void InputManager::unregisterTouchSensor(TouchSensor* device) {
     if (!device) return;
     
-    // 根据设备指针定位索引并移除，避免使用旧接口
+    // 获取设备ID掩码
+    uint8_t device_id_mask = device->getModuleMask();
+    
+    // 从TouchSensor设备列表中移除
     auto it = std::find(touch_sensor_devices_.begin(), touch_sensor_devices_.end(), device);
     if (it != touch_sensor_devices_.end()) {
-        int removed_index = static_cast<int>(std::distance(touch_sensor_devices_.begin(), it));
         touch_sensor_devices_.erase(it);
         
-        // 重新整理设备映射数组（按索引）
-        if (removed_index >= 0 && removed_index < config_->device_count) {
-            for (int i = removed_index; i < config_->device_count - 1; i++) {
-                config_->touch_device_mappings[i] = config_->touch_device_mappings[i + 1];
+        // 在配置映射中找到对应设备并标记为未连接
+        InputManager_PrivateConfig* config = inputmanager_get_config_holder();
+        for (int i = 0; i < config->device_count; i++) {
+            if (config->touch_device_mappings[i].device_id_mask == device_id_mask) {
+                config->touch_device_mappings[i].is_connected = false;
+                log_info("设备已断开连接: " + device->getDeviceName() + " (ID掩码: 0x" + std::to_string(device_id_mask) + ")");
+                break;
             }
-            config_->device_count--;
         }
     }
 }
@@ -216,7 +236,7 @@ bool InputManager::removePhysicalKeyboard(uint8_t gpio_pin) {
 }
 
 inline void InputManager::processSerialModeWithDelay() {
-    Mai2Serial_TouchState delayed_serial_state;
+    static Mai2Serial_TouchState delayed_serial_state;
     
     // 获取延迟后的Serial状态
     if (!getDelayedSerialState(delayed_serial_state)) {
@@ -225,7 +245,7 @@ inline void InputManager::processSerialModeWithDelay() {
     
     // 直接发送延迟后的Serial状态，无需重新计算
     if (mai2_serial_) {
-        mai2_serial_->send_touch_state(delayed_serial_state.parts.state1, delayed_serial_state.parts.state2);
+        mai2_serial_->send_touch_data(delayed_serial_state);
     }
 }
 
@@ -327,7 +347,7 @@ inline bool InputManager::setWorkMode(InputWorkMode mode) {
     return true;
 }
 
-// CPU0核心循环 - TouchSensor触摸采样和Serial/HID处理
+// CPU0核心循环 - TouchSensor触摸采样和Serial/HID处理 
 void InputManager::task0() {
     // 更新所有设备的触摸状态
     updateTouchStates();
@@ -632,12 +652,13 @@ void InputManager::processAutoAdjustSensitivity() {
 }
 
 // 设置灵敏度
-// 32位地址灵敏度管理
 void InputManager::setSensitivity(uint8_t device_id_mask, uint8_t channel, uint8_t sensitivity) {
     TouchDeviceMapping* mapping = findTouchDeviceMapping(device_id_mask);
     if (mapping && channel < mapping->max_channels) {
+        log_debug("setSensitivity: device_id_mask=" + std::to_string(device_id_mask) +
+        "channel=" + std::to_string(channel) +
+        "sensitivity=" + std::to_string(sensitivity));
         mapping->sensitivity[channel] = sensitivity;
-        
         // 使用新的TouchSensor接口设置通道灵敏度
         TouchSensor* device = findTouchSensorByIdMask(device_id_mask);
         if (device) {
@@ -658,10 +679,7 @@ bool InputManager::setSensitivityByDeviceName(const std::string& device_name, ui
     for (size_t i = 0; i < touch_sensor_devices_.size(); ++i) {
         TouchSensor* device = touch_sensor_devices_[i];
         if (device && device->getDeviceName() == device_name) {
-            TouchSampleResult result = device->sample();
-            // 使用采样结果的高8位作为设备掩码
-            uint8_t device_id_mask = (result.touch_mask >> 24) & 0xFF;
-            setSensitivity(device_id_mask, channel, sensitivity);
+            setSensitivity(device->getModuleMask(), channel, sensitivity);
             return true;
         }
     }
@@ -937,127 +955,22 @@ void InputManager::updateChannelStatesAfterBinding() {
 // 更新触摸状态
 inline void InputManager::updateTouchStates() {
     // 使用TouchSensor统一采样接口更新触摸状态（微秒时间戳）
+    static TouchSensor* device;
+    static TouchSampleResult result;
     for (int i = 0; i < (int)touch_sensor_devices_.size(); i++) {
-        static TouchSensor* device;
         device = touch_sensor_devices_[i];
-
+        
         // 保存之前的触摸状态
         touch_device_states_[i].previous_touch_mask = touch_device_states_[i].current_touch_mask;
-
-        if (device) {
-            // 使用新的sample接口直接返回TouchSampleResult
-            TouchSampleResult result = device->sample();
-            
-            // 从TouchSampleResult中提取数据（直接使用union字段）
-            // result.touch_mask包含完整的32位掩码（高8位设备掩码+低24位通道掩码）
-            touch_device_states_[i].current_touch_mask = result.touch_mask;
-            // 确保设备掩码正确设置（从采样结果的高8位获取）
-            touch_device_states_[i].parts.device_mask = (result.touch_mask >> 24) & 0xFF;
-            touch_device_states_[i].timestamp_us = result.timestamp_us;  // 直接使用us级时间戳
-            touch_device_states_[i].is_valid = true;
-        } else {
-            // 设备无效时通道状态置0
-            touch_device_states_[i].current_touch_mask = 0;
-            touch_device_states_[i].timestamp_us = time_us_32();
-            touch_device_states_[i].is_valid = false;
-        }
+        result = device->sample();
+        touch_device_states_[i].current_touch_mask = result.touch_mask;
+        touch_device_states_[i].parts.device_mask = result.module_mask;
+        touch_device_states_[i].timestamp_us = result.timestamp_us;  // 直接使用us级时间戳
     }
     // 增加采样计数器
     incrementSampleCounter();
     // 序列化发送前的延迟缓冲不变
     storeDelayedSerialState();
-}
-
-// 处理Serial模式 - 使用反向映射的32位TouchSensor接口实现
-inline void InputManager::processSerialMode() {
-    Mai2Serial_TouchState touch_state;
-    touch_state.parts.state1 = 0;
-    touch_state.parts.state2 = 0;
-    
-    // 使用静态触摸键盘bitmap，避免重复构造
-    static KeyboardBitmap touch_keyboard_bitmap;
-    touch_keyboard_bitmap.clear();
-    
-    // 预计算32位触摸设备映射指针数组，避免重复查找
-    TouchDeviceMapping* touch_mappings[8];
-    const int touch_device_count = config_->device_count;
-    
-    // 预处理8位触摸设备映射，建立快速查找表
-    for (int i = 0; i < touch_device_count; i++) {
-        const uint8_t device_id_mask = touch_device_states_[i].parts.device_mask;
-        touch_mappings[i] = findTouchDeviceMapping(device_id_mask);
-    }
-    
-    // 反向映射处理：遍历所有Mai2区域，检查对应的通道是否被触摸
-    for (int i = 0; i < touch_device_count; i++) {
-        const TouchDeviceMapping* mapping = touch_mappings[i];
-        if (!mapping) continue;
-        
-        const uint32_t current_touch_mask = touch_device_states_[i].current_touch_mask;
-        const uint8_t device_id_mask = static_cast<uint8_t>(touch_device_states_[i].parts.device_mask & 0xFF);
-        
-        // 遍历所有Mai2区域（1-34）
-        for (uint8_t area = 1; area <= 34; area++) {
-            const auto& area_mapping = mapping->serial_mappings[area];
-            if (area_mapping.channel == 0xFFFFFFFF) continue; // 未绑定的区域
-            
-            // 检查是否属于当前设备并解码通道号
-            if (mapping->device_id_mask == device_id_mask && isValidPhysicalAddress(area_mapping.channel)) {
-                const uint8_t bound_channel = decodeChannelNumber(area_mapping.channel);
-                const uint32_t ch_mask = (1UL << bound_channel);
-                const bool touched = (current_touch_mask & ch_mask) != 0;
-                
-                // 设置对应的Mai2区域状态
-                const uint8_t bit_index = area - 1;
-                const uint32_t bit_mask = (1UL << (bit_index & 31));
-                
-                if (bit_index < 32) {
-                    touch_state.parts.state1 = touched ? 
-                        (touch_state.parts.state1 | bit_mask) : 
-                        (touch_state.parts.state1 & ~bit_mask);
-                } else {
-                    touch_state.parts.state2 = touched ? 
-                        (touch_state.parts.state2 | bit_mask) : 
-                        (touch_state.parts.state2 & ~bit_mask);
-                }
-            }
-        }
-        
-        // 处理键盘映射（反向映射）
-        for (const auto& kb_pair : mapping->keyboard_mappings) {
-            const HID_KeyCode key = kb_pair.first;
-            const auto& kb_mapping = kb_pair.second;
-            
-            if (kb_mapping.channel == 0xFFFFFFFF) continue;
-            
-            // 检查是否属于当前设备并解码通道号
-            if (mapping->device_id_mask == device_id_mask && isValidPhysicalAddress(kb_mapping.channel)) {
-                const uint8_t bound_channel = decodeChannelNumber(kb_mapping.channel);
-                const uint32_t ch_mask = (1UL << bound_channel);
-                const bool touched = (current_touch_mask & ch_mask) != 0;
-                
-                // 设置键盘状态
-                const uint8_t bit_idx = touch_keyboard_bitmap.getBitIndex(key);
-                if (bit_idx < 128) {
-                    const uint64_t key_mask = (1ULL << (bit_idx & 63));
-                    if (bit_idx < 64) {
-                        touch_keyboard_bitmap.bitmap_low = touched ? 
-                            (touch_keyboard_bitmap.bitmap_low | key_mask) : 
-                            (touch_keyboard_bitmap.bitmap_low & ~key_mask);
-                    } else {
-                        touch_keyboard_bitmap.bitmap_high = touched ? 
-                            (touch_keyboard_bitmap.bitmap_high | key_mask) : 
-                            (touch_keyboard_bitmap.bitmap_high & ~key_mask);
-                    }
-                }
-            }
-        }
-    }
-    
-    // Serial数据发送
-    if (mai2_serial_) {
-        mai2_serial_->send_touch_state(touch_state.parts.state1, touch_state.parts.state2);
-    }
 }
 
 // 发送HID触摸数据 - 使用32位TouchSensor接口的统一实现
@@ -1169,7 +1082,6 @@ void inputmanager_register_default_configs(config_map_t& default_map) {
     // 注册InputManager默认配置
     default_map[INPUTMANAGER_WORK_MODE] = ConfigValue((uint8_t)0);  // 默认工作模式
     default_map[INPUTMANAGER_TOUCH_KEYBOARD_ENABLED] = ConfigValue(true);  // 默认启用触摸键盘
-    default_map[INPUTMANAGER_DEVICE_COUNT] = ConfigValue((uint8_t)0);  // 默认设备数量
     default_map[INPUTMANAGER_TOUCH_RESPONSE_DELAY] = ConfigValue((uint8_t)0);  // 默认触摸响应延迟
     
     // 二进制数据配置使用空字符串作为默认值
@@ -1199,9 +1111,6 @@ bool inputmanager_load_config_from_manager() {
     // 加载触摸键盘模式
     static_config_.touch_keyboard_mode = static_cast<TouchKeyboardMode>(config_mgr->get_uint8(INPUTMANAGER_TOUCH_KEYBOARD_MODE));
     
-    // 加载设备数量
-    static_config_.device_count = config_mgr->get_uint8(INPUTMANAGER_DEVICE_COUNT);
-    
     // 加载触摸响应延迟
     static_config_.touch_response_delay_ms = config_mgr->get_uint8(INPUTMANAGER_TOUCH_RESPONSE_DELAY);
     
@@ -1217,6 +1126,8 @@ bool inputmanager_load_config_from_manager() {
                 // 只复制mask不为0的设备配置
                 if (src[i].device_id_mask != 0) {
                     static_config_.touch_device_mappings[valid_device_count] = src[i];
+                    // 配置加载时，所有设备初始状态设为未连接
+                    static_config_.touch_device_mappings[valid_device_count].is_connected = false;
                     valid_device_count++;
                 }
             }
@@ -1250,9 +1161,15 @@ bool inputmanager_load_config_from_manager() {
     // 应用加载的配置到实际硬件设备
     InputManager* instance = InputManager::getInstance();
     if (instance) {
+        // 根据设备模式遍历设备映射表，对存在映射关系的设备进行预注册
+        // 所有配置的设备在此阶段都标记为未连接状态
+        InputManager::log_info("预注册配置中的触摸设备映射，设备数量: " + std::to_string(static_config_.device_count));
+        
         // 应用触摸设备的灵敏度设置
         for (int i = 0; i < static_config_.device_count; i++) {
             const TouchDeviceMapping& mapping = static_config_.touch_device_mappings[i];
+            InputManager::log_debug("预注册设备ID掩码: 0x" + std::to_string(mapping.device_id_mask) + ", 状态: 未连接");
+            
             // 使用公有方法setSensitivity来应用灵敏度设置
             for (uint8_t channel = 0; channel < mapping.max_channels; channel++) {
                 uint8_t sensitivity = mapping.sensitivity[channel];
@@ -1267,19 +1184,17 @@ bool inputmanager_load_config_from_manager() {
 }
 
 // UI专用接口实现
-void InputManager::get_all_device_status(TouchDeviceStatus data[8], int& device_count) {
+void InputManager::get_all_device_status(TouchDeviceStatus *data) {
     InputManager_PrivateConfig* config = inputmanager_get_config_holder();
-    device_count = config->device_count;
-    
-    for (int i = 0; i < device_count && i < 8; i++) {
+    for (int i = 0; i < config->device_count; i++) {
         // 复制设备映射配置
         data[i].touch_device = config->touch_device_mappings[i];
         
         // 获取当前触摸状态
         data[i].touch_states_32bit = touch_device_states_[i].current_touch_mask;
         
-        // 设置连接状态（假设所有配置的设备都已连接）
-        data[i].is_connected = true;
+        // 设置连接状态 - 根据实际连接状态反馈
+        data[i].is_connected = config->touch_device_mappings[i].is_connected;
         
         // 生成设备名称（8位ID掩码转换为HEX）
         uint8_t device_id_mask = data[i].touch_device.device_id_mask;
@@ -1309,9 +1224,6 @@ bool inputmanager_write_config_to_manager(const InputManager_PrivateConfig& conf
     
     // 写入触摸键盘模式
     config_mgr->set_uint8(INPUTMANAGER_TOUCH_KEYBOARD_MODE, static_cast<uint8_t>(config.touch_keyboard_mode));
-    
-    // 写入设备数量
-    config_mgr->set_uint8(INPUTMANAGER_DEVICE_COUNT, config.device_count);
     
     // 写入触摸响应延迟
     config_mgr->set_uint8(INPUTMANAGER_TOUCH_RESPONSE_DELAY, config.touch_response_delay_ms);
@@ -1407,7 +1319,7 @@ void InputManager::processSerialBinding() {
             // 发送当前要绑定区域的mai2消息
             if (current_binding_index_ < 34) {
                 Mai2_TouchArea current_area = getSerialBindingArea(current_binding_index_);
-                sendMai2TouchMessage(current_area);
+                mai2_serial_->manually_triggle_area(current_area);
                 binding_state_ = BindingState::SERIAL_BINDING_WAIT_TOUCH;
                 
                 // 通知UI显示当前绑定区域
@@ -1480,6 +1392,7 @@ void InputManager::processSerialBinding() {
                 binding_active_ = false;
                 binding_callback_ = nullptr;
                 binding_state_ = BindingState::IDLE;
+                mai2_serial_->clear_manually_triggle_area();
             }
             break;
             
@@ -1738,30 +1651,6 @@ void InputManager::restoreChannelStates() {
     }
 }
 
-// 发送Mai2触摸消息
-void InputManager::sendMai2TouchMessage(Mai2_TouchArea area) {
-    if (mai2_serial_) {
-        // 创建触摸状态，只设置指定区域为触摸状态
-        Mai2Serial_TouchState touch_state;
-        touch_state.parts.state1 = 0;
-        touch_state.parts.state2 = 0;
-        
-        // 设置对应区域的状态
-        if (area >= 1 && area <= 34) {
-            uint8_t bit_index = area - 1;
-            if (bit_index < 32) {
-                touch_state.parts.state1 |= (1UL << bit_index);
-            } else {
-                bit_index -= 32;
-                touch_state.parts.state2 |= (1 << bit_index);
-            }
-        }
-        
-        // 发送触摸状态
-         mai2_serial_->send_touch_state(touch_state.parts.state1, touch_state.parts.state2);
-    }
-}
-
 // 获取Mai2区域名称
 const char* InputManager::getMai2AreaName(Mai2_TouchArea area) {
     if (area >= MAI2_NO_USED && area <= MAI2_AREA_E8) {
@@ -1785,10 +1674,9 @@ void InputManager::updateGPIOStates() {
 }
 
 void InputManager::processGPIOKeyboard() {
-    // 高性能GPIO处理：零内存分配，使用类成员缓存变量
     static KeyboardBitmap prev_keyboard_state; // 跟踪上一次的按键状态
     static KeyboardBitmap current_keyboard_state;
-    // 零内存分配：使用类成员缓存变量计算所有变化位图和反转位图
+
     gpio_mcu_changed_ = mcu_gpio_states_ ^ mcu_gpio_previous_states_;
     gpio_mcu_inverted_ = ~mcu_gpio_states_; // 低电平有效
     gpio_mcp_changed_a_ = mcp_gpio_states_.port_a ^ mcp_gpio_previous_states_.port_a;
@@ -1876,11 +1764,11 @@ uint32_t InputManager::getTouchSampleRate() {
 }
 
 inline void InputManager::incrementSampleCounter() {
-    sample_counter_++;
-    
+    static uint32_t current_time;
     // 检查是否需要重置计数器（每秒一次）
-    uint32_t current_time = to_ms_since_boot(get_absolute_time());
-    if (current_time - last_reset_time_ >= 1000) {
+    current_time = time_us_32();
+    sample_counter_++;
+    if (current_time - last_reset_time_ >= 1000000) {
         current_sample_rate_ = sample_counter_;
         sample_counter_ = 0;
         last_reset_time_ = current_time;
@@ -1942,30 +1830,27 @@ InputManager_PrivateConfig InputManager::getConfig() const {
 
 inline void InputManager::storeDelayedSerialState() {
     // 获取当前时间戳（微秒）
-    const uint32_t current_time_us = time_us_32();
-    
+    static uint32_t current_time_us;
+    static Mai2Serial_TouchState serial_state;
+    static Mai2_TouchArea area;
+    static uint8_t bit_index;
+    static uint32_t bit_mask;
     // 计算当前Serial状态
-    Mai2Serial_TouchState serial_state;
+    current_time_us = time_us_32();
     serial_state.parts.state1 = 0;
     serial_state.parts.state2 = 0;
     
-    const int device_count = config_->device_count;
-    
     // 计算Serial触摸状态
-    for (int i = 0; i < device_count; i++) {
+    for (int i = 0; i < config_->device_count; i++) {
         const uint32_t device_id_mask = touch_device_states_[i].current_touch_mask;
         TouchDeviceMapping* mapping = findTouchDeviceMapping(device_id_mask);
         if (!mapping) continue;
         
-        const uint32_t current_mask = touch_device_states_[i].current_touch_mask;
-        
         // 处理所有支持的通道
         for (uint8_t ch = 0; ch < mapping->max_channels; ch++) {
-            const uint32_t ch_mask = (1UL << ch);
-            const bool touched = (current_mask & ch_mask) != 0;
-            
+            if (!(touch_device_states_[i].current_touch_mask & (1UL << ch))) continue;
             // 处理Serial触摸映射 - 使用反向映射查找
-            Mai2_TouchArea area = MAI2_NO_USED;
+            area = MAI2_NO_USED;
             // 生成当前通道的32位物理地址
             uint32_t physical_address = encodePhysicalChannelAddress(mapping->device_id_mask, 1 << ch);
             // 查找该通道对应的区域
@@ -1975,27 +1860,20 @@ inline void InputManager::storeDelayedSerialState() {
                     break;
                 }
             }
-            if (area != MAI2_NO_USED && area >= 1 && area <= 34) {
-                const uint8_t bit_index = area - 1;
-                const uint32_t bit_mask = (1UL << (bit_index & 31));
-                
-                if (bit_index < 32) {
-                    serial_state.parts.state1 = touched ? 
-                        (serial_state.parts.state1 | bit_mask) : 
-                        (serial_state.parts.state1 & ~bit_mask);
-                } else {
-                    serial_state.parts.state2 = touched ? 
-                        (serial_state.parts.state2 | bit_mask) : 
-                        (serial_state.parts.state2 & ~bit_mask);
-                }
+            if (area >= 1 && area <= 34) {
+                bit_index = area - 1;
+                bit_mask = (1UL << (bit_index & 31));
+                if (bit_index < 32) 
+                    serial_state.parts.state1 |= bit_mask;
+                else 
+                    serial_state.parts.state2 |= bit_mask;
             }
         }
     }
     
     // 存储计算好的Serial状态到缓冲区
-    DelayedSerialState& current_entry = delay_buffer_[delay_buffer_head_];
-    current_entry.timestamp_us = current_time_us;
-    current_entry.serial_touch_state = serial_state;
+    delay_buffer_[delay_buffer_head_].timestamp_us = current_time_us;
+    delay_buffer_[delay_buffer_head_].serial_touch_state = serial_state;
     
     // 更新缓冲区指针
     delay_buffer_head_ = (delay_buffer_head_ + 1) % DELAY_BUFFER_SIZE;
@@ -2005,105 +1883,54 @@ inline void InputManager::storeDelayedSerialState() {
 }
 
 bool InputManager::getDelayedSerialState(Mai2Serial_TouchState& delayed_state) {
-    if (delay_buffer_count_ == 0 || config_->touch_response_delay_ms == 0) {
-        // 无延迟或缓冲区为空，计算并返回当前Serial状态
-        Mai2Serial_TouchState current_serial_state;
-        current_serial_state.parts.state1 = 0;
-        current_serial_state.parts.state2 = 0;
+    static uint32_t target_time;
+    static uint8_t buffer_idx;
+
+    // 零延迟路径 - 直接使用当前状态，避免所有缓冲区操作
+    if (config_->touch_response_delay_ms == 0) {
+        delayed_state = {0};
         
-        const int device_count = config_->device_count;
-        
-        // 计算当前Serial触摸状态
-        for (int i = 0; i < device_count; i++) {
-            const uint32_t device_id_mask = touch_device_states_[i].current_touch_mask;
-            TouchDeviceMapping* mapping = findTouchDeviceMapping(device_id_mask);
-            if (!mapping) continue;
+        // 批量处理所有设备，减少循环开销
+        for (uint8_t i = 0; i < config_->device_count; ++i) {
+            uint32_t active_channels = touch_device_states_[i].current_touch_mask & 
+                                     config_->touch_device_mappings[i].enabled_channels_mask;
             
-            const uint32_t current_mask = touch_device_states_[i].current_touch_mask;
-            
-            // 处理所有支持的通道
-            for (uint8_t ch = 0; ch < mapping->max_channels; ch++) {
-                const uint32_t ch_mask = (1UL << ch);
-                const bool touched = (current_mask & ch_mask) != 0;
+            while (active_channels) {
+                uint8_t channel = __builtin_ctz(active_channels);
+                active_channels &= ~(1U << channel);
                 
-                // 处理Serial触摸映射
-                // 使用反向映射查找
-                Mai2_TouchArea area = MAI2_NO_USED;
-                // 生成当前通道的32位物理地址
-                uint32_t physical_address = encodePhysicalChannelAddress(mapping->device_id_mask, 1 << ch);
-                // 查找该通道对应的区域
-                for (int area_idx = 1; area_idx <= 34; area_idx++) {
-                    if (mapping->serial_mappings[area_idx].channel == physical_address) {
-                        area = static_cast<Mai2_TouchArea>(area_idx);
+                // 直接查找映射区域
+                uint32_t physical_addr = encodePhysicalChannelAddress(
+                    config_->touch_device_mappings[i].device_id_mask, 
+                    1U << channel
+                );
+                
+                for (uint8_t area = 1; area <= 34; ++area) {
+                    if (config_->touch_device_mappings[i].serial_mappings[area].channel == physical_addr) {
+                        (area <= 32) ? 
+                            delayed_state.parts.state1 |= (1UL << (area - 1)) :
+                            delayed_state.parts.state2 |= (1UL << (area - 33));
                         break;
                     }
                 }
-                if (area != MAI2_NO_USED && area >= 1 && area <= 34) {
-                    const uint8_t bit_index = area - 1;
-                    const uint32_t bit_mask = (1UL << (bit_index & 31));
-                    
-                    if (bit_index < 32) {
-                        current_serial_state.parts.state1 = touched ? 
-                            (current_serial_state.parts.state1 | bit_mask) : 
-                            (current_serial_state.parts.state1 & ~bit_mask);
-                    } else {
-                        current_serial_state.parts.state2 = touched ? 
-                            (current_serial_state.parts.state2 | bit_mask) : 
-                            (current_serial_state.parts.state2 & ~bit_mask);
-                    }
-                }
             }
         }
-        
-        delayed_state = current_serial_state;
         return true;
     }
     
-    const uint32_t current_time_us = time_us_32();
-    const uint32_t target_delay_us = config_->touch_response_delay_ms * 1000;
-    
-    // 查找最接近目标延迟时间的数据
-    int best_index = -1;
-    uint32_t best_time_diff = UINT32_MAX;
-    
-    for (int i = 0; i < delay_buffer_count_; i++) {
-        const int buffer_index = (delay_buffer_head_ - 1 - i + DELAY_BUFFER_SIZE) % DELAY_BUFFER_SIZE;
-        const DelayedSerialState& entry = delay_buffer_[buffer_index];
-        
-        // 计算时间差（处理时间戳溢出）
-        uint32_t time_diff;
-        if (current_time_us >= entry.timestamp_us) {
-            time_diff = current_time_us - entry.timestamp_us;
-        } else {
-            // 处理时间戳溢出情况
-            time_diff = (UINT32_MAX - entry.timestamp_us) + current_time_us + 1;
-        }
-        
-        // 查找最接近目标延迟的数据
-        if (time_diff >= target_delay_us) {
-            const uint32_t diff_from_target = time_diff - target_delay_us;
-            if (diff_from_target < best_time_diff) {
-                best_time_diff = diff_from_target;
-                best_index = buffer_index;
-            }
-        }
-    }
-    
-    if (best_index >= 0) {
-        // 找到合适的延迟数据
-        const DelayedSerialState& best_entry = delay_buffer_[best_index];
-        delayed_state = best_entry.serial_touch_state;
-        return true;
-    } else {
-        // 没有找到合适的延迟数据，使用最旧的数据
-        if (delay_buffer_count_ > 0) {
-            const int oldest_index = (delay_buffer_head_ - delay_buffer_count_ + DELAY_BUFFER_SIZE) % DELAY_BUFFER_SIZE;
-            const DelayedSerialState& oldest_entry = delay_buffer_[oldest_index];
-            delayed_state = oldest_entry.serial_touch_state;
+    // 延迟路径 - 从缓冲区获取
+    target_time = time_us_32() - (config_->touch_response_delay_ms * 1000U);
+    buffer_idx = delay_buffer_head_;
+    // 从最新数据向前搜索，找到目标时间点0
+    for (uint8_t i = 0; i < delay_buffer_count_; ++i) {
+        buffer_idx = (buffer_idx - 1) & (DELAY_BUFFER_SIZE - 1);
+        if (delay_buffer_[buffer_idx].timestamp_us <= target_time) {
+            delayed_state = delay_buffer_[buffer_idx].serial_touch_state;
             return true;
         }
     }
     
+    delayed_state = {0};
     return false;
 }
 

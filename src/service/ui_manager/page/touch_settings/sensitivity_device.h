@@ -29,9 +29,9 @@ public:
     virtual void jump_str(const std::string& str) override;
     
 private:
-    std::string device_name_;  // 通过jump_str接收的设备名称
-    std::vector<int32_t> cached_sensitivity_values_;  // 缓存的灵敏度值
-    TouchDeviceMapping cached_mapping_;  // 缓存的设备映射
+    static std::string device_name_;  // 通过jump_str接收的设备名称
+    static std::vector<int32_t> cached_sensitivity_values_;  // 缓存的灵敏度值
+    static TouchDeviceMapping cached_mapping_;  // 缓存的设备映射
     bool mapping_cached_;  // 映射是否已缓存
     
     /**
@@ -51,17 +51,10 @@ private:
     std::string generate_channel_setting_id(const std::string& device_name, uint8_t channel);
     
     /**
-     * 灵敏度值变更回调
-     * @param channel 通道号
-     * @param new_value 新的灵敏度值
-     */
-    void on_sensitivity_changed(uint8_t channel, int32_t new_value);
-    
-    /**
      * 灵敏度设置完成回调
      * @param channel 通道号
      */
-    void on_sensitivity_complete(uint8_t channel);
+    static void on_sensitivity_complete();
     
     /**
      * 初始化缓存的灵敏度值

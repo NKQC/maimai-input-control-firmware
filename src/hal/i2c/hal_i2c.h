@@ -4,6 +4,7 @@
 #include <string>
 #include <vector>
 #include <functional>
+#include <hardware/i2c.h>
 
 extern "C" {
 #include "../global_irq.h"
@@ -30,64 +31,45 @@ public:
     virtual ~HAL_I2C() = default;
     
     // 初始化I2C接口
-    virtual bool init(uint8_t sda_pin, uint8_t scl_pin, uint32_t frequency = 100000) = 0;
+    bool init(uint8_t sda_pin, uint8_t scl_pin, uint32_t frequency = 100000);
     
     // 释放I2C资源
-    virtual void deinit() = 0;
+    void deinit();
     
     // 写入数据
-    virtual bool write(uint8_t address, const uint8_t* data, size_t length) = 0;
+    bool write(uint8_t address, const uint8_t* data, size_t length);
     
     // 读取数据
-    virtual bool read(uint8_t address, uint8_t* buffer, size_t length) = 0;
-    
+    bool read(uint8_t address, uint8_t* buffer, size_t length);
+
     // 异步DMA读写操作
-    virtual bool read_async(uint8_t address, uint8_t* buffer, size_t length, dma_callback_t callback = nullptr) = 0;
-    virtual bool write_async(uint8_t address, const uint8_t* data, size_t length, dma_callback_t callback = nullptr) = 0;
+    bool read_async(uint8_t address, uint8_t* buffer, size_t length, dma_callback_t callback = nullptr);
+    bool write_async(uint8_t address, const uint8_t* data, size_t length, dma_callback_t callback = nullptr);
     
     // 检查DMA传输状态
-    virtual bool is_busy() const = 0;
+    bool is_busy() const;
     
-    // 写入寄存器
-    virtual bool write_register(uint8_t address, uint8_t reg, uint8_t value) = 0;
+    // 写入寄存器 REG & 0x8000 时 锁定16位发送 否则根据是否满9位地址判断发送8或16位
+    int write_register(uint8_t address, uint16_t reg, uint8_t* value, uint8_t length);
     
-    // 读取寄存器
-    virtual bool read_register(uint8_t address, uint8_t reg, uint8_t* value) = 0;
-    
+    // 读取寄存器 REG & 0x8000 时 锁定16位发送 否则根据是否满9位地址判断发送8或16位
+    int read_register(uint8_t address, uint16_t reg, uint8_t* value, uint8_t length);
+
     // 检查设备是否存在
-    virtual bool device_exists(uint8_t address) = 0;
+    bool device_exists(uint8_t address);
     
     // 扫描I2C总线上的设备
-    virtual std::vector<uint8_t> scan_devices() = 0;
+    std::vector<uint8_t> scan_devices();
     
     // 获取实例名称
     virtual std::string get_name() const = 0;
-};
 
-// I2C0实例
-class HAL_I2C0 : public HAL_I2C {
-public:
-    static HAL_I2C0* getInstance();
-    ~HAL_I2C0();
+protected:
+    // 构造函数，由子类调用
+    HAL_I2C(i2c_inst_t* i2c_instance, void (*tx_callback)(bool), void (*rx_callback)(bool));
     
-    bool init(uint8_t sda_pin, uint8_t scl_pin, uint32_t frequency = 100000) override;
-    void deinit() override;
-    bool write(uint8_t address, const uint8_t* data, size_t length) override;
-    bool read(uint8_t address, uint8_t* buffer, size_t length) override;
-    bool read_async(uint8_t address, uint8_t* buffer, size_t length, dma_callback_t callback = nullptr) override;
-    bool write_async(uint8_t address, const uint8_t* data, size_t length, dma_callback_t callback = nullptr) override;
-    bool is_busy() const override;
-    bool write_register(uint8_t address, uint8_t reg, uint8_t value) override;
-    bool read_register(uint8_t address, uint8_t reg, uint8_t* value) override;
-    bool device_exists(uint8_t address) override;
-    std::vector<uint8_t> scan_devices() override;
-    std::string get_name() const override { return "I2C0"; }
-    
-    // 友元函数声明，允许DMA回调函数访问私有成员
-    friend void i2c0_tx_dma_callback(bool success);
-    friend void i2c0_rx_dma_callback(bool success);
-
-private:
+    // I2C实例和状态变量
+    i2c_inst_t* i2c_instance_;
     bool initialized_;
     uint8_t sda_pin_;
     uint8_t scl_pin_;
@@ -96,6 +78,24 @@ private:
     int dma_tx_channel_;
     int dma_rx_channel_;
     
+    // DMA回调函数指针
+    void (*tx_dma_callback_)(bool);
+    void (*rx_dma_callback_)(bool);
+};
+
+// I2C0实例
+class HAL_I2C0 : public HAL_I2C {
+public:
+    static HAL_I2C0* getInstance();
+    ~HAL_I2C0();
+    
+    std::string get_name() const override { return "I2C0"; }
+    
+    // 友元函数声明，允许DMA回调函数访问私有成员
+    friend void i2c0_tx_dma_callback(bool success);
+    friend void i2c0_rx_dma_callback(bool success);
+
+private:
     static HAL_I2C0* instance_;
     
     // 私有构造函数（单例模式）
@@ -110,32 +110,13 @@ public:
     static HAL_I2C1* getInstance();
     ~HAL_I2C1();
     
-    bool init(uint8_t sda_pin, uint8_t scl_pin, uint32_t frequency = 100000) override;
-    void deinit() override;
-    bool write(uint8_t address, const uint8_t* data, size_t length) override;
-    bool read(uint8_t address, uint8_t* buffer, size_t length) override;
-    bool read_async(uint8_t address, uint8_t* buffer, size_t length, dma_callback_t callback = nullptr) override;
-    bool write_async(uint8_t address, const uint8_t* data, size_t length, dma_callback_t callback = nullptr) override;
-    bool is_busy() const override;
-    bool write_register(uint8_t address, uint8_t reg, uint8_t value) override;
-    bool read_register(uint8_t address, uint8_t reg, uint8_t* value) override;
-    bool device_exists(uint8_t address) override;
-    std::vector<uint8_t> scan_devices() override;
-    std::string get_name() const override;
+    std::string get_name() const override { return "I2C1"; }
     
     // 友元函数声明，允许DMA回调函数访问私有成员
     friend void i2c1_tx_dma_callback(bool success);
     friend void i2c1_rx_dma_callback(bool success);
 
 private:
-    bool initialized_;
-    uint8_t sda_pin_;
-    uint8_t scl_pin_;
-    bool dma_busy_;
-    dma_callback_t dma_callback_;
-    int dma_tx_channel_;
-    int dma_rx_channel_;
-    
     static HAL_I2C1* instance_;
     
     // 私有构造函数（单例模式）

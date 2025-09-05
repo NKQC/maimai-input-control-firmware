@@ -58,10 +58,9 @@ void BindingSettings::render(PageTemplate& page_template) {
             // 检查是否已有绑区设置
             // 检查是否有现有的Serial映射
             bool has_existing_mapping = false;
-            InputManager::TouchDeviceStatus device_status[8];
-            int device_count;
-            input_manager->get_all_device_status(device_status, device_count);
-            
+            int device_count = input_manager->get_device_count();
+            InputManager::TouchDeviceStatus device_status[device_count];
+            input_manager->get_all_device_status(device_status);
             for (int i = 0; i < device_count; i++) {
                 for (int ch = 0; ch < device_status[i].touch_device.max_channels; ch++) {
                     if (device_status[i].touch_device.serial_mappings[ch].channel != 0) {

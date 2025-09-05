@@ -146,7 +146,7 @@ bool InteractiveSensitivity::detect_touch_area(std::string& detected_device, uin
     // 获取所有设备状态
     InputManager::TouchDeviceStatus device_status[8];
     int device_count = 0;
-    input_manager->get_all_device_status(device_status, device_count);
+    input_manager->get_all_device_status(device_status);
     
     // 检查每个设备的触摸状态
     for (int i = 0; i < device_count; i++) {
@@ -205,9 +205,9 @@ uint8_t InteractiveSensitivity::get_suggested_sensitivity(const std::string& dev
     }
     
     // 获取所有设备状态
-    InputManager::TouchDeviceStatus device_status[8];
-    int device_count = 0;
-    input_manager->get_all_device_status(device_status, device_count);
+    int device_count = input_manager->get_device_count();
+    InputManager::TouchDeviceStatus device_status[device_count];
+    input_manager->get_all_device_status(device_status);
     
     // 查找指定设备的device_id_mask
     uint8_t device_id_mask = 0;

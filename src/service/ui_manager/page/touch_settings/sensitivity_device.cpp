@@ -7,7 +7,11 @@
 
 namespace ui {
 
-SensitivityDevice::SensitivityDevice() : device_name_(""), mapping_cached_(false) {
+std::string SensitivityDevice::device_name_ = "";
+std::vector<int32_t> SensitivityDevice::cached_sensitivity_values_ = {};
+TouchDeviceMapping SensitivityDevice::cached_mapping_ = {};
+
+SensitivityDevice::SensitivityDevice() : mapping_cached_(false) {
     // 构造函数无需特殊初始化
 }
 
@@ -62,7 +66,7 @@ void SensitivityDevice::render(PageTemplate& page_template) {
         }
         
         // 生成通道标签
-        char channel_label[16];
+        char channel_label[24];
         snprintf(channel_label, sizeof(channel_label), "CH%d", ch);
         
         // 生成设置ID
@@ -71,17 +75,8 @@ void SensitivityDevice::render(PageTemplate& page_template) {
         // 使用缓存的灵敏度值
         int32_t* sensitivity_value_ptr = &cached_sensitivity_values_[ch];
         
-        // 创建回调函数
-        auto change_cb = [this, ch](int32_t new_value) {
-            this->on_sensitivity_changed(ch, new_value);
-        };
-        
-        auto complete_cb = [this, ch]() {
-            this->on_sensitivity_complete(ch);
-        };
-        
         // 添加整数设置行，使用缓存的值指针和回调函数
-        ADD_INT_SETTING(sensitivity_value_ptr, 0, 99, channel_label, setting_id, change_cb, complete_cb, COLOR_TEXT_WHITE)
+        ADD_INT_SETTING(sensitivity_value_ptr, 0, 99, channel_label, setting_id, nullptr, on_sensitivity_complete, COLOR_TEXT_WHITE)
     }
     
     // 如果没有启用的通道
@@ -107,9 +102,10 @@ bool SensitivityDevice::get_device_mapping(const std::string& device_name, Touch
     }
     
     // 获取所有设备状态
-    InputManager::TouchDeviceStatus device_status[8];
-    int device_count = 0;
-    input_manager->get_all_device_status(device_status, device_count);
+    uint8_t device_count = input_manager->get_device_count();
+    InputManager::TouchDeviceStatus device_status[device_count];
+    
+    input_manager->get_all_device_status(device_status);
     
     // 查找指定设备
     for (int i = 0; i < device_count; i++) {
@@ -150,46 +146,16 @@ void SensitivityDevice::init_cached_values() {
     mapping_cached_ = true;
 }
 
-void SensitivityDevice::on_sensitivity_changed(uint8_t channel, int32_t new_value) {
-    // 更新缓存的灵敏度值
-    if (channel < cached_sensitivity_values_.size()) {
-        cached_sensitivity_values_[channel] = new_value;
-        // 同时更新缓存的映射中的值
-        if (channel < cached_mapping_.max_channels) {
-            cached_mapping_.sensitivity[channel] = static_cast<uint8_t>(new_value);
-        }
-    }
-}
-
-void SensitivityDevice::on_sensitivity_complete(uint8_t channel) {
+void SensitivityDevice::on_sensitivity_complete() {
     // 将缓存的灵敏度值写回到InputManager配置
     InputManager* input_manager = InputManager::getInstance();
     if (!input_manager) {
         return;
     }
-    
-    // 获取InputManager的配置
-    InputManager_PrivateConfig* config = inputmanager_get_config_holder();
-    if (!config) {
-        return;
+    for (uint8_t ch = 0; ch < cached_mapping_.max_channels; ch++) {
+        input_manager->setSensitivity(cached_mapping_.device_id_mask, ch, cached_sensitivity_values_[ch]);
     }
-    
-    // 查找对应的设备并更新灵敏度
-    for (uint8_t i = 0; i < config->device_count; i++) {
-        TouchDeviceMapping& device_mapping = config->touch_device_mappings[i];
-        
-        // 通过设备ID掩码匹配设备（这里需要根据实际的设备识别方式调整）
-        if (device_mapping.device_id_mask == cached_mapping_.device_id_mask) {
-            // 更新指定通道的灵敏度
-            if (channel < device_mapping.max_channels) {
-                device_mapping.sensitivity[channel] = static_cast<uint8_t>(cached_sensitivity_values_[channel]);
-            }
-            
-            // 保存配置到ConfigManager
-            inputmanager_write_config_to_manager(*config);
-            break;
-        }
-    }
+    UIManager::log_debug_static("on_sensitivity_complete");
 }
 
 } // namespace ui

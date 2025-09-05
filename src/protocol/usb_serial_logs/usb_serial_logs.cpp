@@ -213,9 +213,10 @@ void USB_SerialLogs::flush() {
     if (!is_ready()) {
         return;
     }
-
+    static uint32_t max_oneshot = USB_LOGS_MAX_ONESHOT;
+    max_oneshot = USB_LOGS_MAX_ONESHOT;
     // 直接从队列发送日志
-    while (!log_queue_.empty()) {
+    while (!log_queue_.empty() && max_oneshot--) {
         const USB_LogEntry& entry = log_queue_.front();
         // 格式化日志条目
         std::string formatted = format_log_entry(entry);

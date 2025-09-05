@@ -153,10 +153,12 @@ void HID::report_keyboard() {
     // HID键盘报文格式: [modifier][reserved][key1][key2][key3][key4][key5][key6]
     // 总共8字节，符合标准HID键盘报文格式
     static uint8_t keyboard_report[8];
-    
-    uint8_t keyboard_enum = 0;
-    uint8_t keys_to_send = keyboard_state.key_count;
-    uint8_t key_index = 0;
+    static uint8_t keyboard_enum = 0;
+    static uint8_t keys_to_send = 0;
+    static uint8_t key_index = 0;
+    keyboard_enum = 0;
+    keys_to_send = keyboard_state.key_count;
+    key_index = 0;
     
     // 如果没有按键按下且没有修饰键，发送空报文
     if (keyboard_state.key_count == 0 && keyboard_state.modifier_keys == 0) {

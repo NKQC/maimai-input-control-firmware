@@ -106,11 +106,11 @@ TouchSampleResult GTX312L::sample() {
 }
 
 bool GTX312L::write_register(uint8_t reg, uint8_t value) {
-    return i2c_hal_->write_register(i2c_device_address_, reg, value);
+    return i2c_hal_->write_register(i2c_device_address_, reg, &value, 1);
 }
 
 bool GTX312L::read_register(uint8_t reg, uint8_t& value) {
-    return i2c_hal_->read_register(i2c_device_address_, reg, &value);
+    return i2c_hal_->read_register(i2c_device_address_, reg, &value, 1);
 }
 
 bool GTX312L::write_registers(uint8_t reg, const uint8_t* data, size_t length) {

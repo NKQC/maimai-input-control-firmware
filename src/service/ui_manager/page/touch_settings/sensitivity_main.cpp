@@ -23,9 +23,9 @@ void SensitivityMain::render(PageTemplate& page_template) {
     }
     
     // 获取所有设备状态
-    InputManager::TouchDeviceStatus device_status[8];
-    int device_count = 0;
-    input_manager->get_all_device_status(device_status, device_count);
+    int device_count = input_manager->get_device_count();
+    InputManager::TouchDeviceStatus device_status[device_count];
+    input_manager->get_all_device_status(device_status);
     
     PAGE_START()
     SET_TITLE("灵敏度调整", COLOR_WHITE)

@@ -23,23 +23,22 @@ LineConfig::LineConfig(const LineConfig& other)
         case CallbackType::VALUE_CHANGE:
             callback_data.value_change_callback = other.callback_data.value_change_callback;
             break;
-        case CallbackType::COMPLETE:
-            callback_data.complete_callback = other.callback_data.complete_callback;
-            break;
         case CallbackType::CLICK:
             callback_data.click_callback = other.callback_data.click_callback;
             break;
         case CallbackType::SELECTOR:
             callback_data.selector_callback = other.callback_data.selector_callback;
             break;
+        case CallbackType::COMPLETE:
         case CallbackType::NONE:
         default:
             // 对于NONE类型，不需要复制任何数据
             break;
     }
     
-    // 复制独立的lock_callback
+    // 复制独立的回调函数
     lock_callback = other.lock_callback;
+    int_complete_callback = other.int_complete_callback;
 }
 
 // LineConfig赋值操作符实现
@@ -63,23 +62,22 @@ LineConfig& LineConfig::operator=(const LineConfig& other) {
             case CallbackType::VALUE_CHANGE:
                 callback_data.value_change_callback = other.callback_data.value_change_callback;
                 break;
-            case CallbackType::COMPLETE:
-                callback_data.complete_callback = other.callback_data.complete_callback;
-                break;
             case CallbackType::CLICK:
                 callback_data.click_callback = other.callback_data.click_callback;
                 break;
             case CallbackType::SELECTOR:
                 callback_data.selector_callback = other.callback_data.selector_callback;
                 break;
+            case CallbackType::COMPLETE:
             case CallbackType::NONE:
             default:
                 // 对于NONE类型，不需要复制任何数据
                 break;
         }
         
-        // 复制独立的lock_callback
+        // 复制独立的回调函数
         lock_callback = other.lock_callback;
+        int_complete_callback = other.int_complete_callback;
     }
     return *this;
 }
@@ -103,22 +101,21 @@ LineConfig::LineConfig(LineConfig&& other) noexcept
         case CallbackType::VALUE_CHANGE:
             callback_data.value_change_callback = std::move(other.callback_data.value_change_callback);
             break;
-        case CallbackType::COMPLETE:
-            callback_data.complete_callback = std::move(other.callback_data.complete_callback);
-            break;
         case CallbackType::CLICK:
             callback_data.click_callback = std::move(other.callback_data.click_callback);
             break;
         case CallbackType::SELECTOR:
             callback_data.selector_callback = std::move(other.callback_data.selector_callback);
             break;
+        case CallbackType::COMPLETE:
         case CallbackType::NONE:
         default:
             break;
     }
     
-    // 移动独立的lock_callback
+    // 移动独立的回调函数
     lock_callback = std::move(other.lock_callback);
+    int_complete_callback = std::move(other.int_complete_callback);
     
     // 重置源对象
     other.callback_type = CallbackType::NONE;
@@ -151,22 +148,21 @@ LineConfig& LineConfig::operator=(LineConfig&& other) noexcept {
             case CallbackType::VALUE_CHANGE:
                 callback_data.value_change_callback = std::move(other.callback_data.value_change_callback);
                 break;
-            case CallbackType::COMPLETE:
-                callback_data.complete_callback = std::move(other.callback_data.complete_callback);
-                break;
             case CallbackType::CLICK:
                 callback_data.click_callback = std::move(other.callback_data.click_callback);
                 break;
             case CallbackType::SELECTOR:
                 callback_data.selector_callback = std::move(other.callback_data.selector_callback);
                 break;
+            case CallbackType::COMPLETE:
             case CallbackType::NONE:
             default:
                 break;
         }
         
-        // 移动独立的lock_callback
+        // 移动独立的回调函数
         lock_callback = std::move(other.lock_callback);
+        int_complete_callback = std::move(other.int_complete_callback);
         
         // 重置源对象
         other.callback_type = CallbackType::NONE;

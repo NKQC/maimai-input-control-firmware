@@ -32,9 +32,14 @@
 #define AD7147_REG_STAGE_HIGH_INT_STATUS     0x0009    // 阶段高中断状态寄存器
 #define AD7147_REG_STAGE_COMPLETE_INT_STATUS 0x000A    // 阶段完成中断状态寄存器
 
+// CDC数据
+#define AD7147_REG_CDC_DATA                 0x000B    // CDC数据寄存器
+
 // Stage配置寄存器基地址（每个stage占用8个16位寄存器）
 #define AD7147_REG_STAGE0_CONNECTION         0x0080   // Stage 0连接寄存器
 #define AD7147_REG_STAGE_SIZE                8        // 每个stage占用的寄存器数量
+
+#define AD7147_REG_DEVICE_ID                 0x0017   // 设备ID寄存器
 
 // Stage寄存器偏移（相对于STAGEx_CONNECTION基地址）
 #define AD7147_STAGE_CONNECTION_OFFSET       0        // 连接配置寄存器偏移
@@ -46,7 +51,27 @@
 #define AD7147_STAGE_OFFSET_LOW_CLAMP_OFFSET 7        // 低偏移钳位寄存器偏移
 
 // 灵敏度寄存器默认值
-#define AD7147_SENSITIVITY_DEFAULT           0x2626   // 默认灵敏度值
+#define AD7147_SENSITIVITY_DEFAULT           0x4A4A   // 默认灵敏度值
+#define AD7147_DEFAULT_AFE_OFFSET            0x0      // AFE偏移默认值
+
+// 阶段配置相关常量
+#define AD7147_STAGE1_CONNECTION             0x0088   // Stage 1连接寄存器
+#define AD7147_STAGE2_CONNECTION             0x0090   // Stage 2连接寄存器
+#define AD7147_STAGE3_CONNECTION             0x0098   // Stage 3连接寄存器
+#define AD7147_STAGE4_CONNECTION             0x00A0   // Stage 4连接寄存器
+#define AD7147_STAGE5_CONNECTION             0x00A8   // Stage 5连接寄存器
+#define AD7147_STAGE6_CONNECTION             0x00B0   // Stage 6连接寄存器
+#define AD7147_STAGE7_CONNECTION             0x00B8   // Stage 7连接寄存器
+#define AD7147_STAGE8_CONNECTION             0x00C0   // Stage 8连接寄存器
+#define AD7147_STAGE9_CONNECTION             0x00C8   // Stage 9连接寄存器
+#define AD7147_STAGE10_CONNECTION            0x00D0   // Stage 10连接寄存器
+#define AD7147_STAGE11_CONNECTION            0x00D8   // Stage 11连接寄存器
+
+// 阶段配置默认值
+#define AD7147_DEFAULT_OFFSET_LOW            50       // 默认低偏移值
+#define AD7147_DEFAULT_OFFSET_HIGH           50       // 默认高偏移值
+#define AD7147_DEFAULT_OFFSET_HIGH_CLAMP     100      // 默认高偏移钳位值
+#define AD7147_DEFAULT_OFFSET_LOW_CLAMP      100      // 默认低偏移钳位值
 
 // 设备信息结构体
 struct AD7147_DeviceInfo {
@@ -90,10 +115,9 @@ private:
 
     // 将启用通道掩码实时下发到硬件，使对应Stage的校准/中断启用或关闭
     bool applyEnabledChannelsToHardware();
+    bool configureStages(uint16_t power_control_val, const uint16_t* connection_values);
 
     // 内部辅助函数（16位寄存器地址 + 16位数据）
-    bool write_register(uint16_t reg, uint16_t value);
+    bool write_register(uint16_t reg, uint8_t* value, uint16_t size = 2);
     bool read_register(uint16_t reg, uint16_t& value);
-    bool write_registers(uint16_t start_reg, const uint16_t* data, size_t length);
-    bool read_registers(uint16_t start_reg, uint16_t* data, size_t length);
 };

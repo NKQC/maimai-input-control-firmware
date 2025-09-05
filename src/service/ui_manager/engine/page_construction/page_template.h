@@ -81,12 +81,14 @@ struct LineConfig {
     // 回调函数union - 优化内存占用，每个LineConfig实例只使用其中一个回调
     union CallbackData {
         std::function<void(int32_t)> value_change_callback = nullptr; // INT设置值变更回调
-        std::function<void()> complete_callback;            // INT设置完成回调
         std::function<void()> click_callback;               // 按钮点击回调
         SelectorCallback selector_callback;                 // 选择器回调
         CallbackData() {}
         ~CallbackData() {}
     } callback_data;
+
+    // INT设置专用的完成回调（独立存储，避免union限制）
+    std::function<void()> int_complete_callback = nullptr;
 
     // 选择器锁定回调
     std::function<void()> lock_callback = nullptr;
@@ -176,11 +178,13 @@ struct LineConfig {
         if (change_cb) {
             config.callback_data.value_change_callback = change_cb;
             config.callback_type = CallbackType::VALUE_CHANGE;
-        } else if (complete_cb) {
-            config.callback_data.complete_callback = complete_cb;
-            config.callback_type = CallbackType::COMPLETE;
         } else {
             config.callback_type = CallbackType::NONE;
+        }
+        
+        // 独立设置完成回调
+        if (complete_cb) {
+            config.int_complete_callback = complete_cb;
         }
         config.color = c;
         config.align = LineAlign::CENTER;

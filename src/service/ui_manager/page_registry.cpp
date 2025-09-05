@@ -2,7 +2,6 @@
 #include "page/main_page.h"
 #include "page/main_menu.h"
 #include "page/touch_settings/touch_settings_main.h"
-#include "page/touch_settings/touch_ic_status.h"
 #include "page/touch_settings/sensitivity_main.h"
 #include "page/touch_settings/sensitivity_device.h"
 #include "page/touch_settings/interactive_sensitivity.h"
@@ -81,9 +80,6 @@ void PageRegistry::register_default_pages() {
     auto touch_settings_main_page = std::make_shared<TouchSettingsMain>();
     register_page("touch_settings_main", touch_settings_main_page);
     
-    auto touch_ic_status_page = std::make_shared<TouchICStatus>();
-    register_page("touch_ic_status", touch_ic_status_page);
-    
     auto sensitivity_main_page = std::make_shared<SensitivityMain>();
     register_page("sensitivity_main", sensitivity_main_page);
     
@@ -100,10 +96,6 @@ void PageRegistry::register_default_pages() {
     // 注册通用设置页面
     auto general_settings_page = std::make_shared<GeneralSettings>();
     register_page("general_settings", general_settings_page);
-    
-    // 可以在这里添加更多默认页面的注册
-    // REGISTER_PAGE("settings", SettingsPage);
-    // REGISTER_PAGE("status", StatusPage);
     
     // 注册内部模板页面
     register_internal_pages();

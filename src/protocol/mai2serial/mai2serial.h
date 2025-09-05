@@ -24,28 +24,21 @@ enum Mai2Serial_Command {
     MAI2SERIAL_CMD_SENS = 'k'    // Sensitivity
 };
 
-
-
-// 触摸数据结构
+// 触摸状态数据结构 - 支持34分区设备
 struct Mai2Serial_TouchState {
     union {
+        uint64_t raw;  // 原始64位数据，支持34分区
         struct {
-            uint32_t state1 : 25;
-            uint32_t state2 : 7;
+            uint32_t state1 : 32;  // 第一部分状态位（分区1-32）
+            uint32_t state2 : 3;  // 第二部分状态位（分区33-34及扩展）
         } parts;
-        uint32_t raw;
     };
-
+    
     Mai2Serial_TouchState() : raw(0) {}
-};
-
-struct Mai2Serial_TouchData {
-    Mai2Serial_TouchState touch_state;
-
-    Mai2Serial_TouchData() {}
-    Mai2Serial_TouchData(uint32_t s1, uint8_t s2) {
-        touch_state.parts.state1 = s1 & 0x1FFFFFF; // 25 bits
-        touch_state.parts.state2 = s2 & 0x7F;      // 7 bits
+    Mai2Serial_TouchState(uint64_t value) : raw(value) {}
+    Mai2Serial_TouchState(uint32_t state1, uint32_t state2) {
+        parts.state1 = state1;
+        parts.state2 = state2;
     }
 };
 
@@ -95,7 +88,17 @@ public:
         RUNNING
     };
 
-    using Mai2Serial_TouchCallback = void (*)(const Mai2Serial_TouchData&);
+    union touch_data_packet{
+        uint8_t data[9];
+        struct {
+            uint8_t start_byte = '(';
+            uint32_t state1 = 0;
+            uint8_t state2 = 0;
+            uint8_t end_byte = ')';
+        } parts;
+        touch_data_packet() {}
+    };
+
     using Mai2Serial_CommandCallback = void (*)(Mai2Serial_Command, const uint8_t*, uint8_t);
 
     Mai2Serial(HAL_UART* uart_hal);
@@ -104,11 +107,10 @@ public:
     bool init();
     void deinit();
 
-    bool is_ready() const;
+    inline bool is_ready() const;
 
     bool set_config(const Mai2Serial_Config& config);
     Mai2Serial_Config get_config() const;
-    void set_touch_callback(Mai2Serial_TouchCallback callback);
     void set_command_callback(Mai2Serial_CommandCallback callback);
 
     bool start();
@@ -117,16 +119,21 @@ public:
 
     bool set_baud_rate(uint32_t baud_rate);
 
-    void task();
+    inline void task() {
+        process_commands();
+    };
 
     // 数据发送
-    bool send_touch_data(const Mai2Serial_TouchData& touch_data);
-    bool send_touch_state(uint32_t state1, uint32_t state2);
+    bool send_touch_data(Mai2Serial_TouchState& touch_data);
     void send_command_response(uint8_t lr, uint8_t sensor, uint8_t cmd, uint8_t value);
 
-    // 状态	s
+    // 状态
     void set_serial_ok(bool ok);
     bool get_serial_ok() const;
+
+    // 设置触发指定区域
+    void manually_triggle_area(Mai2_TouchArea area);
+    void clear_manually_triggle_area();
 
     // DMA接收处理（流式）
     void process_commands();
@@ -152,10 +159,9 @@ private:
     uint8_t rx_stream_buffer_[MAI2SERIAL_STREAM_BUFFER_SIZE];
     size_t rx_stream_pos_;
 
-    // 最近一次的触摸数据
-    Mai2Serial_TouchData last_touch_data_;
+    // 触摸覆盖层 用于绑定或其他情况下手动触发指定区域
+    Mai2Serial_TouchState triggle_touch_data_;
 
     // 回调
-    Mai2Serial_TouchCallback touch_callback_ = nullptr;
     Mai2Serial_CommandCallback command_callback_ = nullptr;
 };
