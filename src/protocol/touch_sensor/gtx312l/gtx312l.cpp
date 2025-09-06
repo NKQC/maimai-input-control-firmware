@@ -8,7 +8,7 @@
 GTX312L::GTX312L(HAL_I2C* i2c_hal, I2C_Bus i2c_bus, uint8_t device_addr)
     : TouchSensor(GTX312L_MAX_CHANNELS), i2c_hal_(i2c_hal), i2c_bus_(i2c_bus), 
       device_addr_(device_addr), i2c_device_address_(device_addr), initialized_(false),
-      i2c_bus_enum_(i2c_bus), enabled_channels_mask_(0), last_touch_state_(0) {
+      i2c_bus_enum_(i2c_bus), enabled_channels_mask_(0) {
     // 生成模块掩码：bit7=I2C总线编号，bit6-0=I2C地址
     module_name = "GTX312L";
     module_mask_ = generateModuleMask(static_cast<uint8_t>(i2c_bus), device_addr);
@@ -98,7 +98,6 @@ TouchSampleResult GTX312L::sample() {
         read_register(GTX312L_REG_TOUCH_STATUS_H, bitmap.h)) {
         result.channel_mask = (static_cast<uint32_t>(bitmap.value) & 0x0FFFu) & enabled_channels_mask_; // 12位通道掩码，自动限制在24位内
         result.module_mask = module_mask_;
-        last_touch_state_ = result.channel_mask;
     }
     
     result.timestamp_us = time_us_32();

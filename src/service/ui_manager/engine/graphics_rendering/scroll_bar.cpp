@@ -47,8 +47,8 @@ void ScrollBar::update_scroll_info(const ScrollInfo& info) {
 }
 
 void ScrollBar::setup_page_scroll(const std::vector<LineConfig>& lines, int visible_lines) {
-    // 限制最多15行
-    size_t max_lines = std::min(lines.size(), (size_t)15);
+    // 限制最多30行
+    size_t max_lines = std::min(lines.size(), (size_t)30);
     page_scroll_state_.all_lines.clear();
     page_scroll_state_.all_lines.reserve(max_lines);
     

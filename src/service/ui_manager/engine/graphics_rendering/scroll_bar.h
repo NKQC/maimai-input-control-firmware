@@ -13,7 +13,7 @@ namespace ui {
 /**
  * 滚动条组件
  * 用于显示内容的滚动位置和比例
- * 支持与PageTemplate配合工作，最多支持15行列表
+ * 支持与PageTemplate配合工作，最多支持30行列表
  */
 class ScrollBar {
 public:
@@ -32,12 +32,12 @@ public:
         int total_items;        // 总项目数
         int visible_items;      // 可见项目数
         int current_offset;     // 当前偏移量
-        int max_items;          // 最大支持项目数（默认15）
+        int max_items;          // 最大支持项目数（默认30）
     };
     
     // 页面滚动状态
     struct PageScrollState {
-        std::vector<LineConfig> all_lines;  // 所有行配置（最多15行）
+        std::vector<LineConfig> all_lines;  // 所有行配置（最多30行）
         int display_start_index;            // 当前显示起始索引
         int visible_line_count;             // 可见行数（固定4行）
         bool scroll_enabled;                // 是否启用滚动

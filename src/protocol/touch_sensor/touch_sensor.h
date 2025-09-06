@@ -4,6 +4,8 @@
 #include <string>
 #include <vector>
 #include <memory>
+#include <sstream>
+#include <cstdlib>
 
 // 前向声明
 class HAL_I2C;
@@ -114,6 +116,10 @@ public:
     // 灵敏度控制接口 - 子类可选实现 (统一使用0-99范围)
     virtual bool setChannelSensitivity(uint8_t channel, uint8_t sensitivity) { return false; }  // 设置通道灵敏度 (0-99)
     virtual uint8_t getChannelSensitivity(uint8_t channel) const { return 50; }  // 获取通道灵敏度 (0-99，默认50)
+    
+    // 配置管理接口 - 子类可选实现
+    virtual bool loadConfig(const std::string& config_data) { return false; }  // 从字符串加载配置
+    virtual std::string saveConfig() const { return ""; }  // 保存配置到字符串
 
 protected:
     uint8_t max_channels_;  // 该IC支持的最大通道数（最大24）
@@ -122,11 +128,198 @@ protected:
     uint8_t module_mask_;              // 8位模块掩码 (bit7=I2C总线编号, bit6-0=I2C 7位地址)
     uint32_t supported_channel_count_; // 支持的通道数量
     
-    // 静态掩码操作方法 - 用于生成和解析32位触摸掩码
-    
-    // 注意：TouchSampleResult现在使用union结构，可直接访问module_mask和channel_mask字段
-    // 无需转换函数，直接使用 result.module_mask 和 result.channel_mask 即可
-    
+    /**
+     * 配置管理器结构体 - 提供通用的配置存储和转换功能
+     * 使用字符串存储，支持多种数据类型的重载读写函数
+     */
+    struct ConfigManager {
+        std::string config_data;
+        
+        // Write functions for different types
+        void setConfig(const std::string& key, int32_t value) {
+            setConfigInternal(key, std::to_string(value));
+        }
+        
+        void setConfig(const std::string& key, uint32_t value) {
+            setConfigInternal(key, std::to_string(value));
+        }
+        
+        void setConfig(const std::string& key, int16_t value) {
+            setConfigInternal(key, std::to_string(value));
+        }
+        
+        void setConfig(const std::string& key, uint16_t value) {
+            setConfigInternal(key, std::to_string(value));
+        }
+        
+        void setConfig(const std::string& key, int8_t value) {
+            setConfigInternal(key, std::to_string(static_cast<int>(value)));
+        }
+        
+        void setConfig(const std::string& key, uint8_t value) {
+            setConfigInternal(key, std::to_string(static_cast<unsigned int>(value)));
+        }
+        
+        void setConfig(const std::string& key, float value) {
+            setConfigInternal(key, std::to_string(value));
+        }
+        
+        void setConfig(const std::string& key, bool value) {
+             setConfigInternal(key, value ? "1" : "0");
+         }
+        
+        void setConfig(const std::string& key, const std::string& value) {
+            setConfigInternal(key, value);
+        }
+        
+        // Read functions for different types
+        int32_t getConfig(const std::string& key, int32_t default_value) const {
+            std::string value = getConfigInternal(key);
+            if (value.empty()) return default_value;
+            char* end;
+            long result = std::strtol(value.c_str(), &end, 10);
+            if (end == value.c_str() || *end != '\0') {
+                return default_value;
+            }
+            return static_cast<int32_t>(result);
+        }
+        
+        uint32_t getConfig(const std::string& key, uint32_t default_value) const {
+            std::string value = getConfigInternal(key);
+            if (value.empty()) return default_value;
+            char* end;
+            unsigned long result = std::strtoul(value.c_str(), &end, 10);
+            if (end == value.c_str() || *end != '\0') {
+                return default_value;
+            }
+            return static_cast<uint32_t>(result);
+        }
+        
+        int16_t getConfig(const std::string& key, int16_t default_value) const {
+            std::string value = getConfigInternal(key);
+            if (value.empty()) return default_value;
+            char* end;
+            long result = std::strtol(value.c_str(), &end, 10);
+            if (end == value.c_str() || *end != '\0') {
+                return default_value;
+            }
+            return static_cast<int16_t>(result);
+        }
+        
+        uint16_t getConfig(const std::string& key, uint16_t default_value) const {
+            std::string value = getConfigInternal(key);
+            if (value.empty()) return default_value;
+            char* end;
+            unsigned long result = std::strtoul(value.c_str(), &end, 10);
+            if (end == value.c_str() || *end != '\0') {
+                return default_value;
+            }
+            return static_cast<uint16_t>(result);
+        }
+        
+        int8_t getConfig(const std::string& key, int8_t default_value) const {
+            std::string value = getConfigInternal(key);
+            if (value.empty()) return default_value;
+            char* end;
+            long result = std::strtol(value.c_str(), &end, 10);
+            if (end == value.c_str() || *end != '\0') {
+                return default_value;
+            }
+            return static_cast<int8_t>(result);
+        }
+        
+        uint8_t getConfig(const std::string& key, uint8_t default_value) const {
+            std::string value = getConfigInternal(key);
+            if (value.empty()) return default_value;
+            char* end;
+            unsigned long result = std::strtoul(value.c_str(), &end, 10);
+            if (end == value.c_str() || *end != '\0') {
+                return default_value;
+            }
+            return static_cast<uint8_t>(result);
+        }
+        
+        float getConfig(const std::string& key, float default_value) const {
+            std::string value = getConfigInternal(key);
+            if (value.empty()) return default_value;
+            char* end;
+            float result = std::strtof(value.c_str(), &end);
+            if (end == value.c_str() || *end != '\0') {
+                return default_value;
+            }
+            return result;
+        }
+        
+        bool getConfig(const std::string& key, bool default_value) const {
+             std::string value = getConfigInternal(key);
+             if (value.empty()) return default_value;
+             return (value == "1" || value == "true");
+         }
+        
+        std::string getConfig(const std::string& key, const std::string& default_value) const {
+            std::string value = getConfigInternal(key);
+            return value.empty() ? default_value : value;
+        }
+        
+        // 序列化为字符串
+        std::string toString() const {
+            return config_data;
+        }
+        
+        // 从字符串反序列化
+        bool fromString(const std::string& data) {
+            config_data = data;
+            return true;
+        }
+        
+        // 清空配置
+        void clear() {
+            config_data.clear();
+        }
+        
+        // 检查是否包含指定配置
+        bool hasConfig(const std::string& key) const {
+            return !getConfigInternal(key).empty();
+        }
+        
+    private:
+        void setConfigInternal(const std::string& key, const std::string& value) {
+            // Remove existing key if present
+            std::string search_key = key + "=";
+            size_t start_pos = config_data.find(search_key);
+            if (start_pos != std::string::npos) {
+                size_t end_pos = config_data.find('\n', start_pos);
+                if (end_pos != std::string::npos) {
+                    config_data.erase(start_pos, end_pos - start_pos + 1);
+                } else {
+                    config_data.erase(start_pos);
+                }
+            }
+            
+            // Add new key-value pair
+            if (!config_data.empty() && config_data.back() != '\n') {
+                config_data += "\n";
+            }
+            config_data += key + "=" + value + "\n";
+        }
+        
+        std::string getConfigInternal(const std::string& key) const {
+            std::string search_key = key + "=";
+            size_t start_pos = config_data.find(search_key);
+            if (start_pos == std::string::npos) {
+                return "";
+            }
+            
+            start_pos += search_key.length();
+            size_t end_pos = config_data.find('\n', start_pos);
+            if (end_pos == std::string::npos) {
+                return config_data.substr(start_pos);
+            }
+            
+            return config_data.substr(start_pos, end_pos - start_pos);
+        }
+    };
+
     /**
      * 生成模块掩码
      * @param i2c_bus I2C总线编号 (0或1)

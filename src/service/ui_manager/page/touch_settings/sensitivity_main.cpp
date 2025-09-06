@@ -2,7 +2,9 @@
 #include "../../ui_manager.h"
 #include "../../engine/page_construction/page_macros.h"
 #include "../../engine/page_construction/page_template.h"
+#include "device_type_utils.h"
 #include <cstdio>
+#include <cstring>
 
 namespace ui {
 
@@ -46,8 +48,13 @@ void SensitivityMain::render(PageTemplate& page_template) {
             // 设备颜色：连接状态决定
             Color device_color = device.is_connected ? COLOR_TEXT_WHITE : COLOR_RED;
             
-            // 使用新的ADD_MENU_WITH_STR宏传递设备名称
-            ADD_MENU_WITH_STR(device.device_name, "sensitivity_device", device.device_name, device_color)
+            // 使用DeviceTypeUtils获取页面信息
+            std::string page_name, jump_str;
+            DeviceTypeUtils::getDevicePageInfo(device, page_name, jump_str);
+            
+            ADD_MENU_WITH_STR(jump_str, page_name, device.device_name, device_color)
+            
+            
         }
     }
     

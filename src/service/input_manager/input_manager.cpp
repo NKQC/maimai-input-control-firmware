@@ -10,6 +10,10 @@
 
 // 静态实例
 InputManager* InputManager::instance_ = nullptr;
+// 静态配置变量
+static InputManager_PrivateConfig static_config_;
+// Debug开关静态变量
+bool InputManager::debug_enabled_ = false;
 
 // 单例模式实现
 InputManager* InputManager::getInstance() {
@@ -34,6 +38,8 @@ InputManager::InputManager()
     , current_binding_index_(0)
     , binding_start_time_(0)
     , binding_timeout_ms_(30000)  // 30秒超时
+    , binding_hardware_ops_pending_(false)
+    , binding_cancel_pending_(false)
     , hid_binding_device_addr_(0)
     , hid_binding_channel_(0)
     , hid_binding_x_(0.0f)
@@ -126,7 +132,7 @@ bool InputManager::registerTouchSensor(TouchSensor* device) {
 
     // 检查mask是否为全0，如果是则忽略该设备
     if (device_id_mask == 0) {
-        log_warn("Ignoring touch sensor with zero mask: " + device->getDeviceName());
+        log_warning("Ignoring touch sensor with zero mask: " + device->getDeviceName());
         return false;
     }
     
@@ -155,6 +161,8 @@ bool InputManager::registerTouchSensor(TouchSensor* device) {
             return true; // 成功更新连接状态
         }
     }
+    // 当设备存在自定义配置时 加载他
+    load_touch_device_config(device, device_id_mask);
     
     // 添加到TouchSensor设备列表
     touch_sensor_devices_.push_back(device);
@@ -201,9 +209,21 @@ void InputManager::unregisterTouchSensor(TouchSensor* device) {
     }
 }
 
-// GTX312L接口已移除 - 统一使用TouchSensor接口
-
-// GTX312L接口已移除 - 统一使用TouchSensor接口
+void InputManager::load_touch_device_config(TouchSensor* device, uint8_t device_id_mask) {
+    // 尝试加载该设备的自定义配置
+    ConfigManager* config_mgr = ConfigManager::getInstance();
+    if (config_mgr) {
+        std::string config_key = "TOUCH_DEVICE_CONFIG_" + std::to_string(device_id_mask);
+        std::string device_config = config_mgr->get_string_dynamic(config_key);
+        if (!device_config.empty()) {
+            if (device->loadConfig(device_config)) {
+                log_info("已加载设备自定义配置: " + device->getDeviceName() + " (ID掩码: 0x" + std::to_string(device_id_mask) + ")");
+            } else {
+                log_warning("加载设备配置失败: " + device->getDeviceName() + " (ID掩码: 0x" + std::to_string(device_id_mask) + ")");
+            }
+        }
+    }
+}
 
 // 物理键盘映射管理方法
 bool InputManager::addPhysicalKeyboard(MCU_GPIO gpio, HID_KeyCode default_key) {
@@ -351,7 +371,9 @@ inline bool InputManager::setWorkMode(InputWorkMode mode) {
 void InputManager::task0() {
     // 更新所有设备的触摸状态
     updateTouchStates();
+
     mai2_serial_->task();
+
     // 处理自动灵敏度调整状态机
     if (auto_adjust_context_.active) {
         processAutoAdjustSensitivity();
@@ -359,9 +381,16 @@ void InputManager::task0() {
     
     // 处理绑定状态
     if (binding_active_) {
+        // 如果需要执行硬件操作，先执行
+        if (binding_hardware_ops_pending_) {
+            backupChannelStates();
+            enableAllChannels();
+            binding_hardware_ops_pending_ = false;
+        }
         processBinding();
         return;
     }
+    
     if (getWorkMode() == InputWorkMode::SERIAL_MODE) {
         processSerialModeWithDelay();
     }
@@ -393,10 +422,7 @@ void InputManager::startSerialBinding(InteractiveBindingCallback callback) {
     binding_state_ = BindingState::SERIAL_BINDING_INIT;
     current_binding_index_ = 0;
     binding_start_time_ = to_ms_since_boot(get_absolute_time());
-    
-    // 备份当前通道状态并启用所有通道
-    backupChannelStates();
-    enableAllChannels();
+    binding_hardware_ops_pending_ = true;  // 标记需要在task0中执行硬件操作
 }
 
 // 开始HID绑定
@@ -417,10 +443,7 @@ void InputManager::startHIDBinding(InteractiveBindingCallback callback) {
     hid_binding_channel_ = 0;
     hid_binding_x_ = 0.0f;
     hid_binding_y_ = 0.0f;
-
-    // 备份当前通道状态并启用所有通道
-    backupChannelStates();
-    enableAllChannels();
+    binding_hardware_ops_pending_ = true;  // 标记需要在task0中执行硬件操作
 }
 
 // 开始自动Serial绑定
@@ -435,10 +458,7 @@ bool InputManager::startAutoSerialBinding() {
     binding_state_ = BindingState::AUTO_SERIAL_BINDING_INIT;
     current_binding_index_ = 0;
     binding_start_time_ = to_ms_since_boot(get_absolute_time());
-    
-    // 备份当前通道状态并启用所有通道
-    backupChannelStates();
-    enableAllChannels();
+    binding_hardware_ops_pending_ = true;  // 标记需要在task0中执行硬件操作
     
     return true;
 }
@@ -453,6 +473,7 @@ void InputManager::cancelBinding() {
         binding_active_ = false;
         binding_callback_ = nullptr;
         binding_state_ = BindingState::IDLE;
+        binding_hardware_ops_pending_ = false;
         current_binding_index_ = 0;
         binding_start_time_ = 0;
         
@@ -461,22 +482,35 @@ void InputManager::cancelBinding() {
         hid_binding_channel_ = 0;
         hid_binding_x_ = 0.0f;
         hid_binding_y_ = 0.0f;
+        
+        mai2_serial_->clear_manually_triggle_area();
     }
 }
 
 // 设置HID绑定坐标
 void InputManager::setHIDCoordinates(float x, float y) {
+    log_debug("setHIDCoordinates() called with x=" + std::to_string(x) + ", y=" + std::to_string(y));
+    
     if (binding_active_ && binding_state_ == BindingState::HID_BINDING_SET_COORDS) {
         hid_binding_x_ = x;
         hid_binding_y_ = y;
+        log_debug("HID coordinates set successfully");
+    } else {
+        log_warning("setHIDCoordinates called but not in correct binding state");
     }
 }
 
 // 确认HID绑定
 void InputManager::confirmHIDBinding() {
+    log_debug("confirmHIDBinding() called");
+    
     if (binding_active_ && binding_state_ == BindingState::HID_BINDING_SET_COORDS) {
+        log_debug("Confirming HID binding, updating channel states");
         binding_state_ = BindingState::HID_BINDING_COMPLETE;
         updateChannelStatesAfterBinding();
+        log_debug("HID binding confirmed successfully");
+    } else {
+        log_warning("confirmHIDBinding called but not in correct binding state");
     }
 }
 
@@ -487,15 +521,31 @@ bool InputManager::isAutoSerialBindingComplete() const {
 
 // 确认自动绑区结果
 void InputManager::confirmAutoSerialBinding() {
+    log_debug("confirmAutoSerialBinding() called");
+    
     if (binding_active_ && binding_state_ == BindingState::AUTO_SERIAL_BINDING_WAIT) {
+        log_debug("Confirming auto Serial binding, updating channel states");
         binding_state_ = BindingState::AUTO_SERIAL_BINDING_COMPLETE;
         updateChannelStatesAfterBinding();
+        log_debug("Auto Serial binding confirmed successfully");
+    } else {
+        log_warning("confirmAutoSerialBinding called but not in correct binding state");
     }
 }
 
 // 获取当前绑定状态
 BindingState InputManager::getBindingState() const {
     return binding_state_;
+}
+
+// 获取当前绑定区域索引
+uint8_t InputManager::getCurrentBindingIndex() const {
+    return current_binding_index_;
+}
+
+void InputManager::requestCancelBinding() {
+    // 设置取消标志位，让task0处理实际的取消操作
+    binding_cancel_pending_ = true;
 }
 
 // 自动调整指定通道的灵敏度
@@ -685,11 +735,6 @@ bool InputManager::setSensitivityByDeviceName(const std::string& device_name, ui
     }
     return false;
 }
-
-// 16位地址兼容性方法已移除 - 统一使用32位地址处理
-
-// 16位地址兼容性方法已移除 - 统一使用32位地址处理
-// 使用setSensitivityByDeviceName替代set_channel_sensitivity_by_name
 
 // 设置Serial映射 - 反向映射版本
 void InputManager::setSerialMapping(uint8_t device_id_mask, uint8_t channel, Mai2_TouchArea area) {
@@ -1058,24 +1103,12 @@ TouchDeviceMapping* InputManager::findTouchDeviceMapping(uint8_t device_id_mask)
 TouchSensor* InputManager::findTouchSensorByIdMask(uint8_t device_id_mask) {
     // 优先根据缓存匹配
     for (size_t i = 0; i < sizeof(touch_device_states_) / sizeof(touch_device_states_[0]); ++i) {
-        if (touch_device_states_[i].current_touch_mask == device_id_mask) {
+        if (touch_device_states_[i].parts.device_mask == device_id_mask) {
             if (i < touch_sensor_devices_.size()) return touch_sensor_devices_[i];
         }
     }
-    // 回退：遍历设备进行一次采样以确认ID
-    for (auto* device : touch_sensor_devices_) {
-        if (!device) continue;
-        TouchSampleResult result = device->sample();
-        uint32_t full_mask = result.touch_mask; // 直接使用union字段获取完整32位掩码
-        if (full_mask == device_id_mask) return device;
-    }
     return nullptr;
 }
-
-// 地址转换方法已移除，统一使用TouchSensor接口
-
-// 静态配置变量
-static InputManager_PrivateConfig static_config_;
 
 // [默认配置注册函数] - 注册所有InputManager的默认配置到ConfigManager
 void inputmanager_register_default_configs(config_map_t& default_map) {
@@ -1173,9 +1206,7 @@ bool inputmanager_load_config_from_manager() {
             // 使用公有方法setSensitivity来应用灵敏度设置
             for (uint8_t channel = 0; channel < mapping.max_channels; channel++) {
                 uint8_t sensitivity = mapping.sensitivity[channel];
-                if (sensitivity > 0) {  // 只应用非零灵敏度值
-                    instance->setSensitivity(mapping.device_id_mask, channel, sensitivity);
-                }
+                instance->setSensitivity(mapping.device_id_mask, channel, sensitivity);
             }
         }
     }
@@ -1200,8 +1231,33 @@ void InputManager::get_all_device_status(TouchDeviceStatus *data) {
         uint8_t device_id_mask = data[i].touch_device.device_id_mask;
         char hex_name[12];
         snprintf(hex_name, sizeof(hex_name), "%02X", device_id_mask);
+
         data[i].device_name = std::string(hex_name);
+        data[i].device_type = TouchSensor::identifyICType(device_id_mask & 0x7F);
     }
+}
+
+// 通过设备名称获取TouchSensor实例
+TouchSensor* InputManager::getTouchSensorByDeviceName(const std::string& device_name) {
+    // 获取所有设备状态
+    int device_count = get_device_count();
+    if (device_count == 0) {
+        return nullptr;
+    }
+    
+    TouchDeviceStatus device_status[device_count];
+    get_all_device_status(device_status);
+    
+    // 查找匹配设备名称的已连接设备
+    for (uint8_t i = 0; i < device_count; i++) {
+        if (device_status[i].device_name == device_name) {
+            // 找到匹配的设备，通过设备ID掩码获取TouchSensor实例
+            uint8_t device_id_mask = device_status[i].touch_device.device_id_mask;
+            return findTouchSensorByIdMask(device_id_mask);
+        }
+    }
+    
+    return nullptr;
 }
 
 // [配置读取函数] - 返回当前配置的副本
@@ -1256,6 +1312,24 @@ bool inputmanager_write_config_to_manager(const InputManager_PrivateConfig& conf
         config_mgr->set_string(INPUTMANAGER_LOGICAL_MAPPINGS, mappings_data);
     }
     
+    // 保存支持saveConfig的触摸设备的自定义配置
+    InputManager* instance = InputManager::getInstance();
+    if (instance) {
+        const std::vector<TouchSensor*>& devices = instance->getTouchSensorDevices();
+        for (TouchSensor* device : devices) {
+            USB_LOG_DEBUG("尝试保存TouchSensor设置 %s", device->getDeviceName().c_str());
+            if (device) {
+                std::string device_config = device->saveConfig();
+                USB_LOG_DEBUG("设置 %s 配置:%s", device->getDeviceName().c_str(), device_config.c_str());
+                if (!device_config.empty()) {
+                    uint8_t device_id_mask = device->getModuleMask();
+                    std::string config_key = "TOUCH_DEVICE_CONFIG_" + std::to_string(device_id_mask);
+                    config_mgr->set_string_dynamic(config_key, device_config);
+                }
+            }
+        }
+    }
+    
     // 更新静态配置
     static_config_ = config;
     
@@ -1264,10 +1338,18 @@ bool inputmanager_write_config_to_manager(const InputManager_PrivateConfig& conf
 
 // 绑定处理主函数
 void InputManager::processBinding() {
+    // 检查是否有取消绑定请求
+    if (binding_cancel_pending_) {
+        binding_cancel_pending_ = false;
+        cancelBinding();
+        return;
+    }
+    
     uint32_t current_time = to_ms_since_boot(get_absolute_time());
     
     // 检查超时
     if (current_time - binding_start_time_ > binding_timeout_ms_) {
+        log_warning("Binding timeout detected, elapsed: " + std::to_string(current_time - binding_start_time_) + "ms");
         if (binding_callback_) {
             binding_callback_(false, "Binding timeout");
         }
@@ -1281,6 +1363,7 @@ void InputManager::processBinding() {
         case BindingState::SERIAL_BINDING_WAIT_TOUCH:
         case BindingState::SERIAL_BINDING_PROCESSING:
         case BindingState::SERIAL_BINDING_COMPLETE:
+            log_debug("Processing Serial binding, state: " + std::to_string(static_cast<int>(binding_state_)));
             processSerialBinding();
             break;
             
@@ -1288,6 +1371,7 @@ void InputManager::processBinding() {
         case BindingState::HID_BINDING_WAIT_TOUCH:
         case BindingState::HID_BINDING_SET_COORDS:
         case BindingState::HID_BINDING_COMPLETE:
+            log_debug("Processing HID binding, state: " + std::to_string(static_cast<int>(binding_state_)));
             processHIDBinding();
             break;
             
@@ -1295,10 +1379,12 @@ void InputManager::processBinding() {
         case BindingState::AUTO_SERIAL_BINDING_SCAN:
         case BindingState::AUTO_SERIAL_BINDING_WAIT:
         case BindingState::AUTO_SERIAL_BINDING_COMPLETE:
+            log_debug("Processing Auto Serial binding, state: " + std::to_string(static_cast<int>(binding_state_)));
             processAutoSerialBinding();
             break;
             
         default:
+            log_warning("Unknown binding state: " + std::to_string(static_cast<int>(binding_state_)));
             break;
     }
 }
@@ -1934,30 +2020,48 @@ bool InputManager::getDelayedSerialState(Mai2Serial_TouchState& delayed_state) {
     return false;
 }
 
-void InputManager::log_debug(std::string msg) {
-    auto* logger = USB_SerialLogs::get_global_instance();
-    if (logger) {
-        logger->debug(msg, "InputManager");
+// 静态日志函数实现
+void InputManager::log_debug(const std::string& msg) {
+    if (debug_enabled_) {
+        auto* logger = USB_SerialLogs::get_global_instance();
+        if (logger) {
+            logger->debug(msg, "InputManager");
+        }
     }
 }
 
-void InputManager::log_info(std::string msg) {
+void InputManager::log_info(const std::string& msg) {
     auto* logger = USB_SerialLogs::get_global_instance();
     if (logger) {
         logger->info(msg, "InputManager");
     }
 }
 
-void InputManager::log_warn(std::string msg) {
+void InputManager::log_warning(const std::string& msg) {
     auto* logger = USB_SerialLogs::get_global_instance();
     if (logger) {
         logger->warning(msg, "InputManager");
     }
 }
 
-void InputManager::log_error(std::string msg) {
+void InputManager::log_error(const std::string& msg) {
     auto* logger = USB_SerialLogs::get_global_instance();
     if (logger) {
         logger->error(msg, "InputManager");
     }
+}
+
+// Debug开关控制函数
+void InputManager::set_debug_enabled(bool enabled) {
+    debug_enabled_ = enabled;
+    if (enabled) {
+        auto* logger = USB_SerialLogs::get_global_instance();
+        if (logger) {
+            logger->info("InputManager debug logging enabled", "InputManager");
+        }
+    }
+}
+
+bool InputManager::is_debug_enabled() {
+    return debug_enabled_;
 }

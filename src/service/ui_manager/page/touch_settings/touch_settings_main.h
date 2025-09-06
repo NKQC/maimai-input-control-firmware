@@ -28,7 +28,7 @@ private:
      * @param device_id_mask 触摸IC设备ID掩码
      * @return 格式化后的地址字符串
      */
-    static std::string format_device_address(uint32_t device_id_mask);
+    static std::string format_device_address(uint8_t device_id_mask);
 
     /**
      * 格式化触摸通道位图为字符串

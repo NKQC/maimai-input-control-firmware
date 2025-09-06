@@ -273,7 +273,6 @@ public:
     bool scroll_up();     // 向上滚动
     bool scroll_down();   // 向下滚动
     bool is_scroll_enabled() const { return scroll_enabled_; }
-    void update_scroll_display();  // 更新滚动显示
     int get_selected_index() const { return selected_menu_index_; }
     
     // 页面状态保存和恢复
@@ -281,7 +280,6 @@ public:
     void set_scroll_position(int position) { 
         if (scroll_enabled_) {
             scroll_bar_.set_display_start_index(position);
-            update_scroll_display();
         }
     }
     
@@ -401,10 +399,5 @@ private:
     int16_t get_text_x_position(const std::string& text, LineAlign align, const Rect& rect);
     void draw_selection_indicator(int line_index);
 };
-
-// 预定义模板实现已迁移到template_page目录中的PageConstructor派生类
-// 使用PageRegistry注册的内部页面：
-// - "__error__" : ErrorPage
-// - "__int_setting__" : IntSettingPage
 
 #endif // PAGE_TEMPLATE_H

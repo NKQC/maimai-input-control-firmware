@@ -1184,6 +1184,30 @@ void ConfigManager::set_string(const std::string& key, const std::string& value)
     set(key, ConfigValue(value));
 }
 
+// 动态设置接口实现 - 允许设置未注册的键（字符串限定）
+void ConfigManager::set_string_dynamic(const std::string& key, const std::string& value) {
+    // 直接设置到运行时map，不检查是否已注册
+    _runtime_map[key] = ConfigValue(value);
+    
+    // 清除字符串缓存
+    auto cache_it = _string_cache.find(key);
+    if (cache_it != _string_cache.end()) {
+        _string_cache.erase(cache_it);
+    }
+}
+
+bool ConfigManager::has_string_dynamic(const std::string& key) {
+    return _runtime_map.find(key) != _runtime_map.end();
+}
+
+std::string ConfigManager::get_string_dynamic(const std::string& key, const std::string& default_value) {
+    auto it = _runtime_map.find(key);
+    if (it != _runtime_map.end() && it->second.type == ConfigValueType::STRING) {
+        return it->second.string_val;
+    }
+    return default_value;
+}
+
 // 批量操作接口
 std::map<std::string, ConfigValue> ConfigManager::get_all() {
     return _runtime_map;

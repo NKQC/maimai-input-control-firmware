@@ -166,7 +166,7 @@ public:
     std::vector<std::string> get_available_pages();
     
     // 新页面引擎接口
-    inline bool switch_to_page(const std::string& page_name);
+    bool switch_to_page(const std::string& page_name);
     const std::string& get_current_page_name() const;
     // Removed PageBase and PageConstructor - using simplified approach
     bool register_main_page();

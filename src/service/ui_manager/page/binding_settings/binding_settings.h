@@ -52,28 +52,28 @@ private:
     std::string get_current_binding_area();
     
     /**
-     * 启动Serial模式绑区
+     * 启动交互式绑区
      * @return 是否成功启动
      */
-    bool start_serial_binding();
+    static bool start_serial_binding();
     
     /**
-     * 终止当前绑区
+     * 终止当前绑区操作
      * @return 是否成功终止
      */
-    bool stop_binding();
+    static bool stop_binding();
     
     /**
      * 确认并保存绑区设置
      * @return 是否成功保存
      */
-    bool confirm_and_save_binding();
+    static bool confirm_and_save_binding();
     
     /**
-     * 回退一步绑区
+     * 回退绑区步骤
      * @return 是否成功回退
      */
-    bool step_back_binding();
+    static bool step_back_binding();
     
     /**
      * 格式化绑区状态文本

@@ -251,6 +251,7 @@ public:
     // 设备注册 - TouchSensor统一接口
     bool registerTouchSensor(TouchSensor* device);
     void unregisterTouchSensor(TouchSensor* device);
+    void load_touch_device_config(TouchSensor* device, uint8_t device_id_mask);
     
     // 工作模式设置
     inline bool setWorkMode(InputWorkMode mode);
@@ -274,6 +275,8 @@ public:
     
     // 绑定状态查询
     BindingState getBindingState() const;      // 获取当前绑定状态
+    uint8_t getCurrentBindingIndex() const;  // 获取当前绑定区域索引
+    void requestCancelBinding();             // 请求取消绑定（UI层调用）
     
     // HID绑定相关方法
     void setHIDCoordinates(float x, float y);  // 设置HID绑定坐标
@@ -290,6 +293,7 @@ public:
         TouchDeviceMapping touch_device;           // 32位设备映射
         uint32_t touch_states_32bit;              // 32位触摸状态
         std::string device_name;
+        TouchSensorType device_type = TouchSensorType::UNKNOWN;
         bool is_connected;
         
         TouchDeviceStatus() : touch_states_32bit(0), is_connected(false) {}
@@ -297,6 +301,9 @@ public:
     inline uint8_t get_device_count() { return config_->device_count; }
 
     void get_all_device_status(TouchDeviceStatus *data);
+    
+    // 通过设备名称获取TouchSensor实例
+    TouchSensor* getTouchSensorByDeviceName(const std::string& device_name);
     
     // 设置Serial映射
     void setSerialMapping(uint8_t device_id_mask, uint8_t channel, Mai2_TouchArea area);
@@ -348,27 +355,38 @@ public:
     void setTouchResponseDelay(uint8_t delay_ms);  // 设置触摸响应延迟 (0-100ms)
     uint8_t getTouchResponseDelay() const;         // 获取当前延迟设置
     
-    // 配置管理
-    InputManager_PrivateConfig getConfig() const;  // 获取当前配置副本
+    // 获取配置副本
+    InputManager_PrivateConfig getConfig() const;
+    
+    // 获取触摸设备列表
+    const std::vector<TouchSensor*>& getTouchSensorDevices() const { return touch_sensor_devices_; }  // 获取当前配置副本
     
     // 采样计数器管理
     inline void incrementSampleCounter();
     void resetSampleCounter();
 
     // LOG
-    static void log_debug(std::string msg);
-    static void log_info(std::string msg);
-    static void log_warn(std::string msg);
-    static void log_error(std::string msg);
+    // 静态日志函数
+    static void log_debug(const std::string& msg);
+    static void log_info(const std::string& msg);
+    static void log_warning(const std::string& msg);
+    static void log_error(const std::string& msg);
+    
+    // Debug开关控制
+    static void set_debug_enabled(bool enabled);
+    static bool is_debug_enabled();
     
 private:
-    // 单例模式
+    // 私有构造函数
     InputManager();
     InputManager(const InputManager&) = delete;
     InputManager& operator=(const InputManager&) = delete;
-    
-    // 私有成员变量
+
+    // 静态实例
     static InputManager* instance_;
+    
+    // Debug开关静态变量
+    static bool debug_enabled_;
     
     // 设备管理
     std::vector<TouchSensor*> touch_sensor_devices_;           // 注册的TouchSensor设备列表
@@ -388,12 +406,12 @@ private:
         TouchDeviceState() : current_touch_mask(0), 
                            previous_touch_mask(0), timestamp_us(0) {}
     };
-    TouchDeviceState touch_device_states_[8];          // 每个设备的触摸状态
+    TouchDeviceState touch_device_states_[MAX_TOUCH_DEVICE];          // 每个设备的触摸状态
     
     // 统一使用TouchDeviceState
 
     // 延迟缓冲区管理 - 优化为只存储Serial数据
-    static constexpr uint8_t DELAY_BUFFER_SIZE = 32;   // 缓冲区大小，支持最大100ms延迟
+    static constexpr uint8_t DELAY_BUFFER_SIZE = 101;   // 缓冲区大小，支持最大100ms延迟
     struct DelayedSerialState {
         Mai2Serial_TouchState serial_touch_state;  // 存储64位Serial触摸状态（支持34分区）
         uint32_t timestamp_us;                     // 微秒级时间戳
@@ -418,6 +436,8 @@ private:
     uint8_t current_binding_index_;          // 当前绑定的区域索引
     uint32_t binding_start_time_;            // 绑定开始时间
     uint32_t binding_timeout_ms_;            // 绑定超时时间
+    bool binding_hardware_ops_pending_;      // 绑定硬件操作待执行标志
+    bool binding_cancel_pending_;            // 绑定取消操作待执行标志
     bool original_channels_backup_[8][12];   // 原始通道启用状态备份
     
     // HID绑定相关变量

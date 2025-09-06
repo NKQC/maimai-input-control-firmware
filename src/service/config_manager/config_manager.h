@@ -135,6 +135,11 @@ public:
     static void set_float(const std::string& key, float value);
     static void set_string(const std::string& key, const std::string& value);
     
+    // 动态设置接口 - 允许设置未注册的键（字符串限定）
+    static void set_string_dynamic(const std::string& key, const std::string& value);
+    static bool has_string_dynamic(const std::string& key);
+    static std::string get_string_dynamic(const std::string& key, const std::string& default_value = "");
+    
     // 批量操作接口
     static std::map<std::string, ConfigValue> get_all();
     static void set_batch(const std::map<std::string, ConfigValue>& values);

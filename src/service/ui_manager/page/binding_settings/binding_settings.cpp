@@ -53,31 +53,28 @@ void BindingSettings::render(PageTemplate& page_template) {
     switch (current_state) {
         case BindingUIState::IDLE: {
             ADD_TEXT("当前状态: 空闲", COLOR_TEXT_WHITE, LineAlign::CENTER)
-            ADD_TEXT("准备开始交互式绑区", COLOR_TEXT_YELLOW, LineAlign::CENTER)
             
             // 检查是否已有绑区设置
             // 检查是否有现有的Serial映射
-            bool has_existing_mapping = false;
+            uint8_t has_existing_mapping = false;
             int device_count = input_manager->get_device_count();
             InputManager::TouchDeviceStatus device_status[device_count];
             input_manager->get_all_device_status(device_status);
             for (int i = 0; i < device_count; i++) {
                 for (int ch = 0; ch < device_status[i].touch_device.max_channels; ch++) {
                     if (device_status[i].touch_device.serial_mappings[ch].channel != 0) {
-                        has_existing_mapping = true;
+                        has_existing_mapping++;
                         break;
                     }
                 }
-                if (has_existing_mapping) break;
             }
             
-            if (has_existing_mapping) {
-                ADD_TEXT("检测到现有绑区设置", COLOR_TEXT_GREEN, LineAlign::CENTER)
-                ADD_TEXT("新的绑区将覆盖现有设置", COLOR_YELLOW, LineAlign::CENTER)
+            if (has_existing_mapping > 33) {
+                ADD_TEXT("已有绑区 继续将覆盖", COLOR_TEXT_GREEN, LineAlign::CENTER)
             }
             
-            ADD_BUTTON("开始绑区", [this]() {
-                this->start_serial_binding();
+            ADD_BUTTON("开始绑区", []() {
+                BindingSettings::start_serial_binding();
             }, COLOR_TEXT_GREEN, LineAlign::CENTER)
             break;
         }
@@ -102,11 +99,11 @@ void BindingSettings::render(PageTemplate& page_template) {
                 ADD_TEXT(area_text, COLOR_TEXT_GREEN, LineAlign::CENTER)
             }
             
-            ADD_BUTTON("回退一步", [this]() {
-                this->step_back_binding();
+            ADD_BUTTON("回退一步", []() {
+                BindingSettings::step_back_binding();
             }, COLOR_TEXT_YELLOW, LineAlign::CENTER)
-            ADD_BUTTON("终止绑区", [this]() {
-                this->stop_binding();
+            ADD_BUTTON("终止绑区", []() {
+                BindingSettings::stop_binding();
             }, COLOR_RED, LineAlign::CENTER)
             break;
         }
@@ -122,14 +119,14 @@ void BindingSettings::render(PageTemplate& page_template) {
             snprintf(summary_text, sizeof(summary_text), "已绑定区域: %d个", total_areas);
             ADD_TEXT(summary_text, COLOR_TEXT_WHITE, LineAlign::CENTER)
             
-            ADD_BUTTON("确认保存", [this]() {
-                this->confirm_and_save_binding();
+            ADD_BUTTON("确认保存", []() {
+                BindingSettings::confirm_and_save_binding();
             }, COLOR_TEXT_GREEN, LineAlign::CENTER)
-            ADD_BUTTON("重新绑区", [this]() {
-                this->start_serial_binding();
+            ADD_BUTTON("重新绑区", []() {
+                BindingSettings::start_serial_binding();
             }, COLOR_TEXT_YELLOW, LineAlign::CENTER)
-            ADD_BUTTON("取消", [this]() {
-                this->stop_binding();
+            ADD_BUTTON("取消", []() {
+                BindingSettings::stop_binding();
             }, COLOR_RED, LineAlign::CENTER)
             break;
         }
@@ -144,11 +141,11 @@ void BindingSettings::render(PageTemplate& page_template) {
                 ADD_TEXT(error_msg, COLOR_TEXT_WHITE, LineAlign::CENTER);
             }
             
-            ADD_BUTTON("重试", [this]() {
-                this->start_serial_binding();
+            ADD_BUTTON("重试", []() {
+                BindingSettings::start_serial_binding();
             }, COLOR_TEXT_YELLOW, LineAlign::CENTER)
-            ADD_BUTTON("取消", [this]() {
-                this->stop_binding();
+            ADD_BUTTON("取消", []() {
+                BindingSettings::stop_binding();
             }, COLOR_RED, LineAlign::CENTER)
             break;
         }
@@ -199,9 +196,22 @@ uint8_t BindingSettings::get_binding_progress() {
         return 0;
     }
     
-    // TODO: Implement getBindingProgress
-    // return input_manager->getBindingProgress();
-    return 0;
+    // 根据绑定状态计算进度
+    BindingState binding_state = input_manager->getBindingState();
+    switch (binding_state) {
+        case BindingState::SERIAL_BINDING_WAIT_TOUCH:
+        case BindingState::SERIAL_BINDING_PROCESSING:
+        case BindingState::AUTO_SERIAL_BINDING_SCAN: {
+            // 获取当前绑定索引，计算准确进度
+            uint8_t current_index = input_manager->getCurrentBindingIndex();
+            return (current_index * 100) / 34; // 总共34个区域
+        }
+        case BindingState::SERIAL_BINDING_COMPLETE:
+        case BindingState::AUTO_SERIAL_BINDING_COMPLETE:
+            return 100;
+        default:
+            return 0;
+    }
 }
 
 std::string BindingSettings::get_current_binding_area() {
@@ -210,10 +220,26 @@ std::string BindingSettings::get_current_binding_area() {
         return "";
     }
     
-    // TODO: Implement getCurrentBindingAreaIndex
-    // uint8_t current_area_index = input_manager->getCurrentBindingAreaIndex();
-    uint8_t current_area_index = 0;
-    return get_mai2_area_name(current_area_index);
+    // 根据绑定状态返回当前区域信息
+    BindingState binding_state = input_manager->getBindingState();
+    switch (binding_state) {
+        case BindingState::SERIAL_BINDING_WAIT_TOUCH:
+        case BindingState::SERIAL_BINDING_PROCESSING: {
+            // 获取当前绑定索引并显示具体区域名称
+            uint8_t current_index = input_manager->getCurrentBindingIndex();
+            if (current_index < 34) {
+                return get_mai2_area_name(current_index);
+            }
+            return "绑定完成";
+        }
+        case BindingState::AUTO_SERIAL_BINDING_SCAN:
+            return "自动扫描中...";
+        case BindingState::SERIAL_BINDING_COMPLETE:
+        case BindingState::AUTO_SERIAL_BINDING_COMPLETE:
+            return "绑定完成";
+        default:
+            return "";
+    }
 }
 
 bool BindingSettings::start_serial_binding() {
@@ -222,8 +248,11 @@ bool BindingSettings::start_serial_binding() {
         return false;
     }
     
-    // TODO: Implement startSerialBinding with callback
-    // input_manager->startSerialBinding();
+    // 启动Serial绑定，使用lambda作为回调
+    input_manager->startSerialBinding([](bool success, const char* message) {
+        // 绑定回调处理 - 可以在这里更新UI状态或显示消息
+        // 暂时不做特殊处理
+    });
     return true;
 }
 
@@ -233,8 +262,8 @@ bool BindingSettings::stop_binding() {
         return false;
     }
     
-    // TODO: Implement stopBinding
-    // return input_manager->stopBinding();
+    // 取消绑定
+    input_manager->requestCancelBinding();
     return true;
 }
 
@@ -244,8 +273,10 @@ bool BindingSettings::confirm_and_save_binding() {
         return false;
     }
     
-    // 确认并保存绑定设置
-    // 这里应该调用相应的确认方法，暂时返回true
+    // 确认自动绑区结果（如果是自动绑区完成状态）
+    if (input_manager->isAutoSerialBindingComplete()) {
+        input_manager->confirmAutoSerialBinding();
+    }
     return true;
 }
 
@@ -255,8 +286,9 @@ bool BindingSettings::step_back_binding() {
         return false;
     }
     
-    // 回退绑定步骤
-    // 这里应该调用相应的回退方法，暂时返回true
+    // 回退绑定步骤 - 目前InputManager没有提供回退功能
+    // 可以考虑重新开始绑定或取消当前绑定
+    input_manager->cancelBinding();
     return true;
 }
 

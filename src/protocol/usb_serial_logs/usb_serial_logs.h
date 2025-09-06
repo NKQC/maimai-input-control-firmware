@@ -11,7 +11,7 @@
 // USB串口日志系统配置
 #define USB_LOGS_MAX_LINE_LENGTH 256
 #define USB_LOGS_QUEUE_SIZE 200
-#define USB_LOGS_MAX_ONESHOT 5
+#define USB_LOGS_MAX_ONESHOT 50
 
 // 日志级别
 enum class USB_LogLevel : uint8_t {

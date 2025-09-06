@@ -2,6 +2,8 @@
 #include "../../ui_manager.h"
 #include "../../engine/page_construction/page_macros.h"
 #include "../../engine/page_construction/page_template.h"
+#include "../../page_registry.h"
+#include "device_type_utils.h"
 #include <cstdio>
 #include <cstring>
 #include "pico/time.h"
@@ -53,11 +55,9 @@ void InteractiveSensitivity::render(PageTemplate& page_template) {
                     s_detected_device.c_str(), s_detected_channel);
             ADD_TEXT(device_info, COLOR_TEXT_GREEN, LineAlign::CENTER)
             
-            char sensitivity_info[64];
-            snprintf(sensitivity_info, sizeof(sensitivity_info), "建议灵敏度: %d", s_suggested_sensitivity);
-            ADD_TEXT(sensitivity_info, COLOR_TEXT_WHITE, LineAlign::CENTER)
+            ADD_TEXT("点击进入通道设置", COLOR_TEXT_WHITE, LineAlign::CENTER)
             
-            ADD_BUTTON("确认调整", []() { InteractiveSensitivity::on_confirm_adjust(); }, COLOR_TEXT_GREEN, LineAlign::CENTER)
+            ADD_BUTTON("进入设置", []() { InteractiveSensitivity::on_jump_to_channel_settings(); }, COLOR_TEXT_GREEN, LineAlign::CENTER)
             ADD_BUTTON("重新检测", []() { InteractiveSensitivity::on_retry_detect(); }, COLOR_TEXT_YELLOW, LineAlign::CENTER)
             break;
         }
@@ -236,20 +236,45 @@ uint8_t InteractiveSensitivity::get_suggested_sensitivity(const std::string& dev
 }
 
 // 按钮回调函数实现
-void InteractiveSensitivity::on_confirm_adjust() {
-    // 确认调整：开始执行灵敏度调整
-    s_current_state = InteractiveState::ADJUSTING;
-    s_last_update_time = to_ms_since_boot(get_absolute_time());
-    
-    // 执行实际的灵敏度调整
+void InteractiveSensitivity::on_jump_to_channel_settings() {
+    // 跳转到对应的通道设置界面
     InputManager* input_manager = InputManager::getInstance();
-    if (input_manager && !s_detected_device.empty()) {
-        // 这里应该调用实际的灵敏度调整函数
-        // 暂时模拟调整过程
-        s_current_state = InteractiveState::COMPLETED;
-    } else {
+    if (!input_manager || s_detected_device.empty()) {
         s_current_state = InteractiveState::ERROR;
+        return;
     }
+    
+    // 获取设备信息
+    int device_count = input_manager->get_device_count();
+    InputManager::TouchDeviceStatus device_status[device_count];
+    input_manager->get_all_device_status(device_status);
+    
+    // 查找对应的设备
+    for (int i = 0; i < device_count; i++) {
+        if (device_status[i].device_name == s_detected_device && device_status[i].is_connected) {
+            std::string page_name, jump_str;
+            DeviceTypeUtils::getChannelPageInfo(device_status[i], s_detected_channel, page_name, jump_str);
+            
+            // 获取UIManager实例并跳转页面
+            UIManager* ui_manager = UIManager::getInstance();
+            if (ui_manager) {
+                ui_manager->switch_to_page(page_name);
+                
+                // 如果有jump_str参数，则调用目标页面的jump_str函数
+                if (!jump_str.empty()) {
+                    auto& registry = ui::PageRegistry::get_instance();
+                    auto page_constructor = registry.get_page(page_name);
+                    if (page_constructor) {
+                        page_constructor->jump_str(jump_str);
+                    }
+                }
+            }
+            return;
+        }
+    }
+    
+    // 如果没有找到设备，设置为错误状态
+    s_current_state = InteractiveState::ERROR;
 }
 
 void InteractiveSensitivity::on_retry_detect() {

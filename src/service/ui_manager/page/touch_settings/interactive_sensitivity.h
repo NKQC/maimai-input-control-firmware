@@ -75,7 +75,7 @@ private:
     /**
      * 按钮回调函数
      */
-    static void on_confirm_adjust();
+    static void on_jump_to_channel_settings();
     static void on_retry_detect();
     static void on_continue_adjust();
     static void on_retry_adjust();

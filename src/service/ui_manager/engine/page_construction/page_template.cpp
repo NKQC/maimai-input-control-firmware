@@ -277,9 +277,6 @@ void PageTemplate::set_line(int line_index, const LineConfig& config) {
     // 统一使用all_lines_管理所有行内容
     if (line_index >= 0 && line_index < (int)all_lines_.size()) {
         all_lines_[line_index] = config;
-        if (scroll_enabled_) {
-            update_scroll_display(); // 滚动模式下更新显示
-        }
     }
 }
 
@@ -312,8 +309,6 @@ void PageTemplate::set_all_lines(const std::vector<LineConfig>& lines) {
         scroll_bar_.setup_page_scroll(lines, visible_lines_count_);
         
         scroll_enabled_ = true;
-        // 显示当前滚动位置的行
-        update_scroll_display();
     } else {
         scroll_enabled_ = false;
         // 确保all_lines_大小符合可见行数
@@ -403,7 +398,6 @@ bool PageTemplate::scroll_up() {
     
     bool scrolled = scroll_bar_.scroll_up();
     if (scrolled) {
-        update_scroll_display();
         // 添加调试日志
         UIManager::log_debug_static("ScrollBar: UP scrolled, start_index=" + std::to_string(scroll_bar_.get_display_start_index()));
     }
@@ -417,24 +411,10 @@ bool PageTemplate::scroll_down() {
     
     bool scrolled = scroll_bar_.scroll_down();
     if (scrolled) {
-        update_scroll_display();
         // 添加调试日志
         UIManager::log_debug_static("ScrollBar: DOWN scrolled, start_index=" + std::to_string(scroll_bar_.get_display_start_index()));
     }
     return scrolled;
-}
-
-void PageTemplate::update_scroll_display() {
-    if (!scroll_enabled_) {
-        return;
-    }
-    
-    // 滚动显示逻辑现在直接在draw()方法中处理
-    // 不再需要单独的visible_lines数组
-    
-    // // 添加调试日志
-    // UIManager::log_debug_static("update_scroll_display: start_index=" + std::to_string(scroll_bar_.get_display_start_index()) + 
-    //                            ", visible_lines_count=" + std::to_string(visible_lines_count_));
 }
 
 void PageTemplate::set_visible_end_line(int target_line_index) {
@@ -468,8 +448,7 @@ void PageTemplate::set_visible_end_line(int target_line_index) {
     
     // 设置新的滚动位置
     scroll_bar_.set_display_start_index(new_start_index);
-    update_scroll_display();
-    
+
     // 添加调试日志
     UIManager::log_debug_static("set_visible_end_line: target=" + std::to_string(target_line_index) + 
                                ", new_start=" + std::to_string(new_start_index) + " - " + std::to_string(scroll_bar_.get_display_start_index()) + 

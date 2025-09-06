@@ -131,7 +131,6 @@ private:
     bool initialized_;
     I2C_Bus i2c_bus_enum_;                   // I2C总线枚举
     uint32_t enabled_channels_mask_;         // 启用的通道掩码
-    mutable uint32_t last_touch_state_;      // 最后一次触摸状态缓存
     
     // 内部辅助函数
     bool write_register(uint8_t reg, uint8_t value);

@@ -22,7 +22,7 @@ struct CharBitmap {
 #define ASCII_COUNT (ASCII_END - ASCII_START + 1)
 
 // 中文字符数量定义
-#define CHINESE_CHAR_COUNT 208
+#define CHINESE_CHAR_COUNT 256
 
 // 中文字符映射结构
 struct ChineseChar {

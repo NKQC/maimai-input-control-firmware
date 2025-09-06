@@ -73,13 +73,10 @@ void TouchSettingsMain::render(PageTemplate& page_template) {
     PAGE_END()
 }
 
-std::string TouchSettingsMain::format_device_address(uint32_t device_id_mask) {
-    // 提取IC ID (高8位)
-    uint8_t ic_id = (device_id_mask >> 24) & 0xFF;
-    
+std::string TouchSettingsMain::format_device_address(uint8_t device_id_mask) {
     // 格式化为十六进制地址
     char addr_str[16];
-    snprintf(addr_str, sizeof(addr_str), "0x%02X", ic_id);
+    snprintf(addr_str, sizeof(addr_str), "0x%02X", device_id_mask);
     
     return std::string(addr_str);
 }
