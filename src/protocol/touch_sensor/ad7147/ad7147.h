@@ -51,8 +51,8 @@
 #define AD7147_STAGE_OFFSET_LOW_CLAMP_OFFSET 7        // 低偏移钳位寄存器偏移
 
 // 灵敏度寄存器默认值
-#define AD7147_SENSITIVITY_DEFAULT           0x4A4A   // 默认灵敏度值
-#define AD7147_DEFAULT_AFE_OFFSET            0x00BE      // AFE偏移默认值
+#define AD7147_SENSITIVITY_DEFAULT           0x2929   // 默认灵敏度值
+#define AD7147_DEFAULT_AFE_OFFSET            0x0000      // AFE偏移默认值
 
 // 阶段配置相关常量
 #define AD7147_STAGE1_CONNECTION             0x0088   // Stage 1连接寄存器
@@ -68,157 +68,12 @@
 #define AD7147_STAGE11_CONNECTION            0x00D8   // Stage 11连接寄存器
 
 // 阶段配置默认值
-#define AD7147_DEFAULT_OFFSET_LOW            0x0      // 默认低偏移值
-#define AD7147_DEFAULT_OFFSET_HIGH           0x3000      // 默认高偏移值
-#define AD7147_DEFAULT_OFFSET_HIGH_CLAMP     0xFFFF     // 默认高偏移钳位值
-#define AD7147_DEFAULT_OFFSET_LOW_CLAMP      0x4000     // 默认低偏移钳位值
+#define AD7147_DEFAULT_OFFSET_LOW            0x0000      // 默认低偏移值
+#define AD7147_DEFAULT_OFFSET_HIGH           0x1000      // 默认高偏移值
+#define AD7147_DEFAULT_OFFSET_HIGH_CLAMP     0x0000     // 默认高偏移钳位值
+#define AD7147_DEFAULT_OFFSET_LOW_CLAMP      0x0000     // 默认低偏移钳位值
 #define AD7147_CDC_BASELINE                  32767    // CDC基准值，用于显示计算
 
-// 自动偏移校准相关常量
-#define AD7147_AUTO_OFFSET_MAX_ITERATIONS    100     // 最大迭代次数
-#define AD7147_AUTO_OFFSET_TOLERANCE         100      // CDC值容差范围
-#define AD7147_CDC_EXTREME_LOW_THRESHOLD     100      // CDC极值低阈值
-#define AD7147_CDC_EXTREME_HIGH_THRESHOLD    65435    // CDC极值高阈值
-#define AD7147_CONTINUOUS_NON_TRIGGER_THRESHOLD 10   // 连续未触发阈值
-#define AD7147_OFFSET_ADJUSTMENT_STEP        100      // 偏移调整步进
-#define AD7147_SENSITIVITY_ADJUSTMENT_STEP   1        // 灵敏度调整步进
-#define AD7147_AFE_OFFSET_MAX                63       // AFE偏移最大值
-#define AD7147_AFE_OFFSET_MIN                0        // AFE偏移最小值
-
-// 自动偏移校准状态枚举
-enum class AutoOffsetState {
-    IDLE,                    // 空闲状态
-    ADJUSTING_POS_AFE,      // 调整正向AFE偏移
-    TESTING_NEG_AFE_REVERSE, // 测试负向AFE反向设置
-    ADJUSTING_NEG_AFE,      // 调整负向AFE偏移
-    RESET_NEG_AFE_REVERSE,  // 重置负向AFE反向设置
-    RESET_POS_AFE_ZERO,     // 重置正向AFE为0
-    TESTING_POS_AFE_REVERSE, // 测试正向AFE反向设置
-    ADJUSTING_POS_AFE_REVERSE, // 调整正向AFE反向偏移
-    FINE_TUNING_TO_BASELINE, // 精细调整到基线
-    CHECKING_TRIGGER_STATUS, // 检查触发状态
-    ADJUSTING_SENSITIVITY,   // 调整灵敏度
-    ADJUSTING_OFFSET_RANGE,  // 调整偏移范围
-    ADJUSTING_PEAK_DETECT,   // 调整峰值检测
-    COMPLETED,              // 校准完成
-    FAILED,                 // 校准失败
-    CALIBRATION_ERROR       // 校准错误
-};
-
-// 校准策略枚举
-enum class CalibrationStrategy {
-    EXTREME_TEST,           // 极值测试策略
-    BINARY_SEARCH,          // 二分搜索策略
-    REVERSE_SEARCH,         // 反向搜索策略
-    FINE_TUNE              // 精细调整策略
-};
-
-// 自动偏移校准结果枚举
-enum class AutoOffsetResult {
-    SUCCESS,                // 校准成功
-    OUT_OF_RANGE,          // 超出调整范围
-    TIMEOUT,               // 超时
-    HARDWARE_ERROR,        // 硬件错误
-    FAILED                 // 校准失败
-};
-
-// 单个通道的偏移校准状态
-struct ChannelOffsetCalibration {
-    uint8_t stage;                      // 阶段编号
-    AutoOffsetState state;              // 当前状态
-    uint16_t target_cdc;               // 目标CDC值
-    uint16_t current_cdc;              // 当前CDC值
-    
-    // AFE偏移校准相关
-    uint8_t pos_afe_min, pos_afe_max;  // 正AFE偏移搜索范围
-    uint8_t neg_afe_min, neg_afe_max;  // 负AFE偏移搜索范围
-    bool pos_afe_swap_tried;           // 是否尝试过正AFE交换
-    bool neg_afe_swap_tried;           // 是否尝试过负AFE交换
-    
-    // 采样偏移校准相关
-    uint16_t sample_offset_low_min, sample_offset_low_max;   // 低采样偏移搜索范围
-    uint16_t sample_offset_high_min, sample_offset_high_max; // 高采样偏移搜索范围
-    
-    // 灵敏度校准相关
-    uint16_t sensitivity_min, sensitivity_max;               // 灵敏度搜索范围
-    uint16_t pos_sensitivity_min, pos_sensitivity_max;       // 正灵敏度搜索范围
-    uint16_t neg_sensitivity_min, neg_sensitivity_max;       // 负灵敏度搜索范围
-    uint8_t pos_peak_detect_min, pos_peak_detect_max;       // 正峰值检测搜索范围
-    uint8_t neg_peak_detect_min, neg_peak_detect_max;       // 负峰值检测搜索范围
-    
-    uint8_t iteration_count;           // 迭代计数
-    bool is_triggered;                 // 当前通道是否被触发
-    
-    // 其他状态跟踪
-    CalibrationStrategy current_strategy;  // 当前校准策略
-    uint16_t extreme_pos_cdc;             // 正极值CDC测试结果
-    uint16_t extreme_neg_cdc;             // 负极值CDC测试结果
-    bool extreme_pos_tested;              // 是否已测试正极值
-    bool extreme_neg_tested;              // 是否已测试负极值
-    bool reverse_direction;               // 是否需要反向调整
-    uint16_t last_cdc_value;              // 上次CDC值
-    int16_t cdc_trend;                    // CDC变化趋势 (+1上升, -1下降, 0无变化)
-    uint8_t stuck_count;                  // 卡住计数器
-    
-    // 新增字段用于新的校准逻辑
-    bool is_cdc_extreme;                  // 当前CDC是否为极值
-    uint8_t calibration_step;             // 当前校准步骤
-    bool pos_afe_reverse_enabled;         // 正向AFE是否启用反向
-    bool neg_afe_reverse_enabled;         // 负向AFE是否启用反向
-    uint8_t adjustment_direction;         // 调整方向 (0=正向, 1=负向)
-    uint8_t continuous_non_trigger_count; // 连续未触发计数
-    uint8_t continuous_non_extreme_count; // 连续非极值计数
-    uint8_t baseline_adjustment_step;     // 基线调整步进
-    
-    // 50周期极值范围采样字段
-    uint8_t sample_count;                 // 当前采样计数
-    uint16_t sample_max_cdc;              // 采样期间最大CDC值
-    uint16_t sample_min_cdc;              // 采样期间最小CDC值
-    uint16_t sample_range;                // CDC值范围 (max - min)
-    
-    ChannelOffsetCalibration() : stage(0), state(AutoOffsetState::IDLE), 
-                                target_cdc(AD7147_CDC_BASELINE),
-                                current_cdc(0), pos_afe_min(0), pos_afe_max(AD7147_AFE_OFFSET_MAX),
-                                neg_afe_min(0), neg_afe_max(AD7147_AFE_OFFSET_MAX), 
-                                pos_afe_swap_tried(false), neg_afe_swap_tried(false),
-                                sample_offset_low_min(0), sample_offset_low_max(0xFFFF),
-                                sample_offset_high_min(0), sample_offset_high_max(0xFFFF),
-                                sensitivity_min(0), sensitivity_max(0xFFFF),
-                                 pos_sensitivity_min(0), pos_sensitivity_max(0xFFFF),
-                                 neg_sensitivity_min(0), neg_sensitivity_max(0xFFFF),
-                                pos_peak_detect_min(0), pos_peak_detect_max(7),
-                                neg_peak_detect_min(0), neg_peak_detect_max(7),
-                                iteration_count(0), is_triggered(false),
-                                current_strategy(CalibrationStrategy::EXTREME_TEST),
-                                extreme_pos_cdc(0), extreme_neg_cdc(0),
-                                extreme_pos_tested(false), extreme_neg_tested(false),
-                                reverse_direction(false), last_cdc_value(0),
-                                cdc_trend(0), stuck_count(0), is_cdc_extreme(false),
-                                calibration_step(0), pos_afe_reverse_enabled(false),
-                                neg_afe_reverse_enabled(false), adjustment_direction(0),
-                                continuous_non_trigger_count(0), continuous_non_extreme_count(0),
-                                baseline_adjustment_step(1), sample_count(0), sample_max_cdc(0),
-                                sample_min_cdc(0xFFFF), sample_range(0) {}
-};
-
-// 全局偏移校准状态
-struct GlobalOffsetCalibration {
-    bool is_active;                     // 是否正在进行校准
-    uint8_t total_channels;             // 总通道数
-    uint8_t current_channel_index;      // 当前校准通道索引
-    uint8_t completed_channels;         // 已完成通道数
-    uint32_t start_time_ms;            // 开始时间
-    ChannelOffsetCalibration channels[AD7147_MAX_CHANNELS]; // 各通道校准状态
-    
-    void reset_status() {
-        for (uint8_t i = 0; i < AD7147_MAX_CHANNELS; i++) {
-            channels[i].state = AutoOffsetState::IDLE;
-        }
-    }
-
-    GlobalOffsetCalibration() : is_active(false), total_channels(0), 
-                               current_channel_index(0), completed_channels(0), start_time_ms(0) {}
-};
 
 // 设备信息结构体
 struct AD7147_DeviceInfo {
@@ -284,18 +139,32 @@ struct StageConfig {
     StageSettings() {
         // 初始化阶段连接配置，对应CIN0-CIN11的单端配置
         const uint16_t default_connections[12][2] = {
-            {0xFFFE, 0x1FFF}, // Stage 0 - CIN0
-            {0xFFFB, 0x1FFF}, // Stage 1 - CIN1  
-            {0xFFEF, 0x1FFF}, // Stage 2 - CIN2
-            {0xFFBF, 0x1FFF}, // Stage 3 - CIN3
-            {0xFEFF, 0x1FFF}, // Stage 4 - CIN4
-            {0xFBFF, 0x1FFF}, // Stage 5 - CIN5
-            {0xEFFF, 0x1FFF}, // Stage 6 - CIN6
-            {0xFFFF, 0x1FFE}, // Stage 7 - CIN7
-            {0xEFFF, 0x1FFB}, // Stage 8 - CIN8
-            {0xEFFF, 0x1FEF}, // Stage 9 - CIN9
-            {0xEFFF, 0x1FBF}, // Stage 10 - CIN10
-            {0xEFFF, 0x1EFF}  // Stage 11 - CIN11
+            // BIAS版 显然不适合mai2情况 天线效应会干碎BIAS
+            // {0xFFFE, 0x1FFF}, // Stage 0 - CIN0
+            // {0xFFFB, 0x1FFF}, // Stage 1 - CIN1  
+            // {0xFFEF, 0x1FFF}, // Stage 2 - CIN2
+            // {0xFFBF, 0x1FFF}, // Stage 3 - CIN3
+            // {0xFEFF, 0x1FFF}, // Stage 4 - CIN4
+            // {0xFBFF, 0x1FFF}, // Stage 5 - CIN5
+            // {0xEFFF, 0x1FFF}, // Stage 6 - CIN6
+            // {0xFFFF, 0x1FFE}, // Stage 7 - CIN7
+            // {0xEFFF, 0x1FFB}, // Stage 8 - CIN8
+            // {0xEFFF, 0x1FEF}, // Stage 9 - CIN9
+            // {0xEFFF, 0x1FBF}, // Stage 10 - CIN10
+            // {0xEFFF, 0x1EFF}  // Stage 11 - CIN11
+            // 高阻版
+            {0x0002, 0x1000}, // Stage 0 - CIN0
+            {0x0008, 0x1000}, // Stage 1 - CIN1  
+            {0x0020, 0x1000}, // Stage 2 - CIN2
+            {0x0080, 0x1000}, // Stage 3 - CIN3
+            {0x0200, 0x1000}, // Stage 4 - CIN4
+            {0x0800, 0x1000}, // Stage 5 - CIN5
+            {0x2000, 0x1000}, // Stage 6 - CIN6
+            {0x0000, 0x1002}, // Stage 7 - CIN7
+            {0x0000, 0x1008}, // Stage 8 - CIN8
+            {0x0000, 0x1020}, // Stage 9 - CIN9
+            {0x0000, 0x1080}, // Stage 10 - CIN10
+            {0x0000, 0x1200}  // Stage 11 - CIN11
         };
         
         for (int i = 0; i < 12; i++) {
@@ -305,10 +174,109 @@ struct StageConfig {
     }
  };
 
+// 寄存器结构体定义
+// PWR_CONTROL寄存器 (0x000)
+union PWRControlRegister {
+    uint16_t raw;
+    struct {
+        uint16_t power_mode : 2;           // [1:0] 工作模式
+        uint16_t lp_conv_delay : 2;        // [3:2] 低功耗模式转换延迟
+        uint16_t sequence_stage_num : 4;   // [7:4] 序列中的阶段数量 (N+1)
+        uint16_t decimation : 2;           // [9:8] ADC抽取因子
+        uint16_t sw_reset : 1;             // [10] 软件复位控制
+        uint16_t int_pol : 1;              // [11] 中断极性控制
+        uint16_t ext_source : 1;           // [12] 激励源控制
+        uint16_t unused : 1;               // [13] 未使用，设为0
+        uint16_t cdc_bias : 2;             // [15:14] CDC偏置电流控制
+    } bits;
+    
+    PWRControlRegister() : raw(0x12F0) {}  // 默认值
+};
+
+// STAGE_CAL_EN寄存器 (0x001)
+union StageCalEnRegister {
+    uint16_t raw;
+    struct {
+        uint16_t stage0_cal_en : 1;        // [0] STAGE0校准使能
+        uint16_t stage1_cal_en : 1;        // [1] STAGE1校准使能
+        uint16_t stage2_cal_en : 1;        // [2] STAGE2校准使能
+        uint16_t stage3_cal_en : 1;        // [3] STAGE3校准使能
+        uint16_t stage4_cal_en : 1;        // [4] STAGE4校准使能
+        uint16_t stage5_cal_en : 1;        // [5] STAGE5校准使能
+        uint16_t stage6_cal_en : 1;        // [6] STAGE6校准使能
+        uint16_t stage7_cal_en : 1;        // [7] STAGE7校准使能
+        uint16_t stage8_cal_en : 1;        // [8] STAGE8校准使能
+        uint16_t stage9_cal_en : 1;        // [9] STAGE9校准使能
+        uint16_t stage10_cal_en : 1;       // [10] STAGE10校准使能
+        uint16_t stage11_cal_en : 1;       // [11] STAGE11校准使能
+        uint16_t avg_fp_skip : 2;          // [13:12] 全功率模式跳过控制
+        uint16_t avg_lp_skip : 2;          // [15:14] 低功率模式跳过控制
+    } bits;
+    
+    StageCalEnRegister() : raw(0x0000) {}  // 默认值
+
+};
+
+// AMB_COMP_CTRL0寄存器 (0x002)
+union AmbCompCtrl0Register {
+    uint16_t raw;
+    struct {
+        uint16_t ff_skip_cnt : 4;          // [3:0] 快速滤波器跳过控制
+        uint16_t fp_proximity_cnt : 4;     // [7:4] 全功率模式接近计数
+        uint16_t lp_proximity_cnt : 4;     // [11:8] 低功率模式接近计数
+        uint16_t pwr_down_timeout : 2;     // [13:12] 全功率到低功率模式超时控制
+        uint16_t forced_cal : 1;           // [14] 强制校准控制
+        uint16_t conv_reset : 1;           // [15] 转换复位控制
+    } bits;
+    
+    AmbCompCtrl0Register() : raw(0xC0FF) {}  // 默认值
+};
+
+// AMB_COMP_CTRL1寄存器 (0x003)
+union AmbCompCtrl1Register {
+    uint16_t raw;
+    struct {
+        uint16_t proximity_recal_lvl : 8;  // [7:0] 接近重新校准级别
+        uint16_t proximity_detection_rate : 6; // [13:8] 接近检测速率
+        uint16_t slow_filter_update_lvl : 2;   // [15:14] 慢滤波器更新级别
+    } bits;
+    
+    AmbCompCtrl1Register() : raw(0x0040) {}  // 默认值 (64)
+};
+
+// AMB_COMP_CTRL2寄存器 (0x004)
+union AmbCompCtrl2Register {
+    uint16_t raw;
+    struct {
+        uint16_t fp_proximity_recal : 10;  // [9:0] 全功率模式接近重新校准时间控制
+        uint16_t lp_proximity_recal : 6;   // [15:10] 低功率模式接近重新校准时间控制
+    } bits;
+    
+    AmbCompCtrl2Register() : raw(0xFFFF) {}  // 默认值 (0x3FF | (0x3F << 10))
+};
+
+// 寄存器配置结构体
+struct AD7147RegisterConfig {
+    PWRControlRegister pwr_control;        // 0x000 电源控制
+    StageCalEnRegister stage_cal_en;       // 0x001 阶段校准使能
+    AmbCompCtrl0Register amb_comp_ctrl0;   // 0x002 环境补偿控制0
+    AmbCompCtrl1Register amb_comp_ctrl1;   // 0x003 环境补偿控制1
+    AmbCompCtrl2Register amb_comp_ctrl2;   // 0x004 环境补偿控制2
+    uint16_t stage_low_int_enable;         // 0x005 阶段低中断使能
+    uint16_t stage_high_int_enable;        // 0x006 阶段高中断使能
+    uint16_t stage_complete_int_enable;    // 0x007 阶段完成中断使能
+    
+    AD7147RegisterConfig() :
+        stage_low_int_enable(0x0FFF),      // 默认值
+        stage_high_int_enable(0x0000),     // 默认值
+        stage_complete_int_enable(0x0000)  // 默认值
+    {}
+};
+
 class AD7147 : public TouchSensor {
 public:
     AD7147(HAL_I2C* i2c_hal, I2C_Bus i2c_bus, uint8_t device_addr);
-    ~AD7147() override;
+    ~AD7147() noexcept override;
     
     // TouchSensor接口实现
     uint32_t getSupportedChannelCount() const override;
@@ -330,14 +298,6 @@ public:
     StageConfig getStageConfig(uint8_t stage) const;                     // 获取指定阶段配置副本
     bool readStageCDC(uint8_t stage, uint16_t& cdc_value);              // 读取指定阶段CDC值
 
-    // 自动偏移校准接口
-    bool startAutoOffsetCalibration();                                  // 启动自动偏移校准（所有启用通道）
-    bool startAutoOffsetCalibrationForStage(uint8_t stage);            // 启动指定阶段的自动偏移校准
-    bool isAutoOffsetCalibrationActive() const;                        // 检查是否正在进行自动偏移校准
-    AutoOffsetResult getAutoOffsetCalibrationResult(uint8_t stage) const; // 获取指定阶段的校准结果
-    uint8_t getAutoOffsetCalibrationProgress() const;                  // 获取校准进度（0-100）
-    void stopAutoOffsetCalibration();                                  // 停止自动偏移校准
-    
     // 设备信息读取
     bool read_device_info(AD7147_DeviceInfo& info);
     
@@ -355,6 +315,7 @@ private:
 
     // 配置相关成员变量
     StageSettings stage_settings_;           // Stage配置设置
+    AD7147RegisterConfig register_config_;   // 寄存器配置
     
     // CDC读取相关
     volatile bool cdc_read_request_;         // CDC读取请求标志
@@ -368,26 +329,112 @@ private:
     };
     PendingStageConfig pending_configs_;
     uint8_t pending_config_count_;          // 待处理配置计数器
-    
-    // 自动偏移校准相关成员变量
-    GlobalOffsetCalibration auto_offset_calibration_;  // 全局偏移校准状态
 
     // 私有方法
     bool applyEnabledChannelsToHardware();
     bool configureStages(uint16_t power_control_val, const uint16_t* connection_values);
     inline bool apply_stage_settings();      // 应用stage设置到硬件
     
-    // 自动偏移校准辅助方法
+    // 校准相关辅助方法
     void processAutoOffsetCalibration();     // 在sample()中调用，处理自动偏移校准状态机
-    bool calibrateSingleChannel(ChannelOffsetCalibration& channel_cal); // 校准单个通道
-    bool adjustAFEOffset(uint8_t stage, ChannelOffsetCalibration& channel_cal); // 调整AFE偏移
-    bool trySwapAFEOffset(uint8_t stage, ChannelOffsetCalibration& channel_cal); // 尝试交换AFE偏移
-    bool adjustSampleOffset(uint8_t stage, ChannelOffsetCalibration& channel_cal); // 调整采样偏移
-    bool adjustSensitivity(uint8_t stage, ChannelOffsetCalibration& channel_cal); // 调整灵敏度
-    bool checkChannelTriggered(uint8_t stage); // 检查通道是否被触发
-    void resetChannelCalibration(ChannelOffsetCalibration& channel_cal, uint8_t stage); // 重置通道校准状态
-
+ 
     // I2C通信方法
     bool write_register(uint16_t reg, uint8_t* value, uint16_t size = 2);
     bool read_register(uint16_t reg, uint16_t& value);
+
+    class CalibrationTools {
+        public:
+        /**
+         * 采样: CDC采样连续采样50次 记录平均值 最大值和最小值
+         * 每个通道都要来一遍下面的流程 校准即一次顺序校准全部阶段
+         * 
+         * 触发连续采样50次 记录触发和未触发次数 换算为比例作为稳定值
+         * 重置设置均为0 
+         * 灵敏度设置为默认值
+         * 截断值设置最大0xFFFF 最小0x0000
+         * 
+         * 1.启动检查CDC值是否在5000 - 60000 区间
+         * 2.如果超过60000 则尝试每次10步拉AEF负值 如果低于5000 则尝试每次10步拉AEF正值 如果卡在极限值震荡 则优先向正方向拉线 尝试均极值后负方向拉线
+         * 3.当值显著向低回偏 则尝试拉到基准线 过基准线则减半步数 反方向拉 当再次过线继续减半步数 反方向拉 直到step为1时在基线附近
+         * 4.当AEF基线在对应值到极值时仍未拉到基线 则启动对方方向值的反向模式 随后继续以当前步数拉值
+         * 5.当任意时刻成功调回基线 则宣告阶段1完成 如果双边均测试到极值无法继续 则宣告当前通道电容值过大 失败
+         * 6.在调回基线后 检查通道是否存在触发情况 如果存在触发 则每步50提高高偏移值 直到整个采样中不存在触发 宣告阶段2完成
+         * 7.如果阶段2不存在触发/已调整完毕不存在触发 则每步50降低偏移值 一旦检测到触发 则减半步数 提高步进偏移值 直到没有触发 则继续减半步数 步进降低偏移值 直到再次触发 再次减半步数...
+         * 该迭代最多迭代5次步进值降低 确保最后一步是抬高阈值 最终采样不应该出现触发
+         * 当完成后 继续监测1000个采样 确认无触发 宣告完成 如果仍有触发 则以5步进抬高偏移值 继续监测1000个采样 确认无触发 宣告完成 如果仍有触发 继续抬高 循环监测 直到确认无触发
+         * 8.当阶段2完成后 执行阶段3 根据空载低值 设置低极限值为阶段2验证采样最低值的80% 设置最高值为阶段2验证采样最高值的200%(若超限则直接CDC极限值) 即结束
+         */
+        // 校准阶段
+        enum CalibrationState {
+            IDLE,  // 初始化/完成时设置回IDLE
+            Stage1_Pos_baseline,
+            Stage1_Neg_baseline,
+
+            Stage2_Offset_calibration,
+            Stage2_Measure_offset,
+
+            Stage3_verify_limit
+        };
+        
+        enum Direction {
+            Pos,
+            Neg
+        };
+
+        struct CDCSample_result {
+            uint16_t average = 0;
+            uint16_t max = 0;
+            uint16_t min = 0;
+            uint16_t sample_count = 0;
+            CDCSample_result () {}
+            void clear() {
+                average = 0;
+                max = 0;
+                min = 0;
+                sample_count = 0;
+            }
+        };
+
+        struct TriggleSample {
+            uint16_t triggle_num = 0;
+            uint16_t not_triggle_num = 0;
+            uint16_t sample_count = 0;
+            TriggleSample() {}
+            void clear() {
+                triggle_num = 0;
+                not_triggle_num = 0;
+                sample_count = 0;
+            }
+        };
+
+        AD7147* pthis = nullptr;
+
+        CalibrationState calibration_state_ = IDLE;
+
+        bool start_calibration() {
+            if (calibration_state_ != IDLE) return false;
+            calibration_state_ = Stage1_Pos_baseline;
+            return true;
+        }
+
+        // 主循环方法
+        void CalibrationLoop();
+        
+        // 工具方法
+        // 清空设置到校准所需值
+        void Clear_and_prepare_stage_settings(uint8_t stage);
+        // 直接设置AEF偏移 已内置正负翻转 0-127 
+        void Set_AEF_Offset(uint8_t stage, Direction direction, uint8_t offset);
+        // 直接设置执行方向的偏移值 0-65535
+        void Set_Offset(uint8_t stage, Direction direction, uint16_t offset);
+        // 直接设置指定方向的偏移阈值 0-65535
+        void Set_Clamp(uint8_t stage, Direction direction, uint16_t clamp);
+
+        // [执行一次采样一次 到目标周期返回True] 读取CDC值 50次采样 计算平均值 最大值和最小值
+        bool Read_CDC_50Sample(uint8_t stage, CDCSample_result& result);
+        // [执行一次采样一次 直接解析sample中的采样数据 sample应当通过外部直接传入循环中的采样结果原始值 到目标周期返回True] 读取触发值 50次采样 计算触发和未触发次数
+        bool Read_Triggle_50Sample(uint8_t stage, uint32_t sample, TriggleSample& result);
+    };
+
+    CalibrationTools calibration_tools_;
 };
