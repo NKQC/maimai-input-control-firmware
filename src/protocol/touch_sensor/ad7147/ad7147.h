@@ -51,7 +51,7 @@
 #define AD7147_STAGE_OFFSET_LOW_CLAMP_OFFSET 7        // 低偏移钳位寄存器偏移
 
 // 灵敏度寄存器默认值
-#define AD7147_SENSITIVITY_DEFAULT           0x2929   // 默认灵敏度值
+#define AD7147_SENSITIVITY_DEFAULT           0x5959   // 默认灵敏度值
 #define AD7147_DEFAULT_AFE_OFFSET            0x0000      // AFE偏移默认值
 
 // 阶段配置相关常量
@@ -73,6 +73,8 @@
 #define AD7147_DEFAULT_OFFSET_HIGH_CLAMP     0x0000     // 默认高偏移钳位值
 #define AD7147_DEFAULT_OFFSET_LOW_CLAMP      0x0000     // 默认低偏移钳位值
 #define AD7147_CDC_BASELINE                  32767    // CDC基准值，用于显示计算
+
+#define CALIBRATION_SAMPLE_COUNT 150    // 自动校准单轮采样次数
 
 
 // 设备信息结构体
@@ -214,7 +216,6 @@ union StageCalEnRegister {
     } bits;
     
     StageCalEnRegister() : raw(0x0000) {}  // 默认值
-
 };
 
 // AMB_COMP_CTRL0寄存器 (0x002)
@@ -298,6 +299,12 @@ public:
     StageConfig getStageConfig(uint8_t stage) const;                     // 获取指定阶段配置副本
     bool readStageCDC(uint8_t stage, uint16_t& cdc_value);              // 读取指定阶段CDC值
 
+    // 自动偏移校准：供UI调用
+    bool startAutoOffsetCalibration();
+    bool isAutoOffsetCalibrationActive() const;
+    uint8_t getAutoOffsetCalibrationProgress() const;
+    uint8_t getAutoOffsetCalibrationTotalProgress() const; // 新增：全局总进度
+
     // 设备信息读取
     bool read_device_info(AD7147_DeviceInfo& info);
     
@@ -330,10 +337,15 @@ private:
     PendingStageConfig pending_configs_;
     uint8_t pending_config_count_;          // 待处理配置计数器
 
+    // 允许内部校准工具访问私有成员与方法
+    friend class CalibrationTools;
+
     // 私有方法
     bool applyEnabledChannelsToHardware();
-    bool configureStages(uint16_t power_control_val, const uint16_t* connection_values);
+    bool configureStages(const uint16_t* connection_values);
     inline bool apply_stage_settings();      // 应用stage设置到硬件
+    // 内部快速读取当前stage配置（不做边界检查）
+    inline StageConfig getStageConfigInternal(uint8_t stage) const { return stage_settings_.stages[stage]; }
     
     // 校准相关辅助方法
     void processAutoOffsetCalibration();     // 在sample()中调用，处理自动偏移校准状态机
@@ -341,6 +353,8 @@ private:
     // I2C通信方法
     bool write_register(uint16_t reg, uint8_t* value, uint16_t size = 2);
     bool read_register(uint16_t reg, uint16_t& value);
+    // 直接读取指定stage的CDC寄存器（内部使用）
+    bool readStageCDC_direct(uint8_t stage, uint16_t& cdc_value);
 
     class CalibrationTools {
         public:
@@ -367,18 +381,20 @@ private:
         // 校准阶段
         enum CalibrationState {
             IDLE,  // 初始化/完成时设置回IDLE
-            Stage1_Pos_baseline,
-            Stage1_Neg_baseline,
-
+            Stage1_baseline,
             Stage2_Offset_calibration,
-            Stage2_Measure_offset,
-
             Stage3_verify_limit
         };
         
         enum Direction {
             Pos,
             Neg
+        };
+
+        enum Stage1Mode {
+            FOUND_BASELINE,
+            FOUND_TRIGGLELINE,
+            STAGE1_COMPLETE
         };
 
         struct CDCSample_result {
@@ -411,18 +427,25 @@ private:
 
         CalibrationState calibration_state_ = IDLE;
 
+        uint8_t stage_process = 0;
+        
+        // 当前正在校准的stage索引 [0..11]；当全部完成后置为12
+        uint8_t current_stage_index_ = 0;
+
         bool start_calibration() {
             if (calibration_state_ != IDLE) return false;
-            calibration_state_ = Stage1_Pos_baseline;
+            calibration_state_ = Stage1_baseline;
             return true;
         }
 
         // 主循环方法
-        void CalibrationLoop();
+        void CalibrationLoop(uint32_t sample);
         
         // 工具方法
         // 清空设置到校准所需值
         void Clear_and_prepare_stage_settings(uint8_t stage);
+        // 完成时恢复校准
+        void Complete_and_restore_calibration();
         // 直接设置AEF偏移 已内置正负翻转 0-127 
         void Set_AEF_Offset(uint8_t stage, Direction direction, uint8_t offset);
         // 直接设置执行方向的偏移值 0-65535
@@ -431,9 +454,9 @@ private:
         void Set_Clamp(uint8_t stage, Direction direction, uint16_t clamp);
 
         // [执行一次采样一次 到目标周期返回True] 读取CDC值 50次采样 计算平均值 最大值和最小值
-        bool Read_CDC_50Sample(uint8_t stage, CDCSample_result& result);
+        bool Read_CDC_Sample(uint8_t stage, CDCSample_result& result);
         // [执行一次采样一次 直接解析sample中的采样数据 sample应当通过外部直接传入循环中的采样结果原始值 到目标周期返回True] 读取触发值 50次采样 计算触发和未触发次数
-        bool Read_Triggle_50Sample(uint8_t stage, uint32_t sample, TriggleSample& result);
+        bool Read_Triggle_Sample(uint8_t stage, uint32_t sample, TriggleSample& result);
     };
 
     CalibrationTools calibration_tools_;

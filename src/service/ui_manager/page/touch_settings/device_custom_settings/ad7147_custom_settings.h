@@ -70,6 +70,7 @@ private:
     // 一键拉偏移功能相关
     static bool auto_offset_active_;                   // 自动偏移校准是否激活
     static uint8_t auto_offset_progress_;              // 自动偏移校准进度 (0-100)
+    static uint8_t auto_offset_total_progress_;        // 自动偏移校准总进度 (0-100)
     
     /**
      * 获取AD7147设备实例

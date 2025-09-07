@@ -42,8 +42,15 @@ bool AD7147::init() {
     enabled_channels_mask_ = 0x1FFFu; // 13位
     
     // 可选：配置所有阶段（如果需要自定义配置）
-    uint16_t power_control_val = 0x02B0;
-    ret &= configureStages(power_control_val, nullptr);
+    register_config_.pwr_control.bits.power_mode = 0;
+    register_config_.pwr_control.bits.lp_conv_delay = 0;
+    register_config_.pwr_control.bits.sequence_stage_num = 0xB;
+    register_config_.pwr_control.bits.decimation = 2;
+    register_config_.pwr_control.bits.sw_reset = 0;
+    register_config_.pwr_control.bits.int_pol = 0;
+    register_config_.pwr_control.bits.ext_source = 0;
+    register_config_.pwr_control.bits.cdc_bias = 0;
+    ret &= configureStages(nullptr);
 
     initialized_ = ret;
     return ret;
@@ -188,6 +195,13 @@ bool AD7147::readStageCDC(uint8_t stage, uint16_t& cdc_value) {
      return false;
 }
 
+bool AD7147::readStageCDC_direct(uint8_t stage, uint16_t& cdc_value) {
+    if (!initialized_ || stage >= 12) return false;
+    // 读取指定阶段的CDC数据，直接访问CDC寄存器
+    uint16_t cdc_reg_addr = AD7147_REG_CDC_DATA + stage;
+    return read_register(cdc_reg_addr, cdc_value);
+}
+
 // 反初始化AD7147
 void AD7147::deinit() {
     initialized_ = false;
@@ -242,8 +256,8 @@ TouchSampleResult AD7147::sample() {
     result.channel_mask = status_regs;
 
     // 留给校准模块
-
-
+    if (calibration_tools_.calibration_state_)
+        calibration_tools_.CalibrationLoop(status_regs);
 
     // 仅报告当前启用的通道，保证禁用通道不产生事件
     result.channel_mask &= enabled_channels_mask_;
@@ -348,7 +362,7 @@ inline bool AD7147::apply_stage_settings() {
     return ret;
 }
 
-bool AD7147::configureStages(uint16_t power_control_val, const uint16_t* connection_values) {
+bool AD7147::configureStages(const uint16_t* connection_values) {
     bool ret = true;
     
     // 如果提供了connection_values，更新stage_settings_中的AFE偏移
@@ -361,8 +375,6 @@ bool AD7147::configureStages(uint16_t power_control_val, const uint16_t* connect
     // 应用stage设置
     ret &= apply_stage_settings();
     USB_LOG_DEBUG("AD7147 ConfigureStages Register");
-    // 使用结构体配置寄存器
-    register_config_.pwr_control.raw = power_control_val;
     
     // 准备寄存器数据数组
     uint8_t reg_data[16];
@@ -423,6 +435,44 @@ bool AD7147::setStageConfigAsync(uint8_t stage, const StageConfig& config) {
     
     // 没有空闲槽位
     return false;
+}
+
+bool AD7147::startAutoOffsetCalibration() {
+    if (!initialized_) return false;
+    calibration_tools_.pthis = this;
+    // 启动内部校准工具
+    calibration_tools_.calibration_state_ = AD7147::CalibrationTools::Stage1_baseline;
+    return true;
+}
+
+bool AD7147::isAutoOffsetCalibrationActive() const {
+    return initialized_ && (calibration_tools_.calibration_state_ != AD7147::CalibrationTools::IDLE);
+}
+
+uint8_t AD7147::getAutoOffsetCalibrationProgress() const {
+    // 保持现有阶段进度的映射，不改变现有显示逻辑
+    return calibration_tools_.stage_process;
+}
+
+
+uint8_t AD7147::getAutoOffsetCalibrationTotalProgress() const {
+    using CT = AD7147::CalibrationTools;
+    const uint8_t total_stages = 12;
+
+    // 未运行且未完成
+    if (calibration_tools_.calibration_state_ == CT::IDLE) {
+        return (calibration_tools_.current_stage_index_ >= total_stages) ? 255 : 0;
+    }
+
+    // 已完成的stage数量=当前正在处理的stage索引
+    uint8_t completed = calibration_tools_.current_stage_index_;
+    // 当前stage内进度，沿用阶段映射（20/60/80/95）
+    uint8_t stage_phase_progress = getAutoOffsetCalibrationProgress();
+
+    // 总进度 = (已完成stage数*100 + 当前stage内进度) / 总stage数
+    uint16_t accum = static_cast<uint16_t>(completed) * 255u + static_cast<uint16_t>(stage_phase_progress);
+    uint8_t total = static_cast<uint8_t>(accum / total_stages);
+    return total;
 }
 
 
