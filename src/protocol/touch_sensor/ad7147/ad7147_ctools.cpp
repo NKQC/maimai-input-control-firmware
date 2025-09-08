@@ -185,7 +185,7 @@ void AD7147::CalibrationTools::CalibrationLoop(uint32_t sample)
             return;
         }
 
-        // 每步采样5次
+        // 每步采样
         if (s2_sample_count < STAGE2_MEASURE_COUNT)
         {
             // 取反后：位为0表示触发
@@ -262,7 +262,7 @@ void AD7147::CalibrationTools::CalibrationLoop(uint32_t sample)
             uint8_t off = (uint8_t)((s2_cur_aef >= 0) ? s2_cur_aef : -s2_cur_aef);
             Set_AEF_Offset(stage_index, dir, off);
         }
-        stage_process++;
+        stage_process = stage_process > 252 ? 252 : stage_process + 1;
         s2_sample_count = 0;
         total_sample_count = 0;
         triggle_sample_count = 0;

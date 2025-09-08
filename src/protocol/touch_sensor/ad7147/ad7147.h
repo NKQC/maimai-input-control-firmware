@@ -84,7 +84,7 @@
 #define AD7147_CDC_BASELINE 0x8000              // CDC基准值，用于显示计算
 
 #define CALIBRATION_SAMPLE_COUNT 200 // 自动校准单轮采样次数
-#define STAGE2_MEASURE_COUNT 15     // 确认采样次数 次数越大偏移数值越保守 稳定性越好
+#define STAGE2_MEASURE_COUNT 30     // 确认采样次数 次数越大偏移数值越保守 稳定性越好
 
 // 设备信息结构体
 struct AD7147_DeviceInfo
