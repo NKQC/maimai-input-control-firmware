@@ -45,11 +45,11 @@ bool AD7147::init() {
     register_config_.pwr_control.bits.power_mode = 0;
     register_config_.pwr_control.bits.lp_conv_delay = 0;
     register_config_.pwr_control.bits.sequence_stage_num = 0xB;
-    register_config_.pwr_control.bits.decimation = 2;
+    register_config_.pwr_control.bits.decimation = 3;
     register_config_.pwr_control.bits.sw_reset = 0;
     register_config_.pwr_control.bits.int_pol = 0;
     register_config_.pwr_control.bits.ext_source = 0;
-    register_config_.pwr_control.bits.cdc_bias = 0;
+    register_config_.pwr_control.bits.cdc_bias = 1;
     ret &= configureStages(nullptr);
 
     initialized_ = ret;
@@ -253,11 +253,11 @@ TouchSampleResult AD7147::sample() {
     read_register(AD7147_REG_STAGE_HIGH_INT_STATUS, status_regs);
     
     // 合并触摸状态并限制在24位范围内
-    result.channel_mask = status_regs;
+    result.channel_mask = ~status_regs;
 
     // 留给校准模块
     if (calibration_tools_.calibration_state_)
-        calibration_tools_.CalibrationLoop(status_regs);
+        calibration_tools_.CalibrationLoop(result.channel_mask);
 
     // 仅报告当前启用的通道，保证禁用通道不产生事件
     result.channel_mask &= enabled_channels_mask_;
@@ -315,7 +315,6 @@ bool AD7147::applyEnabledChannelsToHardware() {
     // 关闭未启用阶段的校准和比较中断，减少扫描负担，提高有效采样速率
     bool ok = true;
     ok &= write_register(AD7147_REG_STAGE_CAL_EN, mask13);
-    ok &= write_register(AD7147_REG_STAGE_LOW_INT_EN, mask13);
     ok &= write_register(AD7147_REG_STAGE_HIGH_INT_EN, mask13);
 
     return ok;
@@ -412,7 +411,8 @@ bool AD7147::configureStages(const uint16_t* connection_values) {
     ret &= write_register(AD7147_REG_STAGE_CAL_EN, cal_en_data, 2);
 
     // 更新AMB_COMP_CTRL0配置
-    register_config_.amb_comp_ctrl0.raw = 0x72F0;
+    register_config_.amb_comp_ctrl0.raw = 0x32FF; 
+    register_config_.amb_comp_ctrl0.bits.forced_cal = true;
     uint8_t amb_ctrl0_data[2] = {
         (uint8_t)(register_config_.amb_comp_ctrl0.raw >> 8),
         (uint8_t)(register_config_.amb_comp_ctrl0.raw & 0xFF)
