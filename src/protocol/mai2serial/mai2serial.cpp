@@ -10,14 +10,9 @@ Mai2Serial::Mai2Serial(HAL_UART* uart_hal)
     , initialized_(false)
     , serial_ok_(false)
     , config_()
-    , status_(Status::STOPPED)
-    , command_buffer_pos_(0) {
+    , status_(Status::STOPPED) {
     
-    for (int i = 0; i < MAI2SERIAL_COMMAND_LENGTH; i++) {
-        command_buffer_[i] = 0;
-    }
-
-    // 新增：初始化流式接收缓冲区
+    // 初始化流式接收缓冲区
     rx_stream_pos_ = 0;
     std::memset(rx_stream_buffer_, 0, sizeof(rx_stream_buffer_));
 }
@@ -323,27 +318,58 @@ void Mai2Serial::process_dma_received_data(const uint8_t* data, size_t length) {
             continue;
         }
 
-        // 非'{'开头的字节作为字符串命令流式传入
-        process_received_byte(rx_stream_buffer_[0]);
-        // 丢弃最前面1字节
-        std::memmove(rx_stream_buffer_, rx_stream_buffer_ + 1, rx_stream_pos_ - 1);
-        rx_stream_pos_ -= 1;
+        // 处理字符串指令：查找完整的以\r或\n结尾的指令
+        bool found_command = false;
+        size_t command_end = 0;
+        
+        // 查找指令结束符
+        for (size_t i = 0; i < rx_stream_pos_; ++i) {
+            if (rx_stream_buffer_[i] == '\r' || rx_stream_buffer_[i] == '\n') {
+                command_end = i;
+                found_command = true;
+                break;
+            }
+            // 如果遇到MAI2SERIAL_CMD_START_BYTE，清零之前内容并重新开始
+            if (rx_stream_buffer_[i] == (uint8_t)MAI2SERIAL_CMD_START_BYTE) {
+                // 将START_BYTE移到缓冲区开头
+                if (i > 0) {
+                    std::memmove(rx_stream_buffer_, rx_stream_buffer_ + i, rx_stream_pos_ - i);
+                    rx_stream_pos_ -= i;
+                }
+                // 重新开始处理，跳出当前循环
+                break;
+            }
+        }
+        
+        if (found_command && command_end > 0) {
+            // 找到完整指令，提取并处理
+            char temp_buffer[MAI2SERIAL_STREAM_BUFFER_SIZE];
+            std::memcpy(temp_buffer, rx_stream_buffer_, command_end);
+            temp_buffer[command_end] = '\0';
+            
+            // 处理指令
+            process_received_byte(std::string(temp_buffer));
+            
+            // 移除已处理的数据（包括结束符）
+            size_t bytes_to_remove = command_end + 1;
+            std::memmove(rx_stream_buffer_, rx_stream_buffer_ + bytes_to_remove,
+                         rx_stream_pos_ - bytes_to_remove);
+            rx_stream_pos_ -= bytes_to_remove;
+        } else if (!found_command) {
+            // 没有找到完整指令，等待更多数据
+            break;
+        } else {
+            // 找到结束符但指令为空，只移除结束符
+            std::memmove(rx_stream_buffer_, rx_stream_buffer_ + 1, rx_stream_pos_ - 1);
+            rx_stream_pos_ -= 1;
+        }
     }
 }
 
-void Mai2Serial::process_received_byte(uint8_t byte) {
-    // 处理接收到的字节
-    if (byte == '\r' || byte == '\n') {
-        if (command_buffer_pos_ > 0) {
-            command_buffer_[command_buffer_pos_] = '\0';
-            parse_command(std::string(command_buffer_));
-            command_buffer_pos_ = 0;
-        }
-    } else if (command_buffer_pos_ < sizeof(command_buffer_) - 1) {
-        command_buffer_[command_buffer_pos_++] = byte;
-    } else {
-        // 缓冲区溢出，重置
-        command_buffer_pos_ = 0;
+void Mai2Serial::process_received_byte(const std::string& command_str) {
+    // 处理接收到的完整字符串指令
+    if (!command_str.empty()) {
+        parse_command(command_str);
     }
 }
 
@@ -375,21 +401,6 @@ void Mai2Serial::parse_command(const std::string& command_str) {
         default:
             // 忽略所有其他命令
             break;
-    }
-    
-    // 通知命令回调
-    if (command_callback_) {
-        Mai2Serial_Command cmd_enum = MAI2SERIAL_CMD_STAT; // 默认值
-        switch (cmd) {
-            case 'E': cmd_enum = MAI2SERIAL_CMD_RSET; break;
-            case 'L': cmd_enum = MAI2SERIAL_CMD_HALT; break;
-            case 'A': cmd_enum = MAI2SERIAL_CMD_STAT; break;
-            case 'r': cmd_enum = MAI2SERIAL_CMD_RATIO; break;
-            case 'k': cmd_enum = MAI2SERIAL_CMD_SENS; break;
-        }
-        uint8_t* param_data = param.empty() ? nullptr : (uint8_t*)param.c_str();
-        uint8_t param_count = param.empty() ? 0 : param.length();
-        command_callback_(cmd_enum, param_data, param_count);
     }
 }
 

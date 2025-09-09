@@ -15,7 +15,7 @@
 
 // AD7147寄存器定义
 #define AD7147_I2C_ADDR_DEFAULT 0x2C // 默认I2C地址
-#define AD7147_MAX_CHANNELS 13       // 最大触摸通道数
+#define AD7147_MAX_CHANNELS 12       // 最大触摸通道数 这里只考虑支持最多同时触发的点数 13点那个不考虑
 
 // 主要寄存器地址
 #define AD7147_REG_PWR_CONTROL 0x0000           // 电源控制寄存器
@@ -84,7 +84,7 @@
 #define AD7147_CDC_BASELINE 0x8000              // CDC基准值，用于显示计算
 
 #define CALIBRATION_SAMPLE_COUNT 200 // 自动校准单轮采样次数
-#define STAGE2_MEASURE_COUNT 30     // 确认采样次数 次数越大偏移数值越保守 稳定性越好
+#define STAGE2_MEASURE_TIME_MS 1000     // 确认采样次数 次数越大偏移数值越保守 稳定性越好
 
 // 设备信息结构体
 struct AD7147_DeviceInfo
@@ -93,6 +93,50 @@ struct AD7147_DeviceInfo
     bool is_valid;
 
     AD7147_DeviceInfo() : i2c_address(0), is_valid(false) {}
+};
+
+// 通道连接配置定义（对应CIN0-CIN11）
+const uint16_t channel_connections[12][2] = {
+     // POSTIVE
+    // BIAS版 显然不适合mai2情况 天线效应会干碎BIAS
+    // {0xFFFE, 0x1FFF}, // Stage 0 - CIN0
+    // {0xFFFB, 0x1FFF}, // Stage 1 - CIN1
+    // {0xFFEF, 0x1FFF}, // Stage 2 - CIN2
+    // {0xFFBF, 0x1FFF}, // Stage 3 - CIN3
+    // {0xFEFF, 0x1FFF}, // Stage 4 - CIN4
+    // {0xFBFF, 0x1FFF}, // Stage 5 - CIN5
+    // {0xEFFF, 0x1FFF}, // Stage 6 - CIN6
+    // {0xFFFF, 0x1FFE}, // Stage 7 - CIN7
+    // {0xEFFF, 0x1FFB}, // Stage 8 - CIN8
+    // {0xEFFF, 0x1FEF}, // Stage 9 - CIN9
+    // {0xEFFF, 0x1FBF}, // Stage 10 - CIN10
+    // {0xEFFF, 0x1EFF}  // Stage 11 - CIN11
+    // 高阻版
+    // {0x0002, 0x1000}, // Stage 0 - CIN0
+    // {0x0008, 0x1000}, // Stage 1 - CIN1
+    // {0x0020, 0x1000}, // Stage 2 - CIN2
+    // {0x0080, 0x1000}, // Stage 3 - CIN3
+    // {0x0200, 0x1000}, // Stage 4 - CIN4
+    // {0x0800, 0x1000}, // Stage 5 - CIN5
+    // {0x2000, 0x1000}, // Stage 6 - CIN6
+    // {0x0000, 0x1002}, // Stage 7 - CIN7
+    // {0x0000, 0x1008}, // Stage 8 - CIN8
+    // {0x0000, 0x1020}, // Stage 9 - CIN9
+    // {0x0000, 0x1080}, // Stage 10 - CIN10
+    // {0x0000, 0x1200}  // Stage 11 - CIN11
+    // NEGTIVE
+    {0x0001, 0x1000}, // Stage 0 - CIN0
+    {0x0004, 0x1000}, // Stage 1 - CIN1
+    {0x0010, 0x1000}, // Stage 2 - CIN2
+    {0x0040, 0x1000}, // Stage 3 - CIN3
+    {0x0100, 0x1000}, // Stage 4 - CIN4
+    {0x0400, 0x1000}, // Stage 5 - CIN5
+    {0x1000, 0x1000}, // Stage 6 - CIN6
+    {0x0000, 0x1001}, // Stage 7 - CIN7
+    {0x0000, 0x1004}, // Stage 8 - CIN8
+    {0x0000, 0x1010}, // Stage 9 - CIN9
+    {0x0000, 0x1040}, // Stage 10 - CIN10
+    {0x0000, 0x1100}  // Stage 11 - CIN11
 };
 
 // AFE偏移寄存器位域结构
@@ -132,7 +176,7 @@ union SensitivityRegister
 };
 
 // Stage配置结构体 - 包含单个stage的所有配置参数
-struct StageConfig
+struct PortConfig
 {
     uint16_t connection_6_0;         // 连接配置寄存器6-0
     uint16_t connection_12_7;        // 连接配置寄存器12-7
@@ -143,67 +187,23 @@ struct StageConfig
     uint16_t offset_high_clamp;      // 高偏移钳位值
     uint16_t offset_low_clamp;       // 低偏移钳位值
 
-    StageConfig() : connection_6_0(0), connection_12_7(0), afe_offset(AD7147_DEFAULT_AFE_OFFSET),
-                    sensitivity(AD7147_SENSITIVITY_DEFAULT), offset_low(AD7147_DEFAULT_OFFSET_LOW),
-                    offset_high(AD7147_DEFAULT_OFFSET_HIGH), offset_high_clamp(AD7147_DEFAULT_OFFSET_HIGH_CLAMP),
-                    offset_low_clamp(AD7147_DEFAULT_OFFSET_LOW_CLAMP) {}
+    PortConfig() : connection_6_0(0), connection_12_7(0), afe_offset(AD7147_DEFAULT_AFE_OFFSET),
+                   sensitivity(AD7147_SENSITIVITY_DEFAULT), offset_low(AD7147_DEFAULT_OFFSET_LOW),
+                   offset_high(AD7147_DEFAULT_OFFSET_HIGH), offset_high_clamp(AD7147_DEFAULT_OFFSET_HIGH_CLAMP),
+                   offset_low_clamp(AD7147_DEFAULT_OFFSET_LOW_CLAMP) {}
 };
 
 // 全阶段设置结构体 - 包含所有12个stage的配置
 struct StageSettings
 {
-    StageConfig stages[12]; // 12个stage的配置
+    PortConfig stages[12]; // 12个stage的配置
 
     StageSettings()
     {
-        // 初始化阶段连接配置，对应CIN0-CIN11的单端配置
-        const uint16_t default_connections[12][2] = {
-            // POSTIVE
-            // BIAS版 显然不适合mai2情况 天线效应会干碎BIAS
-            // {0xFFFE, 0x1FFF}, // Stage 0 - CIN0
-            // {0xFFFB, 0x1FFF}, // Stage 1 - CIN1
-            // {0xFFEF, 0x1FFF}, // Stage 2 - CIN2
-            // {0xFFBF, 0x1FFF}, // Stage 3 - CIN3
-            // {0xFEFF, 0x1FFF}, // Stage 4 - CIN4
-            // {0xFBFF, 0x1FFF}, // Stage 5 - CIN5
-            // {0xEFFF, 0x1FFF}, // Stage 6 - CIN6
-            // {0xFFFF, 0x1FFE}, // Stage 7 - CIN7
-            // {0xEFFF, 0x1FFB}, // Stage 8 - CIN8
-            // {0xEFFF, 0x1FEF}, // Stage 9 - CIN9
-            // {0xEFFF, 0x1FBF}, // Stage 10 - CIN10
-            // {0xEFFF, 0x1EFF}  // Stage 11 - CIN11
-            // 高阻版
-            // {0x0002, 0x1000}, // Stage 0 - CIN0
-            // {0x0008, 0x1000}, // Stage 1 - CIN1
-            // {0x0020, 0x1000}, // Stage 2 - CIN2
-            // {0x0080, 0x1000}, // Stage 3 - CIN3
-            // {0x0200, 0x1000}, // Stage 4 - CIN4
-            // {0x0800, 0x1000}, // Stage 5 - CIN5
-            // {0x2000, 0x1000}, // Stage 6 - CIN6
-            // {0x0000, 0x1002}, // Stage 7 - CIN7
-            // {0x0000, 0x1008}, // Stage 8 - CIN8
-            // {0x0000, 0x1020}, // Stage 9 - CIN9
-            // {0x0000, 0x1080}, // Stage 10 - CIN10
-            // {0x0000, 0x1200}  // Stage 11 - CIN11
-            // NEGTIVE
-            {0x0001, 0x1000}, // Stage 0 - CIN0
-            {0x0004, 0x1000}, // Stage 1 - CIN1
-            {0x0010, 0x1000}, // Stage 2 - CIN2
-            {0x0040, 0x1000}, // Stage 3 - CIN3
-            {0x0100, 0x1000}, // Stage 4 - CIN4
-            {0x0400, 0x1000}, // Stage 5 - CIN5
-            {0x1000, 0x1000}, // Stage 6 - CIN6
-            {0x0000, 0x1001}, // Stage 7 - CIN7
-            {0x0000, 0x1004}, // Stage 8 - CIN8
-            {0x0000, 0x1010}, // Stage 9 - CIN9
-            {0x0000, 0x1040}, // Stage 10 - CIN10
-            {0x0000, 0x1100}  // Stage 11 - CIN11
-        };
-
         for (int i = 0; i < 12; i++)
         {
-            stages[i].connection_6_0 = default_connections[i][0];
-            stages[i].connection_12_7 = default_connections[i][1];
+            stages[i].connection_6_0 = channel_connections[i][0];
+            stages[i].connection_12_7 = channel_connections[i][1];
         }
     }
 };
@@ -338,10 +338,18 @@ public:
     bool loadConfig(const std::string &config_data) override;            // 从字符串加载配置
     std::string saveConfig() const override;                             // 保存配置到字符串
     bool setCustomSensitivitySettings(const std::string &settings_data); // 设置自定义灵敏度配置
-    bool setStageConfig(uint8_t stage, const StageConfig &config);       // 设置指定阶段配置 只能在同核心调用 否则秒崩
-    bool setStageConfigAsync(uint8_t stage, const StageConfig &config);  // 异步设置指定阶段配置
-    StageConfig getStageConfig(uint8_t stage) const;                     // 获取指定阶段配置副本
+    bool setStageConfig(uint8_t stage, const PortConfig &config);       // 设置指定阶段配置 只能在同核心调用 否则秒崩
+    bool setStageConfigAsync(uint8_t stage, const PortConfig &config);  // 异步设置指定阶段配置
+    PortConfig getStageConfig(uint8_t stage) const;                     // 获取指定阶段配置副本
     bool readStageCDC(uint8_t stage, uint16_t &cdc_value);               // 读取指定阶段CDC值
+    
+    // 校准相关接口实现
+    bool calibrateSensor() override;                                     // 校准传感器(接入startAutoOffsetCalibration)
+    uint8_t getCalibrationProgress() const override;                     // 获取校准进度(接入getAutoOffsetCalibrationTotalProgress)
+    bool setLEDEnabled(bool enabled) override;                           // 设置LED状态(修改stage_low_int_enable的第12-13位)
+    
+    // 异常通道检测接口实现
+    uint32_t getAbnormalChannelMask() const override;                    // 获取异常通道bitmap (返回abnormal_channels_bitmap_)
 
     // 自动偏移校准：供UI调用
     bool startAutoOffsetCalibration();
@@ -363,6 +371,7 @@ private:
     bool initialized_;
     I2C_Bus i2c_bus_enum_;           // I2C总线枚举
     uint32_t enabled_channels_mask_; // 启用的通道掩码
+    uint32_t calirate_save_enabled_channels_mask_; // 校准时保存的启用的通道掩码
 
     // 配置相关成员变量
     StageSettings stage_settings_;         // Stage配置设置
@@ -374,13 +383,16 @@ private:
     uint16_t cdc_read_value_;         // 读取到的CDC值
 
     // 异步配置相关
-    struct PendingStageConfig
+    struct PendingPortConfig
     {
         uint8_t stage;
-        StageConfig config;
+        PortConfig config;
     };
-    PendingStageConfig pending_configs_;
+    PendingPortConfig pending_configs_;
     uint8_t pending_config_count_; // 待处理配置计数器
+
+    // 校准异常通道记录
+    uint16_t abnormal_channels_bitmap_; // 校准时异常通道的bitmap (bit0-11对应channel0-11)
 
     // 允许内部校准工具访问私有成员与方法
     friend class CalibrationTools;
@@ -390,7 +402,7 @@ private:
     bool configureStages(const uint16_t *connection_values);
     inline bool apply_stage_settings(); // 应用stage设置到硬件
     // 内部快速读取当前stage配置（不做边界检查）
-    inline StageConfig getStageConfigInternal(uint8_t stage) const { return stage_settings_.stages[stage]; }
+    inline PortConfig getStageConfigInternal(uint8_t stage) const { return stage_settings_.stages[stage]; }
 
     // 校准相关辅助方法
     void processAutoOffsetCalibration(); // 在sample()中调用，处理自动偏移校准状态机

@@ -4,7 +4,10 @@
 // 清空设置到校准所需值
 void AD7147::CalibrationTools::Clear_and_prepare_stage_settings(uint8_t stage)
 {
-    StageConfig config = pthis->stage_settings_.stages[stage];
+    // 清空异常通道bitmap (校准开始时重置)
+    pthis->abnormal_channels_bitmap_ = 0;
+    
+    PortConfig config = pthis->stage_settings_.stages[stage];
     config.afe_offset.bits.pos_afe_offset_swap = 0;
     config.afe_offset.bits.pos_afe_offset = 0;
     config.afe_offset.bits.neg_afe_offset_swap = 0;
@@ -14,19 +17,22 @@ void AD7147::CalibrationTools::Clear_and_prepare_stage_settings(uint8_t stage)
     config.offset_low = 0;
     config.offset_high_clamp = 0xFFFF;
     config.offset_low_clamp = 0;
+    pthis->calirate_save_enabled_channels_mask_ = pthis->enabled_channels_mask_; // 校准时保存的启用的通道掩码
+    pthis->enabled_channels_mask_ = ((1 << AD7147_MAX_CHANNELS) - 1);
     pthis->setStageConfig(stage, config);
-
+    pthis->applyEnabledChannelsToHardware();
 }
 
 void AD7147::CalibrationTools::Complete_and_restore_calibration()
 {
-    // 现在实际上什么都不需要做
+    pthis->enabled_channels_mask_ = pthis->calirate_save_enabled_channels_mask_; // 校准时保存的启用的通道掩码
+    pthis->applyEnabledChannelsToHardware();
 }
 
 // 设置AFE偏移 0-127
 void AD7147::CalibrationTools::Set_AEF_Offset(uint8_t stage, Direction direction, uint8_t offset)
 {
-    StageConfig config = pthis->stage_settings_.stages[stage];
+    PortConfig config = pthis->stage_settings_.stages[stage];
     if (direction == Pos)
     {
         config.afe_offset.bits.pos_afe_offset_swap = 0;
@@ -95,11 +101,8 @@ void AD7147::CalibrationTools::CalibrationLoop(uint32_t sample)
     static bool s2_inited = false;
     static int16_t s2_base_aef = 0;
     static int16_t s2_cur_aef = 0;
-    static int8_t s2_dir = +1;          // 初始尝试增加AEF
-    static bool s2_dir_locked = false;  // 是否已根据“显著增高”切换过方向
-    static uint8_t s2_sample_count = 0; // 阶段2每步采样次数（目标5次）
-    static uint16_t total_sample_count = 0;   // 总采样次数
-    static uint16_t triggle_sample_count = 0; // 触发采样次数
+    static uint32_t triggle_sample_count = 0; // 触发采样次数
+    static uint32_t measure_time_tag = 0;
 
     // 同步当前stage索引（供外部观察）
     current_stage_index_ = stage_index;
@@ -155,7 +158,7 @@ void AD7147::CalibrationTools::CalibrationLoop(uint32_t sample)
             Direction dir = (s1_aef >= 0) ? Pos : Neg;
             uint8_t off = (uint8_t)((s1_aef >= 0) ? s1_aef : -s1_aef);
             Set_AEF_Offset(stage_index, dir, off);
-            stage_process = (s1_aef + 127) * 7 / 5;
+            stage_process = (s1_aef + 127) / 2;
             return;
         }
 
@@ -179,27 +182,21 @@ void AD7147::CalibrationTools::CalibrationLoop(uint32_t sample)
             s2_inited = true;
             s2_base_aef = s1_best_aef;
             s2_cur_aef = s2_base_aef;
-            s2_dir = +1;           // 先尝试增加AEF
-            s2_dir_locked = false; // 尚未改变方向
-            s2_sample_count = 0;
+            measure_time_tag = us_to_ms(time_us_32()) + STAGE2_MEASURE_TIME_MS;
             return;
         }
 
         // 每步采样
-        if (s2_sample_count < STAGE2_MEASURE_COUNT)
+        if (measure_time_tag > us_to_ms(time_us_32()))
         {
-            // 取反后：位为0表示触发
             Read_Triggle_Sample(stage_index, sample, trig_res);
             triggle_sample_count += trig_res.triggle_num;
-            total_sample_count += trig_res.sample_count;
             trig_res.clear();
-            s2_sample_count++;
             return;
         }
 
-        // 完成5次采样，评估结果
-        int8_t ratio = (triggle_sample_count * 100) / total_sample_count;  // ratio绝对值 我们期望是50% 只需要查看他的偏差
-        if (!ratio)
+        // 完成N次采样，评估结果
+        if (!triggle_sample_count)
         {
             // 当前stage达成目标，进入下一个stage
             stage_index++;
@@ -214,7 +211,6 @@ void AD7147::CalibrationTools::CalibrationLoop(uint32_t sample)
             else
             {
                 current_stage_index_ = stage_index;
-                Clear_and_prepare_stage_settings(stage_index);
                 calibration_state_ = Stage1_baseline;
                 s1_inited = false;
                 s2_inited = false;
@@ -222,27 +218,20 @@ void AD7147::CalibrationTools::CalibrationLoop(uint32_t sample)
             }
         }
 
-        // 若发现触发占比较阶段1最佳比例显著增高，则反向（这里只要高于阶段1比例即判定为显著增高）
-        if (!s2_dir_locked && ratio > s1_best_ratio)
-        {
-            s2_dir = -1;          // 改为向反方向调整
-            s2_dir_locked = true; // 仅切换一次
-        }
-
         // 按当前方向单步调整
-        s2_cur_aef = (int16_t)(s2_cur_aef + s2_dir);
+        s2_cur_aef--;
 
-        // 限制最大调整范围 ±32
-        if (s2_cur_aef > s2_base_aef + 48 || s2_cur_aef < s2_base_aef - 48)
+        // 限制最大调整范围 -48
+        if (s2_cur_aef < s2_base_aef - 48)
         {
             // 超出范围，放弃当前stage，进入下一stage
             stage_index++;
             if (stage_index >= 12)
             {
-                Complete_and_restore_calibration();
                 current_stage_index_ = 12;
                 calibration_state_ = IDLE;
                 inited = false;
+                pthis->abnormal_channels_bitmap_ |= (1 << (stage_index - 1));
                 return;
             }
             else
@@ -263,9 +252,9 @@ void AD7147::CalibrationTools::CalibrationLoop(uint32_t sample)
             Set_AEF_Offset(stage_index, dir, off);
         }
         stage_process = stage_process > 252 ? 252 : stage_process + 1;
-        s2_sample_count = 0;
-        total_sample_count = 0;
+        measure_time_tag = 0;
         triggle_sample_count = 0;
+        measure_time_tag = us_to_ms(time_us_32()) + STAGE2_MEASURE_TIME_MS;
         return;
     }
     }

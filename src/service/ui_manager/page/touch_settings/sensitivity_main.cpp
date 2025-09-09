@@ -51,10 +51,7 @@ void SensitivityMain::render(PageTemplate& page_template) {
             // 使用DeviceTypeUtils获取页面信息
             std::string page_name, jump_str;
             DeviceTypeUtils::getDevicePageInfo(device, page_name, jump_str);
-            
             ADD_MENU_WITH_STR(jump_str, page_name, device.device_name, device_color)
-            
-            
         }
     }
     

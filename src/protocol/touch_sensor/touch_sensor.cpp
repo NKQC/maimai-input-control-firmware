@@ -22,13 +22,13 @@ uint32_t TouchSensor::getSupportedChannelCount() const {
  * @return IC类型
  */
 TouchSensorType TouchSensor::identifyICType(uint8_t i2c_address) {
-    // GTX312L使用0xB*地址模式，反掩码0x4F (B=1011, 反掩码=0100)
+    // GTX312L使用0xB*地址模式，反掩码0x4F (B=1011, 反掩码=0100) 尚未修改
     if ((i2c_address & static_cast<uint8_t>(TouchSensorReverseMask::GTX312L_MASK)) == 0x40) {
         return TouchSensorType::GTX312L;
     }
     
-    // AD7147使用0x2*地址模式，反掩码0xEF (2=0010, 反掩码=1110)
-    if ((i2c_address & 0xF0) == 0x20) {
+    // AD7147使用0x2*地址模式
+    if (!(i2c_address & static_cast<uint8_t>(TouchSensorReverseMask::AD7147_MASK))) {
         return TouchSensorType::AD7147;
     }
     

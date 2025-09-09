@@ -168,19 +168,14 @@ BindingSettings::BindingUIState BindingSettings::get_current_binding_state() {
             s_ui_state = BindingUIState::IDLE;
             break;
             
-        case BindingState::SERIAL_BINDING_WAIT_TOUCH:
-        case BindingState::SERIAL_BINDING_PROCESSING:
+        case BindingState::WAIT_TOUCH:
+        case BindingState::PROCESSING:
             s_ui_state = BindingUIState::BINDING_ACTIVE;
             break;
             
-        case BindingState::SERIAL_BINDING_COMPLETE:
-            s_ui_state = BindingUIState::BINDING_COMPLETE;
-            break;
+        // 注意：COMPLETE状态已被移除，绑定完成后直接回到IDLE状态
             
-        case BindingState::HID_BINDING_INIT:
-        case BindingState::HID_BINDING_WAIT_TOUCH:
-            s_ui_state = BindingUIState::BINDING_ERROR;
-            break;
+
             
         default:
             s_ui_state = BindingUIState::IDLE;
@@ -199,15 +194,13 @@ uint8_t BindingSettings::get_binding_progress() {
     // 根据绑定状态计算进度
     BindingState binding_state = input_manager->getBindingState();
     switch (binding_state) {
-        case BindingState::SERIAL_BINDING_WAIT_TOUCH:
-        case BindingState::SERIAL_BINDING_PROCESSING:
-        case BindingState::AUTO_SERIAL_BINDING_SCAN: {
+        case BindingState::WAIT_TOUCH:
+        case BindingState::PROCESSING: {
             // 获取当前绑定索引，计算准确进度
             uint8_t current_index = input_manager->getCurrentBindingIndex();
             return (current_index * 100) / 34; // 总共34个区域
         }
-        case BindingState::SERIAL_BINDING_COMPLETE:
-        case BindingState::AUTO_SERIAL_BINDING_COMPLETE:
+        case BindingState::IDLE:
             return 100;
         default:
             return 0;
@@ -223,8 +216,8 @@ std::string BindingSettings::get_current_binding_area() {
     // 根据绑定状态返回当前区域信息
     BindingState binding_state = input_manager->getBindingState();
     switch (binding_state) {
-        case BindingState::SERIAL_BINDING_WAIT_TOUCH:
-        case BindingState::SERIAL_BINDING_PROCESSING: {
+        case BindingState::WAIT_TOUCH:
+        case BindingState::PROCESSING: {
             // 获取当前绑定索引并显示具体区域名称
             uint8_t current_index = input_manager->getCurrentBindingIndex();
             if (current_index < 34) {
@@ -232,10 +225,7 @@ std::string BindingSettings::get_current_binding_area() {
             }
             return "绑定完成";
         }
-        case BindingState::AUTO_SERIAL_BINDING_SCAN:
-            return "自动扫描中...";
-        case BindingState::SERIAL_BINDING_COMPLETE:
-        case BindingState::AUTO_SERIAL_BINDING_COMPLETE:
+        case BindingState::IDLE:
             return "绑定完成";
         default:
             return "";

@@ -141,7 +141,7 @@ public:
 
 private:
     bool send_response(const std::string& response);
-    void process_received_byte(uint8_t byte);
+    void process_received_byte(const std::string& command_str);
     void parse_command(const std::string& command_str);
     void process_command_packet(const uint8_t* packet, size_t length);
 
@@ -150,10 +150,6 @@ private:
     bool serial_ok_;
     Mai2Serial_Config config_;
     Status status_;
-
-    // 字符串命令缓冲
-    char command_buffer_[MAI2SERIAL_COMMAND_LENGTH];
-    size_t command_buffer_pos_;
 
     // 新增：流式接收缓冲区（4倍固定长度，滑动窗口解析）
     uint8_t rx_stream_buffer_[MAI2SERIAL_STREAM_BUFFER_SIZE];

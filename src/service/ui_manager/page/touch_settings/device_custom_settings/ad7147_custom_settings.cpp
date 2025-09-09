@@ -10,7 +10,7 @@ namespace ui {
 // 静态成员变量定义
 std::string AD7147CustomSettings::device_name_;
 int32_t AD7147CustomSettings::current_stage_ = 0;
-StageConfig AD7147CustomSettings::current_config_;
+PortConfig AD7147CustomSettings::current_config_;
 BitfieldHelper AD7147CustomSettings::bitfield_helper_;
 uint16_t AD7147CustomSettings::current_cdc_value_ = 0;
 bool AD7147CustomSettings::config_loaded_ = false;
@@ -22,7 +22,7 @@ uint8_t AD7147CustomSettings::auto_offset_progress_ = 0;
 uint8_t AD7147CustomSettings::auto_offset_total_progress_ = 0;
 
 // BitfieldHelper方法实现
-void BitfieldHelper::loadFromStageConfig(const StageConfig& config) {
+void BitfieldHelper::loadFromPortConfig(const PortConfig& config) {
     // 加载AFE偏移位域
     afe_offset.neg_afe_offset = config.afe_offset.bits.neg_afe_offset;
     afe_offset.neg_afe_swap = config.afe_offset.bits.neg_afe_offset_swap;
@@ -36,7 +36,7 @@ void BitfieldHelper::loadFromStageConfig(const StageConfig& config) {
     sensitivity.pos_peak_detect = config.sensitivity.bits.pos_peak_detect;
 }
 
-void BitfieldHelper::writeToStageConfig(StageConfig& config) const {
+void BitfieldHelper::writeToPortConfig(PortConfig& config) const {
     // 写回AFE偏移位域
     config.afe_offset.bits.neg_afe_offset = afe_offset.neg_afe_offset;
     config.afe_offset.bits.neg_afe_offset_swap = afe_offset.neg_afe_swap;
@@ -245,21 +245,25 @@ void AD7147CustomSettings::render(PageTemplate& page_template) {
     }, COLOR_TEXT_WHITE)
     
     // 连接配置
-    snprintf(text, sizeof(text), "连接6-0: 0x%04X", current_config_.connection_6_0);
-    ADD_TEXT(text, COLOR_TEXT_WHITE, LineAlign::LEFT)
+    // snprintf(text, sizeof(text), "连接6-0: 0x%04X", current_config_.connection_6_0);
+    // ADD_TEXT(text, COLOR_TEXT_WHITE, LineAlign::LEFT)
     
-    snprintf(text, sizeof(text), "连接12-7: 0x%04X", current_config_.connection_12_7);
-    ADD_TEXT(text, COLOR_TEXT_WHITE, LineAlign::LEFT)
+    // snprintf(text, sizeof(text), "连接12-7: 0x%04X", current_config_.connection_12_7);
+    // ADD_TEXT(text, COLOR_TEXT_WHITE, LineAlign::LEFT)
     
-    // 重置当前阶段配置按钮
-    ADD_BUTTON("重置当前阶段", []() {
-        resetCurrentStageFromDevice();
-    }, COLOR_TEXT_YELLOW, LineAlign::CENTER)
+    // 容易误触 暂时关掉 
+    /* 
+     * TODO: 添加确认页面
+     */
+    // // 重置当前阶段配置按钮
+    // ADD_BUTTON("重置当前阶段", []() {
+    //     resetCurrentStageFromDevice();
+    // }, COLOR_TEXT_YELLOW, LineAlign::CENTER)
     
-    // 重置设置按钮
-    ADD_BUTTON("重置设置", []() {
-        resetToDefault();
-    }, COLOR_ERROR, LineAlign::CENTER)
+    // // 重置设置按钮
+    // ADD_BUTTON("重置设置", []() {
+    //     resetToDefault();
+    // }, COLOR_ERROR, LineAlign::CENTER)
 
     PAGE_END()
 }
@@ -285,7 +289,6 @@ AD7147* AD7147CustomSettings::getAD7147Device() {
     if (!input_mgr) {
         return nullptr;
     }
-    
     // 通过设备名称获取TouchSensor实例
     TouchSensor* touch_sensor = input_mgr->getTouchSensorByDeviceName(device_name_);
     if (!touch_sensor) {
@@ -321,7 +324,7 @@ void AD7147CustomSettings::loadStageDataAndStatus() {
     // 加载配置数据（仅在需要时）
     if (!config_loaded_) {
         current_config_ = ad7147->getStageConfig(current_stage_);
-        bitfield_helper_.loadFromStageConfig(current_config_);
+        bitfield_helper_.loadFromPortConfig(current_config_);
         config_loaded_ = true;
     }
     
@@ -365,8 +368,8 @@ void AD7147CustomSettings::applyConfig() {
     
     AD7147* ad7147 = getAD7147Device();
     if (ad7147) {
-        // 将位域配置写回到StageConfig
-        bitfield_helper_.writeToStageConfig(current_config_);
+        // 将位域配置写回到PortConfig
+        bitfield_helper_.writeToPortConfig(current_config_);
         // 应用配置到硬件
         ad7147->setStageConfigAsync(current_stage_, current_config_);
     }
@@ -394,13 +397,13 @@ void AD7147CustomSettings::resetToDefault() {
         StageSettings default_settings;
         
         // 从默认设置中获取当前stage的配置
-        StageConfig default_config = default_settings.stages[current_stage_];
+        PortConfig default_config = default_settings.stages[current_stage_];
         
         // 应用默认配置到当前配置
         current_config_ = default_config;
         
         // 从默认配置加载位域辅助结构
-        bitfield_helper_.loadFromStageConfig(current_config_);
+        bitfield_helper_.loadFromPortConfig(current_config_);
         
         // 应用配置到硬件
         applyConfig();
@@ -421,8 +424,8 @@ void AD7147CustomSettings::resetCurrentStageFromDevice() {
         // 从AD7147设备读取当前阶段的配置
         current_config_ = ad7147->getStageConfig(current_stage_);
         
-        // 从设备配置加载位域辅助结构
-        bitfield_helper_.loadFromStageConfig(current_config_);
+        // 从当前配置加载位域辅助结构
+        bitfield_helper_.loadFromPortConfig(current_config_);
         
         // 标记配置已加载
         config_loaded_ = true;

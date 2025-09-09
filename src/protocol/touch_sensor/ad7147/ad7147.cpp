@@ -11,10 +11,11 @@ AD7147::AD7147(HAL_I2C* i2c_hal, I2C_Bus i2c_bus, uint8_t device_addr)
       device_addr_(device_addr), i2c_device_address_(device_addr),
       initialized_(false), i2c_bus_enum_(i2c_bus), enabled_channels_mask_(0),
       cdc_read_request_(false), cdc_read_stage_(0), cdc_read_value_(0),
-      pending_config_count_(0) {
+      pending_config_count_(0), abnormal_channels_bitmap_(0) {
     module_name = "AD7147";
     module_mask_ = TouchSensor::generateModuleMask(static_cast<uint8_t>(i2c_bus), device_addr);
     supported_channel_count_ = AD7147_MAX_CHANNELS;
+    supports_calibration_ = true;  // AD7147支持校准功能
     calibration_tools_.pthis = this;
 }
 
@@ -39,7 +40,7 @@ bool AD7147::init() {
     USB_LOG_DEBUG("AD7147 device ID: %0x", _device_id);
     ret &= _device_id != 0;
     // 默认启用全部通道，与芯片默认一致，并将各阶段的中断/校准开关同步到寄存器，保证设置可实时生效
-    enabled_channels_mask_ = 0x1FFFu; // 13位
+    enabled_channels_mask_ = ((1 << AD7147_MAX_CHANNELS) - 1); // 13位
     
     // 可选：配置所有阶段（如果需要自定义配置）
     register_config_.pwr_control.bits.power_mode = 0;
@@ -128,7 +129,7 @@ bool AD7147::setCustomSensitivitySettings(const std::string& settings_data) {
     return apply_stage_settings();
 }
 
-bool AD7147::setStageConfig(uint8_t stage, const StageConfig& config) {
+bool AD7147::setStageConfig(uint8_t stage, const PortConfig& config) {
     if (!initialized_ || stage >= 12) {
         return false;
     }
@@ -164,9 +165,9 @@ bool AD7147::setStageConfig(uint8_t stage, const StageConfig& config) {
     return ret;
 }
 
-StageConfig AD7147::getStageConfig(uint8_t stage) const {
+PortConfig AD7147::getStageConfig(uint8_t stage) const {
     if (stage >= 12) {
-        return StageConfig(); // 返回默认配置
+        return PortConfig(); // 返回默认配置
     }
     
     return stage_settings_.stages[stage];
@@ -230,12 +231,8 @@ bool AD7147::isInitialized() const {
 }
 
 TouchSampleResult AD7147::sample() {
-    static TouchSampleResult result = {};
+    static TouchSampleResult result = {.touch_mask = uint32_t(module_mask_ << 24)};
     static uint16_t status_regs;
-    if (!initialized_) {
-        result.timestamp_us = time_us_32();
-        return result;
-    }
 
     // 处理待应用的异步配置
     if (pending_config_count_) {
@@ -258,10 +255,6 @@ TouchSampleResult AD7147::sample() {
     // 留给校准模块
     if (calibration_tools_.calibration_state_)
         calibration_tools_.CalibrationLoop(result.channel_mask);
-
-    // 仅报告当前启用的通道，保证禁用通道不产生事件
-    result.channel_mask &= enabled_channels_mask_;
-    result.module_mask = module_mask_;
     result.timestamp_us = time_us_32();
     
     return result;
@@ -310,13 +303,82 @@ bool AD7147::read_register(uint16_t reg, uint16_t& value) {
 
 // 将启用的通道掩码实时应用到硬件，按位启用/关闭各个阶段（Stage）
 bool AD7147::applyEnabledChannelsToHardware() {
-    uint8_t mask13[2] = {(uint8_t)(enabled_channels_mask_ >> 8), (uint8_t)(enabled_channels_mask_ & 0x1FFFu)};
-
-    // 关闭未启用阶段的校准和比较中断，减少扫描负担，提高有效采样速率
+    // 通道12始终禁用以简化实现（仅支持12个stage，无法实现13通道的多点触控）
+    uint32_t working_mask = enabled_channels_mask_ & 0x0FFF; // 只处理通道0-11
+    
+    // 获取启用通道的数量和索引
+    uint8_t enabled_channels[12];
+    uint8_t enabled_count = 0;
+    
+    for (uint8_t ch = 0; ch < 12; ch++) {
+        if (working_mask & (1UL << ch)) {
+            enabled_channels[enabled_count] = ch;
+            enabled_count++;
+        }
+    }
+    
+    
+    
     bool ok = true;
-    ok &= write_register(AD7147_REG_STAGE_CAL_EN, mask13);
-    ok &= write_register(AD7147_REG_STAGE_HIGH_INT_EN, mask13);
-
+    uint8_t config_buffer[16];
+    
+    // 配置启用的通道到对应的stage
+    for (uint8_t stage = 0; stage < 12; stage++) {
+        if (stage < enabled_count) {
+            // 使用启用通道的配置
+            uint8_t channel = enabled_channels[stage];
+            stage_settings_.stages[stage].connection_6_0 = channel_connections[channel][0];
+            stage_settings_.stages[stage].connection_12_7 = channel_connections[channel][1];
+        } else {
+            // 未使用的stage设置为0（禁用）
+            stage_settings_.stages[stage].connection_6_0 = 0x0000;
+            stage_settings_.stages[stage].connection_12_7 = 0x0000;
+        }
+        
+        // 写入stage连接配置
+        const PortConfig& stage_config = stage_settings_.stages[stage];
+        config_buffer[0] = (uint8_t)(stage_config.connection_6_0 >> 8);
+        config_buffer[1] = (uint8_t)(stage_config.connection_6_0 & 0xFF);
+        config_buffer[2] = (uint8_t)(stage_config.connection_12_7 >> 8);
+        config_buffer[3] = (uint8_t)(stage_config.connection_12_7 & 0xFF);
+        
+        uint16_t stage_base_addr = AD7147_REG_STAGE0_CONNECTION + (stage * AD7147_REG_STAGE_SIZE);
+        ok &= write_register(stage_base_addr + AD7147_STAGE_CONNECTION_OFFSET, config_buffer, 4);
+    }
+    
+    // 设置校准使能：只启用实际使用的stage
+    uint16_t cal_enable_mask = 0;
+    if (enabled_count > 0) {
+        cal_enable_mask = (1 << enabled_count) - 1; // 启用stage 0到enabled_count-1
+    }
+    
+    uint8_t cal_en_data[2] = {
+        (uint8_t)(cal_enable_mask >> 8),
+        (uint8_t)(cal_enable_mask & 0xFF)
+    };
+    ok &= write_register(AD7147_REG_STAGE_CAL_EN, cal_en_data, 2);
+    
+    // 设置高中断使能
+    uint8_t high_int_data[2] = {
+        (uint8_t)(cal_enable_mask >> 8),
+        (uint8_t)(cal_enable_mask & 0xFF)
+    };
+    ok &= write_register(AD7147_REG_STAGE_HIGH_INT_EN, high_int_data, 2);
+    
+    // 设置sequence_stage_num为启用通道数量减1
+    if (enabled_count > 0) {
+        register_config_.pwr_control.bits.sequence_stage_num = enabled_count - 1;
+    } else {
+        register_config_.pwr_control.bits.sequence_stage_num = 0;
+    }
+    
+    // 写入电源控制寄存器
+    uint8_t pwr_ctrl_data[2] = {
+        (uint8_t)(register_config_.pwr_control.raw >> 8),
+        (uint8_t)(register_config_.pwr_control.raw & 0xFF)
+    };
+    ok &= write_register(AD7147_REG_PWR_CONTROL, pwr_ctrl_data, 2);
+    
     return ok;
 }
 
@@ -328,7 +390,7 @@ inline bool AD7147::apply_stage_settings() {
     USB_LOG_DEBUG("AD7147 apply_stage_settings");
     // 配置每个阶段（Stage 0-11）
     for (uint8_t stage = 0; stage < 12; stage++) {
-        const StageConfig& stage_config = stage_settings_.stages[stage];
+        const PortConfig& stage_config = stage_settings_.stages[stage];
         
         config_buffer[0] = (uint8_t)(stage_config.connection_6_0 >> 8);
         config_buffer[1] = (uint8_t)(stage_config.connection_6_0 & 0xFF);
@@ -412,7 +474,7 @@ bool AD7147::configureStages(const uint16_t* connection_values) {
 
     // 更新AMB_COMP_CTRL0配置
     register_config_.amb_comp_ctrl0.raw = 0x32FF; 
-    register_config_.amb_comp_ctrl0.bits.forced_cal = true;
+    register_config_.amb_comp_ctrl0.bits.forced_cal = false;
     uint8_t amb_ctrl0_data[2] = {
         (uint8_t)(register_config_.amb_comp_ctrl0.raw >> 8),
         (uint8_t)(register_config_.amb_comp_ctrl0.raw & 0xFF)
@@ -423,7 +485,7 @@ bool AD7147::configureStages(const uint16_t* connection_values) {
 }
 
 // 异步设置Stage配置
-bool AD7147::setStageConfigAsync(uint8_t stage, const StageConfig& config) {
+bool AD7147::setStageConfigAsync(uint8_t stage, const PortConfig& config) {
     if (stage >= 12) {
         return false;
     }
@@ -456,11 +518,10 @@ uint8_t AD7147::getAutoOffsetCalibrationProgress() const {
 
 
 uint8_t AD7147::getAutoOffsetCalibrationTotalProgress() const {
-    using CT = AD7147::CalibrationTools;
     const uint8_t total_stages = 12;
 
     // 未运行且未完成
-    if (calibration_tools_.calibration_state_ == CT::IDLE) {
+    if (calibration_tools_.calibration_state_ == AD7147::CalibrationTools::IDLE) {
         return (calibration_tools_.current_stage_index_ >= total_stages) ? 255 : 0;
     }
 
@@ -473,6 +534,48 @@ uint8_t AD7147::getAutoOffsetCalibrationTotalProgress() const {
     uint16_t accum = static_cast<uint16_t>(completed) * 255u + static_cast<uint16_t>(stage_phase_progress);
     uint8_t total = static_cast<uint8_t>(accum / total_stages);
     return total;
+}
+
+// TouchSensor基类虚函数实现
+bool AD7147::calibrateSensor() {
+    // 启动自动偏移校准
+    return startAutoOffsetCalibration();
+}
+
+uint8_t AD7147::getCalibrationProgress() const {
+    // 返回自动偏移校准的总进度
+    return getAutoOffsetCalibrationTotalProgress();
+}
+
+bool AD7147::setLEDEnabled(bool enabled) {
+    // AD7147 LED control through register 0x005 bits [13:12]
+    // 00 = disable GPIO pin
+    // 01 = configure GPIO as an input  
+    // 10 = configure GPIO as an active low output
+    // 11 = configure GPIO as an active high output
+    
+    uint16_t reg_value;
+    if (!read_register(0x005, reg_value)) {
+        return false;
+    }
+    
+    // Clear bits [13:12]
+    reg_value &= ~(0x3 << 12);
+    
+    // Set bits [13:12] = 00 (disable GPIO pin)
+    reg_value |= (enabled ? 0x3 : 0x2) << 12;
+
+    uint8_t reg_data[2] = {
+        (uint8_t)(reg_value >> 8),
+        (uint8_t)(reg_value & 0xFF)
+    };
+    
+    return write_register(0x005, reg_data, 2);
+}
+
+uint32_t AD7147::getAbnormalChannelMask() const {
+    // 返回异常通道位图
+    return abnormal_channels_bitmap_;
 }
 
 

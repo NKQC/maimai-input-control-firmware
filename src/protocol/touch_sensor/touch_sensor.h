@@ -26,8 +26,8 @@ enum class TouchSensorType : uint8_t {
  * 当(IC_ADDRESS & REVERSE_MASK) == 0时判定为匹配
  */
 enum class TouchSensorReverseMask : uint8_t {
-    GTX312L_MASK = 0x4F,  // GTX312L使用0xB*地址模式的反掩码 (B=1011, 反掩码=0100)
-    AD7147_MASK = 0xEF    // AD7147使用0x2*地址模式的反掩码 (2=0010, 反掩码=1110)
+    GTX312L_MASK = 0x4F,  // GTX312L使用0xB*地址模式的反掩码
+    AD7147_MASK = 0xD2    // AD7147使用0x2*地址模式的反掩码
 };
 
 typedef struct {
@@ -120,6 +120,17 @@ public:
     // 配置管理接口 - 子类可选实现
     virtual bool loadConfig(const std::string& config_data) { return false; }  // 从字符串加载配置
     virtual std::string saveConfig() const { return ""; }  // 保存配置到字符串
+    
+    // 校准相关接口 - 子类可选实现
+    virtual bool calibrateSensor() { return false; }  // 校准传感器
+    virtual uint8_t getCalibrationProgress() const { return 0; }  // 获取校准进度 (0-100)
+    virtual bool setLEDEnabled(bool enabled) { return false; }  // 设置LED状态
+    
+    // 异常通道检测接口 - 子类可选实现
+    virtual uint32_t getAbnormalChannelMask() const { return 0; }  // 获取异常通道bitmap (格式同sample返回的channel_mask)
+    
+    // 校准支持标志
+    bool supports_calibration_ = false;  // 该芯片是否支持校准功能
 
 protected:
     uint8_t max_channels_;  // 该IC支持的最大通道数（最大24）

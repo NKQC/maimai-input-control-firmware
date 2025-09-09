@@ -4,13 +4,12 @@
 #include "../../hal/usb/hal_usb.h"
 #include <string>
 #include <functional>
-#include <queue>
 #include <cstdint>
 #include "pico/time.h"
 
 // USB串口日志系统配置
 #define USB_LOGS_MAX_LINE_LENGTH 256
-#define USB_LOGS_QUEUE_SIZE 200
+#define USB_LOGS_BUFFER_SIZE 8192  // 8KB缓冲区
 #define USB_LOGS_MAX_ONESHOT 50
 
 // 日志级别
@@ -34,7 +33,6 @@ struct USB_SerialLogs_Config {
     USB_LogLevel min_level;       // 最小日志级别
     USB_LogFormat format;         // 日志格式
     bool enable_colors;           // 启用颜色输出
-    // 移除缓冲相关配置
     uint16_t flush_interval_ms;   // 刷新间隔
     bool auto_flush;              // 自动刷新
     
@@ -55,9 +53,57 @@ struct USB_LogEntry {
     std::string tag;              // 标签
     
     USB_LogEntry() : timestamp(0), level(USB_LogLevel::INFO) {}
+    
     USB_LogEntry(USB_LogLevel lvl, const std::string& msg, const std::string& t = "")
         : level(lvl), message(msg), tag(t) {
         timestamp = time_us_32() / 1000;
+    }
+};
+
+// 日志条目头部结构
+struct USB_LogEntryHeader {
+    uint16_t size;          // 条目总大小（包含头部）
+    uint32_t timestamp;     // 时间戳
+    USB_LogLevel level;     // 日志级别
+    uint8_t tag_length;     // 标签长度
+    uint8_t message_length; // 消息长度（实际可能更长，这里是低8位）
+    uint16_t full_message_length; // 完整消息长度
+} __attribute__((packed));
+
+// 环形缓冲区结构
+struct USB_LogRingBuffer {
+    uint8_t buffer[USB_LOGS_BUFFER_SIZE];  // 字节级缓冲区
+    volatile size_t write_index;           // 写入索引
+    volatile size_t read_index;            // 读取索引
+    volatile size_t used_bytes;            // 已使用字节数
+    
+    USB_LogRingBuffer() : write_index(0), read_index(0), used_bytes(0) {}
+    
+    // 检查是否为空
+    bool is_empty() const {
+        return used_bytes == 0;
+    }
+    
+    // 检查是否已满
+    bool is_full() const {
+        return used_bytes >= USB_LOGS_BUFFER_SIZE;
+    }
+    
+    // 获取剩余空间
+    size_t get_free_space() const {
+        return USB_LOGS_BUFFER_SIZE - used_bytes;
+    }
+    
+    // 获取已使用空间
+    size_t get_used_space() const {
+        return used_bytes;
+    }
+    
+    // 清空缓冲区
+    void clear() {
+        write_index = 0;
+        read_index = 0;
+        used_bytes = 0;
     }
 };
 
@@ -145,7 +191,7 @@ private:
     Statistics stats_;
     
     // 队列管理
-    std::queue<USB_LogEntry> log_queue_;
+    USB_LogRingBuffer log_buffer_;  // 环形缓冲区
     uint32_t last_flush_time_;
     
     // 回调

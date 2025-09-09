@@ -173,19 +173,10 @@ enum class InputWorkMode : uint8_t {
 
 // 绑定状态枚举
 enum class BindingState : uint8_t {
-    IDLE = 0,                    // 空闲状态
-    SERIAL_BINDING_INIT,         // Serial绑定初始化
-    SERIAL_BINDING_WAIT_TOUCH,   // 等待触摸输入
-    SERIAL_BINDING_PROCESSING,   // 处理绑定
-    SERIAL_BINDING_COMPLETE,     // 绑定完成
-    HID_BINDING_INIT,           // HID绑定初始化
-    HID_BINDING_WAIT_TOUCH,     // 等待触摸输入
-    HID_BINDING_SET_COORDS,     // 设置坐标
-    HID_BINDING_COMPLETE,       // HID绑定完成
-    AUTO_SERIAL_BINDING_INIT,   // 自动Serial绑定初始化
-    AUTO_SERIAL_BINDING_SCAN,   // 扫描触摸输入
-    AUTO_SERIAL_BINDING_WAIT,   // 等待用户确认
-    AUTO_SERIAL_BINDING_COMPLETE // 自动绑定完成
+    IDLE = 0,        // 空闲状态
+    PREPARE,         // 准备绑定
+    WAIT_TOUCH,      // 等待触摸输入
+    PROCESSING       // 处理绑定
 };
 
 // 统一使用TouchDeviceMapping
@@ -265,7 +256,6 @@ public:
     
     // 交互式绑定
     void startSerialBinding(InteractiveBindingCallback callback);
-    void startHIDBinding(InteractiveBindingCallback callback);
     bool startAutoSerialBinding(); // 引导式自动绑区(仅Serial模式)
     void cancelBinding();
     
@@ -278,15 +268,44 @@ public:
     uint8_t getCurrentBindingIndex() const;  // 获取当前绑定区域索引
     void requestCancelBinding();             // 请求取消绑定（UI层调用）
     
-    // HID绑定相关方法
-    void setHIDCoordinates(float x, float y);  // 设置HID绑定坐标
-    void confirmHIDBinding();                  // 确认HID绑定
-    
     // 灵敏度管理
     uint8_t autoAdjustSensitivity(uint8_t device_id_mask, uint8_t channel); // 指定通道的灵敏度调整
     void setSensitivity(uint8_t device_id_mask, uint8_t channel, uint8_t sensitivity);
     uint8_t getSensitivity(uint8_t device_id_mask, uint8_t channel);
     bool setSensitivityByDeviceName(const std::string& device_name, uint8_t channel, uint8_t sensitivity);
+    
+    // 校准管理
+    void calibrateAllSensors();                        // 校准所有支持校准的传感器
+    uint8_t getCalibrationProgress();                  // 获取校准进度 (0-255范围)
+    
+    // 异常通道检测结构体 - 精简版，只传递必要数据
+    struct AbnormalChannelInfo {
+        uint32_t device_and_channel_mask; // 高8位为设备ID，低24位为异常通道掩码
+        
+        AbnormalChannelInfo() : device_and_channel_mask(0) {}
+        AbnormalChannelInfo(uint32_t mask) : device_and_channel_mask(mask) {}
+        
+        // 辅助方法
+        uint8_t getDeviceId() const { return (device_and_channel_mask >> 24) & 0xFF; }
+        uint32_t getChannelMask() const { return device_and_channel_mask & 0xFFFFFF; }
+    };
+    
+    // 异常通道检测结果 - 使用静态预分配数组
+    struct AbnormalChannelResult {
+        AbnormalChannelInfo devices[MAX_TOUCH_DEVICE];  // 预分配设备数组
+        uint8_t device_count;                           // 实际设备数量
+        
+        AbnormalChannelResult() : device_count(0) {}
+    };
+    
+    // 收集所有支持校准设备的异常通道 - 使用静态预分配
+    AbnormalChannelResult collectAbnormalChannels();
+    
+    // 根据设备ID掩码获取设备名称 - UI显示时调用
+    std::string getDeviceNameByMask(uint32_t device_and_channel_mask) const;
+    
+    // 根据设备ID掩码获取设备类型 - UI显示时调用
+    TouchSensorType getDeviceTypeByMask(uint32_t device_and_channel_mask) const;
     
     // UI专用接口 - 获取所有设备状态
     struct TouchDeviceStatus {
@@ -441,9 +460,9 @@ private:
     bool original_channels_backup_[8][12];   // 原始通道启用状态备份
     
     // HID绑定相关变量
-    uint32_t hid_binding_device_addr_;       // HID绑定的设备ID掩码(32位)
-    uint8_t hid_binding_channel_;            // HID绑定的通道
-    float hid_binding_x_, hid_binding_y_;    // HID绑定的坐标
+
+    // 校准管理相关变量
+    bool calibration_request_pending_;       // 校准请求待处理标志
     
     // 自动灵敏度调整状态机
     enum class AutoAdjustState {
@@ -510,6 +529,7 @@ private:
     // 内部处理函数
     inline void updateTouchStates();
     inline void sendHIDTouchData();
+    void processCalibrationRequest();               // 处理校准请求（在task0中调用）
     
     // 触摸响应延迟管理私有方法
     inline void storeDelayedSerialState();                     // 存储当前Serial状态到延迟缓冲区
@@ -576,7 +596,6 @@ private:
     // 绑定处理函数
     void processBinding();
     void processSerialBinding();
-    void processHIDBinding();
     void processAutoSerialBinding();
     void backupChannelStates();
     void restoreChannelStates();

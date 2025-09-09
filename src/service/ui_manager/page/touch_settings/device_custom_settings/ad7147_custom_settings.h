@@ -29,11 +29,11 @@ struct BitfieldHelper {
         int32_t pos_peak_detect = 0;           // 正峰值检测 (0-5)
     } sensitivity;
     BitfieldHelper() {};
-    // 从StageConfig加载位域值
-    void loadFromStageConfig(const StageConfig& config);
+    // 从PortConfig加载位域值
+    void loadFromPortConfig(const PortConfig& config);
     
-    // 写回到StageConfig
-    void writeToStageConfig(StageConfig& config) const;
+    // 写回到PortConfig
+    void writeToPortConfig(PortConfig& config) const;
 };
 
 /**
@@ -61,7 +61,7 @@ public:
 private:
     static std::string device_name_;                    // 设备名称
     static int32_t current_stage_;                      // 当前选择的阶段
-    static StageConfig current_config_;                 // 当前阶段配置
+    static PortConfig current_config_;                 // 当前阶段配置
     static BitfieldHelper bitfield_helper_;            // 位域配置辅助结构体
     static uint16_t current_cdc_value_;                 // 当前CDC值
     static bool config_loaded_;                         // 配置是否已加载

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../../engine/page_construction/page_constructor.h"
+#include "../../../input_manager/input_manager.h"
 #include <cstdint>
 
 namespace ui {
@@ -22,6 +23,11 @@ public:
     
 private:
     static int32_t delay_value;
+    
+    // 校准相关静态变量
+    static bool calibration_in_progress_;     // 校准是否正在进行
+    static bool calibration_completed_;       // 校准是否已完成
+    static InputManager::AbnormalChannelResult abnormal_channels_;  // 异常通道检测结果
 
     /**
      * 格式化触摸IC地址为字符串
@@ -38,6 +44,11 @@ private:
      * @return 格式化后的通道位图字符串
      */
     static std::string format_touch_bitmap(uint32_t touch_mask, uint8_t max_channels, uint32_t enabled_channels_mask);
+    
+    /**
+     * 校准按钮回调函数
+     */
+    static void onCalibrateButtonPressed();
 };
 
 } // namespace ui

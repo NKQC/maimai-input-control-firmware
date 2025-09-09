@@ -70,7 +70,9 @@ public:
                                          uint8_t channel,
                                          std::string& page_name, 
                                          std::string& jump_str) {
+        UIManager::log_debug_static("device_type: " + std::to_string((uint8_t)device.device_type));
         switch (device.device_type) {
+            
             case TouchSensorType::AD7147:
                 if (device.is_connected) {
                     page_name = "ad7147_custom_settings";
