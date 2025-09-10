@@ -92,16 +92,21 @@ void Mai2Serial::send_touch_data(Mai2Serial_TouchState& touch_data) {
     // 更新下次发送时间
     next_send_time_us_ = current_time_us + packet_transmission_time_us_;
     
-    touch_data.raw |= triggle_touch_data_.raw;
+    // 静态预组装数据包，最低CPU占用优化
+    static uint8_t packet[9] = {MAI2SERIAL_TOUCH_START_BYTE,0,0,0,0,0,0,0,MAI2SERIAL_TOUCH_END_BYTE};
+    static uint64_t combined_bits;  // 35位数据
+    combined_bits = touch_data.raw | triggle_touch_data_.raw;
     
-    // 按照标准实现：预先组装完整数据包，避免循环和多次write调用
-    static touch_data_packet _packet;
-    _packet.parts.state1 = touch_data.parts.state1;
-    _packet.parts.state2 = touch_data.parts.state2;
-
+    packet[1] = (uint8_t)(combined_bits & 0x1F);         // 位0-4
+    packet[2] = (uint8_t)((combined_bits >> 5) & 0x1F);  // 位5-9
+    packet[3] = (uint8_t)((combined_bits >> 10) & 0x1F); // 位10-14
+    packet[4] = (uint8_t)((combined_bits >> 15) & 0x1F); // 位15-19
+    packet[5] = (uint8_t)((combined_bits >> 20) & 0x1F); // 位20-24
+    packet[6] = (uint8_t)((combined_bits >> 25) & 0x1F); // 位25-29
+    packet[7] = (uint8_t)((combined_bits >> 30) & 0x1F); // 位30-34
 
     // 使用新的DMA接口：写入TX缓冲区会自动处理DMA传输
-    uart_hal_->write_to_tx_buffer(_packet.data, 9);
+    uart_hal_->write_to_tx_buffer(packet, 9);
 }
 
 // 处理命令 - 使用DMA接收

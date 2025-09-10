@@ -88,17 +88,6 @@ public:
         RUNNING
     };
 
-    union touch_data_packet{
-        uint8_t data[9];
-        struct {
-            uint8_t start_byte = '(';
-            uint32_t state1 = 0;
-            uint8_t state2 = 0;
-            uint8_t end_byte = ')';
-        } parts;
-        touch_data_packet() {}
-    };
-
     using Mai2Serial_CommandCallback = void (*)(Mai2Serial_Command, const uint8_t*, uint8_t);
 
     Mai2Serial(HAL_UART* uart_hal);

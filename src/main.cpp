@@ -520,7 +520,6 @@ bool init_service_layer() {
 
     // 扫描I2C设备并初始化触摸设备
     AutoRegisterTouchSensor();
-    
     // 启用InputManager的debug模式以便定位CPU0锁死问题
     input_manager->set_debug_enabled(DEBUG_INPUTMANAGER_LOG);
     

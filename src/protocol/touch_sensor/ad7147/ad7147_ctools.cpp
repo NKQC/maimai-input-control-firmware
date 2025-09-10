@@ -25,6 +25,9 @@ void AD7147::CalibrationTools::Clear_and_prepare_stage_settings(uint8_t stage)
 
 void AD7147::CalibrationTools::Complete_and_restore_calibration()
 {
+    s1_inited_ = false;
+    inited_ = false;
+    calibration_state_ = IDLE;
     pthis->enabled_channels_mask_ = pthis->calirate_save_enabled_channels_mask_; // 校准时保存的启用的通道掩码
     pthis->applyEnabledChannelsToHardware();
 }
@@ -74,16 +77,14 @@ bool AD7147::CalibrationTools::Read_Triggle_Sample(uint8_t stage, uint32_t sampl
 
 void AD7147::CalibrationTools::CalibrationLoop(uint32_t sample)
 {
-    // 同步当前stage索引（供外部观察）
-    current_stage_index_ = stage_index_;
-
     // 首次进入复位硬件配置到校准所需
     if (!inited_)
     {
         inited_ = true;
+        has_jump_point = false;
+        stage_index_ = 0;
         Clear_and_prepare_stage_settings(stage_index_);
         s1_inited_ = false;
-        s2_inited_ = false;
     }
 
     switch (calibration_state_)
@@ -93,30 +94,46 @@ void AD7147::CalibrationTools::CalibrationLoop(uint32_t sample)
         return;
     }
 
-    case Stage1_baseline:
+    case PROCESS:
     {
         if (!s1_inited_)
         {
             s1_inited_ = true;
             s1_aef_ = CALIBRATION_STAGE1_SCAN_RANGEA;
             s1_best_aef_ = 0;
-            s1_best_ratio_ = 100;
+            s1_best_ratio_ = 2147483647;
+            has_jump_point = false;
             trig_res_.clear();
             // 写入起点AEF
             Set_AEF_Offset(stage_index_, s1_aef_);
             return; // 下次进入开始采样
         }
 
-        // 阶段1每个AEF点进行一轮采样（50次，见CALIBRATION_SAMPLE_COUNT），计算触发比例
+        // 阶段1每个AEF点进行一轮采样 计算触发比例
         if (!Read_Triggle_Sample(stage_index_, sample, trig_res_)) return; // 继续采样当前AEF点
 
         // 计算触发比例并更新最佳点
-        int8_t ratio = abs((trig_res_.triggle_num * 100) / trig_res_.sample_count / 100 - 50);  // ratio绝对值 我们期望是50% 只需要查看他的偏差
-        if (ratio < s1_best_ratio_)
+        uint32_t ratio = abs(((trig_res_.triggle_num * 1000) / trig_res_.sample_count) - 500);  // ratio绝对值 我们期望是50% 只需要查看他的偏差
+        if (ratio < s1_best_ratio_ && trig_res_.triggle_num)
         {
             s1_best_ratio_ = ratio;
             s1_best_aef_ = s1_aef_;
+            if (trig_res_.not_triggle_num) has_jump_point = true;  // 同时存在触发和未触发点位 此时存在跳变点
         }
+
+        // 跳变点的下一步就是找到无触发点 随后添加额外的保留偏移
+        if (has_jump_point && !trig_res_.triggle_num) {
+            // 扫描完成，应用阶段1最佳AEF
+            Set_AEF_Offset(stage_index_, s1_aef_ + CALIBRATION_AEF_SAVE_AREA);
+            stage_index_++;
+            s1_inited_ = false;
+            if (stage_index_ >= 12)
+            {
+                Complete_and_restore_calibration();
+            }
+            return;
+        }
+
         trig_res_.clear();
 
         // 推进到下一个AEF点
@@ -132,106 +149,20 @@ void AD7147::CalibrationTools::CalibrationLoop(uint32_t sample)
             s1_aef_--;
             #endif
             Set_AEF_Offset(stage_index_, s1_aef_);
-            stage_process = (s1_aef_ + 127) / 2;
+            stage_process = MIN((abs(s1_aef_) * 100 / abs(CALIBRATION_STAGE1_SCAN_RANGEA - CALIBRATION_STAGE1_SCAN_RANGEB)), 255);
             return;
         }
 
-        // 扫描完成，应用阶段1最佳AEF
-        Set_AEF_Offset(stage_index_, s1_best_aef_);
-
-        // 切换到阶段2
-        s2_inited_ = false;
-        calibration_state_ = Stage2_Offset_calibration;
-        return;
-    }
-
-    case Stage2_Offset_calibration:
-    {
-        if (!s2_inited_)
+        // 扫描结束 能到这里的必然是没找到跳变点 该通道视为异常
+        pthis->abnormal_channels_bitmap_ |= (1 << stage_index_);
+        stage_index_++;
+        s1_inited_ = false;
+        if (stage_index_ >= 12)
         {
-            s2_inited_ = true;
-            s2_base_aef_ = s1_best_aef_;
-            s2_cur_aef_ = s2_base_aef_;
-            measure_time_tag_ = us_to_ms(time_us_32()) + STAGE2_MEASURE_TIME_MS;
+            Complete_and_restore_calibration();
             return;
         }
 
-        // 每步采样
-        if (measure_time_tag_ > us_to_ms(time_us_32()))
-        {
-            Read_Triggle_Sample(stage_index_, sample, trig_res_);
-            triggle_sample_count_ += trig_res_.triggle_num;
-            trig_res_.clear();
-            return;
-        }
-
-        // 完成N次采样，评估结果
-        if (!triggle_sample_count_)
-        {
-            // 当前stage达成目标，进入下一个stage
-            stage_index_++;
-            if (stage_index_ >= 12)
-            {
-                current_stage_index_ = 12;
-                calibration_state_ = IDLE;
-                inited_ = false; // 为下次校准流程复位
-                return;
-            }
-            else
-            {
-                {
-                    s2_cur_aef_ += CALIBRATION_AEF_SAVE_AREA;
-                    Set_AEF_Offset(stage_index_, s2_cur_aef_);
-                }
-                current_stage_index_ = stage_index_;
-                calibration_state_ = Stage1_baseline;
-                s1_inited_ = false;
-                s2_inited_ = false;
-                return;
-            }
-        }
-
-        // 按当前方向单步调整
-        #if CALIBRATION_STAGE1_SCAN_RANGEB - CALIBRATION_STAGE1_SCAN_RANGEA > 0
-        s2_cur_aef_++;
-        #else
-        s2_cur_aef_--;
-        #endif
-
-        // 限制最大调整范围
-        #if CALIBRATION_STAGE1_SCAN_RANGEB - CALIBRATION_STAGE1_SCAN_RANGEA > 0
-        if (s2_cur_aef_ > s2_base_aef_ + 32)
-        #else
-        if (s2_cur_aef_ < s2_base_aef_ - 32)
-        #endif
-        {
-            // 超出范围，放弃当前stage，进入下一stage
-            stage_index_++;
-            if (stage_index_ >= 12)
-            {
-                current_stage_index_ = 12;
-                Complete_and_restore_calibration();
-                calibration_state_ = IDLE;
-                inited_ = false;
-                pthis->abnormal_channels_bitmap_ |= (1 << (stage_index_ - 1));
-                return;
-            }
-            else
-            {
-                current_stage_index_ = stage_index_;
-                calibration_state_ = Stage1_baseline;
-                s1_inited_ = false;
-                s2_inited_ = false;
-                return;
-            }
-        }
-
-        // 应用新的AEF并开始下一轮5次采样
-        Set_AEF_Offset(stage_index_, s2_cur_aef_);
-        stage_process = stage_process > 252 ? 252 : stage_process + 1;
-        measure_time_tag_ = 0;
-        triggle_sample_count_ = 0;
-        measure_time_tag_ = us_to_ms(time_us_32()) + STAGE2_MEASURE_TIME_MS;
         return;
     }
     }

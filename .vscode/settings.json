@@ -89,7 +89,8 @@
         "watchdog.h": "c",
         "bootrom.h": "c",
         "stdio_uart.h": "c",
-        "global_irq.h": "c"
+        "global_irq.h": "c",
+        "*.clang-format-ignore": "cpp"
     },
     "java.project.explorer.showNonJavaResources": true,
     "java.dependency.syncWithFolderExplorer": false

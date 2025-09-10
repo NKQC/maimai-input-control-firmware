@@ -140,63 +140,62 @@ protected:
     uint32_t supported_channel_count_; // 支持的通道数量
     
     /**
-     * 配置管理器结构体 - 提供通用的配置存储和转换功能
-     * 使用字符串存储，支持多种数据类型的重载读写函数
+     * 配置保存器结构体 - 优化的顺序存储版本
+     * 使用顺序存储，大幅减少存储开销，无键名存储
      */
-    struct ConfigManager {
+    struct SaveConfig {
         std::string config_data;
+        mutable size_t read_pos = 0;  // 读取位置指针
         
-        // Write functions for different types
-        void setConfig(const std::string& key, int32_t value) {
-            setConfigInternal(key, std::to_string(value));
+        // 顺序写入函数 - 按调用顺序写入值
+        void writeValue(uint32_t value) {
+            if (!config_data.empty()) config_data += ",";
+            config_data += std::to_string(value);
         }
         
-        void setConfig(const std::string& key, uint32_t value) {
-            setConfigInternal(key, std::to_string(value));
+        void writeValue(int32_t value) {
+            if (!config_data.empty()) config_data += ",";
+            config_data += std::to_string(value);
         }
         
-        void setConfig(const std::string& key, int16_t value) {
-            setConfigInternal(key, std::to_string(value));
+        void writeValue(uint16_t value) {
+            if (!config_data.empty()) config_data += ",";
+            config_data += std::to_string(value);
         }
         
-        void setConfig(const std::string& key, uint16_t value) {
-            setConfigInternal(key, std::to_string(value));
+        void writeValue(int16_t value) {
+            if (!config_data.empty()) config_data += ",";
+            config_data += std::to_string(value);
         }
         
-        void setConfig(const std::string& key, int8_t value) {
-            setConfigInternal(key, std::to_string(static_cast<int>(value)));
+        void writeValue(uint8_t value) {
+            if (!config_data.empty()) config_data += ",";
+            config_data += std::to_string(static_cast<unsigned int>(value));
         }
         
-        void setConfig(const std::string& key, uint8_t value) {
-            setConfigInternal(key, std::to_string(static_cast<unsigned int>(value)));
+        void writeValue(int8_t value) {
+            if (!config_data.empty()) config_data += ",";
+            config_data += std::to_string(static_cast<int>(value));
         }
         
-        void setConfig(const std::string& key, float value) {
-            setConfigInternal(key, std::to_string(value));
+        void writeValue(float value) {
+            if (!config_data.empty()) config_data += ",";
+            config_data += std::to_string(value);
         }
         
-        void setConfig(const std::string& key, bool value) {
-             setConfigInternal(key, value ? "1" : "0");
-         }
-        
-        void setConfig(const std::string& key, const std::string& value) {
-            setConfigInternal(key, value);
+        void writeValue(bool value) {
+            if (!config_data.empty()) config_data += ",";
+            config_data += (value ? "1" : "0");
         }
         
-        // Read functions for different types
-        int32_t getConfig(const std::string& key, int32_t default_value) const {
-            std::string value = getConfigInternal(key);
-            if (value.empty()) return default_value;
-            char* end;
-            long result = std::strtol(value.c_str(), &end, 10);
-            if (end == value.c_str() || *end != '\0') {
-                return default_value;
-            }
-            return static_cast<int32_t>(result);
+        void writeValue(const std::string& value) {
+            if (!config_data.empty()) config_data += ",";
+            config_data += value;
         }
         
-        uint32_t getConfig(const std::string& key, uint32_t default_value) const {
-            std::string value = getConfigInternal(key);
+        // 顺序读取函数 - 按调用顺序读取值
+        uint32_t readValue(uint32_t default_value) const {
+            std::string value = getNextValue();
             if (value.empty()) return default_value;
             char* end;
             unsigned long result = std::strtoul(value.c_str(), &end, 10);
@@ -206,19 +205,19 @@ protected:
             return static_cast<uint32_t>(result);
         }
         
-        int16_t getConfig(const std::string& key, int16_t default_value) const {
-            std::string value = getConfigInternal(key);
+        int32_t readValue(int32_t default_value) const {
+            std::string value = getNextValue();
             if (value.empty()) return default_value;
             char* end;
             long result = std::strtol(value.c_str(), &end, 10);
             if (end == value.c_str() || *end != '\0') {
                 return default_value;
             }
-            return static_cast<int16_t>(result);
+            return static_cast<int32_t>(result);
         }
         
-        uint16_t getConfig(const std::string& key, uint16_t default_value) const {
-            std::string value = getConfigInternal(key);
+        uint16_t readValue(uint16_t default_value) const {
+            std::string value = getNextValue();
             if (value.empty()) return default_value;
             char* end;
             unsigned long result = std::strtoul(value.c_str(), &end, 10);
@@ -228,19 +227,19 @@ protected:
             return static_cast<uint16_t>(result);
         }
         
-        int8_t getConfig(const std::string& key, int8_t default_value) const {
-            std::string value = getConfigInternal(key);
+        int16_t readValue(int16_t default_value) const {
+            std::string value = getNextValue();
             if (value.empty()) return default_value;
             char* end;
             long result = std::strtol(value.c_str(), &end, 10);
             if (end == value.c_str() || *end != '\0') {
                 return default_value;
             }
-            return static_cast<int8_t>(result);
+            return static_cast<int16_t>(result);
         }
         
-        uint8_t getConfig(const std::string& key, uint8_t default_value) const {
-            std::string value = getConfigInternal(key);
+        uint8_t readValue(uint8_t default_value) const {
+            std::string value = getNextValue();
             if (value.empty()) return default_value;
             char* end;
             unsigned long result = std::strtoul(value.c_str(), &end, 10);
@@ -250,8 +249,19 @@ protected:
             return static_cast<uint8_t>(result);
         }
         
-        float getConfig(const std::string& key, float default_value) const {
-            std::string value = getConfigInternal(key);
+        int8_t readValue(int8_t default_value) const {
+            std::string value = getNextValue();
+            if (value.empty()) return default_value;
+            char* end;
+            long result = std::strtol(value.c_str(), &end, 10);
+            if (end == value.c_str() || *end != '\0') {
+                return default_value;
+            }
+            return static_cast<int8_t>(result);
+        }
+        
+        float readValue(float default_value) const {
+            std::string value = getNextValue();
             if (value.empty()) return default_value;
             char* end;
             float result = std::strtof(value.c_str(), &end);
@@ -261,14 +271,14 @@ protected:
             return result;
         }
         
-        bool getConfig(const std::string& key, bool default_value) const {
-             std::string value = getConfigInternal(key);
-             if (value.empty()) return default_value;
-             return (value == "1" || value == "true");
-         }
+        bool readValue(bool default_value) const {
+            std::string value = getNextValue();
+            if (value.empty()) return default_value;
+            return (value == "1" || value == "true");
+        }
         
-        std::string getConfig(const std::string& key, const std::string& default_value) const {
-            std::string value = getConfigInternal(key);
+        std::string readValue(const std::string& default_value) const {
+            std::string value = getNextValue();
             return value.empty() ? default_value : value;
         }
         
@@ -280,54 +290,40 @@ protected:
         // 从字符串反序列化
         bool fromString(const std::string& data) {
             config_data = data;
+            read_pos = 0;  // 重置读取位置
             return true;
         }
         
         // 清空配置
         void clear() {
             config_data.clear();
+            read_pos = 0;
         }
         
-        // 检查是否包含指定配置
-        bool hasConfig(const std::string& key) const {
-            return !getConfigInternal(key).empty();
+        // 重置读取位置
+        void resetReadPosition() const {
+            read_pos = 0;
         }
         
     private:
-        void setConfigInternal(const std::string& key, const std::string& value) {
-            // Remove existing key if present
-            std::string search_key = key + "=";
-            size_t start_pos = config_data.find(search_key);
-            if (start_pos != std::string::npos) {
-                size_t end_pos = config_data.find('\n', start_pos);
-                if (end_pos != std::string::npos) {
-                    config_data.erase(start_pos, end_pos - start_pos + 1);
-                } else {
-                    config_data.erase(start_pos);
-                }
-            }
-            
-            // Add new key-value pair
-            if (!config_data.empty() && config_data.back() != '\n') {
-                config_data += "\n";
-            }
-            config_data += key + "=" + value + "\n";
-        }
-        
-        std::string getConfigInternal(const std::string& key) const {
-            std::string search_key = key + "=";
-            size_t start_pos = config_data.find(search_key);
-            if (start_pos == std::string::npos) {
+        // 获取下一个值
+        std::string getNextValue() const {
+            if (read_pos >= config_data.length()) {
                 return "";
             }
             
-            start_pos += search_key.length();
-            size_t end_pos = config_data.find('\n', start_pos);
-            if (end_pos == std::string::npos) {
-                return config_data.substr(start_pos);
+            size_t comma_pos = config_data.find(',', read_pos);
+            std::string value;
+            
+            if (comma_pos != std::string::npos) {
+                value = config_data.substr(read_pos, comma_pos - read_pos);
+                read_pos = comma_pos + 1;
+            } else {
+                value = config_data.substr(read_pos);
+                read_pos = config_data.length();
             }
             
-            return config_data.substr(start_pos, end_pos - start_pos);
+            return value;
         }
     };
 

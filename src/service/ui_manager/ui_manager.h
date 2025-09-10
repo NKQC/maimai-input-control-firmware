@@ -136,7 +136,7 @@ void uimanager_register_default_configs(config_map_t& default_map);  // 注册�
 UIManager_PrivateConfig* ui_manager_get_config_holder();  // 配置保管函数
 bool ui_manager_load_config_from_manager(ConfigManager* config_manager);  // 配置加载函数
 UIManager_PrivateConfig ui_manager_get_config_copy();  // 配置读取函数
-bool ui_manager_write_config_to_manager(ConfigManager* config_manager, const UIManager_PrivateConfig& config);  // 配置写入函数
+bool ui_manager_write_config_to_manager(const UIManager_PrivateConfig& config);  // 配置写入函数
 
 // UIManager类
 class UIManager {

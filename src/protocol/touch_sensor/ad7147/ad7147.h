@@ -60,7 +60,7 @@
 #define AD7147_STAGE_OFFSET_LOW_CLAMP_OFFSET 7  // 低偏移钳位寄存器偏移
 
 // 灵敏度寄存器默认值
-#define AD7147_SENSITIVITY_DEFAULT 0x3A3A // 默认灵敏度值
+#define AD7147_SENSITIVITY_DEFAULT 0x4A4A // 默认灵敏度值
 #define AD7147_DEFAULT_AFE_OFFSET 0x0000  // AFE偏移默认值
 
 // 阶段配置相关常量
@@ -85,9 +85,8 @@
 
 #define CALIBRATION_STAGE1_SCAN_RANGEA 0  //A -> B
 #define CALIBRATION_STAGE1_SCAN_RANGEB -127
-#define CALIBRATION_SAMPLE_COUNT 200 // 自动校准单轮采样次数
-#define STAGE2_MEASURE_TIME_MS 2000  // 确认采样时间 次数越大偏移数值越保守 稳定性越好
-#define CALIBRATION_AEF_SAVE_AREA -3  // AEF完成时额外偏置保留区域 预留缓冲空间防止意外触发
+#define CALIBRATION_SAMPLE_COUNT 300 // 自动校准单轮采样次数
+#define CALIBRATION_AEF_SAVE_AREA -5  // AEF完成时额外偏置保留区域 预留缓冲空间防止意外触发
 
 // 设备信息结构体
 struct AD7147_DeviceInfo
@@ -373,6 +372,7 @@ private:
     // 状态相关成员变量
     bool initialized_;
     I2C_Bus i2c_bus_enum_;           // I2C总线枚举
+    uint8_t enabled_stage;
     uint32_t enabled_channels_mask_; // 启用的通道掩码
     uint32_t calirate_save_enabled_channels_mask_; // 校准时保存的启用的通道掩码
 
@@ -388,6 +388,13 @@ private:
     // sample()函数的实例级变量（原来的静态变量）
     TouchSampleResult sample_result_; // 采样结果
     uint16_t status_regs_;            // 状态寄存器值
+    
+    // sample()函数中的映射重建临时变量（优化热点函数性能）
+    uint32_t reconstructed_mask_;     // 重建的通道掩码
+    uint16_t stage_status_;           // 反转后的stage状态
+    uint8_t stage_index_;             // stage索引计数器
+    uint32_t temp_mask_;              // 临时掩码用于位运算
+    uint8_t channel_pos_;             // 通道位置
 
     // 异步配置相关
     struct PendingPortConfig
@@ -427,8 +434,7 @@ private:
         enum CalibrationState
         {
             IDLE, // 初始化/完成时设置回IDLE
-            Stage1_baseline,
-            Stage2_Offset_calibration
+            PROCESS,
         };
 
         enum Direction
@@ -473,31 +479,22 @@ private:
 
         uint8_t stage_process = 0;
 
-        // 当前正在校准的stage索引 [0..11]；当全部完成后置为12
-        uint8_t current_stage_index_ = 0;
-
         bool inited_ = false;
         uint8_t stage_index_ = 0; // 当前校准的stage [0..11]
         
         // 阶段1：扫频寻找震荡点（触发与非触发最接近50%）
         bool s1_inited_ = false;
-        int16_t s1_aef_ = -127;       // 当前扫描AEF -127..127
+        int16_t s1_aef_ = CALIBRATION_STAGE1_SCAN_RANGEA;       // 当前扫描AEF -127..127
         int16_t s1_best_aef_ = 0;     // 阶段1找到的最佳AEF
-        int8_t s1_best_ratio_ = 100;  // 阶段1最佳触发比例
+        uint32_t s1_best_ratio_ = 2147483647;  // 阶段1最佳触发比例
+        bool has_jump_point = false;
         TriggleSample trig_res_;      // 阶段1采样累积
-        
-        // 阶段2：从阶段1最佳点出发，单步调整AEF使触发占比降至0%
-        bool s2_inited_ = false;
-        int16_t s2_base_aef_ = 0;
-        int16_t s2_cur_aef_ = 0;
-        uint32_t triggle_sample_count_ = 0; // 触发采样次数
-        uint32_t measure_time_tag_ = 0;
 
         bool start_calibration()
         {
             if (calibration_state_ != IDLE)
                 return false;
-            calibration_state_ = Stage1_baseline;
+            calibration_state_ = PROCESS;
             return true;
         }
 

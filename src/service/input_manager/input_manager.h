@@ -335,6 +335,7 @@ public:
     void setSerialAreaSensitivity(Mai2_TouchArea area, uint8_t sensitivity);
     void setHIDAreaSensitivity(uint8_t hid_area_index, uint8_t sensitivity);
     void setKeyboardSensitivity(HID_KeyCode key, uint8_t sensitivity);
+    // 设置映射 TODO: TouchHID暂未实现UI
     void setHIDMapping(uint8_t device_id_mask, uint8_t channel, float x, float y);
     void setTouchKeyboardMapping(uint8_t device_id_mask, uint8_t channel, HID_KeyCode key);
     Mai2_TouchArea getSerialMapping(uint8_t device_id_mask, uint8_t channel);
@@ -533,7 +534,7 @@ private:
     
     // 触摸响应延迟管理私有方法
     inline void storeDelayedSerialState();                     // 存储当前Serial状态到延迟缓冲区
-    bool getDelayedSerialState(Mai2Serial_TouchState& delayed_state); // 获取延迟后的Serial状态
+
     inline void processSerialModeWithDelay();          // 带延迟的Serial模式处理
     
     // 通道mask辅助函数
@@ -596,7 +597,6 @@ private:
     // 绑定处理函数
     void processBinding();
     void processSerialBinding();
-    void processAutoSerialBinding();
     void backupChannelStates();
     void restoreChannelStates();
     const char* getMai2AreaName(Mai2_TouchArea area);

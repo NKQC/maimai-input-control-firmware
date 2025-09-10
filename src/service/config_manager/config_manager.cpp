@@ -1249,12 +1249,23 @@ void ConfigManager::save_config() {
     _save_requested = true;
 }
 
+
 // 保存配置到文件（task版本，检查信号）
 bool ConfigManager::save_config_task() {
     if (!_save_requested) {
         return true;  // 没有保存请求，直接返回成功
     }
     
+    // 调用各服务的配置写入函数
+    InputManager_PrivateConfig input_config = inputmanager_get_config_copy();
+    inputmanager_write_config_to_manager(input_config);
+    
+    UIManager_PrivateConfig ui_config = ui_manager_get_config_copy();
+    ui_manager_write_config_to_manager(ui_config);
+    
+    LightManager_PrivateConfig light_config = lightmanager_get_config_copy();
+    lightmanager_write_config_to_manager(light_config);
+        
     _save_requested = false;  // 清除保存请求信号
     
     log_debug("Starting config save process...");

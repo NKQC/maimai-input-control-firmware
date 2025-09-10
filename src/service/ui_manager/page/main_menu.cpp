@@ -61,16 +61,6 @@ void MainMenu::save_config() {
     // 获取各服务的当前配置并写入到ConfigManager
     ConfigManager* config_mgr = ConfigManager::getInstance();
     if (config_mgr) {
-        // 调用各服务的配置写入函数
-        InputManager_PrivateConfig input_config = inputmanager_get_config_copy();
-        inputmanager_write_config_to_manager(input_config);
-        
-        UIManager_PrivateConfig ui_config = ui_manager_get_config_copy();
-        ui_manager_write_config_to_manager(config_mgr, ui_config);
-        
-        LightManager_PrivateConfig light_config = lightmanager_get_config_copy();
-        lightmanager_write_config_to_manager(light_config);
-        
         // 统一保存所有配置到存储
         ConfigManager::save_config();
     }

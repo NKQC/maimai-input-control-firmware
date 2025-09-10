@@ -9,9 +9,10 @@
 AD7147::AD7147(HAL_I2C* i2c_hal, I2C_Bus i2c_bus, uint8_t device_addr)
     : TouchSensor(AD7147_MAX_CHANNELS), i2c_hal_(i2c_hal), i2c_bus_(i2c_bus),
       device_addr_(device_addr), i2c_device_address_(device_addr),
-      initialized_(false), i2c_bus_enum_(i2c_bus), enabled_channels_mask_(0),
+      initialized_(false), i2c_bus_enum_(i2c_bus), enabled_stage(MIN(AD7147_MAX_CHANNELS, 12)), enabled_channels_mask_(0),
       cdc_read_request_(false), cdc_read_stage_(0), cdc_read_value_(0),
       sample_result_{.touch_mask = uint32_t(0)}, status_regs_(0),
+      reconstructed_mask_(0), stage_status_(0), stage_index_(0), temp_mask_(0), channel_pos_(0),
       pending_config_count_(0), abnormal_channels_bitmap_(0) {
     module_name = "AD7147";
     module_mask_ = TouchSensor::generateModuleMask(static_cast<uint8_t>(i2c_bus), device_addr);
@@ -66,23 +67,21 @@ bool AD7147::loadConfig(const std::string& config_data) {
         return false;
     }
     
-    ConfigManager config_manager;
+    SaveConfig config_manager;
     if (!config_manager.fromString(config_data)) {
         return false;
     }
     
-    // 从配置中加载stage设置
+    // 按固定顺序从配置中加载stage设置
     for (int32_t stage = 0; stage < 12; stage++) {
-        std::string stage_prefix = "stage" + std::to_string(stage) + "_";
-        
-        stage_settings_.stages[stage].connection_6_0 = config_manager.getConfig(stage_prefix + "connection_6_0", stage_settings_.stages[stage].connection_6_0);
-        stage_settings_.stages[stage].connection_12_7 = config_manager.getConfig(stage_prefix + "connection_12_7", stage_settings_.stages[stage].connection_12_7);
-        stage_settings_.stages[stage].afe_offset = AFEOffsetRegister(config_manager.getConfig(stage_prefix + "afe_offset", static_cast<uint32_t>(stage_settings_.stages[stage].afe_offset.raw)));
-        stage_settings_.stages[stage].sensitivity = SensitivityRegister(config_manager.getConfig(stage_prefix + "sensitivity", static_cast<uint32_t>(stage_settings_.stages[stage].sensitivity.raw)));
-        stage_settings_.stages[stage].offset_low = config_manager.getConfig(stage_prefix + "offset_low", stage_settings_.stages[stage].offset_low);
-        stage_settings_.stages[stage].offset_high = config_manager.getConfig(stage_prefix + "offset_high", stage_settings_.stages[stage].offset_high);
-        stage_settings_.stages[stage].offset_high_clamp = config_manager.getConfig(stage_prefix + "offset_high_clamp", stage_settings_.stages[stage].offset_high_clamp);
-        stage_settings_.stages[stage].offset_low_clamp = config_manager.getConfig(stage_prefix + "offset_low_clamp", stage_settings_.stages[stage].offset_low_clamp);
+        stage_settings_.stages[stage].connection_6_0 = config_manager.readValue(stage_settings_.stages[stage].connection_6_0);
+        stage_settings_.stages[stage].connection_12_7 = config_manager.readValue(stage_settings_.stages[stage].connection_12_7);
+        stage_settings_.stages[stage].afe_offset = AFEOffsetRegister(config_manager.readValue(static_cast<uint32_t>(stage_settings_.stages[stage].afe_offset.raw)));
+        stage_settings_.stages[stage].sensitivity = SensitivityRegister(config_manager.readValue(static_cast<uint32_t>(stage_settings_.stages[stage].sensitivity.raw)));
+        stage_settings_.stages[stage].offset_low = config_manager.readValue(stage_settings_.stages[stage].offset_low);
+        stage_settings_.stages[stage].offset_high = config_manager.readValue(stage_settings_.stages[stage].offset_high);
+        stage_settings_.stages[stage].offset_high_clamp = config_manager.readValue(stage_settings_.stages[stage].offset_high_clamp);
+        stage_settings_.stages[stage].offset_low_clamp = config_manager.readValue(stage_settings_.stages[stage].offset_low_clamp);
     }
     
     // 应用配置到硬件
@@ -90,20 +89,18 @@ bool AD7147::loadConfig(const std::string& config_data) {
 }
 
 std::string AD7147::saveConfig() const {
-    ConfigManager config_manager;
+    SaveConfig config_manager;
     
-    // 保存stage设置到配置
+    // 按固定顺序保存stage设置到配置
     for (int32_t stage = 0; stage < 12; stage++) {
-        std::string stage_prefix = "stage" + std::to_string(stage) + "_";
-        
-        config_manager.setConfig(stage_prefix + "connection_6_0", static_cast<uint32_t>(stage_settings_.stages[stage].connection_6_0));
-        config_manager.setConfig(stage_prefix + "connection_12_7", static_cast<uint32_t>(stage_settings_.stages[stage].connection_12_7));
-        config_manager.setConfig(stage_prefix + "afe_offset", static_cast<uint32_t>(stage_settings_.stages[stage].afe_offset.raw));
-        config_manager.setConfig(stage_prefix + "sensitivity", static_cast<uint32_t>(stage_settings_.stages[stage].sensitivity.raw));
-        config_manager.setConfig(stage_prefix + "offset_low", static_cast<uint32_t>(stage_settings_.stages[stage].offset_low));
-        config_manager.setConfig(stage_prefix + "offset_high", static_cast<uint32_t>(stage_settings_.stages[stage].offset_high));
-        config_manager.setConfig(stage_prefix + "offset_high_clamp", static_cast<uint32_t>(stage_settings_.stages[stage].offset_high_clamp));
-        config_manager.setConfig(stage_prefix + "offset_low_clamp", static_cast<uint32_t>(stage_settings_.stages[stage].offset_low_clamp));
+        config_manager.writeValue(static_cast<uint32_t>(stage_settings_.stages[stage].connection_6_0));
+        config_manager.writeValue(static_cast<uint32_t>(stage_settings_.stages[stage].connection_12_7));
+        config_manager.writeValue(static_cast<uint32_t>(stage_settings_.stages[stage].afe_offset.raw));
+        config_manager.writeValue(static_cast<uint32_t>(stage_settings_.stages[stage].sensitivity.raw));
+        config_manager.writeValue(static_cast<uint32_t>(stage_settings_.stages[stage].offset_low));
+        config_manager.writeValue(static_cast<uint32_t>(stage_settings_.stages[stage].offset_high));
+        config_manager.writeValue(static_cast<uint32_t>(stage_settings_.stages[stage].offset_high_clamp));
+        config_manager.writeValue(static_cast<uint32_t>(stage_settings_.stages[stage].offset_low_clamp));
     }
     
     return config_manager.toString();
@@ -114,18 +111,29 @@ bool AD7147::setCustomSensitivitySettings(const std::string& settings_data) {
         return false;
     }
     
-    ConfigManager config_manager;
+    SaveConfig config_manager;
     if (!config_manager.fromString(settings_data)) {
         return false;
     }
     
-    // 更新stage设置中的灵敏度配置
+    // 按固定顺序解析配置并应用到stage设置
     for (int32_t stage = 0; stage < 12; stage++) {
-        std::string stage_key = "stage" + std::to_string(stage) + "_sensitivity";
-        if (config_manager.hasConfig(stage_key)) {
-            uint32_t sensitivity_value = config_manager.getConfig(stage_key, static_cast<uint32_t>(stage_settings_.stages[stage].sensitivity.raw));
-            stage_settings_.stages[stage].sensitivity = SensitivityRegister(static_cast<uint16_t>(sensitivity_value));
-        }
+        // 跳过连接设置，只读取敏感度相关的设置
+        config_manager.readValue(stage_settings_.stages[stage].connection_6_0); // 跳过
+        config_manager.readValue(stage_settings_.stages[stage].connection_12_7); // 跳过
+        
+        // 读取并应用敏感度相关设置
+        uint32_t afe_offset_raw = config_manager.readValue(static_cast<uint32_t>(stage_settings_.stages[stage].afe_offset.raw));
+        stage_settings_.stages[stage].afe_offset = AFEOffsetRegister(afe_offset_raw);
+        
+        uint32_t sensitivity_raw = config_manager.readValue(static_cast<uint32_t>(stage_settings_.stages[stage].sensitivity.raw));
+        stage_settings_.stages[stage].sensitivity = SensitivityRegister(sensitivity_raw);
+        
+        // 跳过其他设置
+        config_manager.readValue(stage_settings_.stages[stage].offset_low); // 跳过
+        config_manager.readValue(stage_settings_.stages[stage].offset_high); // 跳过
+        config_manager.readValue(stage_settings_.stages[stage].offset_high_clamp); // 跳过
+        config_manager.readValue(stage_settings_.stages[stage].offset_low_clamp); // 跳过
     }
     
     // 应用更新后的设置到硬件
@@ -246,12 +254,37 @@ TouchSampleResult AD7147::sample() {
         uint16_t cdc_reg_addr = AD7147_REG_CDC_DATA + cdc_read_stage_;
         if (read_register(cdc_reg_addr, cdc_read_value_)) cdc_read_request_ = false;
     }
+    i2c_hal_->read_register(device_addr_, (AD7147_REG_STAGE_HIGH_INT_STATUS | 0x8000), (uint8_t*)&status_regs_, 2);
+    __asm__ volatile (
+            "rev16 %0, %0\n"
+            : "+r" (status_regs_)
+            :: "cc"
+    );
     
-    read_register(AD7147_REG_STAGE_HIGH_INT_STATUS, status_regs_);
+    // 重建通道映射：将stage反馈映射回正确的通道位置
+    reconstructed_mask_ = 0;
+    stage_status_ = ~status_regs_; // 反转状态位（触摸时为1）
     
-    // 合并触摸状态并限制在24位范围内
-    sample_result_.channel_mask = ~status_regs_;
-
+    stage_index_ = 0;
+    temp_mask_ = enabled_channels_mask_;
+    
+    // 使用位运算快速找到每个启用通道的位置并映射stage状态
+    while (temp_mask_ && stage_index_ < enabled_stage) {
+        // 找到下一个启用通道的位置（从低位开始）
+        channel_pos_ = __builtin_ctz(temp_mask_); // 计算尾随零的个数
+        
+        // 如果当前stage有触摸状态，设置对应通道位
+        if (stage_status_ & (1U << stage_index_)) {
+            reconstructed_mask_ |= (1UL << channel_pos_);
+        }
+        
+        // 清除已处理的通道位，继续下一个
+        temp_mask_ &= temp_mask_ - 1; // 清除最低位的1
+        stage_index_++;
+    }
+    
+    sample_result_.channel_mask = reconstructed_mask_;
+    
     // 留给校准模块
     if (calibration_tools_.calibration_state_)
         calibration_tools_.CalibrationLoop(sample_result_.channel_mask);
@@ -269,6 +302,13 @@ bool AD7147::setChannelEnabled(uint8_t channel, bool enabled) {
         enabled_channels_mask_ |= (1UL << channel);
     } else {
         enabled_channels_mask_ &= ~(1UL << channel);
+    }
+    // 更新启用的阶段数量
+    enabled_stage = 0;
+    for (uint8_t stage = 0; stage < AD7147_MAX_CHANNELS; stage++) {
+        if (enabled_channels_mask_ & (1UL << stage)) {
+            enabled_stage++;
+        }
     }
 
     // 将开关通道设置实时下发到芯片，关闭未用阶段以提升扫描/采样速率
@@ -316,9 +356,7 @@ bool AD7147::applyEnabledChannelsToHardware() {
             enabled_count++;
         }
     }
-    
-    
-    
+
     bool ok = true;
     uint8_t config_buffer[16];
     
@@ -503,7 +541,7 @@ bool AD7147::startAutoOffsetCalibration() {
     if (!initialized_) return false;
     calibration_tools_.pthis = this;
     // 启动内部校准工具
-    calibration_tools_.calibration_state_ = AD7147::CalibrationTools::Stage1_baseline;
+    calibration_tools_.calibration_state_ = AD7147::CalibrationTools::PROCESS;
     return true;
 }
 
@@ -518,21 +556,19 @@ uint8_t AD7147::getAutoOffsetCalibrationProgress() const {
 
 
 uint8_t AD7147::getAutoOffsetCalibrationTotalProgress() const {
-    const uint8_t total_stages = 12;
-
     // 未运行且未完成
     if (calibration_tools_.calibration_state_ == AD7147::CalibrationTools::IDLE) {
-        return (calibration_tools_.current_stage_index_ >= total_stages) ? 255 : 0;
+        return (calibration_tools_.stage_index_ >= AD7147_MAX_CHANNELS) ? 255 : 0;
     }
 
     // 已完成的stage数量=当前正在处理的stage索引
-    uint8_t completed = calibration_tools_.current_stage_index_;
+    uint8_t completed = calibration_tools_.stage_index_;
     // 当前stage内进度，沿用阶段映射（20/60/80/95）
     uint8_t stage_phase_progress = getAutoOffsetCalibrationProgress();
 
     // 总进度 = (已完成stage数*100 + 当前stage内进度) / 总stage数
     uint16_t accum = static_cast<uint16_t>(completed) * 255u + static_cast<uint16_t>(stage_phase_progress);
-    uint8_t total = static_cast<uint8_t>(accum / total_stages);
+    uint8_t total = static_cast<uint8_t>(accum / AD7147_MAX_CHANNELS);
     return total;
 }
 

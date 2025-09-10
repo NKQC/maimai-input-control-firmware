@@ -66,13 +66,13 @@ bool ui_manager_load_config_from_manager(ConfigManager* config_manager) {
     UIManager::log_debug_static("Loading configuration from ConfigManager...");
     
     // 从ConfigManager加载各项配置
-    static_config_.refresh_rate_ms = config_manager->get_uint16("UIMANAGER_REFRESH_RATE");
-    static_config_.brightness = config_manager->get_uint8("UIMANAGER_BRIGHTNESS");
-    static_config_.enable_backlight = config_manager->get_bool("UIMANAGER_ENABLE_BACKLIGHT");
-    static_config_.backlight_timeout = config_manager->get_uint16("UIMANAGER_BACKLIGHT_TIMEOUT");
-    static_config_.screen_timeout = config_manager->get_uint16("UIMANAGER_SCREEN_TIMEOUT");
-    static_config_.enable_joystick = config_manager->get_bool("UIMANAGER_ENABLE_JOYSTICK");
-    static_config_.joystick_sensitivity = config_manager->get_uint8("UIMANAGER_JOYSTICK_SENSITIVITY");
+    static_config_.refresh_rate_ms = config_manager->get_uint16(UIMANAGER_REFRESH_RATE);
+    static_config_.brightness = config_manager->get_uint8(UIMANAGER_BRIGHTNESS);
+    static_config_.enable_backlight = config_manager->get_bool(UIMANAGER_ENABLE_BACKLIGHT);
+    static_config_.backlight_timeout = config_manager->get_uint16(UIMANAGER_BACKLIGHT_TIMEOUT);
+    static_config_.screen_timeout = config_manager->get_uint16(UIMANAGER_SCREEN_TIMEOUT);
+    static_config_.enable_joystick = config_manager->get_bool(UIMANAGER_ENABLE_JOYSTICK);
+    static_config_.joystick_sensitivity = config_manager->get_uint8(UIMANAGER_JOYSTICK_SENSITIVITY);
     
     UIManager::log_debug_static("Loaded brightness: " + std::to_string(static_config_.brightness));
     UIManager::log_debug_static("Loaded refresh_rate_ms: " + std::to_string(static_config_.refresh_rate_ms));
@@ -114,22 +114,20 @@ UIManager_PrivateConfig ui_manager_get_config_copy() {
 }
 
 // 配置写入函数 - 将配置写入ConfigManager并保存
-bool ui_manager_write_config_to_manager(ConfigManager* config_manager, const UIManager_PrivateConfig& config) {
-    if (config_manager == nullptr) {
-        return false;
-    }
+bool ui_manager_write_config_to_manager(const UIManager_PrivateConfig& config) {
     
+    ConfigManager* config_manager = ConfigManager::getInstance();
     // 更新静态配置
     static_config_ = config;
     
     // 将配置写入ConfigManager
-    config_manager->set_uint16("UIMANAGER_REFRESH_RATE", config.refresh_rate_ms);
-    config_manager->set_uint8("UIMANAGER_BRIGHTNESS", config.brightness);
-    config_manager->set_bool("UIMANAGER_ENABLE_BACKLIGHT", config.enable_backlight);
-    config_manager->set_uint16("UIMANAGER_BACKLIGHT_TIMEOUT", config.backlight_timeout);
-    config_manager->set_uint16("UIMANAGER_SCREEN_TIMEOUT", config.screen_timeout);
-    config_manager->set_bool("UIMANAGER_ENABLE_JOYSTICK", config.enable_joystick);
-    config_manager->set_uint8("UIMANAGER_JOYSTICK_SENSITIVITY", config.joystick_sensitivity);
+    config_manager->set_uint16(UIMANAGER_REFRESH_RATE, config.refresh_rate_ms);
+    config_manager->set_uint8(UIMANAGER_BRIGHTNESS, config.brightness);
+    config_manager->set_bool(UIMANAGER_ENABLE_BACKLIGHT, config.enable_backlight);
+    config_manager->set_uint16(UIMANAGER_BACKLIGHT_TIMEOUT, config.backlight_timeout);
+    config_manager->set_uint16(UIMANAGER_SCREEN_TIMEOUT, config.screen_timeout);
+    config_manager->set_bool(UIMANAGER_ENABLE_JOYSTICK, config.enable_joystick);
+    config_manager->set_uint8(UIMANAGER_JOYSTICK_SENSITIVITY, config.joystick_sensitivity);
     
     return true;
 }
