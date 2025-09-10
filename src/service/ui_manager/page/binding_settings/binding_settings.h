@@ -70,12 +70,6 @@ private:
     static bool confirm_and_save_binding();
     
     /**
-     * 回退绑区步骤
-     * @return 是否成功回退
-     */
-    static bool step_back_binding();
-    
-    /**
      * 格式化绑区状态文本
      * @param state 绑区状态
      * @return 状态文本

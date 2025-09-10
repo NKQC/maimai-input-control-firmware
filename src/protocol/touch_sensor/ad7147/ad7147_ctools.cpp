@@ -121,10 +121,9 @@ void AD7147::CalibrationTools::CalibrationLoop(uint32_t sample)
             if (trig_res_.not_triggle_num) has_jump_point = true;  // 同时存在触发和未触发点位 此时存在跳变点
         }
 
-        // 跳变点的下一步就是找到无触发点 随后添加额外的保留偏移
+        // 跳变点的下一步 找到无触发点 随后添加额外的保留偏移
         if (has_jump_point && !trig_res_.triggle_num) {
             // 扫描完成，应用阶段1最佳AEF
-            Set_AEF_Offset(stage_index_, s1_aef_ + CALIBRATION_AEF_SAVE_AREA);
             stage_index_++;
             s1_inited_ = false;
             if (stage_index_ >= 12)
@@ -162,7 +161,6 @@ void AD7147::CalibrationTools::CalibrationLoop(uint32_t sample)
             Complete_and_restore_calibration();
             return;
         }
-
         return;
     }
     }

@@ -60,7 +60,7 @@
 #define AD7147_STAGE_OFFSET_LOW_CLAMP_OFFSET 7  // 低偏移钳位寄存器偏移
 
 // 灵敏度寄存器默认值
-#define AD7147_SENSITIVITY_DEFAULT 0x4A4A // 默认灵敏度值
+#define AD7147_SENSITIVITY_DEFAULT 0x4949 // 默认灵敏度值
 #define AD7147_DEFAULT_AFE_OFFSET 0x0000  // AFE偏移默认值
 
 // 阶段配置相关常量
@@ -84,9 +84,9 @@
 #define AD7147_CDC_BASELINE 0x8000              // CDC基准值，用于显示计算
 
 #define CALIBRATION_STAGE1_SCAN_RANGEA 0  //A -> B
-#define CALIBRATION_STAGE1_SCAN_RANGEB -127
-#define CALIBRATION_SAMPLE_COUNT 300 // 自动校准单轮采样次数
-#define CALIBRATION_AEF_SAVE_AREA -5  // AEF完成时额外偏置保留区域 预留缓冲空间防止意外触发
+#define CALIBRATION_STAGE1_SCAN_RANGEB -100
+#define CALIBRATION_SAMPLE_COUNT 5000 // 自动校准单轮采样次数
+#define CALIBRATION_AEF_SAVE_AREA -2  // AEF完成时额外偏置保留区域 预留缓冲空间防止意外触发
 
 // 设备信息结构体
 struct AD7147_DeviceInfo
@@ -461,9 +461,9 @@ private:
 
         struct TriggleSample
         {
-            uint16_t triggle_num = 0;
-            uint16_t not_triggle_num = 0;
-            uint16_t sample_count = 0;
+            uint32_t triggle_num = 0;
+            uint32_t not_triggle_num = 0;
+            uint32_t sample_count = 0;
             TriggleSample() {}
             void clear()
             {

@@ -88,17 +88,9 @@ struct LogicalKeyMapping {
     }
 };
 
-// 触摸设备映射结构体 - 8位设备掩码版本
-struct TouchDeviceMapping {
-    uint8_t device_id_mask;                         // 8位设备ID掩码
-    uint8_t max_channels;                           // 设备支持的最大通道数
-    uint8_t sensitivity[24];                        // 每个物理通道的灵敏度设置（以设备为单位统一管理）
-    uint32_t enabled_channels_mask;                  // 启用的通道掩码（位图，仅低24位有效）
-    bool is_connected;                              // 设备连接状态标志
-    
-    // 反向映射：逻辑区域 -> 物理通道
-    // 每个逻辑区域只能绑定一个通道，但一个通道可以被多个逻辑区域绑定
-    // 灵敏度数据与逻辑区域无关，统一由设备的sensitivity数组管理
+// 独立的区域通道映射配置结构体 - 与设备解耦的通用映射配置
+struct AreaChannelMappingConfig {
+    // 基础映射结构
     struct AreaChannelMapping {
         uint32_t channel;                           // 32位物理通道地址：高8位设备掩码+低24位bitmap
         
@@ -106,7 +98,7 @@ struct TouchDeviceMapping {
     };
     
     // Serial模式：Mai2区域 -> 通道映射（反向映射）
-    AreaChannelMapping serial_mappings[35];         // Mai2区域1-34的映射（索引0未使用）
+    AreaChannelMapping serial_mappings[34];         // Mai2区域1-34的映射（索引0-33对应区域1-34）
     
     // HID模式：坐标区域 -> 通道映射（支持多个HID触摸点）
     struct HIDAreaMapping {
@@ -124,6 +116,25 @@ struct TouchDeviceMapping {
         KeyboardMapping() : channel(0xFFFFFFFF) {}       // 0xFFFFFFFF表示未映射
     };
     std::map<HID_KeyCode, KeyboardMapping> keyboard_mappings; // 按键到通道的映射
+    
+    AreaChannelMappingConfig() {
+        // 初始化所有映射为未映射状态
+        for (int i = 0; i < 34; i++) {
+            serial_mappings[i] = AreaChannelMapping();
+        }
+        for (int i = 0; i < 10; i++) {
+            hid_mappings[i] = HIDAreaMapping();
+        }
+    }
+};
+
+// 触摸设备映射结构体 - 8位设备掩码版本（剥离映射配置后）
+struct TouchDeviceMapping {
+    uint8_t device_id_mask;                         // 8位设备ID掩码
+    uint8_t max_channels;                           // 设备支持的最大通道数
+    uint8_t sensitivity[24];                        // 每个物理通道的灵敏度设置（以设备为单位统一管理）
+    uint32_t enabled_channels_mask;                  // 启用的通道掩码（位图，仅低24位有效）
+    bool is_connected;                              // 设备连接状态标志
     
     TouchDeviceMapping() : device_id_mask(0), max_channels(0), enabled_channels_mask(0), is_connected(false) {
         // 初始化物理通道灵敏度为默认值
@@ -164,6 +175,7 @@ enum class TouchKeyboardMode : uint8_t {
 #define INPUTMANAGER_PHYSICAL_KEYBOARDS "input_manager_physical_keyboards"
 #define INPUTMANAGER_LOGICAL_MAPPINGS "input_manager_logical_mappings"
 #define INPUTMANAGER_TOUCH_RESPONSE_DELAY "input_manager_touch_response_delay"
+#define INPUTMANAGER_AREA_CHANNEL_MAPPINGS "input_manager_area_channel_mappings"
 
 // 工作模式枚举
 enum class InputWorkMode : uint8_t {
@@ -186,6 +198,9 @@ struct InputManager_PrivateConfig {
     InputWorkMode work_mode;
     TouchDeviceMapping touch_device_mappings[MAX_TOUCH_DEVICE];    // 触摸设备映射
     uint8_t device_count;
+    
+    // 独立的区域通道映射配置
+    AreaChannelMappingConfig area_channel_mappings;
     
     // 物理键盘映射配置
     std::vector<PhysicalKeyboardMapping> physical_keyboard_mappings;
@@ -341,6 +356,9 @@ public:
     Mai2_TouchArea getSerialMapping(uint8_t device_id_mask, uint8_t channel);
     TouchAxis getHIDMapping(uint8_t device_id_mask, uint8_t channel);
     HID_KeyCode getTouchKeyboardMapping(uint8_t device_id_mask, uint8_t channel);
+    
+    // 检查映射是否存在的接口
+    bool hasAvailableSerialMapping() const;
     
     // 物理键盘GPIO映射方法
     bool addPhysicalKeyboard(MCU_GPIO gpio, HID_KeyCode default_key = HID_KeyCode::KEY_NONE);

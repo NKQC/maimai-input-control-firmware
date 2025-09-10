@@ -55,40 +55,25 @@ void BindingSettings::render(PageTemplate& page_template) {
             ADD_TEXT("当前状态: 空闲", COLOR_TEXT_WHITE, LineAlign::CENTER)
             
             // 检查是否已有绑区设置
-            // 检查是否有现有的Serial映射
-            uint8_t has_existing_mapping = false;
-            int device_count = input_manager->get_device_count();
-            InputManager::TouchDeviceStatus device_status[device_count];
-            input_manager->get_all_device_status(device_status);
-            for (int i = 0; i < device_count; i++) {
-                for (int ch = 0; ch < device_status[i].touch_device.max_channels; ch++) {
-                    if (device_status[i].touch_device.serial_mappings[ch].channel != 0) {
-                        has_existing_mapping++;
-                        break;
-                    }
-                }
-            }
+            // 使用InputManager接口检查是否存在映射
+            bool has_existing_mapping = input_manager->hasAvailableSerialMapping();
             
-            if (has_existing_mapping > 33) {
+            if (has_existing_mapping) {
                 ADD_TEXT("已有绑区 继续将覆盖", COLOR_TEXT_GREEN, LineAlign::CENTER)
             }
             
             ADD_BUTTON("开始绑区", []() {
                 BindingSettings::start_serial_binding();
             }, COLOR_TEXT_GREEN, LineAlign::CENTER)
+
+            ADD_MENU("绑区信息", "binding_info", COLOR_BLUE)
             break;
         }
         
         case BindingUIState::BINDING_ACTIVE: {
             uint8_t progress = get_binding_progress();
             std::string current_area = get_current_binding_area();
-            
-            ADD_TEXT("绑区进行中...", COLOR_TEXT_YELLOW, LineAlign::CENTER)
-            
-            char progress_text[64];
-            snprintf(progress_text, sizeof(progress_text), "进度: %d%%", progress);
-            ADD_TEXT(progress_text, COLOR_TEXT_WHITE, LineAlign::CENTER)
-            
+
             static uint8_t progress_data = 0;
             progress_data = progress;
             ADD_PROGRESS(&progress_data, COLOR_TEXT_YELLOW)
@@ -96,12 +81,8 @@ void BindingSettings::render(PageTemplate& page_template) {
             if (!current_area.empty()) {
                 char area_text[128];
                 snprintf(area_text, sizeof(area_text), "当前绑定: %s", current_area.c_str());
-                ADD_TEXT(area_text, COLOR_TEXT_GREEN, LineAlign::CENTER)
+                ADD_TEXT(area_text, COLOR_TEXT_WHITE, LineAlign::CENTER)
             }
-            
-            ADD_BUTTON("回退一步", []() {
-                BindingSettings::step_back_binding();
-            }, COLOR_TEXT_YELLOW, LineAlign::CENTER)
             ADD_BUTTON("终止绑区", []() {
                 BindingSettings::stop_binding();
             }, COLOR_RED, LineAlign::CENTER)
@@ -267,18 +248,6 @@ bool BindingSettings::confirm_and_save_binding() {
     if (input_manager->isAutoSerialBindingComplete()) {
         input_manager->confirmAutoSerialBinding();
     }
-    return true;
-}
-
-bool BindingSettings::step_back_binding() {
-    InputManager* input_manager = InputManager::getInstance();
-    if (!input_manager) {
-        return false;
-    }
-    
-    // 回退绑定步骤 - 目前InputManager没有提供回退功能
-    // 可以考虑重新开始绑定或取消当前绑定
-    input_manager->cancelBinding();
     return true;
 }
 

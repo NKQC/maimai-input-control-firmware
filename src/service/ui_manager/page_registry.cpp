@@ -7,6 +7,7 @@
 #include "page/touch_settings/interactive_sensitivity.h"
 #include "page/touch_settings/device_custom_settings/ad7147_custom_settings.h"
 #include "page/binding_settings/binding_settings.h"
+#include "page/binding_settings/binding_info.h"
 #include "page/general_settings/general_settings.h"
 #include "engine/template_page/error_page.h"
 #include "engine/template_page/int_setting_page.h"
@@ -97,6 +98,10 @@ void PageRegistry::register_default_pages() {
     // 注册绑区设置页面
     auto binding_settings_page = std::make_shared<BindingSettings>();
     register_page("binding_settings", binding_settings_page);
+    
+    // 注册绑区信息显示页面
+    auto binding_info_page = std::make_shared<BindingInfo>();
+    register_page("binding_info", binding_info_page);
     
     // 注册通用设置页面
     auto general_settings_page = std::make_shared<GeneralSettings>();
