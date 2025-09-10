@@ -25,6 +25,8 @@ private:
     static int32_t delay_value;
     
     // 校准相关静态变量
+    static uint8_t progress;
+
     static bool calibration_in_progress_;     // 校准是否正在进行
     static bool calibration_completed_;       // 校准是否已完成
     static InputManager::AbnormalChannelResult abnormal_channels_;  // 异常通道检测结果

@@ -59,7 +59,7 @@ void GeneralSettings::update_brightness_progress() {
     brightness_progress_data_ = static_cast<uint8_t>(brightness_value_);
 }
 
-void GeneralSettings::on_screen_timeout_changed(int new_value) {
+void GeneralSettings::on_screen_timeout_changed(int32_t new_value) {
     screen_timeout_seconds_ = new_value;
     
     // 通过UIManager接口设置息屏超时，不保存配置
@@ -79,7 +79,7 @@ void GeneralSettings::on_screen_timeout_complete() {
      }
  }
 
-void GeneralSettings::on_brightness_changed(int new_value) {
+void GeneralSettings::on_brightness_changed(int32_t new_value) {
     brightness_value_ = new_value;
     
     // 通过UIManager接口设置亮度，不保存配置

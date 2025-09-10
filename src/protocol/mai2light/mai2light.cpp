@@ -54,7 +54,7 @@ Mai2Light::Mai2Light(HAL_UART* uart_hal, uint8_t node_id)
     config_.node_id = node_id;
     
     // 初始化LED状态
-    for (int i = 0; i < MAI2LIGHT_NUM_LEDS; i++) {
+    for (int32_t i = 0; i < MAI2LIGHT_NUM_LEDS; i++) {
         led_status_[i] = Mai2Light_LEDStatus();
         fade_start_colors_[i] = Mai2Light_RGB();
         fade_target_colors_[i] = Mai2Light_RGB();
@@ -177,7 +177,7 @@ bool Mai2Light::set_all_leds(const Mai2Light_RGB& color) {
         return false;
     }
     
-    for (int i = 0; i < MAI2LIGHT_NUM_LEDS; i++) {
+    for (int32_t i = 0; i < MAI2LIGHT_NUM_LEDS; i++) {
         set_led_color(i, color);
     }
     
@@ -193,7 +193,7 @@ bool Mai2Light::set_global_brightness(uint8_t brightness) {
     config_.global_brightness = brightness;
     
     // 应用到所有LED
-    for (int i = 0; i < MAI2LIGHT_NUM_LEDS; i++) {
+    for (int32_t i = 0; i < MAI2LIGHT_NUM_LEDS; i++) {
         led_status_[i].brightness = brightness;
     }
     
@@ -424,7 +424,7 @@ bool Mai2Light::send_packet(const Mai2Light_PacketReq& packet) {
     buffer[pos++] = (uint8_t)packet.command;
     
     // 复制数据
-    for (int i = 0; i < packet.length && pos < sizeof(buffer) - 1; i++) {
+    for (int32_t i = 0; i < packet.length && pos < sizeof(buffer) - 1; i++) {
         buffer[pos++] = packet.data[i];
     }
     
@@ -565,7 +565,7 @@ bool Mai2Light::parse_packet(const uint8_t* buffer, uint8_t length, Mai2Light_Pa
     packet.command = (Mai2Light_Command)buffer[3];
     
     // 复制数据
-    for (int i = 0; i < packet.length && i < sizeof(packet.data); i++) {
+    for (int32_t i = 0; i < packet.length && i < sizeof(packet.data); i++) {
         packet.data[i] = buffer[4 + i];
     }
     
@@ -577,7 +577,7 @@ bool Mai2Light::parse_packet(const uint8_t* buffer, uint8_t length, Mai2Light_Pa
 // 计算校验和
 uint8_t Mai2Light::calculate_checksum(const uint8_t* data, uint8_t length) {
     uint8_t checksum = 0;
-    for (int i = 0; i < length; i++) {
+    for (int32_t i = 0; i < length; i++) {
         checksum ^= data[i];
     }
     return checksum;
@@ -769,7 +769,7 @@ void Mai2Light::send_ack(Mai2Light_Command command, Mai2Light_AckStatus status,
     buffer[pos++] = (uint8_t)ack.report;
     
     // 复制数据
-    for (int i = 0; i < data_length && pos < sizeof(buffer) - 1; i++) {
+    for (int32_t i = 0; i < data_length && pos < sizeof(buffer) - 1; i++) {
         buffer[pos++] = ack.data[i];
     }
     
@@ -900,7 +900,7 @@ void Mai2Light::update_fade_effects() {
     
     if (elapsed_time >= config_.fade_time_ms) {
         // 渐变完成
-        for (int i = 0; i < MAI2LIGHT_NUM_LEDS; i++) {
+        for (int32_t i = 0; i < MAI2LIGHT_NUM_LEDS; i++) {
             led_status_[i].color = fade_target_colors_[i];
         }
         is_fading_ = false;
@@ -908,7 +908,7 @@ void Mai2Light::update_fade_effects() {
         // 计算渐变进度
         uint8_t progress = (elapsed_time * 255) / config_.fade_time_ms;
         
-        for (int i = 0; i < MAI2LIGHT_NUM_LEDS; i++) {
+        for (int32_t i = 0; i < MAI2LIGHT_NUM_LEDS; i++) {
             led_status_[i].color = fade_start_colors_[i].blend(fade_target_colors_[i], progress);
         }
     }

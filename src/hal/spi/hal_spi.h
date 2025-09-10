@@ -103,8 +103,8 @@ private:
     uint8_t cs_pin_;
     bool cs_active_low_;
     uint32_t frequency_;
-    int dma_tx_channel_;
-    int dma_rx_channel_;
+    int32_t dma_tx_channel_;
+    int32_t dma_rx_channel_;
     bool dma_busy_;
     bool dma_irq_initialized_;
     dma_callback_t dma_callback_;
@@ -170,8 +170,8 @@ private:
     uint8_t cs_pin_;
     bool cs_active_low_;
     uint32_t frequency_;
-    int dma_tx_channel_;
-    int dma_rx_channel_;
+    int32_t dma_tx_channel_;
+    int32_t dma_rx_channel_;
     bool dma_busy_;
     bool dma_irq_initialized_;
     dma_callback_t dma_callback_;

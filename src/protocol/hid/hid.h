@@ -228,7 +228,7 @@ private:
             key_count = 0;
             modifier_keys = 0;
             state_changed = true;  // 清空状态时标记为已变化
-            for (int i = 0; i < KEYBOARD_SIMUL_PRESS; i++) {
+            for (int32_t i = 0; i < KEYBOARD_SIMUL_PRESS; i++) {
                 key[i] = HID_KeyCode::KEY_NONE;
             }
             update_last_state();
@@ -251,7 +251,7 @@ private:
             }
             
             // 检查是否已存在该按键
-            for (int i = 0; i < key_count; i++) {
+            for (int32_t i = 0; i < key_count; i++) {
                 if (key[i] == _key) {
                     return true; // 按键已存在，不重复添加
                 }
@@ -284,9 +284,9 @@ private:
             }
             
             // 普通按键处理
-            for (int i = 0; i < key_count; i++) {
+            for (int32_t i = 0; i < key_count; i++) {
                 if (key[i] == _key) {
-                    for (int j = i; j < key_count - 1; j++) {
+                    for (int32_t j = i; j < key_count - 1; j++) {
                         key[j] = key[j + 1];
                     }
                     key[key_count - 1] = HID_KeyCode::KEY_NONE;
@@ -307,7 +307,7 @@ private:
         void update_last_state() {
             last_key_count = key_count;
             last_modifier_keys = modifier_keys;
-            for (int i = 0; i < KEYBOARD_SIMUL_PRESS; i++) {
+            for (int32_t i = 0; i < KEYBOARD_SIMUL_PRESS; i++) {
                 last_key[i] = key[i];
             }
             state_changed = false;
@@ -362,7 +362,7 @@ private:
             return false;
         }
         bool release(uint8_t _id) {
-            for (int i = 0; i < press_modifier; i++) {
+            for (int32_t i = 0; i < press_modifier; i++) {
                 if (touch_press[i].id == _id) {
                     // 将触摸点移动到release数组
                     if (release_modifier < TOUCH_LOCAL_NUM) {
@@ -371,7 +371,7 @@ private:
                     }
                     
                     // 从press数组中移除
-                    for (int j = i; j < press_modifier - 1; j++) {
+                    for (int32_t j = i; j < press_modifier - 1; j++) {
                         touch_press[j] = touch_press[j + 1];
                     }
                     press_modifier--;
@@ -384,10 +384,10 @@ private:
             return false;
         }
         void remove(uint8_t _id) {
-            for (int i = 0; i < release_modifier; i++) {
+            for (int32_t i = 0; i < release_modifier; i++) {
                 if (touch_release[i].id == _id) {
                     touch_release[i] = {0, 0, 0, 0};
-                    for (int j = i; j < release_modifier - 1; j++) {
+                    for (int32_t j = i; j < release_modifier - 1; j++) {
                         touch_release[j] = touch_release[j + 1];
                     }
                     release_modifier--;

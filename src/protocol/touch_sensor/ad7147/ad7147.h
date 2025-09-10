@@ -60,7 +60,7 @@
 #define AD7147_STAGE_OFFSET_LOW_CLAMP_OFFSET 7  // 低偏移钳位寄存器偏移
 
 // 灵敏度寄存器默认值
-#define AD7147_SENSITIVITY_DEFAULT 0x3939 // 默认灵敏度值
+#define AD7147_SENSITIVITY_DEFAULT 0x3A3A // 默认灵敏度值
 #define AD7147_DEFAULT_AFE_OFFSET 0x0000  // AFE偏移默认值
 
 // 阶段配置相关常量
@@ -77,14 +77,17 @@
 #define AD7147_STAGE11_CONNECTION 0x00D8 // Stage 11连接寄存器
 
 // 阶段配置默认值
-#define AD7147_DEFAULT_OFFSET_LOW 0x1000        // 默认低偏移值
-#define AD7147_DEFAULT_OFFSET_HIGH 0x1000       // 默认高偏移值
+#define AD7147_DEFAULT_OFFSET_LOW 0x2000        // 默认低偏移值
+#define AD7147_DEFAULT_OFFSET_HIGH 0x2000       // 默认高偏移值
 #define AD7147_DEFAULT_OFFSET_LOW_CLAMP 0x7000  // 默认低偏移钳位值
 #define AD7147_DEFAULT_OFFSET_HIGH_CLAMP 0x7000 // 默认高偏移钳位值
 #define AD7147_CDC_BASELINE 0x8000              // CDC基准值，用于显示计算
 
+#define CALIBRATION_STAGE1_SCAN_RANGEA 0  //A -> B
+#define CALIBRATION_STAGE1_SCAN_RANGEB -127
 #define CALIBRATION_SAMPLE_COUNT 200 // 自动校准单轮采样次数
-#define STAGE2_MEASURE_TIME_MS 1000     // 确认采样次数 次数越大偏移数值越保守 稳定性越好
+#define STAGE2_MEASURE_TIME_MS 2000  // 确认采样时间 次数越大偏移数值越保守 稳定性越好
+#define CALIBRATION_AEF_SAVE_AREA -3  // AEF完成时额外偏置保留区域 预留缓冲空间防止意外触发
 
 // 设备信息结构体
 struct AD7147_DeviceInfo
@@ -200,7 +203,7 @@ struct StageSettings
 
     StageSettings()
     {
-        for (int i = 0; i < 12; i++)
+        for (int32_t i = 0; i < 12; i++)
         {
             stages[i].connection_6_0 = channel_connections[i][0];
             stages[i].connection_12_7 = channel_connections[i][1];
@@ -377,10 +380,14 @@ private:
     StageSettings stage_settings_;         // Stage配置设置
     AD7147RegisterConfig register_config_; // 寄存器配置
 
-    // CDC读取相关
+    // 实例级状态变量（原来的静态变量）
     volatile bool cdc_read_request_;  // CDC读取请求标志
     volatile uint8_t cdc_read_stage_; // 请求读取的阶段
     uint16_t cdc_read_value_;         // 读取到的CDC值
+    
+    // sample()函数的实例级变量（原来的静态变量）
+    TouchSampleResult sample_result_; // 采样结果
+    uint16_t status_regs_;            // 状态寄存器值
 
     // 异步配置相关
     struct PendingPortConfig
@@ -469,6 +476,23 @@ private:
         // 当前正在校准的stage索引 [0..11]；当全部完成后置为12
         uint8_t current_stage_index_ = 0;
 
+        bool inited_ = false;
+        uint8_t stage_index_ = 0; // 当前校准的stage [0..11]
+        
+        // 阶段1：扫频寻找震荡点（触发与非触发最接近50%）
+        bool s1_inited_ = false;
+        int16_t s1_aef_ = -127;       // 当前扫描AEF -127..127
+        int16_t s1_best_aef_ = 0;     // 阶段1找到的最佳AEF
+        int8_t s1_best_ratio_ = 100;  // 阶段1最佳触发比例
+        TriggleSample trig_res_;      // 阶段1采样累积
+        
+        // 阶段2：从阶段1最佳点出发，单步调整AEF使触发占比降至0%
+        bool s2_inited_ = false;
+        int16_t s2_base_aef_ = 0;
+        int16_t s2_cur_aef_ = 0;
+        uint32_t triggle_sample_count_ = 0; // 触发采样次数
+        uint32_t measure_time_tag_ = 0;
+
         bool start_calibration()
         {
             if (calibration_state_ != IDLE)
@@ -486,7 +510,7 @@ private:
         // 完成时恢复校准
         void Complete_and_restore_calibration();
         // 直接设置AEF偏移 已内置正负翻转 0-127
-        void Set_AEF_Offset(uint8_t stage, Direction direction, uint8_t offset);
+        void Set_AEF_Offset(uint8_t stage, int8_t offset);
 
         // [执行一次采样一次 到目标周期返回True] 读取CDC值 50次采样 计算平均值 最大值和最小值
         bool Read_CDC_Sample(uint8_t stage, CDCSample_result &result);

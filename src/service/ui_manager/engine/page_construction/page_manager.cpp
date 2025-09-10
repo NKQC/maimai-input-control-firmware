@@ -12,7 +12,7 @@ PageNavigationManager& PageNavigationManager::getInstance() {
     return instance;
 }
 
-void PageNavigationManager::push_page(const std::string& page, int cursor_pos, int scroll_pos) {
+void PageNavigationManager::push_page(const std::string& page, int32_t cursor_pos, int32_t scroll_pos) {
     PageState new_page(page, cursor_pos, scroll_pos);
     
     // 检查是否存在跳跃式回环 (A->B->C->D->B)

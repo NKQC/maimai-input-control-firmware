@@ -68,8 +68,8 @@ extern "C" {
 
 #define UART0_TX_PIN 12
 #define UART0_RX_PIN 13
-#define UART0_CTS_PIN 14
-#define UART0_RTS_PIN 15
+#define UART0_CTS_PIN 255//14
+#define UART0_RTS_PIN 255//15
 #define UART1_TX_PIN 8
 #define UART1_RX_PIN 9
 #define NEOPIXEL_PIN 11

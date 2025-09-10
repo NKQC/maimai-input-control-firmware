@@ -242,7 +242,7 @@ public:
     // 设备注册 - TouchSensor统一接口
     bool registerTouchSensor(TouchSensor* device);
     void unregisterTouchSensor(TouchSensor* device);
-    void load_touch_device_config(TouchSensor* device, uint8_t device_id_mask);
+    void load_touch_device_config(TouchSensor* device);
     
     // 工作模式设置
     inline bool setWorkMode(InputWorkMode mode);
@@ -589,7 +589,7 @@ private:
     }
     
     // 地址处理辅助方法
-    int findTouchDeviceIndex(uint8_t device_id_mask);
+    int32_t findTouchDeviceIndex(uint8_t device_id_mask);
     TouchDeviceMapping* findTouchDeviceMapping(uint8_t device_id_mask);
     TouchSensor* findTouchSensorByIdMask(uint8_t device_id_mask);
     

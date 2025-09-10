@@ -502,7 +502,7 @@ void USB_SerialLogs::handle_error(const std::string& error_msg) {
 
 std::string USB_SerialLogs::format_string(const char* format, va_list args) {
     char buffer[USB_LOGS_MAX_LINE_LENGTH];
-    int result = vsnprintf(buffer, sizeof(buffer), format, args);
+    int32_t result = vsnprintf(buffer, sizeof(buffer), format, args);
     
     if (result < 0) {
         return "[FORMAT ERROR]";

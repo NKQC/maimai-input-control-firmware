@@ -273,7 +273,7 @@ void PageTemplate::set_title(const std::string& title, Color color) {
     visible_lines_count_ = has_title_ ? 4 : 5;
 }
 
-void PageTemplate::set_line(int line_index, const LineConfig& config) {
+void PageTemplate::set_line(int32_t line_index, const LineConfig& config) {
     // 统一使用all_lines_管理所有行内容
     if (line_index >= 0 && line_index < (int)all_lines_.size()) {
         all_lines_[line_index] = config;
@@ -333,7 +333,7 @@ void PageTemplate::clear() {
     selected_menu_index_ = 0;
 }
 
-void PageTemplate::clear_line(int line_index) {
+void PageTemplate::clear_line(int32_t line_index) {
     if (line_index >= 0 && line_index < (int)all_lines_.size()) {
         all_lines_[line_index].text.clear();
         all_lines_[line_index].type = LineType::TEXT_ITEM;
@@ -355,8 +355,8 @@ void PageTemplate::draw() {
         draw_title();
         
         // 绘制内容行
-        for (int i = 0; i < visible_lines_count_; i++) {
-            int actual_index = scroll_enabled_ ? scroll_bar_.get_display_start_index() + i : i;
+        for (int32_t i = 0; i < visible_lines_count_; i++) {
+            int32_t actual_index = scroll_enabled_ ? scroll_bar_.get_display_start_index() + i : i;
             if (actual_index < (int)all_lines_.size()) {
                 // 对于进度条，即使text为空也要绘制
                 if (all_lines_[actual_index].type == LineType::PROGRESS_BAR || !all_lines_[actual_index].text.empty()) {
@@ -378,7 +378,7 @@ void PageTemplate::draw_background(Color bg_color) {
     }
 }
 
-void PageTemplate::set_selected_index(int index) {
+void PageTemplate::set_selected_index(int32_t index) {
     // 清除所有选中状态
     for (auto& line : all_lines_) {
         line.selected = false;
@@ -417,7 +417,7 @@ bool PageTemplate::scroll_down() {
     return scrolled;
 }
 
-void PageTemplate::set_visible_end_line(int target_line_index) {
+void PageTemplate::set_visible_end_line(int32_t target_line_index) {
     if (!scroll_enabled_ || all_lines_.empty()) {
         return;
     }
@@ -428,8 +428,8 @@ void PageTemplate::set_visible_end_line(int target_line_index) {
     }
     
     // 计算新的滚动起始位置
-    int new_start_index;
-    int max_start = std::max(0, (int)all_lines_.size() - visible_lines_count_);
+    int32_t new_start_index;
+    int32_t max_start = MAX(0, all_lines_.size() - visible_lines_count_);
     
     if (target_line_index < visible_lines_count_) {
         // 如果目标行在前几行，直接从第0行开始显示
@@ -444,7 +444,7 @@ void PageTemplate::set_visible_end_line(int target_line_index) {
     }
     
     // 额外的边界检查，确保new_start_index不会为负数
-    new_start_index = std::max(0, std::min(new_start_index, max_start));
+    new_start_index = MAX(0, MIN(new_start_index, max_start));
     
     // 设置新的滚动位置
     scroll_bar_.set_display_start_index(new_start_index);
@@ -455,7 +455,7 @@ void PageTemplate::set_visible_end_line(int target_line_index) {
                                ", visible_count=" + std::to_string(visible_lines_count_));
 }
 
-void PageTemplate::set_progress(int line_index, float progress, const std::string& text) {
+void PageTemplate::set_progress(int32_t line_index, float progress, const std::string& text) {
     if (line_index >= 0 && line_index < (int)all_lines_.size()) {
         all_lines_[line_index].type = LineType::PROGRESS_BAR;
         // Note: progress value should be handled via progress_ptr in LineConfig
@@ -464,7 +464,7 @@ void PageTemplate::set_progress(int line_index, float progress, const std::strin
     }
 }
 
-void PageTemplate::show_status_indicator(int line_index, Color color, bool filled) {
+void PageTemplate::show_status_indicator(int32_t line_index, Color color, bool filled) {
     if (line_index >= 0 && line_index < 4 && graphics_engine_) {
         Rect line_rect = get_line_rect(line_index);
         int16_t indicator_size = 6;
@@ -513,23 +513,23 @@ void PageTemplate::set_split_ratio(float ratio) {
     }
 }
 
-int16_t PageTemplate::get_line_y_position(int line_index) {
+int16_t PageTemplate::get_line_y_position(int32_t line_index) {
     if (line_index < 0 || line_index >= 5) return 0;
     return (has_title_ ? CONTENT_START_Y : LINE_SPACING) + line_index * (LINE_HEIGHT + LINE_SPACING);
 }
 
-Rect PageTemplate::get_line_rect(int line_index) {
+Rect PageTemplate::get_line_rect(int32_t line_index) {
     int16_t y = get_line_y_position(line_index);
     return Rect(0, y, LINE_WEIGHT, LINE_HEIGHT);
 }
 
-Rect PageTemplate::get_split_left_rect(int line_index) {
+Rect PageTemplate::get_split_left_rect(int32_t line_index) {
     int16_t y = get_line_y_position(line_index);
     int16_t divider_x = (int16_t)(128 * split_ratio_);
     return Rect(0, y, divider_x - 1, LINE_HEIGHT);
 }
 
-Rect PageTemplate::get_split_right_rect(int line_index) {
+Rect PageTemplate::get_split_right_rect(int32_t line_index) {
     int16_t y = get_line_y_position(line_index);
     int16_t divider_x = (int16_t)(128 * split_ratio_);
     return Rect(divider_x + 1, y, 128 - divider_x - 1, LINE_HEIGHT);
@@ -543,7 +543,7 @@ void PageTemplate::draw_title() {
                                                TextAlign::CENTER);
 }
 
-void PageTemplate::draw_line(int line_index, const LineConfig& config) {
+void PageTemplate::draw_line(int32_t line_index, const LineConfig& config) {
     if (!graphics_engine_) return;
     
     switch (config.type) {
@@ -575,7 +575,7 @@ void PageTemplate::draw_line(int line_index, const LineConfig& config) {
 }
 
 // 文本项渲染
-void PageTemplate::draw_text_item(int line_index, const LineConfig& config) {
+void PageTemplate::draw_text_item(int32_t line_index, const LineConfig& config) {
     if (!graphics_engine_ || config.text.empty()) return;
     
     Rect line_rect = get_line_rect(line_index);
@@ -586,7 +586,7 @@ void PageTemplate::draw_text_item(int line_index, const LineConfig& config) {
 }
 
 // 状态行渲染
-void PageTemplate::draw_status_line(int line_index, const LineConfig& config) {
+void PageTemplate::draw_status_line(int32_t line_index, const LineConfig& config) {
     if (!graphics_engine_ || config.text.empty()) return;
     
     Rect line_rect = get_line_rect(line_index);
@@ -597,7 +597,7 @@ void PageTemplate::draw_status_line(int line_index, const LineConfig& config) {
 }
 
 // 菜单跳转项渲染
-void PageTemplate::draw_menu_jump(int line_index, const LineConfig& config) {
+void PageTemplate::draw_menu_jump(int32_t line_index, const LineConfig& config) {
     if (!graphics_engine_) return;
     
     Rect line_rect = get_line_rect(line_index);
@@ -616,7 +616,7 @@ void PageTemplate::draw_menu_jump(int line_index, const LineConfig& config) {
 }
 
 // 进度条项渲染
-void PageTemplate::draw_progress_bar(int line_index, const LineConfig& config) {
+void PageTemplate::draw_progress_bar(int32_t line_index, const LineConfig& config) {
     if (!graphics_engine_) {
         return;
     }
@@ -635,8 +635,8 @@ void PageTemplate::draw_progress_bar(int line_index, const LineConfig& config) {
     char display_str[8];
     if (has_valid_data) {
         // 使用整数运算计算百分比: percentage = progress_value * 100 / 255
-        int progress_percent = (progress_value * 100) / 255;
-        snprintf(display_str, sizeof(display_str), "%d%%", progress_percent);
+        int32_t progress_percent = (progress_value * 100) / 255;
+        snprintf(display_str, sizeof(display_str), "%ld%%", progress_percent);
     } else {
         snprintf(display_str, sizeof(display_str), "ERR");
     }
@@ -670,7 +670,7 @@ void PageTemplate::draw_progress_bar(int line_index, const LineConfig& config) {
 }
 
 // INT设置项渲染
-void PageTemplate::draw_int_setting(int line_index, const LineConfig& config) {
+void PageTemplate::draw_int_setting(int32_t line_index, const LineConfig& config) {
     if (!graphics_engine_ || !config.data.int_setting.int_value_ptr) return;
     
     Rect line_rect = get_line_rect(line_index);
@@ -702,7 +702,7 @@ void PageTemplate::draw_int_setting(int line_index, const LineConfig& config) {
 }
 
 // 按钮项渲染
-void PageTemplate::draw_button_item(int line_index, const LineConfig& config) {
+void PageTemplate::draw_button_item(int32_t line_index, const LineConfig& config) {
     if (!graphics_engine_ || config.text.empty()) return;
     
     Rect line_rect = get_line_rect(line_index);
@@ -724,7 +724,7 @@ void PageTemplate::draw_button_item(int line_index, const LineConfig& config) {
 }
 
 // 返回项渲染
-void PageTemplate::draw_back_item(int line_index, const LineConfig& config) {
+void PageTemplate::draw_back_item(int32_t line_index, const LineConfig& config) {
     if (!graphics_engine_) return;
     
     Rect line_rect = get_line_rect(line_index);
@@ -751,7 +751,7 @@ void PageTemplate::draw_back_item(int line_index, const LineConfig& config) {
 }
 
 // 选择器项渲染
-void PageTemplate::draw_selector_item(int line_index, const LineConfig& config) {
+void PageTemplate::draw_selector_item(int32_t line_index, const LineConfig& config) {
     if (!graphics_engine_) return;
     
     Rect line_rect = get_line_rect(line_index);
@@ -874,7 +874,7 @@ int16_t PageTemplate::get_text_x_position(const std::string& text,
     }
 }
 
-void PageTemplate::draw_selection_indicator(int line_index) {
+void PageTemplate::draw_selection_indicator(int32_t line_index) {
     if (!graphics_engine_) return;
     
     Rect line_rect = get_line_rect(line_index);

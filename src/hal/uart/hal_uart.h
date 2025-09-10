@@ -101,8 +101,8 @@ private:
     std::function<void(uint8_t)> rx_callback_;
     bool dma_busy_;
     dma_callback_t dma_callback_;
-    int dma_tx_channel_;
-    int dma_ctrl_channel_;  // DMA控制通道
+    int32_t dma_tx_channel_;
+    int32_t dma_ctrl_channel_;  // DMA控制通道
     
     // 友元函数声明，仅保留TX回调
     friend void uart0_tx_dma_callback(bool success);
@@ -165,8 +165,8 @@ private:
     std::function<void(uint8_t)> rx_callback_;
     bool dma_busy_;
     dma_callback_t dma_callback_;
-    int dma_tx_channel_;
-    int dma_ctrl_channel_;  // DMA控制通道
+    int32_t dma_tx_channel_;
+    int32_t dma_ctrl_channel_;  // DMA控制通道
 
     // 友元函数声明，仅保留TX回调
     friend void uart1_tx_dma_callback(bool success);

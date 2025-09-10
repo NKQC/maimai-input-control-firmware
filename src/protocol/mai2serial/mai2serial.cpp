@@ -10,7 +10,9 @@ Mai2Serial::Mai2Serial(HAL_UART* uart_hal)
     , initialized_(false)
     , serial_ok_(false)
     , config_()
-    , status_(Status::STOPPED) {
+    , status_(Status::STOPPED)
+    , packet_transmission_time_us_(0)
+    , next_send_time_us_(0) {
     
     // 初始化流式接收缓冲区
     rx_stream_pos_ = 0;
@@ -58,6 +60,10 @@ bool Mai2Serial::set_config(const Mai2Serial_Config& config) {
     if (initialized_) {
         // 重新配置UART波特率
         return set_baud_rate(config.baud_rate);
+    } else {
+        // 如果未初始化，也需要计算传输时间并重置下次发送时间
+        calculate_packet_transmission_time();
+        next_send_time_us_ = 0;
     }
     
     return true;
@@ -69,10 +75,22 @@ Mai2Serial_Config Mai2Serial::get_config() const {
 }
 
 // 发送触摸数据
-bool Mai2Serial::send_touch_data(Mai2Serial_TouchState& touch_data) {
+void Mai2Serial::send_touch_data(Mai2Serial_TouchState& touch_data) {
     if (!is_ready() || !serial_ok_) {
-        return false;
+        return;
     }
+    
+    // 流控逻辑：使用静态变量存储当前时间，避免重复获取
+    static uint32_t current_time_us;
+    current_time_us = time_us_32();
+    
+    // 直接比较下次发送时间
+    if (next_send_time_us_ > current_time_us) {
+        return;  // 时间未到，直接返回
+    }
+    
+    // 更新下次发送时间
+    next_send_time_us_ = current_time_us + packet_transmission_time_us_;
     
     touch_data.raw |= triggle_touch_data_.raw;
     
@@ -83,9 +101,7 @@ bool Mai2Serial::send_touch_data(Mai2Serial_TouchState& touch_data) {
 
 
     // 使用新的DMA接口：写入TX缓冲区会自动处理DMA传输
-    size_t bytes_written = uart_hal_->write_to_tx_buffer(_packet.data, 9);
-    bool result = (bytes_written == 9);
-    return result;
+    uart_hal_->write_to_tx_buffer(_packet.data, 9);
 }
 
 // 处理命令 - 使用DMA接收
@@ -127,8 +143,6 @@ bool Mai2Serial::start() {
     }
     
     status_ = Status::RUNNING;
-    
-    send_response("OK");
     return true;
 }
 
@@ -138,7 +152,6 @@ bool Mai2Serial::stop() {
     }
     
     status_ = Status::READY;
-    send_response("STOPPED");
     return true;
 }
 
@@ -150,8 +163,6 @@ bool Mai2Serial::reset() {
     // 重置配置为默认值
     config_ = Mai2Serial_Config();
     status_ = Status::READY;
-    
-    send_response("RESET OK");
     return true;
 }
 
@@ -173,12 +184,17 @@ bool Mai2Serial::set_baud_rate(uint32_t baud_rate) {
     }
     config_.baud_rate = baud_rate;
     uart_hal_->set_baudrate(baud_rate);
+    
+    // 重新计算数据包传输时间并重置下次发送时间
+    calculate_packet_transmission_time();
+    next_send_time_us_ = 0;
+    
     return true;
 }
 
 // 处理指令包
 void Mai2Serial::process_command_packet(const uint8_t* packet, size_t length) {
-    if (length < 5 || packet[0] != MAI2SERIAL_CMD_START_BYTE) {
+    if (packet[0] != MAI2SERIAL_CMD_START_BYTE || packet[5] != MAI2SERIAL_CMD_END_BYTE) {
         return;  // 无效包格式
     }
     
@@ -201,7 +217,7 @@ void Mai2Serial::process_command_packet(const uint8_t* packet, size_t length) {
     uint8_t value = packet[4];   // 参数值
     
     switch (cmd) {
-        case MAI2SERIAL_CMD_RSET:  // E - 重置
+        case MAI2SERIAL_CMD_RSET:  // E - 重置 {RSET}
             // 重置传感器和系统状态
             reset();
             serial_ok_ = false;  // 重置时停止发送触摸数据
@@ -211,7 +227,7 @@ void Mai2Serial::process_command_packet(const uint8_t* packet, size_t length) {
             }
             break;
             
-        case MAI2SERIAL_CMD_HALT:  // L - 停止
+        case MAI2SERIAL_CMD_HALT:  // L - 停止 
             // 停止操作
             stop();
             serial_ok_ = false;  // 进入设置模式，停止发送触摸数据
@@ -232,8 +248,8 @@ void Mai2Serial::process_command_packet(const uint8_t* packet, size_t length) {
             break;
             
         case MAI2SERIAL_CMD_SENS:  // k - 灵敏度设置
-            // 发送灵敏度响应，格式: (Rsk值)，注意lr固定为'R'
-            send_command_response('R', sensor, 'k', value);
+            // 发送灵敏度响应，格式: (Rsk值)，
+            send_command_response(lr, sensor, 'k', value);
             // 通知命令回调
             if (command_callback_) {
                 uint8_t params[2] = {sensor, value};
@@ -302,7 +318,7 @@ void Mai2Serial::process_dma_received_data(const uint8_t* data, size_t length) {
             }
             // 检查前8字节内是否包含结束符'}'，若没有则认为还未凑齐（避免误消费）
             bool has_end = false;
-            for (int i = 1; i < MAI2SERIAL_COMMAND_LENGTH; ++i) {
+            for (int32_t i = 1; i < MAI2SERIAL_COMMAND_LENGTH; ++i) {
                 if (rx_stream_buffer_[i] == (uint8_t)MAI2SERIAL_CMD_END_BYTE) { has_end = true; break; }
             }
             if (!has_end) {
@@ -431,4 +447,26 @@ void Mai2Serial::manually_triggle_area(Mai2_TouchArea area) {
 void Mai2Serial::clear_manually_triggle_area() {
     triggle_touch_data_.parts.state1 = 0;
     triggle_touch_data_.parts.state2 = 0;
+}
+
+// 计算数据包传输时间
+void Mai2Serial::calculate_packet_transmission_time() {
+    if (config_.baud_rate == 0) {
+        packet_transmission_time_us_ = 0;
+        return;
+    }
+    
+    // 数据包大小：9字节数据 + 起始位和停止位
+    // 每字节包含：1起始位 + 8数据位 + 1停止位 = 10位
+    const uint32_t packet_size_bytes = 9;
+    const uint32_t bits_per_byte = 10;  // 包含起始位和停止位
+    const uint32_t total_bits = packet_size_bytes * bits_per_byte;
+    
+    // 计算传输时间（微秒），并除以0.98以确保总线占用率不超过98%
+    packet_transmission_time_us_ = (uint32_t)((total_bits * 1000000ULL) / (config_.baud_rate * 0.98f));
+    
+    // 确保最小间隔时间
+    if (packet_transmission_time_us_ < 100) {
+        packet_transmission_time_us_ = 100;  // 最小100微秒间隔
+    }
 }

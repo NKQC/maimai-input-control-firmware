@@ -14,10 +14,10 @@ class UIManager;
 // 页面状态结构
 struct PageState {
     std::string page_name;
-    int cursor_position;
-    int scroll_position;
+    int32_t cursor_position;
+    int32_t scroll_position;
     
-    PageState(const std::string& name = "", int cursor = 0, int scroll = 0)
+    PageState(const std::string& name = "", int32_t cursor = 0, int32_t scroll = 0)
         : page_name(name), cursor_position(cursor), scroll_position(scroll) {}
 };
 
@@ -27,7 +27,7 @@ public:
     static PageNavigationManager& getInstance();
     
     // 简化的页面状态管理（只保存上一个页面）
-    void push_page(const std::string& page, int cursor_pos = 0, int scroll_pos = 0);
+    void push_page(const std::string& page, int32_t cursor_pos = 0, int32_t scroll_pos = 0);
     PageState pop_page();
     std::string get_current_page() const;
     std::string get_previous_page() const;

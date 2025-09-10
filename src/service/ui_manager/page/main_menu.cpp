@@ -34,7 +34,7 @@ void MainMenu::render(PageTemplate& page_template) {
     PAGE_END()
 }
 
-void MainMenu::set_progress(int progress) {
+void MainMenu::set_progress(int32_t progress) {
     // 限制进度值在0-100范围内
     if (progress < 0) {
         progress_ = 0;
@@ -49,11 +49,11 @@ void MainMenu::set_progress(int progress) {
     
     // 将进度存储到共享数据中，供宏控制使用
     char progress_str[16];
-    snprintf(progress_str, sizeof(progress_str), "%d", progress_);
+    snprintf(progress_str, sizeof(progress_str), "%ld", progress_);
     set_shared_data("main_menu_progress", progress_str);
 }
 
-int MainMenu::get_progress() const {
+int32_t MainMenu::get_progress() const {
     return progress_;
 }
 

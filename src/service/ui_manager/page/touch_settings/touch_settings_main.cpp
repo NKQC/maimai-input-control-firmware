@@ -9,6 +9,7 @@ namespace ui {
 int32_t TouchSettingsMain::delay_value = 0;
 
 // 校准相关静态变量初始化
+uint8_t TouchSettingsMain::progress = 0;
 bool TouchSettingsMain::calibration_in_progress_ = false;
 bool TouchSettingsMain::calibration_completed_ = false;
 InputManager::AbnormalChannelResult TouchSettingsMain::abnormal_channels_;
@@ -28,7 +29,7 @@ void TouchSettingsMain::render(PageTemplate& page_template) {
     if (calibration_in_progress_) {
         // 校准进行中，显示进度条
         InputManager* input_manager = InputManager::getInstance();
-        uint8_t progress = input_manager->getCalibrationProgress();
+        progress = input_manager->getCalibrationProgress();
         if (progress == 255) {
             // 校准完成，收集异常通道
             calibration_in_progress_ = false;

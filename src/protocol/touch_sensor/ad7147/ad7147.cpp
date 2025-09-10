@@ -11,12 +11,15 @@ AD7147::AD7147(HAL_I2C* i2c_hal, I2C_Bus i2c_bus, uint8_t device_addr)
       device_addr_(device_addr), i2c_device_address_(device_addr),
       initialized_(false), i2c_bus_enum_(i2c_bus), enabled_channels_mask_(0),
       cdc_read_request_(false), cdc_read_stage_(0), cdc_read_value_(0),
+      sample_result_{.touch_mask = uint32_t(0)}, status_regs_(0),
       pending_config_count_(0), abnormal_channels_bitmap_(0) {
     module_name = "AD7147";
     module_mask_ = TouchSensor::generateModuleMask(static_cast<uint8_t>(i2c_bus), device_addr);
     supported_channel_count_ = AD7147_MAX_CHANNELS;
     supports_calibration_ = true;  // AD7147支持校准功能
     calibration_tools_.pthis = this;
+    // 初始化sample_result_的touch_mask
+    sample_result_.touch_mask = uint32_t(module_mask_ << 24);
 }
 
 // AD7147析构函数
@@ -69,7 +72,7 @@ bool AD7147::loadConfig(const std::string& config_data) {
     }
     
     // 从配置中加载stage设置
-    for (int stage = 0; stage < 12; stage++) {
+    for (int32_t stage = 0; stage < 12; stage++) {
         std::string stage_prefix = "stage" + std::to_string(stage) + "_";
         
         stage_settings_.stages[stage].connection_6_0 = config_manager.getConfig(stage_prefix + "connection_6_0", stage_settings_.stages[stage].connection_6_0);
@@ -90,7 +93,7 @@ std::string AD7147::saveConfig() const {
     ConfigManager config_manager;
     
     // 保存stage设置到配置
-    for (int stage = 0; stage < 12; stage++) {
+    for (int32_t stage = 0; stage < 12; stage++) {
         std::string stage_prefix = "stage" + std::to_string(stage) + "_";
         
         config_manager.setConfig(stage_prefix + "connection_6_0", static_cast<uint32_t>(stage_settings_.stages[stage].connection_6_0));
@@ -117,7 +120,7 @@ bool AD7147::setCustomSensitivitySettings(const std::string& settings_data) {
     }
     
     // 更新stage设置中的灵敏度配置
-    for (int stage = 0; stage < 12; stage++) {
+    for (int32_t stage = 0; stage < 12; stage++) {
         std::string stage_key = "stage" + std::to_string(stage) + "_sensitivity";
         if (config_manager.hasConfig(stage_key)) {
             uint32_t sensitivity_value = config_manager.getConfig(stage_key, static_cast<uint32_t>(stage_settings_.stages[stage].sensitivity.raw));
@@ -231,9 +234,6 @@ bool AD7147::isInitialized() const {
 }
 
 TouchSampleResult AD7147::sample() {
-    static TouchSampleResult result = {.touch_mask = uint32_t(module_mask_ << 24)};
-    static uint16_t status_regs;
-
     // 处理待应用的异步配置
     if (pending_config_count_) {
         setStageConfig(pending_configs_.stage, pending_configs_.config);
@@ -247,17 +247,17 @@ TouchSampleResult AD7147::sample() {
         if (read_register(cdc_reg_addr, cdc_read_value_)) cdc_read_request_ = false;
     }
     
-    read_register(AD7147_REG_STAGE_HIGH_INT_STATUS, status_regs);
+    read_register(AD7147_REG_STAGE_HIGH_INT_STATUS, status_regs_);
     
     // 合并触摸状态并限制在24位范围内
-    result.channel_mask = ~status_regs;
+    sample_result_.channel_mask = ~status_regs_;
 
     // 留给校准模块
     if (calibration_tools_.calibration_state_)
-        calibration_tools_.CalibrationLoop(result.channel_mask);
-    result.timestamp_us = time_us_32();
+        calibration_tools_.CalibrationLoop(sample_result_.channel_mask);
+    sample_result_.timestamp_us = time_us_32();
     
-    return result;
+    return sample_result_;
 }
 
 bool AD7147::setChannelEnabled(uint8_t channel, bool enabled) {
@@ -428,7 +428,7 @@ bool AD7147::configureStages(const uint16_t* connection_values) {
     
     // 如果提供了connection_values，更新stage_settings_中的AFE偏移
     if (connection_values) {
-        for (int i = 0; i < 12; i++) {
+        for (int32_t i = 0; i < 12; i++) {
             stage_settings_.stages[i].afe_offset = connection_values[0];
         }
     }
@@ -458,7 +458,7 @@ bool AD7147::configureStages(const uint16_t* connection_values) {
 
     // 写入配置寄存器组
     bool cb = true;
-    for (int i = 0; i < 8; i++) {
+    for (int32_t i = 0; i < 8; i++) {
         cb &= write_register(AD7147_REG_PWR_CONTROL + i, &reg_data[i * 2], 2);
         if (i == 1) cb = true;  // 允许ADDR 1失败
         ret &= cb;

@@ -470,7 +470,7 @@ void NeoPixel::update_chase_animation() {
     set_pixel(pos, current_animation_.color1);
     
     // 添加尾迹效果
-    for (int i = 1; i <= 3; i++) {
+    for (int32_t i = 1; i <= 3; i++) {
         uint16_t tail_pos = (pos - i + num_leds_) % num_leds_;
         NeoPixel_Color tail_color = current_animation_.color1;
         tail_color.r >>= i;

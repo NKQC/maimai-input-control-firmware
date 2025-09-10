@@ -15,7 +15,7 @@ HAL_PIO0* HAL_PIO0::getInstance() {
 }
 
 HAL_PIO0::HAL_PIO0() : initialized_(false) {
-    for (int i = 0; i < 4; i++) {
+    for (int32_t i = 0; i < 4; i++) {
         sm_claimed_[i] = false;
     }
 }
@@ -44,7 +44,7 @@ bool HAL_PIO0::init(uint8_t gpio_pin) {
 void HAL_PIO0::deinit() {
     if (initialized_) {
         // 释放所有占用的状态机
-        for (int i = 0; i < 4; i++) {
+        for (int32_t i = 0; i < 4; i++) {
             if (sm_claimed_[i]) {
                 unclaim_sm(i);
             }
@@ -74,7 +74,7 @@ void HAL_PIO0::unload_program(const pio_program_t* program, uint8_t offset) {
 bool HAL_PIO0::claim_sm(uint8_t* sm) {
     if (!initialized_) return false;
     
-    int claimed_sm = pio_claim_unused_sm(pio0, false);
+    int32_t claimed_sm = pio_claim_unused_sm(pio0, false);
     if (claimed_sm == -1) {
         return false;
     }
@@ -188,7 +188,7 @@ HAL_PIO1* HAL_PIO1::getInstance() {
 }
 
 HAL_PIO1::HAL_PIO1() : initialized_(false) {
-    for (int i = 0; i < 4; i++) {
+    for (int32_t i = 0; i < 4; i++) {
         sm_claimed_[i] = false;
     }
 }
@@ -217,7 +217,7 @@ bool HAL_PIO1::init(uint8_t gpio_pin) {
 void HAL_PIO1::deinit() {
     if (initialized_) {
         // 释放所有占用的状态机
-        for (int i = 0; i < 4; i++) {
+        for (int32_t i = 0; i < 4; i++) {
             if (sm_claimed_[i]) {
                 unclaim_sm(i);
             }
@@ -247,7 +247,7 @@ void HAL_PIO1::unload_program(const pio_program_t* program, uint8_t offset) {
 bool HAL_PIO1::claim_sm(uint8_t* sm) {
     if (!initialized_) return false;
     
-    int claimed_sm = pio_claim_unused_sm(pio1, false);
+    int32_t claimed_sm = pio_claim_unused_sm(pio1, false);
     if (claimed_sm == -1) {
         return false;
     }

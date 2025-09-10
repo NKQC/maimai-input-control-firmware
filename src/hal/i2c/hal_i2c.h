@@ -50,10 +50,10 @@ public:
     bool is_busy() const;
     
     // 写入寄存器 REG & 0x8000 时 锁定16位发送 否则根据是否满9位地址判断发送8或16位
-    int write_register(uint8_t address, uint16_t reg, uint8_t* value, uint8_t length);
+    int32_t write_register(uint8_t address, uint16_t reg, uint8_t* value, uint8_t length);
     
     // 读取寄存器 REG & 0x8000 时 锁定16位发送 否则根据是否满9位地址判断发送8或16位
-    int read_register(uint8_t address, uint16_t reg, uint8_t* value, uint8_t length);
+    int32_t read_register(uint8_t address, uint16_t reg, uint8_t* value, uint8_t length);
 
     // 检查设备是否存在
     bool device_exists(uint8_t address);
@@ -75,8 +75,8 @@ protected:
     uint8_t scl_pin_;
     bool dma_busy_;
     dma_callback_t dma_callback_;
-    int dma_tx_channel_;
-    int dma_rx_channel_;
+    int32_t dma_tx_channel_;
+    int32_t dma_rx_channel_;
     
     // DMA回调函数指针
     void (*tx_dma_callback_)(bool);

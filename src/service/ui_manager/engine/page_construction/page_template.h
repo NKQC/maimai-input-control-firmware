@@ -253,49 +253,49 @@ public:
     
     // 基础方法
     void set_title(const std::string& title, Color color = COLOR_WHITE);
-    void set_line(int line_index, const LineConfig& config);  // line_index: 0-3 (对应第2-5行)
+    void set_line(int32_t line_index, const LineConfig& config);  // line_index: 0-3 (对应第2-5行)
     void set_lines(const std::vector<LineConfig>& lines);
     void set_all_lines(const std::vector<LineConfig>& lines);  // 设置所有行（支持滚动）
 
     // 清理方法
     void flush();     // 清空行缓存但保留滚动状态，用于页面刷新
     void clear();     // 完全清空所有状态，仅在换页面时使用
-    void clear_line(int line_index);
+    void clear_line(int32_t line_index);
     
     // 绘制页面
     void draw();
     void draw_background(Color bg_color = COLOR_BG_DARK);
     
     // 菜单相关功能
-    void set_selected_index(int index);
+    void set_selected_index(int32_t index);
     
     // 滚动功能
     bool scroll_up();     // 向上滚动
     bool scroll_down();   // 向下滚动
     bool is_scroll_enabled() const { return scroll_enabled_; }
-    int get_selected_index() const { return selected_menu_index_; }
+    int32_t get_selected_index() const { return selected_menu_index_; }
     
     // 页面状态保存和恢复
-    int get_scroll_position() const { return scroll_bar_.get_display_start_index(); }
-    void set_scroll_position(int position) { 
+    int32_t get_scroll_position() const { return scroll_bar_.get_display_start_index(); }
+    void set_scroll_position(int32_t position) { 
         if (scroll_enabled_) {
             scroll_bar_.set_display_start_index(position);
         }
     }
     
     // 设置可见区域的最后一行（让滚动跟随光标）
-    void set_visible_end_line(int target_line_index);
+    void set_visible_end_line(int32_t target_line_index);
     
     // 数据访问方法
     const std::vector<LineConfig>& get_all_lines() const { return all_lines_; }
     std::vector<LineConfig>& get_mutable_all_lines() { return all_lines_; }
-    int get_scroll_start_index() const { return scroll_bar_.get_display_start_index(); }
-    int get_visible_lines_count() const { return visible_lines_count_; }
+    int32_t get_scroll_start_index() const { return scroll_bar_.get_display_start_index(); }
+    int32_t get_visible_lines_count() const { return visible_lines_count_; }
     
-    int get_menu_item_count() const {
+    int32_t get_menu_item_count() const {
         // 统一使用all_lines_管理所有行内容
         const auto& target_lines = all_lines_;
-        int count = 0;
+        int32_t count = 0;
         for (const auto& line : target_lines) {
             // 只计算可交互的菜单项，不包括普通文本
             if (!line.text.empty() && 
@@ -311,7 +311,7 @@ public:
     }
     
     // 获取行配置
-    const LineConfig& get_line_config(int line_index) const {
+    const LineConfig& get_line_config(int32_t line_index) const {
         if (!all_lines_.empty() && line_index >= 0 && line_index < (int)all_lines_.size()) {
             return all_lines_[line_index];
         }
@@ -320,10 +320,10 @@ public:
     }
     
     // 进度条功能
-    void set_progress(int line_index, float progress, const std::string& text = "");
+    void set_progress(int32_t line_index, float progress, const std::string& text = "");
     
     // 状态指示器
-    void show_status_indicator(int line_index, Color color, bool filled = true);
+    void show_status_indicator(int32_t line_index, Color color, bool filled = true);
     
     // 分屏显示支持
     void enable_split_screen(bool enable) { split_screen_enabled_ = enable; }
@@ -346,10 +346,10 @@ public:
     const std::vector<LineConfig>& get_right_lines() const { return right_lines_; }
     
     // 工具函数
-    static int16_t get_line_y_position(int line_index);     // 获取行的Y坐标
-    static Rect get_line_rect(int line_index);              // 获取行的矩形区域
-    Rect get_split_left_rect(int line_index);               // 获取左半屏行区域
-    Rect get_split_right_rect(int line_index);              // 获取右半屏行区域
+    static int16_t get_line_y_position(int32_t line_index);     // 获取行的Y坐标
+    static Rect get_line_rect(int32_t line_index);              // 获取行的矩形区域
+    Rect get_split_left_rect(int32_t line_index);               // 获取左半屏行区域
+    Rect get_split_right_rect(int32_t line_index);              // 获取右半屏行区域
     
 private:
     GraphicsEngine* graphics_engine_;
@@ -362,10 +362,10 @@ private:
     // 状态跟踪变量
     static bool has_title_;          // 是否设置了标题
     static bool has_split_screen_;   // 是否启用分屏模式
-    int visible_lines_count_; // 当前可见行数缓存
+    int32_t visible_lines_count_; // 当前可见行数缓存
 
     // 选中状态
-    int selected_menu_index_;
+    int32_t selected_menu_index_;
     
     // 滚动条支持
     ui::ScrollBar scroll_bar_;
@@ -382,22 +382,22 @@ private:
     
     // 内部绘制函数
     void draw_title();
-    void draw_line(int line_index, const LineConfig& config);
+    void draw_line(int32_t line_index, const LineConfig& config);
     void draw_split_screen();
     
     // 新的渲染方法
-    void draw_text_item(int line_index, const LineConfig& config);
-    void draw_status_line(int line_index, const LineConfig& config);
-    void draw_menu_jump(int line_index, const LineConfig& config);
-    void draw_progress_bar(int line_index, const LineConfig& config);
-    void draw_int_setting(int line_index, const LineConfig& config);
-    void draw_button_item(int line_index, const LineConfig& config);
-    void draw_back_item(int line_index, const LineConfig& config);
-    void draw_selector_item(int line_index, const LineConfig& config);
+    void draw_text_item(int32_t line_index, const LineConfig& config);
+    void draw_status_line(int32_t line_index, const LineConfig& config);
+    void draw_menu_jump(int32_t line_index, const LineConfig& config);
+    void draw_progress_bar(int32_t line_index, const LineConfig& config);
+    void draw_int_setting(int32_t line_index, const LineConfig& config);
+    void draw_button_item(int32_t line_index, const LineConfig& config);
+    void draw_back_item(int32_t line_index, const LineConfig& config);
+    void draw_selector_item(int32_t line_index, const LineConfig& config);
 
     // 辅助方法
     int16_t get_text_x_position(const std::string& text, LineAlign align, const Rect& rect);
-    void draw_selection_indicator(int line_index);
+    void draw_selection_indicator(int32_t line_index);
 };
 
 #endif // PAGE_TEMPLATE_H

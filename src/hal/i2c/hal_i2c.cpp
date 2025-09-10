@@ -79,18 +79,18 @@ void HAL_I2C::deinit() {
 bool HAL_I2C::write(uint8_t address, const uint8_t* data, size_t length) {
     if (!initialized_) return false;
     
-    int result = i2c_write_blocking(i2c_instance_, address, data, length, false);
+    int32_t result = i2c_write_blocking(i2c_instance_, address, data, length, false);
     return result == (int)length;
 }
 
 bool HAL_I2C::read(uint8_t address, uint8_t* buffer, size_t length) {
     if (!initialized_) return false;
     
-    int result = i2c_read_blocking(i2c_instance_, address, buffer, length, false);
+    int32_t result = i2c_read_blocking(i2c_instance_, address, buffer, length, false);
     return result == (int)length;
 }
 
-int HAL_I2C::write_register(uint8_t address, uint16_t reg, uint8_t* value, uint8_t length) {
+int32_t HAL_I2C::write_register(uint8_t address, uint16_t reg, uint8_t* value, uint8_t length) {
     if (!initialized_) return false;
     uint8_t reg_size = reg & 0xFF00 ? 2 : reg & 0x8000 ? 2 : 1;
     uint8_t data[length + reg_size];
@@ -103,7 +103,7 @@ int HAL_I2C::write_register(uint8_t address, uint16_t reg, uint8_t* value, uint8
     return i2c_write_blocking(i2c_instance_, address, data, length + reg_size, false) - reg_size;
 }
 
-int HAL_I2C::read_register(uint8_t address, uint16_t reg, uint8_t* value, uint8_t length) {
+int32_t HAL_I2C::read_register(uint8_t address, uint16_t reg, uint8_t* value, uint8_t length) {
     if (!initialized_) return false;
     uint8_t reg_size = reg & 0xFF00 ? 2 : reg & 0x8000 ? 2 : 1;
     uint8_t data[2];
@@ -120,7 +120,7 @@ bool HAL_I2C::device_exists(uint8_t address) {
     if (!initialized_) return false;
     
     uint8_t dummy;
-    int result = i2c_read_blocking(i2c_instance_, address, &dummy, 1, false);
+    int32_t result = i2c_read_blocking(i2c_instance_, address, &dummy, 1, false);
     return result >= 0;
 }
 

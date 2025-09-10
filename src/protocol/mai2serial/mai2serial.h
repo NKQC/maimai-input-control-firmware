@@ -3,8 +3,8 @@
 #include <string>
 #include "src/hal/uart/hal_uart.h"
 
-// 固定长度命令包格式: { L R c v }
-#define MAI2SERIAL_COMMAND_LENGTH 8
+// 固定长度命令包格式: { L R c v }  不管分隔符
+#define MAI2SERIAL_COMMAND_LENGTH 6
 #define MAI2SERIAL_CMD_START_BYTE '{'
 #define MAI2SERIAL_CMD_END_BYTE   '}'
 
@@ -124,7 +124,7 @@ public:
     };
 
     // 数据发送
-    bool send_touch_data(Mai2Serial_TouchState& touch_data);
+    void send_touch_data(Mai2Serial_TouchState& touch_data);
     void send_command_response(uint8_t lr, uint8_t sensor, uint8_t cmd, uint8_t value);
 
     // 状态
@@ -144,12 +144,17 @@ private:
     void process_received_byte(const std::string& command_str);
     void parse_command(const std::string& command_str);
     void process_command_packet(const uint8_t* packet, size_t length);
+    void calculate_packet_transmission_time();  // 计算数据包传输时间
 
     HAL_UART* uart_hal_;
     bool initialized_;
     bool serial_ok_;
     Mai2Serial_Config config_;
     Status status_;
+    
+    // 流控相关成员变量
+    uint32_t packet_transmission_time_us_;  // 单个数据包传输时间(微秒)
+    uint32_t next_send_time_us_;           // 下次发送时间戳(微秒)
 
     // 新增：流式接收缓冲区（4倍固定长度，滑动窗口解析）
     uint8_t rx_stream_buffer_[MAI2SERIAL_STREAM_BUFFER_SIZE];

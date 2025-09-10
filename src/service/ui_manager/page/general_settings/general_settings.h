@@ -39,7 +39,7 @@ private:
      * 息屏超时值变化回调
      * @param new_value 新的超时值（秒）
      */
-    static void on_screen_timeout_changed(int new_value);
+    static void on_screen_timeout_changed(int32_t new_value);
     
     /**
      * 息屏超时值设置完成回调
@@ -50,7 +50,7 @@ private:
      * 亮度值变化回调
      * @param new_value 新的亮度值（0-255）
      */
-    static void on_brightness_changed(int new_value);
+    static void on_brightness_changed(int32_t new_value);
     
     /**
      * 亮度值设置完成回调
