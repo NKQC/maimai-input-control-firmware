@@ -450,6 +450,7 @@ void InputManager::task0()
         if (binding_hardware_ops_pending_)
         {
             enableAllChannels();
+            clearSerialMappings();
             binding_hardware_ops_pending_ = false;
         }
         processBinding();
@@ -1060,6 +1061,18 @@ void InputManager::enableMappedChannels()
             device->setChannelEnabled(ch, enabled);
         }
     }
+}
+
+// 清空当前绑区的串口映射
+void InputManager::clearSerialMappings()
+{
+    // 清空所有串口映射，将所有区域设置为未映射状态
+    for (int area_idx = 0; area_idx < 34; area_idx++)
+    {
+        static_config_.area_channel_mappings.serial_mappings[area_idx].channel = 0xFFFFFFFF; // 0xFFFFFFFF表示未映射
+    }
+    
+    log_info("Serial mappings cleared");
 }
 
 void InputManager::updateChannelStatesAfterBinding()

@@ -383,6 +383,7 @@ public:
     // 通道控制接口
     void enableAllChannels();   // 启用所有通道(绑定时使用)
     void enableMappedChannels(); // 仅启用已映射的通道
+    void clearSerialMappings();  // 清空当前绑区的串口映射
     void updateChannelStatesAfterBinding();  // 绑定后更新通道状态
     
     // 性能监控
