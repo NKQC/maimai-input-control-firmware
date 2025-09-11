@@ -60,7 +60,7 @@
 #define AD7147_STAGE_OFFSET_LOW_CLAMP_OFFSET 7  // 低偏移钳位寄存器偏移
 
 // 灵敏度寄存器默认值
-#define AD7147_SENSITIVITY_DEFAULT 0x4949 // 默认灵敏度值
+#define AD7147_SENSITIVITY_DEFAULT 0x5F5F // 默认灵敏度值
 #define AD7147_DEFAULT_AFE_OFFSET 0x0000  // AFE偏移默认值
 
 // 阶段配置相关常量
@@ -77,16 +77,19 @@
 #define AD7147_STAGE11_CONNECTION 0x00D8 // Stage 11连接寄存器
 
 // 阶段配置默认值
-#define AD7147_DEFAULT_OFFSET_LOW 0x2000        // 默认低偏移值
-#define AD7147_DEFAULT_OFFSET_HIGH 0x2000       // 默认高偏移值
-#define AD7147_DEFAULT_OFFSET_LOW_CLAMP 0x7000  // 默认低偏移钳位值
-#define AD7147_DEFAULT_OFFSET_HIGH_CLAMP 0x7000 // 默认高偏移钳位值
+#define AD7147_DEFAULT_OFFSET_LOW 0x3000        // 默认低偏移值
+#define AD7147_DEFAULT_OFFSET_HIGH 0x3000       // 默认高偏移值
+#define AD7147_DEFAULT_OFFSET_LOW_CLAMP 0x3400  // 默认低偏移钳位值
+#define AD7147_DEFAULT_OFFSET_HIGH_CLAMP 0x3400 // 默认高偏移钳位值
 #define AD7147_CDC_BASELINE 0x8000              // CDC基准值，用于显示计算
 
-#define CALIBRATION_STAGE1_SCAN_RANGEA 0  //A -> B
-#define CALIBRATION_STAGE1_SCAN_RANGEB -100
-#define CALIBRATION_SAMPLE_COUNT 5000 // 自动校准单轮采样次数
-#define CALIBRATION_AEF_SAVE_AREA -2  // AEF完成时额外偏置保留区域 预留缓冲空间防止意外触发
+#define AD7147_CALIBRATION_TARGET_VALUE (AD7147_DEFAULT_OFFSET_HIGH_CLAMP)
+
+#define CALIBRATION_STAGE1_SCAN_RANGEA -5  //A -> B
+#define CALIBRATION_STAGE1_SCAN_RANGEB -127
+#define CALIBRATION_SCAN_SAMPLE_COUNT 300 // 自动校准单轮采样次数
+#define CALIBRATION_MEASURE_SAMPLE_COUNT 200000
+#define CALIBRATION_AEF_SAVE_AREA 0  // AEF完成时额外偏置保留区域 预留缓冲空间防止意外触发
 
 // 设备信息结构体
 struct AD7147_DeviceInfo
@@ -356,7 +359,6 @@ public:
     // 自动偏移校准：供UI调用
     bool startAutoOffsetCalibration();
     bool isAutoOffsetCalibrationActive() const;
-    uint8_t getAutoOffsetCalibrationProgress() const;
     uint8_t getAutoOffsetCalibrationTotalProgress() const; // 新增：全局总进度
 
     // 设备信息读取
@@ -480,15 +482,15 @@ private:
         uint8_t stage_process = 0;
 
         bool inited_ = false;
-        uint8_t stage_index_ = 0; // 当前校准的stage [0..11]
         
-        // 阶段1：扫频寻找震荡点（触发与非触发最接近50%）
-        bool s1_inited_ = false;
-        int16_t s1_aef_ = CALIBRATION_STAGE1_SCAN_RANGEA;       // 当前扫描AEF -127..127
-        int16_t s1_best_aef_ = 0;     // 阶段1找到的最佳AEF
-        uint32_t s1_best_ratio_ = 2147483647;  // 阶段1最佳触发比例
-        bool has_jump_point = false;
-        TriggleSample trig_res_;      // 阶段1采样累积
+        // 阶段1：扫频寻找震荡点（触发与非触发最接近50%）- 多通道并行处理
+        bool s1_inited_[AD7147_MAX_CHANNELS] = {false};  // 每个通道的初始化状态
+        int16_t s1_aef_[AD7147_MAX_CHANNELS];            // 每个通道当前扫描AEF -127..127
+        int16_t s1_best_aef_[AD7147_MAX_CHANNELS] = {0}; // 每个通道阶段1找到的最佳AEF
+        CDCSample_result cdc_samples_[AD7147_MAX_CHANNELS]; // 每个通道CDC采样结果
+        uint16_t max_fluctuation_[AD7147_MAX_CHANNELS] = {0}; // 每个通道最大波动差
+        TriggleSample trigger_samples_[AD7147_MAX_CHANNELS]; // 每个通道触发采样结果
+        bool global_initialized_ = false;               // 全局初始化标志，用于一次性初始化所有通道
 
         bool start_calibration()
         {
@@ -503,16 +505,16 @@ private:
 
         // 工具方法
         // 清空设置到校准所需值
-        void Clear_and_prepare_stage_settings(uint8_t stage);
+        void Clear_and_prepare_stage_settings();
         // 完成时恢复校准
         void Complete_and_restore_calibration();
         // 直接设置AEF偏移 已内置正负翻转 0-127
-        void Set_AEF_Offset(uint8_t stage, int8_t offset);
+        void Set_AEF_Offset(uint8_t stage, int16_t offset);
 
-        // [执行一次采样一次 到目标周期返回True] 读取CDC值 50次采样 计算平均值 最大值和最小值
-        bool Read_CDC_Sample(uint8_t stage, CDCSample_result &result);
-        // [执行一次采样一次 直接解析sample中的采样数据 sample应当通过外部直接传入循环中的采样结果原始值 到目标周期返回True] 读取触发值 50次采样 计算触发和未触发次数
-        bool Read_Triggle_Sample(uint8_t stage, uint32_t sample, TriggleSample &result);
+        // [执行一次采样一次 到目标周期返回True] 读取CDC值 计算平均值 最大值和最小值
+        bool Read_CDC_Sample(uint8_t stage, CDCSample_result &result, bool measure);
+        // [执行一次采样一次 直接解析sample中的采样数据 sample应当通过外部直接传入循环中的采样结果原始值 到目标周期/验证时为触发 返回True] 读取触发值 计算触发和未触发次数
+        bool Read_Triggle_Sample(uint8_t stage, uint32_t sample, TriggleSample &result, bool measure);
     };
 
     CalibrationTools calibration_tools_;

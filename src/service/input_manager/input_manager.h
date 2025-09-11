@@ -293,28 +293,7 @@ public:
     void calibrateAllSensors();                        // 校准所有支持校准的传感器
     uint8_t getCalibrationProgress();                  // 获取校准进度 (0-255范围)
     
-    // 异常通道检测结构体 - 精简版，只传递必要数据
-    struct AbnormalChannelInfo {
-        uint32_t device_and_channel_mask; // 高8位为设备ID，低24位为异常通道掩码
-        
-        AbnormalChannelInfo() : device_and_channel_mask(0) {}
-        AbnormalChannelInfo(uint32_t mask) : device_and_channel_mask(mask) {}
-        
-        // 辅助方法
-        uint8_t getDeviceId() const { return (device_and_channel_mask >> 24) & 0xFF; }
-        uint32_t getChannelMask() const { return device_and_channel_mask & 0xFFFFFF; }
-    };
-    
-    // 异常通道检测结果 - 使用静态预分配数组
-    struct AbnormalChannelResult {
-        AbnormalChannelInfo devices[MAX_TOUCH_DEVICE];  // 预分配设备数组
-        uint8_t device_count;                           // 实际设备数量
-        
-        AbnormalChannelResult() : device_count(0) {}
-    };
-    
-    // 收集所有支持校准设备的异常通道 - 使用静态预分配
-    AbnormalChannelResult collectAbnormalChannels();
+
     
     // 根据设备ID掩码获取设备名称 - UI显示时调用
     std::string getDeviceNameByMask(uint32_t device_and_channel_mask) const;
@@ -478,8 +457,6 @@ private:
     bool binding_hardware_ops_pending_;      // 绑定硬件操作待执行标志
     bool binding_cancel_pending_;            // 绑定取消操作待执行标志
     bool original_channels_backup_[8][12];   // 原始通道启用状态备份
-    
-    // HID绑定相关变量
 
     // 校准管理相关变量
     bool calibration_request_pending_;       // 校准请求待处理标志

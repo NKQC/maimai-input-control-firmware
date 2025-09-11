@@ -29,7 +29,6 @@ private:
 
     static bool calibration_in_progress_;     // 校准是否正在进行
     static bool calibration_completed_;       // 校准是否已完成
-    static InputManager::AbnormalChannelResult abnormal_channels_;  // 异常通道检测结果
 
     /**
      * 格式化触摸IC地址为字符串

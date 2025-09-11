@@ -54,7 +54,7 @@ bool AD7147::init() {
     register_config_.pwr_control.bits.sw_reset = 0;
     register_config_.pwr_control.bits.int_pol = 0;
     register_config_.pwr_control.bits.ext_source = 0;
-    register_config_.pwr_control.bits.cdc_bias = 1;
+    register_config_.pwr_control.bits.cdc_bias = 3;
     ret &= configureStages(nullptr);
 
     initialized_ = ret;
@@ -549,27 +549,9 @@ bool AD7147::isAutoOffsetCalibrationActive() const {
     return initialized_ && (calibration_tools_.calibration_state_ != AD7147::CalibrationTools::IDLE);
 }
 
-uint8_t AD7147::getAutoOffsetCalibrationProgress() const {
-    // 保持现有阶段进度的映射，不改变现有显示逻辑
-    return calibration_tools_.stage_process;
-}
-
-
 uint8_t AD7147::getAutoOffsetCalibrationTotalProgress() const {
-    // 未运行且未完成
-    if (calibration_tools_.calibration_state_ == AD7147::CalibrationTools::IDLE) {
-        return (calibration_tools_.stage_index_ >= AD7147_MAX_CHANNELS) ? 255 : 0;
-    }
-
-    // 已完成的stage数量=当前正在处理的stage索引
-    uint8_t completed = calibration_tools_.stage_index_;
-    // 当前stage内进度，沿用阶段映射（20/60/80/95）
-    uint8_t stage_phase_progress = getAutoOffsetCalibrationProgress();
-
-    // 总进度 = (已完成stage数*100 + 当前stage内进度) / 总stage数
-    uint16_t accum = static_cast<uint16_t>(completed) * 255u + static_cast<uint16_t>(stage_phase_progress);
-    uint8_t total = static_cast<uint8_t>(accum / AD7147_MAX_CHANNELS);
-    return total;
+    // 运行中时，直接返回CalibrationLoop中计算的平均进度
+    return calibration_tools_.stage_process;
 }
 
 // TouchSensor基类虚函数实现

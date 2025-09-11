@@ -26,7 +26,12 @@ void MainPage::render(PageTemplate& page_template) {
     // 主界面页面 - 使用页面构造宏简化代码
     PAGE_START()
     SET_TITLE("主界面", COLOR_WHITE)
-    
+    if (!input_manager->getTouchSampleRate()) {
+        ADD_TEXT("I2C Bus ERROR", COLOR_ERROR, LineAlign::CENTER)
+        ADD_TEXT("Reboot NOW", COLOR_ERROR, LineAlign::CENTER)
+        PAGE_END()
+        return;
+    }
     // 第一行：触摸轮询回报率
     std::string touch_rate_text = "触摸轮询: ";
     if (input_manager) {

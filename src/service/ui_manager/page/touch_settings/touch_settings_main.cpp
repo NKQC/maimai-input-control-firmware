@@ -12,7 +12,6 @@ int32_t TouchSettingsMain::delay_value = 0;
 uint8_t TouchSettingsMain::progress = 0;
 bool TouchSettingsMain::calibration_in_progress_ = false;
 bool TouchSettingsMain::calibration_completed_ = false;
-InputManager::AbnormalChannelResult TouchSettingsMain::abnormal_channels_;
 
 TouchSettingsMain::TouchSettingsMain() {
     // 构造函数无需特殊初始化
@@ -31,60 +30,17 @@ void TouchSettingsMain::render(PageTemplate& page_template) {
         InputManager* input_manager = InputManager::getInstance();
         progress = input_manager->getCalibrationProgress();
         if (progress == 255) {
-            // 校准完成，收集异常通道
+            // 校准完成
             calibration_in_progress_ = false;
             calibration_completed_ = true;
-            abnormal_channels_ = input_manager->collectAbnormalChannels();
         } else {
             // 显示进度条
             ADD_TEXT("校准进度", COLOR_YELLOW, LineAlign::CENTER)
             ADD_PROGRESS(&progress, COLOR_YELLOW)
         }
     } else if (calibration_completed_) {
-        // 校准完成，显示异常通道
-        if (abnormal_channels_.device_count == 0) {
-            ADD_TEXT("校准完成 所有通道正常", COLOR_GREEN, LineAlign::CENTER)
-        } else {
-            ADD_TEXT("校准完成 发现异常通道:", COLOR_RED, LineAlign::CENTER)
-            for (uint8_t i = 0; i < abnormal_channels_.device_count; i++) {
-                const auto& abnormal_info = abnormal_channels_.devices[i];
-                // 显示异常设备信息 - 通过InputManager获取设备名称
-                InputManager* input_manager = InputManager::getInstance();
-                std::string device_name = input_manager->getDeviceNameByMask(abnormal_info.device_and_channel_mask);
-                uint8_t device_id = abnormal_info.getDeviceId();
-                std::string device_info = device_name + ": " + format_device_address(device_id);
-                ADD_TEXT(device_info, COLOR_RED, LineAlign::LEFT)
-                
-                // 显示异常通道编号列表，每行5个编号，居中显示
-                uint32_t channel_mask = abnormal_info.getChannelMask();
-                std::string channel_line = "异常通道: ";
-                int channels_in_line = 0;
-                bool first_channel = true;
-                
-                for (uint8_t ch = 0; ch < 24; ch++) {
-                    if (channel_mask & (1UL << ch)) {
-                        if (!first_channel) {
-                            if (channels_in_line >= 5) {
-                                // 当前行已满5个，输出并开始新行
-                                ADD_TEXT(channel_line, COLOR_RED, LineAlign::CENTER)
-                                channel_line = "          ";  // 缩进对齐
-                                channels_in_line = 0;
-                            } else {
-                                channel_line += " ";
-                            }
-                        }
-                        channel_line += std::to_string(ch);
-                        channels_in_line++;
-                        first_channel = false;
-                    }
-                }
-                
-                if (!first_channel) {
-                    ADD_TEXT(channel_line, COLOR_RED, LineAlign::CENTER)
-                }
-            }
-        }
-        // 重置校准状态的按钮（隐式，通过重新进入页面实现）
+        // 校准完成
+        ADD_TEXT("校准完成", COLOR_GREEN, LineAlign::CENTER)
     } else {
         // 未开始校准，显示校准按钮
         ADD_BUTTON("校准全部传感器", onCalibrateButtonPressed, COLOR_TEXT_WHITE, LineAlign::CENTER)
@@ -180,7 +136,7 @@ void TouchSettingsMain::onCalibrateButtonPressed() {
         input_manager->calibrateAllSensors();
         calibration_in_progress_ = true;
         calibration_completed_ = false;
-        abnormal_channels_.device_count = 0;  // 清空异常通道检测结果
+        // 清空状态
     }
 }
 

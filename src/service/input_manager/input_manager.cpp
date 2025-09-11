@@ -1593,6 +1593,8 @@ void InputManager::processSerialBinding()
 {
     static uint8_t binding_device_addr = 0;
     static uint8_t binding_channel = 0;
+    static uint8_t initial_binding_device_addr = 0;  // 记录初始触摸的设备
+    static uint8_t initial_binding_channel = 0;      // 记录初始触摸的通道
 
     switch (binding_state_)
     {
@@ -1654,10 +1656,23 @@ void InputManager::processSerialBinding()
         if (touch_count == 1)
         {
             uint32_t current_time = to_ms_since_boot(get_absolute_time());
-            if (current_time - binding_start_time_ >= 1000)
-            {   // 持续1秒
+            
+            // 检查是否是第一次检测到触摸，或者是否是同一个设备和通道
+            if (current_time - binding_start_time_ < 100) // 前100ms内记录初始触摸
+            {
+                initial_binding_device_addr = touched_device_id;
+                initial_binding_channel = touched_channel;
+            }
+            else if (touched_device_id != initial_binding_device_addr || touched_channel != initial_binding_channel)
+            {
+                // 触摸的设备或通道发生变化，重置计时器（防止狸猫换太子）
+                binding_start_time_ = to_ms_since_boot(get_absolute_time());
+                initial_binding_device_addr = touched_device_id;
+                initial_binding_channel = touched_channel;
+            }
+            else if (current_time - binding_start_time_ >= 1000)
+            {   // 持续1秒且始终是同一个设备和通道
                 // 记录触摸的通道ID并切换到处理状态
-                // 记录触摸的设备和通道信息
                 binding_device_addr = touched_device_id;
                 binding_channel = touched_channel;
                 binding_state_ = BindingState::PROCESSING;
@@ -1667,6 +1682,8 @@ void InputManager::processSerialBinding()
         {
             // 重置计时器（没有触摸或多个触摸）
             binding_start_time_ = to_ms_since_boot(get_absolute_time());
+            initial_binding_device_addr = 0;
+            initial_binding_channel = 0;
         }
     }
     break;
@@ -1990,7 +2007,7 @@ inline void InputManager::storeDelayedSerialState()
              if (channel == 0xFFFFFFFF) continue;
             
             // 优化位运算检查
-            if ((touch_device_states_[i].current_touch_mask & channel) == channel)
+            if ((touch_device_states_[i].current_touch_mask & (channel | 0xFF000000)) == channel)
             {
                 // 直接位操作，避免额外计算
                 if (area_idx < 32)
@@ -2000,7 +2017,6 @@ inline void InputManager::storeDelayedSerialState()
             }
         }
     }
-    log_debug("AREA: " + std::to_string(serial_state.raw));
     // 直接赋值到缓冲区，减少中间变量
     DelayedSerialState &buffer_entry = delay_buffer_[delay_buffer_head_];
     buffer_entry.timestamp_us = current_time_us;
@@ -2082,72 +2098,35 @@ void InputManager::calibrateAllSensors()
 
 void InputManager::processCalibrationRequest()
 {
-    static bool calibration_started = false;
-    static int current_calibration_index = -1;  // 当前校准设备索引
-    static std::vector<TouchSensor*> calibration_sensors;  // 支持校准的传感器列表
+    log_info("Starting simultaneous calibration for all sensors");
     
-    // 如果是新的校准请求，初始化顺序校准
-    if (!calibration_started) {
-        log_info("Starting sequential calibration for all sensors");
-        
-        // 收集所有支持校准的传感器
-        calibration_sensors.clear();
-        for (TouchSensor *sensor : touch_sensor_devices_) {
-            if (sensor && sensor->supports_calibration_) {
-                calibration_sensors.push_back(sensor);
-            }
+    // 收集所有支持校准的传感器
+    std::vector<TouchSensor*> calibration_sensors;
+    for (TouchSensor *sensor : touch_sensor_devices_) {
+        if (sensor && sensor->supports_calibration_) {
+            calibration_sensors.push_back(sensor);
         }
-        
-        if (calibration_sensors.empty()) {
-            log_info("No sensors support calibration");
-            calibration_request_pending_ = false;
-            return;
-        }
-        
-        // 启动第一个传感器的校准
-        current_calibration_index = 0;
-        calibration_started = true;
-        
-        TouchSensor *first_sensor = calibration_sensors[0];
-        log_info("Starting calibration for sensor [1/" + std::to_string(calibration_sensors.size()) + "]: " + first_sensor->getDeviceName());
-        first_sensor->calibrateSensor();
+    }
+    
+    if (calibration_sensors.empty()) {
+        log_info("No sensors support calibration");
+        calibration_request_pending_ = false;
         return;
     }
     
-    // 检查当前校准设备的进度
-    if (current_calibration_index >= 0 && current_calibration_index < static_cast<int>(calibration_sensors.size())) {
-        TouchSensor *current_sensor = calibration_sensors[current_calibration_index];
-        uint8_t progress = current_sensor->getCalibrationProgress();
-        
-        // 如果当前设备校准完成，启动下一个设备
-        if (progress >= 255) {
-            log_info("Calibration completed for sensor: " + current_sensor->getDeviceName());
-            current_calibration_index++;
-            
-            // 检查是否还有下一个设备需要校准
-            if (current_calibration_index < static_cast<int>(calibration_sensors.size())) {
-                TouchSensor *next_sensor = calibration_sensors[current_calibration_index];
-                log_info("Starting calibration for sensor [" + std::to_string(current_calibration_index + 1) + "/" + std::to_string(calibration_sensors.size()) + "]: " + next_sensor->getDeviceName());
-                next_sensor->calibrateSensor();
-            } else {
-                // 所有设备校准完成
-                calibration_request_pending_ = false;
-                calibration_started = false;
-                current_calibration_index = -1;
-                calibration_sensors.clear();
-                log_info("All sensor calibration completed sequentially");
-            }
-        }
+    // 同时启动所有传感器的校准
+    for (TouchSensor *sensor : calibration_sensors) {
+        log_info("Starting calibration for sensor: " + sensor->getDeviceName());
+        sensor->calibrateSensor();
     }
+    
+    // 校准已发起，清除请求标志并退出，让传感器自行完成校准工作
+    log_info("Calibration initiated for all sensors, sensors will complete calibration independently");
+    calibration_request_pending_ = false;
 }
 
 uint8_t InputManager::getCalibrationProgress()
 {
-    // 如果没有校准请求，返回255表示完成
-    if (!calibration_request_pending_) {
-        return 255;
-    }
-    
     // 收集所有支持校准的传感器
     std::vector<TouchSensor*> calibration_sensors;
     for (TouchSensor *sensor : touch_sensor_devices_) {
@@ -2161,77 +2140,37 @@ uint8_t InputManager::getCalibrationProgress()
         return 255;
     }
     
-    // 在顺序校准模式下计算整体进度
-    // 找到当前正在校准的设备索引（第一个未完成的设备）
-    int active_calibration_index = -1;
-    for (int i = 0; i < static_cast<int>(calibration_sensors.size()); i++) {
-        uint8_t progress = calibration_sensors[i]->getCalibrationProgress();
+    // 计算所有传感器的平均进度
+    uint32_t total_progress = 0;
+    uint32_t sensor_count = 0;
+    bool any_calibrating = false;
+    
+    for (TouchSensor *sensor : calibration_sensors) {
+        uint8_t progress = sensor->getCalibrationProgress();
+        total_progress += progress;
+        sensor_count++;
+        
+        // 如果任何传感器的进度小于255，说明还在校准中
         if (progress < 255) {
-            active_calibration_index = i;
-            break;
+            any_calibrating = true;
         }
     }
     
-    // 如果所有设备都已完成，返回255表示完成
-    if (active_calibration_index == -1) {
+    // 如果没有传感器，返回255表示完成
+    if (sensor_count == 0) {
         return 255;
     }
     
-    // 计算整体进度：已完成设备数 * 255 + 当前设备进度
-    uint32_t completed_devices = active_calibration_index;
-    uint8_t current_device_progress = calibration_sensors[active_calibration_index]->getCalibrationProgress();
-    uint32_t total_devices = calibration_sensors.size();
-    
-    // 整体进度 = (已完成设备数 * 255 + 当前设备进度) / 总设备数
-    uint32_t overall_progress = (completed_devices * 255 + current_device_progress) / total_devices;
-    
-    // 确保进度不超过255
-    return (overall_progress > 255) ? 255 : static_cast<uint8_t>(overall_progress);
-}
-
-// 收集所有支持校准设备的异常通道 - 使用静态预分配数组
-InputManager::AbnormalChannelResult InputManager::collectAbnormalChannels()
-{
-    AbnormalChannelResult result;
-    
-    log_info("Collecting abnormal channels from all calibration-supported sensors");
-    
-    // 遍历所有注册的触摸传感器设备
-    for (TouchSensor* sensor : touch_sensor_devices_)
-    {
-        if (sensor && sensor->supports_calibration_ && result.device_count < MAX_TOUCH_DEVICE)
-        {
-            // 获取异常通道bitmap
-            uint32_t abnormal_mask = sensor->getAbnormalChannelMask();
-            
-            if (abnormal_mask != 0)
-            {
-                uint8_t device_id_mask = sensor->getModuleMask();
-                
-                // 点亮异常IC的LED
-                sensor->setLEDEnabled(true);
-                
-                // 构造合并数据：高8位设备ID，低24位异常通道掩码
-                uint32_t combined_mask = ((uint32_t)device_id_mask << 24) | (abnormal_mask & 0xFFFFFF);
-                result.devices[result.device_count] = AbnormalChannelInfo(combined_mask);
-                result.device_count++;
-                
-                log_info("Found abnormal channels - Device ID: 0x" + 
-                        std::to_string(device_id_mask) + ", Channel mask: 0x" + 
-                        std::to_string(abnormal_mask & 0xFFFFFF) + ", Combined: 0x" + 
-                        std::to_string(combined_mask) + ", LED enabled");
-            }
-            else
-            {
-                // 没有异常通道，关闭LED
-                sensor->setLEDEnabled(false);
-            }
-        }
+    // 如果所有传感器都完成了校准（进度都是255），返回255
+    if (!any_calibrating) {
+        return 255;
     }
     
-    log_info("Collected " + std::to_string(result.device_count) + " devices with abnormal channels");
+    // 计算平均进度
+    uint32_t average_progress = total_progress / sensor_count;
     
-    return result;
+    // 确保进度不超过254（255保留给完成状态）
+    return (average_progress >= 255) ? 254 : static_cast<uint8_t>(average_progress);
 }
 
 // 根据设备ID掩码获取设备名称 - UI显示时调用

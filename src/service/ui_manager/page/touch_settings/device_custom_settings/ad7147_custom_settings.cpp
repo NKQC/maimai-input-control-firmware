@@ -18,7 +18,6 @@ bool AD7147CustomSettings::channel_triggered_ = false;
 
 // 一键拉偏移功能相关
 bool AD7147CustomSettings::auto_offset_active_ = false;
-uint8_t AD7147CustomSettings::auto_offset_progress_ = 0;
 uint8_t AD7147CustomSettings::auto_offset_total_progress_ = 0;
 
 // BitfieldHelper方法实现
@@ -84,8 +83,6 @@ void AD7147CustomSettings::render(PageTemplate& page_template) {
     // 一键拉偏移按钮
     updateAutoOffsetStatus();
     if (auto_offset_active_) {
-        ADD_PROGRESS(&auto_offset_progress_, COLOR_TEXT_GREEN)
-        // 新增：总进度条（白色）
         ADD_PROGRESS(&auto_offset_total_progress_, COLOR_TEXT_WHITE)
     } else {
         ADD_BUTTON("一键调整", onAutoOffsetButtonClick, COLOR_TEXT_YELLOW, LineAlign::CENTER)
@@ -444,7 +441,6 @@ void AD7147CustomSettings::startAutoOffsetCalibration() {
     // 启动自动偏移校准
     if (ad7147->startAutoOffsetCalibration()) {
         auto_offset_active_ = true;
-        auto_offset_progress_ = 0;
         auto_offset_total_progress_ = 0;
     }
 }
@@ -453,7 +449,6 @@ void AD7147CustomSettings::updateAutoOffsetStatus() {
     AD7147* ad7147 = getAD7147Device();
     if (!ad7147) {
         auto_offset_active_ = false;
-        auto_offset_progress_ = 0;
         auto_offset_total_progress_ = 0;
         return;
     }
@@ -461,14 +456,8 @@ void AD7147CustomSettings::updateAutoOffsetStatus() {
     auto_offset_active_ = ad7147->isAutoOffsetCalibrationActive();
 
     if (auto_offset_active_) {
-        // 更新阶段进度
-        auto_offset_progress_ = ad7147->getAutoOffsetCalibrationProgress();
-        // 更新总进度
         auto_offset_total_progress_ = ad7147->getAutoOffsetCalibrationTotalProgress();
     } else {
-        // 校准完成或未开始
-        auto_offset_progress_ = 0;
-        auto_offset_total_progress_ = 0;
         // 重新加载配置以反映校准结果
         config_loaded_ = false;
     }
