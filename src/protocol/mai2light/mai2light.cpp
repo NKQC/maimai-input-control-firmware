@@ -115,6 +115,20 @@ bool Mai2Light::is_ready() const {
 
 // 设置配置
 bool Mai2Light::set_config(const Mai2Light_Config& config) {
+    // 验证波特率是否有效
+    const uint32_t* valid_baud_rates = get_supported_baud_rates();
+    size_t valid_count = get_supported_baud_rates_count();
+    bool valid_baud = false;
+    for (size_t i = 0; i < valid_count; i++) {
+        if (valid_baud_rates[i] == config.baud_rate) {
+            valid_baud = true;
+            break;
+        }
+    }
+    if (!valid_baud) {
+        return false;
+    }
+    
     config_ = config;
     
     if (initialized_) {

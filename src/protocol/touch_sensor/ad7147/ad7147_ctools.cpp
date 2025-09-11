@@ -127,10 +127,7 @@ void AD7147::CalibrationTools::CalibrationLoop(uint32_t sample)
                 if (!Read_Triggle_Sample(stage, sample, trigger_samples_[stage], false)) continue; // 继续采样触发状态
                 
                 // 检查是否仍然触发
-                if (trigger_samples_[stage].triggle_num > 0) {
-                    // 仍然触发，清理触发采样数据并继续推进AFE
-                    trigger_samples_[stage].clear();
-                } else {
+                if (!trigger_samples_[stage].triggle_num) {
                     // 不再触发，该通道完成校准
                     Set_AEF_Offset(stage, s1_best_aef_[stage] + CALIBRATION_AEF_SAVE_AREA);
                     s1_inited_[stage] = false;
@@ -141,6 +138,7 @@ void AD7147::CalibrationTools::CalibrationLoop(uint32_t sample)
             // 记录当前最佳AEF
             s1_best_aef_[stage] = s1_aef_[stage];
             cdc_samples_[stage].clear();
+            trigger_samples_[stage].clear();
 
             // 推进到下一个AEF点
             #if (CALIBRATION_STAGE1_SCAN_RANGEB - CALIBRATION_STAGE1_SCAN_RANGEA) < 0

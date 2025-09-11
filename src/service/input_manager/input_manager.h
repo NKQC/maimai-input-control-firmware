@@ -176,6 +176,8 @@ enum class TouchKeyboardMode : uint8_t {
 #define INPUTMANAGER_LOGICAL_MAPPINGS "input_manager_logical_mappings"
 #define INPUTMANAGER_TOUCH_RESPONSE_DELAY "input_manager_touch_response_delay"
 #define INPUTMANAGER_AREA_CHANNEL_MAPPINGS "input_manager_area_channel_mappings"
+#define INPUTMANAGER_MAI2SERIAL_BAUD_RATE "input_manager_mai2serial_baud_rate"
+
 
 // 工作模式枚举
 enum class InputWorkMode : uint8_t {
@@ -215,12 +217,16 @@ struct InputManager_PrivateConfig {
     // 触摸响应延迟配置 (0-100ms)
     uint8_t touch_response_delay_ms;
     
+    // Mai2Serial配置 - 内部管理
+    Mai2Serial_Config mai2serial_config;
+    
     InputManager_PrivateConfig() 
         : work_mode(InputWorkMode::SERIAL_MODE)
         , device_count(0)
         , touch_keyboard_mode(TouchKeyboardMode::BOTH)
         , touch_keyboard_enabled(false)
-        , touch_response_delay_ms(0) {
+        , touch_response_delay_ms(0)
+        , mai2serial_config() {
     }
 };
 
@@ -355,7 +361,7 @@ public:
     
     // 触摸键盘映射方法
     void setTouchKeyboardEnabled(bool enabled);
-    inline bool getTouchKeyboardEnabled() const;
+    bool getTouchKeyboardEnabled() const;
     inline void setTouchKeyboardMode(TouchKeyboardMode mode);
     inline TouchKeyboardMode getTouchKeyboardMode() const;
     
@@ -375,6 +381,12 @@ public:
     
     // 获取配置副本
     InputManager_PrivateConfig getConfig() const;
+    
+    // 获取Mai2Serial配置
+    Mai2Serial_Config getMai2SerialConfig() const;
+    
+    // 设置Mai2Serial配置
+    bool setMai2SerialConfig(const Mai2Serial_Config& config);
     
     // 获取触摸设备列表
     const std::vector<TouchSensor*>& getTouchSensorDevices() const { return touch_sensor_devices_; }  // 获取当前配置副本
@@ -429,14 +441,14 @@ private:
     // 统一使用TouchDeviceState
 
     // 延迟缓冲区管理 - 优化为只存储Serial数据
-    static constexpr uint8_t DELAY_BUFFER_SIZE = 101;   // 缓冲区大小，支持最大100ms延迟
+    static constexpr uint16_t DELAY_BUFFER_SIZE = 512;  // 扩充缓冲区大小，支持更长延迟和更多数据
     struct DelayedSerialState {
         Mai2Serial_TouchState serial_touch_state;  // 存储64位Serial触摸状态（支持34分区）
         uint32_t timestamp_us;                     // 微秒级时间戳
     };
     DelayedSerialState delay_buffer_[DELAY_BUFFER_SIZE]; // 延迟缓冲区
-    uint8_t delay_buffer_head_;                         // 缓冲区头指针
-    uint8_t delay_buffer_count_;                        // 缓冲区中的有效数据数量
+    uint16_t delay_buffer_head_;                        // 缓冲区头指针
+    uint16_t delay_buffer_count_;                       // 缓冲区中的有效数据数量
     
     // GPIO状态管理
     uint32_t mcu_gpio_states_;               // MCU GPIO状态位图

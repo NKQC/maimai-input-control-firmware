@@ -176,9 +176,10 @@ bool Mai2Serial::set_baud_rate(uint32_t baud_rate) {
     if (!initialized_) {
         return false;
     }
-    const uint32_t valid_baud_rates[] = {9600, 115200, 250000, 500000, 1000000, 1500000, 2000000};
+    const uint32_t* valid_baud_rates = get_supported_baud_rates();
+    size_t valid_count = get_supported_baud_rates_count();
     bool valid_baud = false;
-    for (size_t i = 0; i < sizeof(valid_baud_rates)/sizeof(valid_baud_rates[0]); i++) {
+    for (size_t i = 0; i < valid_count; i++) {
         if (valid_baud_rates[i] == baud_rate) {
             valid_baud = true;
             break;

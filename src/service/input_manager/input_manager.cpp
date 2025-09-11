@@ -61,6 +61,14 @@ bool InputManager::init(const InitConfig &config)
     mcp23s17_ = config.mcp23s17;
     mcp23s17_available_ = (mcp23s17_ != nullptr);
     ui_manager_ = config.ui_manager;
+    
+    // 加载配置
+    inputmanager_load_config_from_manager();
+    
+    // 应用mai2serial配置到实例
+    if (mai2_serial_) {
+        mai2_serial_->set_config(config_->mai2serial_config);
+    }
     // 初始化32位触摸状态数组
     for (int32_t i = 0; i < 8; i++)
     {
@@ -74,9 +82,6 @@ bool InputManager::init(const InitConfig &config)
     mcp_gpio_states_.port_b = 0;
     mcp_gpio_states_.timestamp = 0;
     mcp_gpio_previous_states_ = mcp_gpio_states_;
-
-    // 加载配置
-    inputmanager_load_config_from_manager();
 
     return true;
 }
@@ -275,7 +280,7 @@ inline void InputManager::processSerialModeWithDelay()
 {
     static Mai2Serial_TouchState delayed_serial_state;
     static uint32_t target_time;
-    static uint8_t buffer_idx;
+    static uint16_t buffer_idx;
 
     // 内联延迟状态获取逻辑，减少函数调用开销
     // 计算目标时间点（当前时间减去延迟时间）
@@ -289,7 +294,7 @@ inline void InputManager::processSerialModeWithDelay()
     
     // 从最新数据向前搜索，寻找匹配目标时间窗口的时间戳
     buffer_idx = delay_buffer_head_;
-    for (uint8_t i = 0; i < delay_buffer_count_; ++i)
+    for (uint16_t i = 0; i < delay_buffer_count_; ++i)
     {
         buffer_idx = (buffer_idx - 1) & (DELAY_BUFFER_SIZE - 1);
         if (delay_buffer_[buffer_idx].timestamp_us <= target_time)
@@ -403,7 +408,7 @@ void InputManager::setTouchKeyboardEnabled(bool enabled)
     config->touch_keyboard_enabled = enabled;
 }
 
-inline bool InputManager::getTouchKeyboardEnabled() const
+bool InputManager::getTouchKeyboardEnabled() const
 {
     return config_->touch_keyboard_enabled;
 }
@@ -1265,7 +1270,9 @@ void inputmanager_register_default_configs(config_map_t &default_map)
     default_map[INPUTMANAGER_WORK_MODE] = ConfigValue((uint8_t)0);            // 默认工作模式
     default_map[INPUTMANAGER_TOUCH_KEYBOARD_ENABLED] = ConfigValue(true);     // 默认启用触摸键盘
     default_map[INPUTMANAGER_TOUCH_KEYBOARD_MODE] = ConfigValue((uint8_t)0);  // 默认触摸键盘模式
-    default_map[INPUTMANAGER_TOUCH_RESPONSE_DELAY] = ConfigValue((uint8_t)0); // 默认触摸响应延迟
+    default_map[INPUTMANAGER_TOUCH_RESPONSE_DELAY] = ConfigValue((uint8_t)50, (uint8_t)0, (uint8_t)100); // 默认触摸响应延迟
+    default_map[INPUTMANAGER_MAI2SERIAL_BAUD_RATE] = ConfigValue((uint32_t)9600, (uint32_t)9600, (uint32_t)6000000); // Mai2Serial波特率，范围9600-6000000
+
 
     default_map[INPUTMANAGER_TOUCH_DEVICES] = ConfigValue(std::string(""));      // 触摸设备映射数据
     default_map[INPUTMANAGER_PHYSICAL_KEYBOARDS] = ConfigValue(std::string(""));
@@ -1299,6 +1306,9 @@ bool inputmanager_load_config_from_manager()
 
     // 加载触摸响应延迟
     static_config_.touch_response_delay_ms = config_mgr->get_uint8(INPUTMANAGER_TOUCH_RESPONSE_DELAY);
+    
+    // 加载Mai2Serial配置
+    static_config_.mai2serial_config.baud_rate = config_mgr->get_uint32(INPUTMANAGER_MAI2SERIAL_BAUD_RATE);
 
     // 加载TouchDevice设备映射数据
     std::string devices_str = config_mgr->get_string(INPUTMANAGER_TOUCH_DEVICES);
@@ -1463,6 +1473,9 @@ bool inputmanager_write_config_to_manager(const InputManager_PrivateConfig &conf
 
     // 写入触摸响应延迟
     config_mgr->set_uint8(INPUTMANAGER_TOUCH_RESPONSE_DELAY, config.touch_response_delay_ms);
+    
+    // 保存Mai2Serial配置
+    config_mgr->set_uint32(INPUTMANAGER_MAI2SERIAL_BAUD_RATE, config.mai2serial_config.baud_rate);
 
     // 写入TouchDevice设备映射数据
     if (config.device_count > 0)
@@ -1986,6 +1999,27 @@ uint8_t InputManager::getTouchResponseDelay() const
 InputManager_PrivateConfig InputManager::getConfig() const
 {
     return inputmanager_get_config_copy();
+}
+
+// 获取Mai2Serial配置
+Mai2Serial_Config InputManager::getMai2SerialConfig() const
+{
+    return config_->mai2serial_config;
+}
+
+// 设置Mai2Serial配置
+bool InputManager::setMai2SerialConfig(const Mai2Serial_Config& config)
+{
+    // 更新内部配置
+    config_->mai2serial_config = config;
+    
+    // 应用配置到mai2_serial_实例
+    if (mai2_serial_) {
+        bool apply_result = mai2_serial_->set_config(config);
+        return apply_result;
+    }
+    
+    return true;  // 配置已保存到内部
 }
 
 inline void InputManager::storeDelayedSerialState()

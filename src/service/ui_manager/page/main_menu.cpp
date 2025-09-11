@@ -27,6 +27,8 @@ void MainMenu::render(PageTemplate& page_template) {
 
     ADD_MENU("绑定设置", "binding_settings", COLOR_TEXT_WHITE)
     
+    ADD_MENU("通信设置", "communication_settings", COLOR_TEXT_WHITE)
+    
     ADD_MENU("通用设置", "general_settings", COLOR_TEXT_WHITE)
     
     ADD_BUTTON("保存设置", [this]() {this->save_config();}, COLOR_WHITE, LineAlign::LEFT)

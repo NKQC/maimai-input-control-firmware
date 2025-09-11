@@ -9,6 +9,8 @@
 #include "page/binding_settings/binding_settings.h"
 #include "page/binding_settings/binding_info.h"
 #include "page/general_settings/general_settings.h"
+#include "page/communication_settings/communication_settings.h"
+#include "page/communication_settings/keyboard_settings.h"
 #include "engine/template_page/error_page.h"
 #include "engine/template_page/int_setting_page.h"
 #include <algorithm>
@@ -106,6 +108,14 @@ void PageRegistry::register_default_pages() {
     // 注册通用设置页面
     auto general_settings_page = std::make_shared<GeneralSettings>();
     register_page("general_settings", general_settings_page);
+    
+    // 注册通信设置页面
+    auto communication_settings_page = std::make_shared<CommunicationSettings>();
+    register_page("communication_settings", communication_settings_page);
+    
+    // 注册键盘设置页面
+    auto keyboard_settings_page = std::make_shared<KeyboardSettings>();
+    register_page("keyboard_settings", keyboard_settings_page);
     
     // 注册内部模板页面
     register_internal_pages();
