@@ -5,12 +5,13 @@
 #include <string>
 #include <functional>
 #include <cstdint>
+#include <cstring>
 #include "pico/time.h"
 
-// USB串口日志系统配置
+// 配置宏定义
 #define USB_LOGS_MAX_LINE_LENGTH 256
-#define USB_LOGS_BUFFER_SIZE 8192  // 8KB缓冲区
-#define USB_LOGS_MAX_ONESHOT 50
+#define USB_LOGS_BUFFER_BLOCKS 128  // 128个日志块
+#define USB_LOGS_BLOCK_SIZE (USB_LOGS_MAX_LINE_LENGTH + 64)  // 每块预留最长字节+头部空间
 
 // 日志级别
 enum class USB_LogLevel : uint8_t {
@@ -60,50 +61,58 @@ struct USB_LogEntry {
     }
 };
 
-// 日志条目头部结构
-struct USB_LogEntryHeader {
-    uint16_t size;          // 条目总大小（包含头部）
-    uint32_t timestamp;     // 时间戳
-    USB_LogLevel level;     // 日志级别
-    uint8_t tag_length;     // 标签长度
-    uint8_t message_length; // 消息长度（实际可能更长，这里是低8位）
-    uint16_t full_message_length; // 完整消息长度
+// 日志块结构
+struct USB_LogBlock {
+    bool valid;                             // 块是否有效
+    uint32_t timestamp;                     // 时间戳
+    USB_LogLevel level;                     // 日志级别
+    uint8_t tag_length;                     // 标签长度
+    uint16_t message_length;                // 消息长度
+    char data[USB_LOGS_BLOCK_SIZE - 16];    // 数据区域（标签+消息）
+    
+    USB_LogBlock() : valid(false), timestamp(0), level(USB_LogLevel::INFO), 
+                     tag_length(0), message_length(0) {
+        memset(data, 0, sizeof(data));
+    }
 } __attribute__((packed));
 
-// 环形缓冲区结构
+// 块级环形缓冲区结构
 struct USB_LogRingBuffer {
-    uint8_t buffer[USB_LOGS_BUFFER_SIZE];  // 字节级缓冲区
-    volatile size_t write_index;           // 写入索引
-    volatile size_t read_index;            // 读取索引
-    volatile size_t used_bytes;            // 已使用字节数
+    USB_LogBlock blocks[USB_LOGS_BUFFER_BLOCKS];  // 块级缓冲区
+    volatile size_t write_index;                  // 写入索引
+    volatile size_t read_index;                   // 读取索引
+    volatile size_t used_blocks;                  // 已使用块数
     
-    USB_LogRingBuffer() : write_index(0), read_index(0), used_bytes(0) {}
+    USB_LogRingBuffer() : write_index(0), read_index(0), used_blocks(0) {}
     
     // 检查是否为空
     bool is_empty() const {
-        return used_bytes == 0;
+        return used_blocks == 0;
     }
     
     // 检查是否已满
     bool is_full() const {
-        return used_bytes >= USB_LOGS_BUFFER_SIZE;
+        return used_blocks >= USB_LOGS_BUFFER_BLOCKS;
     }
     
     // 获取剩余空间
-    size_t get_free_space() const {
-        return USB_LOGS_BUFFER_SIZE - used_bytes;
+    size_t get_free_blocks() const {
+        return USB_LOGS_BUFFER_BLOCKS - used_blocks;
     }
     
     // 获取已使用空间
-    size_t get_used_space() const {
-        return used_bytes;
+    size_t get_used_blocks() const {
+        return used_blocks;
     }
     
     // 清空缓冲区
     void clear() {
         write_index = 0;
         read_index = 0;
-        used_bytes = 0;
+        used_blocks = 0;
+        for (size_t i = 0; i < USB_LOGS_BUFFER_BLOCKS; i++) {
+            blocks[i].valid = false;
+        }
     }
 };
 
@@ -149,9 +158,9 @@ public:
     
     // 缓冲区管理
     void flush();
-    void clear_buffer();
-    size_t get_buffer_size() const;
-    bool is_buffer_full() const;
+    inline void clear_buffer() { log_buffer_.clear(); }
+    inline size_t get_buffer_size() const { return log_buffer_.get_used_blocks(); }
+    inline bool is_buffer_full() const { return log_buffer_.is_full(); }
     
     // 统计信息
     struct Statistics {
@@ -173,15 +182,15 @@ public:
     void reset_statistics();
     
     // 回调设置
-    void set_log_callback(USB_LogCallback callback);
-    void set_error_callback(USB_ErrorCallback callback);
+    inline void set_log_callback(USB_LogCallback callback) { log_callback_ = callback; }
+    inline void set_error_callback(USB_ErrorCallback callback) { error_callback_ = callback; }
     
     // 任务处理
     void task();
     
     // 静态方法 - 全局日志实例
-    static void set_global_instance(USB_SerialLogs* instance);
-    static USB_SerialLogs* get_global_instance();
+    static inline void set_global_instance(USB_SerialLogs* instance) { global_instance_ = instance; }
+    static inline USB_SerialLogs* get_global_instance() { return global_instance_; }
     static void global_log(USB_LogLevel level, const std::string& message, const std::string& tag = "");
     
 private:
@@ -202,7 +211,9 @@ private:
     static USB_SerialLogs* global_instance_;
     
     // 内部方法
-    bool should_log(USB_LogLevel level) const;
+    inline bool should_log(USB_LogLevel level) const {
+        return static_cast<uint8_t>(level) >= static_cast<uint8_t>(config_.min_level);
+    }
     std::string format_log_entry(const USB_LogEntry& entry);
     std::string get_level_string(USB_LogLevel level) const;
     std::string get_level_color(USB_LogLevel level) const;

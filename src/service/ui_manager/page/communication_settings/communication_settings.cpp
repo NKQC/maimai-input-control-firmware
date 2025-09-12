@@ -2,125 +2,100 @@
 #include "../../ui_manager.h"
 #include "../../../input_manager/input_manager.h"
 #include "../../../config_manager/config_manager.h"
+#include "../../../light_manager/light_manager.h"
 #include "../../engine/page_construction/page_macros.h"
 #include "../../engine/graphics_rendering/graphics_engine.h"
 
 namespace ui {
 
-// 波特率预设值数组 - 使用统一标准
-const uint32_t CommunicationSettings::BAUD_RATES[] = {
-    9600, 115200, 250000, 500000, 1000000, 1500000,
-    2000000, 2500000, 3000000, 4000000, 5000000, 6000000
-};
-const size_t CommunicationSettings::BAUD_RATES_COUNT = sizeof(BAUD_RATES) / sizeof(BAUD_RATES[0]);
+// 使用HAL层提供的波特率预设
 
 // 静态成员变量定义
 uint32_t CommunicationSettings::current_mai2serial_baud_ = 115200;
 uint32_t CommunicationSettings::current_lightmanager_baud_ = 115200;
 uint8_t CommunicationSettings::current_serial_delay_ = 0;
 bool CommunicationSettings::current_keyboard_mapping_enabled_ = false;
-size_t CommunicationSettings::mai2serial_baud_index_ = 4; // 默认115200
-size_t CommunicationSettings::lightmanager_baud_index_ = 4; // 默认115200
+size_t CommunicationSettings::mai2serial_baud_index_ = 1; // 默认115200（HAL预设索引1）
+size_t CommunicationSettings::lightmanager_baud_index_ = 1; // 默认115200（HAL预设索引1）
 
 CommunicationSettings::CommunicationSettings() {
-    loadCurrentSettings();
 }
 
 void CommunicationSettings::render(PageTemplate& page_template) {
     PAGE_WITH_TITLE("通信设置", COLOR_TEXT_WHITE)
-    
+    loadCurrentSettings();
     // 返回项
     ADD_BACK_ITEM("返回", COLOR_TEXT_WHITE)
-
+    static char _text[64];
     // Mai2Serial波特率设置
-    static char mai2serial_baud_text[64];
-    snprintf(mai2serial_baud_text, sizeof(mai2serial_baud_text), "Serial波特率: %s", 
+    snprintf(_text, sizeof(_text), "Serial波特率: %s", 
              formatBaudRateText(current_mai2serial_baud_).c_str());
-    ADD_SIMPLE_SELECTOR(mai2serial_baud_text, onMai2SerialBaudRateChange, COLOR_TEXT_YELLOW)
+    ADD_SIMPLE_SELECTOR(_text, onMai2SerialBaudRateChange, COLOR_TEXT_YELLOW)
     
     // LightManager波特率设置
-    static char lightmanager_baud_text[64];
-    snprintf(lightmanager_baud_text, sizeof(lightmanager_baud_text), "Light波特率: %s", 
+    snprintf(_text, sizeof(_text), "Light波特率: %s", 
              formatBaudRateText(current_lightmanager_baud_).c_str());
-    ADD_SIMPLE_SELECTOR(lightmanager_baud_text, onLightManagerBaudRateChange, COLOR_TEXT_YELLOW)
+    ADD_SIMPLE_SELECTOR(_text, onLightManagerBaudRateChange, COLOR_TEXT_YELLOW)
     
     // 串口模式延迟设置
-    static char serial_delay_text[64];
-    snprintf(serial_delay_text, sizeof(serial_delay_text), "串口延迟: %s", 
+    snprintf(_text, sizeof(_text), "串口延迟: %s", 
              formatDelayText(current_serial_delay_).c_str());
-    ADD_SIMPLE_SELECTOR(serial_delay_text, onSerialDelayChange, COLOR_TEXT_WHITE)
+    ADD_SIMPLE_SELECTOR(_text, onSerialDelayChange, COLOR_TEXT_WHITE)
     
     // 串口模式通道映射键盘开关
-    static char keyboard_mapping_text[64];
-    snprintf(keyboard_mapping_text, sizeof(keyboard_mapping_text), "映射键盘: %s", 
+    snprintf(_text, sizeof(_text), "映射键盘: %s", 
              formatKeyboardMappingText(current_keyboard_mapping_enabled_).c_str());
-    ADD_SIMPLE_SELECTOR(keyboard_mapping_text, onKeyboardMappingToggle, COLOR_TEXT_WHITE)
-    
-    // 键盘设置子菜单
-    ADD_MENU("键盘设置", "keyboard_settings", COLOR_TEXT_GRAY)
+    ADD_BUTTON(_text, onKeyboardMappingToggle, COLOR_TEXT_WHITE, LineAlign::LEFT)
     
     PAGE_END()
 }
 
 void CommunicationSettings::onMai2SerialBaudRateChange(JoystickState state) {
     if (state == JoystickState::UP) {
-        if (mai2serial_baud_index_ < BAUD_RATES_COUNT - 1) {
+        if (mai2serial_baud_index_ < get_supported_baud_rates_count() - 1) {
             mai2serial_baud_index_++;
-            current_mai2serial_baud_ = BAUD_RATES[mai2serial_baud_index_];
-            saveSettings();
+            current_mai2serial_baud_ = get_supported_baud_rates()[mai2serial_baud_index_];
         }
     } else if (state == JoystickState::DOWN) {
         if (mai2serial_baud_index_ > 0) {
             mai2serial_baud_index_--;
-            current_mai2serial_baud_ = BAUD_RATES[mai2serial_baud_index_];
-            saveSettings();
+            current_mai2serial_baud_ = get_supported_baud_rates()[mai2serial_baud_index_];
         }
     }
+    ApplySettings();
 }
 
 void CommunicationSettings::onLightManagerBaudRateChange(JoystickState state) {
     if (state == JoystickState::UP) {
-        if (lightmanager_baud_index_ < BAUD_RATES_COUNT - 1) {
+        if (lightmanager_baud_index_ < get_supported_baud_rates_count() - 1) {
             lightmanager_baud_index_++;
-            current_lightmanager_baud_ = BAUD_RATES[lightmanager_baud_index_];
-            saveSettings();
+            current_lightmanager_baud_ = get_supported_baud_rates()[lightmanager_baud_index_];
         }
     } else if (state == JoystickState::DOWN) {
         if (lightmanager_baud_index_ > 0) {
             lightmanager_baud_index_--;
-            current_lightmanager_baud_ = BAUD_RATES[lightmanager_baud_index_];
-            saveSettings();
+            current_lightmanager_baud_ = get_supported_baud_rates()[lightmanager_baud_index_];
         }
     }
+    ApplySettings();
 }
 
 void CommunicationSettings::onSerialDelayChange(JoystickState state) {
     if (state == JoystickState::UP) {
         if (current_serial_delay_ < 100) {
             current_serial_delay_++;
-            saveSettings();
         }
     } else if (state == JoystickState::DOWN) {
         if (current_serial_delay_ > 0) {
             current_serial_delay_--;
-            saveSettings();
         }
     }
+    ApplySettings();
 }
 
-void CommunicationSettings::onKeyboardMappingToggle(JoystickState state) {
-    if (state == JoystickState::UP || state == JoystickState::DOWN) {
-        current_keyboard_mapping_enabled_ = !current_keyboard_mapping_enabled_;
-        saveSettings();
-    }
-}
-
-void CommunicationSettings::onKeyboardSettingsMenu() {
-    // 跳转到键盘设置页面
-    UIManager* ui_mgr = UIManager::getInstance();
-    if (ui_mgr) {
-        ui_mgr->switch_to_page("keyboard_settings");
-    }
+void CommunicationSettings::onKeyboardMappingToggle() {
+    current_keyboard_mapping_enabled_ = !current_keyboard_mapping_enabled_;
+    ApplySettings();
 }
 
 void CommunicationSettings::loadCurrentSettings() {
@@ -137,19 +112,16 @@ void CommunicationSettings::loadCurrentSettings() {
         current_mai2serial_baud_ = mai2serial_config.baud_rate;
     }
     
-    // 从ConfigManager获取LightManager波特率设置
-    ConfigManager* config_mgr = ConfigManager::getInstance();
-    if (config_mgr) {
-        // LightManager波特率
-        current_lightmanager_baud_ = config_mgr->get_uint32(LIGHTMANAGER_BAUD_RATE);
-    }
+    // 从LightManager获取波特率设置（只读接口）
+    LightManager_PrivateConfig light_config = lightmanager_get_config_copy();
+    current_lightmanager_baud_ = light_config.baud_rate;
     
     // 更新波特率索引
     mai2serial_baud_index_ = findBaudRateIndex(current_mai2serial_baud_);
     lightmanager_baud_index_ = findBaudRateIndex(current_lightmanager_baud_);
 }
 
-void CommunicationSettings::saveSettings() {
+void CommunicationSettings::ApplySettings() {
     // 保存到InputManager
     InputManager* input_mgr = InputManager::getInstance();
     if (input_mgr) {
@@ -157,46 +129,62 @@ void CommunicationSettings::saveSettings() {
         input_mgr->setTouchKeyboardEnabled(current_keyboard_mapping_enabled_);
     }
     
-    // 保存到ConfigManager
-    ConfigManager* config_mgr = ConfigManager::getInstance();
-    if (config_mgr) {
-        // 保存LightManager波特率
-        config_mgr->set_uint32(LIGHTMANAGER_BAUD_RATE, current_lightmanager_baud_);
-        
-        // 应用LightManager波特率设置
-        LightManager* light_mgr = LightManager::getInstance();
-        if (light_mgr) {
-            Mai2Light_Config light_config;
-            light_config.baud_rate = current_lightmanager_baud_;
-            light_mgr->update_mai2light_config(light_config);
-        }
-        
-        // 应用Mai2Serial波特率设置
-        if (input_mgr) {
-            Mai2Serial_Config mai2serial_config = input_mgr->getMai2SerialConfig();
-            mai2serial_config.baud_rate = current_mai2serial_baud_;
-            input_mgr->setMai2SerialConfig(mai2serial_config);
-        }
+    LightManager* light_mgr = LightManager::getInstance();
+    if (light_mgr) {
+        Mai2Light_Config light_config;
+        light_config.baud_rate = current_lightmanager_baud_;
+        light_mgr->update_mai2light_config(light_config);
+    }
+    
+    // 应用Mai2Serial波特率设置
+    if (input_mgr) {
+        Mai2Serial_Config mai2serial_config = input_mgr->getMai2SerialConfig();
+        mai2serial_config.baud_rate = current_mai2serial_baud_;
+        input_mgr->setMai2SerialConfig(mai2serial_config);
     }
 }
 
 size_t CommunicationSettings::findBaudRateIndex(uint32_t baud_rate) {
-    for (size_t i = 0; i < BAUD_RATES_COUNT; i++) {
-        if (BAUD_RATES[i] == baud_rate) {
+    const uint32_t* supported_rates = get_supported_baud_rates();
+    size_t count = get_supported_baud_rates_count();
+    for (size_t i = 0; i < count; i++) {
+        if (supported_rates[i] == baud_rate) {
             return i;
         }
     }
-    return 4; // 默认返回115200的索引
+    return 1; // 默认返回115200的索引（在HAL预设中是索引1）
 }
 
 std::string CommunicationSettings::formatBaudRateText(uint32_t baud_rate) {
+    char buffer[16];
+    
     if (baud_rate >= 1000000) {
-        return std::to_string(baud_rate / 1000000) + "M";
+        // 处理兆位级波特率，使用整数运算避免浮点
+        uint32_t mbaud_int = baud_rate / 1000000;
+        uint32_t mbaud_frac = (baud_rate % 1000000) / 100000; // 取一位小数
+        
+        if (baud_rate % 1000000 == 0) {
+            // 整数兆位，如1M, 2M, 3M等
+            snprintf(buffer, sizeof(buffer), "%luM", (unsigned long)mbaud_int);
+        } else {
+            // 小数兆位，如1.5M, 2.5M等
+            snprintf(buffer, sizeof(buffer), "%lu.%luM", (unsigned long)mbaud_int, (unsigned long)mbaud_frac);
+        }
     } else if (baud_rate >= 1000) {
-        return std::to_string(baud_rate / 1000) + "K";
+        // 处理千位级波特率，使用整数运算
+        uint32_t kbaud_int = baud_rate / 1000;
+        uint32_t kbaud_frac = (baud_rate % 1000) / 100; // 取一位小数
+        
+        if (baud_rate % 1000 == 0) {
+            snprintf(buffer, sizeof(buffer), "%luK", (unsigned long)kbaud_int);
+        } else {
+            snprintf(buffer, sizeof(buffer), "%lu.%luK", (unsigned long)kbaud_int, (unsigned long)kbaud_frac);
+        }
     } else {
-        return std::to_string(baud_rate);
+        snprintf(buffer, sizeof(buffer), "%lu", (unsigned long)baud_rate);
     }
+    
+    return std::string(buffer);
 }
 
 std::string CommunicationSettings::formatDelayText(uint8_t delay_ms) {

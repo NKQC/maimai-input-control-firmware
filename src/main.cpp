@@ -39,7 +39,7 @@ extern "C" {
 #define DEBUG_LIGHTMANAGER_LOG true
 #define DEBUG_UIMANAGER_LOG true
 
-#define SYSTEM_VERSION "3.0.1"
+#define SYSTEM_VERSION "3.0.2"
 #define HARDWARE_VERSION "3.0"
 #define BUILD_DATE __DATE__
 #define BUILD_TIME __TIME__
@@ -317,12 +317,10 @@ inline bool init_basic() {
  */
 void print_system_info() {
     if (usb_logs) {
-        usb_logs->infof("=== MaiMai Controller V%s ===", SYSTEM_VERSION);
+        usb_logs->infof("=== Mai2 Controller V%s ===", SYSTEM_VERSION);
         usb_logs->infof("Hardware Version: %s", HARDWARE_VERSION);
         usb_logs->infof("Build Date: %s %s", BUILD_DATE, BUILD_TIME);
         usb_logs->infof("CPU Frequency: %lu MHz", rp2040.f_cpu() / 1000000);
-        usb_logs->info("Free Heap: Available", "Memory");
-        usb_logs->info("Flash Size: Available", "Storage");
         usb_logs->info("==============================");
     }
 }
@@ -500,10 +498,22 @@ bool init_service_layer() {
     input_manager->addPhysicalKeyboard(MCP_GPIO::GPIOA6, HID_KeyCode::KEY_A);
     input_manager->addPhysicalKeyboard(MCP_GPIO::GPIOA7, HID_KeyCode::KEY_Q);
 
-    input_manager->addPhysicalKeyboard(MCP_GPIO::GPIOB0, HID_KeyCode::KEY_9);
+    input_manager->addPhysicalKeyboard(MCP_GPIO::GPIOB0, HID_KeyCode::KEY_8);
     input_manager->addPhysicalKeyboard(MCP_GPIO::GPIOB1, HID_KeyCode::KEY_3);
     input_manager->addPhysicalKeyboard(MCP_GPIO::GPIOB2, HID_KeyCode::KEY_ENTER);
     input_manager->addPhysicalKeyboard(MCP_GPIO::GPIOB3, HID_KeyCode::KEY_SPACE);
+
+    // 注册Serial TouchArea -> Keyboard
+    input_manager->addTouchKeyboardMapping(MAI2_A1_AREA, 0, HID_KeyCode::KEY_W);
+    input_manager->addTouchKeyboardMapping(MAI2_A2_AREA, 0, HID_KeyCode::KEY_E);
+    input_manager->addTouchKeyboardMapping(MAI2_A3_AREA, 0, HID_KeyCode::KEY_D);
+    input_manager->addTouchKeyboardMapping(MAI2_A4_AREA, 0, HID_KeyCode::KEY_C);
+    input_manager->addTouchKeyboardMapping(MAI2_A5_AREA, 0, HID_KeyCode::KEY_X);
+    input_manager->addTouchKeyboardMapping(MAI2_A6_AREA, 0, HID_KeyCode::KEY_Z);
+    input_manager->addTouchKeyboardMapping(MAI2_A7_AREA, 0, HID_KeyCode::KEY_A);
+    input_manager->addTouchKeyboardMapping(MAI2_A8_AREA, 0, HID_KeyCode::KEY_Q);
+    input_manager->addTouchKeyboardMapping(MAI2_A1_AREA | MAI2_A8_AREA, 3000, HID_KeyCode::KEY_SPACE);
+    input_manager->addTouchKeyboardMapping(MAI2_A4_AREA | MAI2_A5_AREA, 3000, HID_KeyCode::KEY_ENTER);
 
     // 初始化LightManager
     light_manager = LightManager::getInstance();

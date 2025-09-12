@@ -211,54 +211,37 @@ void USB_SerialLogs::flush() {
     if (!is_ready()) {
         return;
     }
-    static uint32_t max_oneshot = USB_LOGS_MAX_ONESHOT;
-    max_oneshot = USB_LOGS_MAX_ONESHOT;
     
-    // 从字节级环形缓冲区读取并发送日志
-    while (!log_buffer_.is_empty() && max_oneshot--) {
-        // 检查是否有足够的数据读取头部
-        if (log_buffer_.get_used_space() < sizeof(USB_LogEntryHeader)) {
-            break;  // 数据不完整，等待更多数据
+    // 从块级缓冲区读取并发送日志
+    while (!log_buffer_.is_empty()) {
+        // 获取当前读取块
+        USB_LogBlock& block = log_buffer_.blocks[log_buffer_.read_index];
+        
+        // 检查块是否有效
+        if (!block.valid) {
+            // 跳过无效块
+            log_buffer_.read_index = (log_buffer_.read_index + 1) % USB_LOGS_BUFFER_BLOCKS;
+            log_buffer_.used_blocks--;
+            continue;
         }
         
-        // 读取头部信息
-        USB_LogEntryHeader header;
-        size_t read_pos = log_buffer_.read_index;
-        for (size_t i = 0; i < sizeof(USB_LogEntryHeader); i++) {
-            reinterpret_cast<uint8_t*>(&header)[i] = log_buffer_.buffer[read_pos];
-            read_pos = (read_pos + 1) % USB_LOGS_BUFFER_SIZE;
-        }
-        
-        // 检查是否有足够的数据读取完整条目
-        if (log_buffer_.get_used_space() < header.size) {
-            break;  // 数据不完整，等待更多数据
-        }
-        
-        // 读取标签
+        // 提取标签和消息
         std::string tag;
-        tag.reserve(header.tag_length);
-        for (size_t i = 0; i < header.tag_length; i++) {
-            tag += static_cast<char>(log_buffer_.buffer[read_pos]);
-            read_pos = (read_pos + 1) % USB_LOGS_BUFFER_SIZE;
-        }
-        
-        // 读取消息
         std::string message;
-        size_t msg_len = header.full_message_length;
-        message.reserve(msg_len);
-        for (size_t i = 0; i < msg_len; i++) {
-            message += static_cast<char>(log_buffer_.buffer[read_pos]);
-            read_pos = (read_pos + 1) % USB_LOGS_BUFFER_SIZE;
+        
+        size_t offset = 0;
+        if (block.tag_length > 0) {
+            tag.assign(block.data + offset, block.tag_length);
+            offset += block.tag_length;
         }
         
-        // 重构USB_LogEntry对象
-        USB_LogEntry entry;
-        entry.timestamp = header.timestamp;
-        entry.level = header.level;
-        entry.tag = std::move(tag);
-        entry.message = std::move(message);
+        if (block.message_length > 0) {
+            message.assign(block.data + offset, block.message_length);
+        }
         
-        // 格式化日志条目
+        // 创建日志条目并格式化
+        USB_LogEntry entry(block.level, message, tag);
+        entry.timestamp = block.timestamp;
         std::string formatted = format_log_entry(entry);
         formatted += "\r\n";
         
@@ -271,9 +254,11 @@ void USB_SerialLogs::flush() {
         // 直接发送，如果失败则停止处理
         if (usb_hal_->cdc_write((const uint8_t*)formatted.c_str(), formatted.length())) {
             stats_.bytes_sent += formatted.length();
-            // 更新读取指针和已使用字节数
-            log_buffer_.read_index = read_pos;
-            log_buffer_.used_bytes -= header.size;
+            
+            // 标记块为无效并更新读取指针
+            block.valid = false;
+            log_buffer_.read_index = (log_buffer_.read_index + 1) % USB_LOGS_BUFFER_BLOCKS;
+            log_buffer_.used_blocks--;
         } else {
             // 发送失败，停止处理，保留缓冲区中的数据
             break;
@@ -281,21 +266,6 @@ void USB_SerialLogs::flush() {
     }
     
     last_flush_time_ = time_us_32() / 1000;
-}
-
-// 清除环形缓冲区
-void USB_SerialLogs::clear_buffer() {
-    log_buffer_.clear();
-}
-
-// 获取缓冲区已使用大小
-size_t USB_SerialLogs::get_buffer_size() const {
-    return log_buffer_.get_used_space();
-}
-
-// 检查缓冲区是否已满
-bool USB_SerialLogs::is_buffer_full() const {
-    return log_buffer_.is_full();
 }
 
 // 获取统计信息
@@ -307,15 +277,6 @@ bool USB_SerialLogs::get_statistics(Statistics& stats) {
 // 重置统计信息
 void USB_SerialLogs::reset_statistics() {
     stats_ = Statistics();
-}
-
-// 设置回调
-void USB_SerialLogs::set_log_callback(USB_LogCallback callback) {
-    log_callback_ = callback;
-}
-
-void USB_SerialLogs::set_error_callback(USB_ErrorCallback callback) {
-    error_callback_ = callback;
 }
 
 // 任务处理
@@ -333,24 +294,12 @@ void USB_SerialLogs::task() {
     }
 }
 
-// 静态方法实现
-void USB_SerialLogs::set_global_instance(USB_SerialLogs* instance) {
-    global_instance_ = instance;
-}
 
-USB_SerialLogs* USB_SerialLogs::get_global_instance() {
-    return global_instance_;
-}
 
 void USB_SerialLogs::global_log(USB_LogLevel level, const std::string& message, const std::string& tag) {
     if (global_instance_) {
         global_instance_->log(level, message, tag);
     }
-}
-
-// 私有方法实现
-bool USB_SerialLogs::should_log(USB_LogLevel level) const {
-    return static_cast<uint8_t>(level) >= static_cast<uint8_t>(config_.min_level);
 }
 
 std::string USB_SerialLogs::format_log_entry(const USB_LogEntry& entry) {
@@ -428,48 +377,51 @@ std::string USB_SerialLogs::get_timestamp_string(uint32_t timestamp) const {
 }
 
 void USB_SerialLogs::add_to_queue(const USB_LogEntry& entry) {
-    // 计算所需空间：头部 + 标签 + 消息
-    size_t tag_len = entry.tag.length();
-    size_t msg_len = entry.message.length();
-    size_t total_size = sizeof(USB_LogEntryHeader) + tag_len + msg_len;
+    // 检查消息长度是否超过块容量
+    size_t tag_size = entry.tag.length();
+    size_t message_size = entry.message.length();
+    size_t total_data_size = tag_size + message_size;
     
-    // 检查剩余容量，如果不足则直接丢弃
-    if (total_size > log_buffer_.get_free_space()) {
+    if (total_data_size > sizeof(log_buffer_.blocks[0].data)) {
         stats_.dropped_logs++;
-        return;  // 直接丢弃，不加入缓冲区
+        return;  // 丢弃过大的消息
     }
     
-    // 准备头部数据
-    USB_LogEntryHeader header;
-    header.size = static_cast<uint16_t>(total_size);
-    header.timestamp = entry.timestamp;
-    header.level = entry.level;
-    header.tag_length = static_cast<uint8_t>(std::min(tag_len, size_t(255)));
-    header.message_length = static_cast<uint8_t>(msg_len & 0xFF);
-    header.full_message_length = static_cast<uint16_t>(std::min(msg_len, size_t(65535)));
-    
-    // 写入头部
-    size_t write_pos = log_buffer_.write_index;
-    for (size_t i = 0; i < sizeof(USB_LogEntryHeader); i++) {
-        log_buffer_.buffer[write_pos] = reinterpret_cast<const uint8_t*>(&header)[i];
-        write_pos = (write_pos + 1) % USB_LOGS_BUFFER_SIZE;
+    // 如果缓冲区满了，覆盖最旧的块
+    if (log_buffer_.is_full()) {
+        log_buffer_.read_index = (log_buffer_.read_index + 1) % USB_LOGS_BUFFER_BLOCKS;
+        log_buffer_.used_blocks--;
+        stats_.dropped_logs++;
     }
     
-    // 写入标签
-    for (size_t i = 0; i < tag_len; i++) {
-        log_buffer_.buffer[write_pos] = static_cast<uint8_t>(entry.tag[i]);
-        write_pos = (write_pos + 1) % USB_LOGS_BUFFER_SIZE;
+    // 获取当前写入块
+    USB_LogBlock& block = log_buffer_.blocks[log_buffer_.write_index];
+    
+    // 填充块数据
+    block.valid = true;
+    block.timestamp = entry.timestamp;
+    block.level = entry.level;
+    block.tag_length = static_cast<uint8_t>(std::min(tag_size, static_cast<size_t>(255)));
+    block.message_length = static_cast<uint16_t>(std::min(message_size, static_cast<size_t>(65535)));
+    
+    // 清空数据区域
+    memset(block.data, 0, sizeof(block.data));
+    
+    // 复制标签和消息数据
+    size_t offset = 0;
+    if (tag_size > 0) {
+        memcpy(block.data + offset, entry.tag.c_str(), tag_size);
+        offset += tag_size;
+    }
+    if (message_size > 0) {
+        memcpy(block.data + offset, entry.message.c_str(), message_size);
     }
     
-    // 写入消息
-    for (size_t i = 0; i < msg_len; i++) {
-        log_buffer_.buffer[write_pos] = static_cast<uint8_t>(entry.message[i]);
-        write_pos = (write_pos + 1) % USB_LOGS_BUFFER_SIZE;
+    // 更新写入索引和已使用块数
+    log_buffer_.write_index = (log_buffer_.write_index + 1) % USB_LOGS_BUFFER_BLOCKS;
+    if (!log_buffer_.is_full()) {
+        log_buffer_.used_blocks++;
     }
-    
-    // 更新写入指针和已使用字节数
-    log_buffer_.write_index = write_pos;
-    log_buffer_.used_bytes += total_size;
 }
 
 void USB_SerialLogs::update_statistics(USB_LogLevel level) {

@@ -1,5 +1,6 @@
 #include "ad7147.h"
 #include <algorithm>
+#include "src/protocol/usb_serial_logs/usb_serial_logs.h"
 
 // 清空设置到校准所需值 - 一次性准备全部通道
 void AD7147::CalibrationTools::Clear_and_prepare_stage_settings()
@@ -17,6 +18,7 @@ void AD7147::CalibrationTools::Clear_and_prepare_stage_settings()
         s1_aef_[ch] = CALIBRATION_STAGE1_SCAN_RANGEA;
         s1_best_aef_[ch] = 0;
         cdc_samples_[ch].clear();
+        trigger_samples_[ch].clear();
         max_fluctuation_[ch] = 0;
         // 写入起点AEF
         Set_AEF_Offset(ch, s1_aef_[ch]);
@@ -62,6 +64,7 @@ bool AD7147::CalibrationTools::Read_CDC_Sample(uint8_t stage, CDCSample_result &
     }
     else
         result.average = value;
+    if (!result.min) result.min = result.average;
     result.max = MAX(result.max, value);
     result.min = MIN(result.min, value);
     return (result.sample_count++ >= (measure ? CALIBRATION_MEASURE_SAMPLE_COUNT : CALIBRATION_SCAN_SAMPLE_COUNT));
@@ -115,17 +118,16 @@ void AD7147::CalibrationTools::CalibrationLoop(uint32_t sample)
             if (!Read_CDC_Sample(stage, cdc_samples_[stage], false)) continue; // 继续采样当前AEF点
 
             // 计算当前波动差并更新最大波动差
-            uint16_t current_fluctuation = cdc_samples_[stage].max - cdc_samples_[stage].min;
+            uint16_t current_fluctuation = abs(cdc_samples_[stage].max - cdc_samples_[stage].min);
             if (current_fluctuation > max_fluctuation_[stage]) {
                 max_fluctuation_[stage] = current_fluctuation;
             }
-
-            // 验证当前CDC是否高于目标值 + 最大波动差的绝对值
-            uint16_t adjusted_target = target_value + (max_fluctuation_[stage] / 3);
+            // 验证当前CDC是否高于目标值 + 最大波动差绝对值一半
+            uint16_t adjusted_target = target_value + (max_fluctuation_[stage] / 2);
             if (cdc_samples_[stage].average >= adjusted_target) {
                 // 达到目标CDC值，开始检查触发状态
-                if (!Read_Triggle_Sample(stage, sample, trigger_samples_[stage], false)) continue; // 继续采样触发状态
-                
+                if (!Read_Triggle_Sample(stage, sample, trigger_samples_[stage], true)) continue; // 继续采样触发状态
+                USB_LOG_DEBUG("On Target CDC: stage: %d, cdc: %d, triggle: %d, not_triggle: %d", stage, cdc_samples_[stage].average, trigger_samples_[stage].triggle_num, trigger_samples_[stage].not_triggle_num);
                 // 检查是否仍然触发
                 if (!trigger_samples_[stage].triggle_num) {
                     // 不再触发，该通道完成校准
@@ -133,12 +135,12 @@ void AD7147::CalibrationTools::CalibrationLoop(uint32_t sample)
                     s1_inited_[stage] = false;
                     continue;
                 }
+                trigger_samples_[stage].clear();
             }
 
             // 记录当前最佳AEF
             s1_best_aef_[stage] = s1_aef_[stage];
             cdc_samples_[stage].clear();
-            trigger_samples_[stage].clear();
 
             // 推进到下一个AEF点
             #if (CALIBRATION_STAGE1_SCAN_RANGEB - CALIBRATION_STAGE1_SCAN_RANGEA) < 0

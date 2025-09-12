@@ -35,8 +35,6 @@ LightManager_PrivateConfig* lightmanager_get_config_holder() {
     return &config;
 }
 
-
-
 // [配置读取函数] 遵循服务层规则3 - 从config_holder地址读取配置并返回副本
 LightManager_PrivateConfig lightmanager_get_config_copy() {
     LightManager_PrivateConfig* holder = lightmanager_get_config_holder();

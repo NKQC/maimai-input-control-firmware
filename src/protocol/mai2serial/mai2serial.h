@@ -30,7 +30,7 @@ struct Mai2Serial_TouchState {
         uint64_t raw;  // 原始64位数据，支持34分区
         struct {
             uint32_t state1 : 32;  // 第一部分状态位（分区1-32）
-            uint32_t state2 : 3;  // 第二部分状态位（分区33-34及扩展）
+            uint32_t state2 : 3;   // 第二部分状态位（分区33-34及扩展）
         } parts;
     };
     
@@ -40,9 +40,59 @@ struct Mai2Serial_TouchState {
         parts.state1 = state1;
         parts.state2 = state2;
     }
+    
+    // 位域预处理方法 - 用于高效的位操作和掩码生成
+    inline uint64_t getMask() const { return raw & 0x7FFFFFFFF; } // 获取35位有效数据掩码
+    inline void clear() { raw = 0; }
 };
 
-// Mai2 区域映射枚举 - 对应maimai街机的34个触摸区域
+// 位域操作宏 - 用于InputManager高效检查触发位置
+#define MAI2_TOUCH_CHECK_MASK(state, mask) (((state).raw & (mask)) == (mask))  // 检查掩码匹配
+
+// 常用区域组合掩码
+#define MAI2_MASK_A_RING    MAI2_TOUCH_MASK_RANGE(MAI2_AREA_A1, MAI2_AREA_A8)  // A环掩码
+#define MAI2_MASK_B_RING    MAI2_TOUCH_MASK_RANGE(MAI2_AREA_B1, MAI2_AREA_B8)  // B环掩码
+#define MAI2_MASK_C_CENTER  MAI2_TOUCH_MASK_RANGE(MAI2_AREA_C1, MAI2_AREA_C2)  // C中心掩码
+#define MAI2_MASK_D_RING    MAI2_TOUCH_MASK_RANGE(MAI2_AREA_D1, MAI2_AREA_D8)  // D环掩码
+#define MAI2_MASK_E_RING    MAI2_TOUCH_MASK_RANGE(MAI2_AREA_E1, MAI2_AREA_E8)  // E环掩码
+
+// 位区Area编码
+#define MAI2_A1_AREA 0x01
+#define MAI2_A2_AREA 0x02
+#define MAI2_A3_AREA 0x04
+#define MAI2_A4_AREA 0x08
+#define MAI2_A5_AREA 0x10
+#define MAI2_A6_AREA 0x20
+#define MAI2_A7_AREA 0x40
+#define MAI2_A8_AREA 0x80
+#define MAI2_B1_AREA 0x0100
+#define MAI2_B2_AREA 0x0200
+#define MAI2_B3_AREA 0x0400
+#define MAI2_B4_AREA 0x0800
+#define MAI2_B5_AREA 0x1000
+#define MAI2_B6_AREA 0x2000
+#define MAI2_B7_AREA 0x4000
+#define MAI2_B8_AREA 0x8000
+#define MAI2_C1_AREA 0x010000
+#define MAI2_C2_AREA 0x020000
+#define MAI2_D1_AREA 0x040000
+#define MAI2_D2_AREA 0x080000
+#define MAI2_D3_AREA 0x100000
+#define MAI2_D4_AREA 0x200000
+#define MAI2_D5_AREA 0x400000
+#define MAI2_D6_AREA 0x800000
+#define MAI2_D7_AREA 0x1000000
+#define MAI2_D8_AREA 0x2000000
+#define MAI2_E1_AREA 0x4000000
+#define MAI2_E2_AREA 0x8000000
+#define MAI2_E3_AREA 0x10000000
+#define MAI2_E4_AREA 0x20000000
+#define MAI2_E5_AREA 0x40000000
+#define MAI2_E6_AREA 0x80000000
+#define MAI2_E7_AREA 0x100000000
+#define MAI2_E8_AREA 0x200000000
+
+// Mai2 区域映射枚举 - 对应maimai街 კომპიუტერი 34触摸区域
 // 参考设计文档中的区域定义：A1-A8, B1-B8, C1-C2, D1-D8, E1-E8
 enum Mai2_TouchArea {
     // A区 (外环) 1-8

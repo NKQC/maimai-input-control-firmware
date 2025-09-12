@@ -27,8 +27,7 @@ InputManager *InputManager::getInstance()
 
 // 私有构造函数
 InputManager::InputManager()
-    : delay_buffer_head_(0), delay_buffer_count_(0), mcu_gpio_states_(0), mcu_gpio_previous_states_(0), sample_counter_(0), last_reset_time_(0), current_sample_rate_(0), binding_active_(false), binding_callback_(), binding_state_(BindingState::IDLE), current_binding_index_(0), binding_start_time_(0), binding_timeout_ms_(30000) // 30秒超时
-      ,
+    : delay_buffer_head_(0), delay_buffer_count_(0), mcu_gpio_states_(0), mcu_gpio_previous_states_(0), serial_state_(), touch_keyboard_enabled_(false), touch_keyboard_current_time_cache_(0), touch_keyboard_areas_matched_cache_(false), touch_keyboard_hold_satisfied_cache_(false), sample_counter_(0), last_reset_time_(0), current_sample_rate_(0), binding_active_(false), binding_callback_(), binding_state_(BindingState::IDLE), current_binding_index_(0), binding_start_time_(0), binding_timeout_ms_(30000),
       binding_hardware_ops_pending_(false), binding_cancel_pending_(false), calibration_request_pending_(false), auto_adjust_context_(), mai2_serial_(nullptr), hid_(nullptr), mcp23s17_(nullptr), config_(inputmanager_get_config_holder()), mcp23s17_available_(false), ui_manager_(nullptr), gpio_keyboard_bitmap_(), touch_bitmap_cache_(), mcp_gpio_states_(), mcp_gpio_previous_states_()
 {
 
@@ -302,6 +301,7 @@ inline void InputManager::processSerialModeWithDelay()
             // 找到目标时间点的数据，直接使用预计算的serial状态
             delayed_serial_state = delay_buffer_[buffer_idx].serial_touch_state;
             // 直接发送延迟后的Serial状态
+            serial_state_ = delayed_serial_state;  // 为确保当外键映射启用时时间是同步的
             mai2_serial_->send_touch_data(delayed_serial_state);
             return;
         }
@@ -313,92 +313,6 @@ inline void InputManager::processSerialModeWithDelay()
 void InputManager::clearPhysicalKeyboards()
 {
     config_->physical_keyboard_mappings.clear();
-}
-
-// 逻辑按键映射管理方法
-bool InputManager::addLogicalKeyMapping(uint8_t gpio_id, HID_KeyCode key)
-{
-    // 检查是否已存在该GPIO映射
-    for (auto &mapping : config_->logical_key_mappings)
-    {
-        if (mapping.gpio_id == gpio_id)
-        {
-            // 查找空位添加新按键（最多3个）
-            for (int i = 0; i < 3; i++)
-            {
-                if (mapping.keys[i] == HID_KeyCode::KEY_NONE)
-                {
-                    mapping.keys[i] = key;
-                    mapping.key_count++;
-                    return true;
-                }
-            }
-            return false; // 已满
-        }
-    }
-
-    // 添加新映射
-    LogicalKeyMapping new_mapping;
-    new_mapping.gpio_id = gpio_id;
-    new_mapping.keys[0] = key;
-    new_mapping.key_count = 1;
-    config_->logical_key_mappings.push_back(new_mapping);
-
-    return true;
-}
-
-bool InputManager::removeLogicalKeyMapping(uint8_t gpio_id, HID_KeyCode key)
-{
-    for (auto &mapping : config_->logical_key_mappings)
-    {
-        if (mapping.gpio_id == gpio_id)
-        {
-            // 查找并移除指定的按键
-            for (int i = 0; i < 3; i++)
-            {
-                if (mapping.keys[i] == key)
-                {
-                    mapping.keys[i] = HID_KeyCode::KEY_NONE;
-                    mapping.key_count--;
-
-                    // 如果没有按键了，移除整个映射
-                    if (mapping.key_count == 0)
-                    {
-                        auto it = std::find_if(config_->logical_key_mappings.begin(),
-                                               config_->logical_key_mappings.end(),
-                                               [gpio_id](const LogicalKeyMapping &m)
-                                               {
-                                                   return m.gpio_id == gpio_id;
-                                               });
-                        if (it != config_->logical_key_mappings.end())
-                        {
-                            config_->logical_key_mappings.erase(it);
-                        }
-                    }
-                    return true;
-                }
-            }
-        }
-    }
-    return false;
-}
-
-bool InputManager::clearLogicalKeyMapping(uint8_t gpio_id)
-{
-    auto it = std::find_if(config_->logical_key_mappings.begin(),
-                           config_->logical_key_mappings.end(),
-                           [gpio_id](const LogicalKeyMapping &mapping)
-                           {
-                               return mapping.gpio_id == gpio_id;
-                           });
-
-    if (it != config_->logical_key_mappings.end())
-    {
-        config_->logical_key_mappings.erase(it);
-        return true;
-    }
-
-    return false;
 }
 
 // 触摸键盘映射管理方法
@@ -421,6 +335,98 @@ inline void InputManager::setTouchKeyboardMode(TouchKeyboardMode mode)
 inline TouchKeyboardMode InputManager::getTouchKeyboardMode() const
 {
     return config_->touch_keyboard_mode;
+}
+
+// 触摸键盘映射管理方法实现
+bool InputManager::addTouchKeyboardMapping(uint64_t area_mask, uint32_t hold_time_ms, HID_KeyCode key)
+{
+    // 检查参数有效性
+    if (area_mask == 0 || key == HID_KeyCode::KEY_NONE) {
+        return false;
+    }
+    
+    // 检查是否已存在相同的映射
+    for (const auto& mapping : config_->touch_keyboard_mappings) {
+        if (mapping.area_mask == area_mask && mapping.key == key) {
+            return false; // 已存在相同映射
+        }
+    }
+    
+    // 添加新映射
+    TouchKeyboardMapping new_mapping(area_mask, hold_time_ms, key);
+    config_->touch_keyboard_mappings.push_back(new_mapping);
+    
+    return true;
+}
+
+bool InputManager::removeTouchKeyboardMapping(uint64_t area_mask, HID_KeyCode key)
+{
+    auto it = std::find_if(config_->touch_keyboard_mappings.begin(),
+                           config_->touch_keyboard_mappings.end(),
+                           [area_mask, key](const TouchKeyboardMapping& mapping) {
+                               return mapping.area_mask == area_mask && mapping.key == key;
+                           });
+    
+    if (it != config_->touch_keyboard_mappings.end()) {
+        config_->touch_keyboard_mappings.erase(it);
+        return true;
+    }
+    
+    return false;
+}
+
+void InputManager::clearTouchKeyboardMappings()
+{
+    config_->touch_keyboard_mappings.clear();
+    touch_keyboard_enabled_ = false;
+}
+
+const std::vector<TouchKeyboardMapping>& InputManager::getTouchKeyboardMappings() const
+{
+    return config_->touch_keyboard_mappings;
+}
+
+inline bool InputManager::checkTouchKeyboardTrigger()
+{       
+    // 缓存当前时间，避免重复系统调用
+    touch_keyboard_current_time_cache_ = us_to_ms(time_us_32());
+    
+    bool any_key_pressed = false;
+    
+    // 遍历所有触摸键盘映射，独立处理每个映射
+    for (auto& mapping : config_->touch_keyboard_mappings) {
+        // 使用位操作宏进行高效区域匹配检查
+          touch_keyboard_areas_matched_cache_ = MAI2_TOUCH_CHECK_MASK(serial_state_, mapping.area_mask);
+          
+          if (__builtin_expect(touch_keyboard_areas_matched_cache_, 0)) {
+              // 区域匹配，检查是否刚开始按下
+              if (__builtin_expect(mapping.press_timestamp == 0, 0)) {
+                  mapping.press_timestamp = touch_keyboard_current_time_cache_;
+              }
+  
+              touch_keyboard_hold_satisfied_cache_ = (mapping.hold_time_ms == 0) || 
+                                                    ((touch_keyboard_current_time_cache_ - mapping.press_timestamp) >= mapping.hold_time_ms);
+            
+            if (__builtin_expect(touch_keyboard_hold_satisfied_cache_ && !mapping.key_pressed, 0)) {
+                // 满足条件，按下按键 - 直接调用HID方法避免额外检查
+                hid_->press_key(mapping.key);
+                mapping.key_pressed = true;
+            }
+            
+            if (mapping.key_pressed) {
+                any_key_pressed = true;
+            }
+        } else {
+            // 区域不匹配，释放按键
+            if (__builtin_expect(mapping.key_pressed, 0)) {
+                hid_->release_key(mapping.key);
+                mapping.key_pressed = false;
+            }
+            mapping.press_timestamp = 0;
+        }
+    }
+    
+    return any_key_pressed;
 }
 
 // 设置工作模式
@@ -476,9 +482,18 @@ void InputManager::task1()
     updateGPIOStates();
     processGPIOKeyboard(); // 现在直接调用HID的press_key/release_key方法
 
-    if (config_->work_mode == InputWorkMode::HID_MODE)
+    switch (config_->work_mode)
     {
-        sendHIDTouchData();
+        case InputWorkMode::HID_MODE:
+            sendHIDTouchData();
+            break;
+        case InputWorkMode::SERIAL_MODE:
+            // 检查触摸键盘触发
+            if (touch_keyboard_enabled_)
+                checkTouchKeyboardTrigger();
+            break;
+        default:
+            break;
     }
     hid_->task();
 }
@@ -1020,7 +1035,7 @@ void InputManager::enableMappedChannels()
     InputManager_PrivateConfig *config = inputmanager_get_config_holder();
     InputWorkMode work_mode = getWorkMode();
 
-    for (int i = 0; i < INPUTMANAGER_MAX_TOUCH_DEVICES && i < touch_sensor_devices_.size(); i++)
+    for (int i = 0; i < MAX_TOUCH_DEVICE && i < touch_sensor_devices_.size(); i++)
     {
         auto *device = touch_sensor_devices_[i];
         auto &mapping = config->touch_device_mappings[i];
@@ -1085,7 +1100,7 @@ void InputManager::updateChannelStatesAfterBinding()
     InputManager_PrivateConfig *config = inputmanager_get_config_holder();
     InputWorkMode work_mode = getWorkMode();
 
-    for (int i = 0; i < INPUTMANAGER_MAX_TOUCH_DEVICES; i++)
+    for (int i = 0; i < MAX_TOUCH_DEVICE; i++)
     {
         auto &mapping = config->touch_device_mappings[i];
 
@@ -1268,7 +1283,7 @@ void inputmanager_register_default_configs(config_map_t &default_map)
 {
     // 注册InputManager默认配置
     default_map[INPUTMANAGER_WORK_MODE] = ConfigValue((uint8_t)0);            // 默认工作模式
-    default_map[INPUTMANAGER_TOUCH_KEYBOARD_ENABLED] = ConfigValue(true);     // 默认启用触摸键盘
+    default_map[INPUTMANAGER_TOUCH_KEYBOARD_ENABLED] = ConfigValue(false);    // 默认关闭触摸键盘
     default_map[INPUTMANAGER_TOUCH_KEYBOARD_MODE] = ConfigValue((uint8_t)0);  // 默认触摸键盘模式
     default_map[INPUTMANAGER_TOUCH_RESPONSE_DELAY] = ConfigValue((uint8_t)50, (uint8_t)0, (uint8_t)100); // 默认触摸响应延迟
     default_map[INPUTMANAGER_MAI2SERIAL_BAUD_RATE] = ConfigValue((uint32_t)9600, (uint32_t)9600, (uint32_t)6000000); // Mai2Serial波特率，范围9600-6000000
@@ -1276,7 +1291,6 @@ void inputmanager_register_default_configs(config_map_t &default_map)
 
     default_map[INPUTMANAGER_TOUCH_DEVICES] = ConfigValue(std::string(""));      // 触摸设备映射数据
     default_map[INPUTMANAGER_PHYSICAL_KEYBOARDS] = ConfigValue(std::string(""));
-    default_map[INPUTMANAGER_LOGICAL_MAPPINGS] = ConfigValue(std::string(""));
     default_map[INPUTMANAGER_AREA_CHANNEL_MAPPINGS] = ConfigValue(std::string(""));  // 区域通道映射配置
 }
 
@@ -1346,18 +1360,6 @@ bool inputmanager_load_config_from_manager()
         std::memcpy(static_config_.physical_keyboard_mappings.data(),
                     physical_keyboards_str.data(),
                     physical_keyboards_str.size());
-    }
-
-    // 加载逻辑按键映射数据
-    std::string logical_mappings_str = config_mgr->get_string(INPUTMANAGER_LOGICAL_MAPPINGS);
-    if (!logical_mappings_str.empty())
-    {
-        size_t mapping_count = logical_mappings_str.size() / sizeof(LogicalKeyMapping);
-        static_config_.logical_key_mappings.clear();
-        static_config_.logical_key_mappings.resize(mapping_count);
-        std::memcpy(static_config_.logical_key_mappings.data(),
-                    logical_mappings_str.data(),
-                    logical_mappings_str.size());
     }
 
     // 加载区域通道映射配置
@@ -1495,17 +1497,6 @@ bool inputmanager_write_config_to_manager(const InputManager_PrivateConfig &conf
                     config.physical_keyboard_mappings.data(),
                     keyboards_size);
         config_mgr->set_string(INPUTMANAGER_PHYSICAL_KEYBOARDS, keyboards_data);
-    }
-
-    // 写入逻辑按键映射数据
-    if (!config.logical_key_mappings.empty())
-    {
-        size_t mappings_size = sizeof(LogicalKeyMapping) * config.logical_key_mappings.size();
-        std::string mappings_data(mappings_size, '\0');
-        std::memcpy(&mappings_data[0],
-                    config.logical_key_mappings.data(),
-                    mappings_size);
-        config_mgr->set_string(INPUTMANAGER_LOGICAL_MAPPINGS, mappings_data);
     }
 
     // 写入区域通道映射配置
@@ -1834,8 +1825,7 @@ void InputManager::processGPIOKeyboard()
     // 零内存分配：使用类成员缓存变量获取所有指针和计数
     gpio_mappings_cache_ = config_->physical_keyboard_mappings.data();
     gpio_mapping_count_cache_ = config_->physical_keyboard_mappings.size();
-    gpio_logical_mappings_cache_ = config_->logical_key_mappings.data();
-    gpio_logical_count_cache_ = config_->logical_key_mappings.size();
+
 
     for (size_t i = 0; i < gpio_mapping_count_cache_; ++i)
     {
@@ -1962,19 +1952,6 @@ const std::vector<PhysicalKeyboardMapping> &InputManager::getPhysicalKeyboards()
     return config_->physical_keyboard_mappings;
 }
 
-// 清除所有逻辑按键映射
-void InputManager::clearAllLogicalKeyMappings()
-{
-    config_->logical_key_mappings.clear();
-    inputmanager_write_config_to_manager(*config_);
-}
-
-// 获取逻辑按键映射列表
-const std::vector<LogicalKeyMapping> &InputManager::getLogicalKeyMappings() const
-{
-    return config_->logical_key_mappings;
-}
-
 // 触摸响应延迟管理实现
 void InputManager::setTouchResponseDelay(uint8_t delay_ms)
 {
@@ -1985,9 +1962,6 @@ void InputManager::setTouchResponseDelay(uint8_t delay_ms)
     // 清空延迟缓冲区
     delay_buffer_head_ = 0;
     delay_buffer_count_ = 0;
-
-    // 持久化保存配置
-    inputmanager_write_config_to_manager(*config_);
 }
 
 uint8_t InputManager::getTouchResponseDelay() const
@@ -2025,10 +1999,9 @@ bool InputManager::setMai2SerialConfig(const Mai2Serial_Config& config)
 inline void InputManager::storeDelayedSerialState()
 {
     static uint32_t current_time_us;
-    static Mai2Serial_TouchState serial_state;
-    serial_state.parts.state1 = 0;
-    serial_state.parts.state2 = 0;
-
+    static uint32_t channel;
+    static Mai2Serial_TouchState local_serial_state_;
+    local_serial_state_.clear();
     current_time_us = time_us_32();
 
     // 优化的Serial触摸状态计算
@@ -2037,24 +2010,22 @@ inline void InputManager::storeDelayedSerialState()
         // 直接使用0-33索引，避免额外运算
          for (int area_idx = 0; area_idx < 34; area_idx++)
          {
-             uint32_t channel = static_config_.area_channel_mappings.serial_mappings[area_idx].channel;  // 直接索引0-33
-             if (channel == 0xFFFFFFFF) continue;
+            channel = static_config_.area_channel_mappings.serial_mappings[area_idx].channel;  // 直接索引0-33
+            if (channel == 0xFFFFFFFF) continue;
             
             // 优化位运算检查
             if ((touch_device_states_[i].current_touch_mask & (channel | 0xFF000000)) == channel)
             {
                 // 直接位操作，避免额外计算
                 if (area_idx < 32)
-                    serial_state.parts.state1 |= (1UL << area_idx);
+                    local_serial_state_.parts.state1 |= (1UL << area_idx);
                 else
-                    serial_state.parts.state2 |= (1UL << (area_idx - 32));
+                    local_serial_state_.parts.state2 |= (1UL << (area_idx - 32));
             }
         }
     }
-    // 直接赋值到缓冲区，减少中间变量
-    DelayedSerialState &buffer_entry = delay_buffer_[delay_buffer_head_];
-    buffer_entry.timestamp_us = current_time_us;
-    buffer_entry.serial_touch_state = serial_state;
+    delay_buffer_[delay_buffer_head_].timestamp_us = current_time_us;
+    delay_buffer_[delay_buffer_head_].serial_touch_state = serial_state_;
 
     // 优化缓冲区指针更新
     delay_buffer_head_ = (delay_buffer_head_ + 1) % DELAY_BUFFER_SIZE;

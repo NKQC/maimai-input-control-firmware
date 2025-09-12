@@ -4,6 +4,7 @@
 #include "../../../input_manager/input_manager.h"
 #include "../../../../protocol/mai2serial/mai2serial.h"
 #include "../../../light_manager/light_manager.h"
+#include "../../../../hal/uart/hal_uart.h"
 #include <string>
 #include <functional>
 #include <cstdint>
@@ -26,9 +27,6 @@ public:
     virtual void render(PageTemplate& page_template) override;
     
 private:
-    // 波特率预设值数组
-    static const uint32_t BAUD_RATES[];
-    static const size_t BAUD_RATES_COUNT;
     
     // 当前设置状态
     static uint32_t current_mai2serial_baud_;
@@ -44,12 +42,11 @@ private:
     static void onMai2SerialBaudRateChange(JoystickState state);
     static void onLightManagerBaudRateChange(JoystickState state);
     static void onSerialDelayChange(JoystickState state);
-    static void onKeyboardMappingToggle(JoystickState state);
-    static void onKeyboardSettingsMenu();
+    static void onKeyboardMappingToggle();
     
     // 辅助函数
     static void loadCurrentSettings();
-    static void saveSettings();
+    static void ApplySettings();
     static size_t findBaudRateIndex(uint32_t baud_rate);
     static std::string formatBaudRateText(uint32_t baud_rate);
     static std::string formatDelayText(uint8_t delay_ms);

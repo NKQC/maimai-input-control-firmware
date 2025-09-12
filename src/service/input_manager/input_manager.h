@@ -74,6 +74,18 @@ struct PhysicalKeyboardMapping {
     PhysicalKeyboardMapping(MCU_GPIO mcu, HID_KeyCode key) : mcu_gpio(mcu), default_key(key) {}
     PhysicalKeyboardMapping(MCP_GPIO mcp, HID_KeyCode key) : mcp_gpio(mcp), default_key(key) {}
 };
+// 触摸键盘映射结构体
+struct TouchKeyboardMapping {
+    uint64_t area_mask;          // 触摸区域掩码，使用Mai2Serial_TouchState的64位格式
+    uint32_t hold_time_ms;       // 长按生效时间（毫秒）
+    HID_KeyCode key;             // 触发的按键
+    uint32_t press_timestamp;    // 按下时间戳（毫秒）
+    bool key_pressed;            // 当前按键是否处于按下状态
+    
+    TouchKeyboardMapping() : area_mask(0), hold_time_ms(0), key(HID_KeyCode::KEY_NONE), press_timestamp(0), key_pressed(false) {}
+    TouchKeyboardMapping(uint64_t mask, uint32_t hold_time, HID_KeyCode trigger_key) 
+        : area_mask(mask), hold_time_ms(hold_time), key(trigger_key), press_timestamp(0), key_pressed(false) {}
+};
 
 // 逻辑按键映射结构体 - 支持每个GPIO绑定最多3个HID键
 struct LogicalKeyMapping {
@@ -169,11 +181,9 @@ enum class TouchKeyboardMode : uint8_t {
 // 配置键预处理定义
 #define INPUTMANAGER_WORK_MODE "input_manager_work_mode"
 #define INPUTMANAGER_TOUCH_DEVICES "input_manager_touch_devices"
-#define INPUTMANAGER_MAX_TOUCH_DEVICES 8
 #define INPUTMANAGER_TOUCH_KEYBOARD_ENABLED "input_manager_touch_keyboard_enabled"
 #define INPUTMANAGER_TOUCH_KEYBOARD_MODE "input_manager_touch_keyboard_mode"
 #define INPUTMANAGER_PHYSICAL_KEYBOARDS "input_manager_physical_keyboards"
-#define INPUTMANAGER_LOGICAL_MAPPINGS "input_manager_logical_mappings"
 #define INPUTMANAGER_TOUCH_RESPONSE_DELAY "input_manager_touch_response_delay"
 #define INPUTMANAGER_AREA_CHANNEL_MAPPINGS "input_manager_area_channel_mappings"
 #define INPUTMANAGER_MAI2SERIAL_BAUD_RATE "input_manager_mai2serial_baud_rate"
@@ -207,10 +217,8 @@ struct InputManager_PrivateConfig {
     // 物理键盘映射配置
     std::vector<PhysicalKeyboardMapping> physical_keyboard_mappings;
     
-    // 逻辑按键映射配置
-    std::vector<LogicalKeyMapping> logical_key_mappings;
-    
     // 触摸键盘映射配置
+    std::vector<TouchKeyboardMapping> touch_keyboard_mappings;
     TouchKeyboardMode touch_keyboard_mode;
     bool touch_keyboard_enabled;
     
@@ -299,8 +307,6 @@ public:
     void calibrateAllSensors();                        // 校准所有支持校准的传感器
     uint8_t getCalibrationProgress();                  // 获取校准进度 (0-255范围)
     
-
-    
     // 根据设备ID掩码获取设备名称 - UI显示时调用
     std::string getDeviceNameByMask(uint32_t device_and_channel_mask) const;
     
@@ -352,18 +358,20 @@ public:
     void clearPhysicalKeyboards();
     const std::vector<PhysicalKeyboardMapping>& getPhysicalKeyboards() const;
     
-    // 逻辑按键映射方法
-    bool addLogicalKeyMapping(uint8_t gpio_id, HID_KeyCode key);
-    bool removeLogicalKeyMapping(uint8_t gpio_id, HID_KeyCode key);
-    bool clearLogicalKeyMapping(uint8_t gpio_id);
-    void clearAllLogicalKeyMappings();
-    const std::vector<LogicalKeyMapping>& getLogicalKeyMappings() const;
-    
     // 触摸键盘映射方法
     void setTouchKeyboardEnabled(bool enabled);
     bool getTouchKeyboardEnabled() const;
     inline void setTouchKeyboardMode(TouchKeyboardMode mode);
     inline TouchKeyboardMode getTouchKeyboardMode() const;
+    
+    // 触摸键盘映射管理方法
+    bool addTouchKeyboardMapping(uint64_t area_mask, uint32_t hold_time_ms, HID_KeyCode key);
+    bool removeTouchKeyboardMapping(uint64_t area_mask, HID_KeyCode key);
+    void clearTouchKeyboardMappings();
+    const std::vector<TouchKeyboardMapping>& getTouchKeyboardMappings() const;
+    
+    // 触摸键盘转换内联接口 - serial模式专用
+    inline bool checkTouchKeyboardTrigger();  // 检查触发条件并处理按键状态
     
     // 通道控制接口
     void enableAllChannels();   // 启用所有通道(绑定时使用)
@@ -453,6 +461,17 @@ private:
     // GPIO状态管理
     uint32_t mcu_gpio_states_;               // MCU GPIO状态位图
     uint32_t mcu_gpio_previous_states_;      // MCU GPIO上一次状态
+    
+    // Serial状态桥梁变量 - 用于触摸键盘转换
+    Mai2Serial_TouchState serial_state_;    // 当前Serial触摸状态，作为task0和task1之间的桥梁
+    
+    // 触摸键盘转换相关私有变量
+    bool touch_keyboard_enabled_;            // 触摸键盘功能开关
+    
+    // 触摸键盘性能优化缓存变量（避免函数调用和局部变量）
+    mutable uint32_t touch_keyboard_current_time_cache_; // 当前时间缓存
+    mutable bool touch_keyboard_areas_matched_cache_;    // 区域匹配结果缓存
+    mutable bool touch_keyboard_hold_satisfied_cache_;   // 长按时间满足缓存
     
     // 采样频率测量相关
     uint32_t sample_counter_;           // 采样计数器
