@@ -61,14 +61,12 @@ struct UIStatistics {
     uint32_t input_events = 0;
     uint32_t render_frames = 0;
     uint32_t error_count = 0;
-    uint32_t uptime_seconds = 0;
     
     void reset() {
         page_switches = 0;
         input_events = 0;
         render_frames = 0;
         error_count = 0;
-        uptime_seconds = 0;
     }
 };
 
@@ -324,7 +322,7 @@ private:
     void update_page_template_content();
     
     // 30fps刷新任务
-    void refresh_task_30fps();
+    inline void refresh_task_30fps(uint32_t millis);
     static void display_refresh_timer_callback(void* arg);
     
     // 处理输入相关
@@ -346,7 +344,7 @@ private:
     inline void handle_back_item();
     
     // 背光和屏幕超时处理
-    inline void handle_screen_timeout();
+    inline void handle_screen_timeout(uint32_t millis);
     
     // 工具函数
     void log_debug(const std::string& message);

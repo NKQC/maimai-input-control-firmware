@@ -305,6 +305,7 @@ public:
     
     // 校准管理
     void calibrateAllSensors();                        // 校准所有支持校准的传感器
+    void calibrateAllSensorsWithTarget(uint8_t sensitivity_target); // 校准所有传感器并指定灵敏度目标
     uint8_t getCalibrationProgress();                  // 获取校准进度 (0-255范围)
     
     // 根据设备ID掩码获取设备名称 - UI显示时调用
@@ -367,7 +368,6 @@ public:
     // 触摸键盘映射管理方法
     bool addTouchKeyboardMapping(uint64_t area_mask, uint32_t hold_time_ms, HID_KeyCode key);
     bool removeTouchKeyboardMapping(uint64_t area_mask, HID_KeyCode key);
-    void clearTouchKeyboardMappings();
     const std::vector<TouchKeyboardMapping>& getTouchKeyboardMappings() const;
     
     // 触摸键盘转换内联接口 - serial模式专用
@@ -465,9 +465,6 @@ private:
     // Serial状态桥梁变量 - 用于触摸键盘转换
     Mai2Serial_TouchState serial_state_;    // 当前Serial触摸状态，作为task0和task1之间的桥梁
     
-    // 触摸键盘转换相关私有变量
-    bool touch_keyboard_enabled_;            // 触摸键盘功能开关
-    
     // 触摸键盘性能优化缓存变量（避免函数调用和局部变量）
     mutable uint32_t touch_keyboard_current_time_cache_; // 当前时间缓存
     mutable bool touch_keyboard_areas_matched_cache_;    // 区域匹配结果缓存
@@ -491,6 +488,8 @@ private:
 
     // 校准管理相关变量
     bool calibration_request_pending_;       // 校准请求待处理标志
+    uint8_t calibration_sensitivity_target_; // 校准灵敏度目标 (1=高敏, 2=默认, 3=低敏)
+    bool calibration_in_progress_;           // 校准正在运行
     
     // 自动灵敏度调整状态机
     enum class AutoAdjustState {

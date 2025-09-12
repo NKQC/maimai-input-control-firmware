@@ -350,6 +350,7 @@ public:
     
     // 校准相关接口实现
     bool calibrateSensor() override;                                     // 校准传感器(接入startAutoOffsetCalibration)
+    bool calibrateSensor(uint8_t sensitivity_target) override;           // 校准传感器(带灵敏度目标)
     uint8_t getCalibrationProgress() const override;                     // 获取校准进度(接入getAutoOffsetCalibrationTotalProgress)
     bool setLEDEnabled(bool enabled) override;                           // 设置LED状态(修改stage_low_int_enable的第12-13位)
     
@@ -480,6 +481,7 @@ private:
         CalibrationState calibration_state_ = IDLE;
 
         uint8_t stage_process = 0;
+        uint8_t sensitivity_target = 2;  // 灵敏度目标 (1=高敏, 2=默认, 3=低敏)
 
         bool inited_ = false;
         

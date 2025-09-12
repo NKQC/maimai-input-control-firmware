@@ -99,8 +99,6 @@ bool UIManager::switch_to_page(const std::string& page_name) {
     current_page_name_ = page_name;
     current_menu_index_ = 0;
     page_template_->set_visible_end_line(current_menu_index_);
-    last_activity_time_ = to_ms_since_boot(get_absolute_time());
-    
     return true;
 }
 
@@ -268,12 +266,16 @@ bool UIManager::init_gpio() {
 // 优化的GPIO输入处理
 void UIManager::handle_input() {
     // 批量读取所有按钮状态
-    bool button_states[3] = {
-        gpio_get(joystick_a_pin_),
-        gpio_get(joystick_b_pin_),
-        gpio_get(joystick_confirm_pin_)
+    static bool button_states[3] = {
+        false,
+        false,
+        false
     };
     
+    button_states[0] = gpio_get(joystick_a_pin_);
+    button_states[1] = gpio_get(joystick_b_pin_);
+    button_states[2] = gpio_get(joystick_confirm_pin_);
+
     // 应用active_low逻辑
     if (buttons_active_low_) {
         for (int i = 0; i < 3; i++) {
@@ -404,26 +406,23 @@ void UIManager::refresh_display() {
 }
 
 // 30fps刷新任务
-void UIManager::refresh_task_30fps() {
+void UIManager::refresh_task_30fps(uint32_t millis) {
     if (!initialized_ || !display_device_) {
         return;
     }
     
-    uint32_t current_time = to_ms_since_boot(get_absolute_time());
     // 30fps = 33.33ms间隔
-    if (current_time - last_refresh_time_ >= 33) {
-        // 屏幕亮起时始终刷新，对于主页面也需要重绘以更新运行时长
+    if (millis - last_refresh_time_ >= 33) {
+        // 屏幕亮起时始终刷新
 
-        if (page_template_) {
-            draw_page_with_template();
-            // 渲染光标指示器
-            render_cursor_indicator();
-        }
+        draw_page_with_template();
+        // 渲染光标指示器
+        render_cursor_indicator();
         
         // 刷新显示
         refresh_display();
         
-        last_refresh_time_ = current_time;
+        last_refresh_time_ = millis;
     }
 }
 
@@ -761,7 +760,6 @@ void UIManager::handle_back_item() {
             page_template_->set_selected_index(current_menu_index_);
         }
         
-        last_activity_time_ = to_ms_since_boot(get_absolute_time());
         log_debug("Returned from popup to page: " + current_page_name_ +
                  " with index: " + std::to_string(current_menu_index_));
     } else {
@@ -777,7 +775,6 @@ void UIManager::handle_back_item() {
                 page_template_->set_scroll_position(prev_state.scroll_position);
             }
             
-            last_activity_time_ = to_ms_since_boot(get_absolute_time());
             log_debug("Returned to page: " + current_page_name_ + 
                  ", cursor: " + std::to_string(current_menu_index_) + 
                  ", scroll: " + std::to_string(prev_state.scroll_position));
@@ -882,13 +879,11 @@ void UIManager::task() {
         return;
     }
     
-    uint32_t current_time = to_ms_since_boot(get_absolute_time());
+    static uint32_t current_time;
+    current_time = to_ms_since_boot(get_absolute_time());
     
     // 处理息屏
-    handle_screen_timeout();
-
-    // 更新统计信息
-    statistics_.uptime_seconds = current_time / 1000;
+    handle_screen_timeout(current_time);
     
     // 处理输入
     handle_input();
@@ -897,15 +892,6 @@ void UIManager::task() {
     if (screen_off_) {
         // 息屏时只进行必要的检测，不进行渲染
         // 检查是否有需要唤醒屏幕的条件
-        
-        // 检查摇杆输入
-        // 简单检查摇杆状态，如有输入则唤醒
-        for (int i = 0; i < 3; i++) {
-            if (joystick_buttons_[i]) {
-                wake_screen();
-                break;
-            }
-        }
 
         // 检查是否有故障需要显示
         if (global_has_error_) {
@@ -918,15 +904,13 @@ void UIManager::task() {
     
     // 屏幕开启状态下的正常渲染
     // 使用30fps刷新任务进行页面渲染
-    refresh_task_30fps();
+    refresh_task_30fps(current_time);
 }
 
 // 息屏管理
-void UIManager::handle_screen_timeout() {
-    uint32_t current_time = to_ms_since_boot(get_absolute_time());
-    uint32_t timeout_ms = static_config_.screen_timeout * 1000;
+void UIManager::handle_screen_timeout(uint32_t millis) {
     if (!screen_off_) {
-        if (current_time - last_activity_time_ > timeout_ms) {
+        if (millis - last_activity_time_ > static_config_.screen_timeout * 1000) {
             screen_off_ = true;
             // 息屏：关闭背光但保持显示内容
             if (display_device_) {
@@ -1203,7 +1187,6 @@ bool UIManager::handle_selector_input(JoystickState state) {
 // 统一的摇杆输入处理接口
 bool UIManager::handle_joystick_input(int button) {
     // 更新活动时间
-    last_activity_time_ = to_ms_since_boot(get_absolute_time());
     
     // 将按钮索引映射到摇杆状态
     JoystickState state;

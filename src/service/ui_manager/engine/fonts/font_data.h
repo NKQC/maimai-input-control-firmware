@@ -21,8 +21,6 @@ struct CharBitmap {
 #define ASCII_END 126
 #define ASCII_COUNT (ASCII_END - ASCII_START + 1)
 
-// 中文字符数量定义
-#define CHINESE_CHAR_COUNT 282
 
 // 中文字符映射结构
 struct ChineseChar {
@@ -73,7 +71,7 @@ namespace FontData {
         extern const char PROGMEM chinese_index_string[];
         
         // 字符点阵数据数组
-        extern const uint8_t char_bits[CHINESE_CHAR_COUNT][28];
+        extern const uint8_t char_bits[][28];
     }
     
     // 统一字库搜索接口

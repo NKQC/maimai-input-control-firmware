@@ -560,6 +560,13 @@ bool AD7147::calibrateSensor() {
     return startAutoOffsetCalibration();
 }
 
+bool AD7147::calibrateSensor(uint8_t sensitivity_target) {
+    // 设置校准工具的灵敏度目标
+    calibration_tools_.sensitivity_target = sensitivity_target;
+    // 启动自动偏移校准
+    return startAutoOffsetCalibration();
+}
+
 uint8_t AD7147::getCalibrationProgress() const {
     // 返回自动偏移校准的总进度
     return getAutoOffsetCalibrationTotalProgress();

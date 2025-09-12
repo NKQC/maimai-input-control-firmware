@@ -123,6 +123,7 @@ public:
     
     // 校准相关接口 - 子类可选实现
     virtual bool calibrateSensor() { return false; }  // 校准传感器
+    virtual bool calibrateSensor(uint8_t sensitivity_target) { return calibrateSensor(); }  // 校准传感器(带灵敏度目标)
     virtual uint8_t getCalibrationProgress() const { return 0; }  // 获取校准进度 (0-100)
     virtual bool setLEDEnabled(bool enabled) { return false; }  // 设置LED状态
     

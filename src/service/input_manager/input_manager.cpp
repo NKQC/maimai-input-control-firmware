@@ -27,8 +27,8 @@ InputManager *InputManager::getInstance()
 
 // 私有构造函数
 InputManager::InputManager()
-    : delay_buffer_head_(0), delay_buffer_count_(0), mcu_gpio_states_(0), mcu_gpio_previous_states_(0), serial_state_(), touch_keyboard_enabled_(false), touch_keyboard_current_time_cache_(0), touch_keyboard_areas_matched_cache_(false), touch_keyboard_hold_satisfied_cache_(false), sample_counter_(0), last_reset_time_(0), current_sample_rate_(0), binding_active_(false), binding_callback_(), binding_state_(BindingState::IDLE), current_binding_index_(0), binding_start_time_(0), binding_timeout_ms_(30000),
-      binding_hardware_ops_pending_(false), binding_cancel_pending_(false), calibration_request_pending_(false), auto_adjust_context_(), mai2_serial_(nullptr), hid_(nullptr), mcp23s17_(nullptr), config_(inputmanager_get_config_holder()), mcp23s17_available_(false), ui_manager_(nullptr), gpio_keyboard_bitmap_(), touch_bitmap_cache_(), mcp_gpio_states_(), mcp_gpio_previous_states_()
+    : delay_buffer_head_(0), delay_buffer_count_(0), mcu_gpio_states_(0), mcu_gpio_previous_states_(0), serial_state_(), touch_keyboard_current_time_cache_(0), touch_keyboard_areas_matched_cache_(false), touch_keyboard_hold_satisfied_cache_(false), sample_counter_(0), last_reset_time_(0), current_sample_rate_(0), binding_active_(false), binding_callback_(), binding_state_(BindingState::IDLE), current_binding_index_(0), binding_start_time_(0), binding_timeout_ms_(30000),
+      binding_hardware_ops_pending_(false), binding_cancel_pending_(false), calibration_request_pending_(false), calibration_sensitivity_target_(2), calibration_in_progress_(false), auto_adjust_context_(), mai2_serial_(nullptr), hid_(nullptr), mcp23s17_(nullptr), config_(inputmanager_get_config_holder()), mcp23s17_available_(false), ui_manager_(nullptr), gpio_keyboard_bitmap_(), touch_bitmap_cache_(), mcp_gpio_states_(), mcp_gpio_previous_states_()
 {
 
     // 初始化32位触摸状态数组
@@ -280,10 +280,23 @@ inline void InputManager::processSerialModeWithDelay()
     static Mai2Serial_TouchState delayed_serial_state;
     static uint32_t target_time;
     static uint16_t buffer_idx;
+    static uint16_t last_hit_offset = 0;  // 上次命中位置相对于head的偏移
+    static uint32_t current_timestamp;
+    static uint16_t best_idx;
+    static uint16_t best_offset;
+    static uint16_t offset;
+    // 使用union位域优化bool变量存储，支持一次性重置所有标志
+    static union {
+        struct {
+            uint8_t found : 1;  // 是否找到符合条件的数据
+            uint8_t reserved : 7;  // 预留位，供未来扩展
+        };
+        uint8_t all_flags;  // 用于一次性重置所有标志位
+    } flags;
 
     // 内联延迟状态获取逻辑，减少函数调用开销
-    // 计算目标时间点（当前时间减去延迟时间）
-    target_time = time_us_32() - (config_->touch_response_delay_ms * 1000U);
+    // 一次性重置所有标志位，降低CPU开销
+    flags.all_flags = 0;
     
     // 如果缓冲区为空，直接返回
     if (delay_buffer_count_ == 0)
@@ -291,23 +304,80 @@ inline void InputManager::processSerialModeWithDelay()
         return;
     }
     
-    // 从最新数据向前搜索，寻找匹配目标时间窗口的时间戳
-    buffer_idx = delay_buffer_head_;
-    for (uint16_t i = 0; i < delay_buffer_count_; ++i)
+    // 如果延迟为0，直接使用最新数据，无需搜索
+    if (config_->touch_response_delay_ms == 0)
     {
-        buffer_idx = (buffer_idx - 1) & (DELAY_BUFFER_SIZE - 1);
-        if (delay_buffer_[buffer_idx].timestamp_us <= target_time)
+        buffer_idx = (delay_buffer_head_ - 1) & (DELAY_BUFFER_SIZE - 1);
+        delayed_serial_state = delay_buffer_[buffer_idx].serial_touch_state;
+        serial_state_ = delayed_serial_state;
+        mai2_serial_->send_touch_data(delayed_serial_state);
+        last_hit_offset = 1;  // 更新偏移为最新位置
+        return;
+    }
+    
+    // 计算目标时间点（当前时间减去延迟时间）
+    target_time = time_us_32() - (config_->touch_response_delay_ms * 1000U);
+    
+    // 限制偏移范围，防止越界
+    if (last_hit_offset >= delay_buffer_count_)
+    {
+        last_hit_offset = delay_buffer_count_ / 2;  // 重置到中间位置
+    }
+    
+    // 从上次命中位置开始搜索
+    buffer_idx = (delay_buffer_head_ - last_hit_offset) & (DELAY_BUFFER_SIZE - 1);
+    current_timestamp = delay_buffer_[buffer_idx].timestamp_us;
+    
+    if (current_timestamp <= target_time)
+    {
+        // 当前位置时间戳过旧，需要向最新方向搜索最贴近目标的位置
+        best_idx = buffer_idx;
+        best_offset = last_hit_offset;
+        
+        // 向最新方向搜索，找到最后一个符合条件的位置
+        for (offset = last_hit_offset - 1; offset > 0; --offset)
         {
-            // 找到目标时间点的数据，直接使用预计算的serial状态
-            delayed_serial_state = delay_buffer_[buffer_idx].serial_touch_state;
-            // 直接发送延迟后的Serial状态
-            serial_state_ = delayed_serial_state;  // 为确保当外键映射启用时时间是同步的
-            mai2_serial_->send_touch_data(delayed_serial_state);
+            buffer_idx = (delay_buffer_head_ - offset) & (DELAY_BUFFER_SIZE - 1);
+            if (delay_buffer_[buffer_idx].timestamp_us <= target_time)
+            {
+                best_idx = buffer_idx;
+                best_offset = offset;
+            }
+            else
+            {
+                break;  // 找到第一个不符合的，停止搜索
+            }
+        }
+        
+        buffer_idx = best_idx;
+        last_hit_offset = best_offset;
+    }
+    else
+    {
+        // 当前位置时间戳过新，需要向过去方向搜索第一个符合条件的位置
+        flags.found = 0;
+        for (offset = last_hit_offset + 1; offset <= delay_buffer_count_; ++offset)
+        {
+            buffer_idx = (delay_buffer_head_ - offset) & (DELAY_BUFFER_SIZE - 1);
+            if (delay_buffer_[buffer_idx].timestamp_us <= target_time)
+            {
+                last_hit_offset = offset;
+                flags.found = 1;
+                break;
+            }
+        }
+        
+        if (!flags.found)
+        {
+            // 没找到符合条件的，说明还没到发送时候
             return;
         }
     }
     
-    // 如果转完一圈都找不到匹配的时间窗口，说明还没到发送的时候
+    // 发送找到的数据
+    delayed_serial_state = delay_buffer_[buffer_idx].serial_touch_state;
+    serial_state_ = delayed_serial_state;  // 为确保当外键映射启用时时间是同步的
+    mai2_serial_->send_touch_data(delayed_serial_state);
 }
 
 void InputManager::clearPhysicalKeyboards()
@@ -373,12 +443,6 @@ bool InputManager::removeTouchKeyboardMapping(uint64_t area_mask, HID_KeyCode ke
     }
     
     return false;
-}
-
-void InputManager::clearTouchKeyboardMappings()
-{
-    config_->touch_keyboard_mappings.clear();
-    touch_keyboard_enabled_ = false;
 }
 
 const std::vector<TouchKeyboardMapping>& InputManager::getTouchKeyboardMappings() const
@@ -454,6 +518,11 @@ void InputManager::task0()
     if (calibration_request_pending_)
         processCalibrationRequest();
 
+    if (calibration_in_progress_) {
+        getCalibrationProgress();
+        return;
+    }
+    
     // 处理绑定状态
     if (binding_active_)
     {
@@ -489,7 +558,7 @@ void InputManager::task1()
             break;
         case InputWorkMode::SERIAL_MODE:
             // 检查触摸键盘触发
-            if (touch_keyboard_enabled_)
+            if (config_->touch_keyboard_enabled)
                 checkTouchKeyboardTrigger();
             break;
         default:
@@ -2101,6 +2170,15 @@ void InputManager::calibrateAllSensors()
     calibration_request_pending_ = true;
 }
 
+void InputManager::calibrateAllSensorsWithTarget(uint8_t sensitivity_target)
+{
+    // 存储灵敏度目标参数
+    calibration_sensitivity_target_ = sensitivity_target;
+    
+    // 设置校准请求标志，实际校准将在task0中执行
+    calibration_request_pending_ = true;
+}
+
 void InputManager::processCalibrationRequest()
 {
     log_info("Starting simultaneous calibration for all sensors");
@@ -2122,12 +2200,13 @@ void InputManager::processCalibrationRequest()
     // 同时启动所有传感器的校准
     for (TouchSensor *sensor : calibration_sensors) {
         log_info("Starting calibration for sensor: " + sensor->getDeviceName());
-        sensor->calibrateSensor();
+        sensor->calibrateSensor(calibration_sensitivity_target_);
     }
     
     // 校准已发起，清除请求标志并退出，让传感器自行完成校准工作
     log_info("Calibration initiated for all sensors, sensors will complete calibration independently");
     calibration_request_pending_ = false;
+    calibration_in_progress_ = true;
 }
 
 uint8_t InputManager::getCalibrationProgress()
@@ -2168,6 +2247,7 @@ uint8_t InputManager::getCalibrationProgress()
     
     // 如果所有传感器都完成了校准（进度都是255），返回255
     if (!any_calibrating) {
+        calibration_in_progress_ = false;
         return 255;
     }
     

@@ -10,6 +10,7 @@ int32_t TouchSettingsMain::delay_value = 0;
 
 // 校准相关静态变量初始化
 uint8_t TouchSettingsMain::progress = 0;
+uint8_t TouchSettingsMain::sensitivity_target = 2;  // 默认灵敏度
 bool TouchSettingsMain::calibration_in_progress_ = false;
 bool TouchSettingsMain::calibration_completed_ = false;
 
@@ -18,12 +19,38 @@ TouchSettingsMain::TouchSettingsMain() {
 }
 
 void TouchSettingsMain::render(PageTemplate& page_template) {
-    // 触摸设置主页面 - 使用页面构造宏
+    // 获取InputManager实例并显示各设备状态
+    InputManager* input_manager = InputManager::getInstance();
+
     PAGE_START()
     SET_TITLE("触摸设置", COLOR_WHITE)
-    
+
     // 返回上级页面
     ADD_BACK_ITEM("返回", COLOR_TEXT_WHITE)
+
+    if (input_manager) {
+        int device_count = input_manager->get_device_count();
+        InputManager::TouchDeviceStatus device_status[device_count];
+        input_manager->get_all_device_status(device_status);
+        
+        if (device_count > 0) {
+            std::string device_info = "共 " + std::to_string(device_count) + " 个触摸设备:";
+            ADD_TEXT(device_info, COLOR_TEXT_WHITE, LineAlign::CENTER)
+            for (int i = 0; i < device_count; i++) {
+                const auto& device = device_status[i];
+                // 设备名称和地址行
+                device_info = device.device_name + ": " + format_device_address(device.touch_device.device_id_mask);
+                Color device_color = device.is_connected ? COLOR_TEXT_WHITE : COLOR_RED;
+                ADD_TEXT(device_info, device_color, LineAlign::LEFT)
+                
+                // 触摸bitmap行
+                std::string bitmap_line = format_touch_bitmap(device.touch_states_32bit, device.touch_device.max_channels, device.touch_device.enabled_channels_mask);
+                ADD_TEXT(bitmap_line, COLOR_TEXT_WHITE, LineAlign::LEFT)
+            }
+        } else {
+            ADD_TEXT("未检测到触摸IC设备", COLOR_YELLOW, LineAlign::CENTER)
+        }
+    }
     
     if (calibration_in_progress_) {
         // 校准进行中，显示进度条
@@ -42,60 +69,25 @@ void TouchSettingsMain::render(PageTemplate& page_template) {
         // 校准完成
         ADD_TEXT("校准完成", COLOR_GREEN, LineAlign::CENTER)
     } else {
+        // 校准灵敏度目标选择器
+        static char sensitivity_text[32];
+        const char* sensitivity_options[] = {"高敏", "默认", "低敏"};
+        snprintf(sensitivity_text, sizeof(sensitivity_text), "校准灵敏度: %s", sensitivity_options[TouchSettingsMain::sensitivity_target - 1]);
+        ADD_SIMPLE_SELECTOR(sensitivity_text, [](JoystickState state) {
+            if (state == JoystickState::UP && TouchSettingsMain::sensitivity_target < 3) {
+                TouchSettingsMain::sensitivity_target++;
+            } else if (state == JoystickState::DOWN && TouchSettingsMain::sensitivity_target > 1) {
+                TouchSettingsMain::sensitivity_target--;
+            }
+        }, COLOR_TEXT_WHITE)
+        
         // 未开始校准，显示校准按钮
         ADD_BUTTON("校准全部传感器", onCalibrateButtonPressed, COLOR_TEXT_WHITE, LineAlign::CENTER)
     }
 
     // 灵敏度调整菜单项
-    ADD_MENU("灵敏度调整", "sensitivity_main", COLOR_TEXT_WHITE)
+    ADD_MENU("按模块调整灵敏度", "sensitivity_main", COLOR_TEXT_WHITE)
 
-    // 获取InputManager实例并显示各设备状态
-    InputManager* input_manager = InputManager::getInstance();
-    
-    // Serial模式延迟设置（仅在Serial模式下显示）
-    if (input_manager) {
-        InputManager_PrivateConfig config = input_manager->getConfig();
-        if (config.work_mode == InputWorkMode::SERIAL_MODE) {
-            if (!delay_value) {
-                delay_value = static_cast<int32_t>(input_manager->getTouchResponseDelay()); // 更新当前值
-            }
-            ADD_INT_SETTING(&delay_value, 0, 100, 
-                          "延迟设置: " + std::to_string(delay_value) + "ms", 
-                          "触摸响应延迟",
-                          nullptr,
-                          []() {
-                              // 完成回调
-                              auto* input_mgr = InputManager::getInstance();
-                              if (input_mgr) {
-                                  input_mgr->setTouchResponseDelay(static_cast<uint8_t>(delay_value));
-                            }},
-                          COLOR_TEXT_WHITE);
-        }
-    }
-
-    if (input_manager) {
-        int device_count = input_manager->get_device_count();
-        InputManager::TouchDeviceStatus device_status[device_count];
-        input_manager->get_all_device_status(device_status);
-        
-        if (device_count > 0) {
-            std::string device_info = "检测到 " + std::to_string(device_count) + " 个触摸设备:";
-            ADD_TEXT(device_info, COLOR_TEXT_WHITE, LineAlign::LEFT)
-            for (int i = 0; i < device_count; i++) {
-                const auto& device = device_status[i];
-                // 设备名称和地址行
-                device_info = device.device_name + ": " + format_device_address(device.touch_device.device_id_mask);
-                Color device_color = device.is_connected ? COLOR_TEXT_WHITE : COLOR_RED;
-                ADD_TEXT(device_info, device_color, LineAlign::LEFT)
-                
-                // 触摸bitmap行
-                std::string bitmap_line = format_touch_bitmap(device.touch_states_32bit, device.touch_device.max_channels, device.touch_device.enabled_channels_mask);
-                ADD_TEXT(bitmap_line, COLOR_TEXT_WHITE, LineAlign::LEFT)
-            }
-        } else {
-            ADD_TEXT("未检测到触摸IC设备", COLOR_YELLOW, LineAlign::CENTER)
-        }
-    }
     PAGE_END()
 }
 
@@ -133,7 +125,7 @@ void TouchSettingsMain::onCalibrateButtonPressed() {
     // 启动校准
     InputManager* input_manager = InputManager::getInstance();
     if (input_manager) {
-        input_manager->calibrateAllSensors();
+        input_manager->calibrateAllSensorsWithTarget(sensitivity_target);
         calibration_in_progress_ = true;
         calibration_completed_ = false;
         // 清空状态
