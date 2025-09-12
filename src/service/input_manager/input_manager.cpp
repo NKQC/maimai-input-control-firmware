@@ -408,7 +408,7 @@ inline TouchKeyboardMode InputManager::getTouchKeyboardMode() const
 }
 
 // 触摸键盘映射管理方法实现
-bool InputManager::addTouchKeyboardMapping(uint64_t area_mask, uint32_t hold_time_ms, HID_KeyCode key)
+bool InputManager::addTouchKeyboardMapping(uint64_t area_mask, uint32_t hold_time_ms, HID_KeyCode key, bool trigger_once)
 {
     // 检查参数有效性
     if (area_mask == 0 || key == HID_KeyCode::KEY_NONE) {
@@ -423,7 +423,7 @@ bool InputManager::addTouchKeyboardMapping(uint64_t area_mask, uint32_t hold_tim
     }
     
     // 添加新映射
-    TouchKeyboardMapping new_mapping(area_mask, hold_time_ms, key);
+    TouchKeyboardMapping new_mapping(area_mask, hold_time_ms, key, trigger_once);
     config_->touch_keyboard_mappings.push_back(new_mapping);
     
     return true;
@@ -472,9 +472,19 @@ inline bool InputManager::checkTouchKeyboardTrigger()
                                                     ((touch_keyboard_current_time_cache_ - mapping.press_timestamp) >= mapping.hold_time_ms);
             
             if (__builtin_expect(touch_keyboard_hold_satisfied_cache_ && !mapping.key_pressed, 0)) {
-                // 满足条件，按下按键 - 直接调用HID方法避免额外检查
-                hid_->press_key(mapping.key);
-                mapping.key_pressed = true;
+                // 检查trigger_once模式
+                if (mapping.trigger_once) {
+                    // trigger_once模式：只有未触发过才能按下按键
+                    if (!mapping.has_triggered) {
+                        hid_->press_key(mapping.key);
+                        mapping.key_pressed = true;
+                        mapping.has_triggered = true;  // 标记已触发
+                    }
+                } else {
+                    // 正常模式：满足条件就按下按键
+                    hid_->press_key(mapping.key);
+                    mapping.key_pressed = true;
+                }
             }
             
             if (mapping.key_pressed) {
@@ -487,6 +497,8 @@ inline bool InputManager::checkTouchKeyboardTrigger()
                 mapping.key_pressed = false;
             }
             mapping.press_timestamp = 0;
+            // 重置trigger_once状态，允许下次触摸时重新触发
+            mapping.has_triggered = false;
         }
     }
     

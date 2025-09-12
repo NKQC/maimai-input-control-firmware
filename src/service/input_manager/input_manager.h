@@ -81,10 +81,12 @@ struct TouchKeyboardMapping {
     HID_KeyCode key;             // 触发的按键
     uint32_t press_timestamp;    // 按下时间戳（毫秒）
     bool key_pressed;            // 当前按键是否处于按下状态
+    bool trigger_once;           // 是否只触发一次（启用时触发只触发一次，关闭时保持现状）
+    bool has_triggered;          // 是否已经触发过（用于trigger_once模式）
     
-    TouchKeyboardMapping() : area_mask(0), hold_time_ms(0), key(HID_KeyCode::KEY_NONE), press_timestamp(0), key_pressed(false) {}
-    TouchKeyboardMapping(uint64_t mask, uint32_t hold_time, HID_KeyCode trigger_key) 
-        : area_mask(mask), hold_time_ms(hold_time), key(trigger_key), press_timestamp(0), key_pressed(false) {}
+    TouchKeyboardMapping() : area_mask(0), hold_time_ms(0), key(HID_KeyCode::KEY_NONE), press_timestamp(0), key_pressed(false), trigger_once(false), has_triggered(false) {}
+    TouchKeyboardMapping(uint64_t mask, uint32_t hold_time, HID_KeyCode trigger_key, bool once = false) 
+        : area_mask(mask), hold_time_ms(hold_time), key(trigger_key), press_timestamp(0), key_pressed(false), trigger_once(once), has_triggered(false) {}
 };
 
 // 逻辑按键映射结构体 - 支持每个GPIO绑定最多3个HID键
@@ -366,7 +368,7 @@ public:
     inline TouchKeyboardMode getTouchKeyboardMode() const;
     
     // 触摸键盘映射管理方法
-    bool addTouchKeyboardMapping(uint64_t area_mask, uint32_t hold_time_ms, HID_KeyCode key);
+    bool addTouchKeyboardMapping(uint64_t area_mask, uint32_t hold_time_ms, HID_KeyCode key, bool trigger_once = false);
     bool removeTouchKeyboardMapping(uint64_t area_mask, HID_KeyCode key);
     const std::vector<TouchKeyboardMapping>& getTouchKeyboardMappings() const;
     
