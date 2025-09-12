@@ -124,7 +124,7 @@ void AD7147::CalibrationTools::CalibrationLoop(uint32_t sample)
             }
             // 验证当前CDC是否高于目标值 + 最大波动差绝对值2/3
             // 应用灵敏度目标控制: * 5 / sensitivity_target
-            uint16_t adjusted_target = target_value + (max_fluctuation_[stage] * 5 / sensitivity_target);
+            uint16_t adjusted_target = target_value + (max_fluctuation_[stage] * 2 / (sensitivity_target + 2));
             if (cdc_samples_[stage].average >= adjusted_target) {
                 // 达到目标CDC值，开始检查触发状态
                 if (!Read_Triggle_Sample(stage, sample, trigger_samples_[stage], true)) continue; // 继续采样触发状态

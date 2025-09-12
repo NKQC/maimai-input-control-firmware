@@ -71,7 +71,7 @@ void TouchSettingsMain::render(PageTemplate& page_template) {
     } else {
         // 校准灵敏度目标选择器
         static char sensitivity_text[32];
-        const char* sensitivity_options[] = {"高敏", "默认", "低敏"};
+        const char* sensitivity_options[] = {"低敏", "默认", "高敏"};
         snprintf(sensitivity_text, sizeof(sensitivity_text), "校准灵敏度: %s", sensitivity_options[TouchSettingsMain::sensitivity_target - 1]);
         ADD_SIMPLE_SELECTOR(sensitivity_text, [](JoystickState state) {
             if (state == JoystickState::UP && TouchSettingsMain::sensitivity_target < 3) {
