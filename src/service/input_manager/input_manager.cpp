@@ -2025,7 +2025,7 @@ inline void InputManager::storeDelayedSerialState()
         }
     }
     delay_buffer_[delay_buffer_head_].timestamp_us = current_time_us;
-    delay_buffer_[delay_buffer_head_].serial_touch_state = serial_state_;
+    delay_buffer_[delay_buffer_head_].serial_touch_state = local_serial_state_;
 
     // 优化缓冲区指针更新
     delay_buffer_head_ = (delay_buffer_head_ + 1) % DELAY_BUFFER_SIZE;
