@@ -1,7 +1,7 @@
 #pragma once
 
-#include "../../engine/page_construction/page_constructor.h"
-#include "../../../input_manager/input_manager.h"
+#include "../../../engine/page_construction/page_constructor.h"
+#include "../../../../input_manager/input_manager.h"
 #include <cstdint>
 #include <string>
 

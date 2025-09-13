@@ -12,7 +12,8 @@
 // 页面开始宏 - 清空页面并初始化行容器
 #define PAGE_START() \
     page_template.flush(); \
-    std::vector<LineConfig> all_lines;
+    static std::vector<LineConfig> all_lines; \
+    all_lines.clear();
 
 // 设置标题
 #define SET_TITLE(title, color) \

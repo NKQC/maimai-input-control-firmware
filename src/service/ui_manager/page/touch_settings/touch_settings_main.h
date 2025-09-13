@@ -7,6 +7,37 @@
 namespace ui {
 
 /**
+ * 灵敏度选项枚举
+ */
+enum class SensitivityOption : int8_t {
+    UNCHANGED = 0,  // 不变（仅供zone_sensitivity使用）
+    LOW = 1,        // 低敏
+    DEFAULT = 2,    // 默认
+    HIGH = 3,       // 高敏
+    ULTRA = 4       // 超敏
+};
+
+/**
+ * 获取灵敏度选项的文字描述
+ * @param option 灵敏度选项
+ * @param include_unchanged 是否包含"不变"选项（默认false）
+ * @return 对应的文字描述
+ */
+const char* getSensitivityOptionText(SensitivityOption option, bool include_unchanged = false);
+
+/**
+ * 获取灵敏度选项数组（不包含UNCHANGED）
+ * @return 灵敏度选项文字数组
+ */
+const char* const* getSensitivityOptions();
+
+/**
+ * 获取灵敏度选项数量（不包含UNCHANGED）
+ * @return 选项数量
+ */
+size_t getSensitivityOptionsCount();
+
+/**
  * 触摸设置主页面构造器
  * 包含触摸IC状态和灵敏度调整菜单项
  */
@@ -29,7 +60,6 @@ private:
     static uint8_t sensitivity_target;        // 校准灵敏度目标 (1=高敏, 2=默认, 3=低敏)
 
     static bool calibration_in_progress_;     // 校准是否正在进行
-    static bool calibration_completed_;       // 校准是否已完成
 
     /**
      * 格式化触摸IC地址为字符串

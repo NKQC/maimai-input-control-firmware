@@ -1,9 +1,9 @@
 #include "interactive_sensitivity.h"
-#include "../../ui_manager.h"
-#include "../../engine/page_construction/page_macros.h"
-#include "../../engine/page_construction/page_template.h"
-#include "../../page_registry.h"
-#include "device_type_utils.h"
+#include "../../../ui_manager.h"
+#include "../../../engine/page_construction/page_macros.h"
+#include "../../../engine/page_construction/page_template.h"
+#include "../../../page_registry.h"
+#include "../device_type_utils.h"
 #include <cstdio>
 #include <cstring>
 #include "pico/time.h"

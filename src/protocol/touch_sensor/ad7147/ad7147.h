@@ -363,6 +363,8 @@ public:
     // 校准相关接口实现
     bool calibrateSensor() override;                           // 校准传感器(接入startAutoOffsetCalibration)
     bool calibrateSensor(uint8_t sensitivity_target) override; // 校准传感器(带灵敏度目标)
+    bool setChannelCalibrationTarget(uint8_t channel, uint8_t sensitivity_target) override; // 设置指定通道的校准目标灵敏度
+    bool startCalibration() override;                          // 启动校准过程
     uint8_t getCalibrationProgress() const override;           // 获取校准进度(接入getAutoOffsetCalibrationTotalProgress)
     bool setLEDEnabled(bool enabled) override;                 // 设置LED状态(修改stage_low_int_enable的第12-13位)
 
@@ -494,23 +496,31 @@ private:
             }
         };
 
+        // 校准状态结构体 - 包含所有校准相关的数据
+        // 单个通道的校准数据结构
+        struct ChannelCalibrationData
+        {
+            uint8_t sensitivity_target = 2;        // 灵敏度目标 (1=高敏, 2=默认, 3=低敏)
+            bool s1_inited_ = false;               // 初始化状态
+            int16_t s1_aef_ = 0;                   // 当前扫描AEF -127..127
+            int16_t s1_best_aef_ = 0;              // 阶段1找到的最佳AEF
+            CDCSample_result cdc_samples_;         // CDC采样结果
+            uint16_t max_fluctuation_ = 0;         // 最大波动差
+            TriggleSample trigger_samples_;        // 触发采样结果
+        };
+
+        struct CalibrationData
+        {
+            uint8_t stage_process = 0;
+            bool inited_ = false;
+            bool global_initialized_ = false;                     // 全局初始化标志，用于一次性初始化所有通道
+            ChannelCalibrationData channels[AD7147_MAX_CHANNELS]; // 每个通道的校准数据
+        };
+
         AD7147 *pthis = nullptr;
 
         CalibrationState calibration_state_ = IDLE;
-
-        uint8_t stage_process = 0;
-        uint8_t sensitivity_target = 2; // 灵敏度目标 (1=高敏, 2=默认, 3=低敏)
-
-        bool inited_ = false;
-
-        // 阶段1：扫频寻找震荡点（触发与非触发最接近50%）- 多通道并行处理
-        bool s1_inited_[AD7147_MAX_CHANNELS] = {false};       // 每个通道的初始化状态
-        int16_t s1_aef_[AD7147_MAX_CHANNELS];                 // 每个通道当前扫描AEF -127..127
-        int16_t s1_best_aef_[AD7147_MAX_CHANNELS] = {0};      // 每个通道阶段1找到的最佳AEF
-        CDCSample_result cdc_samples_[AD7147_MAX_CHANNELS];   // 每个通道CDC采样结果
-        uint16_t max_fluctuation_[AD7147_MAX_CHANNELS] = {0}; // 每个通道最大波动差
-        TriggleSample trigger_samples_[AD7147_MAX_CHANNELS];  // 每个通道触发采样结果
-        bool global_initialized_ = false;                     // 全局初始化标志，用于一次性初始化所有通道
+        CalibrationData calibration_data_; // 校准数据结构体
 
         bool start_calibration()
         {

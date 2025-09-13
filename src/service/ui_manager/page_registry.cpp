@@ -2,9 +2,11 @@
 #include "page/main_page.h"
 #include "page/main_menu.h"
 #include "page/touch_settings/touch_settings_main.h"
-#include "page/touch_settings/sensitivity_main.h"
-#include "page/touch_settings/sensitivity_device.h"
-#include "page/touch_settings/interactive_sensitivity.h"
+#include "page/touch_settings/status/touch_status.h"
+#include "page/touch_settings/sensitivity/zone_sensitivity.h"
+#include "page/touch_settings/sensitivity/sensitivity_main.h"
+#include "page/touch_settings/sensitivity/sensitivity_device.h"
+#include "page/touch_settings/sensitivity/interactive_sensitivity.h"
 #include "page/touch_settings/device_custom_settings/ad7147_custom_settings.h"
 #include "page/binding_settings/binding_settings.h"
 #include "page/binding_settings/binding_info.h"
@@ -79,9 +81,17 @@ void PageRegistry::register_default_pages() {
     auto main_menu_page = std::make_shared<MainMenu>();
     register_page("main_menu", main_menu_page);
     
-    // 注册触摸设置相关页面
+    // 注册触摸设置主页面
     auto touch_settings_main_page = std::make_shared<TouchSettingsMain>();
     register_page("touch_settings_main", touch_settings_main_page);
+    
+    // 注册触摸状态页面
+    auto touch_status_page = std::make_shared<TouchStatus>();
+    register_page("touch_status", touch_status_page);
+    
+    // 注册按分区设置灵敏度页面
+    auto zone_sensitivity_page = std::make_shared<ZoneSensitivity>();
+    register_page("zone_sensitivity", zone_sensitivity_page);
     
     auto sensitivity_main_page = std::make_shared<SensitivityMain>();
     register_page("sensitivity_main", sensitivity_main_page);

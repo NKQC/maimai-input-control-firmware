@@ -15,14 +15,14 @@ typedef uint16_t Color;
 // 基础颜色定义 (BGR565格式 - 适配ST7735S BGR模式)
 #define COLOR_BLACK       0x0000  // 黑色
 #define COLOR_WHITE       0xFFFF  // 白色
-#define COLOR_RED         0xF800  // 红色 (RGB565: R=31, G=0, B=0)
-#define COLOR_GREEN       0x07E0  // 绿色 (RGB565: R=0, G=63, B=0)
-#define COLOR_BLUE        0x001F  // 蓝色 (RGB565: R=0, G=0, B=31)
-#define COLOR_YELLOW      0xFFE0  // 黄色 (RGB565: R=31, G=63, B=0)
-#define COLOR_CYAN        0x07FF  // 青色 (RGB565: R=0, G=63, B=31)
-#define COLOR_MAGENTA     0xF81F  // 洋红 (RGB565: R=31, G=0, B=31)
+#define COLOR_RED         0x001F  // 红色 (BGR565: B=31, G=0, R=0)
+#define COLOR_GREEN       0x07E0  // 绿色 (BGR565: B=0, G=63, R=0)
+#define COLOR_BLUE        0xF800  // 蓝色 (BGR565: B=0, G=0, R=31)
+#define COLOR_YELLOW      0x07FF  // 黄色 (BGR565: B=31, G=63, R=0)
+#define COLOR_CYAN        0xFFE0  // 青色 (BGR565: B=31, G=63, R=0)
+#define COLOR_MAGENTA     0xF81F  // 洋红 (BGR565: B=31, G=0, R=31)
 #define COLOR_GRAY        0x8410  // 灰色
-#define COLOR_DARK_GRAY   0x4208  // 深灰色
+#define COLOR_DARK_GRAY   0x4208  // 深灰色dcxz
 #define COLOR_LIGHT_GRAY  0xC618  // 浅灰色
 
 // 现代化UI颜色主题 (BGR565格式)

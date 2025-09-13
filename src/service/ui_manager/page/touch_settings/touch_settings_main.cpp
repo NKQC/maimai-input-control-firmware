@@ -6,13 +6,33 @@
 
 namespace ui {
 
+// 灵敏度选项实现
+const char* getSensitivityOptionText(SensitivityOption option, bool include_unchanged) {
+    switch (option) {
+        case SensitivityOption::UNCHANGED: return include_unchanged ? "不变" : "未知";
+        case SensitivityOption::LOW: return "低敏";
+        case SensitivityOption::DEFAULT: return "默认";
+        case SensitivityOption::HIGH: return "高敏";
+        case SensitivityOption::ULTRA: return "超敏";
+        default: return "未知";
+    }
+}
+
+const char* const* getSensitivityOptions() {
+    static const char* options[] = {"低敏", "默认", "高敏", "超敏"};
+    return options;
+}
+
+size_t getSensitivityOptionsCount() {
+    return 4;
+}
+
 int32_t TouchSettingsMain::delay_value = 0;
 
 // 校准相关静态变量初始化
 uint8_t TouchSettingsMain::progress = 0;
 uint8_t TouchSettingsMain::sensitivity_target = 2;  // 默认灵敏度
 bool TouchSettingsMain::calibration_in_progress_ = false;
-bool TouchSettingsMain::calibration_completed_ = false;
 
 TouchSettingsMain::TouchSettingsMain() {
     // 构造函数无需特殊初始化
@@ -28,55 +48,30 @@ void TouchSettingsMain::render(PageTemplate& page_template) {
     // 返回上级页面
     ADD_BACK_ITEM("返回", COLOR_TEXT_WHITE)
 
-    if (input_manager) {
-        int device_count = input_manager->get_device_count();
-        InputManager::TouchDeviceStatus device_status[device_count];
-        input_manager->get_all_device_status(device_status);
-        
-        if (device_count > 0) {
-            std::string device_info = "共 " + std::to_string(device_count) + " 个触摸设备:";
-            ADD_TEXT(device_info, COLOR_TEXT_WHITE, LineAlign::CENTER)
-            for (int i = 0; i < device_count; i++) {
-                const auto& device = device_status[i];
-                // 设备名称和地址行
-                device_info = device.device_name + ": " + format_device_address(device.touch_device.device_id_mask);
-                Color device_color = device.is_connected ? COLOR_TEXT_WHITE : COLOR_RED;
-                ADD_TEXT(device_info, device_color, LineAlign::LEFT)
-                
-                // 触摸bitmap行
-                std::string bitmap_line = format_touch_bitmap(device.touch_states_32bit, device.touch_device.max_channels, device.touch_device.enabled_channels_mask);
-                ADD_TEXT(bitmap_line, COLOR_TEXT_WHITE, LineAlign::LEFT)
-            }
-        } else {
-            ADD_TEXT("未检测到触摸IC设备", COLOR_YELLOW, LineAlign::CENTER)
-        }
-    }
-    
+    // 触摸状态查看菜单项
+    ADD_MENU("查看触摸状态", "touch_status", COLOR_TEXT_WHITE)
+    calibration_in_progress_ = input_manager->isCalibrationInProgress();
     if (calibration_in_progress_) {
         // 校准进行中，显示进度条
         InputManager* input_manager = InputManager::getInstance();
         progress = input_manager->getCalibrationProgress();
         if (progress == 255) {
             // 校准完成
-            calibration_in_progress_ = false;
-            calibration_completed_ = true;
+            ADD_TEXT("校准完成", COLOR_GREEN, LineAlign::CENTER)
         } else {
             // 显示进度条
             ADD_TEXT("校准进度", COLOR_YELLOW, LineAlign::CENTER)
             ADD_PROGRESS(&progress, COLOR_YELLOW)
         }
-    } else if (calibration_completed_) {
-        // 校准完成
-        ADD_TEXT("校准完成", COLOR_GREEN, LineAlign::CENTER)
     } else {
         // 校准灵敏度目标选择器
         static char sensitivity_text[32];
-        const char* sensitivity_options[] = {"低敏", "默认", "高敏", "超敏"};
-        snprintf(sensitivity_text, sizeof(sensitivity_text), "校准灵敏度: %s", sensitivity_options[TouchSettingsMain::sensitivity_target - 1]);
+        SensitivityOption current_option = static_cast<SensitivityOption>(TouchSettingsMain::sensitivity_target);
+        snprintf(sensitivity_text, sizeof(sensitivity_text), "校准灵敏度: %s", getSensitivityOptionText(current_option));
         ADD_SIMPLE_SELECTOR(sensitivity_text, [](JoystickState state) {
-            if (state == JoystickState::UP && TouchSettingsMain::sensitivity_target < 4) {
+            if (state == JoystickState::UP && TouchSettingsMain::sensitivity_target < static_cast<uint8_t>(SensitivityOption::ULTRA)) {
                 TouchSettingsMain::sensitivity_target++;
-            } else if (state == JoystickState::DOWN && TouchSettingsMain::sensitivity_target > 1) {
+            } else if (state == JoystickState::DOWN && TouchSettingsMain::sensitivity_target > static_cast<uint8_t>(SensitivityOption::LOW)) {
                 TouchSettingsMain::sensitivity_target--;
             }
         }, COLOR_TEXT_WHITE)
@@ -87,6 +82,11 @@ void TouchSettingsMain::render(PageTemplate& page_template) {
 
     // 灵敏度调整菜单项
     ADD_MENU("按模块调整灵敏度", "sensitivity_main", COLOR_TEXT_WHITE)
+    
+    // 按分区设置灵敏度选项（仅Serial模式）
+    if (input_manager->getWorkMode() == InputWorkMode::SERIAL_MODE) {
+        ADD_MENU("按分区设置灵敏度", "zone_sensitivity", COLOR_TEXT_WHITE)
+    }
 
     PAGE_END()
 }
@@ -126,8 +126,6 @@ void TouchSettingsMain::onCalibrateButtonPressed() {
     InputManager* input_manager = InputManager::getInstance();
     if (input_manager) {
         input_manager->calibrateAllSensorsWithTarget(sensitivity_target);
-        calibration_in_progress_ = true;
-        calibration_completed_ = false;
         // 清空状态
     }
 }

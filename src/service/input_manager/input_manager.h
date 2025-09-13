@@ -316,7 +316,12 @@ public:
     // 校准管理
     void calibrateAllSensors();                        // 校准所有支持校准的传感器
     void calibrateAllSensorsWithTarget(uint8_t sensitivity_target); // 校准所有传感器并指定灵敏度目标
+    void calibrateSelectedChannels();                 // 启动特殊校准（仅校准被setChannelCalibrationTarget设置过的通道）
+    void setCalibrationTargetByBitmap(uint32_t channel_bitmap, uint8_t target_sensitivity); // 按bitmap设置校准目标灵敏度
     uint8_t getCalibrationProgress();                  // 获取校准进度 (0-255范围)
+    inline bool isCalibrationInProgress() const {
+        return calibration_in_progress_;
+    }
     
     // 根据设备ID掩码获取设备名称 - UI显示时调用
     std::string getDeviceNameByMask(uint32_t device_and_channel_mask) const;
@@ -496,10 +501,17 @@ private:
     bool binding_cancel_pending_;            // 绑定取消操作待执行标志
     bool original_channels_backup_[8][12];   // 原始通道启用状态备份
 
+    // 校准类别枚举
+    enum class CalibrationRequestType : uint8_t {
+        IDLE = 0,           // 空闲状态
+        REQUEST_NORMAL = 1, // 普通校准请求
+        REQUEST_SUPER = 2   // 特殊校准请求（按分区）
+    };
+    
     // 校准管理相关变量
-    bool calibration_request_pending_;       // 校准请求待处理标志
-    uint8_t calibration_sensitivity_target_; // 校准灵敏度目标 (1=高敏, 2=默认, 3=低敏)
-    bool calibration_in_progress_;           // 校准正在运行
+    CalibrationRequestType calibration_request_pending_; // 校准请求类型
+    uint8_t calibration_sensitivity_target_;             // 校准灵敏度目标 (1=高敏, 2=默认, 3=低敏)
+    bool calibration_in_progress_;                       // 校准正在运行
     
     // 自动灵敏度调整状态机
     enum class AutoAdjustState {

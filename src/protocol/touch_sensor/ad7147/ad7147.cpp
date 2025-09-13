@@ -551,7 +551,12 @@ bool AD7147::setStageConfigAsync(uint8_t stage, const PortConfig& config) {
 
 bool AD7147::startAutoOffsetCalibration() {
     if (!initialized_) return false;
+    // 拉起全部通道校准
+    for (uint8_t channel = 0; channel < AD7147_MAX_CHANNELS; channel++) {
+        calibration_tools_.calibration_data_.channels[channel].s1_inited_ = true;
+    }
     calibration_tools_.pthis = this;
+    
     // 启动内部校准工具
     calibration_tools_.calibration_state_ = AD7147::CalibrationTools::PROCESS;
     return true;
@@ -563,7 +568,7 @@ bool AD7147::isAutoOffsetCalibrationActive() const {
 
 uint8_t AD7147::getAutoOffsetCalibrationTotalProgress() const {
     // 运行中时，直接返回CalibrationLoop中计算的平均进度
-    return calibration_tools_.stage_process;
+    return calibration_tools_.calibration_data_.stage_process;
 }
 
 // TouchSensor基类虚函数实现
@@ -573,10 +578,34 @@ bool AD7147::calibrateSensor() {
 }
 
 bool AD7147::calibrateSensor(uint8_t sensitivity_target) {
-    // 设置校准工具的灵敏度目标
-    calibration_tools_.sensitivity_target = sensitivity_target;
+    // 设置所有通道的灵敏度目标为相同值
+    for (int i = 0; i < AD7147_MAX_CHANNELS; i++) {
+        calibration_tools_.calibration_data_.channels[i].sensitivity_target = sensitivity_target;
+    }
     // 启动自动偏移校准
     return startAutoOffsetCalibration();
+}
+
+bool AD7147::setChannelCalibrationTarget(uint8_t channel, uint8_t sensitivity_target) {
+    // 检查通道范围
+    if (channel >= AD7147_MAX_CHANNELS) {
+        return false;
+    }
+    
+    // 设置指定通道的灵敏度目标
+    calibration_tools_.calibration_data_.channels[channel].sensitivity_target = sensitivity_target;
+    // 标记该通道已被设置过校准目标，需要进行校准处理
+    calibration_tools_.calibration_data_.channels[channel].s1_inited_ = true;
+    return true;
+}
+
+bool AD7147::startCalibration() {
+    if (!initialized_) return false;
+    // 启动自动偏移校准
+    calibration_tools_.pthis = this;
+    // 启动内部校准工具
+    calibration_tools_.calibration_state_ = AD7147::CalibrationTools::PROCESS;
+    return true;
 }
 
 uint8_t AD7147::getCalibrationProgress() const {

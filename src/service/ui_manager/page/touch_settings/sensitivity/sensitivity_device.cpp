@@ -1,7 +1,7 @@
 #include "sensitivity_device.h"
-#include "../../ui_manager.h"
-#include "../../engine/page_construction/page_macros.h"
-#include "../../engine/page_construction/page_template.h"
+#include "../../../ui_manager.h"
+#include "../../../engine/page_construction/page_macros.h"
+#include "../../../engine/page_construction/page_template.h"
 #include <cstdio>
 #include <cstring>
 

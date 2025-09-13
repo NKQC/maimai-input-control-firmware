@@ -28,7 +28,7 @@ InputManager *InputManager::getInstance()
 // 私有构造函数
 InputManager::InputManager()
     : delay_buffer_head_(0), delay_buffer_count_(0), mcu_gpio_states_(0), mcu_gpio_previous_states_(0), serial_state_(), touch_keyboard_current_time_cache_(0), touch_keyboard_areas_matched_cache_(false), touch_keyboard_hold_satisfied_cache_(false), sample_counter_(0), last_reset_time_(0), current_sample_rate_(0), binding_active_(false), binding_callback_(), binding_state_(BindingState::IDLE), current_binding_index_(0), binding_start_time_(0), binding_timeout_ms_(30000),
-      binding_hardware_ops_pending_(false), binding_cancel_pending_(false), calibration_request_pending_(false), calibration_sensitivity_target_(2), calibration_in_progress_(false), auto_adjust_context_(), mai2_serial_(nullptr), hid_(nullptr), mcp23s17_(nullptr), config_(inputmanager_get_config_holder()), mcp23s17_available_(false), ui_manager_(nullptr), gpio_keyboard_bitmap_(), touch_bitmap_cache_(), mcp_gpio_states_(), mcp_gpio_previous_states_()
+      binding_hardware_ops_pending_(false), binding_cancel_pending_(false), calibration_request_pending_(CalibrationRequestType::IDLE), calibration_sensitivity_target_(2), calibration_in_progress_(false), auto_adjust_context_(), mai2_serial_(nullptr), hid_(nullptr), mcp23s17_(nullptr), config_(inputmanager_get_config_holder()), mcp23s17_available_(false), ui_manager_(nullptr), gpio_keyboard_bitmap_(), touch_bitmap_cache_(), mcp_gpio_states_(), mcp_gpio_previous_states_()
 {
 
     // 初始化32位触摸状态数组
@@ -526,7 +526,7 @@ void InputManager::task0()
     }
 
     // 处理校准请求
-    if (calibration_request_pending_)
+    if (calibration_request_pending_ != CalibrationRequestType::IDLE)
         processCalibrationRequest();
 
     if (calibration_in_progress_) {
@@ -2196,46 +2196,114 @@ bool InputManager::is_debug_enabled()
 void InputManager::calibrateAllSensors()
 {
     // 设置校准请求标志，实际校准将在task0中执行
-    calibration_request_pending_ = true;
+    calibration_request_pending_ = CalibrationRequestType::REQUEST_NORMAL;
+}
+
+void InputManager::calibrateSelectedChannels()
+{
+    // 设置特殊校准请求标志，实际校准将在task0中执行
+    if (!calibration_in_progress_) {
+        calibration_request_pending_ = CalibrationRequestType::REQUEST_SUPER;
+    }
+}
+
+void InputManager::setCalibrationTargetByBitmap(uint32_t channel_bitmap, uint8_t target_sensitivity)
+{
+    if (calibration_in_progress_) return;
+    // 解析bitmap中的设备和通道信息
+    uint8_t device_mask = (channel_bitmap >> 24) & 0xFF;
+    uint32_t channel_mask = channel_bitmap & 0xFFFFFF;
+    
+    // 查找对应的传感器
+    TouchSensor* sensor = findTouchSensorByIdMask(device_mask);
+    if (!sensor) {
+        log_warning("setCalibrationTargetByBitmap: Device not found for mask " + std::to_string(device_mask));
+        return;
+    }
+    
+    // 为支持按通道校准的设备批量设置校准目标灵敏度
+    // 遍历通道掩码，为每个设置的通道设置校准目标
+    for (uint8_t channel = 0; channel < 24; channel++) {
+        if (channel_mask & (1 << channel)) {
+            log_info("Setting calibration target sensitivity " + std::to_string(target_sensitivity) + " for device " + std::to_string(device_mask) + " channel " + std::to_string(channel));
+            // 调用传感器的设置校准目标方法
+            sensor->setChannelCalibrationTarget(channel, target_sensitivity);
+        }
+    }
+    
+    // 注意：此函数仅设置校准目标，不自动发起校准
+    // 需要单独调用calibrateSelectedChannels()来发起特殊校准
 }
 
 void InputManager::calibrateAllSensorsWithTarget(uint8_t sensitivity_target)
 {
-    // 存储灵敏度目标参数
-    calibration_sensitivity_target_ = sensitivity_target;
-    
-    // 设置校准请求标志，实际校准将在task0中执行
-    calibration_request_pending_ = true;
+    if (!calibration_in_progress_) {
+        // 存储灵敏度目标参数
+        calibration_sensitivity_target_ = sensitivity_target;
+        
+        // 设置校准请求标志，实际校准将在task0中执行
+        calibration_request_pending_ = CalibrationRequestType::REQUEST_NORMAL;
+    }
 }
 
 void InputManager::processCalibrationRequest()
 {
-    log_info("Starting simultaneous calibration for all sensors");
-    
-    // 收集所有支持校准的传感器
-    std::vector<TouchSensor*> calibration_sensors;
-    for (TouchSensor *sensor : touch_sensor_devices_) {
-        if (sensor && sensor->supports_calibration_) {
-            calibration_sensors.push_back(sensor);
+    if (calibration_request_pending_ == CalibrationRequestType::REQUEST_NORMAL) {
+        log_info("Starting normal simultaneous calibration for all sensors");
+        
+        // 收集所有支持校准的传感器
+        std::vector<TouchSensor*> calibration_sensors;
+        for (TouchSensor *sensor : touch_sensor_devices_) {
+            if (sensor && sensor->supports_calibration_) {
+                calibration_sensors.push_back(sensor);
+            }
         }
+        
+        if (calibration_sensors.empty()) {
+            log_info("No sensors support calibration");
+            calibration_request_pending_ = CalibrationRequestType::IDLE;
+            return;
+        }
+        
+        // 同时启动所有传感器的校准
+        for (TouchSensor *sensor : calibration_sensors) {
+            log_info("Starting calibration for sensor: " + sensor->getDeviceName());
+            sensor->calibrateSensor(calibration_sensitivity_target_);
+        }
+        
+        // 校准已发起，清除请求标志并退出，让传感器自行完成校准工作
+        log_info("Normal calibration initiated for all sensors, sensors will complete calibration independently");
+        calibration_request_pending_ = CalibrationRequestType::IDLE;
+        calibration_in_progress_ = true;
     }
-    
-    if (calibration_sensors.empty()) {
-        log_info("No sensors support calibration");
-        calibration_request_pending_ = false;
-        return;
+    else if (calibration_request_pending_ == CalibrationRequestType::REQUEST_SUPER) {
+        log_info("Starting special calibration for selected channels");
+        
+        // 收集所有支持校准的传感器
+        std::vector<TouchSensor*> calibration_sensors;
+        for (TouchSensor *sensor : touch_sensor_devices_) {
+            if (sensor && sensor->supports_calibration_) {
+                calibration_sensors.push_back(sensor);
+            }
+        }
+        
+        if (calibration_sensors.empty()) {
+            log_info("No sensors support calibration");
+            calibration_request_pending_ = CalibrationRequestType::IDLE;
+            return;
+        }
+        
+        // 对每个传感器调用单独的启动函数
+        for (TouchSensor *sensor : calibration_sensors) {
+            log_info("Starting special calibration for sensor: " + sensor->getDeviceName());
+            sensor->startCalibration();
+        }
+        
+        // 校准已发起，清除请求标志并退出
+        log_info("Special calibration initiated for selected channels");
+        calibration_request_pending_ = CalibrationRequestType::IDLE;
+        calibration_in_progress_ = true;
     }
-    
-    // 同时启动所有传感器的校准
-    for (TouchSensor *sensor : calibration_sensors) {
-        log_info("Starting calibration for sensor: " + sensor->getDeviceName());
-        sensor->calibrateSensor(calibration_sensitivity_target_);
-    }
-    
-    // 校准已发起，清除请求标志并退出，让传感器自行完成校准工作
-    log_info("Calibration initiated for all sensors, sensors will complete calibration independently");
-    calibration_request_pending_ = false;
-    calibration_in_progress_ = true;
 }
 
 uint8_t InputManager::getCalibrationProgress()

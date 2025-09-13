@@ -1,8 +1,8 @@
 #include "sensitivity_main.h"
-#include "../../ui_manager.h"
-#include "../../engine/page_construction/page_macros.h"
-#include "../../engine/page_construction/page_template.h"
-#include "device_type_utils.h"
+#include "../../../ui_manager.h"
+#include "../../../engine/page_construction/page_macros.h"
+#include "../../../engine/page_construction/page_template.h"
+#include "../device_type_utils.h"
 #include <cstdio>
 #include <cstring>
 
