@@ -13,7 +13,7 @@ AD7147::AD7147(HAL_I2C* i2c_hal, I2C_Bus i2c_bus, uint8_t device_addr)
       cdc_read_request_(false), cdc_read_stage_(0), cdc_read_value_(0),
       sample_result_{.touch_mask = uint32_t(0)}, status_regs_(0),
       reconstructed_mask_(0), stage_status_(0), stage_index_(0), temp_mask_(0), channel_pos_(0),
-      pending_config_count_(0), abnormal_channels_bitmap_(0) {
+      pending_config_count_(0), abnormal_channels_bitmap_(0), auto_calibration_control_(0) {
     module_name = "AD7147";
     module_mask_ = TouchSensor::generateModuleMask(static_cast<uint8_t>(i2c_bus), device_addr);
     supported_channel_count_ = AD7147_MAX_CHANNELS;
@@ -253,6 +253,18 @@ TouchSampleResult AD7147::sample() {
         // 读取指定阶段的CDC数据
         uint16_t cdc_reg_addr = AD7147_REG_CDC_DATA + cdc_read_stage_;
         if (read_register(cdc_reg_addr, cdc_read_value_)) cdc_read_request_ = false;
+    }
+    
+    // 处理自动校准控制请求
+    if (auto_calibration_control_ & 0x80000000) {
+        // 提取低24位寄存器值
+        uint16_t cal_value = static_cast<uint16_t>(auto_calibration_control_ & 0x00FFFFFF);
+        // 异步更新AD7147_STAGE_CAL_EN寄存器
+        uint8_t cal_data[2] = {static_cast<uint8_t>(cal_value & 0xFF), static_cast<uint8_t>((cal_value >> 8) & 0xFF)};
+        if (write_register(AD7147_REG_STAGE_CAL_EN, cal_data, 2)) {
+            // 清除执行标志，标记完成
+            auto_calibration_control_ &= 0x7FFFFFFF;
+        }
     }
     i2c_hal_->read_register(device_addr_, (AD7147_REG_STAGE_HIGH_INT_STATUS | 0x8000), (uint8_t*)&status_regs_, 2);
     __asm__ volatile (
@@ -503,7 +515,7 @@ bool AD7147::configureStages(const uint16_t* connection_values) {
     }
     
     // 启用所有阶段校准
-    register_config_.stage_cal_en.raw = 0x0FFF;
+    register_config_.stage_cal_en.raw = AD7147_STAGE_CAL_EN;
     uint8_t cal_en_data[2] = {
         (uint8_t)(register_config_.stage_cal_en.raw >> 8),
         (uint8_t)(register_config_.stage_cal_en.raw & 0xFF)
@@ -601,6 +613,12 @@ bool AD7147::setLEDEnabled(bool enabled) {
 uint32_t AD7147::getAbnormalChannelMask() const {
     // 返回异常通道位图
     return abnormal_channels_bitmap_;
+}
+
+// 自动校准控制接口实现
+void AD7147::setAutoCalibration(bool enable) {
+    // 设置自动校准启停状态
+    auto_calibration_control_ = enable ? 0x80000FFF : 0x80000000;
 }
 
 

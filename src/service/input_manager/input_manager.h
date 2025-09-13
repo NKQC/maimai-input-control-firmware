@@ -74,6 +74,14 @@ struct PhysicalKeyboardMapping {
     PhysicalKeyboardMapping(MCU_GPIO mcu, HID_KeyCode key) : mcu_gpio(mcu), default_key(key) {}
     PhysicalKeyboardMapping(MCP_GPIO mcp, HID_KeyCode key) : mcp_gpio(mcp), default_key(key) {}
 };
+
+// 单次触发时的状态枚举
+enum TouchKeyboard_TriggleStage {
+    TOUCH_KEYBOARD_TRIGGLE_STAGE_NONE,
+    TOUCH_KEYBOARD_TRIGGLE_STAGE_PRESS,
+    TOUCH_KEYBOARD_TRIGGLE_STAGE_RELEASE,
+};
+
 // 触摸键盘映射结构体
 struct TouchKeyboardMapping {
     uint64_t area_mask;          // 触摸区域掩码，使用Mai2Serial_TouchState的64位格式
@@ -82,11 +90,11 @@ struct TouchKeyboardMapping {
     uint32_t press_timestamp;    // 按下时间戳（毫秒）
     bool key_pressed;            // 当前按键是否处于按下状态
     bool trigger_once;           // 是否只触发一次（启用时触发只触发一次，关闭时保持现状）
-    bool has_triggered;          // 是否已经触发过（用于trigger_once模式）
+    TouchKeyboard_TriggleStage has_triggered;          // 是否已经触发过（用于trigger_once模式）
     
-    TouchKeyboardMapping() : area_mask(0), hold_time_ms(0), key(HID_KeyCode::KEY_NONE), press_timestamp(0), key_pressed(false), trigger_once(false), has_triggered(false) {}
+    TouchKeyboardMapping() : area_mask(0), hold_time_ms(0), key(HID_KeyCode::KEY_NONE), press_timestamp(0), key_pressed(false), trigger_once(false), has_triggered(TOUCH_KEYBOARD_TRIGGLE_STAGE_NONE) {}
     TouchKeyboardMapping(uint64_t mask, uint32_t hold_time, HID_KeyCode trigger_key, bool once = false) 
-        : area_mask(mask), hold_time_ms(hold_time), key(trigger_key), press_timestamp(0), key_pressed(false), trigger_once(once), has_triggered(false) {}
+        : area_mask(mask), hold_time_ms(hold_time), key(trigger_key), press_timestamp(0), key_pressed(false), trigger_once(once), has_triggered(TOUCH_KEYBOARD_TRIGGLE_STAGE_NONE) {}
 };
 
 // 逻辑按键映射结构体 - 支持每个GPIO绑定最多3个HID键
@@ -373,7 +381,7 @@ public:
     const std::vector<TouchKeyboardMapping>& getTouchKeyboardMappings() const;
     
     // 触摸键盘转换内联接口 - serial模式专用
-    inline bool checkTouchKeyboardTrigger();  // 检查触发条件并处理按键状态
+    inline void checkTouchKeyboardTrigger();  // 检查触发条件并处理按键状态
     
     // 通道控制接口
     void enableAllChannels();   // 启用所有通道(绑定时使用)
@@ -557,6 +565,7 @@ private:
     
     // 内部处理函数
     inline void updateTouchStates();
+    inline void updateAutoCalibrationControl();  // 处理自动校准控制
     inline void sendHIDTouchData();
     void processCalibrationRequest();               // 处理校准请求（在task0中调用）
     

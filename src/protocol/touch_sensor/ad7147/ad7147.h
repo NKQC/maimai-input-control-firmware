@@ -63,6 +63,9 @@
 #define AD7147_SENSITIVITY_DEFAULT 0x0F0F // 默认灵敏度值
 #define AD7147_DEFAULT_AFE_OFFSET 0x0000  // AFE偏移默认值
 
+// 校准设置
+#define AD7147_STAGE_CAL_EN 0x0FFF // 阶段校准使能寄存器 默认0x0000 0x0FFF启动校准
+
 // 阶段配置相关常量
 #define AD7147_STAGE1_CONNECTION 0x0088  // Stage 1连接寄存器
 #define AD7147_STAGE2_CONNECTION 0x0090  // Stage 2连接寄存器
@@ -77,19 +80,28 @@
 #define AD7147_STAGE11_CONNECTION 0x00D8 // Stage 11连接寄存器
 
 // 阶段配置默认值
-#define AD7147_DEFAULT_OFFSET_LOW 0x3100        // 默认低偏移值
-#define AD7147_DEFAULT_OFFSET_HIGH 0x3100       // 默认高偏移值
+#define AD7147_DEFAULT_OFFSET_LOW 0x3000        // 默认低偏移值
+#define AD7147_DEFAULT_OFFSET_HIGH 0x3000       // 默认高偏移值
 #define AD7147_DEFAULT_OFFSET_LOW_CLAMP 0x3100  // 默认低偏移钳位值
 #define AD7147_DEFAULT_OFFSET_HIGH_CLAMP 0x3100 // 默认高偏移钳位值
 #define AD7147_CDC_BASELINE 0x8000              // CDC基准值，用于显示计算
 
-#define AD7147_CALIBRATION_TARGET_VALUE (AD7147_DEFAULT_OFFSET_HIGH)
+#define AD7147_CALIBRATION_TARGET_VALUE (AD7147_CDC_BASELINE - AD7147_DEFAULT_OFFSET_HIGH_CLAMP)
 
-#define CALIBRATION_STAGE1_SCAN_RANGEA -5  //A -> B
+#define CALIBRATION_STAGE1_SCAN_RANGEA -5 // A -> B
 #define CALIBRATION_STAGE1_SCAN_RANGEB -127
 #define CALIBRATION_SCAN_SAMPLE_COUNT 300 // 自动校准单轮采样次数
 #define CALIBRATION_MEASURE_SAMPLE_COUNT 3000
-#define CALIBRATION_AEF_SAVE_AREA -2  // AEF完成时额外偏置保留区域 预留缓冲空间防止意外触发
+#define CALIBRATION_AEF_SAVE_AREA -1 // AEF完成时额外偏置保留区域 预留缓冲空间防止意外触发
+
+// 反向指数算法参数宏定义
+#define FLUCTUATION_MIN_THRESHOLD 500   // 波动最小阈值
+#define FLUCTUATION_MAX_THRESHOLD 6000 // 波动最大阈值
+#define FLUCTUATION_MAX_FACTOR (1 / 2)        // 最大调整系数
+#define FLUCTUATION_MIN_FACTOR 5        // 最小调整系数（除数）
+#define TAYLOR_SCALE_FACTOR 1024        // 泰勒级数缩放因子
+#define TAYLOR_K_DIVISOR 2              // K因子除数
+#define TAYLOR_NORMALIZATION_RANGE 4950 // 归一化范围
 
 // 设备信息结构体
 struct AD7147_DeviceInfo
@@ -102,7 +114,7 @@ struct AD7147_DeviceInfo
 
 // 通道连接配置定义（对应CIN0-CIN11）
 const uint16_t channel_connections[12][2] = {
-     // POSTIVE
+    // POSTIVE
     // BIAS版 显然不适合mai2情况 天线效应会干碎BIAS
     // {0xFFFE, 0x1FFF}, // Stage 0 - CIN0
     // {0xFFFB, 0x1FFF}, // Stage 1 - CIN1
@@ -343,19 +355,22 @@ public:
     bool loadConfig(const std::string &config_data) override;            // 从字符串加载配置
     std::string saveConfig() const override;                             // 保存配置到字符串
     bool setCustomSensitivitySettings(const std::string &settings_data); // 设置自定义灵敏度配置
-    bool setStageConfig(uint8_t stage, const PortConfig &config);       // 设置指定阶段配置 只能在同核心调用 否则秒崩
-    bool setStageConfigAsync(uint8_t stage, const PortConfig &config);  // 异步设置指定阶段配置
-    PortConfig getStageConfig(uint8_t stage) const;                     // 获取指定阶段配置副本
+    bool setStageConfig(uint8_t stage, const PortConfig &config);        // 设置指定阶段配置 只能在同核心调用 否则秒崩
+    bool setStageConfigAsync(uint8_t stage, const PortConfig &config);   // 异步设置指定阶段配置
+    PortConfig getStageConfig(uint8_t stage) const;                      // 获取指定阶段配置副本
     bool readStageCDC(uint8_t stage, uint16_t &cdc_value);               // 读取指定阶段CDC值
-    
+
     // 校准相关接口实现
-    bool calibrateSensor() override;                                     // 校准传感器(接入startAutoOffsetCalibration)
-    bool calibrateSensor(uint8_t sensitivity_target) override;           // 校准传感器(带灵敏度目标)
-    uint8_t getCalibrationProgress() const override;                     // 获取校准进度(接入getAutoOffsetCalibrationTotalProgress)
-    bool setLEDEnabled(bool enabled) override;                           // 设置LED状态(修改stage_low_int_enable的第12-13位)
-    
+    bool calibrateSensor() override;                           // 校准传感器(接入startAutoOffsetCalibration)
+    bool calibrateSensor(uint8_t sensitivity_target) override; // 校准传感器(带灵敏度目标)
+    uint8_t getCalibrationProgress() const override;           // 获取校准进度(接入getAutoOffsetCalibrationTotalProgress)
+    bool setLEDEnabled(bool enabled) override;                 // 设置LED状态(修改stage_low_int_enable的第12-13位)
+
     // 异常通道检测接口实现
-    uint32_t getAbnormalChannelMask() const override;                    // 获取异常通道bitmap (返回abnormal_channels_bitmap_)
+    uint32_t getAbnormalChannelMask() const override; // 获取异常通道bitmap (返回abnormal_channels_bitmap_)
+
+    // 自动校准控制接口重写
+    void setAutoCalibration(bool enable) override; // 控制自动校准启停
 
     // 自动偏移校准：供UI调用
     bool startAutoOffsetCalibration();
@@ -374,9 +389,9 @@ private:
 
     // 状态相关成员变量
     bool initialized_;
-    I2C_Bus i2c_bus_enum_;           // I2C总线枚举
+    I2C_Bus i2c_bus_enum_; // I2C总线枚举
     uint8_t enabled_stage;
-    uint32_t enabled_channels_mask_; // 启用的通道掩码
+    uint32_t enabled_channels_mask_;               // 启用的通道掩码
     uint32_t calirate_save_enabled_channels_mask_; // 校准时保存的启用的通道掩码
 
     // 配置相关成员变量
@@ -387,17 +402,17 @@ private:
     volatile bool cdc_read_request_;  // CDC读取请求标志
     volatile uint8_t cdc_read_stage_; // 请求读取的阶段
     uint16_t cdc_read_value_;         // 读取到的CDC值
-    
+
     // sample()函数的实例级变量（原来的静态变量）
     TouchSampleResult sample_result_; // 采样结果
     uint16_t status_regs_;            // 状态寄存器值
-    
+
     // sample()函数中的映射重建临时变量（优化热点函数性能）
-    uint32_t reconstructed_mask_;     // 重建的通道掩码
-    uint16_t stage_status_;           // 反转后的stage状态
-    uint8_t stage_index_;             // stage索引计数器
-    uint32_t temp_mask_;              // 临时掩码用于位运算
-    uint8_t channel_pos_;             // 通道位置
+    uint32_t reconstructed_mask_; // 重建的通道掩码
+    uint16_t stage_status_;       // 反转后的stage状态
+    uint8_t stage_index_;         // stage索引计数器
+    uint32_t temp_mask_;          // 临时掩码用于位运算
+    uint8_t channel_pos_;         // 通道位置
 
     // 异步配置相关
     struct PendingPortConfig
@@ -410,6 +425,9 @@ private:
 
     // 校准异常通道记录
     uint16_t abnormal_channels_bitmap_; // 校准时异常通道的bitmap (bit0-11对应channel0-11)
+
+    // 自动校准控制
+    volatile int32_t auto_calibration_control_; // 自动校准控制变量 (最高位=执行标志, 低24位=寄存器值)
 
     // 允许内部校准工具访问私有成员与方法
     friend class CalibrationTools;
@@ -481,18 +499,18 @@ private:
         CalibrationState calibration_state_ = IDLE;
 
         uint8_t stage_process = 0;
-        uint8_t sensitivity_target = 2;  // 灵敏度目标 (1=高敏, 2=默认, 3=低敏)
+        uint8_t sensitivity_target = 2; // 灵敏度目标 (1=高敏, 2=默认, 3=低敏)
 
         bool inited_ = false;
-        
+
         // 阶段1：扫频寻找震荡点（触发与非触发最接近50%）- 多通道并行处理
-        bool s1_inited_[AD7147_MAX_CHANNELS] = {false};  // 每个通道的初始化状态
-        int16_t s1_aef_[AD7147_MAX_CHANNELS];            // 每个通道当前扫描AEF -127..127
-        int16_t s1_best_aef_[AD7147_MAX_CHANNELS] = {0}; // 每个通道阶段1找到的最佳AEF
-        CDCSample_result cdc_samples_[AD7147_MAX_CHANNELS]; // 每个通道CDC采样结果
+        bool s1_inited_[AD7147_MAX_CHANNELS] = {false};       // 每个通道的初始化状态
+        int16_t s1_aef_[AD7147_MAX_CHANNELS];                 // 每个通道当前扫描AEF -127..127
+        int16_t s1_best_aef_[AD7147_MAX_CHANNELS] = {0};      // 每个通道阶段1找到的最佳AEF
+        CDCSample_result cdc_samples_[AD7147_MAX_CHANNELS];   // 每个通道CDC采样结果
         uint16_t max_fluctuation_[AD7147_MAX_CHANNELS] = {0}; // 每个通道最大波动差
-        TriggleSample trigger_samples_[AD7147_MAX_CHANNELS]; // 每个通道触发采样结果
-        bool global_initialized_ = false;               // 全局初始化标志，用于一次性初始化所有通道
+        TriggleSample trigger_samples_[AD7147_MAX_CHANNELS];  // 每个通道触发采样结果
+        bool global_initialized_ = false;                     // 全局初始化标志，用于一次性初始化所有通道
 
         bool start_calibration()
         {

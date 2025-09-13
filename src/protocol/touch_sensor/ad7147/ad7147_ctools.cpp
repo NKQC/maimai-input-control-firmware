@@ -122,43 +122,44 @@ void AD7147::CalibrationTools::CalibrationLoop(uint32_t sample)
             if (current_fluctuation > max_fluctuation_[stage]) {
                 max_fluctuation_[stage] = current_fluctuation;
             }
-            // 验证当前CDC是否高于目标值 + 基于反向指数算法的波动调整 虽然比较扯 但该操作是通过内圈受的干扰比外圈要多一点这个特性在判断灵敏度需求
-            // 反向指数算法: 波动值50内给最大调整，5000及以上给最小调整，通过噪声判断灵敏度需求
+            // 验证当前CDC是否高于目标值 + 基于正向指数算法的波动调整
+            // 正向指数算法: 波动值越大给越大调整，通过噪声判断灵敏度需求
             uint16_t fluctuation_factor = 0;
-            if (max_fluctuation_[stage] <= 50) {
-                // 波动很小，给最大调整值
-                fluctuation_factor = max_fluctuation_[stage] * 2; // 最大调整系数
-            } else if (max_fluctuation_[stage] >= 5000) {
-                // 波动很大，给最小调整值
-                fluctuation_factor = max_fluctuation_[stage] / 10; // 最小调整系数
+            if (max_fluctuation_[stage] <= FLUCTUATION_MIN_THRESHOLD) {
+                // 波动很小，给最小调整值
+                fluctuation_factor = max_fluctuation_[stage] / FLUCTUATION_MIN_FACTOR; // 最小调整系数
+            } else if (max_fluctuation_[stage] >= FLUCTUATION_MAX_THRESHOLD) {
+                // 波动很大，给最大调整值
+                fluctuation_factor = max_fluctuation_[stage] * FLUCTUATION_MAX_FACTOR; // 最大调整系数
             } else {
-                // 中间区域使用反向指数函数: factor = max_val * exp(-k * (x - 50) / (5000 - 50))
-                // 波动越大，调整值越小，实现噪声自适应灵敏度
-                uint32_t x_normalized = max_fluctuation_[stage] - 50; // 减去最小阈值
+                // 中间区域使用正向指数函数: factor = min_val + (max_val - min_val) * (1 - exp(-k * (x - 50) / (10000 - 50)))
+                // 波动越大，调整值越大，实现噪声自适应灵敏度
+                uint32_t x_normalized = max_fluctuation_[stage] - FLUCTUATION_MIN_THRESHOLD; // 减去最小阈值
                 
                 // 使用泰勒级数近似指数函数: e^(-t) ≈ 1 - t + t²/2 - t³/6 + ...
-                // 其中 t = k * x_normalized / 4950, k由sensitivity_target控制
-                uint32_t k_factor = (1024 * sensitivity_target) / 2; // sensitivity_target越大，k越大，衰减越快
-                uint32_t t = (k_factor * x_normalized) / 4950; // 缩放到合适范围
+                // 其中 t = k * x_normalized / TAYLOR_NORMALIZATION_RANGE, k由sensitivity_target控制
+                uint32_t k_factor = (TAYLOR_SCALE_FACTOR * sensitivity_target) / TAYLOR_K_DIVISOR; // sensitivity_target越大，k越大，增长越快
+                uint32_t t = (k_factor * x_normalized) / TAYLOR_NORMALIZATION_RANGE; // 缩放到合适范围
                 
-                // 泰勒级数前4项计算 e^(-t) * 1024
-                uint32_t exp_neg_t = 1024; // 初始值 1 * 1024
-                if (t < 1024) { // 避免溢出
+                // 泰勒级数前4项计算 e^(-t) * TAYLOR_SCALE_FACTOR
+                uint32_t exp_neg_t = TAYLOR_SCALE_FACTOR; // 初始值 1 * TAYLOR_SCALE_FACTOR
+                if (t < TAYLOR_SCALE_FACTOR) { // 避免溢出
                     exp_neg_t = exp_neg_t - t; // -t项
-                    if (t < 512) {
-                        exp_neg_t = exp_neg_t + (t * t) / (2 * 1024); // +t²/2项
-                        if (t < 256) {
-                            exp_neg_t = exp_neg_t - (t * t * t) / (6 * 1024 * 1024); // -t³/6项
+                    if (t < TAYLOR_SCALE_FACTOR / 2) {
+                        exp_neg_t = exp_neg_t + (t * t) / (2 * TAYLOR_SCALE_FACTOR); // +t²/2项
+                        if (t < TAYLOR_SCALE_FACTOR / 4) {
+                            exp_neg_t = exp_neg_t - (t * t * t) / (6 * TAYLOR_SCALE_FACTOR * TAYLOR_SCALE_FACTOR); // -t³/6项
                         }
                     }
                 } else {
                     exp_neg_t = 0; // 当t很大时，e^(-t)接近0
                 }
                 
-                // 计算反向指数因子: 从2倍到0.1倍的指数衰减
-                uint32_t max_factor = max_fluctuation_[stage] * 2; // 最大调整值(低噪声时)
-                uint32_t min_factor = max_fluctuation_[stage] / 10; // 最小调整值(高噪声时)
-                fluctuation_factor = min_factor + ((max_factor - min_factor) * exp_neg_t) / 1024;
+                // 计算正向指数因子: 从0.1倍到2倍的指数增长
+                uint32_t min_factor = max_fluctuation_[stage] / FLUCTUATION_MIN_FACTOR; // 最小调整值(低噪声时)
+                uint32_t max_factor = max_fluctuation_[stage] * FLUCTUATION_MAX_FACTOR; // 最大调整值(高噪声时)
+                uint32_t growth_factor = TAYLOR_SCALE_FACTOR - exp_neg_t; // 1 - e^(-t)
+                fluctuation_factor = min_factor + ((max_factor - min_factor) * growth_factor) / TAYLOR_SCALE_FACTOR;
             }
             uint16_t adjusted_target = target_value + fluctuation_factor;
             if (cdc_samples_[stage].average >= adjusted_target) {

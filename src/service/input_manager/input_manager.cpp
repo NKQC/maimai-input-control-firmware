@@ -450,18 +450,15 @@ const std::vector<TouchKeyboardMapping>& InputManager::getTouchKeyboardMappings(
     return config_->touch_keyboard_mappings;
 }
 
-inline bool InputManager::checkTouchKeyboardTrigger()
+inline void InputManager::checkTouchKeyboardTrigger()
 {       
     // 缓存当前时间，避免重复系统调用
     touch_keyboard_current_time_cache_ = us_to_ms(time_us_32());
-    
-    bool any_key_pressed = false;
     
     // 遍历所有触摸键盘映射，独立处理每个映射
     for (auto& mapping : config_->touch_keyboard_mappings) {
         // 使用位操作宏进行高效区域匹配检查
           touch_keyboard_areas_matched_cache_ = MAI2_TOUCH_CHECK_MASK(serial_state_, mapping.area_mask);
-          
           if (__builtin_expect(touch_keyboard_areas_matched_cache_, 0)) {
               // 区域匹配，检查是否刚开始按下
               if (__builtin_expect(mapping.press_timestamp == 0, 0)) {
@@ -471,38 +468,41 @@ inline bool InputManager::checkTouchKeyboardTrigger()
               touch_keyboard_hold_satisfied_cache_ = (mapping.hold_time_ms == 0) || 
                                                     ((touch_keyboard_current_time_cache_ - mapping.press_timestamp) >= mapping.hold_time_ms);
             
-            if (__builtin_expect(touch_keyboard_hold_satisfied_cache_ && !mapping.key_pressed, 0)) {
-                // 检查trigger_once模式
-                if (mapping.trigger_once) {
-                    // trigger_once模式：只有未触发过才能按下按键
-                    if (!mapping.has_triggered) {
+            // 处理触发逻辑
+            if (mapping.trigger_once) {
+                // trigger_once：同一次触摸只触发一次；必须离开区域后才能再次触发；触发后下一次检查立即松开
+                if (mapping.has_triggered == TOUCH_KEYBOARD_TRIGGLE_STAGE_NONE) {
+                    if (__builtin_expect(touch_keyboard_hold_satisfied_cache_, 0)) {
                         hid_->press_key(mapping.key);
                         mapping.key_pressed = true;
-                        mapping.has_triggered = true;  // 标记已触发
+                        mapping.has_triggered = TOUCH_KEYBOARD_TRIGGLE_STAGE_PRESS;
                     }
-                } else {
-                    // 正常模式：满足条件就按下按键
+                } else if (mapping.has_triggered == TOUCH_KEYBOARD_TRIGGLE_STAGE_PRESS) {
+                    // 立即松开（下一次检查）
+                    hid_->release_key(mapping.key);
+                    mapping.key_pressed = false;
+                    mapping.has_triggered = TOUCH_KEYBOARD_TRIGGLE_STAGE_RELEASE;
+                }
+                // RELEASE 状态下保持不触发，直到区域不匹配时在else分支中重置为 NONE
+            } else {
+                // 正常模式：满足条件就按下按键
+                if (__builtin_expect(touch_keyboard_hold_satisfied_cache_ && !mapping.key_pressed, 0)) {
                     hid_->press_key(mapping.key);
                     mapping.key_pressed = true;
                 }
             }
-            
-            if (mapping.key_pressed) {
-                any_key_pressed = true;
-            }
         } else {
             // 区域不匹配，释放按键
             if (__builtin_expect(mapping.key_pressed, 0)) {
+                mapping.has_triggered = TOUCH_KEYBOARD_TRIGGLE_STAGE_NONE;
                 hid_->release_key(mapping.key);
                 mapping.key_pressed = false;
             }
             mapping.press_timestamp = 0;
-            // 重置trigger_once状态，允许下次触摸时重新触发
-            mapping.has_triggered = false;
         }
     }
     
-    return any_key_pressed;
+    return;
 }
 
 // 设置工作模式
@@ -1249,6 +1249,24 @@ inline void InputManager::updateTouchStates()
     incrementSampleCounter();
     // 序列化发送前的延迟缓冲不变
     storeDelayedSerialState();
+    // 处理自动校准控制
+    updateAutoCalibrationControl();
+}
+
+// 处理自动校准控制 - 根据mai2serial发送状态控制AD7147设备的自动校准
+inline void InputManager::updateAutoCalibrationControl()
+{
+    // 根据mai2serial发送状态控制自动校准
+    static bool last_serial_ok = false;
+    static bool current_serial_ok = false;
+    current_serial_ok = mai2_serial_->get_serial_ok();
+    if (current_serial_ok != last_serial_ok) {
+        // 发送状态发生变化，更新所有AD7147设备的自动校准状态
+        for (TouchSensor* sensor : touch_sensor_devices_) {
+            sensor->setAutoCalibration(!current_serial_ok);
+        }
+        last_serial_ok = current_serial_ok;
+    }
 }
 
 // 发送HID触摸数据 - 使用32位TouchSensor接口的统一实现

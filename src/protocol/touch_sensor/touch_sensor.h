@@ -127,6 +127,9 @@ public:
     virtual uint8_t getCalibrationProgress() const { return 0; }  // 获取校准进度 (0-100)
     virtual bool setLEDEnabled(bool enabled) { return false; }  // 设置LED状态
     
+    // 自动校准控制接口 - 子类可选实现
+    virtual void setAutoCalibration(bool enable) { }  // 控制自动校准启停
+    
     // 异常通道检测接口 - 子类可选实现
     virtual uint32_t getAbnormalChannelMask() const { return 0; }  // 获取异常通道bitmap (格式同sample返回的channel_mask)
     
