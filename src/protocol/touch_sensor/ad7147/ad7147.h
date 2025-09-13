@@ -89,7 +89,7 @@
 #define CALIBRATION_STAGE1_SCAN_RANGEB -127
 #define CALIBRATION_SCAN_SAMPLE_COUNT 300 // 自动校准单轮采样次数
 #define CALIBRATION_MEASURE_SAMPLE_COUNT 3000
-#define CALIBRATION_AEF_SAVE_AREA -1  // AEF完成时额外偏置保留区域 预留缓冲空间防止意外触发
+#define CALIBRATION_AEF_SAVE_AREA -2  // AEF完成时额外偏置保留区域 预留缓冲空间防止意外触发
 
 // 设备信息结构体
 struct AD7147_DeviceInfo

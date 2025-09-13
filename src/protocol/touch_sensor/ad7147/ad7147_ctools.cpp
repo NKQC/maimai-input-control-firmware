@@ -122,9 +122,45 @@ void AD7147::CalibrationTools::CalibrationLoop(uint32_t sample)
             if (current_fluctuation > max_fluctuation_[stage]) {
                 max_fluctuation_[stage] = current_fluctuation;
             }
-            // 验证当前CDC是否高于目标值 + 最大波动差绝对值2/3
-            // 应用灵敏度目标控制: * 5 / sensitivity_target
-            uint16_t adjusted_target = target_value + (max_fluctuation_[stage] * 2 / (sensitivity_target + 2));
+            // 验证当前CDC是否高于目标值 + 基于反向指数算法的波动调整 虽然比较扯 但该操作是通过内圈受的干扰比外圈要多一点这个特性在判断灵敏度需求
+            // 反向指数算法: 波动值50内给最大调整，5000及以上给最小调整，通过噪声判断灵敏度需求
+            uint16_t fluctuation_factor = 0;
+            if (max_fluctuation_[stage] <= 50) {
+                // 波动很小，给最大调整值
+                fluctuation_factor = max_fluctuation_[stage] * 2; // 最大调整系数
+            } else if (max_fluctuation_[stage] >= 5000) {
+                // 波动很大，给最小调整值
+                fluctuation_factor = max_fluctuation_[stage] / 10; // 最小调整系数
+            } else {
+                // 中间区域使用反向指数函数: factor = max_val * exp(-k * (x - 50) / (5000 - 50))
+                // 波动越大，调整值越小，实现噪声自适应灵敏度
+                uint32_t x_normalized = max_fluctuation_[stage] - 50; // 减去最小阈值
+                
+                // 使用泰勒级数近似指数函数: e^(-t) ≈ 1 - t + t²/2 - t³/6 + ...
+                // 其中 t = k * x_normalized / 4950, k由sensitivity_target控制
+                uint32_t k_factor = (1024 * sensitivity_target) / 2; // sensitivity_target越大，k越大，衰减越快
+                uint32_t t = (k_factor * x_normalized) / 4950; // 缩放到合适范围
+                
+                // 泰勒级数前4项计算 e^(-t) * 1024
+                uint32_t exp_neg_t = 1024; // 初始值 1 * 1024
+                if (t < 1024) { // 避免溢出
+                    exp_neg_t = exp_neg_t - t; // -t项
+                    if (t < 512) {
+                        exp_neg_t = exp_neg_t + (t * t) / (2 * 1024); // +t²/2项
+                        if (t < 256) {
+                            exp_neg_t = exp_neg_t - (t * t * t) / (6 * 1024 * 1024); // -t³/6项
+                        }
+                    }
+                } else {
+                    exp_neg_t = 0; // 当t很大时，e^(-t)接近0
+                }
+                
+                // 计算反向指数因子: 从2倍到0.1倍的指数衰减
+                uint32_t max_factor = max_fluctuation_[stage] * 2; // 最大调整值(低噪声时)
+                uint32_t min_factor = max_fluctuation_[stage] / 10; // 最小调整值(高噪声时)
+                fluctuation_factor = min_factor + ((max_factor - min_factor) * exp_neg_t) / 1024;
+            }
+            uint16_t adjusted_target = target_value + fluctuation_factor;
             if (cdc_samples_[stage].average >= adjusted_target) {
                 // 达到目标CDC值，开始检查触发状态
                 if (!Read_Triggle_Sample(stage, sample, trigger_samples_[stage], true)) continue; // 继续采样触发状态
