@@ -480,7 +480,6 @@ inline void InputManager::checkTouchKeyboardTrigger()
                 } else if (mapping.has_triggered == TOUCH_KEYBOARD_TRIGGLE_STAGE_PRESS) {
                     // 立即松开（下一次检查）
                     hid_->release_key(mapping.key);
-                    mapping.key_pressed = false;
                     mapping.has_triggered = TOUCH_KEYBOARD_TRIGGLE_STAGE_RELEASE;
                 }
                 // RELEASE 状态下保持不触发，直到区域不匹配时在else分支中重置为 NONE
@@ -1250,7 +1249,7 @@ inline void InputManager::updateTouchStates()
     // 序列化发送前的延迟缓冲不变
     storeDelayedSerialState();
     // 处理自动校准控制
-    updateAutoCalibrationControl();
+    // updateAutoCalibrationControl();
 }
 
 // 处理自动校准控制 - 根据mai2serial发送状态控制AD7147设备的自动校准
