@@ -80,11 +80,11 @@
 #define AD7147_STAGE11_CONNECTION 0x00D8 // Stage 11连接寄存器
 
 // 阶段配置默认值
-#define AD7147_DEFAULT_OFFSET_LOW 0x3000        // 默认低偏移值
-#define AD7147_DEFAULT_OFFSET_HIGH 0x3000       // 默认高偏移值
-#define AD7147_DEFAULT_OFFSET_LOW_CLAMP 0x3100  // 默认低偏移钳位值
-#define AD7147_DEFAULT_OFFSET_HIGH_CLAMP 0x3100 // 默认高偏移钳位值
-#define AD7147_CDC_BASELINE 0x8000              // CDC基准值，用于显示计算
+#define AD7147_DEFAULT_OFFSET_LOW 0x3000                                 // 默认低偏移值
+#define AD7147_DEFAULT_OFFSET_LOW_CLAMP 0x3100                           // 默认低偏移钳位值
+#define AD7147_DEFAULT_OFFSET_HIGH AD7147_DEFAULT_OFFSET_LOW             // 默认高偏移值
+#define AD7147_DEFAULT_OFFSET_HIGH_CLAMP AD7147_DEFAULT_OFFSET_LOW_CLAMP // 默认高偏移钳位值
+#define AD7147_CDC_BASELINE 0x8000                                       // CDC基准值，用于显示计算
 
 #define CALIBRATION_STAGE1_SCAN_RANGEA -5 // A -> B
 #define CALIBRATION_STAGE1_SCAN_RANGEB -127
@@ -93,15 +93,16 @@
 #define CALIBRATION_AEF_SAVE_AREA -1 // AEF完成时额外偏置保留区域 预留缓冲空间防止意外触发
 
 // 反向指数算法参数宏定义
+#define STAGE_REDUCE_NUM 0x400
 #define FLUCTUATION_MIN_THRESHOLD 800   // 波动最小阈值
-#define FLUCTUATION_MAX_THRESHOLD 6000 // 波动最大阈值
-#define FLUCTUATION_MAX_FACTOR (1 / 2)        // 最大调整系数
-#define FLUCTUATION_MIN_FACTOR 5        // 最小调整系数（除数）
+#define FLUCTUATION_MAX_THRESHOLD 7000  // 波动最大阈值
+#define FLUCTUATION_MAX_FACTOR 1 / 2  // 最大调整系数
+#define FLUCTUATION_MIN_FACTOR 10       // 最小调整系数（除数）
 #define TAYLOR_SCALE_FACTOR 1024        // 泰勒级数缩放因子
 #define TAYLOR_K_DIVISOR 2              // K因子除数
 #define TAYLOR_NORMALIZATION_RANGE 4950 // 归一化范围
 
-#define AD7147_CALIBRATION_TARGET_VALUE (AD7147_CDC_BASELINE - AD7147_DEFAULT_OFFSET_HIGH_CLAMP - FLUCTUATION_MIN_THRESHOLD)
+#define AD7147_CALIBRATION_TARGET_VALUE (AD7147_DEFAULT_OFFSET_HIGH_CLAMP)
 
 // 设备信息结构体
 struct AD7147_DeviceInfo
@@ -361,12 +362,12 @@ public:
     bool readStageCDC(uint8_t stage, uint16_t &cdc_value);               // 读取指定阶段CDC值
 
     // 校准相关接口实现
-    bool calibrateSensor() override;                           // 校准传感器(接入startAutoOffsetCalibration)
-    bool calibrateSensor(uint8_t sensitivity_target) override; // 校准传感器(带灵敏度目标)
+    bool calibrateSensor() override;                                                        // 校准传感器(接入startAutoOffsetCalibration)
+    bool calibrateSensor(uint8_t sensitivity_target) override;                              // 校准传感器(带灵敏度目标)
     bool setChannelCalibrationTarget(uint8_t channel, uint8_t sensitivity_target) override; // 设置指定通道的校准目标灵敏度
-    bool startCalibration() override;                          // 启动校准过程
-    uint8_t getCalibrationProgress() const override;           // 获取校准进度(接入getAutoOffsetCalibrationTotalProgress)
-    bool setLEDEnabled(bool enabled) override;                 // 设置LED状态(修改stage_low_int_enable的第12-13位)
+    bool startCalibration() override;                                                       // 启动校准过程
+    uint8_t getCalibrationProgress() const override;                                        // 获取校准进度(接入getAutoOffsetCalibrationTotalProgress)
+    bool setLEDEnabled(bool enabled) override;                                              // 设置LED状态(修改stage_low_int_enable的第12-13位)
 
     // 异常通道检测接口实现
     uint32_t getAbnormalChannelMask() const override; // 获取异常通道bitmap (返回abnormal_channels_bitmap_)
@@ -500,13 +501,13 @@ private:
         // 单个通道的校准数据结构
         struct ChannelCalibrationData
         {
-            uint8_t sensitivity_target = 2;        // 灵敏度目标 (1=高敏, 2=默认, 3=低敏)
-            bool s1_inited_ = false;               // 初始化状态
-            int16_t s1_aef_ = 0;                   // 当前扫描AEF -127..127
-            int16_t s1_best_aef_ = 0;              // 阶段1找到的最佳AEF
-            CDCSample_result cdc_samples_;         // CDC采样结果
-            uint16_t max_fluctuation_ = 0;         // 最大波动差
-            TriggleSample trigger_samples_;        // 触发采样结果
+            uint8_t sensitivity_target = 2; // 灵敏度目标 (1=低敏, 2=默认, 3=高敏)
+            bool s1_inited_ = false;        // 初始化状态
+            int16_t s1_aef_ = 0;            // 当前扫描AEF -127..127
+            int16_t s1_best_aef_ = 0;       // 阶段1找到的最佳AEF
+            CDCSample_result cdc_samples_;  // CDC采样结果
+            uint16_t max_fluctuation_ = 0;  // 最大波动差
+            TriggleSample trigger_samples_; // 触发采样结果
         };
 
         struct CalibrationData

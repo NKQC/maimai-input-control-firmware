@@ -9,7 +9,7 @@
 namespace ui {
 
 // 静态成员变量定义
-int32_t GeneralSettings::screen_timeout_seconds_ = 300;
+int32_t GeneralSettings::screen_timeout_seconds_ = 30;
 int32_t GeneralSettings::brightness_value_ = 128;
 uint8_t GeneralSettings::brightness_progress_data_ = 128;
 
@@ -39,7 +39,7 @@ void GeneralSettings::render(PageTemplate& page_template) {
     
     // 息屏超时设置
     ADD_INT_SETTING(&screen_timeout_seconds_, 30, 3600, "秒", "息屏超时", 
-                    on_screen_timeout_changed, on_screen_timeout_complete, COLOR_TEXT_WHITE)
+                    on_screen_timeout_changed, nullptr, COLOR_TEXT_WHITE)
     
     // 亮度设置标题
     ADD_TEXT("亮度设置:", COLOR_TEXT_WHITE, LineAlign::LEFT)
@@ -68,16 +68,6 @@ void GeneralSettings::on_screen_timeout_changed(int32_t new_value) {
         ui_manager->set_screen_timeout(static_cast<uint16_t>(new_value));
     }
 }
-
-void GeneralSettings::on_screen_timeout_complete() {
-     // 在完成时保存配置到ConfigManager
-     ConfigManager* config_manager = ConfigManager::getInstance();
-     if (config_manager) {
-         // 将秒转换为毫秒保存
-         config_manager->set_uint16("UIMANAGER_SCREEN_TIMEOUT", static_cast<uint16_t>(screen_timeout_seconds_ * 1000));
-         config_manager->save_config();
-     }
- }
 
 void GeneralSettings::on_brightness_changed(int32_t new_value) {
     brightness_value_ = new_value;

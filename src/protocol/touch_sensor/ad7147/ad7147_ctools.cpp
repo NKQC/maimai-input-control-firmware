@@ -161,7 +161,7 @@ void AD7147::CalibrationTools::CalibrationLoop(uint32_t sample)
                 uint32_t growth_factor = TAYLOR_SCALE_FACTOR - exp_neg_t; // 1 - e^(-t)
                 fluctuation_factor = min_factor + ((max_factor - min_factor) * growth_factor) / TAYLOR_SCALE_FACTOR;
             }
-            uint16_t adjusted_target = target_value + fluctuation_factor;
+            uint16_t adjusted_target = target_value + fluctuation_factor - (STAGE_REDUCE_NUM * (MAX(calibration_data_.channels[stage].sensitivity_target, 1) - 1));
             if (calibration_data_.channels[stage].cdc_samples_.average >= adjusted_target) {
                 // 达到目标CDC值，开始检查触发状态
                 if (!Read_Triggle_Sample(stage, sample, calibration_data_.channels[stage].trigger_samples_, true)) continue; // 继续采样触发状态

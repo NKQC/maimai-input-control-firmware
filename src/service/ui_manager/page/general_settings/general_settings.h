@@ -42,11 +42,6 @@ private:
     static void on_screen_timeout_changed(int32_t new_value);
     
     /**
-     * 息屏超时值设置完成回调
-     */
-    static void on_screen_timeout_complete();
-    
-    /**
      * 亮度值变化回调
      * @param new_value 新的亮度值（0-255）
      */
