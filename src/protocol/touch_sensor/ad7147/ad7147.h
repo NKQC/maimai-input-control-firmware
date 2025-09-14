@@ -99,7 +99,6 @@
 #define FLUCTUATION_MAX_FACTOR 1                             // 最大调整系数
 #define FLUCTUATION_MIN_FACTOR 10                            // 最小调整系数（除数）
 #define TAYLOR_SCALE_FACTOR 1024                             // 泰勒级数缩放因子
-#define TAYLOR_K_DIVISOR 3 / 2                               // K因子除数
 #define TAYLOR_NORMALIZATION_RANGE FLUCTUATION_MAX_THRESHOLD // 归一化范围
 
 #define AD7147_CALIBRATION_TARGET_VALUE (AD7147_DEFAULT_OFFSET_LOW_CLAMP + (STAGE_REDUCE_NUM / 2))
