@@ -138,7 +138,7 @@ void AD7147::CalibrationTools::CalibrationLoop(uint32_t sample)
                 
                 // 使用泰勒级数近似指数函数: e^(-t) ≈ 1 - t + t²/2 - t³/6 + ...
                 // 其中 t = k * x_normalized / TAYLOR_NORMALIZATION_RANGE, k由当前通道的sensitivity_target控制
-                uint32_t k_factor = (TAYLOR_SCALE_FACTOR * calibration_data_.channels[stage].sensitivity_target) / TAYLOR_K_DIVISOR; // sensitivity_target越大，k越大，衰减越快
+                uint32_t k_factor = (TAYLOR_SCALE_FACTOR * TAYLOR_K_DIVISOR); // sensitivity_target越大，k越大，衰减越快
                 uint32_t t = (k_factor * x_normalized) / TAYLOR_NORMALIZATION_RANGE; // 缩放到合适范围
                 
                 // 泰勒级数前4项计算 e^(-t) * TAYLOR_SCALE_FACTOR
