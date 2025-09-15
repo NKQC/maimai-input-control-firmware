@@ -200,6 +200,8 @@ enum class TouchKeyboardMode : uint8_t {
 #define INPUTMANAGER_SEND_ONLY_ON_CHANGE "input_manager_send_only_on_change"
 #define INPUTMANAGER_DATA_AGGREGATION_DELAY "input_manager_data_aggregation_delay"
 #define INPUTMANAGER_EXTRA_SEND_COUNT "input_manager_extra_send_count"
+#define INPUTMANAGER_RATE_LIMIT_ENABLED "input_manager_rate_limit_enabled"
+#define INPUTMANAGER_RATE_LIMIT_FREQUENCY "input_manager_rate_limit_frequency"
 
 
 // 工作模式枚举
@@ -238,10 +240,14 @@ struct InputManager_PrivateConfig {
     // 触摸响应延迟配置 (0-100ms)
     uint8_t touch_response_delay_ms;
     
-    // Serial模式新功能参数
+    // Serial模式新功能配置
     bool send_only_on_change;                    // 仅改变时发送功能开关
     uint8_t data_aggregation_delay_ms;           // 触发数据聚合延迟时间(ms)
     uint8_t extra_send_count;                    // 额外发送次数
+    
+    // 频率限制配置
+    bool rate_limit_enabled;                     // 频率限制开关
+    uint16_t rate_limit_frequency;               // 频率限制值(Hz, 10-1000)
     
     // Mai2Serial配置 - 内部管理
     Mai2Serial_Config mai2serial_config;
@@ -255,6 +261,8 @@ struct InputManager_PrivateConfig {
         , send_only_on_change(false)
         , data_aggregation_delay_ms(0)
         , extra_send_count(0)
+        , rate_limit_enabled(false)
+        , rate_limit_frequency(120)
         , mai2serial_config() {
     }
 };
@@ -421,6 +429,12 @@ public:
     void setExtraSendCount(uint8_t count);         // 设置额外发送次数(0-10)
     uint8_t getExtraSendCount() const;             // 获取额外发送次数
     
+    // 频率限制接口
+    void setRateLimitEnabled(bool enabled);        // 设置频率限制开关
+    bool getRateLimitEnabled() const;              // 获取频率限制开关状态
+    void setRateLimitFrequency(uint16_t frequency); // 设置频率限制值(10-1000Hz)
+    uint16_t getRateLimitFrequency() const;        // 获取频率限制值
+    
     // 获取配置副本
     InputManager_PrivateConfig getConfig() const;
     
@@ -562,6 +576,9 @@ private:
     } auto_adjust_context_;
     
     // 协议模块引用
+    // 频率限制相关静态成员变量
+    static uint32_t min_interval_us_;           // 预计算的最小间隔时间（微秒）
+    
     Mai2Serial* mai2_serial_;                // Mai2Serial实例引用
     HID* hid_;                               // HID实例引用
     MCP23S17* mcp23s17_;                     // MCP23S17实例引用

@@ -7,6 +7,9 @@
 // 统一的串口波特率枚举定义
 enum class UartBaudRate : uint32_t {
     BAUD_9600 = 9600,
+    BAUD_19200 = 19200,
+    BAUD_38400 = 38400,
+    BAUD_57600 = 57600,
     BAUD_115200 = 115200,
     BAUD_250000 = 250000,
     BAUD_500000 = 500000,
@@ -29,6 +32,9 @@ inline uint32_t uart_baud_rate_to_value(UartBaudRate baud_rate) {
 inline UartBaudRate uart_value_to_baud_rate(uint32_t value) {
     switch (value) {
         case 9600: return UartBaudRate::BAUD_9600;
+        case 19200: return UartBaudRate::BAUD_19200;
+        case 38400: return UartBaudRate::BAUD_38400;
+        case 57600: return UartBaudRate::BAUD_57600;
         case 115200: return UartBaudRate::BAUD_115200;
         case 250000: return UartBaudRate::BAUD_250000;
         case 500000: return UartBaudRate::BAUD_500000;
@@ -47,7 +53,7 @@ inline UartBaudRate uart_value_to_baud_rate(uint32_t value) {
 // 获取所有支持的波特率数组
 inline const uint32_t* get_supported_baud_rates() {
     static const uint32_t supported_rates[] = {
-        9600, 115200, 250000, 500000, 1000000, 1500000,
+        9600, 19200, 38400, 57600, 115200, 250000, 500000, 1000000, 1500000,
         2000000, 2500000, 3000000, 4000000, 5000000, 6000000
     };
     return supported_rates;
@@ -55,7 +61,7 @@ inline const uint32_t* get_supported_baud_rates() {
 
 // 获取支持的波特率数量
 inline size_t get_supported_baud_rates_count() {
-    return 12;
+    return 15;
 }
 
 // 包含Pico SDK头文件

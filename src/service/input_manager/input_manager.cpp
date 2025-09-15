@@ -14,6 +14,8 @@ InputManager *InputManager::instance_ = nullptr;
 static InputManager_PrivateConfig static_config_;
 // Debug开关静态变量
 bool InputManager::debug_enabled_ = false;
+// 频率限制相关静态成员变量
+uint32_t InputManager::min_interval_us_ = 8333;  // 默认120Hz对应的间隔时间（微秒）
 
 // 单例模式实现
 InputManager *InputManager::getInstance()
@@ -284,6 +286,8 @@ inline void InputManager::processSerialModeWithDelay()
     static uint16_t last_hit_offset = 0;  // 上次命中位置相对于head的偏移
     static uint32_t current_timestamp;
     static uint16_t search_offset;
+    static uint32_t last_rate_limit_time = 0;  // 上次发送时间（频率限制用）
+    static uint32_t current_time = 0;  // 使用静态变量避免栈分配
     // 使用union位域优化bool变量存储，支持一次性重置所有标志
     static union {
         struct {
@@ -299,6 +303,16 @@ inline void InputManager::processSerialModeWithDelay()
     // 如果缓冲区为空，直接返回
     if (delay_buffer_count_ == 0) {
         return;
+    }
+    
+    // 频率限制检查（非阻塞流控）
+    if (config_->rate_limit_enabled) {
+        current_time = time_us_32();  // 更新当前时间
+        
+        // 检查是否到达发送时间
+        if (last_rate_limit_time != 0 && (current_time - last_rate_limit_time) < min_interval_us_) {
+            return;  // 未到发送时间，直接返回
+        }
     }
     
     // 如果延迟为0，直接使用最新数据，无需搜索
@@ -416,6 +430,11 @@ process_aggregation:
         // 仅在发送成功时更新last_sent_serial_state_，确保发送失败时保持差异检测
         if (mai2_serial_->send_touch_data(delayed_serial_state)) {
             last_sent_serial_state_ = delayed_serial_state;  // 更新上次发送状态
+            
+            // 更新频率限制时间戳（仅在发送成功时更新）
+            if (config_->rate_limit_enabled) {
+                last_rate_limit_time = current_time;
+            }
         }
         // 注意：连续发送模式(send_only_on_change=false)不受发送成功与否影响
     }
@@ -1431,6 +1450,10 @@ void inputmanager_register_default_configs(config_map_t &default_map)
     default_map[INPUTMANAGER_SEND_ONLY_ON_CHANGE] = ConfigValue(false);       // 默认关闭仅改变时发送
     default_map[INPUTMANAGER_DATA_AGGREGATION_DELAY] = ConfigValue((uint8_t)0, (uint8_t)0, (uint8_t)100); // 数据聚合延迟，范围0-100ms
     default_map[INPUTMANAGER_EXTRA_SEND_COUNT] = ConfigValue((uint8_t)0, (uint8_t)0, (uint8_t)10);        // 额外发送次数，范围0-10次
+    
+    // 频率限制配置
+    default_map[INPUTMANAGER_RATE_LIMIT_ENABLED] = ConfigValue(false);        // 默认关闭频率限制
+    default_map[INPUTMANAGER_RATE_LIMIT_FREQUENCY] = ConfigValue((uint16_t)120, (uint16_t)10, (uint16_t)1000); // 频率限制，范围10-1000Hz
 
     default_map[INPUTMANAGER_TOUCH_DEVICES] = ConfigValue(std::string(""));      // 触摸设备映射数据
     default_map[INPUTMANAGER_PHYSICAL_KEYBOARDS] = ConfigValue(std::string(""));
@@ -1468,6 +1491,16 @@ bool inputmanager_load_config_from_manager()
     static_config_.send_only_on_change = config_mgr->get_bool(INPUTMANAGER_SEND_ONLY_ON_CHANGE);
     static_config_.data_aggregation_delay_ms = config_mgr->get_uint8(INPUTMANAGER_DATA_AGGREGATION_DELAY);
     static_config_.extra_send_count = config_mgr->get_uint8(INPUTMANAGER_EXTRA_SEND_COUNT);
+    
+    // 加载频率限制配置
+    static_config_.rate_limit_enabled = config_mgr->get_bool(INPUTMANAGER_RATE_LIMIT_ENABLED);
+    static_config_.rate_limit_frequency = config_mgr->get_uint16(INPUTMANAGER_RATE_LIMIT_FREQUENCY);
+    
+    // 通过调用设置函数来预计算最小间隔时间，确保复用逻辑
+    InputManager* instance = InputManager::getInstance();
+    if (instance && static_config_.rate_limit_frequency > 0) {
+        instance->setRateLimitFrequency(static_config_.rate_limit_frequency);
+    }
     
     // 加载Mai2Serial配置
     static_config_.mai2serial_config.baud_rate = config_mgr->get_uint32(INPUTMANAGER_MAI2SERIAL_BAUD_RATE);
@@ -1520,7 +1553,6 @@ bool inputmanager_load_config_from_manager()
     }
 
     // 应用加载的配置到实际硬件设备
-    InputManager *instance = InputManager::getInstance();
     if (instance)
     {
         // 根据设备模式遍历设备映射表，对存在映射关系的设备进行预注册
@@ -1628,6 +1660,10 @@ bool inputmanager_write_config_to_manager(const InputManager_PrivateConfig &conf
     config_mgr->set_bool(INPUTMANAGER_SEND_ONLY_ON_CHANGE, config.send_only_on_change);
     config_mgr->set_uint8(INPUTMANAGER_DATA_AGGREGATION_DELAY, config.data_aggregation_delay_ms);
     config_mgr->set_uint8(INPUTMANAGER_EXTRA_SEND_COUNT, config.extra_send_count);
+    
+    // 写入频率限制配置
+    config_mgr->set_bool(INPUTMANAGER_RATE_LIMIT_ENABLED, config.rate_limit_enabled);
+    config_mgr->set_uint16(INPUTMANAGER_RATE_LIMIT_FREQUENCY, config.rate_limit_frequency);
     
     // 保存Mai2Serial配置
     config_mgr->set_uint32(INPUTMANAGER_MAI2SERIAL_BAUD_RATE, config.mai2serial_config.baud_rate);
@@ -2155,6 +2191,34 @@ void InputManager::setExtraSendCount(uint8_t count)
 uint8_t InputManager::getExtraSendCount() const
 {
     return config_->extra_send_count;
+}
+
+// 频率限制接口实现
+void InputManager::setRateLimitEnabled(bool enabled)
+{
+    config_->rate_limit_enabled = enabled;
+}
+
+bool InputManager::getRateLimitEnabled() const
+{
+    return config_->rate_limit_enabled;
+}
+
+void InputManager::setRateLimitFrequency(uint16_t frequency)
+{
+    if (frequency < 10)
+        frequency = 10;   // 限制最小频率为10Hz
+    if (frequency > 1000)
+        frequency = 1000; // 限制最大频率为1000Hz
+    config_->rate_limit_frequency = frequency;
+    
+    // 预计算最小间隔时间（微秒）
+    min_interval_us_ = 1000000U / frequency;
+}
+
+uint16_t InputManager::getRateLimitFrequency() const
+{
+    return config_->rate_limit_frequency;
 }
 
 // 获取当前配置副本

@@ -72,6 +72,26 @@ void CommunicationSettings::render(PageTemplate& page_template) {
                      formatExtraSendCountText(current_extra_send_count_).c_str());
             ADD_SIMPLE_SELECTOR(_text, onExtraSendCountChange, COLOR_TEXT_GREEN)
         }
+        
+        // 频率限制设置
+        ADD_TEXT("发送频率限制设置", COLOR_TEXT_WHITE, LineAlign::CENTER)
+        
+        // 频率限制开关 - 使用按钮组件
+        InputManager* input_mgr = InputManager::getInstance();
+        if (input_mgr) {
+            bool rate_limit_enabled = input_mgr->getRateLimitEnabled();
+            snprintf(_text, sizeof(_text), "频率限制开关: %s", 
+                     rate_limit_enabled ? "开启" : "关闭");
+            ADD_BUTTON(_text, onRateLimitEnabledToggle, 
+                      rate_limit_enabled ? COLOR_TEXT_GREEN : COLOR_TEXT_WHITE, LineAlign::LEFT)
+            
+            // 频率限制值（仅在开关开启时显示）
+            if (rate_limit_enabled) {
+                uint16_t rate_limit_frequency = input_mgr->getRateLimitFrequency();
+                snprintf(_text, sizeof(_text), "频率限制: %dHz", rate_limit_frequency);
+                ADD_SIMPLE_SELECTOR(_text, onRateLimitFrequencyChange, COLOR_TEXT_GREEN)
+            }
+        }
     }
     
     PAGE_END()
@@ -283,6 +303,63 @@ bool CommunicationSettings::isSerialMode() {
         return input_mgr->getWorkMode() == InputWorkMode::SERIAL_MODE;
     }
     return false;
+}
+
+// 频率限制开关回调函数
+void CommunicationSettings::onRateLimitEnabledToggle() {
+    InputManager* input_mgr = InputManager::getInstance();
+    if (!input_mgr) return;
+    
+    bool current_enabled = input_mgr->getRateLimitEnabled();
+    input_mgr->setRateLimitEnabled(!current_enabled);
+}
+
+// 频率限制值回调函数
+void CommunicationSettings::onRateLimitFrequencyChange(JoystickState state) {
+    InputManager* input_mgr = InputManager::getInstance();
+    if (!input_mgr) return;
+    
+    // 常见屏幕刷新率数组
+    static const uint16_t refresh_rates[] = {
+        10, 15, 20, 24, 30, 48, 50, 60, 75, 90,
+        120, 144, 165, 180, 220, 260, 300, 360, 400, 460, 500, 600, 1000
+    };
+    static const size_t rates_count = sizeof(refresh_rates) / sizeof(refresh_rates[0]);
+    
+    uint16_t current_frequency = input_mgr->getRateLimitFrequency();
+    
+    switch (state) {
+    case JoystickState::UP: {
+        // 找到当前频率在数组中的位置，选择下一个更高的频率
+        for (size_t i = 0; i < rates_count - 1; i++) {
+            if (current_frequency < refresh_rates[i]) {
+                input_mgr->setRateLimitFrequency(refresh_rates[i]);
+                return;
+            } else if (current_frequency == refresh_rates[i]) {
+                input_mgr->setRateLimitFrequency(refresh_rates[i + 1]);
+                return;
+            }
+        }
+        // 如果当前频率已经是最高值或超过最高值，保持不变
+        break;
+    }
+    case JoystickState::DOWN: {
+        // 找到当前频率在数组中的位置，选择下一个更低的频率
+        for (size_t i = rates_count - 1; i > 0; i--) {
+            if (current_frequency > refresh_rates[i]) {
+                input_mgr->setRateLimitFrequency(refresh_rates[i]);
+                return;
+            } else if (current_frequency == refresh_rates[i]) {
+                input_mgr->setRateLimitFrequency(refresh_rates[i - 1]);
+                return;
+            }
+        }
+        // 如果当前频率已经是最低值或低于最低值，保持不变
+        break;
+    }
+    default:
+        break;
+    }
 }
 
 } // namespace ui

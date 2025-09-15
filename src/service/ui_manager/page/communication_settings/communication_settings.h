@@ -54,6 +54,10 @@ private:
     static void onDataAggregationDelayChange(JoystickState state);
     static void onExtraSendCountChange(JoystickState state);
     
+    // 频率限制回调函数
+    static void onRateLimitEnabledToggle();
+    static void onRateLimitFrequencyChange(JoystickState state);
+    
     // 辅助函数
     static void loadCurrentSettings();
     static void ApplySettings();
