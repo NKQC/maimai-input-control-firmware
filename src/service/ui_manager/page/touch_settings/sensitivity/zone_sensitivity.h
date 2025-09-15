@@ -2,6 +2,7 @@
 
 #include "../../../engine/page_construction/page_constructor.h"
 #include "../../../../input_manager/input_manager.h"
+#include "../touch_settings_main.h"
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -33,11 +34,11 @@ private:
     struct ZoneBindingInfo {
         std::string zone_name;           // 分区名称 (A, B, C, D, E)
         std::vector<uint32_t> bitmaps;   // 该分区的设备通道bitmap列表
-        uint8_t current_sensitivit_target;     // 当前灵敏度设置
         int8_t target_sensitivity_target;      // 目标灵敏度设置 (0=不变, 1=低敏, 2=中敏, 3=高敏, 4=超敏)
         bool has_bindings;               // 是否有绑定
+        bool has_modified;               // 是否有修改
         
-        ZoneBindingInfo() : current_sensitivit_target(2), target_sensitivity_target(0), has_bindings(false) {}
+        ZoneBindingInfo() : target_sensitivity_target(SENSITIVITY_DEFAULT), has_bindings(false), has_modified(false) {}
     };
     
     /**
@@ -66,14 +67,7 @@ private:
      * @param target_sensitivity_target 目标灵敏度值 (0=不变, 1=低敏, 2=中敏, 3=高敏, 4=超敏)
      */
     void setZoneTargetSensitivity(uint8_t zone_index, uint8_t target_sensitivity);
-    
-    /**
-     * 将SensitivityOption枚举转换为实际灵敏度值
-     * @param option 灵敏度选项
-     * @return 实际灵敏度值 (0-99)
-     */
-    static uint8_t convertSensitivityOptionToValue(SensitivityOption option);
-    
+
     // 静态回调函数
     static void onZoneTargetSensitivityChange(uint8_t zone_index, SensitivityOption option);
     static void onSubmitSpecialCalibration();

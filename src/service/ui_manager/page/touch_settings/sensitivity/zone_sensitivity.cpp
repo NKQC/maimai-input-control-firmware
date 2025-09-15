@@ -1,5 +1,4 @@
 #include "zone_sensitivity.h"
-#include "../touch_settings_main.h"
 #include "../../../ui_manager.h"
 #include "../../../engine/page_construction/page_macros.h"
 #include "../../../engine/page_construction/page_template.h"
@@ -70,11 +69,15 @@ void ZoneSensitivity::render(PageTemplate& page_template) {
         
         // 显示各分区的目标灵敏度选择器
         for (size_t i = 0; i < s_zone_info_.size(); ++i) {
+            // 判断是否已修改（不等于默认值+2）
+            uint32_t text_color = s_zone_info_[i].has_modified ? COLOR_TEXT_GREEN : COLOR_TEXT_WHITE;
+            
+            // 不显示"不变"选项，直接显示数值范围
             snprintf(s_sensitivity_text_buffer, sizeof(s_sensitivity_text_buffer), "%s区目标灵敏度: %s", 
-                        s_zone_info_[i].zone_name.c_str(), getSensitivityOptionText(static_cast<SensitivityOption>(s_zone_info_[i].target_sensitivity_target), true));
+                        s_zone_info_[i].zone_name.c_str(), getSensitivityOptionText(static_cast<SensitivityOption>(s_zone_info_[i].target_sensitivity_target), false));
             ADD_SIMPLE_SELECTOR(s_sensitivity_text_buffer, [i](JoystickState state) {
                 onZoneSensitivityChange(state, i);
-            }, COLOR_WHITE);
+            }, text_color);
         }
         
         // 添加发起特殊校准按钮
@@ -233,22 +236,25 @@ void ZoneSensitivity::onZoneSensitivityChange(JoystickState state, uint8_t zone_
     switch (state) {
     case JoystickState::UP: {
         s_zone_info_[zone_index].target_sensitivity_target++;
-        if (s_zone_info_[zone_index].target_sensitivity_target > int8_t(SensitivityOption::ULTRA)) {
-            s_zone_info_[zone_index].target_sensitivity_target = int8_t(SensitivityOption::ULTRA);
+        if (s_zone_info_[zone_index].target_sensitivity_target > SENSITIVITY_MAX) {
+            s_zone_info_[zone_index].target_sensitivity_target = SENSITIVITY_MAX;
         }
         onZoneTargetSensitivityChange(zone_index, static_cast<SensitivityOption>(s_zone_info_[zone_index].target_sensitivity_target));
+        s_zone_info_[zone_index].has_modified = true;
         break;
     }
     case JoystickState::DOWN: {
         s_zone_info_[zone_index].target_sensitivity_target--;
-        if (s_zone_info_[zone_index].target_sensitivity_target < int8_t(SensitivityOption::LOW)) {
-            s_zone_info_[zone_index].target_sensitivity_target = int8_t(SensitivityOption::LOW);
+        if (s_zone_info_[zone_index].target_sensitivity_target < SENSITIVITY_MIN) {
+            s_zone_info_[zone_index].target_sensitivity_target = SENSITIVITY_MIN;
         }
         onZoneTargetSensitivityChange(zone_index, static_cast<SensitivityOption>(s_zone_info_[zone_index].target_sensitivity_target));
+        s_zone_info_[zone_index].has_modified = true;
         break;
     }
     default:
         return;
     }
 }
+
 } // namespace ui

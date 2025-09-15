@@ -8,31 +8,38 @@ namespace ui {
 
 /**
  * 灵敏度选项枚举
+ * 范围从-10到+10，默认为+2
  */
 enum class SensitivityOption : int8_t {
-    UNCHANGED = 0,  // 不变（仅供zone_sensitivity使用）
-    LOW = 1,        // 低敏
-    DEFAULT = 2,    // 默认
-    HIGH = 3,       // 高敏
-    ULTRA = 4       // 超敏
+    UNCHANGED = 0,  // 不变（仅供zone_sensitivity使用，不在UI中显示）
+    MIN_VALUE = -10, // 最小值
+    MAX_VALUE = 10,  // 最大值
+    DEFAULT_VALUE = 2 // 默认值
 };
+
+/**
+ * 灵敏度数值范围常量
+ */
+static constexpr int8_t SENSITIVITY_MIN = -10;
+static constexpr int8_t SENSITIVITY_MAX = 10;
+static constexpr int8_t SENSITIVITY_DEFAULT = 2;
 
 /**
  * 获取灵敏度选项的文字描述
  * @param option 灵敏度选项
- * @param include_unchanged 是否包含"不变"选项（默认false）
- * @return 对应的文字描述
+ * @param include_unchanged 是否包含"不变"选项的描述
+ * @return 文字描述
  */
 const char* getSensitivityOptionText(SensitivityOption option, bool include_unchanged = false);
 
 /**
- * 获取灵敏度选项数组（不包含UNCHANGED）
- * @return 灵敏度选项文字数组
+ * 获取所有可用的灵敏度数值（-10到+10，不包括UNCHANGED）
+ * @return 灵敏度数值静态数组指针
  */
-const char* const* getSensitivityOptions();
+const int8_t* getSensitivityValues();
 
 /**
- * 获取灵敏度选项数量（不包含UNCHANGED）
+ * 获取灵敏度选项的数量
  * @return 选项数量
  */
 size_t getSensitivityOptionsCount();

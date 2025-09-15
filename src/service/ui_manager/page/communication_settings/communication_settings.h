@@ -34,6 +34,11 @@ private:
     static uint8_t current_serial_delay_;
     static bool current_keyboard_mapping_enabled_;
     
+    // Serial模式新功能设置状态
+    static bool current_send_only_on_change_;
+    static uint8_t current_data_aggregation_delay_;
+    static uint8_t current_extra_send_count_;
+    
     // 波特率选择器索引
     static size_t mai2serial_baud_index_;
     static size_t lightmanager_baud_index_;
@@ -44,6 +49,11 @@ private:
     static void onSerialDelayChange(JoystickState state);
     static void onKeyboardMappingToggle();
     
+    // Serial模式新功能回调函数
+    static void onSendOnlyOnChangeToggle();
+    static void onDataAggregationDelayChange(JoystickState state);
+    static void onExtraSendCountChange(JoystickState state);
+    
     // 辅助函数
     static void loadCurrentSettings();
     static void ApplySettings();
@@ -51,6 +61,12 @@ private:
     static std::string formatBaudRateText(uint32_t baud_rate);
     static std::string formatDelayText(uint8_t delay_ms);
     static std::string formatKeyboardMappingText(bool enabled);
+    
+    // Serial模式新功能辅助函数
+    static std::string formatSendOnlyOnChangeText(bool enabled);
+    static std::string formatDataAggregationDelayText(uint8_t delay_ms);
+    static std::string formatExtraSendCountText(uint8_t count);
+    static bool isSerialMode();
 };
 
 } // namespace ui

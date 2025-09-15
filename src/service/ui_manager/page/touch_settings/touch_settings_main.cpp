@@ -3,28 +3,63 @@
 #include "../../engine/page_construction/page_macros.h"
 #include "../../engine/page_construction/page_template.h"
 #include "../../../input_manager/input_manager.h"
+#include <vector>
+#include <cstdio>
 
 namespace ui {
 
-// 灵敏度选项实现
-const char* getSensitivityOptionText(SensitivityOption option, bool include_unchanged) {
-    switch (option) {
-        case SensitivityOption::UNCHANGED: return include_unchanged ? "不变" : "未知";
-        case SensitivityOption::LOW: return "低敏";
-        case SensitivityOption::DEFAULT: return "默认";
-        case SensitivityOption::HIGH: return "高敏";
-        case SensitivityOption::ULTRA: return "超敏";
-        default: return "未知";
+// 内联数字到字符串转换函数
+inline void int8_to_string(int8_t value, char* buffer) {
+    char* ptr = buffer;
+    
+    if (value > 0) {
+        *ptr++ = '+';
+    } else if (value < 0) {
+        *ptr++ = '-';
+        value = -value;
     }
+    
+    if (value >= 10) {
+        *ptr++ = '0' + (value / 10);
+    }
+    *ptr++ = '0' + (value % 10);
+    *ptr = '\0';
 }
 
-const char* const* getSensitivityOptions() {
-    static const char* options[] = {"低敏", "默认", "高敏", "超敏"};
-    return options;
+// 灵敏度选项实现
+const char* getSensitivityOptionText(SensitivityOption option, bool include_unchanged) {
+    static char buffer[8]; // 静态缓冲区用于存储格式化的数值字符串
+    
+    int8_t value = static_cast<int8_t>(option);
+    
+    // 确保值在有效范围内
+    if (value < SENSITIVITY_MIN || value > SENSITIVITY_MAX) {
+        return "未知";
+    }
+    
+    // 使用内联转换函数
+    int8_to_string(value, buffer);
+    
+    return buffer;
+}
+
+// 获取所有可用的灵敏度选项（-10到+10，不包括UNCHANGED）
+const int8_t* getSensitivityValues() {
+    static int8_t values[SENSITIVITY_MAX - SENSITIVITY_MIN + 1];
+    static bool initialized = false;
+    
+    if (!initialized) {
+        for (int8_t i = SENSITIVITY_MIN; i <= SENSITIVITY_MAX; ++i) {
+            values[i - SENSITIVITY_MIN] = i;
+        }
+        initialized = true;
+    }
+    
+    return values;
 }
 
 size_t getSensitivityOptionsCount() {
-    return 4;
+    return SENSITIVITY_MAX - SENSITIVITY_MIN + 1; // -10到+10共21个选项
 }
 
 int32_t TouchSettingsMain::delay_value = 0;
@@ -69,9 +104,9 @@ void TouchSettingsMain::render(PageTemplate& page_template) {
         SensitivityOption current_option = static_cast<SensitivityOption>(TouchSettingsMain::sensitivity_target);
         snprintf(sensitivity_text, sizeof(sensitivity_text), "校准灵敏度: %s", getSensitivityOptionText(current_option));
         ADD_SIMPLE_SELECTOR(sensitivity_text, [](JoystickState state) {
-            if (state == JoystickState::UP && TouchSettingsMain::sensitivity_target < static_cast<uint8_t>(SensitivityOption::ULTRA)) {
+            if (state == JoystickState::UP && TouchSettingsMain::sensitivity_target < SENSITIVITY_MAX) {
                 TouchSettingsMain::sensitivity_target++;
-            } else if (state == JoystickState::DOWN && TouchSettingsMain::sensitivity_target > static_cast<uint8_t>(SensitivityOption::LOW)) {
+            } else if (state == JoystickState::DOWN && TouchSettingsMain::sensitivity_target > SENSITIVITY_MIN) {
                 TouchSettingsMain::sensitivity_target--;
             }
         }, COLOR_TEXT_WHITE)

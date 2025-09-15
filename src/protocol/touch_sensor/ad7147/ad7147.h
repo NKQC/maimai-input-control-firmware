@@ -93,7 +93,7 @@
 #define CALIBRATION_AEF_SAVE_AREA -1 // AEF完成时额外偏置保留区域 预留缓冲空间防止意外触发
 
 // 指数算法参数宏定义
-#define STAGE_REDUCE_NUM 0x800
+#define STAGE_REDUCE_NUM 0x400
 #define FLUCTUATION_MIN_THRESHOLD 100                        // 波动最小阈值
 #define FLUCTUATION_MAX_THRESHOLD 10000                      // 波动最大阈值
 #define FLUCTUATION_MAX_FACTOR 1                             // 最大调整系数

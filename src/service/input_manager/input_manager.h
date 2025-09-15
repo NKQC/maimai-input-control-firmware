@@ -197,6 +197,9 @@ enum class TouchKeyboardMode : uint8_t {
 #define INPUTMANAGER_TOUCH_RESPONSE_DELAY "input_manager_touch_response_delay"
 #define INPUTMANAGER_AREA_CHANNEL_MAPPINGS "input_manager_area_channel_mappings"
 #define INPUTMANAGER_MAI2SERIAL_BAUD_RATE "input_manager_mai2serial_baud_rate"
+#define INPUTMANAGER_SEND_ONLY_ON_CHANGE "input_manager_send_only_on_change"
+#define INPUTMANAGER_DATA_AGGREGATION_DELAY "input_manager_data_aggregation_delay"
+#define INPUTMANAGER_EXTRA_SEND_COUNT "input_manager_extra_send_count"
 
 
 // 工作模式枚举
@@ -235,6 +238,11 @@ struct InputManager_PrivateConfig {
     // 触摸响应延迟配置 (0-100ms)
     uint8_t touch_response_delay_ms;
     
+    // Serial模式新功能参数
+    bool send_only_on_change;                    // 仅改变时发送功能开关
+    uint8_t data_aggregation_delay_ms;           // 触发数据聚合延迟时间(ms)
+    uint8_t extra_send_count;                    // 额外发送次数
+    
     // Mai2Serial配置 - 内部管理
     Mai2Serial_Config mai2serial_config;
     
@@ -244,6 +252,9 @@ struct InputManager_PrivateConfig {
         , touch_keyboard_mode(TouchKeyboardMode::BOTH)
         , touch_keyboard_enabled(false)
         , touch_response_delay_ms(0)
+        , send_only_on_change(false)
+        , data_aggregation_delay_ms(0)
+        , extra_send_count(0)
         , mai2serial_config() {
     }
 };
@@ -401,6 +412,14 @@ public:
     // 触摸响应延迟管理
     void setTouchResponseDelay(uint8_t delay_ms);  // 设置触摸响应延迟 (0-100ms)
     uint8_t getTouchResponseDelay() const;         // 获取当前延迟设置
+    
+    // Serial模式新功能接口
+    void setSendOnlyOnChange(bool enabled);        // 设置仅改变时发送功能
+    bool getSendOnlyOnChange() const;              // 获取仅改变时发送状态
+    void setDataAggregationDelay(uint8_t delay_ms); // 设置数据聚合延迟(0-100ms)
+    uint8_t getDataAggregationDelay() const;       // 获取数据聚合延迟
+    void setExtraSendCount(uint8_t count);         // 设置额外发送次数(0-10)
+    uint8_t getExtraSendCount() const;             // 获取额外发送次数
     
     // 获取配置副本
     InputManager_PrivateConfig getConfig() const;
@@ -574,8 +593,13 @@ private:
     mutable bool gpio_current_state_cache_;  // GPIO当前状态缓存
     mutable const PhysicalKeyboardMapping* gpio_mapping_ptr_cache_;  // 当前映射指针缓存
     mutable const HID_KeyCode* gpio_keys_ptr_cache_;                 // 当前按键指针缓存
-    
-    // 内部处理函数
+
+    // Serial模式新功能状态变量
+    Mai2Serial_TouchState last_sent_serial_state_;                   // 上次发送的Serial状态（用于仅改变时发送）
+    uint8_t remaining_extra_sends_;                                  // 剩余额外发送次数
+    bool serial_state_changed_;                                      // Serial状态是否改变标志
+
+    // 内部函数   // 内部处理函数
     inline void updateTouchStates();
     inline void updateAutoCalibrationControl();  // 处理自动校准控制
     inline void sendHIDTouchData();

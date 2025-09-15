@@ -28,7 +28,7 @@ InputManager *InputManager::getInstance()
 // 私有构造函数
 InputManager::InputManager()
     : delay_buffer_head_(0), delay_buffer_count_(0), mcu_gpio_states_(0), mcu_gpio_previous_states_(0), serial_state_(), touch_keyboard_current_time_cache_(0), touch_keyboard_areas_matched_cache_(false), touch_keyboard_hold_satisfied_cache_(false), sample_counter_(0), last_reset_time_(0), current_sample_rate_(0), binding_active_(false), binding_callback_(), binding_state_(BindingState::IDLE), current_binding_index_(0), binding_start_time_(0), binding_timeout_ms_(30000),
-      binding_hardware_ops_pending_(false), binding_cancel_pending_(false), calibration_request_pending_(CalibrationRequestType::IDLE), calibration_sensitivity_target_(2), calibration_in_progress_(false), auto_adjust_context_(), mai2_serial_(nullptr), hid_(nullptr), mcp23s17_(nullptr), config_(inputmanager_get_config_holder()), mcp23s17_available_(false), ui_manager_(nullptr), gpio_keyboard_bitmap_(), touch_bitmap_cache_(), mcp_gpio_states_(), mcp_gpio_previous_states_()
+      binding_hardware_ops_pending_(false), binding_cancel_pending_(false), calibration_request_pending_(CalibrationRequestType::IDLE), calibration_sensitivity_target_(2), calibration_in_progress_(false), auto_adjust_context_(), mai2_serial_(nullptr), hid_(nullptr), mcp23s17_(nullptr), config_(inputmanager_get_config_holder()), mcp23s17_available_(false), ui_manager_(nullptr), gpio_keyboard_bitmap_(), touch_bitmap_cache_(), mcp_gpio_states_(), mcp_gpio_previous_states_(), last_sent_serial_state_(), remaining_extra_sends_(0), serial_state_changed_(false)
 {
 
     // 初始化32位触摸状态数组
@@ -309,75 +309,140 @@ inline void InputManager::processSerialModeWithDelay()
     {
         buffer_idx = (delay_buffer_head_ - 1) & (DELAY_BUFFER_SIZE - 1);
         delayed_serial_state = delay_buffer_[buffer_idx].serial_touch_state;
-        serial_state_ = delayed_serial_state;
-        mai2_serial_->send_touch_data(delayed_serial_state);
-        last_hit_offset = 1;  // 更新偏移为最新位置
-        return;
-    }
-    
-    // 计算目标时间点（当前时间减去延迟时间）
-    target_time = time_us_32() - (config_->touch_response_delay_ms * 1000U);
-    
-    // 限制偏移范围，防止越界
-    if (last_hit_offset >= delay_buffer_count_)
-    {
-        last_hit_offset = delay_buffer_count_ / 2;  // 重置到中间位置
-    }
-    
-    // 从上次命中位置开始搜索
-    buffer_idx = (delay_buffer_head_ - last_hit_offset) & (DELAY_BUFFER_SIZE - 1);
-    current_timestamp = delay_buffer_[buffer_idx].timestamp_us;
-    
-    if (current_timestamp <= target_time)
-    {
-        // 当前位置时间戳过旧，需要向最新方向搜索最贴近目标的位置
-        best_idx = buffer_idx;
-        best_offset = last_hit_offset;
-        
-        // 向最新方向搜索，找到最后一个符合条件的位置
-        for (offset = last_hit_offset - 1; offset > 0; --offset)
-        {
-            buffer_idx = (delay_buffer_head_ - offset) & (DELAY_BUFFER_SIZE - 1);
-            if (delay_buffer_[buffer_idx].timestamp_us <= target_time)
-            {
-                best_idx = buffer_idx;
-                best_offset = offset;
-            }
-            else
-            {
-                break;  // 找到第一个不符合的，停止搜索
-            }
-        }
-        
-        buffer_idx = best_idx;
-        last_hit_offset = best_offset;
     }
     else
     {
-        // 当前位置时间戳过新，需要向过去方向搜索第一个符合条件的位置
-        flags.found = 0;
-        for (offset = last_hit_offset + 1; offset <= delay_buffer_count_; ++offset)
+        // 计算目标时间点（当前时间减去延迟时间）
+        target_time = time_us_32() - (config_->touch_response_delay_ms * 1000U);
+        
+        // 限制偏移范围，防止越界
+        if (last_hit_offset >= delay_buffer_count_)
         {
-            buffer_idx = (delay_buffer_head_ - offset) & (DELAY_BUFFER_SIZE - 1);
-            if (delay_buffer_[buffer_idx].timestamp_us <= target_time)
+            last_hit_offset = delay_buffer_count_ / 2;  // 重置到中间位置
+        }
+        
+        // 从上次命中位置开始搜索
+        buffer_idx = (delay_buffer_head_ - last_hit_offset) & (DELAY_BUFFER_SIZE - 1);
+        current_timestamp = delay_buffer_[buffer_idx].timestamp_us;
+        
+        if (current_timestamp <= target_time)
+        {
+            // 当前位置时间戳过旧，需要向最新方向搜索最贴近目标的位置
+            best_idx = buffer_idx;
+            best_offset = last_hit_offset;
+            
+            // 向最新方向搜索，找到最后一个符合条件的位置
+            for (offset = last_hit_offset - 1; offset > 0; --offset)
             {
-                last_hit_offset = offset;
-                flags.found = 1;
-                break;
+                buffer_idx = (delay_buffer_head_ - offset) & (DELAY_BUFFER_SIZE - 1);
+                if (delay_buffer_[buffer_idx].timestamp_us <= target_time)
+                {
+                    best_idx = buffer_idx;
+                    best_offset = offset;
+                }
+                else
+                {
+                    break;  // 找到第一个不符合的，停止搜索
+                }
+            }
+            
+            buffer_idx = best_idx;
+            last_hit_offset = best_offset;
+        }
+        else
+        {
+            // 当前位置时间戳过新，需要向过去方向搜索第一个符合条件的位置
+            flags.found = 0;
+            for (offset = last_hit_offset + 1; offset <= delay_buffer_count_; ++offset)
+            {
+                buffer_idx = (delay_buffer_head_ - offset) & (DELAY_BUFFER_SIZE - 1);
+                if (delay_buffer_[buffer_idx].timestamp_us <= target_time)
+                {
+                    last_hit_offset = offset;
+                    flags.found = 1;
+                    break;
+                }
+            }
+            
+            if (!flags.found)
+            {
+                // 没找到符合条件的，说明还没到发送时候
+                return;
             }
         }
         
-        if (!flags.found)
+        delayed_serial_state = delay_buffer_[buffer_idx].serial_touch_state;
+    }
+    
+    // 功能1: 触发数据聚合处理
+    if (config_->data_aggregation_delay_ms > 0 && config_->touch_response_delay_ms >= config_->data_aggregation_delay_ms)
+    {
+        // 计算聚合时间范围的起始时间点
+        uint32_t aggregation_start_time = time_us_32() - (config_->touch_response_delay_ms * 1000U);
+        uint32_t aggregation_end_time = aggregation_start_time + (config_->data_aggregation_delay_ms * 1000U);
+        
+        // 遍历聚合时间范围内的所有数据，进行AND运算
+        Mai2Serial_TouchState aggregated_state = delayed_serial_state;  // 初始化为当前状态
+        
+        for (uint16_t i = 0; i < delay_buffer_count_; ++i)
         {
-            // 没找到符合条件的，说明还没到发送时候
-            return;
+            uint16_t check_idx = (delay_buffer_head_ - 1 - i) & (DELAY_BUFFER_SIZE - 1);
+            uint32_t check_timestamp = delay_buffer_[check_idx].timestamp_us;
+            
+            // 如果时间戳在聚合范围内
+            if (check_timestamp >= aggregation_start_time && check_timestamp <= aggregation_end_time)
+            {
+                // 进行AND运算：只有在整个时间段内都触发的通道才保持触发状态
+                aggregated_state.parts.state1 &= delay_buffer_[check_idx].serial_touch_state.parts.state1;
+                aggregated_state.parts.state2 &= delay_buffer_[check_idx].serial_touch_state.parts.state2;
+            }
+            else if (check_timestamp < aggregation_start_time)
+            {
+                break;  // 时间戳过旧，停止搜索
+            }
+        }
+        
+        delayed_serial_state = aggregated_state;
+    }
+    
+    // 功能2: 仅改变时发送判断
+    serial_state_changed_ = (delayed_serial_state.raw != last_sent_serial_state_.raw);
+    
+    bool should_send = false;
+    
+    if (config_->send_only_on_change)
+    {
+        // 如果启用仅改变时发送
+        if (serial_state_changed_)
+        {
+            should_send = true;
+            // 数据改变时重置额外发送次数
+            remaining_extra_sends_ = config_->extra_send_count;
+        }
+        else if (remaining_extra_sends_ > 0)
+        {
+            // 数据未改变但还有额外发送次数
+            should_send = true;
+            remaining_extra_sends_--;
+        }
+    }
+    else
+    {
+        // 未启用仅改变时发送，总是发送
+        should_send = true;
+        if (serial_state_changed_)
+        {
+            remaining_extra_sends_ = config_->extra_send_count;
         }
     }
     
-    // 发送找到的数据
-    delayed_serial_state = delay_buffer_[buffer_idx].serial_touch_state;
-    serial_state_ = delayed_serial_state;  // 为确保当外键映射启用时时间是同步的
-    mai2_serial_->send_touch_data(delayed_serial_state);
+    // 发送数据
+    if (should_send)
+    {
+        serial_state_ = delayed_serial_state;  // 为确保当外键映射启用时时间是同步的
+        mai2_serial_->send_touch_data(delayed_serial_state);
+        last_sent_serial_state_ = delayed_serial_state;  // 更新上次发送状态
+    }
 }
 
 void InputManager::clearPhysicalKeyboards()
@@ -1385,7 +1450,11 @@ void inputmanager_register_default_configs(config_map_t &default_map)
     default_map[INPUTMANAGER_TOUCH_KEYBOARD_MODE] = ConfigValue((uint8_t)0);  // 默认触摸键盘模式
     default_map[INPUTMANAGER_TOUCH_RESPONSE_DELAY] = ConfigValue((uint8_t)50, (uint8_t)0, (uint8_t)100); // 默认触摸响应延迟
     default_map[INPUTMANAGER_MAI2SERIAL_BAUD_RATE] = ConfigValue((uint32_t)9600, (uint32_t)9600, (uint32_t)6000000); // Mai2Serial波特率，范围9600-6000000
-
+    
+    // Serial模式新功能配置
+    default_map[INPUTMANAGER_SEND_ONLY_ON_CHANGE] = ConfigValue(false);       // 默认关闭仅改变时发送
+    default_map[INPUTMANAGER_DATA_AGGREGATION_DELAY] = ConfigValue((uint8_t)0, (uint8_t)0, (uint8_t)100); // 数据聚合延迟，范围0-100ms
+    default_map[INPUTMANAGER_EXTRA_SEND_COUNT] = ConfigValue((uint8_t)0, (uint8_t)0, (uint8_t)10);        // 额外发送次数，范围0-10次
 
     default_map[INPUTMANAGER_TOUCH_DEVICES] = ConfigValue(std::string(""));      // 触摸设备映射数据
     default_map[INPUTMANAGER_PHYSICAL_KEYBOARDS] = ConfigValue(std::string(""));
@@ -1418,6 +1487,11 @@ bool inputmanager_load_config_from_manager()
 
     // 加载触摸响应延迟
     static_config_.touch_response_delay_ms = config_mgr->get_uint8(INPUTMANAGER_TOUCH_RESPONSE_DELAY);
+    
+    // 加载Serial模式新功能配置
+    static_config_.send_only_on_change = config_mgr->get_bool(INPUTMANAGER_SEND_ONLY_ON_CHANGE);
+    static_config_.data_aggregation_delay_ms = config_mgr->get_uint8(INPUTMANAGER_DATA_AGGREGATION_DELAY);
+    static_config_.extra_send_count = config_mgr->get_uint8(INPUTMANAGER_EXTRA_SEND_COUNT);
     
     // 加载Mai2Serial配置
     static_config_.mai2serial_config.baud_rate = config_mgr->get_uint32(INPUTMANAGER_MAI2SERIAL_BAUD_RATE);
@@ -1573,6 +1647,11 @@ bool inputmanager_write_config_to_manager(const InputManager_PrivateConfig &conf
 
     // 写入触摸响应延迟
     config_mgr->set_uint8(INPUTMANAGER_TOUCH_RESPONSE_DELAY, config.touch_response_delay_ms);
+    
+    // 写入Serial模式新功能配置
+    config_mgr->set_bool(INPUTMANAGER_SEND_ONLY_ON_CHANGE, config.send_only_on_change);
+    config_mgr->set_uint8(INPUTMANAGER_DATA_AGGREGATION_DELAY, config.data_aggregation_delay_ms);
+    config_mgr->set_uint8(INPUTMANAGER_EXTRA_SEND_COUNT, config.extra_send_count);
     
     // 保存Mai2Serial配置
     config_mgr->set_uint32(INPUTMANAGER_MAI2SERIAL_BAUD_RATE, config.mai2serial_config.baud_rate);
@@ -2065,6 +2144,41 @@ void InputManager::setTouchResponseDelay(uint8_t delay_ms)
 uint8_t InputManager::getTouchResponseDelay() const
 {
     return config_->touch_response_delay_ms;
+}
+
+// Serial模式新功能接口实现
+void InputManager::setSendOnlyOnChange(bool enabled)
+{
+    config_->send_only_on_change = enabled;
+}
+
+bool InputManager::getSendOnlyOnChange() const
+{
+    return config_->send_only_on_change;
+}
+
+void InputManager::setDataAggregationDelay(uint8_t delay_ms)
+{
+    if (delay_ms > 100)
+        delay_ms = 100; // 限制最大延迟为100ms
+    config_->data_aggregation_delay_ms = delay_ms;
+}
+
+uint8_t InputManager::getDataAggregationDelay() const
+{
+    return config_->data_aggregation_delay_ms;
+}
+
+void InputManager::setExtraSendCount(uint8_t count)
+{
+    if (count > 10)
+        count = 10; // 限制最大额外发送次数为10
+    config_->extra_send_count = count;
+}
+
+uint8_t InputManager::getExtraSendCount() const
+{
+    return config_->extra_send_count;
 }
 
 // 获取当前配置副本

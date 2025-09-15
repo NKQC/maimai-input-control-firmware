@@ -25,19 +25,19 @@ typedef uint16_t Color;
 #define COLOR_DARK_GRAY   0x4208  // 深灰色dcxz
 #define COLOR_LIGHT_GRAY  0xC618  // 浅灰色
 
-// 现代化UI颜色主题 (BGR565格式)
+// 现代化UI颜色主题 (RBG565格式)
 #define COLOR_BG_DARK     0x18C3  // 深色背景 #1a1a1a
 #define COLOR_BG_CARD     0x2945  // 卡片背景 #2a2a2a
 #define COLOR_BORDER      0x4208  // 边框颜色 #404040
-#define COLOR_PRIMARY     0xF800  // 主色调 #0080ff (RGB565格式)
+#define COLOR_PRIMARY     0x801F  // 主色调 #0080ff (RBG565格式)
 #define COLOR_TEXT_WHITE  0xFFFF  // 白色文字
 #define COLOR_TEXT_GRAY   0x8410  // 灰色文字
-#define COLOR_TEXT_YELLOW 0x07FF  // 黄色文字
-#define COLOR_TEXT_GREEN  0x07E0  // 绿色文字
-#define COLOR_SUCCESS     0x07E0  // 成功绿色
-#define COLOR_WARNING     0x07FF  // 警告黄色 (RGB565格式)
-#define COLOR_ERROR       0x001F  // 错误红色 (RGB565格式)
-#define COLOR_INFO        0xF800  // 信息蓝色 (RGB565格式)
+#define COLOR_TEXT_YELLOW 0xFFE0  // 黄色文字
+#define COLOR_TEXT_GREEN  0xE007  // 绿色文字
+#define COLOR_SUCCESS     0xE007  // 成功绿色
+#define COLOR_WARNING     0xFFE0  // 警告黄色 (RBG565格式)
+#define COLOR_ERROR       0xF001  // 错误红色 (RBG565格式)
+#define COLOR_INFO        0x801F  // 信息蓝色 (RBG565格式)
 
 // 点结构
 struct Point {
