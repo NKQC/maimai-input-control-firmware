@@ -163,7 +163,7 @@ public:
     };
 
     // 数据发送
-    void send_touch_data(Mai2Serial_TouchState& touch_data);
+    bool send_touch_data(Mai2Serial_TouchState& touch_data);
     void send_command_response(uint8_t lr, uint8_t sensor, uint8_t cmd, uint8_t value);
 
     // 状态

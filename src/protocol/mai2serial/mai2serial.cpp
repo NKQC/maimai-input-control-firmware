@@ -75,9 +75,9 @@ Mai2Serial_Config Mai2Serial::get_config() const {
 }
 
 // 发送触摸数据
-void Mai2Serial::send_touch_data(Mai2Serial_TouchState& touch_data) {
+bool Mai2Serial::send_touch_data(Mai2Serial_TouchState& touch_data) {
     if (!is_ready() || !serial_ok_) {
-        return;
+        return false;  // 设备未就绪或串口不可用，发送失败
     }
     
     // 流控逻辑：使用静态变量存储当前时间，避免重复获取
@@ -86,7 +86,7 @@ void Mai2Serial::send_touch_data(Mai2Serial_TouchState& touch_data) {
     
     // 直接比较下次发送时间
     if (next_send_time_us_ > current_time_us) {
-        return;  // 时间未到，直接返回
+        return false;  // 时间未到，发送失败
     }
     
     // 更新下次发送时间
@@ -105,8 +105,8 @@ void Mai2Serial::send_touch_data(Mai2Serial_TouchState& touch_data) {
     packet[6] = (uint8_t)((combined_bits >> 25) & 0x1F); // 位25-29
     packet[7] = (uint8_t)((combined_bits >> 30) & 0x1F); // 位30-34
 
-    // 使用新的DMA接口：写入TX缓冲区会自动处理DMA传输
-    uart_hal_->write_to_tx_buffer(packet, 9);
+    // 返回是否成功写入完整数据包
+    return (uart_hal_->write_to_tx_buffer(packet, 9) == 9);
 }
 
 // 处理命令 - 使用DMA接收
