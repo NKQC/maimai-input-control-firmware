@@ -514,6 +514,7 @@ bool init_service_layer() {
     input_manager->addTouchKeyboardMapping(MAI2_A8_AREA, 1000, HID_KeyCode::KEY_Q, true);
     input_manager->addTouchKeyboardMapping(MAI2_B1_AREA | MAI2_B8_AREA | MAI2_E1_AREA, 1000, HID_KeyCode::KEY_SPACE, true);
     input_manager->addTouchKeyboardMapping(MAI2_C1_AREA | MAI2_C2_AREA, 1000, HID_KeyCode::KEY_ENTER);
+    input_manager->addTouchKeyboardMapping(MAI2_A1_AREA | MAI2_A2_AREA | MAI2_A4_AREA | MAI2_A5_AREA, 1000, HID_KeyCode::KEY_F8, true);
 
     // 初始化LightManager
     light_manager = LightManager::getInstance();
