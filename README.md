@@ -182,14 +182,14 @@ input_manager->addPhysicalKeyboard(MCP_GPIO::GPIOB3, HID_KeyCode::KEY_SPACE);
 
 | 触摸区域 | 对应键盘按键 | 长按时间 | 触发模式 |
 |----------|-------------|----------|----------|
-| MAI2_A1_AREA | W | 1000ms | 单次触发 |
+| MAI2_A1_AREA | W | 1000ms | 持续触发 |
 | MAI2_A2_AREA | E | 1000ms | 持续触发 |
 | MAI2_A3_AREA | D | 1000ms | 持续触发 |
-| MAI2_A4_AREA | C | 1000ms | 单次触发 |
-| MAI2_A5_AREA | X | 1000ms | 单次触发 |
+| MAI2_A4_AREA | C | 1000ms | 持续触发 |
+| MAI2_A5_AREA | X | 1000ms | 持续触发 |
 | MAI2_A6_AREA | Z | 1000ms | 持续触发 |
 | MAI2_A7_AREA | A | 1000ms | 持续触发 |
-| MAI2_A8_AREA | Q | 1000ms | 单次触发 |
+| MAI2_A8_AREA | Q | 1000ms | 持续触发 |
 | MAI2_B1_AREA + MAI2_B8_AREA + MAI2_E1_AREA | Space | 1000ms | 单次触发 |
 | MAI2_C1_AREA + MAI2_C2_AREA | Enter | 1000ms | 持续触发 |
 | MAI2_D3_AREA + MAI2_D7_AREA | F8 | 1000ms | 持续触发 |
@@ -215,14 +215,14 @@ input_manager->addPhysicalKeyboard(MCP_GPIO::GPIOB3, HID_KeyCode::KEY_SPACE);
 #### 映射配置
 
 ```cpp
-input_manager->addTouchKeyboardMapping(MAI2_A1_AREA, 1000, HID_KeyCode::KEY_W, true);
+input_manager->addTouchKeyboardMapping(MAI2_A1_AREA, 1000, HID_KeyCode::KEY_W);
     input_manager->addTouchKeyboardMapping(MAI2_A2_AREA, 1000, HID_KeyCode::KEY_E);
     input_manager->addTouchKeyboardMapping(MAI2_A3_AREA, 1000, HID_KeyCode::KEY_D);
-    input_manager->addTouchKeyboardMapping(MAI2_A4_AREA, 1000, HID_KeyCode::KEY_C, true);
-    input_manager->addTouchKeyboardMapping(MAI2_A5_AREA, 1000, HID_KeyCode::KEY_X, true);
+    input_manager->addTouchKeyboardMapping(MAI2_A4_AREA, 1000, HID_KeyCode::KEY_C);
+    input_manager->addTouchKeyboardMapping(MAI2_A5_AREA, 1000, HID_KeyCode::KEY_X);
     input_manager->addTouchKeyboardMapping(MAI2_A6_AREA, 1000, HID_KeyCode::KEY_Z);
     input_manager->addTouchKeyboardMapping(MAI2_A7_AREA, 1000, HID_KeyCode::KEY_A);
-    input_manager->addTouchKeyboardMapping(MAI2_A8_AREA, 1000, HID_KeyCode::KEY_Q, true);
+    input_manager->addTouchKeyboardMapping(MAI2_A8_AREA, 1000, HID_KeyCode::KEY_Q);
     input_manager->addTouchKeyboardMapping(MAI2_B1_AREA | MAI2_B8_AREA | MAI2_E1_AREA, 1000, HID_KeyCode::KEY_SPACE, true);
     input_manager->addTouchKeyboardMapping(MAI2_C1_AREA | MAI2_C2_AREA, 1000, HID_KeyCode::KEY_ENTER);
     input_manager->addTouchKeyboardMapping(MAI2_D3_AREA | MAI2_D7_AREA, 1000, HID_KeyCode::KEY_F8);

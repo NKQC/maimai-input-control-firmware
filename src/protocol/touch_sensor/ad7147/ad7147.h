@@ -101,6 +101,10 @@
 #define TAYLOR_SCALE_FACTOR 1024                             // 泰勒级数缩放因子
 #define TAYLOR_NORMALIZATION_RANGE FLUCTUATION_MAX_THRESHOLD // 归一化范围
 
+// 面积补偿参数（基于平均CDC波动差）
+#define AREA_COMPENSATION_DIVISOR 8   // 将平均波动差缩放为补偿量的除数（越小补偿越大）
+#define AREA_COMPENSATION_MAX 0x2000     // 面积补偿上限，防止过度补偿
+
 #define AD7147_CALIBRATION_TARGET_VALUE (AD7147_DEFAULT_OFFSET_LOW_CLAMP + (STAGE_REDUCE_NUM / 2))
 
 // 设备信息结构体
@@ -265,7 +269,7 @@ union StageCalEnRegister
         uint16_t stage10_cal_en : 1; // [10] STAGE10校准使能
         uint16_t stage11_cal_en : 1; // [11] STAGE11校准使能
         uint16_t avg_fp_skip : 2;    // [13:12] 全功率模式跳过控制
-        uint16_t avg_lp_skip : 2;    // [15:14] 低功率模式跳过控制
+        uint16_t avg_lp_skip : 2;    // [15:14] 低功耗模式跳过控制
     } bits;
 
     StageCalEnRegister() : raw(0x0000) {} // 默认值
@@ -279,8 +283,8 @@ union AmbCompCtrl0Register
     {
         uint16_t ff_skip_cnt : 4;      // [3:0] 快速滤波器跳过控制
         uint16_t fp_proximity_cnt : 4; // [7:4] 全功率模式接近计数
-        uint16_t lp_proximity_cnt : 4; // [11:8] 低功率模式接近计数
-        uint16_t pwr_down_timeout : 2; // [13:12] 全功率到低功率模式超时控制
+        uint16_t lp_proximity_cnt : 4; // [11:8] 低功耗模式接近计数
+        uint16_t pwr_down_timeout : 2; // [13:12] 全功率到低功耗模式超时控制
         uint16_t forced_cal : 1;       // [14] 强制校准控制
         uint16_t conv_reset : 1;       // [15] 转换复位控制
     } bits;
@@ -507,6 +511,13 @@ private:
             CDCSample_result cdc_samples_;  // CDC采样结果
             uint16_t max_fluctuation_ = 0;  // 最大波动差
             TriggleSample trigger_samples_; // 触发采样结果
+            // 新增：面积与整体CDC平均量化（积分多轮采样）
+            uint32_t area_diff_accum_ = 0;   // 累计的窗口波动差总和（用于面积相关性）
+            uint16_t area_diff_avg_ = 0;     // 平均窗口波动差（与面积正相关）
+            uint16_t area_diff_count_ = 0;   // 参与平均的窗口数量
+            uint32_t cdc_avg_accum_ = 0;     // CDC平均值的积分总和
+            uint16_t cdc_avg_overall_ = 0;   // 多窗口CDC平均值
+            uint16_t cdc_avg_count_ = 0;     // CDC平均值累计计数
         };
 
         struct CalibrationData
@@ -545,6 +556,9 @@ private:
         bool Read_CDC_Sample(uint8_t stage, CDCSample_result &result, bool measure);
         // [执行一次采样一次 直接解析sample中的采样数据 sample应当通过外部直接传入循环中的采样结果原始值 到目标周期/验证时为触发 返回True] 读取触发值 计算触发和未触发次数
         bool Read_Triggle_Sample(uint8_t stage, uint32_t sample, TriggleSample &result, bool measure);
+
+        // 内联：根据噪声与面积补偿计算当前阶段的目标CDC
+        inline uint16_t Compute_CDC_Adjusted_Target(uint8_t stage, uint16_t base_target);
     };
 
     CalibrationTools calibration_tools_;

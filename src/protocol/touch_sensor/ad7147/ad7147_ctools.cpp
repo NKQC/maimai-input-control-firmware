@@ -20,6 +20,13 @@ void AD7147::CalibrationTools::Clear_and_prepare_stage_settings()
         calibration_data_.channels[ch].cdc_samples_.clear();
         calibration_data_.channels[ch].trigger_samples_.clear();
         calibration_data_.channels[ch].max_fluctuation_ = 0;
+        // 新增：复位面积/CDC积分累加器
+        calibration_data_.channels[ch].area_diff_accum_ = 0;
+        calibration_data_.channels[ch].area_diff_avg_ = 0;
+        calibration_data_.channels[ch].area_diff_count_ = 0;
+        calibration_data_.channels[ch].cdc_avg_accum_ = 0;
+        calibration_data_.channels[ch].cdc_avg_overall_ = 0;
+        calibration_data_.channels[ch].cdc_avg_count_ = 0;
 
         Set_AEF_Offset(ch, calibration_data_.channels[ch].s1_aef_);
     }
@@ -81,6 +88,74 @@ bool AD7147::CalibrationTools::Read_Triggle_Sample(uint8_t stage, uint32_t sampl
     return (result.sample_count++ >= (measure ? CALIBRATION_MEASURE_SAMPLE_COUNT : CALIBRATION_SCAN_SAMPLE_COUNT));
 }
 
+inline uint16_t AD7147::CalibrationTools::Compute_CDC_Adjusted_Target(uint8_t stage, uint16_t base_target)
+{
+    ChannelCalibrationData &ch = calibration_data_.channels[stage];
+
+    // 当前窗口波动差（max-min）并更新最大波动差
+    uint16_t current_fluctuation = (ch.cdc_samples_.max >= ch.cdc_samples_.min)
+                                       ? (uint16_t)(ch.cdc_samples_.max - ch.cdc_samples_.min)
+                                       : (uint16_t)(ch.cdc_samples_.min - ch.cdc_samples_.max);
+    if (current_fluctuation > ch.max_fluctuation_)
+    {
+        ch.max_fluctuation_ = current_fluctuation;
+    }
+
+    // 统计：积分多窗口的波动差与CDC平均值
+    ch.area_diff_accum_ += current_fluctuation;
+    if (ch.area_diff_count_ != 0xFFFF)
+        ch.area_diff_count_++;
+    ch.area_diff_avg_ = (uint16_t)(ch.area_diff_accum_ / (uint32_t)(ch.area_diff_count_ ? ch.area_diff_count_ : 1));
+
+    ch.cdc_avg_accum_ += ch.cdc_samples_.average;
+    if (ch.cdc_avg_count_ != 0xFFFF)
+        ch.cdc_avg_count_++;
+    ch.cdc_avg_overall_ = (uint16_t)(ch.cdc_avg_accum_ / (uint32_t)(ch.cdc_avg_count_ ? ch.cdc_avg_count_ : 1));
+
+    // 基于最大波动差的指数型噪声自适应因子（与原逻辑一致）
+    uint16_t fluctuation_factor = 0;
+    uint32_t x_normalized = 0;
+    if (ch.max_fluctuation_ > FLUCTUATION_MIN_THRESHOLD)
+        x_normalized = (uint32_t)(ch.max_fluctuation_ - FLUCTUATION_MIN_THRESHOLD); // 减去最小阈值
+
+    // t = k * x_normalized / RANGE, k=2
+    uint32_t t = (2u * x_normalized) / (uint32_t)TAYLOR_NORMALIZATION_RANGE;
+
+    // 近似 e^(-t)，使用缩放TAYLOR_SCALE_FACTOR
+    uint32_t exp_neg_t = (uint32_t)TAYLOR_SCALE_FACTOR;
+    if (t < (uint32_t)TAYLOR_SCALE_FACTOR)
+    {
+        exp_neg_t = exp_neg_t - t; // -t
+        if (t < (uint32_t)TAYLOR_SCALE_FACTOR / 2u)
+        {
+            exp_neg_t = exp_neg_t + (t * t) / (2u * (uint32_t)TAYLOR_SCALE_FACTOR); // +t^2/2
+            if (t < (uint32_t)TAYLOR_SCALE_FACTOR / 4u)
+            {
+                exp_neg_t = exp_neg_t - (t * t * t) / (6u * (uint32_t)TAYLOR_SCALE_FACTOR * (uint32_t)TAYLOR_SCALE_FACTOR); // -t^3/6
+            }
+        }
+    }
+    else
+    {
+        exp_neg_t = 0; // 大t时 e^-t -> 0
+    }
+
+    uint32_t min_factor = (uint32_t)ch.max_fluctuation_ / (uint32_t)FLUCTUATION_MIN_FACTOR; // 低噪声下的最小调整
+    uint32_t max_factor = (uint32_t)ch.max_fluctuation_ * (uint32_t)FLUCTUATION_MAX_FACTOR; // 高噪声下的最大调整
+    uint32_t growth_factor = (uint32_t)TAYLOR_SCALE_FACTOR - exp_neg_t;                       // 1 - e^-t
+    fluctuation_factor = (uint16_t)(min_factor + ((max_factor - min_factor) * growth_factor) / (uint32_t)TAYLOR_SCALE_FACTOR);
+
+    // 面积补偿：平均波动差与面积正相关，线性叠加到目标CDC
+    uint16_t area_comp = ch.area_diff_avg_ / (uint16_t)AREA_COMPENSATION_DIVISOR;
+    if (area_comp > (uint16_t)AREA_COMPENSATION_MAX) area_comp = (uint16_t)AREA_COMPENSATION_MAX;
+
+    // 灵敏度修正
+    int16_t sensitivity_adjust = (int16_t)((int16_t)STAGE_REDUCE_NUM * (int16_t)ch.sensitivity_target - (int16_t)2);
+    uint16_t adjusted_target = base_target + fluctuation_factor + area_comp;
+    // 组合：基础目标 + 噪声自适应 + 面积补偿 - 灵敏度修正
+    return adjusted_target > sensitivity_adjust ? (adjusted_target - sensitivity_adjust) : 0;
+}
+
 void AD7147::CalibrationTools::CalibrationLoop(uint32_t sample)
 {
     // 首次进入复位硬件配置到校准所需
@@ -117,43 +192,8 @@ void AD7147::CalibrationTools::CalibrationLoop(uint32_t sample)
             // 进行CDC采样
             if (!Read_CDC_Sample(stage, calibration_data_.channels[stage].cdc_samples_, false)) continue; // 继续采样当前AEF点
 
-            // 计算当前波动差并更新最大波动差
-            uint16_t current_fluctuation = abs(calibration_data_.channels[stage].cdc_samples_.max - calibration_data_.channels[stage].cdc_samples_.min);
-            if (current_fluctuation > calibration_data_.channels[stage].max_fluctuation_) {
-                calibration_data_.channels[stage].max_fluctuation_ = current_fluctuation;
-            }
-            // 验证当前CDC是否高于目标值 + 基于正向指数算法的波动调整
-            // 正向指数算法: 波动值越大给越大调整，通过噪声判断灵敏度需求
-            uint16_t fluctuation_factor = 0;
-            
-            // 仅根据波动执行泰勒级数，使用固定k=2
-            // 波动越大，调整值越大，实现噪声自适应灵敏度
-            uint32_t x_normalized = calibration_data_.channels[stage].max_fluctuation_ - FLUCTUATION_MIN_THRESHOLD; // 减去最小阈值
-            
-            // 使用泰勒级数近似指数函数: e^(-t) ≈ 1 - t + t²/2 - t³/6 + ...
-            // 其中 t = k * x_normalized / TAYLOR_NORMALIZATION_RANGE, k=2
-            uint32_t t = (2 * x_normalized) / TAYLOR_NORMALIZATION_RANGE; // 固定k=2
-            
-            // 泰勒级数前4项计算 e^(-t) * TAYLOR_SCALE_FACTOR
-            uint32_t exp_neg_t = TAYLOR_SCALE_FACTOR; // 初始值 1 * TAYLOR_SCALE_FACTOR
-            if (t < TAYLOR_SCALE_FACTOR) { // 避免溢出
-                exp_neg_t = exp_neg_t - t; // -t项
-                if (t < TAYLOR_SCALE_FACTOR / 2) {
-                    exp_neg_t = exp_neg_t + (t * t) / (2 * TAYLOR_SCALE_FACTOR); // +t²/2项
-                    if (t < TAYLOR_SCALE_FACTOR / 4) {
-                        exp_neg_t = exp_neg_t - (t * t * t) / (6 * TAYLOR_SCALE_FACTOR * TAYLOR_SCALE_FACTOR); // -t³/6项
-                    }
-                }
-            } else {
-                exp_neg_t = 0; // 当t很大时，e^(-t)接近0
-            }
-            
-            // 计算正向指数因子: 从0.1倍到2倍的指数增长
-            uint32_t min_factor = calibration_data_.channels[stage].max_fluctuation_ / FLUCTUATION_MIN_FACTOR; // 最小调整值(低噪声时)
-            uint32_t max_factor = calibration_data_.channels[stage].max_fluctuation_ * FLUCTUATION_MAX_FACTOR; // 最大调整值(高噪声时)
-            uint32_t growth_factor = TAYLOR_SCALE_FACTOR - exp_neg_t; // 1 - e^(-t)
-            fluctuation_factor = min_factor + ((max_factor - min_factor) * growth_factor) / TAYLOR_SCALE_FACTOR;
-            uint16_t adjusted_target = target_value + fluctuation_factor - (int16_t)((int16_t)STAGE_REDUCE_NUM * (int16_t)(MAX(calibration_data_.channels[stage].sensitivity_target, 1) - (int16_t)2));
+            // CDC附加处理：指数噪声自适应 + 面积补偿 + 灵敏度修正，得到调整后的目标值
+            uint16_t adjusted_target = Compute_CDC_Adjusted_Target(stage, target_value);
             if (calibration_data_.channels[stage].cdc_samples_.average >= adjusted_target) {
                 // 达到目标CDC值，开始检查触发状态
                 if (!Read_Triggle_Sample(stage, sample, calibration_data_.channels[stage].trigger_samples_, true)) continue; // 继续采样触发状态
