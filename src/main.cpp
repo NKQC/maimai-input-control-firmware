@@ -505,16 +505,16 @@ bool init_service_layer() {
 
     // 注册Serial TouchArea -> Keyboard
     input_manager->addTouchKeyboardMapping(MAI2_A1_AREA, 1000, HID_KeyCode::KEY_W, true);
-    input_manager->addTouchKeyboardMapping(MAI2_A2_AREA, 1000, HID_KeyCode::KEY_E, true);
-    input_manager->addTouchKeyboardMapping(MAI2_A3_AREA, 1000, HID_KeyCode::KEY_D, true);
+    input_manager->addTouchKeyboardMapping(MAI2_A2_AREA, 1000, HID_KeyCode::KEY_E);
+    input_manager->addTouchKeyboardMapping(MAI2_A3_AREA, 1000, HID_KeyCode::KEY_D);
     input_manager->addTouchKeyboardMapping(MAI2_A4_AREA, 1000, HID_KeyCode::KEY_C, true);
     input_manager->addTouchKeyboardMapping(MAI2_A5_AREA, 1000, HID_KeyCode::KEY_X, true);
-    input_manager->addTouchKeyboardMapping(MAI2_A6_AREA, 1000, HID_KeyCode::KEY_Z, true);
-    input_manager->addTouchKeyboardMapping(MAI2_A7_AREA, 1000, HID_KeyCode::KEY_A, true);
+    input_manager->addTouchKeyboardMapping(MAI2_A6_AREA, 1000, HID_KeyCode::KEY_Z);
+    input_manager->addTouchKeyboardMapping(MAI2_A7_AREA, 1000, HID_KeyCode::KEY_A);
     input_manager->addTouchKeyboardMapping(MAI2_A8_AREA, 1000, HID_KeyCode::KEY_Q, true);
     input_manager->addTouchKeyboardMapping(MAI2_B1_AREA | MAI2_B8_AREA | MAI2_E1_AREA, 1000, HID_KeyCode::KEY_SPACE, true);
     input_manager->addTouchKeyboardMapping(MAI2_C1_AREA | MAI2_C2_AREA, 1000, HID_KeyCode::KEY_ENTER);
-    input_manager->addTouchKeyboardMapping(MAI2_A1_AREA | MAI2_A2_AREA | MAI2_A4_AREA | MAI2_A5_AREA, 1000, HID_KeyCode::KEY_F8, true);
+    input_manager->addTouchKeyboardMapping(MAI2_D3_AREA | MAI2_D7_AREA, 1000, HID_KeyCode::KEY_F8);
 
     // 初始化LightManager
     light_manager = LightManager::getInstance();
