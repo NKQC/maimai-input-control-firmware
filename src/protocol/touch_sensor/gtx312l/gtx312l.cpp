@@ -4,6 +4,9 @@
 #include <pico/stdlib.h>
 #include "../../../protocol/usb_serial_logs/usb_serial_logs.h"
 
+// 静态成员变量定义
+uint8_t GTX312L::_async_read_buffer[2];
+
 // GTX312L构造函数
 GTX312L::GTX312L(HAL_I2C* i2c_hal, I2C_Bus i2c_bus, uint8_t device_addr)
     : TouchSensor(GTX312L_MAX_CHANNELS), i2c_hal_(i2c_hal), i2c_bus_(i2c_bus), 
@@ -88,16 +91,8 @@ bool GTX312L::read_device_info(GTX312L_DeviceInfo& info) {
 void GTX312L::sample(async_touchsampleresult callback) {
     if (!callback) return;
     
-    // 使用类级静态变量准备寄存器地址
-    _async_reg_addr[0] = GTX312L_REG_TOUCH_STATUS_L;
-    
-    // 先写入寄存器地址，写入失败直接退出
-    if (!i2c_hal_->write(i2c_device_address_, _async_reg_addr, 1)) {
-        return;
-    }
-    
     // 异步读取两个寄存器的数据
-    i2c_hal_->read_async(i2c_device_address_, _async_read_buffer, 2, [this, callback](bool success) {
+    i2c_hal_->read_register_async(i2c_device_address_, GTX312L_REG_TOUCH_STATUS_L, _async_read_buffer, 2, [this, callback](bool success) {
         TouchSampleResult result = {0, 0};
         
         if (success) {
@@ -202,7 +197,3 @@ uint8_t GTX312L::getChannelSensitivity(uint8_t channel) const {
     // 将GTX312L的0-255范围转换为0-99范围
     return (gtx_sensitivity * 99) / GTX312L_SENSITIVITY_MAX;
 }
-
-// 静态成员变量定义
-uint8_t GTX312L::_async_reg_addr[2];
-uint8_t GTX312L::_async_read_buffer[2];

@@ -48,10 +48,9 @@ std::vector<TouchSensorScanResult> TouchSensor::scanDevices(HAL_I2C* i2c_hal, I2
     if (!i2c_hal || max_devices == 0) {
         return results;
     }
-    
     // 扫描I2C总线获取所有设备地址
     std::vector<uint8_t> addresses = i2c_hal->scan_devices();
-    
+
     for (uint8_t addr : addresses) {
         if (results.size() >= max_devices) {
             break;
@@ -130,7 +129,6 @@ uint8_t TouchSensorManager::scanAndRegisterAll(HAL_I2C* i2c0_hal, HAL_I2C* i2c1_
     clear();
     
     uint8_t registered_count = 0;
-    
     // 扫描I2C0总线
     if (i2c0_hal && registered_count < max_devices) {
         auto i2c0_results = TouchSensor::scanDevices(i2c0_hal, I2C_Bus::I2C0, max_devices - registered_count);

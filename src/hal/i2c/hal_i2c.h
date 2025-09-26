@@ -39,7 +39,19 @@ struct DMA_Context {
     bool is_write;
     std::function<void(bool)> callback;
     
-    DMA_Context() : device_addr(0), buffer(nullptr), length(0), is_write(false) {}
+    // 新增寄存器操作相关字段
+    uint16_t reg_addr;
+    uint8_t reg_size;
+    bool is_register_op;
+    uint8_t* reg_buffer;  // 用于存储寄存器地址+数据的缓冲区
+    
+    // 添加DMA传输控制字段
+    uint16_t* data_cmds;  // I2C命令缓冲区
+    size_t cmd_count;     // 命令数量
+    
+    DMA_Context() : device_addr(0), buffer(nullptr), length(0), is_write(false), 
+                   reg_addr(0), reg_size(0), is_register_op(false), reg_buffer(nullptr),
+                   data_cmds(nullptr), cmd_count(0) {}
 };
 
 class HAL_I2C {
@@ -60,8 +72,14 @@ public:
     // 读取数据
     bool read(uint8_t address, uint8_t* buffer, size_t length);
 
-    // 异步DMA读写操作
+    // 新的易用异步接口 - 自动处理完整I2C事务流程
+    bool read_register_async(uint8_t address, uint16_t reg, uint8_t* value, uint8_t length, dma_callback_t callback);
+    bool write_register_async(uint8_t address, uint16_t reg, uint8_t* value, uint8_t length, dma_callback_t callback);
+    
+    // 废弃的底层异步接口 - 建议使用上面的register_async接口
+    [[deprecated("Use read_register_async instead")]]
     bool read_async(uint8_t address, uint8_t* buffer, size_t length, dma_callback_t callback = nullptr);
+    [[deprecated("Use write_register_async instead")]]
     bool write_async(uint8_t address, const uint8_t* data, size_t length, dma_callback_t callback = nullptr);
     
     // 检查DMA传输状态
@@ -83,10 +101,10 @@ public:
     virtual std::string get_name() const = 0;
 
 protected:
-    // 构造函数
-    HAL_I2C(i2c_inst_t* i2c_instance, void (*tx_callback)(bool), void (*rx_callback)(bool));
+    // 构造函数 - 子类调用
+    HAL_I2C(i2c_inst_t* i2c_instance);
     
-    // 成员变量
+    // I2C实例和基本配置
     i2c_inst_t* i2c_instance_;
     bool initialized_;
     uint8_t sda_pin_;
@@ -98,21 +116,32 @@ protected:
     int32_t dma_tx_channel_;
     int32_t dma_rx_channel_;
     
-    // I2C读命令变量（避免函数级静态变量的潜在误用）
+    // 中断状态跟踪（惰性管理）
+    volatile bool interrupts_enabled_;
+    
+    // I2C读命令字
     uint16_t read_cmd_;
     
-    // DMA回调函数指针
-    void (*tx_dma_callback_)(bool);
-    void (*rx_dma_callback_)(bool);
+    // 寄存器操作缓冲区
+    uint8_t reg_write_buffer_[258];  // 最大2字节寄存器地址 + 256字节数据
     
-    // 内部DMA设置和处理函数
+    // DMA命令缓冲区
+    uint16_t data_cmds_[260];  // 最大传输大小的命令缓冲区
+    
+    // 内部DMA设置函数
     inline bool _setup_dma_write(uint8_t address, const uint8_t* data, size_t length);
     inline bool _setup_dma_read(uint8_t address, uint8_t* buffer, size_t length);
-    void _dma_tx_complete(bool success);
-    void _dma_rx_complete(bool success);
+    inline bool _setup_dma_write_read(uint8_t address, const uint8_t* wbuf, size_t wlen, uint8_t* rbuf, size_t rlen);
+    
+    // 等待总线空闲的内联函数，带有超时设置
+    inline bool _wait_for_bus_idle(uint32_t timeout_ms = 10);
     
     // I2C中断处理
     void _handle_i2c_irq();
+    
+    // 动态中断管理（用于同步/异步操作共存）
+    void _enable_i2c_interrupts();
+    void _disable_i2c_interrupts();
 };
 
 // I2C0实例
@@ -123,21 +152,19 @@ public:
     
     std::string get_name() const override { return "I2C0"; }
     
-    // 友元函数声明
-    friend void i2c0_tx_dma_callback(bool success);
-    friend void i2c0_rx_dma_callback(bool success);
+    // I2C中断处理友元
     friend void i2c0_irq_handler();
 
 private:
     static HAL_I2C0* instance_;
     
-    // 私有构造函数
+    // 私有构造函数 - 单例模式
     HAL_I2C0();
     HAL_I2C0(const HAL_I2C0&) = delete;
     HAL_I2C0& operator=(const HAL_I2C0&) = delete;
 };
 
-// I2C1实例
+// HAL_I2C1类 - I2C1实例
 class HAL_I2C1 : public HAL_I2C {
 public:
     static HAL_I2C1* getInstance();
@@ -145,15 +172,13 @@ public:
     
     std::string get_name() const override { return "I2C1"; }
     
-    // 友元函数声明
-    friend void i2c1_tx_dma_callback(bool success);
-    friend void i2c1_rx_dma_callback(bool success);
+    // I2C中断处理友元
     friend void i2c1_irq_handler();
 
 private:
     static HAL_I2C1* instance_;
     
-    // 私有构造函数
+    // 私有构造函数 - 单例模式
     HAL_I2C1();
     HAL_I2C1(const HAL_I2C1&) = delete;
     HAL_I2C1& operator=(const HAL_I2C1&) = delete;

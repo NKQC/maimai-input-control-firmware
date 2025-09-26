@@ -109,12 +109,82 @@ void InputManager::deinit()
     config->device_count = 0;
 }
 
+// 启动函数 - 分配设备到采样阶段
+void InputManager::start() {
+    log_info("Starting InputManager - assigning devices to sampling stages");
+    
+    // 首先清空所有阶段
+    for (int bus = 0; bus < 2; bus++) {
+        for (int stage = 0; stage < 4; stage++) {
+            i2c_sampling_stages_[bus].device_instances[stage] = nullptr;
+        }
+    }
+    
+    // 按配置中的阶段分配优先处理
+    for (const auto& assignment : config_->stage_assignments) {
+        if (assignment.i2c_bus < 2 && assignment.stage < 4 && assignment.device_id != 0xFF) {
+            // 使用registerDeviceToStage注册设备
+            if (registerDeviceToStage(assignment.stage, assignment.device_id)) {
+                log_debug("Assigned device ID " + std::to_string(assignment.device_id) + 
+                         " to I2C" + std::to_string(assignment.i2c_bus) + 
+                         " stage " + std::to_string(assignment.stage) + " (from config)");
+            }
+        }
+    }
+    
+    // 按注册顺序分配未配置的设备到空闲阶段
+    for (TouchSensor* device : touch_sensor_devices_) {
+        if (!device) continue;
+        
+        uint8_t device_id = device->getModuleMask();
+        bool already_assigned = false;
+        
+        // 检查设备是否已经被分配
+        for (int bus = 0; bus < 2; bus++) {
+            for (int stage = 0; stage < 4; stage++) {
+                if (i2c_sampling_stages_[bus].device_instances[stage] == device) {
+                    already_assigned = true;
+                    break;
+                }
+            }
+            if (already_assigned) break;
+        }
+        
+        if (already_assigned) continue;
+        
+        // 获取设备的I2C总线信息
+        uint8_t device_i2c_bus = TouchSensor::extractI2CBusFromMask(device->getModuleMask());
+        if (device_i2c_bus >= 2) continue;  // 无效总线
+        
+        // 在对应总线上查找空闲阶段
+        bool assigned = false;
+        for (int stage = 0; stage < 4; stage++) {
+            if (i2c_sampling_stages_[device_i2c_bus].device_instances[stage] == nullptr) {
+                // 使用registerDeviceToStage注册设备
+                if (registerDeviceToStage(stage, device_id)) {
+                    log_debug("Assigned device ID " + std::to_string(device_id) + 
+                             " to I2C" + std::to_string(device_i2c_bus) + 
+                             " stage " + std::to_string(stage) + " (auto-assigned)");
+                    assigned = true;
+                    break;
+                }
+            }
+        }
+        
+        if (!assigned) {
+            log_warning("Failed to assign device ID " + std::to_string(device_id) + 
+                       " - no free stages on I2C" + std::to_string(device_i2c_bus));
+        }
+    }
+    
+    log_info("InputManager start completed");
+}
+
 // 注册TouchSensor设备
 // TouchSensor统一接口实现
 bool InputManager::registerTouchSensor(TouchSensor *device)
 {
     InputManager_PrivateConfig *config = inputmanager_get_config_holder();
-
     if (!device || config->device_count >= 8)
     {
         log_error("Failed to register touch sensor: device is null or max device count reached");
@@ -1122,28 +1192,25 @@ void InputManager::updateChannelStatesAfterBinding()
 // 更新触摸状态 - 异步阶段性采样
 inline void InputManager::updateTouchStates()
 {
-    static I2C_SamplingStage& _stage = i2c_sampling_stages_[0];
     static TouchSensor* _target_device = nullptr;
+
     // 遍历每个I2C总线，进行阶段性采样
     for (uint8_t bus = 0; bus < 2; bus++) {
-        _stage = i2c_sampling_stages_[bus];
         
         // 如果当前阶段被锁定（正在采样中），跳过
-        if (_stage.stage_locked) {
+        if (i2c_sampling_stages_[bus].stage_locked) {
             continue;
         }
         
         // 获取当前阶段的设备实例
-        _target_device = _stage.device_instances[_stage.current_stage];
-        
-        // 如果当前阶段为空（target_device == nullptr），直接跳到下一个阶段
+        _target_device = i2c_sampling_stages_[bus].device_instances[i2c_sampling_stages_[bus].current_stage];
         if (_target_device == nullptr) {
-            _stage.current_stage = (_stage.current_stage + 1) % 4;
+            i2c_sampling_stages_[bus].next_stage();
             continue;
         }
         
         // 锁定当前阶段并发起异步采样
-        _stage.stage_locked = true;
+        i2c_sampling_stages_[bus].stage_locked = true;
         _target_device->sample(InputManager::async_touchsampleresult);
     }
 }
@@ -1291,6 +1358,9 @@ void inputmanager_register_default_configs(config_map_t &default_map)
     default_map[INPUTMANAGER_RATE_LIMIT_ENABLED] = ConfigValue(false);        // 默认关闭频率限制
     default_map[INPUTMANAGER_RATE_LIMIT_FREQUENCY] = ConfigValue((uint16_t)120, (uint16_t)10, (uint16_t)1000); // 频率限制，范围10-1000Hz
 
+    // 阶段分配配置
+    default_map[INPUTMANAGER_STAGE_ASSIGNMENTS] = ConfigValue(std::string(""));  // 阶段分配配置
+
     default_map[INPUTMANAGER_TOUCH_DEVICES] = ConfigValue(std::string(""));      // 触摸设备映射数据
     default_map[INPUTMANAGER_PHYSICAL_KEYBOARDS] = ConfigValue(std::string(""));
     default_map[INPUTMANAGER_AREA_CHANNEL_MAPPINGS] = ConfigValue(std::string(""));  // 区域通道映射配置
@@ -1386,6 +1456,18 @@ bool inputmanager_load_config_from_manager()
         // 使用拷贝赋值替代memcpy，避免非平凡可复制对象警告
         const AreaChannelMappingConfig* source = reinterpret_cast<const AreaChannelMappingConfig*>(area_mappings_str.data());
         static_config_.area_channel_mappings = *source;
+    }
+
+    // 加载阶段分配配置
+    std::string stage_assignments_str = config_mgr->get_string(INPUTMANAGER_STAGE_ASSIGNMENTS);
+    if (!stage_assignments_str.empty())
+    {
+        size_t assignment_count = stage_assignments_str.size() / sizeof(InputManager_PrivateConfig::StageAssignment);
+        static_config_.stage_assignments.clear();
+        static_config_.stage_assignments.resize(assignment_count);
+        std::memcpy(static_config_.stage_assignments.data(),
+                    stage_assignments_str.data(),
+                    stage_assignments_str.size());
     }
 
     // 应用加载的配置到实际硬件设备
@@ -1532,6 +1614,17 @@ bool inputmanager_write_config_to_manager(const InputManager_PrivateConfig &conf
                     &config.area_channel_mappings,
                     area_mappings_size);
         config_mgr->set_string(INPUTMANAGER_AREA_CHANNEL_MAPPINGS, area_mappings_data);
+    }
+
+    // 写入阶段分配配置
+    if (!config.stage_assignments.empty())
+    {
+        size_t assignments_size = sizeof(InputManager_PrivateConfig::StageAssignment) * config.stage_assignments.size();
+        std::string assignments_data(assignments_size, '\0');
+        std::memcpy(&assignments_data[0],
+                    config.stage_assignments.data(),
+                    assignments_size);
+        config_mgr->set_string(INPUTMANAGER_STAGE_ASSIGNMENTS, assignments_data);
     }
 
     // 保存支持saveConfig的触摸设备的自定义配置
@@ -2385,19 +2478,23 @@ TouchSensorType InputManager::getDeviceTypeByMask(uint32_t device_and_channel_ma
 
 // 静态异步采样结果处理函数
 void InputManager::async_touchsampleresult(const TouchSampleResult& result) {
-    InputManager* instance = getInstance();
-    if (!instance) return;
-    
+    static InputManager* instance = getInstance();
     // 提取设备掩码和I2C总线信息
-    uint8_t device_mask = result.module_mask;
-    uint8_t i2c_bus = (device_mask >> 7) & 0x01;  // 直接提取I2C总线信息
-    
-    // 确保I2C总线索引有效
-    if (i2c_bus >= 2) return;
-    
-    // 查找对应的设备索引
-    int device_index = -1;
-    for (int i = 0; i < (int)instance->touch_sensor_devices_.size(); i++) {
+    static uint8_t device_mask;
+    static uint8_t i2c_bus;
+    static int8_t device_index;
+
+    device_mask = result.module_mask;
+    i2c_bus = TouchSensor::extractI2CBusFromMask(device_mask);
+    device_index = -1;
+
+    if (result.timestamp_us == 0) {
+        // 约定时间戳为0时 代表采样失败 解锁当前阶段 重新采样
+        instance->i2c_sampling_stages_[i2c_bus].stage_locked = false;
+        return;
+    };
+
+    for (int8_t i = 0; i < instance->touch_sensor_devices_.size(); i++) {
         if (instance->touch_sensor_devices_[i]->getModuleMask() == device_mask) {
             device_index = i;
             break;
@@ -2411,22 +2508,25 @@ void InputManager::async_touchsampleresult(const TouchSampleResult& result) {
         instance->touch_device_states_[device_index].current_touch_mask;
     instance->touch_device_states_[device_index].current_touch_mask = result.touch_mask;
     instance->touch_device_states_[device_index].timestamp_us = result.timestamp_us;
-    
     // 解锁当前阶段并递增到下一个阶段
-    I2C_SamplingStage& stage = instance->i2c_sampling_stages_[i2c_bus];
-    stage.stage_locked = false;
-    stage.current_stage = (stage.current_stage + 1) % 4;
-    
+    instance->i2c_sampling_stages_[i2c_bus].stage_locked = false;
+    instance->i2c_sampling_stages_[i2c_bus].next_stage();
+
     // 增加采样计数器
     instance->incrementSampleCounter();
-    
     // 存储延迟状态
     instance->storeDelayedSerialState();
 }
 
 // 设备注册到阶段的接口实现
-bool InputManager::registerDeviceToStage(uint8_t i2c_bus, uint8_t stage, uint8_t device_id) {
-    if (i2c_bus >= 2 || stage >= 4 || device_id == 0) {
+bool InputManager::registerDeviceToStage(uint8_t stage, uint8_t device_id) {
+    if (device_id == 0) {
+        return false;
+    }
+    
+    // 从device_id中解析i2c_bus
+    uint8_t i2c_bus = TouchSensor::extractI2CBusFromMask(device_id);
+    if (i2c_bus >= 2 || stage >= 4) {
         return false;
     }
     
@@ -2462,8 +2562,17 @@ uint8_t InputManager::getStageDeviceId(uint8_t i2c_bus, uint8_t stage) const {
     return device_instance ? device_instance->getModuleMask() : 0;
 }
 
-bool InputManager::overrideStageDeviceId(uint8_t i2c_bus, uint8_t stage, uint8_t device_id) {
-    if (i2c_bus >= 2 || stage >= 4) {
+bool InputManager::overrideStageDeviceId(uint8_t stage, uint8_t device_id) {
+    // 从device_id中解析i2c_bus（如果device_id为0则跳过解析）
+    uint8_t i2c_bus = 0;
+    if (device_id != 0) {
+        i2c_bus = TouchSensor::extractI2CBusFromMask(device_id);
+        if (i2c_bus >= 2) {
+            return false;
+        }
+    }
+    
+    if (stage >= 4) {
         return false;
     }
     
@@ -2481,4 +2590,81 @@ bool InputManager::overrideStageDeviceId(uint8_t i2c_bus, uint8_t stage, uint8_t
     // 存储实例地址
     i2c_sampling_stages_[i2c_bus].device_instances[stage] = device_instance;
     return (device_id == 0) || (device_instance != nullptr);
+}
+
+// 阶段分配管理接口实现
+bool InputManager::setStageAssignment(uint8_t stage, uint8_t device_id) {
+    // 从device_id中解析i2c_bus
+    uint8_t i2c_bus = TouchSensor::extractI2CBusFromMask(device_id);
+    if (i2c_bus >= 2 || stage >= 4) {
+        return false;
+    }
+    
+    // 查找现有的分配记录
+    auto it = std::find_if(config_->stage_assignments.begin(), config_->stage_assignments.end(),
+        [i2c_bus, stage](const InputManager_PrivateConfig::StageAssignment& assignment) {
+            return assignment.i2c_bus == i2c_bus && assignment.stage == stage;
+        });
+    
+    if (it != config_->stage_assignments.end()) {
+        // 更新现有记录
+        it->device_id = device_id;
+    } else {
+        // 添加新记录
+        config_->stage_assignments.emplace_back(i2c_bus, stage, device_id);
+    }
+    
+    // 立即应用到运行时阶段
+    return registerDeviceToStage(stage, device_id);
+}
+
+bool InputManager::clearStageAssignment(uint8_t i2c_bus, uint8_t stage) {
+    if (i2c_bus >= 2 || stage >= 4) {
+        return false;
+    }
+    
+    // 从配置中移除
+    config_->stage_assignments.erase(
+        std::remove_if(config_->stage_assignments.begin(), config_->stage_assignments.end(),
+            [i2c_bus, stage](const InputManager_PrivateConfig::StageAssignment& assignment) {
+                return assignment.i2c_bus == i2c_bus && assignment.stage == stage;
+            }),
+        config_->stage_assignments.end());
+    
+    // 清除运行时阶段
+    return unregisterDeviceFromStage(i2c_bus, stage);
+}
+
+uint8_t InputManager::getStageAssignment(uint8_t i2c_bus, uint8_t stage) const {
+    if (i2c_bus >= 2 || stage >= 4) {
+        return 0xFF;
+    }
+    
+    // 首先检查配置中的分配
+    auto it = std::find_if(config_->stage_assignments.begin(), config_->stage_assignments.end(),
+        [i2c_bus, stage](const InputManager_PrivateConfig::StageAssignment& assignment) {
+            return assignment.i2c_bus == i2c_bus && assignment.stage == stage;
+        });
+    
+    if (it != config_->stage_assignments.end()) {
+        return it->device_id;
+    }
+    
+    // 如果配置中没有，返回运行时的分配
+    return getStageDeviceId(i2c_bus, stage);
+}
+
+void InputManager::clearAllStageAssignments() {
+    config_->stage_assignments.clear();
+    
+    // 清除所有运行时阶段
+    for (int bus = 0; bus < 2; bus++) {
+        for (int stage = 0; stage < 4; stage++) {
+            unregisterDeviceFromStage(bus, stage);
+        }
+    }
+}
+
+const std::vector<InputManager_PrivateConfig::StageAssignment>& InputManager::getStageAssignments() const {
+    return config_->stage_assignments;
 }

@@ -89,7 +89,7 @@
 #define CALIBRATION_STAGE1_SCAN_RANGEA -5 // A -> B
 #define CALIBRATION_STAGE1_SCAN_RANGEB -127
 #define CALIBRATION_SCAN_SAMPLE_COUNT 300 // 自动校准单轮采样次数
-#define CALIBRATION_MEASURE_SAMPLE_COUNT 3000
+#define CALIBRATION_MEASURE_SAMPLE_COUNT 500
 #define CALIBRATION_AEF_SAVE_AREA -1 // AEF完成时额外偏置保留区域 预留缓冲空间防止意外触发
 
 // 指数算法参数宏定义
@@ -319,6 +319,12 @@ union AmbCompCtrl2Register
     AmbCompCtrl2Register() : raw(0xFFFF) {} // 默认值 (0x3FF | (0x3F << 10))
 };
 
+union AD7147AsyncReadBuffer
+{
+    uint8_t bytes[2];
+    uint16_t value = 0;
+}; // 异步读取数据缓冲区
+
 // 寄存器配置结构体
 struct AD7147RegisterConfig
 {
@@ -435,9 +441,8 @@ private:
     // 自动校准控制
     volatile int32_t auto_calibration_control_; // 自动校准控制变量 (最高位=执行标志, 低24位=寄存器值)
 
-    // 异步I2C操作缓冲区（避免热点函数反复创建变量）
-    static uint8_t _async_reg_addr[2];    // 异步寄存器地址缓冲区
-    static uint8_t _async_read_buffer[2]; // 异步读取数据缓冲区
+    // 异步I2C操作缓冲区
+    AD7147AsyncReadBuffer _async_read_buffer;
 
     // 允许内部校准工具访问私有成员与方法
     friend class CalibrationTools;

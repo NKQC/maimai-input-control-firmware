@@ -39,7 +39,7 @@ typedef struct {
             uint8_t module_mask : 8;      // 高8位：模块掩码
         };
     };
-    uint32_t timestamp_us;   // 微秒级时间戳
+    uint32_t timestamp_us;   // 微秒级时间戳 返回0时代表采样失败
 } TouchSampleResult;
 
 // 异步采样结果回调函数类型定义
@@ -346,24 +346,6 @@ protected:
     static uint8_t generateModuleMask(uint8_t i2c_bus, uint8_t i2c_address) {
         return ((i2c_bus & 0x01) << 7) | (i2c_address & 0x7F);
     }
-    
-    /**
-     * 从模块掩码中提取I2C总线编号
-     * @param module_mask 8位模块掩码
-     * @return I2C总线编号 (0或1)
-     */
-    static uint8_t extractI2CBusFromMask(uint8_t module_mask) {
-        return (module_mask >> 7) & 0x01;
-    }
-    
-    /**
-     * 从模块掩码中提取I2C地址
-     * @param module_mask 8位模块掩码
-     * @return 7位I2C地址
-     */
-    static uint8_t extractI2CAddressFromMask(uint8_t module_mask) {
-        return module_mask & 0x7F;
-    }
 
     std::string module_name;
     
@@ -400,6 +382,24 @@ public:
         char hex[3];
         snprintf(hex, sizeof(hex), "%02x", module_mask_);
         return module_name + "_" + hex;
+    }
+
+    /**
+     * 从模块掩码中提取I2C总线编号
+     * @param module_mask 8位模块掩码
+     * @return I2C总线编号 (0或1)
+     */
+    static uint8_t extractI2CBusFromMask(uint8_t module_mask) {
+        return (module_mask >> 7) & 0x01;
+    }
+    
+    /**
+     * 从模块掩码中提取I2C地址
+     * @param module_mask 8位模块掩码
+     * @return 7位I2C地址
+     */
+    static uint8_t extractI2CAddressFromMask(uint8_t module_mask) {
+        return module_mask & 0x7F;
     }
 };
 

@@ -503,18 +503,19 @@ bool init_service_layer() {
     input_manager->addPhysicalKeyboard(MCP_GPIO::GPIOB2, HID_KeyCode::KEY_ENTER);
     input_manager->addPhysicalKeyboard(MCP_GPIO::GPIOB3, HID_KeyCode::KEY_SPACE);
 
-    // 注册Serial TouchArea -> Keyboard
-    input_manager->addTouchKeyboardMapping(MAI2_A1_AREA, 1000, HID_KeyCode::KEY_W);
-    input_manager->addTouchKeyboardMapping(MAI2_A2_AREA, 1000, HID_KeyCode::KEY_E);
-    input_manager->addTouchKeyboardMapping(MAI2_A3_AREA, 1000, HID_KeyCode::KEY_D);
-    input_manager->addTouchKeyboardMapping(MAI2_A4_AREA, 1000, HID_KeyCode::KEY_C);
-    input_manager->addTouchKeyboardMapping(MAI2_A5_AREA, 1000, HID_KeyCode::KEY_X);
-    input_manager->addTouchKeyboardMapping(MAI2_A6_AREA, 1000, HID_KeyCode::KEY_Z);
-    input_manager->addTouchKeyboardMapping(MAI2_A7_AREA, 1000, HID_KeyCode::KEY_A);
-    input_manager->addTouchKeyboardMapping(MAI2_A8_AREA, 1000, HID_KeyCode::KEY_Q);
-    input_manager->addTouchKeyboardMapping(MAI2_B1_AREA | MAI2_B8_AREA | MAI2_E1_AREA, 1000, HID_KeyCode::KEY_SPACE, true);
-    input_manager->addTouchKeyboardMapping(MAI2_C1_AREA | MAI2_C2_AREA, 1000, HID_KeyCode::KEY_ENTER);
-    input_manager->addTouchKeyboardMapping(MAI2_D3_AREA | MAI2_D7_AREA, 1000, HID_KeyCode::KEY_F8);
+    // 注册Serial TouchArea -> Keyboard 
+    // TODO: 测试时关闭
+    // input_manager->addTouchKeyboardMapping(MAI2_A1_AREA, 1000, HID_KeyCode::KEY_W);
+    // input_manager->addTouchKeyboardMapping(MAI2_A2_AREA, 1000, HID_KeyCode::KEY_E);
+    // input_manager->addTouchKeyboardMapping(MAI2_A3_AREA, 1000, HID_KeyCode::KEY_D);
+    // input_manager->addTouchKeyboardMapping(MAI2_A4_AREA, 1000, HID_KeyCode::KEY_C);
+    // input_manager->addTouchKeyboardMapping(MAI2_A5_AREA, 1000, HID_KeyCode::KEY_X);
+    // input_manager->addTouchKeyboardMapping(MAI2_A6_AREA, 1000, HID_KeyCode::KEY_Z);
+    // input_manager->addTouchKeyboardMapping(MAI2_A7_AREA, 1000, HID_KeyCode::KEY_A);
+    // input_manager->addTouchKeyboardMapping(MAI2_A8_AREA, 1000, HID_KeyCode::KEY_Q);
+    // input_manager->addTouchKeyboardMapping(MAI2_B1_AREA | MAI2_B8_AREA | MAI2_E1_AREA, 1000, HID_KeyCode::KEY_SPACE, true);
+    // input_manager->addTouchKeyboardMapping(MAI2_C1_AREA | MAI2_C2_AREA, 1000, HID_KeyCode::KEY_ENTER);
+    // input_manager->addTouchKeyboardMapping(MAI2_D3_AREA | MAI2_D7_AREA, 1000, HID_KeyCode::KEY_F8);
 
     // 初始化LightManager
     light_manager = LightManager::getInstance();
@@ -528,11 +529,13 @@ bool init_service_layer() {
         return false;
     }
     light_manager->enable_debug_output(DEBUG_LIGHTMANAGER_LOG);
-
     // 扫描I2C设备并初始化触摸设备
     AutoRegisterTouchSensor();
     // 启用InputManager的debug模式以便定位CPU0锁死问题
     input_manager->set_debug_enabled(DEBUG_INPUTMANAGER_LOG);
+    
+    // 启动InputManager - 分配设备到采样阶段
+    input_manager->start();
     
     // 标记服务层初始化完成
     init_sync.service_ready = 1;
@@ -557,7 +560,7 @@ void AutoRegisterTouchSensor() {
     
     // 使用新的统一扫描接口
     uint8_t total_devices = touch_sensor_manager->scanAndRegisterAll(hal_i2c0, hal_i2c1, 8);
-
+    
     for (uint8_t i = 0; i < total_devices; i++) {
         TouchSensor* sensor = touch_sensor_manager->getSensor(i);
         if (sensor) {
@@ -791,7 +794,7 @@ void setup() {
     if (init_success && !init_service_layer()) {
         init_success = false;
     }
-
+    
     if (init_success) {
         print_system_info();
         if (usb_logs) {

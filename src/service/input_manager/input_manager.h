@@ -202,6 +202,7 @@ enum class TouchKeyboardMode : uint8_t {
 #define INPUTMANAGER_EXTRA_SEND_COUNT "input_manager_extra_send_count"
 #define INPUTMANAGER_RATE_LIMIT_ENABLED "input_manager_rate_limit_enabled"
 #define INPUTMANAGER_RATE_LIMIT_FREQUENCY "input_manager_rate_limit_frequency"
+#define INPUTMANAGER_STAGE_ASSIGNMENTS "input_manager_stage_assignments"
 
 
 // 工作模式枚举
@@ -248,6 +249,17 @@ struct InputManager_PrivateConfig {
     // 频率限制配置
     bool rate_limit_enabled;                     // 频率限制开关
     uint16_t rate_limit_frequency;               // 频率限制值(Hz, 10-1000)
+    
+    // 阶段分配配置
+    struct StageAssignment {
+        uint8_t i2c_bus;      // I2C总线编号 (0或1)
+        uint8_t stage;        // 阶段编号 (0-3)
+        uint8_t device_id;    // 设备ID
+        
+        StageAssignment() : i2c_bus(0xFF), stage(0xFF), device_id(0xFF) {}
+        StageAssignment(uint8_t bus, uint8_t stg, uint8_t dev_id) : i2c_bus(bus), stage(stg), device_id(dev_id) {}
+    };
+    std::vector<StageAssignment> stage_assignments;  // 阶段分配配置
     
     // Mai2Serial配置 - 内部管理
     Mai2Serial_Config mai2serial_config;
@@ -296,6 +308,9 @@ public:
     // 初始化和去初始化
     bool init(const InitConfig& config);
     void deinit();
+    
+    // 启动函数 - 分配设备到采样阶段
+    void start();
     
     // 设备注册 - TouchSensor统一接口
     bool registerTouchSensor(TouchSensor* device);
@@ -446,6 +461,13 @@ public:
     // 获取触摸设备列表
     const std::vector<TouchSensor*>& getTouchSensorDevices() const { return touch_sensor_devices_; }  // 获取当前配置副本
     
+    // 阶段分配管理接口
+    bool setStageAssignment(uint8_t stage, uint8_t device_id);                   // 设置阶段分配
+    bool clearStageAssignment(uint8_t i2c_bus, uint8_t stage);                   // 清除阶段分配
+    uint8_t getStageAssignment(uint8_t i2c_bus, uint8_t stage) const;            // 获取阶段分配
+    void clearAllStageAssignments();                                             // 清除所有阶段分配
+    const std::vector<InputManager_PrivateConfig::StageAssignment>& getStageAssignments() const;  // 获取所有阶段分配
+    
     // 采样计数器管理
     inline void incrementSampleCounter();
     void resetSampleCounter();
@@ -487,14 +509,18 @@ private:
                 device_instances[i] = nullptr;
             }
         }
+
+        void next_stage() {
+            current_stage = (current_stage + 1) % 4;
+        }
     };
     I2C_SamplingStage i2c_sampling_stages_[2];  // 支持I2C0和I2C1两个总线
     
     // 设备注册到阶段的接口
-    bool registerDeviceToStage(uint8_t i2c_bus, uint8_t stage, uint8_t device_id);
+    bool registerDeviceToStage(uint8_t stage, uint8_t device_id);
     bool unregisterDeviceFromStage(uint8_t i2c_bus, uint8_t stage);
     uint8_t getStageDeviceId(uint8_t i2c_bus, uint8_t stage) const;
-    bool overrideStageDeviceId(uint8_t i2c_bus, uint8_t stage, uint8_t device_id);
+    bool overrideStageDeviceId(uint8_t stage, uint8_t device_id);
 
     // 32位触摸状态管理
     struct TouchDeviceState {
@@ -564,8 +590,6 @@ private:
     CalibrationRequestType calibration_request_pending_; // 校准请求类型
     uint8_t calibration_sensitivity_target_;             // 校准灵敏度目标 (1=高敏, 2=默认, 3=低敏)
     bool calibration_in_progress_;                       // 校准正在运行
-    
-
     
     // 协议模块引用
     // 频率限制相关静态成员变量
@@ -645,10 +669,7 @@ private:
         uint32_t channel_bitmap = channel_mask & 0x00FFFFFF;
         return (channel_mask != 0) && (__builtin_popcount(channel_bitmap) == 1);
     }
-    
-    // 统一键盘处理函数
 
-    
     // GPIO键盘处理函数
     inline void updateGPIOStates();          // 更新GPIO状态
     inline void processGPIOKeyboard();       // 处理GPIO键盘输入

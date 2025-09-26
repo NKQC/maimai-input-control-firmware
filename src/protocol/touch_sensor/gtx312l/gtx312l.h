@@ -133,7 +133,6 @@ private:
     uint32_t enabled_channels_mask_;         // 启用的通道掩码
 
     // 异步I2C操作缓冲区（避免热点函数反复创建变量）
-    static uint8_t _async_reg_addr[2];    // 异步寄存器地址缓冲区
     static uint8_t _async_read_buffer[2]; // 异步读取数据缓冲区
 
     // 私有方法

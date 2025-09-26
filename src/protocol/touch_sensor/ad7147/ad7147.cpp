@@ -5,10 +5,6 @@
 #include "../../../protocol/usb_serial_logs/usb_serial_logs.h"
 #include "src/protocol/usb_serial_logs/usb_serial_logs.h"
 
-// 静态成员变量定义
-uint8_t AD7147::_async_reg_addr[2];
-uint8_t AD7147::_async_read_buffer[2];
-
 // AD7147构造函数
 AD7147::AD7147(HAL_I2C* i2c_hal, I2C_Bus i2c_bus, uint8_t device_addr)
     : TouchSensor(AD7147_MAX_CHANNELS), i2c_hal_(i2c_hal), i2c_bus_(i2c_bus),
@@ -194,23 +190,24 @@ bool AD7147::readStageCDC(uint8_t stage, uint16_t& cdc_value) {
     }
     
     // 设置CDC读取请求
-     cdc_read_stage_ = stage;
-     cdc_read_request_ = true;
-     
-     // 等待读取完成（超时保护）
-     uint32_t start_time = time_us_32();
-     while (cdc_read_request_ && (time_us_32() - start_time) < 10000) {
-         // 等待sample()处理CDC读取请求
-     }
-     
-     if (!cdc_read_request_) {
-         cdc_value = cdc_read_value_;
-         return true;
-     }
-     
-     return false;
+    cdc_read_stage_ = stage;
+    cdc_read_request_ = true;
+    
+    // 等待读取完成（超时保护）
+    uint32_t start_time = time_us_32();
+    while (cdc_read_request_ && (time_us_32() - start_time) < 10000) {
+        // 等待sample()处理CDC读取请求
+    }
+    
+    if (!cdc_read_request_) {
+        cdc_value = cdc_read_value_;
+        return true;
+    }
+    
+    return false;
 }
 
+// 直接采样CDC
 bool AD7147::readStageCDC_direct(uint8_t stage, uint16_t& cdc_value) {
     if (!initialized_ || stage >= 12) return false;
     // 读取指定阶段的CDC数据，直接访问CDC寄存器
@@ -246,8 +243,6 @@ bool AD7147::isInitialized() const {
 }
 
 void AD7147::sample(async_touchsampleresult callback) {
-    if (!callback) return;
-    
     // 处理待应用的异步配置
     if (pending_config_count_) {
         setStageConfig(pending_configs_.stage, pending_configs_.config);
@@ -255,10 +250,11 @@ void AD7147::sample(async_touchsampleresult callback) {
     }
 
     // 处理CDC读取请求
+    // 由于异步会最大限度使用I2C 必须使用强行等待插入的方式接入同步读取
     if (cdc_read_request_) {
         // 读取指定阶段的CDC数据
         uint16_t cdc_reg_addr = AD7147_REG_CDC_DATA + cdc_read_stage_;
-        if (read_register(cdc_reg_addr, cdc_read_value_)) cdc_read_request_ = false;
+        read_register(cdc_reg_addr, cdc_read_value_);
     }
     
     // 处理自动校准控制请求
@@ -267,33 +263,24 @@ void AD7147::sample(async_touchsampleresult callback) {
         uint16_t cal_value = static_cast<uint16_t>(auto_calibration_control_ & 0x00FFFFFF);
         // 异步更新AD7147_STAGE_CAL_EN寄存器
         uint8_t cal_data[2] = {static_cast<uint8_t>(cal_value & 0xFF), static_cast<uint8_t>((cal_value >> 8) & 0xFF)};
-        if (write_register(AD7147_REG_STAGE_CAL_EN, cal_data, 2)) {
-            // 清除执行标志，标记完成
-            auto_calibration_control_ &= 0x7FFFFFFF;
-        }
-    }
-    
-    // 先写入寄存器地址，写入失败直接退出
-    if (!i2c_hal_->write(device_addr_, _async_reg_addr, 2)) {
-        return;
+        write_register(AD7147_REG_STAGE_CAL_EN, cal_data, 2);
+        // 清除执行标志，标记完成
+        auto_calibration_control_ &= 0x7FFFFFFF;
     }
     
     // 异步读取状态寄存器数据
-    i2c_hal_->read_async(device_addr_, _async_read_buffer, 2, [this, callback](bool success) {
-        TouchSampleResult result = sample_result_;
-        
+    i2c_hal_->read_register_async(device_addr_, AD7147_REG_STAGE_HIGH_INT_STATUS | 0x8000, _async_read_buffer.bytes, 2, [this, callback](bool success) {
         if (success) {
             // 处理状态寄存器数据
-            status_regs_ = (_async_read_buffer[1] << 8) | _async_read_buffer[0];
             __asm__ volatile (
-                    "rev16 %0, %0\n"
-                    : "+r" (status_regs_)
-                    :: "cc"
+                "rev16 %0, %0\n"
+                : "+r" (_async_read_buffer.value)
+                :: "cc"
             );
             
             // 重建通道映射：将stage反馈映射回正确的通道位置
             reconstructed_mask_ = 0;
-            stage_status_ = ~status_regs_; // 反转状态位（触摸时为1）
+            stage_status_ = ~_async_read_buffer.value; // 反转状态位（触摸时为1）
             
             stage_index_ = 0;
             temp_mask_ = enabled_channels_mask_;
@@ -313,16 +300,19 @@ void AD7147::sample(async_touchsampleresult callback) {
                 stage_index_++;
             }
             
-            result.channel_mask = reconstructed_mask_;
-            result.module_mask = module_mask_;
+            sample_result_.channel_mask = reconstructed_mask_;
+            sample_result_.module_mask = module_mask_;
             
             // 留给校准模块
             if (calibration_tools_.calibration_state_)
-                calibration_tools_.CalibrationLoop(result.channel_mask);
+                calibration_tools_.CalibrationLoop(sample_result_.channel_mask);
+            sample_result_.timestamp_us = time_us_32();
+            callback(sample_result_);
+        } else {
+            // 处理I2C读取失败情况
+            sample_result_.timestamp_us = 0;
+            callback(sample_result_);
         }
-        
-        result.timestamp_us = time_us_32();
-        callback(result);
     });
 }
 
