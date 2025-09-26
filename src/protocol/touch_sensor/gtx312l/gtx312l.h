@@ -104,7 +104,7 @@ public:
     
     // 初始化和清理
     // TouchSensor接口实现
-    TouchSampleResult sample() override; // 统一采样接口
+    void sample(async_touchsampleresult callback) override; // 异步采样接口
     uint32_t getSupportedChannelCount() const override;
     bool init() override;
     void deinit() override;
@@ -131,8 +131,12 @@ private:
     bool initialized_;
     I2C_Bus i2c_bus_enum_;                   // I2C总线枚举
     uint32_t enabled_channels_mask_;         // 启用的通道掩码
-    
-    // 内部辅助函数
+
+    // 异步I2C操作缓冲区（避免热点函数反复创建变量）
+    static uint8_t _async_reg_addr[2];    // 异步寄存器地址缓冲区
+    static uint8_t _async_read_buffer[2]; // 异步读取数据缓冲区
+
+    // 私有方法
     bool write_register(uint8_t reg, uint8_t value);
     bool read_register(uint8_t reg, uint8_t& value);
     bool write_registers(uint8_t reg, const uint8_t* data, size_t length);

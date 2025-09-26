@@ -5,6 +5,10 @@
 #include "../../../protocol/usb_serial_logs/usb_serial_logs.h"
 #include "src/protocol/usb_serial_logs/usb_serial_logs.h"
 
+// 静态成员变量定义
+uint8_t AD7147::_async_reg_addr[2];
+uint8_t AD7147::_async_read_buffer[2];
+
 // AD7147构造函数
 AD7147::AD7147(HAL_I2C* i2c_hal, I2C_Bus i2c_bus, uint8_t device_addr)
     : TouchSensor(AD7147_MAX_CHANNELS), i2c_hal_(i2c_hal), i2c_bus_(i2c_bus),
@@ -241,7 +245,9 @@ bool AD7147::isInitialized() const {
     return initialized_;
 }
 
-TouchSampleResult AD7147::sample() {
+void AD7147::sample(async_touchsampleresult callback) {
+    if (!callback) return;
+    
     // 处理待应用的异步配置
     if (pending_config_count_) {
         setStageConfig(pending_configs_.stage, pending_configs_.config);
@@ -266,43 +272,58 @@ TouchSampleResult AD7147::sample() {
             auto_calibration_control_ &= 0x7FFFFFFF;
         }
     }
-    i2c_hal_->read_register(device_addr_, (AD7147_REG_STAGE_HIGH_INT_STATUS | 0x8000), (uint8_t*)&status_regs_, 2);
-    __asm__ volatile (
-            "rev16 %0, %0\n"
-            : "+r" (status_regs_)
-            :: "cc"
-    );
     
-    // 重建通道映射：将stage反馈映射回正确的通道位置
-    reconstructed_mask_ = 0;
-    stage_status_ = ~status_regs_; // 反转状态位（触摸时为1）
-    
-    stage_index_ = 0;
-    temp_mask_ = enabled_channels_mask_;
-    
-    // 使用位运算快速找到每个启用通道的位置并映射stage状态
-    while (temp_mask_ && stage_index_ < enabled_stage) {
-        // 找到下一个启用通道的位置（从低位开始）
-        channel_pos_ = __builtin_ctz(temp_mask_); // 计算尾随零的个数
-        
-        // 如果当前stage有触摸状态，设置对应通道位
-        if (stage_status_ & (1U << stage_index_)) {
-            reconstructed_mask_ |= (1UL << channel_pos_);
-        }
-        
-        // 清除已处理的通道位，继续下一个
-        temp_mask_ &= temp_mask_ - 1; // 清除最低位的1
-        stage_index_++;
+    // 先写入寄存器地址，写入失败直接退出
+    if (!i2c_hal_->write(device_addr_, _async_reg_addr, 2)) {
+        return;
     }
     
-    sample_result_.channel_mask = reconstructed_mask_;
-    
-    // 留给校准模块
-    if (calibration_tools_.calibration_state_)
-        calibration_tools_.CalibrationLoop(sample_result_.channel_mask);
-    sample_result_.timestamp_us = time_us_32();
-    
-    return sample_result_;
+    // 异步读取状态寄存器数据
+    i2c_hal_->read_async(device_addr_, _async_read_buffer, 2, [this, callback](bool success) {
+        TouchSampleResult result = sample_result_;
+        
+        if (success) {
+            // 处理状态寄存器数据
+            status_regs_ = (_async_read_buffer[1] << 8) | _async_read_buffer[0];
+            __asm__ volatile (
+                    "rev16 %0, %0\n"
+                    : "+r" (status_regs_)
+                    :: "cc"
+            );
+            
+            // 重建通道映射：将stage反馈映射回正确的通道位置
+            reconstructed_mask_ = 0;
+            stage_status_ = ~status_regs_; // 反转状态位（触摸时为1）
+            
+            stage_index_ = 0;
+            temp_mask_ = enabled_channels_mask_;
+            
+            // 使用位运算快速找到每个启用通道的位置并映射stage状态
+            while (temp_mask_ && stage_index_ < enabled_stage) {
+                // 找到下一个启用通道的位置（从低位开始）
+                channel_pos_ = __builtin_ctz(temp_mask_); // 计算尾随零的个数
+                
+                // 如果当前stage有触摸状态，设置对应通道位
+                if (stage_status_ & (1U << stage_index_)) {
+                    reconstructed_mask_ |= (1UL << channel_pos_);
+                }
+                
+                // 清除已处理的通道位，继续下一个
+                temp_mask_ &= temp_mask_ - 1; // 清除最低位的1
+                stage_index_++;
+            }
+            
+            result.channel_mask = reconstructed_mask_;
+            result.module_mask = module_mask_;
+            
+            // 留给校准模块
+            if (calibration_tools_.calibration_state_)
+                calibration_tools_.CalibrationLoop(result.channel_mask);
+        }
+        
+        result.timestamp_us = time_us_32();
+        callback(result);
+    });
 }
 
 bool AD7147::setChannelEnabled(uint8_t channel, bool enabled) {
@@ -649,5 +670,3 @@ void AD7147::setAutoCalibration(bool enable) {
     // 设置自动校准启停状态
     auto_calibration_control_ = enable ? 0x80000FFF : 0x80000000;
 }
-
-

@@ -85,23 +85,32 @@ bool GTX312L::read_device_info(GTX312L_DeviceInfo& info) {
     return true;
 }
 
-TouchSampleResult GTX312L::sample() {
-    TouchSampleResult result = {0, 0};
+void GTX312L::sample(async_touchsampleresult callback) {
+    if (!callback) return;
     
-    if (!initialized_) {
+    // 使用类级静态变量准备寄存器地址
+    _async_reg_addr[0] = GTX312L_REG_TOUCH_STATUS_L;
+    
+    // 先写入寄存器地址，写入失败直接退出
+    if (!i2c_hal_->write(i2c_device_address_, _async_reg_addr, 1)) {
+        return;
+    }
+    
+    // 异步读取两个寄存器的数据
+    i2c_hal_->read_async(i2c_device_address_, _async_read_buffer, 2, [this, callback](bool success) {
+        TouchSampleResult result = {0, 0};
+        
+        if (success) {
+            GTX312L_SampleData bitmap{};
+            bitmap.l = _async_read_buffer[0];
+            bitmap.h = _async_read_buffer[1];
+            result.channel_mask = (static_cast<uint32_t>(bitmap.value) & 0x0FFFu) & enabled_channels_mask_;
+            result.module_mask = module_mask_;
+        }
+        
         result.timestamp_us = time_us_32();
-        return result;
-    }
-
-    GTX312L_SampleData bitmap{};
-    if (read_register(GTX312L_REG_TOUCH_STATUS_L, bitmap.l) &&
-        read_register(GTX312L_REG_TOUCH_STATUS_H, bitmap.h)) {
-        result.channel_mask = (static_cast<uint32_t>(bitmap.value) & 0x0FFFu) & enabled_channels_mask_; // 12位通道掩码，自动限制在24位内
-        result.module_mask = module_mask_;
-    }
-    
-    result.timestamp_us = time_us_32();
-    return result;
+        callback(result);
+    });
 }
 
 bool GTX312L::write_register(uint8_t reg, uint8_t value) {
@@ -193,3 +202,7 @@ uint8_t GTX312L::getChannelSensitivity(uint8_t channel) const {
     // 将GTX312L的0-255范围转换为0-99范围
     return (gtx_sensitivity * 99) / GTX312L_SENSITIVITY_MAX;
 }
+
+// 静态成员变量定义
+uint8_t GTX312L::_async_reg_addr[2];
+uint8_t GTX312L::_async_read_buffer[2];

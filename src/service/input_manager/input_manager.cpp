@@ -30,7 +30,7 @@ InputManager *InputManager::getInstance()
 // 私有构造函数
 InputManager::InputManager()
     : delay_buffer_head_(0), delay_buffer_count_(0), mcu_gpio_states_(0), mcu_gpio_previous_states_(0), serial_state_(), touch_keyboard_current_time_cache_(0), touch_keyboard_areas_matched_cache_(false), touch_keyboard_hold_satisfied_cache_(false), sample_counter_(0), last_reset_time_(0), current_sample_rate_(0), binding_active_(false), binding_callback_(), binding_state_(BindingState::IDLE), current_binding_index_(0), binding_start_time_(0), binding_timeout_ms_(30000),
-      binding_hardware_ops_pending_(false), binding_cancel_pending_(false), calibration_request_pending_(CalibrationRequestType::IDLE), calibration_sensitivity_target_(2), calibration_in_progress_(false), auto_adjust_context_(), mai2_serial_(nullptr), hid_(nullptr), mcp23s17_(nullptr), config_(inputmanager_get_config_holder()), mcp23s17_available_(false), ui_manager_(nullptr), gpio_keyboard_bitmap_(), touch_bitmap_cache_(), mcp_gpio_states_(), mcp_gpio_previous_states_(), last_sent_serial_state_(), remaining_extra_sends_(0), serial_state_changed_(false)
+      binding_hardware_ops_pending_(false), binding_cancel_pending_(false), calibration_request_pending_(CalibrationRequestType::IDLE), calibration_sensitivity_target_(2), calibration_in_progress_(false), mai2_serial_(nullptr), hid_(nullptr), mcp23s17_(nullptr), config_(inputmanager_get_config_holder()), mcp23s17_available_(false), ui_manager_(nullptr), gpio_keyboard_bitmap_(), touch_bitmap_cache_(), mcp_gpio_states_(), mcp_gpio_previous_states_(), last_sent_serial_state_(), remaining_extra_sends_(0), serial_state_changed_(false)
 {
 
     // 初始化32位触摸状态数组
@@ -39,6 +39,11 @@ InputManager::InputManager()
         touch_device_states_[i] = TouchDeviceState();
     }
     memset(original_channels_backup_, 0, sizeof(original_channels_backup_));
+
+    // 初始化I2C采样stage队列系统
+    for (int i = 0; i < 2; i++) {
+        i2c_sampling_stages_[i] = I2C_SamplingStage();
+    }
 
     // 初始化MCP GPIO状态
     mcp_gpio_states_.port_a = 0;
@@ -579,12 +584,6 @@ void InputManager::task0()
 
     mai2_serial_->task();
 
-    // 处理自动灵敏度调整状态机
-    if (auto_adjust_context_.active)
-    {
-        processAutoAdjustSensitivity();
-    }
-
     // 处理校准请求
     if (calibration_request_pending_ != CalibrationRequestType::IDLE)
         processCalibrationRequest();
@@ -745,178 +744,10 @@ void InputManager::requestCancelBinding()
 }
 
 // 自动调整指定通道的灵敏度
-uint8_t InputManager::autoAdjustSensitivity(uint8_t device_id_mask, uint8_t channel)
-{
-    if (channel > 24)
-    {
-        return 0; // 无效通道
-    }
 
-    // 查找TouchSensor设备
-    TouchSensor *device = findTouchSensorByIdMask(device_id_mask);
-
-    if (!device)
-    {
-        return 0; // 设备未找到
-    }
-
-    // 如果状态机正在运行，返回当前灵敏度
-    if (auto_adjust_context_.active)
-    {
-        return getSensitivity(device_id_mask, channel);
-    }
-
-    // 初始化状态机
-    auto_adjust_context_.device_id_mask = device_id_mask;
-    auto_adjust_context_.channel = channel;
-    auto_adjust_context_.original_sensitivity = getSensitivity(device_id_mask, channel);
-    auto_adjust_context_.current_sensitivity = 1;
-    auto_adjust_context_.touch_found_sensitivity = 0;
-    auto_adjust_context_.touch_lost_sensitivity = 0;
-    auto_adjust_context_.state = AutoAdjustState::FIND_TOUCH_START;
-    auto_adjust_context_.state_start_time = to_ms_since_boot(get_absolute_time());
-    auto_adjust_context_.active = true;
-
-    return auto_adjust_context_.original_sensitivity;
-}
 
 // 状态机处理函数
-void InputManager::processAutoAdjustSensitivity()
-{
-    millis_t current_time = to_ms_since_boot(get_absolute_time());
-    millis_t elapsed = current_time - auto_adjust_context_.state_start_time;
 
-    // 查找TouchSensor设备
-    TouchSensor *device = nullptr;
-    device = findTouchSensorByIdMask(auto_adjust_context_.device_id_mask);
-
-    if (!device)
-    {
-        // 设备未找到，结束状态机
-        auto_adjust_context_.active = false;
-        return;
-    }
-
-    switch (auto_adjust_context_.state)
-    {
-    case AutoAdjustState::FIND_TOUCH_START:
-        // 设置当前灵敏度并开始等待稳定
-        setSensitivity(auto_adjust_context_.device_id_mask, auto_adjust_context_.channel,
-                       auto_adjust_context_.current_sensitivity);
-        auto_adjust_context_.state = AutoAdjustState::FIND_TOUCH_WAIT;
-        auto_adjust_context_.state_start_time = current_time;
-        break;
-
-    case AutoAdjustState::FIND_TOUCH_WAIT:
-        if (elapsed >= auto_adjust_context_.stabilize_duration)
-        {
-            // 检查是否检测到触摸（通过 sample() 获取当前通道位图）
-            TouchSampleResult result = device->sample();
-            uint32_t current_touch_state = result.channel_mask; // 直接使用union字段
-            if (current_touch_state & (1 << auto_adjust_context_.channel))
-            {
-                // 找到触摸，记录灵敏度
-                auto_adjust_context_.touch_found_sensitivity = auto_adjust_context_.current_sensitivity;
-                auto_adjust_context_.current_sensitivity = auto_adjust_context_.touch_found_sensitivity;
-                auto_adjust_context_.state = AutoAdjustState::FIND_RELEASE_START;
-                auto_adjust_context_.state_start_time = current_time;
-            }
-            else
-            {
-                // 未找到触摸，增加灵敏度
-                auto_adjust_context_.current_sensitivity++;
-                if (auto_adjust_context_.current_sensitivity > 255)
-                {
-                    // 未找到触摸，恢复原始灵敏度并结束
-                    setSensitivity(auto_adjust_context_.device_id_mask, auto_adjust_context_.channel,
-                                   auto_adjust_context_.original_sensitivity);
-                    auto_adjust_context_.active = false;
-                    return;
-                }
-                auto_adjust_context_.state = AutoAdjustState::FIND_TOUCH_START;
-                auto_adjust_context_.state_start_time = current_time;
-            }
-        }
-        break;
-
-    case AutoAdjustState::FIND_RELEASE_START:
-        // 设置当前灵敏度并开始等待稳定
-        setSensitivity(auto_adjust_context_.device_id_mask, auto_adjust_context_.channel,
-                       auto_adjust_context_.current_sensitivity);
-        auto_adjust_context_.state = AutoAdjustState::FIND_RELEASE_WAIT;
-        auto_adjust_context_.state_start_time = current_time;
-        break;
-
-    case AutoAdjustState::FIND_RELEASE_WAIT:
-        if (elapsed >= auto_adjust_context_.stabilize_duration)
-        {
-            // 检查是否失去触摸（通过 sample() 获取当前通道位图）
-            TouchSampleResult result = device->sample();
-            uint32_t current_touch_state = result.channel_mask; // 直接使用union字段
-            if (!(current_touch_state & (1 << auto_adjust_context_.channel)))
-            {
-                // 失去触摸，记录灵敏度
-                auto_adjust_context_.touch_lost_sensitivity = auto_adjust_context_.current_sensitivity;
-                auto_adjust_context_.state = AutoAdjustState::VERIFY_THRESHOLD;
-                auto_adjust_context_.state_start_time = current_time;
-            }
-            else
-            {
-                // 仍有触摸，减小灵敏度
-                auto_adjust_context_.current_sensitivity--;
-                if (auto_adjust_context_.current_sensitivity < 1)
-                {
-                    // 无法找到释放点，使用中间值
-                    uint8_t middle_sensitivity = (auto_adjust_context_.touch_found_sensitivity + 1) / 2;
-                    setSensitivity(auto_adjust_context_.device_id_mask, auto_adjust_context_.channel, middle_sensitivity);
-                    auto_adjust_context_.active = false;
-                    return;
-                }
-                auto_adjust_context_.state = AutoAdjustState::FIND_RELEASE_START;
-                auto_adjust_context_.state_start_time = current_time;
-            }
-        }
-        break;
-
-    case AutoAdjustState::VERIFY_THRESHOLD:
-        // 验证临界点
-        {
-            uint8_t critical_sensitivity = auto_adjust_context_.touch_lost_sensitivity + 1;
-            setSensitivity(auto_adjust_context_.device_id_mask, auto_adjust_context_.channel, critical_sensitivity);
-            auto_adjust_context_.state = AutoAdjustState::COMPLETE;
-            auto_adjust_context_.state_start_time = current_time;
-        }
-        break;
-
-    case AutoAdjustState::COMPLETE:
-        if (elapsed >= auto_adjust_context_.stabilize_duration)
-        {
-            // 最终验证（通过 sample() 获取当前通道位图）
-            TouchSampleResult result = device->sample();
-            uint32_t current_touch_state = result.channel_mask;
-            uint8_t final_sensitivity;
-
-            if (current_touch_state & (1 << auto_adjust_context_.channel))
-            {
-                // 找到了临界点
-                final_sensitivity = auto_adjust_context_.touch_lost_sensitivity + 1;
-            }
-            else
-            {
-                // 需要使用中间值
-                final_sensitivity = (auto_adjust_context_.touch_lost_sensitivity + auto_adjust_context_.touch_found_sensitivity) / 2;
-            }
-
-            setSensitivity(auto_adjust_context_.device_id_mask, auto_adjust_context_.channel, final_sensitivity);
-            auto_adjust_context_.active = false;
-        }
-        break;
-
-    default:
-        auto_adjust_context_.active = false;
-        break;
-    }
-}
 
 // 设置灵敏度
 void InputManager::setSensitivity(uint8_t device_id_mask, uint8_t channel, uint8_t sensitivity)
@@ -1288,28 +1119,33 @@ void InputManager::updateChannelStatesAfterBinding()
     //enableMappedChannels();
 }
 
-// 更新触摸状态
+// 更新触摸状态 - 异步阶段性采样
 inline void InputManager::updateTouchStates()
 {
-    // 使用TouchSensor统一采样接口更新触摸状态（微秒时间戳）
-    static TouchSensor *device;
-    static TouchSampleResult result;
-    for (int i = 0; i < (int)touch_sensor_devices_.size(); i++)
-    {
-        device = touch_sensor_devices_[i];
-
-        // 保存之前的触摸状态
-        touch_device_states_[i].previous_touch_mask = touch_device_states_[i].current_touch_mask;
-        result = device->sample();
-        touch_device_states_[i].current_touch_mask = result.touch_mask;
-        touch_device_states_[i].timestamp_us = result.timestamp_us; // 直接使用us级时间戳
+    static I2C_SamplingStage& _stage = i2c_sampling_stages_[0];
+    static TouchSensor* _target_device = nullptr;
+    // 遍历每个I2C总线，进行阶段性采样
+    for (uint8_t bus = 0; bus < 2; bus++) {
+        _stage = i2c_sampling_stages_[bus];
+        
+        // 如果当前阶段被锁定（正在采样中），跳过
+        if (_stage.stage_locked) {
+            continue;
+        }
+        
+        // 获取当前阶段的设备实例
+        _target_device = _stage.device_instances[_stage.current_stage];
+        
+        // 如果当前阶段为空（target_device == nullptr），直接跳到下一个阶段
+        if (_target_device == nullptr) {
+            _stage.current_stage = (_stage.current_stage + 1) % 4;
+            continue;
+        }
+        
+        // 锁定当前阶段并发起异步采样
+        _stage.stage_locked = true;
+        _target_device->sample(InputManager::async_touchsampleresult);
     }
-    // 增加采样计数器
-    incrementSampleCounter();
-    // 序列化发送前的延迟缓冲不变
-    storeDelayedSerialState();
-    // 处理自动校准控制
-    // updateAutoCalibrationControl();
 }
 
 // 处理自动校准控制 - 根据mai2serial发送状态控制AD7147设备的自动校准
@@ -2545,4 +2381,104 @@ TouchSensorType InputManager::getDeviceTypeByMask(uint32_t device_and_channel_ma
     }
     
     return TouchSensorType::UNKNOWN;
+}
+
+// 静态异步采样结果处理函数
+void InputManager::async_touchsampleresult(const TouchSampleResult& result) {
+    InputManager* instance = getInstance();
+    if (!instance) return;
+    
+    // 提取设备掩码和I2C总线信息
+    uint8_t device_mask = result.module_mask;
+    uint8_t i2c_bus = (device_mask >> 7) & 0x01;  // 直接提取I2C总线信息
+    
+    // 确保I2C总线索引有效
+    if (i2c_bus >= 2) return;
+    
+    // 查找对应的设备索引
+    int device_index = -1;
+    for (int i = 0; i < (int)instance->touch_sensor_devices_.size(); i++) {
+        if (instance->touch_sensor_devices_[i]->getModuleMask() == device_mask) {
+            device_index = i;
+            break;
+        }
+    }
+    
+    if (device_index == -1) return;
+    
+    // 更新设备状态
+    instance->touch_device_states_[device_index].previous_touch_mask = 
+        instance->touch_device_states_[device_index].current_touch_mask;
+    instance->touch_device_states_[device_index].current_touch_mask = result.touch_mask;
+    instance->touch_device_states_[device_index].timestamp_us = result.timestamp_us;
+    
+    // 解锁当前阶段并递增到下一个阶段
+    I2C_SamplingStage& stage = instance->i2c_sampling_stages_[i2c_bus];
+    stage.stage_locked = false;
+    stage.current_stage = (stage.current_stage + 1) % 4;
+    
+    // 增加采样计数器
+    instance->incrementSampleCounter();
+    
+    // 存储延迟状态
+    instance->storeDelayedSerialState();
+}
+
+// 设备注册到阶段的接口实现
+bool InputManager::registerDeviceToStage(uint8_t i2c_bus, uint8_t stage, uint8_t device_id) {
+    if (i2c_bus >= 2 || stage >= 4 || device_id == 0) {
+        return false;
+    }
+    
+    // 根据device_id查找对应的TouchSensor实例
+    TouchSensor* device_instance = nullptr;
+    for (TouchSensor* device : touch_sensor_devices_) {
+        if (device && device->getModuleMask() == device_id) {
+            device_instance = device;
+            break;
+        }
+    }
+    
+    // 存储实例地址（如果找不到设备则存储nullptr）
+    i2c_sampling_stages_[i2c_bus].device_instances[stage] = device_instance;
+    return device_instance != nullptr;
+}
+
+bool InputManager::unregisterDeviceFromStage(uint8_t i2c_bus, uint8_t stage) {
+    if (i2c_bus >= 2 || stage >= 4) {
+        return false;
+    }
+    
+    i2c_sampling_stages_[i2c_bus].device_instances[stage] = nullptr;
+    return true;
+}
+
+uint8_t InputManager::getStageDeviceId(uint8_t i2c_bus, uint8_t stage) const {
+    if (i2c_bus >= 2 || stage >= 4) {
+        return 0;
+    }
+    
+    TouchSensor* device_instance = i2c_sampling_stages_[i2c_bus].device_instances[stage];
+    return device_instance ? device_instance->getModuleMask() : 0;
+}
+
+bool InputManager::overrideStageDeviceId(uint8_t i2c_bus, uint8_t stage, uint8_t device_id) {
+    if (i2c_bus >= 2 || stage >= 4) {
+        return false;
+    }
+    
+    // 根据device_id查找对应的TouchSensor实例
+    TouchSensor* device_instance = nullptr;
+    if (device_id != 0) {
+        for (TouchSensor* device : touch_sensor_devices_) {
+            if (device && device->getModuleMask() == device_id) {
+                device_instance = device;
+                break;
+            }
+        }
+    }
+    
+    // 存储实例地址
+    i2c_sampling_stages_[i2c_bus].device_instances[stage] = device_instance;
+    return (device_id == 0) || (device_instance != nullptr);
 }

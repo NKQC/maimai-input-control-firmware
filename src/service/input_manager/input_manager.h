@@ -327,7 +327,6 @@ public:
     void requestCancelBinding();             // 请求取消绑定（UI层调用）
     
     // 灵敏度管理
-    uint8_t autoAdjustSensitivity(uint8_t device_id_mask, uint8_t channel); // 指定通道的灵敏度调整
     void setSensitivity(uint8_t device_id_mask, uint8_t channel, uint8_t sensitivity);
     uint8_t getSensitivity(uint8_t device_id_mask, uint8_t channel);
     bool setSensitivityByDeviceName(const std::string& device_name, uint8_t channel, uint8_t sensitivity);
@@ -477,6 +476,26 @@ private:
     // 设备管理
     std::vector<TouchSensor*> touch_sensor_devices_;           // 注册的TouchSensor设备列表
 
+    // I2C总线采样stage队列系统
+    struct I2C_SamplingStage {
+        TouchSensor* device_instances[4];  // 每个总线4个阶段的设备实例地址 (nullptr表示空)
+        uint8_t current_stage;             // 当前阶段 (0-3)
+        bool stage_locked;                 // 当前阶段是否被锁定(正在采样中)
+        
+        I2C_SamplingStage() : current_stage(0), stage_locked(false) {
+            for (int i = 0; i < 4; i++) {
+                device_instances[i] = nullptr;
+            }
+        }
+    };
+    I2C_SamplingStage i2c_sampling_stages_[2];  // 支持I2C0和I2C1两个总线
+    
+    // 设备注册到阶段的接口
+    bool registerDeviceToStage(uint8_t i2c_bus, uint8_t stage, uint8_t device_id);
+    bool unregisterDeviceFromStage(uint8_t i2c_bus, uint8_t stage);
+    uint8_t getStageDeviceId(uint8_t i2c_bus, uint8_t stage) const;
+    bool overrideStageDeviceId(uint8_t i2c_bus, uint8_t stage, uint8_t device_id);
+
     // 32位触摸状态管理
     struct TouchDeviceState {
         union {
@@ -546,34 +565,7 @@ private:
     uint8_t calibration_sensitivity_target_;             // 校准灵敏度目标 (1=高敏, 2=默认, 3=低敏)
     bool calibration_in_progress_;                       // 校准正在运行
     
-    // 自动灵敏度调整状态机
-    enum class AutoAdjustState {
-        IDLE,                    // 空闲状态
-        FIND_TOUCH_START,       // 开始寻找触摸阈值
-        FIND_TOUCH_WAIT,        // 等待触摸检测稳定
-        FIND_RELEASE_START,     // 开始寻找释放阈值
-        FIND_RELEASE_WAIT,      // 等待释放检测稳定
-        VERIFY_THRESHOLD,       // 验证阈值
-        COMPLETE                // 完成
-    };
-    
-    struct AutoAdjustContext {
-        uint8_t device_id_mask;
-        uint8_t channel;
-        uint8_t original_sensitivity;
-        uint8_t current_sensitivity;
-        uint8_t touch_found_sensitivity;
-        uint8_t touch_lost_sensitivity;
-        AutoAdjustState state;
-        millis_t state_start_time;
-        millis_t stabilize_duration;
-        bool active;
-        
-        AutoAdjustContext() : device_id_mask(0), channel(0), original_sensitivity(0), 
-                             current_sensitivity(0), touch_found_sensitivity(0), 
-                             touch_lost_sensitivity(0), state(AutoAdjustState::IDLE), 
-                             state_start_time(0), stabilize_duration(100), active(false) {}
-    } auto_adjust_context_;
+
     
     // 协议模块引用
     // 频率限制相关静态成员变量
@@ -622,6 +614,9 @@ private:
     inline void sendHIDTouchData();
     void processCalibrationRequest();               // 处理校准请求（在task0中调用）
     
+    // 异步采样相关函数
+    static void async_touchsampleresult(const TouchSampleResult& result);  // 静态异步采样结果处理函数
+    
     // 触摸响应延迟管理私有方法
     inline void storeDelayedSerialState();                     // 存储当前Serial状态到延迟缓冲区
 
@@ -652,7 +647,7 @@ private:
     }
     
     // 统一键盘处理函数
-    void processAutoAdjustSensitivity();
+
     
     // GPIO键盘处理函数
     inline void updateGPIOStates();          // 更新GPIO状态

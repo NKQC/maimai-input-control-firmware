@@ -6,6 +6,7 @@
 #include <memory>
 #include <sstream>
 #include <cstdlib>
+#include <functional>
 
 // 前向声明
 class HAL_I2C;
@@ -41,6 +42,9 @@ typedef struct {
     uint32_t timestamp_us;   // 微秒级时间戳
 } TouchSampleResult;
 
+// 异步采样结果回调函数类型定义
+using async_touchsampleresult = std::function<void(const TouchSampleResult&)>;
+
 /**
  * IC扫描结果结构体
  */
@@ -70,10 +74,10 @@ public:
     // 纯虚函数接口 - 所有派生类必须实现
     
     /**
-     * 统一采样接口：返回TouchSampleResult结构体
-     * @return TouchSampleResult 包含通道掩码、模块掩码和微秒时间戳
+     * 异步采样接口：通过回调函数返回TouchSampleResult结构体
+     * @param callback 异步采样完成后的回调函数
      */
-    virtual TouchSampleResult sample() = 0;
+    virtual void sample(async_touchsampleresult callback) = 0;
     
     /**
      * 获取当前模块支持的通道数量

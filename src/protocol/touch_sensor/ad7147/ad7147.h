@@ -350,7 +350,7 @@ public:
     void deinit() override;
     bool isInitialized() const override;
     bool setChannelSensitivity(uint8_t channel, uint8_t sensitivity) override; // 设置通道灵敏度 (0-99)
-    TouchSampleResult sample() override;                                       // 统一采样接口
+    void sample(async_touchsampleresult callback) override;                       // 异步采样接口
     bool setChannelEnabled(uint8_t channel, bool enabled) override;            // 设置单个通道使能
     bool getChannelEnabled(uint8_t channel) const override;                    // 获取单个通道使能状态
     uint32_t getEnabledChannelMask() const override;                           // 获取启用通道掩码
@@ -434,6 +434,10 @@ private:
 
     // 自动校准控制
     volatile int32_t auto_calibration_control_; // 自动校准控制变量 (最高位=执行标志, 低24位=寄存器值)
+
+    // 异步I2C操作缓冲区（避免热点函数反复创建变量）
+    static uint8_t _async_reg_addr[2];    // 异步寄存器地址缓冲区
+    static uint8_t _async_read_buffer[2]; // 异步读取数据缓冲区
 
     // 允许内部校准工具访问私有成员与方法
     friend class CalibrationTools;
