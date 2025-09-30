@@ -93,52 +93,43 @@ void HAL_I2C::deinit() {
     initialized_ = false;
 }
 
-bool HAL_I2C::write(uint8_t address, const uint8_t* data, size_t length) {
-    if (!initialized_) return false;
+int32_t HAL_I2C::write(uint8_t address, const uint8_t* data, size_t length) {
+    if (!initialized_) return I2C_Error::STATE_ERROR;
     
     // 等待总线空闲，最长10ms超时
-    if (!_wait_for_bus_idle(10)) {
-        return false;  // 总线忙或超时
+    if (!_wait_for_bus_idle()) {
+        return I2C_Error::TIMEOUT;  // 总线忙或超时
     }
     
-    // 确保中断已关闭（惰性管理）
-    if (interrupts_enabled_) {
-        _disable_i2c_interrupts();
-    }
+    _disable_i2c_interrupts();
     
-    int32_t result = i2c_write_blocking(i2c_instance_, address, data, length, false);
-    return result == (int)length;
+    return i2c_write_blocking(i2c_instance_, address, data, length, false);
 }
 
-bool HAL_I2C::read(uint8_t address, uint8_t* buffer, size_t length) {
-    if (!initialized_) return false;
+int32_t HAL_I2C::read(uint8_t address, uint8_t* buffer, size_t length) {
+    if (!initialized_) return I2C_Error::STATE_ERROR;
     
     // 等待总线空闲，最长10ms超时
-    if (!_wait_for_bus_idle(10)) {
-        return false;  // 总线忙或超时
+    if (!_wait_for_bus_idle()) {
+        return I2C_Error::TIMEOUT;  // 总线忙或超时
     }
     
     // 确保中断已关闭（惰性管理）
-    if (interrupts_enabled_) {
-        _disable_i2c_interrupts();
-    }
+    _disable_i2c_interrupts();
     
-    int32_t result = i2c_read_blocking(i2c_instance_, address, buffer, length, false);
-    return result == (int)length;
+    return i2c_read_blocking(i2c_instance_, address, buffer, length, false);
 }
 
 int32_t HAL_I2C::write_register(uint8_t address, uint16_t reg, uint8_t* value, uint8_t length) {
-    if (!initialized_) return -1;
+    if (!initialized_) return I2C_Error::STATE_ERROR;
     
     // 等待总线空闲，最长10ms超时
-    if (!_wait_for_bus_idle(10)) {
-        return -1;  // 总线忙或超时
+    if (!_wait_for_bus_idle()) {
+        return I2C_Error::TIMEOUT;  // 总线忙或超时
     }
     
-    // 确保中断已关闭（惰性管理）
-    if (interrupts_enabled_) {
-        _disable_i2c_interrupts();
-    }
+    // 确保中断已关闭
+    _disable_i2c_interrupts();
     
     uint8_t reg_size = reg & 0xFF00 ? 2 : reg & 0x8000 ? 2 : 1;
     uint8_t data[length + reg_size];
@@ -152,17 +143,15 @@ int32_t HAL_I2C::write_register(uint8_t address, uint16_t reg, uint8_t* value, u
 }
 
 int32_t HAL_I2C::read_register(uint8_t address, uint16_t reg, uint8_t* value, uint8_t length) {
-    if (!initialized_) return -1;
+    if (!initialized_) return I2C_Error::STATE_ERROR;
     
     // 等待总线空闲，最长10ms超时
-    if (!_wait_for_bus_idle(10)) {
-        return -1;  // 总线忙或超时
+    if (!_wait_for_bus_idle()) {
+        return I2C_Error::TIMEOUT;  // 总线忙或超时
     }
     
-    // 确保中断已关闭（惰性管理）
-    if (interrupts_enabled_) {
-        _disable_i2c_interrupts();
-    }
+    // 确保中断已关闭
+    _disable_i2c_interrupts();
     
     uint8_t reg_size = reg & 0xFF00 ? 2 : reg & 0x8000 ? 2 : 1;
     uint8_t data[2];
@@ -198,9 +187,9 @@ std::vector<uint8_t> HAL_I2C::scan_devices() {
     return found_devices;
 }
 
-bool HAL_I2C::read_async(uint8_t address, uint8_t* buffer, size_t length, dma_callback_t callback) {
+int32_t HAL_I2C::read_async(uint8_t address, uint8_t* buffer, size_t length, dma_callback_t callback) {
     if (!initialized_ || dma_status_ != DMA_Status::IDLE || !buffer || length == 0) {
-        return false;
+        return I2C_Error::STATE_ERROR;
     }
     
     // 设置DMA上下文
@@ -212,9 +201,9 @@ bool HAL_I2C::read_async(uint8_t address, uint8_t* buffer, size_t length, dma_ca
     return _setup_dma_read(address, buffer, length);
 }
 
-bool HAL_I2C::write_async(uint8_t address, const uint8_t* data, size_t length, dma_callback_t callback) {
+int32_t HAL_I2C::write_async(uint8_t address, const uint8_t* data, size_t length, dma_callback_t callback) {
     if (!initialized_ || dma_status_ != DMA_Status::IDLE || !data || length == 0) {
-        return false;
+        return I2C_Error::STATE_ERROR;
     }
     
     // 设置DMA上下文
@@ -228,9 +217,9 @@ bool HAL_I2C::write_async(uint8_t address, const uint8_t* data, size_t length, d
 }
 
 // 新的易用异步接口实现
-bool HAL_I2C::read_register_async(uint8_t address, uint16_t reg, uint8_t* value, uint8_t length, dma_callback_t callback) {
+int32_t HAL_I2C::read_register_async(uint8_t address, uint16_t reg, uint8_t* value, uint8_t length, dma_callback_t callback) {
     if (!initialized_ || dma_status_ != DMA_Status::IDLE || !value || length == 0 || !callback) {
-        return false;
+        return I2C_Error::STATE_ERROR;
     }
     
     // 计算寄存器地址大小
@@ -259,16 +248,16 @@ bool HAL_I2C::read_register_async(uint8_t address, uint16_t reg, uint8_t* value,
     return _setup_dma_write_read(address, reg_write_buffer_, reg_size, value, length);
 }
 
-bool HAL_I2C::write_register_async(uint8_t address, uint16_t reg, uint8_t* value, uint8_t length, dma_callback_t callback) {
+int32_t HAL_I2C::write_register_async(uint8_t address, uint16_t reg, uint8_t* value, uint8_t length, dma_callback_t callback) {
     if (!initialized_ || dma_status_ != DMA_Status::IDLE || !value || length == 0 || !callback) {
-        return false;
+        return I2C_Error::STATE_ERROR;
     }
     
     // 计算寄存器地址大小
     uint8_t reg_size = (reg & 0xFF00) ? 2 : (reg & 0x8000) ? 2 : 1;
     
     if (reg_size + length > sizeof(reg_write_buffer_)) {
-        return false;  // 数据太大
+        return I2C_Error::WRITE_SIZE_ERROR;  // 数据太大
     }
     
     // 设置DMA上下文
@@ -299,17 +288,13 @@ bool HAL_I2C::is_busy() const {
     return dma_status_ != DMA_Status::IDLE;
 }
 
-// DMA写入设置
-bool HAL_I2C::_setup_dma_write(uint8_t address, const uint8_t* data, size_t length) {
-    if (dma_status_ != DMA_Status::IDLE) {
-        return false;
-    }
-    
+// DMA写入设置 注意必须先检查busy
+int32_t HAL_I2C::_setup_dma_write(uint8_t address, const uint8_t* data, size_t length) {
     // 启用I2C中断用于异步操作
     _enable_i2c_interrupts();
     
     if (length == 0 || length > 256) {
-        return false;
+        return I2C_Error::WRITE_SIZE_ERROR;
     }
     
     dma_status_ = DMA_Status::TX_BUSY;
@@ -347,14 +332,11 @@ bool HAL_I2C::_setup_dma_write(uint8_t address, const uint8_t* data, size_t leng
         true
     );
     
-    return true;
+    return I2C_Error::OK;
 }
 
-// DMA读取设置
-bool HAL_I2C::_setup_dma_read(uint8_t address, uint8_t* buffer, size_t length) {
-    if (dma_status_ != DMA_Status::IDLE) {
-        return false;
-    }
+// DMA读取设置 注意必须先检查busy
+int32_t HAL_I2C::_setup_dma_read(uint8_t address, uint8_t* buffer, size_t length) {
     
     // 启用I2C中断用于异步操作
     _enable_i2c_interrupts();
@@ -419,13 +401,13 @@ bool HAL_I2C::_setup_dma_read(uint8_t address, uint8_t* buffer, size_t length) {
     dma_channel_start(dma_rx_channel_);
     dma_channel_start(dma_tx_channel_);
     
-    return true;
+    return I2C_Error::OK;
 }
 
 // DMA写后读设置 - 参考i2c_dma.c的write_read实现
-bool HAL_I2C::_setup_dma_write_read(uint8_t address, const uint8_t* wbuf, size_t wlen, uint8_t* rbuf, size_t rlen) {
+int32_t HAL_I2C::_setup_dma_write_read(uint8_t address, const uint8_t* wbuf, size_t wlen, uint8_t* rbuf, size_t rlen) {
     if (wlen == 0 || rlen == 0 || (wlen + rlen) > 256) {
-        return false;
+        return I2C_Error::WRITE_SIZE_ERROR;
     }
     
     // 启用I2C中断用于异步操作
@@ -494,7 +476,7 @@ bool HAL_I2C::_setup_dma_write_read(uint8_t address, const uint8_t* wbuf, size_t
     dma_channel_start(dma_rx_channel_);
     dma_channel_start(dma_tx_channel_);
     
-    return true;
+    return I2C_Error::OK;
 }
 
 // HAL_I2C0 静态成员初始化
@@ -630,7 +612,6 @@ inline bool HAL_I2C::_wait_for_bus_idle(uint32_t timeout_ms) {
         if (time_us_32() - start_time >= timeout_ms * 1000) {
             return false; // 超时
         }
-        sleep_us(10); // 短暂等待，避免忙等待
     }
     
     return true;

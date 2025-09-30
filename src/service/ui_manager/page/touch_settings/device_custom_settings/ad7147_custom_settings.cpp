@@ -142,6 +142,7 @@ void AD7147CustomSettings::render(PageTemplate& page_template) {
         onConfigComplete();
     }, bitfield_helper_.afe_offset.pos_afe_swap ? COLOR_TEXT_GREEN : COLOR_TEXT_WHITE, LineAlign::LEFT)
     
+#if AD7147_USE_CDC_MODE == 0
     // 灵敏度位域配置
     static char neg_thresh_text[32];
     snprintf(neg_thresh_text, sizeof(neg_thresh_text), "负灵敏度: %ld", bitfield_helper_.sensitivity.neg_threshold_sensitivity);
@@ -240,6 +241,8 @@ void AD7147CustomSettings::render(PageTemplate& page_template) {
             onConfigComplete();
         }
     }, COLOR_TEXT_WHITE)
+
+#endif
     
     // 连接配置
     // snprintf(text, sizeof(text), "连接6-0: 0x%04X", current_config_.connection_6_0);

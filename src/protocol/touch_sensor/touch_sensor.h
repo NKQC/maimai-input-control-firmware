@@ -31,6 +31,14 @@ enum class TouchSensorReverseMask : uint8_t {
     AD7147_MASK = 0xD2    // AD7147使用0x2*地址模式的反掩码
 };
 
+/**
+ * 采样模式枚举 - 触摸传感器采样模式
+ */
+enum class TouchSensorSampleMode : uint8_t {
+    CONTINUOUS = 0,  // 连续采样模式
+    SINGLE_SHOT = 1  // 单次采样模式
+};
+
 typedef struct {
     union {
         uint32_t touch_mask;     // 完整的32位触摸掩码
@@ -130,7 +138,7 @@ public:
     virtual bool calibrateSensor(uint8_t sensitivity_target) { return calibrateSensor(); }  // 校准传感器(带灵敏度目标)
     virtual bool setChannelCalibrationTarget(uint8_t channel, uint8_t sensitivity_target) { return false; }  // 设置指定通道的校准目标灵敏度 (不自动发起校准)
     virtual bool startCalibration() { return false; }  // 启动校准过程 (使用之前设置的通道目标)
-    virtual uint8_t getCalibrationProgress() const { return 0; }  // 获取校准进度 (0-100)
+    virtual uint8_t getCalibrationProgress() const { return 0; }  // 获取校准进度 (0-255)
     virtual bool setLEDEnabled(bool enabled) { return false; }  // 设置LED状态
     
     // 自动校准控制接口 - 子类可选实现

@@ -40,7 +40,7 @@ void AD7147::CalibrationTools::Complete_and_restore_calibration()
     calibration_state_ = IDLE;
     pthis->enabled_channels_mask_ = pthis->calirate_save_enabled_channels_mask_; // 校准时保存的启用的通道掩码
     pthis->applyEnabledChannelsToHardware();
-    
+    calibration_data_.set_stage_finish(); // 所有目标通道都已完成
     // 重置全局初始化标志，以便下次校准时重新初始化
     calibration_data_.global_initialized_ = false;
 }
@@ -177,7 +177,6 @@ void AD7147::CalibrationTools::CalibrationLoop(uint32_t sample)
     {
         bool all_channels_completed = true;
         uint32_t total_progress = 0;
-        uint16_t target_value = AD7147_CALIBRATION_TARGET_VALUE;
 
         // 处理所有12个通道
         for (uint8_t stage = 0; stage < AD7147_MAX_CHANNELS; stage++)
@@ -191,9 +190,8 @@ void AD7147::CalibrationTools::CalibrationLoop(uint32_t sample)
             
             // 进行CDC采样
             if (!Read_CDC_Sample(stage, calibration_data_.channels[stage].cdc_samples_, false)) continue; // 继续采样当前AEF点
-
             // CDC附加处理：指数噪声自适应 + 面积补偿 + 灵敏度修正，得到调整后的目标值
-            uint16_t adjusted_target = Compute_CDC_Adjusted_Target(stage, target_value);
+            uint16_t adjusted_target = Compute_CDC_Adjusted_Target(stage, AD7147_CALIBRATION_TARGET_VALUE);
             if (calibration_data_.channels[stage].cdc_samples_.average >= adjusted_target) {
                 // 达到目标CDC值，开始检查触发状态
                 if (!Read_Triggle_Sample(stage, sample, calibration_data_.channels[stage].trigger_samples_, true)) continue; // 继续采样触发状态
@@ -235,11 +233,10 @@ void AD7147::CalibrationTools::CalibrationLoop(uint32_t sample)
             calibration_data_.channels[stage].s1_inited_ = false; // 标记为已完成（异常）
         }
 
-        // 计算总进度为所有通道的平均进度 (范围0-255)
+        // 计算总进度为所有通道的平均进度 (范围0-254)
         if (!all_channels_completed) {
-            calibration_data_.stage_process = MIN((total_progress / AD7147_MAX_CHANNELS), 255);
+            calibration_data_.set_stage_process(total_progress / AD7147_MAX_CHANNELS);
         } else {
-            calibration_data_.stage_process = 255; // 所有目标通道都已完成
             Complete_and_restore_calibration();
         }
 

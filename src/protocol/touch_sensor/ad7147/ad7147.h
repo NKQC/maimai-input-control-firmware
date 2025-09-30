@@ -35,6 +35,8 @@
 // CDC数据
 #define AD7147_REG_CDC_DATA 0x000B // CDC数据寄存器
 
+#define AD7147_USE_CDC_MODE 1 // 0=状态寄存器模式, 1=CDC判定模式
+
 // 阈值寄存器
 #define STAGE1_HIGH_THRESHOLD 0x11E
 #define STAGE1_LOW_THRESHOLD 0x125
@@ -80,15 +82,15 @@
 #define AD7147_STAGE11_CONNECTION 0x00D8 // Stage 11连接寄存器
 
 // 阶段配置默认值
-#define AD7147_DEFAULT_OFFSET_LOW 0x3000                                 // 默认低偏移值
-#define AD7147_DEFAULT_OFFSET_LOW_CLAMP 0x3100                           // 默认低偏移钳位值
+#define AD7147_DEFAULT_OFFSET_LOW 0x0000                                // 默认低偏移值
+#define AD7147_DEFAULT_OFFSET_LOW_CLAMP 0x0000                           // 默认低偏移钳位值
 #define AD7147_DEFAULT_OFFSET_HIGH AD7147_DEFAULT_OFFSET_LOW             // 默认高偏移值
 #define AD7147_DEFAULT_OFFSET_HIGH_CLAMP AD7147_DEFAULT_OFFSET_LOW_CLAMP // 默认高偏移钳位值
 #define AD7147_CDC_BASELINE 0x8000                                       // CDC基准值，用于显示计算
 
 #define CALIBRATION_STAGE1_SCAN_RANGEA -5 // A -> B
 #define CALIBRATION_STAGE1_SCAN_RANGEB -127
-#define CALIBRATION_SCAN_SAMPLE_COUNT 300 // 自动校准单轮采样次数
+#define CALIBRATION_SCAN_SAMPLE_COUNT 100 // 自动校准单轮采样次数
 #define CALIBRATION_MEASURE_SAMPLE_COUNT 500
 #define CALIBRATION_AEF_SAVE_AREA -1 // AEF完成时额外偏置保留区域 预留缓冲空间防止意外触发
 
@@ -146,18 +148,32 @@ const uint16_t channel_connections[12][2] = {
     // {0x0000, 0x1080}, // Stage 10 - CIN10
     // {0x0000, 0x1200}  // Stage 11 - CIN11
     // NEGTIVE
-    {0x0001, 0x1000}, // Stage 0 - CIN0
-    {0x0004, 0x1000}, // Stage 1 - CIN1
-    {0x0010, 0x1000}, // Stage 2 - CIN2
-    {0x0040, 0x1000}, // Stage 3 - CIN3
-    {0x0100, 0x1000}, // Stage 4 - CIN4
-    {0x0400, 0x1000}, // Stage 5 - CIN5
-    {0x1000, 0x1000}, // Stage 6 - CIN6
-    {0x0000, 0x1001}, // Stage 7 - CIN7
-    {0x0000, 0x1004}, // Stage 8 - CIN8
-    {0x0000, 0x1010}, // Stage 9 - CIN9
-    {0x0000, 0x1040}, // Stage 10 - CIN10
-    {0x0000, 0x1100}  // Stage 11 - CIN11
+    // {0x0001, 0x1000}, // Stage 0 - CIN0
+    // {0x0004, 0x1000}, // Stage 1 - CIN1
+    // {0x0010, 0x1000}, // Stage 2 - CIN2
+    // {0x0040, 0x1000}, // Stage 3 - CIN3
+    // {0x0100, 0x1000}, // Stage 4 - CIN4
+    // {0x0400, 0x1000}, // Stage 5 - CIN5
+    // {0x1000, 0x1000}, // Stage 6 - CIN6
+    // {0x0000, 0x1001}, // Stage 7 - CIN7
+    // {0x0000, 0x1004}, // Stage 8 - CIN8
+    // {0x0000, 0x1010}, // Stage 9 - CIN9
+    // {0x0000, 0x1040}, // Stage 10 - CIN10
+    // {0x0000, 0x1100}  // Stage 11 - CIN11
+
+    // NEGTIVE DIFFERENCE
+    {0x2AA9, 0x3AAA}, // Stage 0 - CIN0
+    {0x2AA6, 0x3AAA}, // Stage 1 - CIN1
+    {0x2A9A, 0x3AAA}, // Stage 2 - CIN2
+    {0x2A6A, 0x3AAA}, // Stage 3 - CIN3
+    {0x29AA, 0x3AAA}, // Stage 4 - CIN4
+    {0x26AA, 0x3AAA}, // Stage 5 - CIN5
+    {0x1AAA, 0x3AAA}, // Stage 6 - CIN6
+    {0x2AAA, 0x3AA9}, // Stage 7 - CIN7
+    {0x2AAA, 0x3AA6}, // Stage 8 - CIN8
+    {0x2AAA, 0x3A9A}, // Stage 9 - CIN9
+    {0x2AAA, 0x3A6A}, // Stage 10 - CIN10
+    {0x2AAA, 0x39AA}  // Stage 11 - CIN11
 };
 
 // AFE偏移寄存器位域结构
@@ -303,7 +319,7 @@ union AmbCompCtrl1Register
         uint16_t slow_filter_update_lvl : 2;   // [15:14] 慢滤波器更新级别
     } bits;
 
-    AmbCompCtrl1Register() : raw(0x0040) {} // 默认值 (64)
+    AmbCompCtrl1Register() : raw(0x0140) {} // 默认值 (64)
 };
 
 // AMB_COMP_CTRL2寄存器 (0x004)
@@ -321,7 +337,11 @@ union AmbCompCtrl2Register
 
 union AD7147AsyncReadBuffer
 {
-    uint8_t bytes[2];
+#if AD7147_USE_CDC_MODE
+    uint8_t bytes[24]; // CDC模式需要24字节(12个stage * 2字节)
+#else
+    uint8_t bytes[2];  // 状态寄存器模式只需2字节
+#endif
     uint16_t value = 0;
 }; // 异步读取数据缓冲区
 
@@ -392,6 +412,10 @@ public:
     // 设备信息读取
     bool read_device_info(AD7147_DeviceInfo &info);
 
+    // 采样模式控制接口
+    bool setSampleMode(TouchSensorSampleMode mode); // 设置采样模式并立即写入寄存器生效
+    TouchSensorSampleMode getSampleMode() const;    // 获取当前采样模式
+
 private:
     // 硬件相关成员变量
     HAL_I2C *i2c_hal_;
@@ -405,6 +429,10 @@ private:
     uint8_t enabled_stage;
     uint32_t enabled_channels_mask_;               // 启用的通道掩码
     uint32_t calirate_save_enabled_channels_mask_; // 校准时保存的启用的通道掩码
+
+    // 采样模式相关成员变量
+    TouchSensorSampleMode current_sample_mode_;    // 当前采样模式
+    volatile bool single_shot_pending_;            // 单次采样等待状态标志
 
     // 配置相关成员变量
     StageSettings stage_settings_;         // Stage配置设置
@@ -421,7 +449,6 @@ private:
 
     // sample()函数中的映射重建临时变量（优化热点函数性能）
     uint32_t reconstructed_mask_; // 重建的通道掩码
-    uint16_t stage_status_;       // 反转后的stage状态
     uint8_t stage_index_;         // stage索引计数器
     uint32_t temp_mask_;          // 临时掩码用于位运算
     uint8_t channel_pos_;         // 通道位置
@@ -449,7 +476,7 @@ private:
 
     // 私有方法
     bool applyEnabledChannelsToHardware();
-    bool configureStages(const uint16_t *connection_values);
+    bool configureSettings(const uint16_t *connection_values);
     inline bool apply_stage_settings(); // 应用stage设置到硬件
     // 内部快速读取当前stage配置（不做边界检查）
     inline PortConfig getStageConfigInternal(uint8_t stage) const { return stage_settings_.stages[stage]; }
@@ -535,6 +562,17 @@ private:
             bool inited_ = false;
             bool global_initialized_ = false;                     // 全局初始化标志，用于一次性初始化所有通道
             ChannelCalibrationData channels[AD7147_MAX_CHANNELS]; // 每个通道的校准数据
+
+            void set_stage_process(uint8_t stage_process)
+            {
+                if (stage_process > 254)
+                    stage_process = 254;
+                this->stage_process = stage_process;
+            }
+            void set_stage_finish()
+            {
+                stage_process = 255;
+            }
         };
 
         AD7147 *pthis = nullptr;

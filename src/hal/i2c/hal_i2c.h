@@ -23,6 +23,16 @@ enum class I2C_Bus : uint8_t {
     I2C1 = 1
 };
 
+enum I2C_Error : int32_t {
+    OK = 0,
+    TIMEOUT = -1,
+    STATE_ERROR = -2,
+    NACK = -3,
+    WRITE_SIZE_ERROR = -4,
+    READ_SIZE_ERROR = -5,
+    OTHER = -6,
+};
+
 // DMA传输状态
 enum class DMA_Status : uint8_t {
     IDLE = 0,
@@ -67,20 +77,16 @@ public:
     void deinit();
     
     // 写入数据
-    bool write(uint8_t address, const uint8_t* data, size_t length);
+    int32_t write(uint8_t address, const uint8_t* data, size_t length);
     
     // 读取数据
-    bool read(uint8_t address, uint8_t* buffer, size_t length);
+    int32_t read(uint8_t address, uint8_t* buffer, size_t length);
 
-    // 新的易用异步接口 - 自动处理完整I2C事务流程
-    bool read_register_async(uint8_t address, uint16_t reg, uint8_t* value, uint8_t length, dma_callback_t callback);
-    bool write_register_async(uint8_t address, uint16_t reg, uint8_t* value, uint8_t length, dma_callback_t callback);
-    
-    // 废弃的底层异步接口 - 建议使用上面的register_async接口
-    [[deprecated("Use read_register_async instead")]]
-    bool read_async(uint8_t address, uint8_t* buffer, size_t length, dma_callback_t callback = nullptr);
-    [[deprecated("Use write_register_async instead")]]
-    bool write_async(uint8_t address, const uint8_t* data, size_t length, dma_callback_t callback = nullptr);
+    int32_t read_register_async(uint8_t address, uint16_t reg, uint8_t* value, uint8_t length, dma_callback_t callback);
+    int32_t write_register_async(uint8_t address, uint16_t reg, uint8_t* value, uint8_t length, dma_callback_t callback);
+
+    int32_t read_async(uint8_t address, uint8_t* buffer, size_t length, dma_callback_t callback = nullptr);
+    int32_t write_async(uint8_t address, const uint8_t* data, size_t length, dma_callback_t callback = nullptr);
     
     // 检查DMA传输状态
     bool is_busy() const;
@@ -129,9 +135,9 @@ protected:
     uint16_t data_cmds_[260];  // 最大传输大小的命令缓冲区
     
     // 内部DMA设置函数
-    inline bool _setup_dma_write(uint8_t address, const uint8_t* data, size_t length);
-    inline bool _setup_dma_read(uint8_t address, uint8_t* buffer, size_t length);
-    inline bool _setup_dma_write_read(uint8_t address, const uint8_t* wbuf, size_t wlen, uint8_t* rbuf, size_t rlen);
+    inline int32_t _setup_dma_write(uint8_t address, const uint8_t* data, size_t length);
+    inline int32_t _setup_dma_read(uint8_t address, uint8_t* buffer, size_t length);
+    inline int32_t _setup_dma_write_read(uint8_t address, const uint8_t* wbuf, size_t wlen, uint8_t* rbuf, size_t rlen);
     
     // 等待总线空闲的内联函数，带有超时设置
     inline bool _wait_for_bus_idle(uint32_t timeout_ms = 10);
@@ -140,8 +146,8 @@ protected:
     void _handle_i2c_irq();
     
     // 动态中断管理（用于同步/异步操作共存）
-    void _enable_i2c_interrupts();
-    void _disable_i2c_interrupts();
+    inline void _enable_i2c_interrupts();
+    inline void _disable_i2c_interrupts();
 };
 
 // I2C0实例

@@ -10,9 +10,10 @@ AD7147::AD7147(HAL_I2C* i2c_hal, I2C_Bus i2c_bus, uint8_t device_addr)
     : TouchSensor(AD7147_MAX_CHANNELS), i2c_hal_(i2c_hal), i2c_bus_(i2c_bus),
       device_addr_(device_addr), i2c_device_address_(device_addr),
       initialized_(false), i2c_bus_enum_(i2c_bus), enabled_stage(MIN(AD7147_MAX_CHANNELS, 12)), enabled_channels_mask_(0),
+      current_sample_mode_(TouchSensorSampleMode::SINGLE_SHOT), single_shot_pending_(false),
       cdc_read_request_(false), cdc_read_stage_(0), cdc_read_value_(0),
       sample_result_{.touch_mask = uint32_t(0)}, status_regs_(0),
-      reconstructed_mask_(0), stage_status_(0), stage_index_(0), temp_mask_(0), channel_pos_(0),
+      reconstructed_mask_(0), stage_index_(0), temp_mask_(0), channel_pos_(0),
       pending_config_count_(0), abnormal_channels_bitmap_(0), auto_calibration_control_(0) {
     module_name = "AD7147";
     module_mask_ = TouchSensor::generateModuleMask(static_cast<uint8_t>(i2c_bus), device_addr);
@@ -50,12 +51,14 @@ bool AD7147::init() {
     register_config_.pwr_control.bits.power_mode = 0;
     register_config_.pwr_control.bits.lp_conv_delay = 0;
     register_config_.pwr_control.bits.sequence_stage_num = 0xB;
-    register_config_.pwr_control.bits.decimation = 3;
+    register_config_.pwr_control.bits.decimation = 2;
     register_config_.pwr_control.bits.sw_reset = 0;
-    register_config_.pwr_control.bits.int_pol = 0;
+    register_config_.pwr_control.bits.int_pol = 1;
     register_config_.pwr_control.bits.ext_source = 0;
-    register_config_.pwr_control.bits.cdc_bias = 3;
-    ret &= configureStages(nullptr);
+    register_config_.pwr_control.bits.cdc_bias = 2;
+    ret &= configureSettings(nullptr);
+
+    ret &= setSampleMode(TouchSensorSampleMode::CONTINUOUS);
 
     initialized_ = ret;
     return ret;
@@ -250,11 +253,9 @@ void AD7147::sample(async_touchsampleresult callback) {
     }
 
     // 处理CDC读取请求
-    // 由于异步会最大限度使用I2C 必须使用强行等待插入的方式接入同步读取
     if (cdc_read_request_) {
-        // 读取指定阶段的CDC数据
-        uint16_t cdc_reg_addr = AD7147_REG_CDC_DATA + cdc_read_stage_;
-        read_register(cdc_reg_addr, cdc_read_value_);
+        readStageCDC_direct(cdc_read_stage_, cdc_read_value_);
+        cdc_read_request_ = false;
     }
     
     // 处理自动校准控制请求
@@ -268,30 +269,31 @@ void AD7147::sample(async_touchsampleresult callback) {
         auto_calibration_control_ &= 0x7FFFFFFF;
     }
     
-    // 异步读取状态寄存器数据
-    i2c_hal_->read_register_async(device_addr_, AD7147_REG_STAGE_HIGH_INT_STATUS | 0x8000, _async_read_buffer.bytes, 2, [this, callback](bool success) {
+#if AD7147_USE_CDC_MODE
+    // CDC模式：异步读取全部阶段CDC数据
+    i2c_hal_->read_register_async(device_addr_, AD7147_REG_CDC_DATA | 0x8000, _async_read_buffer.bytes, 24, [this, callback](bool success) {
         if (success) {
-            // 处理状态寄存器数据
-            __asm__ volatile (
-                "rev16 %0, %0\n"
-                : "+r" (_async_read_buffer.value)
-                :: "cc"
-            );
-            
-            // 重建通道映射：将stage反馈映射回正确的通道位置
+            // CDC判定模式：检查每个stage的CDC值
             reconstructed_mask_ = 0;
-            stage_status_ = ~_async_read_buffer.value; // 反转状态位（触摸时为1）
             
             stage_index_ = 0;
             temp_mask_ = enabled_channels_mask_;
             
-            // 使用位运算快速找到每个启用通道的位置并映射stage状态
-            while (temp_mask_ && stage_index_ < enabled_stage) {
+            // 使用位运算快速找到每个启用通道的位置并映射CDC状态
+            while (temp_mask_ && stage_index_ < enabled_stage && stage_index_ < 12) {
                 // 找到下一个启用通道的位置（从低位开始）
                 channel_pos_ = __builtin_ctz(temp_mask_); // 计算尾随零的个数
                 
-                // 如果当前stage有触摸状态，设置对应通道位
-                if (stage_status_ & (1U << stage_index_)) {
+                // 从缓冲区读取CDC值并使用rev16翻转
+                uint16_t cdc_value = *(uint16_t*)(_async_read_buffer.bytes + stage_index_ * 2);
+                __asm__ volatile (
+                    "rev16 %0, %0\n"
+                    : "+r" (cdc_value)
+                    :: "cc"
+                );
+                
+                // 如果CDC值低于目标值，视为触发
+                if (cdc_value < AD7147_CALIBRATION_TARGET_VALUE) {
                     reconstructed_mask_ |= (1UL << channel_pos_);
                 }
                 
@@ -314,6 +316,53 @@ void AD7147::sample(async_touchsampleresult callback) {
             callback(sample_result_);
         }
     });
+#else
+    // 状态寄存器模式：异步读取状态寄存器数据
+    i2c_hal_->read_register_async(device_addr_, AD7147_REG_STAGE_LOW_INT_STATUS | 0x8000, _async_read_buffer.bytes, 2, [this, callback](bool success) {
+        if (success) {
+            // 处理状态寄存器数据
+            __asm__ volatile (
+                "rev16 %0, %0\n"
+                : "+r" (_async_read_buffer.value)
+                :: "cc"
+            );
+            
+            // 重建通道映射：将stage反馈映射回正确的通道位置
+            reconstructed_mask_ = 0;
+
+            stage_index_ = 0;
+            temp_mask_ = enabled_channels_mask_;
+            
+            // 使用位运算快速找到每个启用通道的位置并映射stage状态
+            while (temp_mask_ && stage_index_ < enabled_stage) {
+                // 找到下一个启用通道的位置（从低位开始）
+                channel_pos_ = __builtin_ctz(temp_mask_); // 计算尾随零的个数
+                
+                // 如果当前stage有触摸状态，设置对应通道位
+                if (_async_read_buffer.value & (1U << stage_index_)) {
+                    reconstructed_mask_ |= (1UL << channel_pos_);
+                }
+                
+                // 清除已处理的通道位，继续下一个
+                temp_mask_ &= temp_mask_ - 1; // 清除最低位的1
+                stage_index_++;
+            }
+            
+            sample_result_.channel_mask = reconstructed_mask_;
+            sample_result_.module_mask = module_mask_;
+            
+            // 留给校准模块
+            if (calibration_tools_.calibration_state_)
+                calibration_tools_.CalibrationLoop(sample_result_.channel_mask);
+            sample_result_.timestamp_us = time_us_32();
+            callback(sample_result_);
+        } else {
+            // 处理I2C读取失败情况
+            sample_result_.timestamp_us = 0;
+            callback(sample_result_);
+        }
+    });
+#endif
 }
 
 bool AD7147::setChannelEnabled(uint8_t channel, bool enabled) {
@@ -484,7 +533,7 @@ inline bool AD7147::apply_stage_settings() {
     return ret;
 }
 
-bool AD7147::configureStages(const uint16_t* connection_values) {
+bool AD7147::configureSettings(const uint16_t* connection_values) {
     bool ret = true;
     
     // 如果提供了connection_values，更新stage_settings_中的AFE偏移
@@ -534,7 +583,7 @@ bool AD7147::configureStages(const uint16_t* connection_values) {
     ret &= write_register(AD7147_REG_STAGE_CAL_EN, cal_en_data, 2);
 
     // 更新AMB_COMP_CTRL0配置
-    register_config_.amb_comp_ctrl0.raw = 0x32FF; 
+    register_config_.amb_comp_ctrl0.raw = 0x0FF0; 
     register_config_.amb_comp_ctrl0.bits.forced_cal = true;
     uint8_t amb_ctrl0_data[2] = {
         (uint8_t)(register_config_.amb_comp_ctrl0.raw >> 8),
@@ -659,4 +708,15 @@ uint32_t AD7147::getAbnormalChannelMask() const {
 void AD7147::setAutoCalibration(bool enable) {
     // 设置自动校准启停状态
     auto_calibration_control_ = enable ? 0x80000FFF : 0x80000000;
+}
+
+// 采样模式切换函数实现
+bool AD7147::setSampleMode(TouchSensorSampleMode mode) {
+    current_sample_mode_ = mode;
+
+    return true;
+}
+
+TouchSensorSampleMode AD7147::getSampleMode() const {
+    return current_sample_mode_;
 }
