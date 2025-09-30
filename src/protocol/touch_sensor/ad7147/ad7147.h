@@ -80,8 +80,8 @@
 #define AD7147_STAGE11_CONNECTION 0x00D8 // Stage 11连接寄存器
 
 // 阶段配置默认值
-#define AD7147_DEFAULT_OFFSET_LOW 0x3000                                 // 默认低偏移值
-#define AD7147_DEFAULT_OFFSET_LOW_CLAMP 0x3100                           // 默认低偏移钳位值
+#define AD7147_DEFAULT_OFFSET_LOW 0x1000                                 // 默认低偏移值
+#define AD7147_DEFAULT_OFFSET_LOW_CLAMP 0x0000                            // 默认低偏移钳位值
 #define AD7147_DEFAULT_OFFSET_HIGH AD7147_DEFAULT_OFFSET_LOW             // 默认高偏移值
 #define AD7147_DEFAULT_OFFSET_HIGH_CLAMP AD7147_DEFAULT_OFFSET_LOW_CLAMP // 默认高偏移钳位值
 #define AD7147_CDC_BASELINE 0x8000                                       // CDC基准值，用于显示计算
@@ -158,6 +158,19 @@ const uint16_t channel_connections[12][2] = {
     {0x0000, 0x1010}, // Stage 9 - CIN9
     {0x0000, 0x1040}, // Stage 10 - CIN10
     {0x0000, 0x1100}  // Stage 11 - CIN11
+    // // NEGTIVE DIFFERENCE
+    // {0x2AA9, 0x1AAA}, // Stage 0 - CIN0
+    // {0x2AA6, 0x1AAA}, // Stage 1 - CIN1
+    // {0x2A9A, 0x1AAA}, // Stage 2 - CIN2
+    // {0x2A6A, 0x1AAA}, // Stage 3 - CIN3
+    // {0x29AA, 0x1AAA}, // Stage 4 - CIN4
+    // {0x26AA, 0x1AAA}, // Stage 5 - CIN5
+    // {0x1AAA, 0x1AAA}, // Stage 6 - CIN6
+    // {0x2AAA, 0x1AA9}, // Stage 7 - CIN7
+    // {0x2AAA, 0x1AA6}, // Stage 8 - CIN8
+    // {0x2AAA, 0x1A9A}, // Stage 9 - CIN9
+    // {0x2AAA, 0x1A6A}, // Stage 10 - CIN10
+    // {0x2AAA, 0x19AA}  // Stage 11 - CIN11
 };
 
 // AFE偏移寄存器位域结构

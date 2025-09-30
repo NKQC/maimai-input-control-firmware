@@ -54,7 +54,7 @@ bool AD7147::init() {
     register_config_.pwr_control.bits.sw_reset = 0;
     register_config_.pwr_control.bits.int_pol = 0;
     register_config_.pwr_control.bits.ext_source = 0;
-    register_config_.pwr_control.bits.cdc_bias = 3;
+    register_config_.pwr_control.bits.cdc_bias = 0;
     ret &= configureStages(nullptr);
 
     initialized_ = ret;
@@ -252,9 +252,8 @@ void AD7147::sample(async_touchsampleresult callback) {
     // 处理CDC读取请求
     // 由于异步会最大限度使用I2C 必须使用强行等待插入的方式接入同步读取
     if (cdc_read_request_) {
-        // 读取指定阶段的CDC数据
-        uint16_t cdc_reg_addr = AD7147_REG_CDC_DATA + cdc_read_stage_;
-        read_register(cdc_reg_addr, cdc_read_value_);
+        readStageCDC_direct(cdc_read_stage_, cdc_read_value_);
+        cdc_read_request_ = false;
     }
     
     // 处理自动校准控制请求
@@ -269,7 +268,7 @@ void AD7147::sample(async_touchsampleresult callback) {
     }
     
     // 异步读取状态寄存器数据
-    i2c_hal_->read_register_async(device_addr_, AD7147_REG_STAGE_HIGH_INT_STATUS | 0x8000, _async_read_buffer.bytes, 2, [this, callback](bool success) {
+    i2c_hal_->read_register_async(device_addr_, AD7147_REG_STAGE_LOW_INT_STATUS | 0x8000, _async_read_buffer.bytes, 2, [this, callback](bool success) {
         if (success) {
             // 处理状态寄存器数据
             __asm__ volatile (
@@ -280,7 +279,7 @@ void AD7147::sample(async_touchsampleresult callback) {
             
             // 重建通道映射：将stage反馈映射回正确的通道位置
             reconstructed_mask_ = 0;
-            stage_status_ = ~_async_read_buffer.value; // 反转状态位（触摸时为1）
+            stage_status_ = _async_read_buffer.value; // 反转状态位（触摸时为1）
             
             stage_index_ = 0;
             temp_mask_ = enabled_channels_mask_;
