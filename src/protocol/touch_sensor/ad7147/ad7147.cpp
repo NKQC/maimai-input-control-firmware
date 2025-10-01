@@ -53,9 +53,9 @@ bool AD7147::init() {
     register_config_.pwr_control.bits.sequence_stage_num = 0xB;
     register_config_.pwr_control.bits.decimation = 2;
     register_config_.pwr_control.bits.sw_reset = 0;
-    register_config_.pwr_control.bits.int_pol = 1;
+    register_config_.pwr_control.bits.int_pol = 0;
     register_config_.pwr_control.bits.ext_source = 0;
-    register_config_.pwr_control.bits.cdc_bias = 2;
+    register_config_.pwr_control.bits.cdc_bias = 0;
     ret &= configureSettings(nullptr);
 
     ret &= setSampleMode(TouchSensorSampleMode::CONTINUOUS);
@@ -213,9 +213,14 @@ bool AD7147::readStageCDC(uint8_t stage, uint16_t& cdc_value) {
 // 直接采样CDC
 bool AD7147::readStageCDC_direct(uint8_t stage, uint16_t& cdc_value) {
     if (!initialized_ || stage >= 12) return false;
+#if AD7147_USE_CDC_MODE
+    cdc_value = last_cdc_values_[stage];
+    return true;
+#else
     // 读取指定阶段的CDC数据，直接访问CDC寄存器
     uint16_t cdc_reg_addr = AD7147_REG_CDC_DATA + stage;
     return read_register(cdc_reg_addr, cdc_value);
+#endif
 }
 
 // 反初始化AD7147
@@ -292,6 +297,9 @@ void AD7147::sample(async_touchsampleresult callback) {
                     :: "cc"
                 );
                 
+                // 存储当前CDC值
+                last_cdc_values_[stage_index_] = cdc_value;
+                
                 // 如果CDC值低于目标值，视为触发
                 if (cdc_value < AD7147_CALIBRATION_TARGET_VALUE) {
                     reconstructed_mask_ |= (1UL << channel_pos_);
@@ -363,6 +371,12 @@ void AD7147::sample(async_touchsampleresult callback) {
         }
     });
 #endif
+}
+
+bool AD7147::sample_ready() {
+    uint16_t status = 0;
+    read_register(AD7147_REG_STAGE_COMPLETE_INT_STATUS, status);
+    return status;
 }
 
 bool AD7147::setChannelEnabled(uint8_t channel, bool enabled) {
@@ -583,7 +597,7 @@ bool AD7147::configureSettings(const uint16_t* connection_values) {
     ret &= write_register(AD7147_REG_STAGE_CAL_EN, cal_en_data, 2);
 
     // 更新AMB_COMP_CTRL0配置
-    register_config_.amb_comp_ctrl0.raw = 0x0FF0; 
+    register_config_.amb_comp_ctrl0.raw = 0x3FFB; 
     register_config_.amb_comp_ctrl0.bits.forced_cal = true;
     uint8_t amb_ctrl0_data[2] = {
         (uint8_t)(register_config_.amb_comp_ctrl0.raw >> 8),

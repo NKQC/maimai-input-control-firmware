@@ -73,7 +73,7 @@
 #define AD7147_STAGE2_CONNECTION 0x0090  // Stage 2连接寄存器
 #define AD7147_STAGE3_CONNECTION 0x0098  // Stage 3连接寄存器
 #define AD7147_STAGE4_CONNECTION 0x00A0  // Stage 4连接寄存器
-#define AD7147_STAGE5_CONNECTION 0x00A8  // Stage 5连接寄存器
+#define AD7147_STAGE5_CONNECTION 0x00A8  // Stage 5连接寄存器s
 #define AD7147_STAGE6_CONNECTION 0x00B0  // Stage 6连接寄存器
 #define AD7147_STAGE7_CONNECTION 0x00B8  // Stage 7连接寄存器
 #define AD7147_STAGE8_CONNECTION 0x00C0  // Stage 8连接寄存器
@@ -82,20 +82,20 @@
 #define AD7147_STAGE11_CONNECTION 0x00D8 // Stage 11连接寄存器
 
 // 阶段配置默认值
-#define AD7147_DEFAULT_OFFSET_LOW 0x0000                                // 默认低偏移值
-#define AD7147_DEFAULT_OFFSET_LOW_CLAMP 0x0000                           // 默认低偏移钳位值
+#define AD7147_DEFAULT_OFFSET_LOW 0x2000                                // 默认低偏移值
+#define AD7147_DEFAULT_OFFSET_LOW_CLAMP 0x2000                           // 默认低偏移钳位值
 #define AD7147_DEFAULT_OFFSET_HIGH AD7147_DEFAULT_OFFSET_LOW             // 默认高偏移值
 #define AD7147_DEFAULT_OFFSET_HIGH_CLAMP AD7147_DEFAULT_OFFSET_LOW_CLAMP // 默认高偏移钳位值
 #define AD7147_CDC_BASELINE 0x8000                                       // CDC基准值，用于显示计算
 
 #define CALIBRATION_STAGE1_SCAN_RANGEA -5 // A -> B
 #define CALIBRATION_STAGE1_SCAN_RANGEB -127
-#define CALIBRATION_SCAN_SAMPLE_COUNT 100 // 自动校准单轮采样次数
+#define CALIBRATION_SCAN_SAMPLE_COUNT 700 // 自动校准单轮采样次数
 #define CALIBRATION_MEASURE_SAMPLE_COUNT 500
 #define CALIBRATION_AEF_SAVE_AREA -1 // AEF完成时额外偏置保留区域 预留缓冲空间防止意外触发
 
 // 指数算法参数宏定义
-#define STAGE_REDUCE_NUM 0x400
+#define STAGE_REDUCE_NUM 0x800
 #define FLUCTUATION_MIN_THRESHOLD 100                        // 波动最小阈值
 #define FLUCTUATION_MAX_THRESHOLD 10000                      // 波动最大阈值
 #define FLUCTUATION_MAX_FACTOR 1                             // 最大调整系数
@@ -107,7 +107,7 @@
 #define AREA_COMPENSATION_DIVISOR 8   // 将平均波动差缩放为补偿量的除数（越小补偿越大）
 #define AREA_COMPENSATION_MAX 0x2000     // 面积补偿上限，防止过度补偿
 
-#define AD7147_CALIBRATION_TARGET_VALUE (AD7147_DEFAULT_OFFSET_LOW_CLAMP + (STAGE_REDUCE_NUM / 2))
+#define AD7147_CALIBRATION_TARGET_VALUE (AD7147_CDC_BASELINE - AD7147_DEFAULT_OFFSET_LOW_CLAMP + (STAGE_REDUCE_NUM / 2))
 
 // 设备信息结构体
 struct AD7147_DeviceInfo
@@ -148,32 +148,32 @@ const uint16_t channel_connections[12][2] = {
     // {0x0000, 0x1080}, // Stage 10 - CIN10
     // {0x0000, 0x1200}  // Stage 11 - CIN11
     // NEGTIVE
-    // {0x0001, 0x1000}, // Stage 0 - CIN0
-    // {0x0004, 0x1000}, // Stage 1 - CIN1
-    // {0x0010, 0x1000}, // Stage 2 - CIN2
-    // {0x0040, 0x1000}, // Stage 3 - CIN3
-    // {0x0100, 0x1000}, // Stage 4 - CIN4
-    // {0x0400, 0x1000}, // Stage 5 - CIN5
-    // {0x1000, 0x1000}, // Stage 6 - CIN6
-    // {0x0000, 0x1001}, // Stage 7 - CIN7
-    // {0x0000, 0x1004}, // Stage 8 - CIN8
-    // {0x0000, 0x1010}, // Stage 9 - CIN9
-    // {0x0000, 0x1040}, // Stage 10 - CIN10
-    // {0x0000, 0x1100}  // Stage 11 - CIN11
+    {0x0001, 0x1000}, // Stage 0 - CIN0
+    {0x0004, 0x1000}, // Stage 1 - CIN1
+    {0x0010, 0x1000}, // Stage 2 - CIN2
+    {0x0040, 0x1000}, // Stage 3 - CIN3
+    {0x0100, 0x1000}, // Stage 4 - CIN4
+    {0x0400, 0x1000}, // Stage 5 - CIN5
+    {0x1000, 0x1000}, // Stage 6 - CIN6
+    {0x0000, 0x1001}, // Stage 7 - CIN7
+    {0x0000, 0x1004}, // Stage 8 - CIN8
+    {0x0000, 0x1010}, // Stage 9 - CIN9
+    {0x0000, 0x1040}, // Stage 10 - CIN10
+    {0x0000, 0x1100}  // Stage 11 - CIN11
 
-    // NEGTIVE DIFFERENCE
-    {0x2AA9, 0x3AAA}, // Stage 0 - CIN0
-    {0x2AA6, 0x3AAA}, // Stage 1 - CIN1
-    {0x2A9A, 0x3AAA}, // Stage 2 - CIN2
-    {0x2A6A, 0x3AAA}, // Stage 3 - CIN3
-    {0x29AA, 0x3AAA}, // Stage 4 - CIN4
-    {0x26AA, 0x3AAA}, // Stage 5 - CIN5
-    {0x1AAA, 0x3AAA}, // Stage 6 - CIN6
-    {0x2AAA, 0x3AA9}, // Stage 7 - CIN7
-    {0x2AAA, 0x3AA6}, // Stage 8 - CIN8
-    {0x2AAA, 0x3A9A}, // Stage 9 - CIN9
-    {0x2AAA, 0x3A6A}, // Stage 10 - CIN10
-    {0x2AAA, 0x39AA}  // Stage 11 - CIN11
+    // // NEGTIVE DIFFERENCE
+    // {0x2AA9, 0x1AAA}, // Stage 0 - CIN0
+    // {0x2AA6, 0x1AAA}, // Stage 1 - CIN1
+    // {0x2A9A, 0x1AAA}, // Stage 2 - CIN2
+    // {0x2A6A, 0x1AAA}, // Stage 3 - CIN3
+    // {0x29AA, 0x1AAA}, // Stage 4 - CIN4
+    // {0x26AA, 0x1AAA}, // Stage 5 - CIN5
+    // {0x1AAA, 0x1AAA}, // Stage 6 - CIN6
+    // {0x2AAA, 0x1AA9}, // Stage 7 - CIN7
+    // {0x2AAA, 0x1AA6}, // Stage 8 - CIN8
+    // {0x2AAA, 0x1A9A}, // Stage 9 - CIN9
+    // {0x2AAA, 0x1A6A}, // Stage 10 - CIN10
+    // {0x2AAA, 0x19AA}  // Stage 11 - CIN11
 };
 
 // AFE偏移寄存器位域结构
@@ -358,8 +358,8 @@ struct AD7147RegisterConfig
     uint16_t stage_complete_int_enable;  // 0x007 阶段完成中断使能
 
     AD7147RegisterConfig() : stage_low_int_enable(0x0FFF),     // 默认值
-                             stage_high_int_enable(0x0000),    // 默认值
-                             stage_complete_int_enable(0x0000) // 默认值
+                             stage_high_int_enable(0x0FFF),    // 默认值
+                             stage_complete_int_enable(0x0FFF) // 默认值
     {
     }
 };
@@ -376,7 +376,9 @@ public:
     void deinit() override;
     bool isInitialized() const override;
     bool setChannelSensitivity(uint8_t channel, uint8_t sensitivity) override; // 设置通道灵敏度 (0-99)
-    void sample(async_touchsampleresult callback) override;                       // 异步采样接口
+    void sample(async_touchsampleresult callback) override;                    // 异步采样接口
+    bool sample_ready() override;
+
     bool setChannelEnabled(uint8_t channel, bool enabled) override;            // 设置单个通道使能
     bool getChannelEnabled(uint8_t channel) const override;                    // 获取单个通道使能状态
     uint32_t getEnabledChannelMask() const override;                           // 获取启用通道掩码
@@ -470,7 +472,9 @@ private:
 
     // 异步I2C操作缓冲区
     AD7147AsyncReadBuffer _async_read_buffer;
-
+#if AD7147_USE_CDC_MODE
+    uint16_t last_cdc_values_[12]; // 存储最近的12个CDC值
+#endif
     // 允许内部校准工具访问私有成员与方法
     friend class CalibrationTools;
 

@@ -66,7 +66,7 @@ int32_t TouchSettingsMain::delay_value = 0;
 
 // 校准相关静态变量初始化
 uint8_t TouchSettingsMain::progress = 0;
-uint8_t TouchSettingsMain::sensitivity_target = 2;  // 默认灵敏度
+int8_t TouchSettingsMain::sensitivity_target = 0;  // 默认灵敏度
 bool TouchSettingsMain::calibration_in_progress_ = false;
 
 TouchSettingsMain::TouchSettingsMain() {

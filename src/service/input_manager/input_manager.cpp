@@ -1208,6 +1208,10 @@ inline void InputManager::updateTouchStates()
             i2c_sampling_stages_[bus].next_stage();
             continue;
         }
+
+        if (!_target_device->sample_ready()) {
+            continue;
+        }
         
         // 锁定当前阶段并发起异步采样
         i2c_sampling_stages_[bus].stage_locked = true;

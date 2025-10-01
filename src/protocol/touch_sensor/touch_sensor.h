@@ -86,6 +86,10 @@ public:
      * @param callback 异步采样完成后的回调函数
      */
     virtual void sample(async_touchsampleresult callback) = 0;
+
+    virtual bool sample_ready() {
+        return true;
+    }
     
     /**
      * 获取当前模块支持的通道数量

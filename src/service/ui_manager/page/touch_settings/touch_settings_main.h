@@ -64,7 +64,7 @@ private:
     
     // 校准相关静态变量
     static uint8_t progress;
-    static uint8_t sensitivity_target;        // 校准灵敏度目标 (1=高敏, 2=默认, 3=低敏)
+    static int8_t sensitivity_target;        // 校准灵敏度目标 (1=高敏, 2=默认, 3=低敏)
 
     static bool calibration_in_progress_;     // 校准是否正在进行
 
