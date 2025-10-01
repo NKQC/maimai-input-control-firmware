@@ -80,8 +80,8 @@
 #define AD7147_STAGE11_CONNECTION 0x00D8 // Stage 11连接寄存器
 
 // 阶段配置默认值
-#define AD7147_DEFAULT_OFFSET_LOW 0x1000                                 // 默认低偏移值
-#define AD7147_DEFAULT_OFFSET_LOW_CLAMP 0x1000                            // 默认低偏移钳位值
+#define AD7147_DEFAULT_OFFSET_LOW 0x2000                                 // 默认低偏移值
+#define AD7147_DEFAULT_OFFSET_LOW_CLAMP 0x2450                           // 默认低偏移钳位值
 #define AD7147_DEFAULT_OFFSET_HIGH AD7147_DEFAULT_OFFSET_LOW             // 默认高偏移值
 #define AD7147_DEFAULT_OFFSET_HIGH_CLAMP AD7147_DEFAULT_OFFSET_LOW_CLAMP // 默认高偏移钳位值
 #define AD7147_CDC_BASELINE 0x8000                                       // CDC基准值，用于显示计算
@@ -102,8 +102,8 @@
 #define TAYLOR_NORMALIZATION_RANGE FLUCTUATION_MAX_THRESHOLD // 归一化范围
 
 // 面积补偿参数（基于平均CDC波动差）
-#define AREA_COMPENSATION_DIVISOR 8   // 将平均波动差缩放为补偿量的除数（越小补偿越大）
-#define AREA_COMPENSATION_MAX 0x2000     // 面积补偿上限，防止过度补偿
+#define AREA_COMPENSATION_DIVISOR 12   // 将平均波动差缩放为补偿量的除数（越小补偿越大）
+#define AREA_COMPENSATION_MAX 0x1000     // 面积补偿上限，防止过度补偿
 
 #define AD7147_CALIBRATION_TARGET_VALUE (AD7147_DEFAULT_OFFSET_LOW_CLAMP + (STAGE_REDUCE_NUM / 2))
 
@@ -119,33 +119,33 @@ struct AD7147_DeviceInfo
 // 通道连接配置定义（对应CIN0-CIN11）
 const uint16_t channel_connections[12][2] = {
     // POSTIVE
-    // BIAS版 显然不适合mai2情况 天线效应会干碎BIAS
-    // {0xFFFE, 0x1FFF}, // Stage 0 - CIN0
-    // {0xFFFB, 0x1FFF}, // Stage 1 - CIN1
-    // {0xFFEF, 0x1FFF}, // Stage 2 - CIN2
-    // {0xFFBF, 0x1FFF}, // Stage 3 - CIN3
-    // {0xFEFF, 0x1FFF}, // Stage 4 - CIN4
-    // {0xFBFF, 0x1FFF}, // Stage 5 - CIN5
-    // {0xEFFF, 0x1FFF}, // Stage 6 - CIN6
-    // {0xFFFF, 0x1FFE}, // Stage 7 - CIN7
-    // {0xEFFF, 0x1FFB}, // Stage 8 - CIN8
-    // {0xEFFF, 0x1FEF}, // Stage 9 - CIN9
-    // {0xEFFF, 0x1FBF}, // Stage 10 - CIN10
-    // {0xEFFF, 0x1EFF}  // Stage 11 - CIN11
+    // //BIAS版 显然不适合mai2情况 天线效应会干碎BIAS
+    // {0x3FFD, 0x3FFF}, // Stage 0 - CIN0
+    // {0x3FF7, 0x3FFF}, // Stage 1 - CIN1
+    // {0x3FDF, 0x3FFF}, // Stage 2 - CIN2
+    // {0x3F7F, 0x3FFF}, // Stage 3 - CIN3
+    // {0x3DFF, 0x3FFF}, // Stage 4 - CIN4
+    // {0x37FF, 0x3FFF}, // Stage 5 - CIN5
+    // {0x1FFF, 0x3FFF}, // Stage 6 - CIN6
+    // {0x3FFF, 0x3FFD}, // Stage 7 - CIN7
+    // {0x3FFF, 0x3FF7}, // Stage 8 - CIN8
+    // {0x3FFF, 0x3FDF}, // Stage 9 - CIN9
+    // {0x3FFF, 0x3F7F}, // Stage 10 - CIN10
+    // {0x3FFF, 0x31FF}  // Stage 11 - CIN11
     // 高阻版
-    // {0x0002, 0x1000}, // Stage 0 - CIN0
-    // {0x0008, 0x1000}, // Stage 1 - CIN1
-    // {0x0020, 0x1000}, // Stage 2 - CIN2
-    // {0x0080, 0x1000}, // Stage 3 - CIN3
-    // {0x0200, 0x1000}, // Stage 4 - CIN4
-    // {0x0800, 0x1000}, // Stage 5 - CIN5
-    // {0x2000, 0x1000}, // Stage 6 - CIN6
-    // {0x0000, 0x1002}, // Stage 7 - CIN7
-    // {0x0000, 0x1008}, // Stage 8 - CIN8
-    // {0x0000, 0x1020}, // Stage 9 - CIN9
-    // {0x0000, 0x1080}, // Stage 10 - CIN10
-    // {0x0000, 0x1200}  // Stage 11 - CIN11
-    // NEGTIVE
+    // {0x0002, 0x2000}, // Stage 0 - CIN0
+    // {0x0008, 0x2000}, // Stage 1 - CIN1
+    // {0x0020, 0x2000}, // Stage 2 - CIN2
+    // {0x0080, 0x2000}, // Stage 3 - CIN3
+    // {0x0200, 0x2000}, // Stage 4 - CIN4
+    // {0x0800, 0x2000}, // Stage 5 - CIN5
+    // {0x2000, 0x2000}, // Stage 6 - CIN6
+    // {0x0000, 0x2002}, // Stage 7 - CIN7
+    // {0x0000, 0x2008}, // Stage 8 - CIN8
+    // {0x0000, 0x2020}, // Stage 9 - CIN9
+    // {0x0000, 0x2080}, // Stage 10 - CIN10
+    // {0x0000, 0x2200}  // Stage 11 - CIN11
+    // // NEGTIVE
     {0x0001, 0x1000}, // Stage 0 - CIN0
     {0x0004, 0x1000}, // Stage 1 - CIN1
     {0x0010, 0x1000}, // Stage 2 - CIN2
@@ -351,8 +351,8 @@ struct AD7147RegisterConfig
     uint16_t stage_complete_int_enable;  // 0x007 阶段完成中断使能
 
     AD7147RegisterConfig() : stage_low_int_enable(0x0FFF),     // 默认值
-                             stage_high_int_enable(0x0000),    // 默认值
-                             stage_complete_int_enable(0x0000) // 默认值
+                             stage_high_int_enable(0x0FFF),    // 默认值
+                             stage_complete_int_enable(0x0FFF) // 默认值
     {
     }
 };
@@ -370,6 +370,8 @@ public:
     bool isInitialized() const override;
     bool setChannelSensitivity(uint8_t channel, uint8_t sensitivity) override; // 设置通道灵敏度 (0-99)
     void sample(async_touchsampleresult callback) override;                       // 异步采样接口
+    bool sample_ready() override;
+
     bool setChannelEnabled(uint8_t channel, bool enabled) override;            // 设置单个通道使能
     bool getChannelEnabled(uint8_t channel) const override;                    // 获取单个通道使能状态
     uint32_t getEnabledChannelMask() const override;                           // 获取启用通道掩码

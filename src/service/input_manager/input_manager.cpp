@@ -813,12 +813,6 @@ void InputManager::requestCancelBinding()
     binding_cancel_pending_ = true;
 }
 
-// 自动调整指定通道的灵敏度
-
-
-// 状态机处理函数
-
-
 // 设置灵敏度
 void InputManager::setSensitivity(uint8_t device_id_mask, uint8_t channel, uint8_t sensitivity)
 {
@@ -1206,6 +1200,11 @@ inline void InputManager::updateTouchStates()
         _target_device = i2c_sampling_stages_[bus].device_instances[i2c_sampling_stages_[bus].current_stage];
         if (_target_device == nullptr) {
             i2c_sampling_stages_[bus].next_stage();
+            continue;
+        }
+        
+        // 检查当前设备是否准备好采样
+        if (!_target_device->sample_ready()) {
             continue;
         }
         

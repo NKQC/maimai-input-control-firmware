@@ -50,11 +50,11 @@ bool AD7147::init() {
     register_config_.pwr_control.bits.power_mode = 0;
     register_config_.pwr_control.bits.lp_conv_delay = 0;
     register_config_.pwr_control.bits.sequence_stage_num = 0xB;
-    register_config_.pwr_control.bits.decimation = 3;
+    register_config_.pwr_control.bits.decimation = 2;
     register_config_.pwr_control.bits.sw_reset = 0;
     register_config_.pwr_control.bits.int_pol = 0;
     register_config_.pwr_control.bits.ext_source = 0;
-    register_config_.pwr_control.bits.cdc_bias = 0;
+    register_config_.pwr_control.bits.cdc_bias = 1;
     ret &= configureStages(nullptr);
 
     initialized_ = ret;
@@ -266,9 +266,9 @@ void AD7147::sample(async_touchsampleresult callback) {
         // 清除执行标志，标记完成
         auto_calibration_control_ &= 0x7FFFFFFF;
     }
-    
+
     // 异步读取状态寄存器数据
-    i2c_hal_->read_register_async(device_addr_, AD7147_REG_STAGE_LOW_INT_STATUS | 0x8000, _async_read_buffer.bytes, 2, [this, callback](bool success) {
+    i2c_hal_->read_register_async(device_addr_, AD7147_REG_STAGE_HIGH_INT_STATUS | 0x8000, _async_read_buffer.bytes, 2, [this, callback](bool success) {
         if (success) {
             // 处理状态寄存器数据
             __asm__ volatile (
@@ -279,7 +279,7 @@ void AD7147::sample(async_touchsampleresult callback) {
             
             // 重建通道映射：将stage反馈映射回正确的通道位置
             reconstructed_mask_ = 0;
-            stage_status_ = _async_read_buffer.value; // 反转状态位（触摸时为1）
+            stage_status_ = ~_async_read_buffer.value; // 反转状态位（触摸时为1）
             
             stage_index_ = 0;
             temp_mask_ = enabled_channels_mask_;
@@ -313,6 +313,13 @@ void AD7147::sample(async_touchsampleresult callback) {
             callback(sample_result_);
         }
     });
+}
+
+bool AD7147::sample_ready() {
+    // 处理待应用的异步配置
+    uint16_t ready = 0;
+    read_register(AD7147_REG_STAGE_COMPLETE_INT_STATUS, ready);
+    return ready;
 }
 
 bool AD7147::setChannelEnabled(uint8_t channel, bool enabled) {
@@ -492,7 +499,7 @@ bool AD7147::configureStages(const uint16_t* connection_values) {
             stage_settings_.stages[i].afe_offset = connection_values[0];
         }
     }
-    
+
     // 应用stage设置
     ret &= apply_stage_settings();
     USB_LOG_DEBUG("AD7147 ConfigureStages Register");
@@ -533,8 +540,8 @@ bool AD7147::configureStages(const uint16_t* connection_values) {
     ret &= write_register(AD7147_REG_STAGE_CAL_EN, cal_en_data, 2);
 
     // 更新AMB_COMP_CTRL0配置
-    register_config_.amb_comp_ctrl0.raw = 0x32F0;
-    register_config_.amb_comp_ctrl0.bits.forced_cal = false;
+    register_config_.amb_comp_ctrl0.raw = 0x32FB;
+    register_config_.amb_comp_ctrl0.bits.forced_cal = true;
     uint8_t amb_ctrl0_data[2] = {
         (uint8_t)(register_config_.amb_comp_ctrl0.raw >> 8),
         (uint8_t)(register_config_.amb_comp_ctrl0.raw & 0xFF)

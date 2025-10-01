@@ -79,6 +79,10 @@ public:
      */
     virtual void sample(async_touchsampleresult callback) = 0;
     
+    virtual bool sample_ready() {
+        return true;
+    };
+
     /**
      * 获取当前模块支持的通道数量
      * @return 支持的最大通道数（1-24）
