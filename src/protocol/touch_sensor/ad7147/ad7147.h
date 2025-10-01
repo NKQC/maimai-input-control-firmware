@@ -81,7 +81,7 @@
 
 // 阶段配置默认值
 #define AD7147_DEFAULT_OFFSET_LOW 0x1000                                 // 默认低偏移值
-#define AD7147_DEFAULT_OFFSET_LOW_CLAMP 0x0000                            // 默认低偏移钳位值
+#define AD7147_DEFAULT_OFFSET_LOW_CLAMP 0x1000                            // 默认低偏移钳位值
 #define AD7147_DEFAULT_OFFSET_HIGH AD7147_DEFAULT_OFFSET_LOW             // 默认高偏移值
 #define AD7147_DEFAULT_OFFSET_HIGH_CLAMP AD7147_DEFAULT_OFFSET_LOW_CLAMP // 默认高偏移钳位值
 #define AD7147_CDC_BASELINE 0x8000                                       // CDC基准值，用于显示计算

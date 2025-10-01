@@ -533,8 +533,8 @@ bool AD7147::configureStages(const uint16_t* connection_values) {
     ret &= write_register(AD7147_REG_STAGE_CAL_EN, cal_en_data, 2);
 
     // 更新AMB_COMP_CTRL0配置
-    register_config_.amb_comp_ctrl0.raw = 0x32FF; 
-    register_config_.amb_comp_ctrl0.bits.forced_cal = true;
+    register_config_.amb_comp_ctrl0.raw = 0x32F0;
+    register_config_.amb_comp_ctrl0.bits.forced_cal = false;
     uint8_t amb_ctrl0_data[2] = {
         (uint8_t)(register_config_.amb_comp_ctrl0.raw >> 8),
         (uint8_t)(register_config_.amb_comp_ctrl0.raw & 0xFF)
