@@ -1,0 +1,1 @@
+-c -mcpu=cortex-m0plus --specs=nano.specs -mthumb -ffunction-sections -fdata-sections -ffat-lto-objects -g -Wall -pipe

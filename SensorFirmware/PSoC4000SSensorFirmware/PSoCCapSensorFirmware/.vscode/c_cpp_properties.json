@@ -1,0 +1,37 @@
+{
+    "version": 4,
+    "env": {
+        "mtbCompilerArgs": [
+            "-c","-mcpu=cortex-m0plus","--specs=nano.specs","-Og","-mthumb","-ffunction-sections","-fdata-sections","-ffat-lto-objects","-g","-Wall","-pipe"
+        ],
+        "mtbDefaultIncludePath": [
+            "bsps/TARGET_CAPSENSOR","bsps",".","bsps/TARGET_CAPSENSOR/config/GeneratedSource","bsps/TARGET_CAPSENSOR/config","../mtb_shared/capsense/release-v4.0.0","../mtb_shared/cmsis/release-v5.8.2/Core/Include","../mtb_shared/cmsis/release-v5.8.2/Core","../mtb_shared/cmsis/release-v5.8.2","../mtb_shared/core-lib/release-v1.6.0/include","../mtb_shared/core-lib/release-v1.6.0","../mtb_shared/mtb-pdl-cat2/release-v2.18.0/devices/include","../mtb_shared/mtb-pdl-cat2/release-v2.18.0/devices","../mtb_shared/mtb-pdl-cat2/release-v2.18.0","../mtb_shared/mtb-pdl-cat2/release-v2.18.0/devices/include/ip","../mtb_shared/mtb-pdl-cat2/release-v2.18.0/drivers/include","../mtb_shared/mtb-pdl-cat2/release-v2.18.0/drivers"
+        ],
+        "mtbDefaultDefines": [
+            "COMPONENT_CAPSENSOR","COMPONENT_CAT2","COMPONENT_CM0P","COMPONENT_CM0P_0","COMPONENT_Debug","COMPONENT_GCC_ARM","COMPONENT_MW_CAPSENSE","COMPONENT_MW_CMSIS","COMPONENT_MW_CORE_LIB","COMPONENT_MW_CORE_MAKE","COMPONENT_MW_MTB_PDL_CAT2","COMPONENT_MW_RECIPE_MAKE_CAT2","COMPONENT_PSOC4000S","COMPONENT_SOFTFP","CORE_NAME_CM0P_0=1","CY8C4045LQI_S411","CY_APPNAME_mtb_example_psoc4_capsense_csd_button_tuning","CY_SUPPORTS_DEVICE_VALIDATION","CY_TARGET_BOARD=CAPSENSOR","CY_USING_HAL","DEBUG","TARGET_CAPSENSOR"
+        ]
+    },
+    "configurations": [
+        {
+            "name": "MTB",
+            "compilerPath": "C:/Users/asdfg/Infineon/Tools/mtb-gcc-arm-eabi/14.2.1/gcc/bin/arm-none-eabi-gcc",
+            "compilerArgs": [
+                "${mtbCompilerArgs}"
+            ],
+            "compileCommands": "${workspaceFolder}/build/compile_commands.json",
+            "intelliSenseMode": "gcc-arm",
+            "cStandard": "c99",
+            "cppStandard": "c++11",
+            "includePath": [
+                "${mtbDefaultIncludePath}"
+            ],
+            "browse": {
+                "limitSymbolsToIncludedHeaders": true,
+                "databaseFilename": ""
+            },
+            "defines": [
+                "${mtbDefaultDefines}"
+            ]
+        }
+    ]
+}
