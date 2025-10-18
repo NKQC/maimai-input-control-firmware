@@ -1,7 +1,7 @@
 MTB_CACHE_FULLPATH=F:/maimaicontrol-V3.0/maimai-input-control-firmware/SensorFirmware/TouchSensor/.mtbqueryapi
 MTB_ADDITIONAL_DEVICES=
 MTB_APPINFO_DEPENDENCIES=Makefile C:/Users/asdfg/ModusToolbox/tools_3.6/make/start.mk C:/Users/asdfg/ModusToolbox/tools_3.6/make/core_version3/start-v3.mk C:/Users/asdfg/ModusToolbox/tools_3.6/make/core_version3/tools_utils.mk C:/Users/asdfg/ModusToolbox/tools_3.6/make/core_version3/startex-v3.mk F:/maimaicontrol-V3.0/maimai-input-control-firmware/SensorFirmware/TouchSensor/libs/mtb.mk bsps/TARGET_TouchSensor/bsp.mk C:/Users/asdfg/ModusToolbox/tools_3.6/make/core_version3/legacy-v3.mk libs/core-make/make/core/main.mk libs/core-make/make/core/bwc.mk libs/core-make/make/core/application_bootstrap.mk libs/core-make/make/core/core_utils.mk libs/recipe-make-cat2/make/recipe/core_selection.mk libs/recipe-make-cat2/make/toolchains/GCC_ARM.mk libs/recipe-make-cat2/make/recipe/recipe_toolchain_file_types.mk libs/recipe-make-cat2/make/recipe/defines.mk libs/recipe-make-cat2/make/recipe/defines_common.mk libs/recipe-make-cat2/make/recipe/recipe_setup.mk libs/core-make/make/core/config.mk libs/core-make/make/core/help.mk libs/core-make/make/core/prebuild.mk libs/recipe-make-cat2/make/recipe/recipe.mk libs/recipe-make-cat2/make/recipe/recipe_common.mk libs/core-make/make/core/transition.mk
-MTB_APP_NAME=mtb-example-psoc4-capsense-csd-button-tuning
+MTB_APP_NAME=TouchSensor
 MTB_APP_PATH=.
 MTB_BUILD_LOCATION=F:/maimaicontrol-V3.0/maimai-input-control-firmware/SensorFirmware/TouchSensor/build
 MTB_BUILD_SUPPORT=

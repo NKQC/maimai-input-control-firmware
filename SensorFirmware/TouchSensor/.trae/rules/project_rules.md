@@ -1,0 +1,1 @@
+编译项目只能使用此指令: C:/Users/asdfg/ModusToolbox/tools_3.6/modus-shell/bin/bash.exe --norc -c export PATH=/bin:/usr/bin:$PATH ; C:/Users/asdfg/ModusToolbox/tools_3.6/modus-shell/bin/make.exe -j build 

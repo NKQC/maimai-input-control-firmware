@@ -46,7 +46,7 @@ TARGET=TouchSensor
 #
 # If APPNAME is edited, ensure to update or regenerate launch
 # configurations for your IDE.
-APPNAME=mtb-example-psoc4-capsense-csd-button-tuning
+APPNAME=TouchSensor
 
 # Name of toolchain to use. Options include:
 #
@@ -94,11 +94,15 @@ DISABLE_COMPONENTS=
 # tree for source code and builds it. The SOURCES variable can be used to
 # manually add source code to the build process from a location not searched
 # by default, or otherwise not found by the build system.
-SOURCES=
+SOURCES=module/capsense/capsense_module.c \
+        module/i2c/i2c_module.c \
+        module/led/led_module.c
 
 # Like SOURCES, but for include directories. Value should be paths to
 # directories (without a leading -I).
-INCLUDES=
+INCLUDES=module/capsense \
+         module/i2c \
+         module/led
 
 # Add additional defines to the build process (without a leading -D).
 DEFINES=

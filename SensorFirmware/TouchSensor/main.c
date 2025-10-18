@@ -1,86 +1,51 @@
-/******************************************************************************
-* File Name: main.c
-*
-* Description: This is the source code for the PSoC 4 CapSense CSD Button
-* Tuning code example for ModusToolbox.
-*
-* Related Document: See README.md
-*
-*******************************************************************************
-* Copyright 2021-2023, Cypress Semiconductor Corporation (an Infineon company) or
-* an affiliate of Cypress Semiconductor Corporation.  All rights reserved.
-*
-* This software, including source code, documentation and related
-* materials ("Software") is owned by Cypress Semiconductor Corporation
-* or one of its affiliates ("Cypress") and is protected by and subject to
-* worldwide patent protection (United States and foreign),
-* United States copyright laws and international treaty provisions.
-* Therefore, you may use this Software only as provided in the license
-* agreement accompanying the software package from which you
-* obtained this Software ("EULA").
-* If no EULA applies, Cypress hereby grants you a personal, non-exclusive,
-* non-transferable license to copy, modify, and compile the Software
-* source code solely for use in connection with Cypress's
-* integrated circuit products.  Any reproduction, modification, translation,
-* compilation, or representation of this Software except as specified
-* above is prohibited without the express written permission of Cypress.
-*
-* Disclaimer: THIS SOFTWARE IS PROVIDED AS-IS, WITH NO WARRANTY OF ANY KIND,
-* EXPRESS OR IMPLIED, INCLUDING, BUT NOT LIMITED TO, NONINFRINGEMENT, IMPLIED
-* WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE. Cypress
-* reserves the right to make changes to the Software without notice. Cypress
-* does not assume any liability arising out of the application or use of the
-* Software or any product or circuit described in the Software. Cypress does
-* not authorize its products for use in any products where a malfunction or
-* failure of the Cypress product may reasonably be expected to result in
-* significant property damage, injury or death ("High Risk Product"). By
-* including Cypress's product in a High Risk Product, the manufacturer
-* of such system or application assumes all risk of such use and in doing
-* so agrees to indemnify Cypress against all liability.
+/*******************************************************************************
+* 文件名: main.c
+* 描述: maimai触摸控制器主程序 - PSoC 4 CapSense I2C从机实现
+* 功能: 动态地址I2C从机，基于寄存器的接口，LED控制
 *******************************************************************************/
 
 
 /*******************************************************************************
- * Include header files
+ * 包含头文件
  ******************************************************************************/
 #include "cy_pdl.h"
 #include "cybsp.h"
 #include "cycfg.h"
 #include "cycfg_capsense.h"
+#include "cy_syslib.h"
+
+/* 模块头文件 */
+#include "module/capsense/capsense_module.h"
+#include "module/i2c/i2c_module.h"
+#include "module/led/led_module.h"
 
 
 /*******************************************************************************
-* Macros
+* 宏定义
 *******************************************************************************/
-#define CAPSENSE_INTR_PRIORITY    (3u)
 #define CY_ASSERT_FAILED          (0u)
 
-/* EZI2C interrupt priority must be higher than CapSense interrupt. */
-#define EZI2C_INTR_PRIORITY       (2u)
-
-
 /*******************************************************************************
-* Global Definitions
+* 全局变量定义
 *******************************************************************************/
-cy_stc_scb_ezi2c_context_t ezi2c_context;
+/* 时间测量相关变量 */
+static uint64_t _last_scan_time = 0;
+static volatile uint32_t _systick_overflow_count = 0;
 
 #if CY_CAPSENSE_BIST_EN
-/* Variables to hold sensor parasitic capacitances */
 uint32_t sensor_cp = 0;
 cy_en_capsense_bist_status_t status;
 #endif /* CY_CAPSENSE_BIST_EN */
 
 
 /*******************************************************************************
-* Function Prototypes
+* 静态函数声明
 *******************************************************************************/
-static void initialize_capsense(void);
-static void capsense_isr(void);
-static void ezi2c_isr(void);
-static void initialize_capsense_tuner(void);
+static uint64_t _get_system_time_us(void);
+static void _update_scan_rate(void);
 
 #if CY_CAPSENSE_BIST_EN
-static void measure_sensor_cp(void);
+static void _measure_sensor_cp(void);
 #endif /* CY_CAPSENSE_BIST_EN */
 
 
@@ -91,200 +56,166 @@ static void measure_sensor_cp(void);
 *  System entrance point. This function performs
 *  - initial setup of device
 *  - initialize CapSense
-*  - initialize tuner communication
-*  - perform Cp measurement if Built-in Self test (BIST) is enabled
-*  - scan touch input continuously
+*  - initialize I2C slave communication
+*  - scan touch input continuously and update registers
 *
 * Return:
 *  int
 *
 *******************************************************************************/
+/*******************************************************************************
+* Function Name: main
+********************************************************************************
+* Summary: 主函数 - 初始化系统并运行主循环
+*******************************************************************************/
 int main(void)
 {
     cy_rslt_t result = CY_RSLT_SUCCESS;
 
-    /* Initialize the device and board peripherals */
+    /* 初始化设备和板级外设 */
     result = cybsp_init();
 
-    /* Board init failed. Stop program execution */
+    /* 板级初始化失败，停止程序执行 */
     if (result != CY_RSLT_SUCCESS)
     {
         CY_ASSERT(CY_ASSERT_FAILED);
     }
 
-    /* Enable global interrupts */
+    /* 使能全局中断 */
     __enable_irq();
 
-    /* Initialize EZI2C */
-    initialize_capsense_tuner();
+    /* 初始化SysTick定时器用于时间测量 */
+    SysTick_Config(SystemCoreClock / 1000); /* 1ms时钟 */
 
-    /* Initialize CapSense */
-    initialize_capsense();
+    /* 初始化LED模块 */
+    led_init();
 
-    /* Start the first scan */
-    Cy_CapSense_ScanAllWidgets(&cy_capsense_context);
+    /* 初始化I2C从机 */
+    i2c_init();
+
+    /* 初始化CapSense */
+    capsense_init();
+
+    /* 开始第一次扫描 */
+    capsense_start_scan();
+    _last_scan_time = _get_system_time_us();
+
+    /* LED在进入主循环前点亮 */
+    led_on();
 
     for (;;)
     {
-        if(CY_CAPSENSE_NOT_BUSY == Cy_CapSense_IsBusy(&cy_capsense_context))
+        if (!capsense_is_busy())
         {
-            /* Process all widgets */
-            Cy_CapSense_ProcessAllWidgets(&cy_capsense_context);
+            /* 处理所有传感器 */
+            capsense_process_widgets();
 
-            /* Turning ON/OFF based on button status */
-            if(0 != Cy_CapSense_IsWidgetActive(CY_CAPSENSE_BUTTON0_WDGT_ID, &cy_capsense_context))
-            {
-                Cy_GPIO_Write(CYBSP_LED_BTN1_PORT, CYBSP_LED_BTN1_NUM, CYBSP_LED_STATE_ON);
-            }
-            else
-            {
-                Cy_GPIO_Write(CYBSP_LED_BTN1_PORT, CYBSP_LED_BTN1_NUM, CYBSP_LED_STATE_OFF);
-            }
+            /* 更新扫描速率计算 */
+            _update_scan_rate();
 
-            /* Establishes synchronized communication with the CapSense Tuner tool */
-            Cy_CapSense_RunTuner(&cy_capsense_context);
+            /* 更新触摸状态位图 */
+            capsense_update_touch_status();
+            
+            /* 应用来自I2C的阈值更改 */
+            capsense_apply_threshold_changes();
 
 #if CY_CAPSENSE_BIST_EN
-            /* Measure the self capacitance of sensor electrode using BIST */
-            measure_sensor_cp();
+            /* 使用BIST测量传感器电极的自电容 */
+            _measure_sensor_cp();
 #endif /* CY_CAPSENSE_BIST_EN */
 
-            /* Start the next scan */
-            Cy_CapSense_ScanAllWidgets(&cy_capsense_context);
+            /* 读取一次0x0寄存器后熄灭LED */
+            static bool first_read_done = false;
+            if (!first_read_done)
+            {
+                /* 模拟读取0x0寄存器 */
+                i2c_handle_register_read(REG_SCAN_RATE);
+                led_off();
+                first_read_done = true;
+            }
+
+            /* 开始下一次扫描 */
+            capsense_start_scan();
         }
     }
 }
 
 
+
+
+
+
+
+
 /*******************************************************************************
-* Function Name: initialize_capsense
+* Function Name: _update_scan_rate
 ********************************************************************************
-* Summary:
-*  This function initializes the CapSense and configures the CapSense
-*  interrupt.
-*
+* Summary: 更新扫描速率计算
 *******************************************************************************/
-static void initialize_capsense(void)
+static void _update_scan_rate(void)
 {
-    cy_capsense_status_t status = CY_CAPSENSE_STATUS_SUCCESS;
-
-    /* CapSense interrupt configuration */
-    const cy_stc_sysint_t capsense_interrupt_config =
+    static uint32_t scan_count = 0;
+    static uint64_t last_rate_update_time = 0;
+    
+    scan_count++;
+    
+    uint64_t current_time = _get_system_time_us();
+    uint64_t time_diff = current_time - last_rate_update_time;
+    
+    /* 每秒更新一次扫描速率 */
+    if (time_diff >= 1000000) /* 1秒 = 1,000,000微秒 */
     {
-        .intrSrc = CYBSP_CSD_IRQ,
-        .intrPriority = CAPSENSE_INTR_PRIORITY,
-    };
-
-    /* Capture the CSD HW block and initialize it to the default state. */
-    status = Cy_CapSense_Init(&cy_capsense_context);
-
-    if (CY_CAPSENSE_STATUS_SUCCESS == status)
-    {
-        /* Initialize CapSense interrupt */
-        Cy_SysInt_Init(&capsense_interrupt_config, capsense_isr);
-        NVIC_ClearPendingIRQ(capsense_interrupt_config.intrSrc);
-        NVIC_EnableIRQ(capsense_interrupt_config.intrSrc);
-
-        /* Initialize the CapSense firmware modules. */
-        status = Cy_CapSense_Enable(&cy_capsense_context);
-    }
-
-    if(status != CY_CAPSENSE_STATUS_SUCCESS)
-    {
-        /* This status could fail before tuning the sensors correctly.
-         * Ensure that this function passes after the CapSense sensors are tuned
-         * as per procedure give in the Readme.md file */
+        g_scan_rate_per_second = (uint16_t)((scan_count * 1000000ULL) / time_diff);
+        scan_count = 0;
+        last_rate_update_time = current_time;
     }
 }
-
-
-/*******************************************************************************
-* Function Name: capsense_isr
-********************************************************************************
-* Summary:
-*  Wrapper function for handling interrupts from CapSense block.
-*
-*******************************************************************************/
-static void capsense_isr(void)
-{
-    Cy_CapSense_InterruptHandler(CYBSP_CSD_HW, &cy_capsense_context);
-}
-
-
-/*******************************************************************************
-* Function Name: initialize_capsense_tuner
-********************************************************************************
-* Summary:
-* - EZI2C module to communicate with the CapSense Tuner tool.
-*
-*******************************************************************************/
-static void initialize_capsense_tuner(void)
-{
-    cy_en_scb_ezi2c_status_t status = CY_SCB_EZI2C_SUCCESS;
-
-    /* EZI2C interrupt configuration structure */
-    const cy_stc_sysint_t ezi2c_intr_config =
-    {
-        .intrSrc = CYBSP_EZI2C_IRQ,
-        .intrPriority = EZI2C_INTR_PRIORITY,
-    };
-
-    /* Initialize the EzI2C firmware module */
-    status = Cy_SCB_EZI2C_Init(CYBSP_EZI2C_HW, &CYBSP_EZI2C_config, &ezi2c_context);
-
-    Cy_SysInt_Init(&ezi2c_intr_config, ezi2c_isr);
-    NVIC_EnableIRQ(ezi2c_intr_config.intrSrc);
-
-    /* Set the CapSense data structure as the I2C buffer to be exposed to the
-     * master on primary slave address interface. Any I2C host tools such as
-     * the Tuner or the Bridge Control Panel can read this buffer but you can
-     * connect only one tool at a time.
-     */
-    Cy_SCB_EZI2C_SetBuffer1(CYBSP_EZI2C_HW, (uint8_t *)&cy_capsense_tuner,
-                            sizeof(cy_capsense_tuner), sizeof(cy_capsense_tuner),
-                            &ezi2c_context);
-
-    /* Enables the SCB block for the EZI2C operation. */
-    Cy_SCB_EZI2C_Enable(CYBSP_EZI2C_HW);
-
-    /* EZI2C initialization failed */
-    if(status != CY_SCB_EZI2C_SUCCESS)
-    {
-        CY_ASSERT(CY_ASSERT_FAILED);
-    }
-}
-
-
-/*******************************************************************************
-* Function Name: ezi2c_isr
-********************************************************************************
-* Summary:
-*  Wrapper function for handling interrupts from EZI2C block.
-*
-*******************************************************************************/
-static void ezi2c_isr(void)
-{
-    Cy_SCB_EZI2C_Interrupt(CYBSP_EZI2C_HW, &ezi2c_context);
-}
-
 
 #if CY_CAPSENSE_BIST_EN
-/*******************************************************************************
-* Function Name: measure_sensor_cp
-********************************************************************************
-* Summary:
-*  Measures the self capacitance of the sensor electrode (Cp) in Femto Farad and
-*  stores its value in the variable sensor_cp.
-*
-*******************************************************************************/
-static void measure_sensor_cp(void)
+/* 测量传感器电极自电容 */
+static void _measure_sensor_cp(void)
 {
-    /* Measure the self capacitance of sensor electrode */
-    status = Cy_CapSense_MeasureCapacitanceSensor(CY_CAPSENSE_BUTTON0_WDGT_ID,
-                                                  CY_CAPSENSE_BUTTON0_SNS0_ID,
+    /* 测量传感器电极自电容 */
+    status = Cy_CapSense_MeasureCapacitanceSensor(CY_CAPSENSE_CAP0_WDGT_ID,
+                                                  CY_CAPSENSE_CAP0_SNS0_ID,
                                              &sensor_cp, &cy_capsense_context);
 }
 #endif /* CY_CAPSENSE_BIST_EN */
 
+/* 获取系统时间（微秒） - 使用SysTick定时器 */
+static uint64_t _get_system_time_us(void)
+{
+    uint32_t systick_val;
+    uint32_t overflow_count;
+    
+    /* 禁用中断以确保原子读取 */
+    __disable_irq();
+    
+    systick_val = SysTick->VAL;
+    overflow_count = _systick_overflow_count;
+    
+    /* 检查是否在读取期间发生溢出 */
+    if ((SysTick->CTRL & SysTick_CTRL_COUNTFLAG_Msk) && (systick_val > (SysTick->LOAD >> 1)))
+    {
+        overflow_count++;
+    }
+    
+    __enable_irq();
+    
+    /* 计算总时间（微秒） */
+    /* SysTick向下计数，所以我们需要从LOAD值中减去当前值 */
+    uint32_t ticks_in_current_ms = SysTick->LOAD - systick_val;
+    uint64_t total_us = (uint64_t)overflow_count * 1000 + (ticks_in_current_ms * 1000) / SysTick->LOAD;
+    
+    return total_us;
+}
 
-/* [] END OF FILE */
+/*******************************************************************************
+* Function Name: SysTick_Handler
+********************************************************************************
+* Summary: SysTick中断处理程序，用于计算溢出次数以进行时间测量
+*******************************************************************************/
+void SysTick_Handler(void)
+{
+    _systick_overflow_count++;
+}
