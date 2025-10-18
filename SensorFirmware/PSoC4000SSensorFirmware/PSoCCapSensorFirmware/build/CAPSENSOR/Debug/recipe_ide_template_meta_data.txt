@@ -1,2 +1,0 @@
-
-TEMPLATE_REPLACE=../mtb_shared/recipe-make-cat2/release-v2.5.0/make/scripts/interface_version_4/vscode/KitProg3/openocd.tcl=openocd.tcl

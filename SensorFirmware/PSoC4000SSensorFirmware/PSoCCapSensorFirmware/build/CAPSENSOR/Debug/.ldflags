@@ -1,1 +1,0 @@
--mcpu=cortex-m0plus --specs=nano.specs -mthumb -ffunction-sections -fdata-sections -ffat-lto-objects -g -Wall -pipe -Wl,--gc-sections -T"bsps/TARGET_CAPSENSOR/TOOLCHAIN_GCC_ARM/linker.ld" -Wl,-Map,@mapfile -Wl,--start-group @objs -Wl,--end-group -o @elffile

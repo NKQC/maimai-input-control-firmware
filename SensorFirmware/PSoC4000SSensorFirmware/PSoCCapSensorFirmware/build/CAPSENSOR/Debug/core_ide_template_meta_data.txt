@@ -1,5 +1,0 @@
-EXTERNAL_REF_KEY=&&LINKED_RESOURCES&&
-TEMPLATE_REPLACE=../mtb_shared/core-make/release-v3.7.0/make/scripts/interface_version_4/vscode/json=.vscode
-TEMPLATE_REPLACE=../mtb_shared/core-make/release-v3.7.0/make/scripts/interface_version_4/vscode/workspace/wks.code-workspace=mtb-example-psoc4-capsense-csd-button-tuning.code-workspace
-EXTERNAL_REF=. 
-EXTERNAL_REF=../mtb_shared
