@@ -31,10 +31,8 @@
 #define REG_CAPA_THRESHOLD          (0xD)
 #define REG_CAPB_THRESHOLD          (0xE)
 
-extern uint16_t g_scan_rate_per_second;
-extern uint8_t g_led_control;
-
 void i2c_init(uint8_t slave_address);
+void i2c_set_scan_rate(uint16_t rate);
 uint16_t i2c_handle_register_read(uint8_t reg_addr);
 void i2c_handle_register_write(uint8_t reg_addr, uint16_t value);
 

@@ -14,8 +14,8 @@ static uint64_t _last_scan_time = 0;
 static volatile uint32_t _systick_overflow_count = 0;
 
 #if CY_CAPSENSE_BIST_EN
-uint32_t sensor_cp = 0;
-cy_en_capsense_bist_status_t status;
+static uint32_t sensor_cp = 0;
+static cy_en_capsense_bist_status_t status;
 #endif /* CY_CAPSENSE_BIST_EN */
 
 
@@ -31,7 +31,8 @@ static void _measure_sensor_cp(void);
 // 主函数：初始化系统并运行主循环
 int main(void)
 {
-    cy_rslt_t result = CY_RSLT_SUCCESS;
+    static cy_rslt_t result; 
+    result = CY_RSLT_SUCCESS;
 
     result = cybsp_init();
 
@@ -58,7 +59,6 @@ int main(void)
             _update_scan_rate();
             capsense_update_touch_status();
             capsense_apply_threshold_changes();
-
 #if CY_CAPSENSE_BIST_EN
             _measure_sensor_cp();
 #endif
@@ -67,27 +67,22 @@ int main(void)
     }
 }
 
-
-
-
-
-
-
-
 // 更新扫描速率
 static void _update_scan_rate(void)
 {
     static uint32_t scan_count = 0;
     static uint64_t last_rate_update_time = 0;
+    static uint64_t current_time = 0;
+    static uint64_t time_diff = 0;
 
     scan_count++;
 
-    uint64_t current_time = _get_system_time_us();
-    uint64_t time_diff = current_time - last_rate_update_time;
+    current_time = _get_system_time_us();
+    time_diff = current_time - last_rate_update_time;
 
     if (time_diff >= 1000000)
     {
-        g_scan_rate_per_second = (uint16_t)((scan_count * 1000000ULL) / time_diff);
+        i2c_set_scan_rate((uint16_t)((scan_count * 1000000ULL) / time_diff));
         scan_count = 0;
         last_rate_update_time = current_time;
     }
@@ -109,7 +104,8 @@ static inline uint8_t _get_i2c_address(void)
     Cy_GPIO_Pin_FastInit(ADDR_PIN_P3_3_PORT, ADDR_PIN_P3_3_NUM, CY_GPIO_DM_PULLUP, 1, HSIOM_SEL_GPIO);
     Cy_GPIO_Pin_FastInit(ADDR_PIN_P3_2_PORT, ADDR_PIN_P3_2_NUM, CY_GPIO_DM_PULLUP, 1, HSIOM_SEL_GPIO);
 
-    uint8_t addr_bits = 0;
+    static uint8_t addr_bits; 
+    addr_bits = 0;
 
     if (Cy_GPIO_Read(ADDR_PIN_P3_3_PORT, ADDR_PIN_P3_3_NUM) == 0)
     {
@@ -130,8 +126,8 @@ static inline uint8_t _get_i2c_address(void)
 // 获取系统时间（微秒）
 static uint64_t _get_system_time_us(void)
 {
-    uint32_t systick_val;
-    uint32_t overflow_count;
+    static uint32_t systick_val;
+    static uint32_t overflow_count;
 
     __disable_irq();
 
@@ -145,8 +141,10 @@ static uint64_t _get_system_time_us(void)
 
     __enable_irq();
 
-    uint32_t ticks_in_current_ms = SysTick->LOAD - systick_val;
-    uint64_t total_us = (uint64_t)overflow_count * 1000 + (ticks_in_current_ms * 1000) / SysTick->LOAD;
+    static uint32_t ticks_in_current_ms;
+    static uint64_t total_us;
+    ticks_in_current_ms = SysTick->LOAD - systick_val;
+    total_us = (uint64_t)overflow_count * 1000 + (ticks_in_current_ms * 1000) / SysTick->LOAD;
 
     return total_us;
 }

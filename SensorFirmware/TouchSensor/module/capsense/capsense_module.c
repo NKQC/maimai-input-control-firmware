@@ -1,12 +1,12 @@
 #include "capsense_module.h"
 
-uint16_t g_touch_status_bitmap = 0;
-uint16_t g_cap_thresholds[12] = {100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100};
-bool g_threshold_changed = false;
+static uint16_t g_touch_status_bitmap = 0;
+static uint16_t g_cap_thresholds[12] = {100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100};
+static bool g_threshold_changed = false;
 
 #if CY_CAPSENSE_BIST_EN
-uint32_t sensor_cp = 0;
-cy_en_capsense_bist_status_t status;
+static uint32_t sensor_cp = 0;
+static cy_en_capsense_bist_status_t status;
 #endif /* CY_CAPSENSE_BIST_EN */
 
 static void _capsense_isr(void);
@@ -14,26 +14,27 @@ static void _capsense_isr(void);
 // 初始化CapSense模块
 void capsense_init(void)
 {
-    cy_capsense_status_t status = CY_CAPSENSE_STATUS_SUCCESS;
+    static cy_capsense_status_t status_local; 
+    status_local = CY_CAPSENSE_STATUS_SUCCESS;
 
-    const cy_stc_sysint_t capsense_intr_config =
+    static const cy_stc_sysint_t capsense_intr_config =
     {
         .intrSrc = csd_interrupt_IRQn,
         .intrPriority = CAPSENSE_INTR_PRIORITY,
     };
 
-    status = Cy_CapSense_Init(&cy_capsense_context);
+    status_local = Cy_CapSense_Init(&cy_capsense_context);
 
-    if (CY_CAPSENSE_STATUS_SUCCESS == status)
+    if (CY_CAPSENSE_STATUS_SUCCESS == status_local)
     {
         Cy_SysInt_Init(&capsense_intr_config, _capsense_isr);
         NVIC_ClearPendingIRQ(capsense_intr_config.intrSrc);
         NVIC_EnableIRQ(capsense_intr_config.intrSrc);
 
-        status = Cy_CapSense_Enable(&cy_capsense_context);
+        status_local = Cy_CapSense_Enable(&cy_capsense_context);
     }
 
-    if(status != CY_CAPSENSE_STATUS_SUCCESS)
+    if(status_local != CY_CAPSENSE_STATUS_SUCCESS)
     {
     }
 }
@@ -55,13 +56,20 @@ void capsense_update_touch_status(void)
 {
     g_touch_status_bitmap = 0;
 
-    for (uint8_t i = 0; i < 12; i++)
+    static uint8_t i;
+    for (i = 0; i < 12; i++)
     {
         if (Cy_CapSense_IsWidgetActive(i, &cy_capsense_context))
         {
             g_touch_status_bitmap |= (1 << i);
         }
     }
+}
+
+// 获取触摸状态位图
+uint16_t capsense_get_touch_status_bitmap(void)
+{
+    return g_touch_status_bitmap;
 }
 
 // 应用阈值更改
@@ -84,7 +92,8 @@ void capsense_apply_threshold_changes(void)
             CY_CAPSENSE_CAPB_FINGER_TH_PARAM_ID
         };
 
-        for (uint8_t i = 0; i < CAPSENSE_WIDGET_COUNT; i++)
+        static uint8_t i;
+        for (i = 0; i < CAPSENSE_WIDGET_COUNT; i++)
         {
             Cy_CapSense_SetParam(widget_finger_th_param_ids[i], g_cap_thresholds[i], &cy_capsense_tuner, &cy_capsense_context);
         }
@@ -102,6 +111,18 @@ void capsense_start_scan(void)
 bool capsense_is_busy(void)
 {
     return (CY_CAPSENSE_BUSY == Cy_CapSense_IsBusy(&cy_capsense_context));
+}
+
+// 阈值访问器
+uint16_t capsense_get_threshold(uint8_t idx)
+{
+    return g_cap_thresholds[idx];
+}
+
+void capsense_set_threshold(uint8_t idx, uint16_t value)
+{
+    g_cap_thresholds[idx] = value;
+    g_threshold_changed = true;
 }
 
 #if CY_CAPSENSE_BIST_EN

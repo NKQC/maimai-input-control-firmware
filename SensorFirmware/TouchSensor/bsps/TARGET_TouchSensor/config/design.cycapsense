@@ -27,7 +27,7 @@
         <Property id="PROX_IIR_BL_N" value="1"/>
         <Property id="PROX_IIR_BL_TYPE" value="PERFORMANCE"/>
         <Property id="MULTI_FREQ_SCAN_EN" value="false"/>
-        <Property id="SENSOR_AUTO_RESET_EN" value="true"/>
+        <Property id="SENSOR_AUTO_RESET_EN" value="false"/>
         <Property id="SLIDER_MULTIPLIER" value="SNS_NUM_MINUS_1"/>
         <Property id="TOUCHPAD_MULTIPLIER" value="SNS_NUM_MINUS_1"/>
         <Property id="BLOCK_ANALOG_WAKEUP_DELAY_US" value="10"/>
