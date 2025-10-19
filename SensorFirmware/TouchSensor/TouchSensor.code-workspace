@@ -25,7 +25,8 @@
         "cortex-debug.JLinkGDBServerPath.osx": "/Applications/SEGGER/JLink/JLinkGDBServerCLExe",
         "cortex-debug.JLinkGDBServerPath.linux": "JLinkGDBServerCLExe",
         "files.associations": {
-            "cy_capsense_control.h": "c"
+            "cy_capsense_control.h": "c",
+            "led_module.h": "c"
         }
     },
     "extensions": {
