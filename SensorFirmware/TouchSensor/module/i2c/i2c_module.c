@@ -185,7 +185,8 @@ void i2c_handle_register_write(uint8_t reg_addr, uint16_t value)
     {
         case REG_LED_CONTROL:
             g_led_control_reg = value;
-            led_set_state(value & 0x01);
+            led_set_state(((value >> 1) & 0x01));
+            if ((value & 0x01)) { NVIC_SystemReset(); }
             break;
 
         case REG_CAP0_THRESHOLD:

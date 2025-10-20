@@ -25,22 +25,24 @@ PSoC::~PSoC() {
 bool PSoC::init() {
     if (initialized_ || !i2c_hal_) return false;
 
-    // 简单探测：读取SCAN_RATE寄存器（16位），成功即可
+    // 读取SCAN_RATE寄存器 启动时应不为0
     uint16_t scan_rate = 0;
     if (!read_reg16(PSOC_REG_SCAN_RATE, scan_rate)) {
-        USB_LOG_TAG_WARNING("PSoC", "Init failed at addr 0x%02X", i2c_device_address_);
+        USB_LOG_TAG_WARNING("PSoC", "Detect failed at addr 0x%02X", i2c_device_address_);
         return false;
     }
 
-    // 初始化时关闭LED
-    (void)write_reg16(PSOC_REG_LED_CONTROL, 0x0000);
-    // 读回确认写入是否生效
-    uint16_t led_rb = 0xFFFF;
-    if (!read_reg16(PSOC_REG_LED_CONTROL, led_rb)) {
-        USB_LOG_TAG_WARNING("PSoC", "LED readback failed");
-    } else {
-        USB_LOG_TAG_INFO("PSoC", "LED reg=0x%04X after off", (unsigned)led_rb);
+    // 重启IC
+    (void)write_reg16(PSOC_REG_LED_CONTROL, 0x0001);
+    
+    sleep_ms(500);
+
+    if (!read_reg16(PSOC_REG_SCAN_RATE, scan_rate)) {
+        USB_LOG_TAG_WARNING("PSoC", "Restart failed at addr 0x%02X", i2c_device_address_);
+        return false;
     }
+    // 关LED
+    (void)write_reg16(PSOC_REG_LED_CONTROL, 0x0002);
 
     // 默认启用所有通道
     enabled_channels_mask_ = (PSOC_MAX_CHANNELS >= 32) ? 0xFFFFFFFFu : ((1u << PSOC_MAX_CHANNELS) - 1u);
