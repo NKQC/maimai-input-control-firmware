@@ -19,16 +19,25 @@ class TouchSensor;
 enum class TouchSensorType : uint8_t {
     UNKNOWN = 0,
     GTX312L = 1,    // GTX312L触摸控制器
-    AD7147 = 2      // AD7147触摸控制器
+    AD7147 = 2,     // AD7147触摸控制器
+    PSOC    = 3     // PSoC I2C从机触摸传感器
 };
 
-/**
- * IC反掩码定义 - 用于自动识别不同IC类型
- * 当(IC_ADDRESS & REVERSE_MASK) == 0时判定为匹配
- */
+// 新的地址匹配规则结构：通过枚举描述匹配类型，便于扩展
+struct TouchSensorAddressRule {
+    enum class Match : uint8_t { Range, Exact, Mask };
+    TouchSensorType type; // 设备类型
+    Match match;          // 匹配方式
+    uint8_t a;            // Range: 起始地址；Exact: 精确地址；Mask: 掩码
+    uint8_t b;            // Range: 结束地址；Exact: 保留0；Mask: 期望值
+};
+
+// IC反掩码定义（历史兼容，已由地址段匹配替代）
+// 当(IC_ADDRESS & REVERSE_MASK) == 0时判定为匹配（不再用于实现，仅保留）
 enum class TouchSensorReverseMask : uint8_t {
     GTX312L_MASK = 0x4F,  // GTX312L使用0xB*地址模式的反掩码
-    AD7147_MASK = 0xD2    // AD7147使用0x2*地址模式的反掩码
+    AD7147_MASK = 0xD2,   // AD7147使用0x2*地址模式的反掩码
+    PSOC_MASK    = 0xF0   // PSoC使用0x08-0x0B地址段（补充掩码占位）
 };
 
 typedef struct {

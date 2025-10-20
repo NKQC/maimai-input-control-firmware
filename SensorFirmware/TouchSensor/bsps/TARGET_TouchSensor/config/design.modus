@@ -305,16 +305,25 @@
                         <Param id="startOnReset" value="true"/>
                     </Parameters>
                 </Personality>
-                <Personality template="m0s8ezi2c" version="1.0" instance="QmMHglsOA9U">
+                <Personality template="m0s8i2c" version="1.0" instance="QmMHglsOA9U">
                     <Block location="scb[1]" locked="true"/>
                     <Parameters>
+                        <Param id="AcceptAddress" value="false"/>
+                        <Param id="AcceptGeneralCall" value="false"/>
+                        <Param id="CallbackDS" value="false"/>
                         <Param id="CallbackDSName" value="DsClockConfigCallback"/>
                         <Param id="DataRate" value="100"/>
+                        <Param id="EnableRxFifo" value="true"/>
+                        <Param id="EnableTxFifo" value="true"/>
                         <Param id="EnableWakeup" value="false"/>
-                        <Param id="NumOfAddr" value="CY_SCB_EZI2C_ONE_ADDRESS"/>
-                        <Param id="SlaveAddress1" value="8"/>
-                        <Param id="SlaveAddress2" value="9"/>
-                        <Param id="SubAddrSize" value="CY_SCB_EZI2C_SUB_ADDR8_BITS"/>
+                        <Param id="ManualDataRateCtrl" value="false"/>
+                        <Param id="ManualDigitalFilter" value="true"/>
+                        <Param id="ManualHighPhaseDutyCycle" value="9"/>
+                        <Param id="ManualLowPhaseDutyCycle" value="16"/>
+                        <Param id="ModeUser" value="CY_SCB_I2C_SLAVE"/>
+                        <Param id="RxAddressFifoDelay" value="6"/>
+                        <Param id="SlaveAddress" value="16"/>
+                        <Param id="SlaveAddressMask" value="254"/>
                         <Param id="inFlash" value="true"/>
                     </Parameters>
                 </Personality>

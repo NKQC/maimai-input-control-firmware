@@ -46,13 +46,13 @@ static void _capsense_isr(void)
 }
 
 // 处理CapSense控件
-void capsense_process_widgets(void)
+inline void capsense_process_widgets(void)
 {
     Cy_CapSense_ProcessAllWidgets(&cy_capsense_context);
 }
 
 // 更新触摸状态位图
-void capsense_update_touch_status(void)
+inline void capsense_update_touch_status(void)
 {
     g_touch_status_bitmap = 0;
 
@@ -67,7 +67,7 @@ void capsense_update_touch_status(void)
 }
 
 // 获取触摸状态位图
-uint16_t capsense_get_touch_status_bitmap(void)
+inline uint16_t capsense_get_touch_status_bitmap(void)
 {
     return g_touch_status_bitmap;
 }

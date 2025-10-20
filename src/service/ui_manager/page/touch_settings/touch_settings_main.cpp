@@ -85,43 +85,49 @@ void TouchSettingsMain::render(PageTemplate& page_template) {
 
     // 触摸状态查看菜单项
     ADD_MENU("查看触摸状态", "touch_status", COLOR_TEXT_WHITE)
-    calibration_in_progress_ = input_manager->isCalibrationInProgress();
-    if (calibration_in_progress_) {
-        // 校准进行中，显示进度条
-        InputManager* input_manager = InputManager::getInstance();
-        progress = input_manager->getCalibrationProgress();
-        if (progress == 255) {
-            // 校准完成
-            ADD_TEXT("校准完成", COLOR_GREEN, LineAlign::CENTER)
-        } else {
-            // 显示进度条
-            ADD_TEXT("校准进度", COLOR_YELLOW, LineAlign::CENTER)
-            ADD_PROGRESS(&progress, COLOR_YELLOW)
-        }
-    } else {
-        // 校准灵敏度目标选择器
-        static char sensitivity_text[32];
-        SensitivityOption current_option = static_cast<SensitivityOption>(TouchSettingsMain::sensitivity_target);
-        snprintf(sensitivity_text, sizeof(sensitivity_text), "校准灵敏度: %s", getSensitivityOptionText(current_option));
-        ADD_SIMPLE_SELECTOR(sensitivity_text, [](JoystickState state) {
-            if (state == JoystickState::UP && TouchSettingsMain::sensitivity_target < SENSITIVITY_MAX) {
-                TouchSettingsMain::sensitivity_target++;
-            } else if (state == JoystickState::DOWN && TouchSettingsMain::sensitivity_target > SENSITIVITY_MIN) {
-                TouchSettingsMain::sensitivity_target--;
+    
+    // 检查是否存在可校准的传感器
+    bool has_calibratable_sensors = input_manager->hasCalibratableSensors();
+    
+    if (has_calibratable_sensors) {
+        calibration_in_progress_ = input_manager->isCalibrationInProgress();
+        if (calibration_in_progress_) {
+            // 校准进行中，显示进度条
+            InputManager* input_manager = InputManager::getInstance();
+            progress = input_manager->getCalibrationProgress();
+            if (progress == 255) {
+                // 校准完成
+                ADD_TEXT("校准完成", COLOR_GREEN, LineAlign::CENTER)
+            } else {
+                // 显示进度条
+                ADD_TEXT("校准进度", COLOR_YELLOW, LineAlign::CENTER)
+                ADD_PROGRESS(&progress, COLOR_YELLOW)
             }
-        }, COLOR_TEXT_WHITE)
-        
-        // 未开始校准，显示校准按钮
-        ADD_BUTTON("校准全部传感器", onCalibrateButtonPressed, COLOR_TEXT_WHITE, LineAlign::CENTER)
+        } else {
+            // 校准灵敏度目标选择器
+            static char sensitivity_text[32];
+            SensitivityOption current_option = static_cast<SensitivityOption>(TouchSettingsMain::sensitivity_target);
+            snprintf(sensitivity_text, sizeof(sensitivity_text), "校准灵敏度: %s", getSensitivityOptionText(current_option));
+            ADD_SIMPLE_SELECTOR(sensitivity_text, [](JoystickState state) {
+                if (state == JoystickState::UP && TouchSettingsMain::sensitivity_target < SENSITIVITY_MAX) {
+                    TouchSettingsMain::sensitivity_target++;
+                } else if (state == JoystickState::DOWN && TouchSettingsMain::sensitivity_target > SENSITIVITY_MIN) {
+                    TouchSettingsMain::sensitivity_target--;
+                }
+            }, COLOR_TEXT_WHITE)
+            
+            // 未开始校准，显示校准按钮
+            ADD_BUTTON("校准全部传感器", onCalibrateButtonPressed, COLOR_TEXT_WHITE, LineAlign::CENTER)
+        }
+
+        // 按分区设置灵敏度选项（仅Serial模式）
+        if (input_manager->getWorkMode() == InputWorkMode::SERIAL_MODE) {
+            ADD_MENU("按分区校准灵敏度", "zone_sensitivity", COLOR_TEXT_WHITE)
+        }
     }
 
     // 灵敏度调整菜单项
     ADD_MENU("按模块调整灵敏度", "sensitivity_main", COLOR_TEXT_WHITE)
-    
-    // 按分区设置灵敏度选项（仅Serial模式）
-    if (input_manager->getWorkMode() == InputWorkMode::SERIAL_MODE) {
-        ADD_MENU("按分区设置灵敏度", "zone_sensitivity", COLOR_TEXT_WHITE)
-    }
 
     PAGE_END()
 }

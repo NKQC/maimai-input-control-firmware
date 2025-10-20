@@ -2437,6 +2437,16 @@ uint8_t InputManager::getCalibrationProgress()
     return (average_progress >= 255) ? 254 : static_cast<uint8_t>(average_progress);
 }
 
+bool InputManager::hasCalibratableSensors() const
+{
+    for (TouchSensor *sensor : touch_sensor_devices_) {
+        if (sensor && sensor->supports_calibration_) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // 根据设备ID掩码获取设备名称 - UI显示时调用
 std::string InputManager::getDeviceNameByMask(uint32_t device_and_channel_mask) const
 {

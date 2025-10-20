@@ -35,9 +35,6 @@ void SensitivityMain::render(PageTemplate& page_template) {
     // 返回上级页面
     ADD_BACK_ITEM("返回", COLOR_TEXT_WHITE)
     
-    // 交互式灵敏度调整选项（第一行）
-    ADD_MENU("交互式调整", "interactive_sensitivity", COLOR_TEXT_YELLOW)
-    
     if (device_count == 0) {
         ADD_TEXT("未检测到触摸IC设备", COLOR_YELLOW, LineAlign::CENTER)
     } else {

@@ -1,10 +1,18 @@
 #include "touch_sensor.h"
 #include "gtx312l/gtx312l.h"
 #include "ad7147/ad7147.h"
+#include "psoc/psoc.h"
 #include "../../hal/i2c/hal_i2c.h"
 #include "../usb_serial_logs/usb_serial_logs.h"
 
 // TouchSensor基类实现文件
+
+// 地址识别规则表 类型：匹配方式（Range/Exact/Mask）、起始地址、结束地址/精确地址/掩码
+static constexpr TouchSensorAddressRule kTouchAddressRules[] = {
+    { TouchSensorType::PSOC,    TouchSensorAddressRule::Match::Range, 0x08, 0x0E },
+    { TouchSensorType::GTX312L, TouchSensorAddressRule::Match::Range, 0xB0, 0xB6 },
+    { TouchSensorType::AD7147,  TouchSensorAddressRule::Match::Range, 0x2C, 0x2F },
+};
 
 /**
  * 获取当前模块支持的通道数量
@@ -22,16 +30,19 @@ uint32_t TouchSensor::getSupportedChannelCount() const {
  * @return IC类型
  */
 TouchSensorType TouchSensor::identifyICType(uint8_t i2c_address) {
-    // GTX312L使用0xB*地址模式，反掩码0x4F (B=1011, 反掩码=0100) 尚未修改
-    if ((i2c_address & static_cast<uint8_t>(TouchSensorReverseMask::GTX312L_MASK)) == 0x40) {
-        return TouchSensorType::GTX312L;
+    for (const auto& rule : kTouchAddressRules) {
+        switch (rule.match) {
+            case TouchSensorAddressRule::Match::Range:
+                if (i2c_address >= rule.a && i2c_address <= rule.b) return rule.type;
+                break;
+            case TouchSensorAddressRule::Match::Exact:
+                if (i2c_address == rule.a) return rule.type;
+                break;
+            case TouchSensorAddressRule::Match::Mask:
+                if ((i2c_address & rule.a) == rule.b) return rule.type;
+                break;
+        }
     }
-    
-    // AD7147使用0x2*地址模式
-    if (!(i2c_address & static_cast<uint8_t>(TouchSensorReverseMask::AD7147_MASK))) {
-        return TouchSensorType::AD7147;
-    }
-    
     return TouchSensorType::UNKNOWN;
 }
 
@@ -100,6 +111,10 @@ std::unique_ptr<TouchSensor> TouchSensor::createSensor(TouchSensorType type, HAL
             
         case TouchSensorType::AD7147:
             sensor = std::make_unique<AD7147>(i2c_hal, i2c_bus, i2c_address);
+            break;
+
+        case TouchSensorType::PSOC:
+            sensor = std::make_unique<PSoC>(i2c_hal, i2c_bus, i2c_address);
             break;
             
         default:

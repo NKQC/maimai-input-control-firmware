@@ -136,9 +136,6 @@ bool GTX312L::read_registers(uint8_t reg, uint8_t* data, size_t length) {
     return i2c_hal_->read(i2c_device_address_, data, length);
 }
 
-// TouchSensor接口实现
-
-
 uint32_t GTX312L::getSupportedChannelCount() const {
     return static_cast<uint32_t>(max_channels_);
 }

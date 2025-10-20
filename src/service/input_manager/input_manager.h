@@ -356,6 +356,9 @@ public:
         return calibration_in_progress_;
     }
     
+    // 检查是否存在支持校准的传感器
+    bool hasCalibratableSensors() const;
+    
     // 根据设备ID掩码获取设备名称 - UI显示时调用
     std::string getDeviceNameByMask(uint32_t device_and_channel_mask) const;
     

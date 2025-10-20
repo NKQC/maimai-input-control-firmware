@@ -171,7 +171,8 @@ int32_t HAL_I2C::read_register(uint8_t address, uint16_t reg, uint8_t* value, ui
         data[0] = (reg >> 8) & 0x7F;
         data[1] = reg & 0xFF;
     }
-    i2c_write_blocking(i2c_instance_, address, data, reg_size, true);
+    // 子地址写入后发送 STOP，确保 EZI2C 指针锁定
+    i2c_write_blocking(i2c_instance_, address, data, reg_size, false);
     return i2c_read_blocking(i2c_instance_, address, value, length, false);
 }
 

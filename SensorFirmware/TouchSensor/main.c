@@ -103,20 +103,20 @@ static inline uint8_t _get_i2c_address(void)
 {
     Cy_GPIO_Pin_FastInit(ADDR_PIN_P3_3_PORT, ADDR_PIN_P3_3_NUM, CY_GPIO_DM_PULLUP, 1, HSIOM_SEL_GPIO);
     Cy_GPIO_Pin_FastInit(ADDR_PIN_P3_2_PORT, ADDR_PIN_P3_2_NUM, CY_GPIO_DM_PULLUP, 1, HSIOM_SEL_GPIO);
-
+    Cy_SysLib_DelayUs(100);  // 等待GPIO稳定
     static uint8_t addr_bits; 
     addr_bits = 0;
 
-    if (Cy_GPIO_Read(ADDR_PIN_P3_3_PORT, ADDR_PIN_P3_3_NUM) == 0)
+    if (Cy_GPIO_Read(ADDR_PIN_P3_3_PORT, ADDR_PIN_P3_3_NUM))
+    {
+        addr_bits |= 0x04;
+    }
+
+    if (Cy_GPIO_Read(ADDR_PIN_P3_2_PORT, ADDR_PIN_P3_2_NUM))
     {
         addr_bits |= 0x02;
     }
-
-    if (Cy_GPIO_Read(ADDR_PIN_P3_2_PORT, ADDR_PIN_P3_2_NUM) == 0)
-    {
-        addr_bits |= 0x01;
-    }
-
+    
     Cy_GPIO_Pin_FastInit(ADDR_PIN_P3_3_PORT, ADDR_PIN_P3_3_NUM, CY_GPIO_DM_STRONG, 1, P3_3_CPUSS_SWD_CLK);
     Cy_GPIO_Pin_FastInit(ADDR_PIN_P3_2_PORT, ADDR_PIN_P3_2_NUM, CY_GPIO_DM_STRONG, 1, P3_2_CPUSS_SWD_DATA);
 
