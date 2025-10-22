@@ -29,6 +29,9 @@ bool HAL_I2C::init(uint8_t sda_pin, uint8_t scl_pin, uint32_t frequency) {
     sda_pin_ = sda_pin;
     scl_pin_ = scl_pin;
     
+    // 在初始化I2C之前尝试解除总线锁定
+    HAL_I2C::unlock_bus(sda_pin_, scl_pin_);
+    
     // 初始化I2C
     i2c_init(i2c_instance_, frequency);
     
@@ -635,4 +638,41 @@ inline bool HAL_I2C::_wait_for_bus_idle(uint32_t timeout_ms) {
     }
     
     return true;
+}
+
+// 解除I2C总线锁定：通过手动SCL脉冲与STOP条件释放SDA
+void HAL_I2C::unlock_bus(uint8_t sda_pin, uint8_t scl_pin, uint32_t pulse_delay_us) {
+    // 切换为GPIO功能，并保持上拉
+    gpio_set_function(sda_pin, GPIO_FUNC_SIO);
+    gpio_set_function(scl_pin, GPIO_FUNC_SIO);
+    gpio_pull_up(sda_pin);
+    gpio_pull_up(scl_pin);
+
+    // 释放（输入态模拟开漏高电平）
+    gpio_set_dir(sda_pin, GPIO_IN);
+    gpio_set_dir(scl_pin, GPIO_IN);
+
+    // 若SDA为低，尝试通过SCL脉冲使从设备释放SDA
+    if (!gpio_get(sda_pin)) {
+        for (int i = 0; i < 18 && !gpio_get(sda_pin); ++i) {
+            // Drive SCL low
+            gpio_set_dir(scl_pin, GPIO_OUT);
+            gpio_put(scl_pin, 0);
+            sleep_us(pulse_delay_us);
+            // Release SCL high
+            gpio_set_dir(scl_pin, GPIO_IN);
+            sleep_us(pulse_delay_us);
+        }
+    }
+
+    // 发送STOP条件：SDA低 -> SCL高 -> SDA高
+    gpio_set_dir(sda_pin, GPIO_OUT);
+    gpio_put(sda_pin, 0);
+    sleep_us(pulse_delay_us);
+
+    gpio_set_dir(scl_pin, GPIO_IN); // 释放SCL为高
+    sleep_us(pulse_delay_us);
+
+    gpio_set_dir(sda_pin, GPIO_IN); // 释放SDA为高
+    sleep_us(pulse_delay_us);
 }

@@ -28,12 +28,17 @@ PSoC::~PSoC() {
 bool PSoC::init() {
     if (initialized_ || !i2c_hal_) return false;
 
-    if (!write_reg16(PSOC_REG_CONTROL, 0x21)) {
-        USB_LOG_TAG_WARNING("PSoC", "Control write failed at addr 0x%02X", i2c_device_address_);
+    if (!write_reg16(PSOC_REG_CONTROL, 0x01)) {
+        USB_LOG_TAG_WARNING("PSoC", "Control reset failed at addr 0x%02X", i2c_device_address_);
         return false;
     }
 
     sleep_ms(500);
+
+    if (!write_reg16(PSOC_REG_CONTROL, 0x04)) {
+        USB_LOG_TAG_WARNING("PSoC", "Control write failed at addr 0x%02X", i2c_device_address_);
+        return false;
+    }
 
     // 读取SCAN_RATE寄存器 启动时应不为0
     uint16_t scan_rate = 0;
@@ -132,11 +137,11 @@ bool PSoC::setChannelSensitivity(uint8_t channel, uint8_t sensitivity) {
         return false;
     }
 
-    // // 写入后读取该通道总电容（单位步进0.01pF），用于保存观感
-    // uint16_t steps = 0;
-    // if (readTotalCap(channel, steps)) {
-    //     channel_total_cap_steps_[channel] = steps;
-    // }
+    // 写入后读取该通道总电容（单位步进0.01pF），用于保存观感
+    uint16_t steps = 0;
+    if (readTotalCap(channel, steps)) {
+        channel_total_cap_steps_[channel] = steps;
+    }
 
     return true;
 }

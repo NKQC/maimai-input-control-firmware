@@ -60,6 +60,9 @@ public:
     
     virtual ~HAL_I2C() = default;
     
+    // 解除I2C总线锁定（在初始化前调用）
+    static void unlock_bus(uint8_t sda_pin, uint8_t scl_pin, uint32_t pulse_delay_us = 5);
+    
     // 初始化I2C接口
     bool init(uint8_t sda_pin, uint8_t scl_pin, uint32_t frequency = 100000);
     
