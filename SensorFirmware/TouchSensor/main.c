@@ -12,6 +12,7 @@
 
 static uint64_t _last_scan_time = 0;
 static volatile uint32_t _systick_overflow_count = 0;
+static uint16_t _last_touch_status = 0;
 
 static inline uint64_t _get_system_time_us(void);
 static inline void _update_scan_rate(void);
@@ -21,6 +22,7 @@ static inline uint8_t _get_i2c_address(void);
 int main(void)
 {
     static cy_rslt_t result; 
+    register uint16_t status = 0;
     result = CY_RSLT_SUCCESS;
 
     result = cybsp_init();
@@ -47,8 +49,11 @@ int main(void)
             capsense_process_widgets();
             capsense_update_touch_status();
             capsense_apply_threshold_changes();
+            status = capsense_get_touch_status_bitmap();
+            i2c_set_touch_status_snapshot(status);
             if (i2c_led_feedback_enabled()) {
-                led_set_state(capsense_get_touch_status_bitmap() != 0);
+                led_set_state(status != _last_touch_status);
+                _last_touch_status = status;
             }
             _update_scan_rate();
             capsense_start_scan();

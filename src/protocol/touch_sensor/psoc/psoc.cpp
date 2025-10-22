@@ -35,10 +35,10 @@ bool PSoC::init() {
 
     sleep_ms(500);
 
-    if (!write_reg16(PSOC_REG_CONTROL, 0x04)) {
-        USB_LOG_TAG_WARNING("PSoC", "Control write failed at addr 0x%02X", i2c_device_address_);
-        return false;
-    }
+    // if (!write_reg16(PSOC_REG_CONTROL, 0x04)) {
+    //     USB_LOG_TAG_WARNING("PSoC", "Control write failed at addr 0x%02X", i2c_device_address_);
+    //     return false;
+    // }
 
     // 读取SCAN_RATE寄存器 启动时应不为0
     uint16_t scan_rate = 0;
@@ -64,16 +64,41 @@ uint32_t PSoC::getSupportedChannelCount() const {
     return static_cast<uint32_t>(max_channels_);
 }
 
+#ifndef PSOC_SAMPLE_USE_SYNC
+#define PSOC_SAMPLE_USE_SYNC 1  // 仅对本文件生效：1=同步采样，0=异步采样
+#endif
 void PSoC::sample(async_touchsampleresult callback) {
     if (!callback) return;
+#if PSOC_SAMPLE_USE_SYNC
+    // 同步采样路径：用于验证稳定性
     if (!initialized_) {
         TouchSampleResult result{};
-        result.timestamp_us = time_us_32();
+        result.timestamp_us = 0; // 未初始化视为失败
         callback(result);
         return;
     }
-
-    // 标准异步实现：发起寄存器异步读取（写子地址+读2字节），回调解析
+    uint16_t touch_status = 0;
+    if (!read_reg16(PSOC_REG_TOUCH_STATUS, touch_status)) {
+        TouchSampleResult result{};
+        result.timestamp_us = 0; // 读取失败视为失败
+        callback(result);
+        return;
+    }
+    TouchSampleResult result{0, 0};
+    uint32_t mask12 = static_cast<uint32_t>(touch_status & 0x0FFFu);
+    result.channel_mask = mask12 & enabled_channels_mask_;
+    result.module_mask = module_mask_;
+    result.timestamp_us = time_us_32();
+    // USB_LOG_DEBUG("Sync read, data={0x%02X, 0x%02X}", (touch_status >> 8) & 0xFF, touch_status & 0xFF);
+    callback(result);
+#else
+    // 异步采样路径：DMA+中断完成后回调（HAL已在STOP中断等待RX DMA完成）
+    if (!initialized_) {
+        TouchSampleResult result{};
+        result.timestamp_us = 0; // 未初始化视为失败
+        callback(result);
+        return;
+    }
     i2c_hal_->read_register_async(
         i2c_device_address_,
         PSOC_REG_TOUCH_STATUS,
@@ -81,17 +106,21 @@ void PSoC::sample(async_touchsampleresult callback) {
         2,
         [this, callback](bool success) {
             TouchSampleResult result{0, 0};
-            result.timestamp_us = time_us_32();
             if (success) {
                 uint16_t v = (static_cast<uint16_t>(_async_read_buffer[0]) << 8) |
                               static_cast<uint16_t>(_async_read_buffer[1]);
                 uint32_t mask12 = static_cast<uint32_t>(v & 0x0FFFu);
                 result.channel_mask = mask12 & enabled_channels_mask_;
                 result.module_mask = module_mask_;
+                result.timestamp_us = time_us_32();
+                USB_LOG_DEBUG("Async read, data={0x%02X, 0x%02X}", (v >> 8) & 0xFF, v & 0xFF);
+            } else {
+                result.timestamp_us = 0; // 失败采样，InputManager将忽略
             }
             callback(result);
         }
     );
+#endif
 }
 
 bool PSoC::setChannelEnabled(uint8_t channel, bool enabled) {

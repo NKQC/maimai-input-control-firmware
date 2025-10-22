@@ -1714,8 +1714,8 @@ void InputManager::processSerialBinding()
 {
     static uint8_t binding_device_addr = 0;
     static uint8_t binding_channel = 0;
-    static uint8_t initial_binding_device_addr = 0;  // 记录初始触摸的设备
-    static uint8_t initial_binding_channel = 0;      // 记录初始触摸的通道
+    // 每通道连续触发的开始时间（ms），用于绑定判定
+    static uint32_t channel_hold_start_ms[8][24] = {{0}};
 
     switch (binding_state_)
     {
@@ -1731,6 +1731,12 @@ void InputManager::processSerialBinding()
             mai2_serial_->manually_triggle_area(current_area);
 
             // 切换到等待触摸状态
+            // 重置每通道的连续触发计时
+            for (int d = 0; d < 8; ++d) {
+                for (int c = 0; c < 24; ++c) {
+                    channel_hold_start_ms[d][c] = 0;
+                }
+            }
             binding_state_ = BindingState::WAIT_TOUCH;
             binding_start_time_ = to_ms_since_boot(get_absolute_time());
         }
@@ -1745,10 +1751,12 @@ void InputManager::processSerialBinding()
 
     case BindingState::WAIT_TOUCH:
     {
-        // 检测触摸输入 - 查找有且只有一个通道触发的情况
-        uint8_t touched_device_id = 0;
-        uint8_t touched_channel = 0;
-        int touch_count = 0;
+        // 新规则：任意一个通道连续触发>=1s则绑定；
+        // 若同时有两个及以上通道连续>=1s则失败；其他零星触发不影响。
+        uint32_t current_time = to_ms_since_boot(get_absolute_time());
+        int held_channels_count = 0;
+        int held_dev_idx = -1;
+        int held_ch = -1;
 
         for (int dev_idx = 0; dev_idx < config_->device_count; dev_idx++)
         {
@@ -1760,52 +1768,42 @@ void InputManager::processSerialBinding()
             const uint8_t max_channels = mapping->max_channels;
             const uint32_t channel_mask = touch_device_states_[dev_idx].parts.channel_mask;
 
-            // 计算当前设备的触摸通道数
             for (uint8_t ch = 0; ch < max_channels && ch < 24; ch++)
             {
                 const uint32_t ch_mask = (1UL << ch);
-                if (channel_mask & ch_mask)
-                {
-                    touch_count++;
-                    touched_device_id = device_id_mask;
-                    touched_channel = ch;
+                bool active = (channel_mask & ch_mask) != 0;
+
+                if (active) {
+                    if (channel_hold_start_ms[dev_idx][ch] == 0) {
+                        channel_hold_start_ms[dev_idx][ch] = current_time;
+                    }
+                } else {
+                    channel_hold_start_ms[dev_idx][ch] = 0;
+                }
+
+                if (channel_hold_start_ms[dev_idx][ch] != 0 &&
+                    (current_time - channel_hold_start_ms[dev_idx][ch] >= 1000)) {
+                    held_channels_count++;
+                    held_dev_idx = dev_idx;
+                    held_ch = ch;
                 }
             }
         }
 
-        // 检查是否有且只有一个通道触发
-        if (touch_count == 1)
-        {
-            uint32_t current_time = to_ms_since_boot(get_absolute_time());
-            
-            // 检查是否是第一次检测到触摸，或者是否是同一个设备和通道
-            if (current_time - binding_start_time_ < 100) // 前100ms内记录初始触摸
-            {
-                initial_binding_device_addr = touched_device_id;
-                initial_binding_channel = touched_channel;
-            }
-            else if (touched_device_id != initial_binding_device_addr || touched_channel != initial_binding_channel)
-            {
-                // 触摸的设备或通道发生变化，重置计时器（防止狸猫换太子）
-                binding_start_time_ = to_ms_since_boot(get_absolute_time());
-                initial_binding_device_addr = touched_device_id;
-                initial_binding_channel = touched_channel;
-            }
-            else if (current_time - binding_start_time_ >= 1000)
-            {   // 持续1秒且始终是同一个设备和通道
-                // 记录触摸的通道ID并切换到处理状态
-                binding_device_addr = touched_device_id;
-                binding_channel = touched_channel;
-                binding_state_ = BindingState::PROCESSING;
-            }
-        }
-        else
-        {
-            // 重置计时器（没有触摸或多个触摸）
-            binding_start_time_ = to_ms_since_boot(get_absolute_time());
-            initial_binding_device_addr = 0;
-            initial_binding_channel = 0;
-        }
+        if (held_channels_count >= 2)
+         {
+             // 存在多个通道连续≥1s，继续等待唯一达标通道（不回调、不取消）
+             log_info("Binding waiting: multiple channels held >1s");
+             // 保持等待状态，无需重置计时
+         }
+         else if (held_channels_count == 1)
+         {
+             // 成功：唯一全程触发通道
+             binding_device_addr = touch_device_states_[held_dev_idx].parts.device_mask;
+             binding_channel = static_cast<uint8_t>(held_ch);
+             binding_state_ = BindingState::PROCESSING;
+         }
+         // else: 继续等待
     }
     break;
 

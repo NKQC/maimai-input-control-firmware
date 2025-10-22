@@ -360,9 +360,6 @@ bool HAL_I2C::_setup_dma_read(uint8_t address, uint8_t* buffer, size_t length) {
         return false;
     }
     
-    // 启用I2C中断用于异步操作
-    _enable_i2c_interrupts();
-    
     if (length == 0 || length > 256) {
         return false;
     }
@@ -418,8 +415,11 @@ bool HAL_I2C::_setup_dma_read(uint8_t address, uint8_t* buffer, size_t length) {
         length,
         false
     );
+
+    // 启用I2C中断用于异步操作
+    _enable_i2c_interrupts();
     
-    // 先启动RX，再启动TX - 参考i2c_dma.c的顺序
+    // 先启动RX，再启动TX
     dma_channel_start(dma_rx_channel_);
     dma_channel_start(dma_tx_channel_);
     
@@ -431,9 +431,6 @@ bool HAL_I2C::_setup_dma_write_read(uint8_t address, const uint8_t* wbuf, size_t
     if (wlen == 0 || rlen == 0 || (wlen + rlen) > 256) {
         return false;
     }
-    
-    // 启用I2C中断用于异步操作
-    _enable_i2c_interrupts();
     
     dma_status_ = DMA_Status::RX_BUSY;  // 最终状态是读取
     
@@ -493,7 +490,9 @@ bool HAL_I2C::_setup_dma_write_read(uint8_t address, const uint8_t* wbuf, size_t
         wlen + rlen,
         false
     );
-    
+
+    // 启用I2C中断用于异步操作
+    _enable_i2c_interrupts();
     // 先启动RX，再启动TX
     dma_channel_start(dma_rx_channel_);
     dma_channel_start(dma_tx_channel_);
@@ -545,12 +544,13 @@ void HAL_I2C::_handle_i2c_irq() {
         // 清除STOP_DET中断
         (void)hw->clr_stop_det;
 
-        dma_status_ = DMA_Status::IDLE;
+        dma_channel_wait_for_finish_blocking(dma_rx_channel_);
         
         // 调用回调函数
         if (dma_context_.callback) {
             dma_context_.callback(true);
         }
+        dma_status_ = DMA_Status::IDLE;
         return;
     }
 }

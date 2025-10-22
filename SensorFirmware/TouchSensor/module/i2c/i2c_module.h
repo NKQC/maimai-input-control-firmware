@@ -55,4 +55,7 @@ void i2c_handle_register_write(uint8_t reg_addr, uint16_t value);
 // 读取LED触摸提示开关状态（CONTROL.bit5）
 bool i2c_led_feedback_enabled(void);
 
+// 新增：主循环提交触摸状态快照，I2C读取返回该快照
+void i2c_set_touch_status_snapshot(uint16_t status);
+
 #endif

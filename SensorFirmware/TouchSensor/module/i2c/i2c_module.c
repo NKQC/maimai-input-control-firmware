@@ -5,6 +5,8 @@
 static cy_stc_scb_i2c_context_t i2c_context;
 static uint16_t g_scan_rate_per_second = 0;
 static volatile i2c_control_reg_t g_control_reg = { .raw = 0 };
+// 新增：触摸状态的主循环快照，I2C读取返回该值以避免抖动
+static volatile uint16_t g_touch_status_snapshot = 0u;
 
 // 使用独立的读写缓冲区，避免读缓冲被写入数据污染
 static uint8_t _i2c_write_buffer[I2C_SLAVE_BUFFER_SIZE];
@@ -72,6 +74,12 @@ void i2c_init(uint8_t slave_address)
 bool i2c_led_feedback_enabled(void)
 {
     return (g_control_reg.bits.led_feedback_en != 0u);
+}
+
+// 新增：由主循环提交触摸状态快照，I2C读取统一返回该值
+void i2c_set_touch_status_snapshot(uint16_t status)
+{
+    g_touch_status_snapshot = status;
 }
 
 // I2C从机中断处理
@@ -188,7 +196,7 @@ uint16_t i2c_handle_register_read(uint8_t reg_addr)
             return g_scan_rate_per_second;
 
         case REG_TOUCH_STATUS:
-            return capsense_get_touch_status_bitmap();
+            return g_touch_status_snapshot | 0x8000;
 
         case REG_CONTROL:
         {

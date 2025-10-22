@@ -171,8 +171,9 @@ void capsense_process_widgets(void)
                 widget_ids[i],
                 (uint32_t)(
                     CY_CAPSENSE_PROCESS_FILTER |
-                    CY_CAPSENSE_PROCESS_CALC_NOISE |
                     CY_CAPSENSE_PROCESS_DIFFCOUNTS |
+                    CY_CAPSENSE_PROCESS_THRESHOLDS |
+                    CY_CAPSENSE_PROCESS_CALC_NOISE |
                     CY_CAPSENSE_PROCESS_STATUS ),
                 &cy_capsense_context);
         }
@@ -184,11 +185,15 @@ void capsense_process_widgets(void)
 
 void capsense_update_touch_status(void)
 {
-    uint16_t bitmap = 0;
+    
+    static uint16_t bitmap = 0;
+    bitmap = 0;
     for (uint8_t i = 0; i < CAPSENSE_WIDGET_COUNT; ++i) {
         bitmap |= (Cy_CapSense_IsWidgetActive(widget_ids[i], &cy_capsense_context) ? (1u << i) : 0u);
     }
+    __disable_irq();
     g_touch_status_bitmap = bitmap;
+    __enable_irq();
 }
 
 void capsense_apply_threshold_changes(void)
