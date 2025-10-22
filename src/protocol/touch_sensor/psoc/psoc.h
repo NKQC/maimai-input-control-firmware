@@ -15,8 +15,8 @@
 // 寄存器地址（1字节）
 #define PSOC_REG_SCAN_RATE       0x00  // R: 16-bit，当前每秒扫描次数
 #define PSOC_REG_TOUCH_STATUS    0x01  // R: 16-bit，bit[0..11] 对应 CAP0..CAPB
-#define PSOC_REG_LED_CONTROL     0x02  // R/W: 16-bit，bit0 控制LED
-#define PSOC_REG_CAP0_THRESHOLD  0x03  // R/W: 16-bit 阈值寄存器
+#define PSOC_REG_CONTROL         0x02  // R/W: 16-bit，bit0=复位, bit1=LED, bit4=绝对模式
+#define PSOC_REG_CAP0_THRESHOLD  0x03  // R/W: 16-bit 阈值/触摸电容设置寄存器（相对/绝对模式）
 #define PSOC_REG_CAP1_THRESHOLD  0x04
 #define PSOC_REG_CAP2_THRESHOLD  0x05
 #define PSOC_REG_CAP3_THRESHOLD  0x06
@@ -28,6 +28,20 @@
 #define PSOC_REG_CAP9_THRESHOLD  0x0C
 #define PSOC_REG_CAPA_THRESHOLD  0x0D
 #define PSOC_REG_CAPB_THRESHOLD  0x0E
+
+// 总触摸电容只读寄存器（单位：步进 0.01 pF）
+#define PSOC_REG_CAP0_TOTAL_CAP  0x0F  // R: 16-bit
+#define PSOC_REG_CAP1_TOTAL_CAP  0x10
+#define PSOC_REG_CAP2_TOTAL_CAP  0x11
+#define PSOC_REG_CAP3_TOTAL_CAP  0x12
+#define PSOC_REG_CAP4_TOTAL_CAP  0x13
+#define PSOC_REG_CAP5_TOTAL_CAP  0x14
+#define PSOC_REG_CAP6_TOTAL_CAP  0x15
+#define PSOC_REG_CAP7_TOTAL_CAP  0x16
+#define PSOC_REG_CAP8_TOTAL_CAP  0x17
+#define PSOC_REG_CAP9_TOTAL_CAP  0x18
+#define PSOC_REG_CAPA_TOTAL_CAP  0x19
+#define PSOC_REG_CAPB_TOTAL_CAP  0x1A
 
 #define PSOC_MAX_CHANNELS        12
 
@@ -47,8 +61,9 @@ public:
     bool getChannelEnabled(uint8_t channel) const override;
     uint32_t getEnabledChannelMask() const override;
 
-    bool setChannelSensitivity(uint8_t channel, uint8_t sensitivity) override; // 0..99 映射为阈值写入
-    bool setLEDEnabled(bool enabled) override;  // 写 LED_CONTROL bit0
+    bool setChannelSensitivity(uint8_t channel, uint8_t sensitivity) override; // 0..99 映射为阈值写入（相对模式）
+    uint8_t getChannelSensitivity(uint8_t channel) const override;              // 返回UI侧0..99
+    bool setLEDEnabled(bool enabled) override;  // 写 CONTROL bit1
 
     // 配置持久化接口实现
     bool loadConfig(const std::string& config_data) override;
@@ -59,6 +74,10 @@ private:
     bool read_reg16(uint8_t reg, uint16_t& value);
     bool write_reg16(uint8_t reg, uint16_t value);
 
+    // 控制位辅助
+    bool setAbsoluteMode(bool enabled);
+    bool readTotalCap(uint8_t channel, uint16_t& steps);
+
     HAL_I2C* i2c_hal_;
     I2C_Bus i2c_bus_;
     uint8_t i2c_device_address_;
@@ -66,8 +85,10 @@ private:
     bool initialized_;
     uint32_t enabled_channels_mask_;
     
-    // 灵敏度设置存储（每通道阈值）
+    // 灵敏度设置存储（每通道阈值原始编码 & UI敏感度 & 总电容步进）
     uint16_t channel_thresholds_[PSOC_MAX_CHANNELS];
+    uint8_t  channel_sensitivity_ui_[PSOC_MAX_CHANNELS];
+    uint16_t channel_total_cap_steps_[PSOC_MAX_CHANNELS];
 
     // 异步读取缓冲
     static uint8_t _async_read_buffer[2];

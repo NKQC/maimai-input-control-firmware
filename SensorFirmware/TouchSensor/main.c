@@ -13,20 +13,9 @@
 static uint64_t _last_scan_time = 0;
 static volatile uint32_t _systick_overflow_count = 0;
 
-#if CY_CAPSENSE_BIST_EN
-static uint32_t sensor_cp = 0;
-static cy_en_capsense_bist_status_t status;
-#endif /* CY_CAPSENSE_BIST_EN */
-
-
-static uint64_t _get_system_time_us(void);
-static void _update_scan_rate(void);
+static inline uint64_t _get_system_time_us(void);
+static inline void _update_scan_rate(void);
 static inline uint8_t _get_i2c_address(void);
-
-#if CY_CAPSENSE_BIST_EN
-static void _measure_sensor_cp(void);
-#endif /* CY_CAPSENSE_BIST_EN */
-
 
 // 主函数：初始化系统并运行主循环
 int main(void)
@@ -44,59 +33,49 @@ int main(void)
     SysTick_Config(SystemCoreClock / 1000);
 
     led_init();
-    led_on();
 
     i2c_init(_get_i2c_address());
     capsense_init();
     capsense_start_scan();
     _last_scan_time = _get_system_time_us();
-
+    led_on();
     for (;;)
     {
         if (!capsense_is_busy())
         {
+            capsense_handle_async_ops();
             capsense_process_widgets();
-            _update_scan_rate();
             capsense_update_touch_status();
             capsense_apply_threshold_changes();
-#if CY_CAPSENSE_BIST_EN
-            _measure_sensor_cp();
-#endif
+            if (i2c_led_feedback_enabled()) {
+                led_set_state(capsense_get_touch_status_bitmap() != 0);
+            }
+            _update_scan_rate();
             capsense_start_scan();
         }
     }
 }
 
 // 更新扫描速率
-static void _update_scan_rate(void)
+static inline void _update_scan_rate(void)
 {
     static uint32_t scan_count = 0;
-    static uint64_t last_rate_update_time = 0;
-    static uint64_t current_time = 0;
-    static uint64_t time_diff = 0;
+    static uint64_t last_update_us = 0;
 
     scan_count++;
 
-    current_time = _get_system_time_us();
-    time_diff = current_time - last_rate_update_time;
+    uint64_t now_us = _get_system_time_us();
+    uint64_t elapsed = now_us - last_update_us;
 
-    if (time_diff >= 1000000)
+    if (elapsed >= 1000000ULL)
     {
-        i2c_set_scan_rate((uint16_t)((scan_count * 1000000ULL) / time_diff));
+        i2c_set_scan_rate((uint16_t)((scan_count * 1000000ULL) / elapsed));
         scan_count = 0;
-        last_rate_update_time = current_time;
+        last_update_us = now_us;
     }
 }
 
-#if CY_CAPSENSE_BIST_EN
-// 测量传感器电极自电容
-static void _measure_sensor_cp(void)
-{
-    status = Cy_CapSense_MeasureCapacitanceSensor(CY_CAPSENSE_CAP0_WDGT_ID,
-                                                  CY_CAPSENSE_CAP0_SNS0_ID,
-                                             &sensor_cp, &cy_capsense_context);
-}
-#endif
+
 
 // 获取I2C从机地址
 static inline uint8_t _get_i2c_address(void)
@@ -124,29 +103,21 @@ static inline uint8_t _get_i2c_address(void)
 }
 
 // 获取系统时间（微秒）
-static uint64_t _get_system_time_us(void)
+static inline uint64_t _get_system_time_us(void)
 {
-    static uint32_t systick_val;
-    static uint32_t overflow_count;
-
     __disable_irq();
-
-    systick_val = SysTick->VAL;
-    overflow_count = _systick_overflow_count;
+    uint32_t systick_val = SysTick->VAL;
+    uint32_t overflow = _systick_overflow_count;
 
     if ((SysTick->CTRL & SysTick_CTRL_COUNTFLAG_Msk) && (systick_val > (SysTick->LOAD >> 1)))
     {
-        overflow_count++;
+        overflow++;
     }
 
     __enable_irq();
 
-    static uint32_t ticks_in_current_ms;
-    static uint64_t total_us;
-    ticks_in_current_ms = SysTick->LOAD - systick_val;
-    total_us = (uint64_t)overflow_count * 1000 + (ticks_in_current_ms * 1000) / SysTick->LOAD;
-
-    return total_us;
+    uint32_t ticks_in_ms = SysTick->LOAD - systick_val;
+    return (uint64_t)overflow * 1000ULL + ((uint64_t)ticks_in_ms * 1000ULL) / SysTick->LOAD;
 }
 
 // SysTick中断处理

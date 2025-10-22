@@ -4,7 +4,7 @@
 
 static cy_stc_scb_i2c_context_t i2c_context;
 static uint16_t g_scan_rate_per_second = 0;
-static uint16_t g_led_control_reg = 0;
+static volatile i2c_control_reg_t g_control_reg = { .raw = 0 };
 
 // 使用独立的读写缓冲区，避免读缓冲被写入数据污染
 static uint8_t _i2c_write_buffer[I2C_SLAVE_BUFFER_SIZE];
@@ -46,6 +46,9 @@ void i2c_init(uint8_t slave_address)
         NVIC_ClearPendingIRQ(i2c_intr_config.intrSrc);
         NVIC_EnableIRQ(i2c_intr_config.intrSrc);
 
+        // 缺省：开启LED触摸提示（CONTROL.bit5=1）
+        g_control_reg.bits.led_feedback_en = 1u;
+
         // 配置独立的读写缓冲
         Cy_SCB_I2C_SlaveConfigReadBuf(scb_1_HW, _i2c_read_buffer, I2C_SLAVE_BUFFER_SIZE, &i2c_context);
         Cy_SCB_I2C_SlaveConfigWriteBuf(scb_1_HW, _i2c_write_buffer, I2C_SLAVE_BUFFER_SIZE, &i2c_context);
@@ -63,6 +66,12 @@ void i2c_init(uint8_t slave_address)
     {
         CY_ASSERT(CY_ASSERT_FAILED);
     }
+}
+
+// 读取LED触摸提示开关状态（CONTROL.bit5）
+bool i2c_led_feedback_enabled(void)
+{
+    return (g_control_reg.bits.led_feedback_en != 0u);
 }
 
 // I2C从机中断处理
@@ -147,31 +156,50 @@ void i2c_set_scan_rate(uint16_t rate)
 // I2C寄存器读取
 uint16_t i2c_handle_register_read(uint8_t reg_addr)
 {
+    // 噪声只读寄存器范围判断
+    if (reg_addr >= REG_NOISE_TH_BASE && reg_addr < (REG_NOISE_TH_BASE + CAPSENSE_WIDGET_COUNT))
+    {
+        return capsense_get_noise_th((uint8_t)(reg_addr - REG_NOISE_TH_BASE));
+    }
+    if (reg_addr >= REG_NNOISE_TH_BASE && reg_addr < (REG_NNOISE_TH_BASE + CAPSENSE_WIDGET_COUNT))
+    {
+        return capsense_get_nnoise_th((uint8_t)(reg_addr - REG_NNOISE_TH_BASE));
+    }
+    // 总触摸电容只读寄存器组
+    if (reg_addr >= REG_TOTAL_TOUCH_CAP_BASE && reg_addr < (REG_TOTAL_TOUCH_CAP_BASE + CAPSENSE_WIDGET_COUNT))
+    {
+        return capsense_get_total_touch_cap((uint8_t)(reg_addr - REG_TOTAL_TOUCH_CAP_BASE));
+    }
+    // 触摸电容设置寄存器组（增量/绝对）范围判断
+    if (reg_addr >= REG_TOUCH_CAP_SETTING_BASE && reg_addr < (REG_TOUCH_CAP_SETTING_BASE + CAPSENSE_WIDGET_COUNT))
+    {
+        uint8_t idx = (uint8_t)(reg_addr - REG_TOUCH_CAP_SETTING_BASE);
+        // 读取时根据模式返回：绝对模式返回总触摸电容步进；相对模式返回原始编码值
+        if (g_control_reg.bits.absolute_mode) {
+            return capsense_get_total_touch_cap(idx);
+        } else {
+            return capsense_sensitivity_to_raw_count(capsense_get_touch_sensitivity(idx));
+        }
+    }
+
     switch (reg_addr)
     {
         case REG_SCAN_RATE:
             return g_scan_rate_per_second;
 
         case REG_TOUCH_STATUS:
-            // 读取触摸状态时熄灭LED
             return capsense_get_touch_status_bitmap();
 
-        case REG_LED_CONTROL:
-            return g_led_control_reg;
+        case REG_CONTROL:
+        {
+            i2c_control_reg_t v = g_control_reg;
+            // 以全局异步位域为准，反映校准请求/完成状态
+            v.bits.calibrate_req = g_capsense_async.bits.calibrate_req;
+            v.bits.calibration_done = g_capsense_async.bits.calibration_done;
+            return v.raw;
+        }
 
-        case REG_CAP0_THRESHOLD:
-        case REG_CAP1_THRESHOLD:
-        case REG_CAP2_THRESHOLD:
-        case REG_CAP3_THRESHOLD:
-        case REG_CAP4_THRESHOLD:
-        case REG_CAP5_THRESHOLD:
-        case REG_CAP6_THRESHOLD:
-        case REG_CAP7_THRESHOLD:
-        case REG_CAP8_THRESHOLD:
-        case REG_CAP9_THRESHOLD:
-        case REG_CAPA_THRESHOLD:
-        case REG_CAPB_THRESHOLD:
-            return capsense_get_threshold(reg_addr - REG_CAP0_THRESHOLD);
+            // 触摸电容设置寄存器组已改为基址范围判断（见函数前部）
 
         default:
             return 0x0000;
@@ -181,30 +209,62 @@ uint16_t i2c_handle_register_read(uint8_t reg_addr)
 // I2C寄存器写入
 void i2c_handle_register_write(uint8_t reg_addr, uint16_t value)
 {
+    // 触摸电容设置寄存器组（增量/绝对）范围写入
+    if (reg_addr >= REG_TOUCH_CAP_SETTING_BASE && reg_addr < (REG_TOUCH_CAP_SETTING_BASE + CAPSENSE_WIDGET_COUNT))
+    {
+        uint8_t idx = (uint8_t)(reg_addr - REG_TOUCH_CAP_SETTING_BASE);
+        if (g_control_reg.bits.absolute_mode) {
+            // 绝对模式：value 为总触摸电容步进（0.01pF），进行边界检查并换算为增量
+            uint16_t cp_base = capsense_get_cp_base_steps(idx);
+            uint16_t total = value;
+            if (total > TOUCH_CAP_TOTAL_MAX_STEPS) {
+                total = TOUCH_CAP_TOTAL_MAX_STEPS;
+            }
+            // 计算增量（可为负值），并按规则夹取
+            int32_t delta = (int32_t)total - (int32_t)cp_base;
+            if (delta > (int32_t)TOUCH_SENSITIVITY_MAX_STEPS) {
+                delta = (int32_t)TOUCH_SENSITIVITY_MAX_STEPS;
+            } else if (delta < -(int32_t)TOUCH_SENSITIVITY_MAX_STEPS) {
+                delta = -(int32_t)TOUCH_SENSITIVITY_MAX_STEPS;
+            }
+            // 正向增量的最小步进（FULL模式下为10步）
+            if (delta > 0 && delta < (int32_t)TOUCH_INCREMENT_MIN_STEPS) {
+                delta = (int32_t)TOUCH_INCREMENT_MIN_STEPS;
+            }
+            capsense_set_touch_sensitivity(idx, (int16_t)delta);
+        } else {
+            // 相对模式：value 为原始编码（0..8191），转换为步进增量
+            capsense_set_touch_sensitivity(idx, capsense_raw_count_to_sensitivity(value));
+        }
+        return;
+    }
     switch (reg_addr)
     {
-        case REG_LED_CONTROL:
-            g_led_control_reg = value;
-            led_set_state(((value >> 1) & 0x01));
-            if ((value & 0x01)) { NVIC_SystemReset(); }
+        case REG_CONTROL:
+        {
+            i2c_control_reg_t in; in.raw = value;
+            // LED控制
+            led_set_state(in.bits.led_on);
+            // 复位请求
+            if (in.bits.reset_req) { NVIC_SystemReset(); }
+            // 校准请求：仅置位全局异步标志，由主循环在CapSense空闲时执行
+            if (in.bits.calibrate_req) {
+                capsense_request_calibration();
+            }
+            // 模式位：更新绝对/相对模式 和 LED触摸提示开关
+            g_control_reg.bits.absolute_mode = in.bits.absolute_mode;
+            g_control_reg.bits.led_feedback_en = in.bits.led_feedback_en;
+            // 保留原有LED位（读回时可见），bit2/bit3由全局异步位域统一管理
+            g_control_reg.bits.led_on = in.bits.led_on;
+            g_control_reg.bits.reset_req = in.bits.reset_req;
             break;
+        }
 
-        case REG_CAP0_THRESHOLD:
-        case REG_CAP1_THRESHOLD:
-        case REG_CAP2_THRESHOLD:
-        case REG_CAP3_THRESHOLD:
-        case REG_CAP4_THRESHOLD:
-        case REG_CAP5_THRESHOLD:
-        case REG_CAP6_THRESHOLD:
-        case REG_CAP7_THRESHOLD:
-        case REG_CAP8_THRESHOLD:
-        case REG_CAP9_THRESHOLD:
-        case REG_CAPA_THRESHOLD:
-        case REG_CAPB_THRESHOLD:
-            capsense_set_threshold(reg_addr - REG_CAP0_THRESHOLD, value);
+            // 触摸电容设置寄存器组写入已改为基址范围判断（见函数前部）
             break;
 
         default:
+            // 噪声只读寄存器组：写入忽略
             break;
     }
 }

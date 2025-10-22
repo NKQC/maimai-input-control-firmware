@@ -26,7 +26,10 @@
         "cortex-debug.JLinkGDBServerPath.linux": "JLinkGDBServerCLExe",
         "files.associations": {
             "cy_capsense_control.h": "c",
-            "led_module.h": "c"
+            "led_module.h": "c",
+            "cycfg_capsense.h": "c",
+            "cy_capsense.h": "c",
+            "cy_capsense_csd_v2.h": "c"
         }
     },
     "extensions": {

@@ -9,7 +9,7 @@
     </DesignProperties>
     <GeneralProperties>
         <Property id="REGULAR_RC_IIR_FILTER_EN" value="true"/>
-        <Property id="REGULAR_IIR_RC_N" value="128"/>
+        <Property id="REGULAR_IIR_RC_N" value="64"/>
         <Property id="REGULAR_RC_MEDIAN_FILTER_EN" value="false"/>
         <Property id="REGULAR_RC_AVERAGE_FILTER_EN" value="false"/>
         <Property id="REGULAR_RC_AVERAGE_SAMPLE_SIZE" value="SAMPLE_4"/>
@@ -22,7 +22,7 @@
         <Property id="PROX_RC_AVERAGE_SAMPLE_SIZE" value="SAMPLE_4"/>
         <Property id="PROX_RC_HW_IIR_FILTER_EN" value="false"/>
         <Property id="PROX_HW_IIR_RC_N" value="1"/>
-        <Property id="REGULAR_IIR_BL_N" value="1"/>
+        <Property id="REGULAR_IIR_BL_N" value="5"/>
         <Property id="REGULAR_IIR_BL_TYPE" value="PERFORMANCE"/>
         <Property id="PROX_IIR_BL_N" value="1"/>
         <Property id="PROX_IIR_BL_TYPE" value="PERFORMANCE"/>
@@ -35,7 +35,7 @@
         <Property id="IREF_SOURCE" value="SRSS"/>
         <Property id="PROX_TOUCH_COEFF" value="1000"/>
         <Property id="CDAC_TRIM_EN" value="false"/>
-        <Property id="BIST_EN" value="false"/>
+        <Property id="BIST_EN" value="true"/>
         <Property id="BIST_WDGT_CRC_EN" value="true"/>
         <Property id="BIST_BSLN_DUPLICATION_EN" value="true"/>
         <Property id="BIST_BSLN_RAW_OUT_RANGE_EN" value="true"/>
@@ -61,9 +61,9 @@
         <Property id="NUM_CENTROIDS" value="1"/>
     </GeneralProperties>
     <CsdProperties>
-        <Property id="CSD_AUTOTUNE" value="HWTH"/>
+        <Property id="CSD_AUTOTUNE" value="HW"/>
         <Property id="CSD_MOD_CLK_DIVIDER" value="1"/>
-        <Property id="CSD_INACTIVE_SNS_CONNECTION" value="HIGHZ"/>
+        <Property id="CSD_INACTIVE_SNS_CONNECTION" value="GROUND"/>
         <Property id="CSD_CHARGE_TRANSFER" value="SOURCING"/>
         <Property id="CSD_IDAC_ROW_COL_ALIGN_EN" value="true"/>
         <Property id="CSD_IDAC_AUTOCAL_EN" value="true"/>
@@ -71,7 +71,7 @@
         <Property id="CSD_IDAC_GAIN_INIT_INDEX" value="GAIN_2400"/>
         <Property id="CSD_IDAC_MIN" value="20"/>
         <Property id="CSD_IDAC_COMP_EN" value="true"/>
-        <Property id="CSD_RAWCOUNT_CAL_LEVEL" value="85"/>
+        <Property id="CSD_RAWCOUNT_CAL_LEVEL" value="50"/>
         <Property id="CSD_VREF_CUSTOM" value="false"/>
         <Property id="CSD_VREF" value="1219"/>
         <Property id="CSD_SHIELD_EN" value="false"/>
@@ -108,10 +108,10 @@
                 <Property id="DIPLEXING" value="false"/>
                 <Property id="MAX_POS_X" value="100"/>
                 <Property id="MAX_POS_Y" value="100"/>
-                <Property id="FINGER_CP" value="0.5"/>
+                <Property id="FINGER_CP" value="1.5"/>
                 <Property id="SNS_CLK" value="4"/>
                 <Property id="ROW_SNS_CLK" value="4"/>
-                <Property id="SNS_CLK_SOURCE" value="AUTO"/>
+                <Property id="SNS_CLK_SOURCE" value="DIRECT"/>
                 <Property id="TX_CLK" value="4"/>
                 <Property id="TX_CLK_SOURCE" value="AUTO"/>
                 <Property id="RESOLUTION" value="RES12BIT"/>
@@ -213,10 +213,10 @@
                 <Property id="DIPLEXING" value="false"/>
                 <Property id="MAX_POS_X" value="100"/>
                 <Property id="MAX_POS_Y" value="100"/>
-                <Property id="FINGER_CP" value="0.5"/>
+                <Property id="FINGER_CP" value="1.5"/>
                 <Property id="SNS_CLK" value="4"/>
                 <Property id="ROW_SNS_CLK" value="4"/>
-                <Property id="SNS_CLK_SOURCE" value="AUTO"/>
+                <Property id="SNS_CLK_SOURCE" value="DIRECT"/>
                 <Property id="TX_CLK" value="4"/>
                 <Property id="TX_CLK_SOURCE" value="AUTO"/>
                 <Property id="RESOLUTION" value="RES12BIT"/>
@@ -318,10 +318,10 @@
                 <Property id="DIPLEXING" value="false"/>
                 <Property id="MAX_POS_X" value="100"/>
                 <Property id="MAX_POS_Y" value="100"/>
-                <Property id="FINGER_CP" value="0.5"/>
+                <Property id="FINGER_CP" value="1.5"/>
                 <Property id="SNS_CLK" value="4"/>
                 <Property id="ROW_SNS_CLK" value="4"/>
-                <Property id="SNS_CLK_SOURCE" value="AUTO"/>
+                <Property id="SNS_CLK_SOURCE" value="DIRECT"/>
                 <Property id="TX_CLK" value="4"/>
                 <Property id="TX_CLK_SOURCE" value="AUTO"/>
                 <Property id="RESOLUTION" value="RES12BIT"/>
@@ -423,10 +423,10 @@
                 <Property id="DIPLEXING" value="false"/>
                 <Property id="MAX_POS_X" value="100"/>
                 <Property id="MAX_POS_Y" value="100"/>
-                <Property id="FINGER_CP" value="0.5"/>
+                <Property id="FINGER_CP" value="1.5"/>
                 <Property id="SNS_CLK" value="4"/>
                 <Property id="ROW_SNS_CLK" value="4"/>
-                <Property id="SNS_CLK_SOURCE" value="AUTO"/>
+                <Property id="SNS_CLK_SOURCE" value="DIRECT"/>
                 <Property id="TX_CLK" value="4"/>
                 <Property id="TX_CLK_SOURCE" value="AUTO"/>
                 <Property id="RESOLUTION" value="RES12BIT"/>
@@ -528,10 +528,10 @@
                 <Property id="DIPLEXING" value="false"/>
                 <Property id="MAX_POS_X" value="100"/>
                 <Property id="MAX_POS_Y" value="100"/>
-                <Property id="FINGER_CP" value="0.5"/>
+                <Property id="FINGER_CP" value="1.5"/>
                 <Property id="SNS_CLK" value="4"/>
                 <Property id="ROW_SNS_CLK" value="4"/>
-                <Property id="SNS_CLK_SOURCE" value="AUTO"/>
+                <Property id="SNS_CLK_SOURCE" value="DIRECT"/>
                 <Property id="TX_CLK" value="4"/>
                 <Property id="TX_CLK_SOURCE" value="AUTO"/>
                 <Property id="RESOLUTION" value="RES12BIT"/>
@@ -633,10 +633,10 @@
                 <Property id="DIPLEXING" value="false"/>
                 <Property id="MAX_POS_X" value="100"/>
                 <Property id="MAX_POS_Y" value="100"/>
-                <Property id="FINGER_CP" value="0.5"/>
+                <Property id="FINGER_CP" value="1.5"/>
                 <Property id="SNS_CLK" value="4"/>
                 <Property id="ROW_SNS_CLK" value="4"/>
-                <Property id="SNS_CLK_SOURCE" value="AUTO"/>
+                <Property id="SNS_CLK_SOURCE" value="DIRECT"/>
                 <Property id="TX_CLK" value="4"/>
                 <Property id="TX_CLK_SOURCE" value="AUTO"/>
                 <Property id="RESOLUTION" value="RES12BIT"/>
@@ -738,10 +738,10 @@
                 <Property id="DIPLEXING" value="false"/>
                 <Property id="MAX_POS_X" value="100"/>
                 <Property id="MAX_POS_Y" value="100"/>
-                <Property id="FINGER_CP" value="0.5"/>
+                <Property id="FINGER_CP" value="1.5"/>
                 <Property id="SNS_CLK" value="4"/>
                 <Property id="ROW_SNS_CLK" value="4"/>
-                <Property id="SNS_CLK_SOURCE" value="AUTO"/>
+                <Property id="SNS_CLK_SOURCE" value="DIRECT"/>
                 <Property id="TX_CLK" value="4"/>
                 <Property id="TX_CLK_SOURCE" value="AUTO"/>
                 <Property id="RESOLUTION" value="RES12BIT"/>
@@ -843,10 +843,10 @@
                 <Property id="DIPLEXING" value="false"/>
                 <Property id="MAX_POS_X" value="100"/>
                 <Property id="MAX_POS_Y" value="100"/>
-                <Property id="FINGER_CP" value="0.5"/>
+                <Property id="FINGER_CP" value="1.5"/>
                 <Property id="SNS_CLK" value="4"/>
                 <Property id="ROW_SNS_CLK" value="4"/>
-                <Property id="SNS_CLK_SOURCE" value="AUTO"/>
+                <Property id="SNS_CLK_SOURCE" value="DIRECT"/>
                 <Property id="TX_CLK" value="4"/>
                 <Property id="TX_CLK_SOURCE" value="AUTO"/>
                 <Property id="RESOLUTION" value="RES12BIT"/>
@@ -948,10 +948,10 @@
                 <Property id="DIPLEXING" value="false"/>
                 <Property id="MAX_POS_X" value="100"/>
                 <Property id="MAX_POS_Y" value="100"/>
-                <Property id="FINGER_CP" value="0.5"/>
+                <Property id="FINGER_CP" value="1.5"/>
                 <Property id="SNS_CLK" value="4"/>
                 <Property id="ROW_SNS_CLK" value="4"/>
-                <Property id="SNS_CLK_SOURCE" value="AUTO"/>
+                <Property id="SNS_CLK_SOURCE" value="DIRECT"/>
                 <Property id="TX_CLK" value="4"/>
                 <Property id="TX_CLK_SOURCE" value="AUTO"/>
                 <Property id="RESOLUTION" value="RES12BIT"/>
@@ -1053,10 +1053,10 @@
                 <Property id="DIPLEXING" value="false"/>
                 <Property id="MAX_POS_X" value="100"/>
                 <Property id="MAX_POS_Y" value="100"/>
-                <Property id="FINGER_CP" value="0.5"/>
+                <Property id="FINGER_CP" value="1.5"/>
                 <Property id="SNS_CLK" value="4"/>
                 <Property id="ROW_SNS_CLK" value="4"/>
-                <Property id="SNS_CLK_SOURCE" value="AUTO"/>
+                <Property id="SNS_CLK_SOURCE" value="DIRECT"/>
                 <Property id="TX_CLK" value="4"/>
                 <Property id="TX_CLK_SOURCE" value="AUTO"/>
                 <Property id="RESOLUTION" value="RES12BIT"/>
@@ -1158,10 +1158,10 @@
                 <Property id="DIPLEXING" value="false"/>
                 <Property id="MAX_POS_X" value="100"/>
                 <Property id="MAX_POS_Y" value="100"/>
-                <Property id="FINGER_CP" value="0.5"/>
+                <Property id="FINGER_CP" value="1.5"/>
                 <Property id="SNS_CLK" value="4"/>
                 <Property id="ROW_SNS_CLK" value="4"/>
-                <Property id="SNS_CLK_SOURCE" value="AUTO"/>
+                <Property id="SNS_CLK_SOURCE" value="DIRECT"/>
                 <Property id="TX_CLK" value="4"/>
                 <Property id="TX_CLK_SOURCE" value="AUTO"/>
                 <Property id="RESOLUTION" value="RES12BIT"/>
@@ -1263,10 +1263,10 @@
                 <Property id="DIPLEXING" value="false"/>
                 <Property id="MAX_POS_X" value="100"/>
                 <Property id="MAX_POS_Y" value="100"/>
-                <Property id="FINGER_CP" value="0.5"/>
+                <Property id="FINGER_CP" value="1.5"/>
                 <Property id="SNS_CLK" value="4"/>
                 <Property id="ROW_SNS_CLK" value="4"/>
-                <Property id="SNS_CLK_SOURCE" value="AUTO"/>
+                <Property id="SNS_CLK_SOURCE" value="DIRECT"/>
                 <Property id="TX_CLK" value="4"/>
                 <Property id="TX_CLK_SOURCE" value="AUTO"/>
                 <Property id="RESOLUTION" value="RES12BIT"/>

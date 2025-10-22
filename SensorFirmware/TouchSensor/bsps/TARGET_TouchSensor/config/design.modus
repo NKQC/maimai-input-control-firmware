@@ -312,7 +312,7 @@
                         <Param id="AcceptGeneralCall" value="false"/>
                         <Param id="CallbackDS" value="false"/>
                         <Param id="CallbackDSName" value="DsClockConfigCallback"/>
-                        <Param id="DataRate" value="100"/>
+                        <Param id="DataRate" value="400"/>
                         <Param id="EnableRxFifo" value="true"/>
                         <Param id="EnableTxFifo" value="true"/>
                         <Param id="EnableWakeup" value="false"/>
