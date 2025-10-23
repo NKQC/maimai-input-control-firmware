@@ -249,7 +249,7 @@ bool InputManager::registerTouchSensor(TouchSensor *device)
     // 初始化默认映射
     for (uint8_t i = 0; i < touch_mapping.max_channels; i++)
     {
-        touch_mapping.sensitivity[i] = 15; // 默认灵敏度
+        touch_mapping.sensitivity[i] = DEFAULT_TOUCH_SENSITIVITY; // 使用统一的默认灵敏度
     }
     touch_mapping.enabled_channels_mask = (1u << touch_mapping.max_channels) - 1; // 启用所有支持的通道
 
@@ -649,6 +649,9 @@ inline bool InputManager::setWorkMode(InputWorkMode mode)
 // CPU0核心循环 - TouchSensor触摸采样和Serial/HID处理
 void InputManager::task0()
 {
+    // 处理异步灵敏度设置请求
+    processSensitivityRequests();
+    
     // 更新所有设备的触摸状态
     updateTouchStates();
 
@@ -813,34 +816,34 @@ void InputManager::requestCancelBinding()
     binding_cancel_pending_ = true;
 }
 
-// 设置灵敏度
-void InputManager::setSensitivity(uint8_t device_id_mask, uint8_t channel, uint8_t sensitivity)
+// 设置灵敏度 (异步版本 - UI接口)
+void InputManager::setSensitivity(uint8_t device_id_mask, uint8_t channel, int8_t sensitivity)
 {
-    TouchDeviceMapping *mapping = findTouchDeviceMapping(device_id_mask);
-    if (mapping && channel < mapping->max_channels)
+    // 将请求推送到环形缓冲区，由task0处理
+    if (sensitivity_request_buffer_.pushRequest(device_id_mask, channel, sensitivity))
     {
-        log_debug("setSensitivity: device_id_mask=" + std::to_string(device_id_mask) +
-                  "channel=" + std::to_string(channel) +
-                  "sensitivity=" + std::to_string(sensitivity));
-        mapping->sensitivity[channel] = sensitivity;
-        // 使用新的TouchSensor接口设置通道灵敏度
-        TouchSensor *device = findTouchSensorByIdMask(device_id_mask);
-        if (device)
-        {
-            // 将内部灵敏度值转换为0-99范围
-            uint8_t normalized_sensitivity = (sensitivity > 99) ? 99 : sensitivity;
-            device->setChannelSensitivity(channel, normalized_sensitivity);
-        }
+        log_debug("setSensitivity: pushed request to buffer - device_id_mask=" + std::to_string(device_id_mask) +
+                  " channel=" + std::to_string(channel) +
+                  " sensitivity=" + std::to_string(sensitivity));
+    }
+    else
+    {
+        log_warning("setSensitivity: buffer full, request dropped - device_id_mask=" + std::to_string(device_id_mask) +
+                   " channel=" + std::to_string(channel));
     }
 }
 
 uint8_t InputManager::getSensitivity(uint8_t device_id_mask, uint8_t channel)
 {
-    TouchDeviceMapping *mapping = findTouchDeviceMapping(device_id_mask);
-    return (mapping && channel < mapping->max_channels) ? mapping->sensitivity[channel] : 15;
+    // 直接从TouchSensor设备获取灵敏度
+    TouchSensor *device = findTouchSensorByIdMask(device_id_mask);
+    if (device && channel < device->getSupportedChannelCount()) {
+        return device->getChannelSensitivity(channel);
+    }
+    return 50; // 默认灵敏度
 }
 
-bool InputManager::setSensitivityByDeviceName(const std::string &device_name, uint8_t channel, uint8_t sensitivity)
+bool InputManager::setSensitivityByDeviceName(const std::string &device_name, uint8_t channel, int8_t sensitivity)
 {
     // 通过设备名称设置灵敏度
     for (size_t i = 0; i < touch_sensor_devices_.size(); ++i)
@@ -965,37 +968,57 @@ bool InputManager::hasAvailableSerialMapping() const
 }
 
 // 设备级别的灵敏度管理接口
-void InputManager::setDeviceChannelSensitivity(uint8_t device_id_mask, uint8_t channel, uint8_t sensitivity)
+void InputManager::setDeviceChannelSensitivity(uint8_t device_id_mask, uint8_t channel, int8_t sensitivity)
 {
-    TouchDeviceMapping *mapping = findTouchDeviceMapping(device_id_mask);
-    if (mapping && channel < mapping->max_channels)
+    // 直接查找TouchSensor设备
+    TouchSensor *device = findTouchSensorByIdMask(device_id_mask);
+    if (device && channel < device->getSupportedChannelCount())
     {
-        mapping->setChannelSensitivity(channel, sensitivity);
-
-        // 同时更新硬件设备的灵敏度
-        for (auto *device : touch_sensor_devices_)
+        // 检查设备是否支持一般灵敏度设置
+        if (!device->supportsGeneralSensitivity())
         {
-            if (device->getModuleMask() == device_id_mask)
-            {
-                device->setChannelSensitivity(channel, sensitivity);
-                break;
-            }
+            log_debug("setDeviceChannelSensitivity: device_id_mask=" + std::to_string(device_id_mask) +
+                      " does not support general sensitivity settings, discarding");
+            return; // 不支持一般灵敏度设置，抛弃设置
         }
+        
+        // 根据设备的灵敏度模式进行限幅
+        int8_t clamped_sensitivity;
+        if (device->isSensitivityRelativeMode())
+        {
+            // 相对模式：限幅到 -127 到 127
+            clamped_sensitivity = std::max(static_cast<int8_t>(-127), 
+                                         std::min(static_cast<int8_t>(127), sensitivity));
+        }
+        else
+        {
+            // 绝对模式：限幅到 0 到 99
+            clamped_sensitivity = std::max(static_cast<int8_t>(0), 
+                                         std::min(static_cast<int8_t>(99), sensitivity));
+        }
+        
+        // 直接更新硬件设备的灵敏度
+        device->setChannelSensitivity(channel, clamped_sensitivity);
+    }
+    else
+    {
+        log_warning("setDeviceChannelSensitivity: TouchSensor device not found or invalid channel - device_id_mask=" + 
+                   std::to_string(device_id_mask) + " channel=" + std::to_string(channel));
     }
 }
 
 uint8_t InputManager::getDeviceChannelSensitivity(uint8_t device_id_mask, uint8_t channel)
 {
-    TouchDeviceMapping *mapping = findTouchDeviceMapping(device_id_mask);
-    if (mapping && channel < mapping->max_channels)
-    {
-        return mapping->sensitivity[channel];
+    // 直接从TouchSensor设备获取灵敏度
+    TouchSensor *device = findTouchSensorByIdMask(device_id_mask);
+    if (device && channel < device->getSupportedChannelCount()) {
+        return device->getChannelSensitivity(channel);
     }
-    return 15; // 默认灵敏度
+    return 50; // 默认灵敏度
 }
 
 // 通过逻辑区域映射设置物理通道灵敏度
-void InputManager::setSerialAreaSensitivity(Mai2_TouchArea area, uint8_t sensitivity)
+void InputManager::setSerialAreaSensitivity(Mai2_TouchArea area, int8_t sensitivity)
 {
     if (area < 1 || area > 34)
         return;
@@ -1004,12 +1027,40 @@ void InputManager::setSerialAreaSensitivity(Mai2_TouchArea area, uint8_t sensiti
     InputManager_PrivateConfig *config = inputmanager_get_config_holder();
     for (auto &mapping : config->touch_device_mappings)
     {
-        const auto &area_mapping = static_config_.area_channel_mappings.serial_mappings[area - 1];  // 区域1-34对应索引0-33
-        if (area_mapping.channel != 0xFFFFFFFF)
+        TouchSensor *device = findTouchSensorByIdMask(mapping.device_id_mask);
+        if (device)
         {
-            // 从32位物理地址解码出通道号
-            uint8_t channel = decodeChannelNumber(area_mapping.channel);
-            setDeviceChannelSensitivity(mapping.device_id_mask, channel, sensitivity);
+            // 检查设备是否支持一般灵敏度设置
+            if (!device->supportsGeneralSensitivity())
+            {
+                log_debug("Device " + std::to_string(mapping.device_id_mask) + " does not support general sensitivity, discarding setting");
+                continue;
+            }
+
+            // 根据设备的相对模式状态进行限幅
+            int8_t clamped_sensitivity = sensitivity;
+            if (device->isSensitivityRelativeMode())
+            {
+                // 相对模式：-127 到 127
+                clamped_sensitivity = std::max(static_cast<int8_t>(-127), std::min(static_cast<int8_t>(127), sensitivity));
+            }
+            else
+            {
+                // 绝对模式：0 到 99
+                clamped_sensitivity = std::max(static_cast<int8_t>(0), std::min(static_cast<int8_t>(99), sensitivity));
+            }
+
+            log_debug("Area " + std::to_string(area) + " sensitivity: original=" + std::to_string(sensitivity) + 
+                     ", clamped=" + std::to_string(clamped_sensitivity) + 
+                     ", relative_mode=" + (device->isSensitivityRelativeMode() ? "true" : "false"));
+
+            const auto &area_mapping = static_config_.area_channel_mappings.serial_mappings[area - 1];  // 区域1-34对应索引0-33
+            if (area_mapping.channel != 0xFFFFFFFF)
+            {
+                // 从32位物理地址解码出通道号
+                uint8_t channel = decodeChannelNumber(area_mapping.channel);
+                setDeviceChannelSensitivity(mapping.device_id_mask, channel, clamped_sensitivity);
+            }
         }
     }
 }
@@ -1108,8 +1159,8 @@ void InputManager::enableMappedChannels()
                 }
             }
 
-            // 只有在enabled_channels_mask中启用且有映射的通道才启用
-            bool ch_available = (mapping.enabled_channels_mask & (1 << ch)) != 0;
+            // 只有在设备中启用且有映射的通道才启用
+            bool ch_available = device->getChannelEnabled(ch);
             bool enabled = ch_available && has_mapping;
 
             // 使用新的TouchSensor接口设置通道使能状态
@@ -1171,10 +1222,10 @@ void InputManager::updateChannelStatesAfterBinding()
                 }
             }
 
-            // 如果没有映射，自动关闭enabled_channels_mask中的对应通道
+            // 如果没有映射，不需要修改enabled_channels_mask，设备状态由设备自身管理
             if (!has_mapping)
             {
-                mapping.enabled_channels_mask &= ~(1 << ch); // 清除对应位
+                // 注释：不再操作enabled_channels_mask，由设备实例直接管理通道状态
             }
         }
     }
@@ -1853,12 +1904,14 @@ void InputManager::processSerialBinding()
 // 备份通道状态
 void InputManager::backupChannelStates()
 {
-    InputManager_PrivateConfig *config = inputmanager_get_config_holder();
-    for (uint8_t i = 0; i < config->device_count && i < 8; i++)
+    for (uint8_t i = 0; i < touch_sensor_devices_.size() && i < 8; i++)
     {
-        for (uint8_t ch = 0; ch < 12; ch++)
+        auto *device = touch_sensor_devices_[i];
+        uint32_t supported_channels = device->getSupportedChannelCount();
+        
+        for (uint8_t ch = 0; ch < supported_channels && ch < 12; ch++)
         {
-            original_channels_backup_[i][ch] = (config->touch_device_mappings[i].enabled_channels_mask & (1 << ch)) ? 1 : 0;
+            original_channels_backup_[i][ch] = device->getChannelEnabled(ch) ? 1 : 0;
         }
     }
 }
@@ -1866,8 +1919,7 @@ void InputManager::backupChannelStates()
 // 恢复通道状态 TODO: 存在异常 暂时别用
 void InputManager::restoreChannelStates()
 {
-    InputManager_PrivateConfig *config = inputmanager_get_config_holder();
-    for (uint8_t i = 0; i < config->device_count && i < 8 && i < touch_sensor_devices_.size(); i++)
+    for (uint8_t i = 0; i < touch_sensor_devices_.size() && i < 8; i++)
     {
         auto *device = touch_sensor_devices_[i];
         uint32_t supported_channels = device->getSupportedChannelCount();
@@ -1876,16 +1928,7 @@ void InputManager::restoreChannelStates()
         {
             bool enabled = (original_channels_backup_[i][ch] != 0);
 
-            if (enabled)
-            {
-                config->touch_device_mappings[i].enabled_channels_mask |= (1 << ch); // 设置位
-            }
-            else
-            {
-                config->touch_device_mappings[i].enabled_channels_mask &= ~(1 << ch); // 清除位
-            }
-
-            // 使用新的TouchSensor接口恢复通道使能状态
+            // 直接使用TouchSensor接口恢复通道使能状态
             device->setChannelEnabled(ch, enabled);
         }
     }
@@ -2334,7 +2377,7 @@ void InputManager::processCalibrationRequest()
         // 收集所有支持校准的传感器
         std::vector<TouchSensor*> calibration_sensors;
         for (TouchSensor *sensor : touch_sensor_devices_) {
-            if (sensor && sensor->supports_calibration_) {
+            if (sensor && sensor->supportsCalibration()) {
                 calibration_sensors.push_back(sensor);
             }
         }
@@ -2362,7 +2405,7 @@ void InputManager::processCalibrationRequest()
         // 收集所有支持校准的传感器
         std::vector<TouchSensor*> calibration_sensors;
         for (TouchSensor *sensor : touch_sensor_devices_) {
-            if (sensor && sensor->supports_calibration_) {
+            if (sensor && sensor->supportsCalibration()) {
                 calibration_sensors.push_back(sensor);
             }
         }
@@ -2391,7 +2434,7 @@ uint8_t InputManager::getCalibrationProgress()
     // 收集所有支持校准的传感器
     std::vector<TouchSensor*> calibration_sensors;
     for (TouchSensor *sensor : touch_sensor_devices_) {
-        if (sensor && sensor->supports_calibration_) {
+        if (sensor && sensor->supportsCalibration()) {
             calibration_sensors.push_back(sensor);
         }
     }
@@ -2438,7 +2481,7 @@ uint8_t InputManager::getCalibrationProgress()
 bool InputManager::hasCalibratableSensors() const
 {
     for (TouchSensor *sensor : touch_sensor_devices_) {
-        if (sensor && sensor->supports_calibration_) {
+        if (sensor && sensor->supportsCalibration()) {
             return true;
         }
     }
@@ -2674,4 +2717,44 @@ void InputManager::clearAllStageAssignments() {
 
 const std::vector<InputManager_PrivateConfig::StageAssignment>& InputManager::getStageAssignments() const {
     return config_->stage_assignments;
+}
+
+void InputManager::processSensitivityRequests() {
+    SensitivityRequest request;
+    while (sensitivity_request_buffer_.popRequest(request)) {
+        // 查找对应的触摸设备
+        TouchDeviceMapping* mapping = findTouchDeviceMapping(request.device_id);
+        if (!mapping) {
+            log_warning("processSensitivityRequests: 未找到设备 ID " + std::to_string(request.device_id));
+            continue;
+        }
+
+        TouchSensor* device = findTouchSensorByIdMask(request.device_id);
+        if (!device) {
+            log_warning("processSensitivityRequests: 未找到触摸传感器 ID " + std::to_string(request.device_id));
+            continue;
+        }
+
+        // 根据设备模式限制灵敏度值
+        int8_t clamped_sensitivity = request.sensitivity;
+        if (device->isSensitivityRelativeMode()) {
+            // 相对模式：-127 到 127
+            clamped_sensitivity = std::max(-127, std::min(127, (int)request.sensitivity));
+        } else {
+            // 绝对模式：0 到 99
+            clamped_sensitivity = std::max(0, std::min(99, (int)request.sensitivity));
+        }
+
+        // 存储到映射中
+        if (request.channel < 32) {
+            mapping->sensitivity[request.channel] = clamped_sensitivity;
+        }
+
+        // 调用设备的灵敏度设置方法
+        device->setChannelSensitivity(request.channel, clamped_sensitivity);
+        
+        log_debug("processSensitivityRequests: 设备 " + std::to_string(request.device_id) + 
+                  " 通道 " + std::to_string(request.channel) + 
+                  " 灵敏度设置为 " + std::to_string(clamped_sensitivity));
+    }
 }

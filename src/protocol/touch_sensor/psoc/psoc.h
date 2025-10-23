@@ -61,7 +61,7 @@ public:
     bool getChannelEnabled(uint8_t channel) const override;
     uint32_t getEnabledChannelMask() const override;
 
-    bool setChannelSensitivity(uint8_t channel, uint8_t sensitivity) override; // 0..99 映射为阈值写入（相对模式）
+    bool setChannelSensitivity(uint8_t channel, int8_t sensitivity) override; // -127..127 映射为阈值写入（相对模式）
     uint8_t getChannelSensitivity(uint8_t channel) const override;              // 返回UI侧0..99
     bool setLEDEnabled(bool enabled) override;  // 写 CONTROL bit1
 
@@ -84,10 +84,9 @@ private:
 
     bool initialized_;
     uint32_t enabled_channels_mask_;
+    uint16_t control_reg_;  // 缓存PSOC_REG_CONTROL寄存器的值
     
-    // 灵敏度设置存储（每通道阈值原始编码 & UI敏感度 & 总电容步进）
-    uint16_t channel_thresholds_[PSOC_MAX_CHANNELS];
-    uint8_t  channel_sensitivity_ui_[PSOC_MAX_CHANNELS];
+    // 总电容步进存储（绝对模式下每通道的总电容设置）
     uint16_t channel_total_cap_steps_[PSOC_MAX_CHANNELS];
 
     // 异步读取缓冲

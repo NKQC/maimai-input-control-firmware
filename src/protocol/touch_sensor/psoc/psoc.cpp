@@ -2,6 +2,7 @@
 #include <pico/time.h>
 #include <pico/stdlib.h>
 #include "../../usb_serial_logs/usb_serial_logs.h"
+#include "../../../service/input_manager/input_manager.h"
 #include <cstring>
 #include <algorithm>
 
@@ -9,14 +10,18 @@ uint8_t PSoC::_async_read_buffer[2];
 
 PSoC::PSoC(HAL_I2C* i2c_hal, I2C_Bus i2c_bus, uint8_t device_addr)
     : TouchSensor(PSOC_MAX_CHANNELS), i2c_hal_(i2c_hal), i2c_bus_(i2c_bus),
-      i2c_device_address_(device_addr), initialized_(false), enabled_channels_mask_(0) {
+      i2c_device_address_(device_addr), initialized_(false), enabled_channels_mask_(0), control_reg_(0) {
     module_name = "PSoC";
     module_mask_ = TouchSensor::generateModuleMask(static_cast<uint8_t>(i2c_bus), device_addr);
     
-    // 初始化默认寄存器原始值（对应灵敏度49为零偏，4095）
+    // 设置PSoC的功能标志：支持一般灵敏度设置(位0) + 相对设置模式(位1)
+    sensor_flag_.supports_general_sensitivity = true;
+    sensor_flag_.sensitivity_relative_mode = true;
+    sensor_flag_.sensitivity_private_mode = false;
+    sensor_flag_.supports_calibration = false;
+    
+    // 初始化默认总电容步进值
     for (int i = 0; i < PSOC_MAX_CHANNELS; i++) {
-        channel_thresholds_[i] = 4095;
-        channel_sensitivity_ui_[i] = 49;   // UI基准
         channel_total_cap_steps_[i] = 0;   // 未知，加载/写入后读取
     }
 }
@@ -32,13 +37,9 @@ bool PSoC::init() {
         USB_LOG_TAG_WARNING("PSoC", "Control reset failed at addr 0x%02X", i2c_device_address_);
         return false;
     }
+    control_reg_ = 0x01;  // 同步缓存状态
 
     sleep_ms(500);
-
-    // if (!write_reg16(PSOC_REG_CONTROL, 0x04)) {
-    //     USB_LOG_TAG_WARNING("PSoC", "Control write failed at addr 0x%02X", i2c_device_address_);
-    //     return false;
-    // }
 
     // 读取SCAN_RATE寄存器 启动时应不为0
     uint16_t scan_rate = 0;
@@ -47,15 +48,23 @@ bool PSoC::init() {
         return false;
     }
 
+    if (!write_reg16(PSOC_REG_CONTROL, 0x20)) {
+        USB_LOG_TAG_WARNING("PSoC", "Control settings failed at addr 0x%02X", i2c_device_address_);
+        return false;
+    }
+    control_reg_ = 0x20;  // 同步缓存状态
+
     // 默认启用所有通道
     enabled_channels_mask_ = (PSOC_MAX_CHANNELS >= 32) ? 0xFFFFFFFFu : ((1u << PSOC_MAX_CHANNELS) - 1u);
     initialized_ = true;
+    
     USB_LOG_TAG_INFO("PSoC", "Init ok, scan_rate=%u (LED off)", (unsigned)scan_rate);
     return true;
 }
 
 void PSoC::deinit() {
     initialized_ = false;
+    control_reg_ = 0;  // 重置缓存状态
 }
 
 bool PSoC::isInitialized() const { return initialized_; }
@@ -140,47 +149,46 @@ uint32_t PSoC::getEnabledChannelMask() const {
 }
 
 uint8_t PSoC::getChannelSensitivity(uint8_t channel) const {
-    if (channel >= PSOC_MAX_CHANNELS) return 49;
-    return channel_sensitivity_ui_[channel];
+    if (channel >= PSOC_MAX_CHANNELS) return 0;
+    // 相对灵敏度传感器始终返回0，不存在绝对灵敏度概念
+    return 0;
 }
 
-// 将0..99的灵敏度映射为原始寄存器值（反向步进）：raw = 4095 - (sensitivity - 49) * 10
-// 其中4095为零偏基准，单步对应10“步进”，并限制在0..8191范围
-// 增加灵敏度 -> 实际减少原始值；降低灵敏度 -> 实际增加原始值
-bool PSoC::setChannelSensitivity(uint8_t channel, uint8_t sensitivity) {
-    if (channel >= PSOC_MAX_CHANNELS || sensitivity > 99 || !initialized_) return false;
+// 相对灵敏度调整：临时调整阈值，不存储相对值
+// 0为基线，正值增加灵敏度（减少阈值），负值降低灵敏度（增加阈值）
+// 每个单位对应10步进，限制在0..8191范围
+bool PSoC::setChannelSensitivity(uint8_t channel, int8_t sensitivity) {
+    if (channel >= PSOC_MAX_CHANNELS || !initialized_) return false;
 
     // 相对模式（CONTROL.bit4=0）
     (void)setAbsoluteMode(false);
 
-    int32_t raw = 4095 - (static_cast<int32_t>(sensitivity) - 49) * 10;
+    // 以4095为基线，直接使用sensitivity进行相对调整
+    int32_t raw = 4095 - static_cast<int32_t>(sensitivity) * 20; // 单灵敏度变化0.2pf
     raw = (raw < 0 ? 0 : (raw > 8191 ? 8191 : raw));
     uint16_t raw16 = static_cast<uint16_t>(raw);
-    
-    // 保存到本地存储（UI与原始编码）
-    channel_sensitivity_ui_[channel] = sensitivity;
-    channel_thresholds_[channel] = raw16;
     
     uint8_t reg = PSOC_REG_CAP0_THRESHOLD + channel; // 连续映射
     if (!write_reg16(reg, raw16)) {
         return false;
     }
 
-    // 写入后读取该通道总电容（单位步进0.01pF），用于保存观感
+    // 写入后读取该通道总电容（单位步进0.01pF），用于保存
     uint16_t steps = 0;
     if (readTotalCap(channel, steps)) {
         channel_total_cap_steps_[channel] = steps;
     }
-
+    USB_LOG_DEBUG("[PSoC]CurrentSensitivity: [%d], ch=%d, raw=%d, Cap=%d", module_mask_, channel, raw, steps);
     return true;
 }
 
 bool PSoC::setLEDEnabled(bool enabled) {
     if (!initialized_) return false;
-    uint16_t ctrl = 0;
-    if (!read_reg16(PSOC_REG_CONTROL, ctrl)) return false;
+    uint16_t ctrl = control_reg_;  // 使用缓存的值
     if (enabled) ctrl |= 0x0002; else ctrl &= ~0x0002; // bit1
-    return write_reg16(PSOC_REG_CONTROL, ctrl);
+    if (!write_reg16(PSOC_REG_CONTROL, ctrl)) return false;
+    control_reg_ = ctrl;  // 更新缓存
+    return true;
 }
 
 bool PSoC::read_reg16(uint8_t reg, uint16_t& value) {
@@ -208,10 +216,11 @@ bool PSoC::write_reg16(uint8_t reg, uint16_t value) {
 }
 
 bool PSoC::setAbsoluteMode(bool enabled) {
-    uint16_t ctrl = 0;
-    if (!read_reg16(PSOC_REG_CONTROL, ctrl)) return false;
+    uint16_t ctrl = control_reg_;  // 使用缓存的值
     if (enabled) ctrl |= 0x0010; else ctrl &= ~0x0010; // bit4
-    return write_reg16(PSOC_REG_CONTROL, ctrl);
+    if (!write_reg16(PSOC_REG_CONTROL, ctrl)) return false;
+    control_reg_ = ctrl;  // 更新缓存
+    return true;
 }
 
 bool PSoC::readTotalCap(uint8_t channel, uint16_t& steps) {
@@ -220,72 +229,39 @@ bool PSoC::readTotalCap(uint8_t channel, uint16_t& steps) {
     return read_reg16(reg, steps);
 }
 
-// 配置持久化实现（支持旧格式兼容）：
-// 旧格式：每通道1个值（raw阈值，共12项）
-// 新格式：每通道3个值（UI敏感度, raw阈值, 总电容步进，共36项）
 bool PSoC::loadConfig(const std::string& config_data) {
     if (!initialized_) {
         return false;
     }
     
-    // 统计逗号数以判定项数
-    size_t tokens = 0;
-    for (char c : config_data) { if (c == ',') tokens++; }
-    tokens += (config_data.empty() ? 0 : 1);
-
     SaveConfig cfg;
     if (!cfg.fromString(config_data)) {
         return false;
     }
 
-    if (tokens >= PSOC_MAX_CHANNELS * 3) {
-        // 新格式：UI, raw, total
-        for (int ch = 0; ch < PSOC_MAX_CHANNELS; ch++) {
-            channel_sensitivity_ui_[ch] = static_cast<uint8_t>(cfg.readValue(static_cast<uint8_t>(channel_sensitivity_ui_[ch])));
-            channel_thresholds_[ch]      = cfg.readValue(channel_thresholds_[ch]);
-            channel_total_cap_steps_[ch] = cfg.readValue(channel_total_cap_steps_[ch]);
-        }
-    } else if (tokens == PSOC_MAX_CHANNELS) {
-        // 旧格式：仅raw阈值
-        for (int ch = 0; ch < PSOC_MAX_CHANNELS; ch++) {
-            channel_thresholds_[ch] = cfg.readValue(channel_thresholds_[ch]);
-            // 计算UI灵敏度（反推）：sens = 49 - (raw - 4095)/10
-            int32_t delta = static_cast<int32_t>(channel_thresholds_[ch]) - 4095;
-            int32_t sens = 49 - (delta / 10);
-            if (sens < 0) sens = 0;
-            if (sens > 99) sens = 99;
-            channel_sensitivity_ui_[ch] = static_cast<uint8_t>(sens);
-            channel_total_cap_steps_[ch] = 0; // 无法从旧格式恢复
-        }
-    } else {
-        // 无法识别，保持默认
-        return false;
+    // 加载总电容步进值
+    for (int ch = 0; ch < PSOC_MAX_CHANNELS; ch++) {
+        channel_total_cap_steps_[ch] = cfg.readValue(channel_total_cap_steps_[ch]);
     }
 
-    // 加载时使用绝对模式：先写入保存的总电容（有则写，无则跳过）
+    // 加载时使用绝对模式：写入保存的总电容
     (void)setAbsoluteMode(true);
     for (int ch = 0; ch < PSOC_MAX_CHANNELS; ch++) {
         if (channel_total_cap_steps_[ch] > 0) {
             uint16_t steps = std::min<uint16_t>(channel_total_cap_steps_[ch], 2200);
-            uint8_t reg = PSOC_REG_CAP0_THRESHOLD + ch;
-            if (!write_reg16(reg, steps)) {
-                return false;
-            }
+            uint8_t threshold_reg = PSOC_REG_CAP0_THRESHOLD + ch;
+            (void)write_reg16(threshold_reg, steps);
         }
     }
 
-    // 同时加载0-99的UI灵敏度（用于后续相对调整的基准与观感）
-    // 不直接写raw以免覆盖绝对模式设置；仅更新本地缓存即可。
     return true;
 }
 
 std::string PSoC::saveConfig() const {
     SaveConfig cfg;
     
-    // 新格式：每通道写入 UI敏感度, raw阈值, 总电容步进
+    // 保存总电容步进值
     for (int ch = 0; ch < PSOC_MAX_CHANNELS; ch++) {
-        cfg.writeValue(static_cast<uint8_t>(channel_sensitivity_ui_[ch]));
-        cfg.writeValue(static_cast<uint32_t>(channel_thresholds_[ch]));
         cfg.writeValue(static_cast<uint32_t>(channel_total_cap_steps_[ch]));
     }
     

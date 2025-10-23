@@ -16,27 +16,17 @@ SensitivityDevice::SensitivityDevice() : mapping_cached_(false) {
 }
 
 void SensitivityDevice::render(PageTemplate& page_template) {
-    // 使用通过jump_str传递的设备名称
-    if (device_name_.empty()) {
-        PAGE_START()
-        SET_TITLE("灵敏度设置", COLOR_WHITE)
-        ADD_BACK_ITEM("返回", COLOR_TEXT_WHITE)
-        ADD_TEXT("无效的设备参数", COLOR_RED, LineAlign::CENTER)
-        PAGE_END()
-        return;
-    }
-    
-    // 获取InputManager实例
-    InputManager* input_manager = InputManager::getInstance();
+    // 检查InputManager是否初始化
+    auto* input_manager = InputManager::getInstance();
     if (!input_manager) {
         PAGE_START()
-        SET_TITLE(device_name_.c_str(), COLOR_WHITE)
+        SET_TITLE("设备灵敏度", COLOR_WHITE)
         ADD_BACK_ITEM("返回", COLOR_TEXT_WHITE)
         ADD_TEXT("InputManager未初始化", COLOR_RED, LineAlign::CENTER)
         PAGE_END()
         return;
     }
-    
+
     // 初始化缓存的灵敏度值
     init_cached_values();
     
@@ -55,19 +45,38 @@ void SensitivityDevice::render(PageTemplate& page_template) {
     // 返回上级页面
     ADD_BACK_ITEM("返回", COLOR_TEXT_WHITE)
     
-    ADD_TEXT("MAX:99 MIN:0", COLOR_WHITE, LineAlign::CENTER)
+    // 获取设备以判断灵敏度模式
+    TouchSensor* device = nullptr;
+    const auto& devices = input_manager->getTouchSensorDevices();
+    for (TouchSensor* sensor : devices) {
+        if (sensor && sensor->getModuleMask() == cached_mapping_.device_id_mask) {
+            device = sensor;
+            break;
+        }
+    }
+    bool is_relative_mode = device && device->isSensitivityRelativeMode();
+    
+    if (is_relative_mode) {
+        ADD_TEXT("相对模式 范围: -127到127", COLOR_WHITE, LineAlign::CENTER)
+    } else {
+        ADD_TEXT("绝对模式 范围: 0到99", COLOR_WHITE, LineAlign::CENTER)
+    }
 
     // 显示每个通道的灵敏度设置
     for (uint8_t ch = 0; ch < cached_mapping_.max_channels; ch++) {
-        // 检查通道是否启用
-        bool channel_enabled = (cached_mapping_.enabled_channels_mask & (1UL << ch)) != 0;
+        // 直接从设备获取通道启用状态
+        bool channel_enabled = device && device->getChannelEnabled(ch);
         if (!channel_enabled) {
             continue; // 跳过未启用的通道
         }
         
         // 生成通道标签
-        char channel_label[24];
-        snprintf(channel_label, sizeof(channel_label), "CH%d", ch);
+        char channel_label[32];
+        if (is_relative_mode) {
+            snprintf(channel_label, sizeof(channel_label), "CH%d (相对)", ch);
+        } else {
+            snprintf(channel_label, sizeof(channel_label), "CH%d (绝对)", ch);
+        }
         
         // 生成设置ID
         std::string setting_id = generate_channel_setting_id(device_name_, ch);
@@ -75,15 +84,14 @@ void SensitivityDevice::render(PageTemplate& page_template) {
         // 使用缓存的灵敏度值
         int32_t* sensitivity_value_ptr = &cached_sensitivity_values_[ch];
         
-        // 添加整数设置行，使用缓存的值指针和回调函数
-        ADD_INT_SETTING(sensitivity_value_ptr, 0, 99, channel_label, setting_id, nullptr, on_sensitivity_complete, COLOR_TEXT_WHITE)
+        // 根据模式设置不同的范围
+        if (is_relative_mode) {
+            ADD_INT_SETTING(sensitivity_value_ptr, -127, 127, channel_label, setting_id, nullptr, on_sensitivity_complete, COLOR_TEXT_WHITE)
+        } else {
+            ADD_INT_SETTING(sensitivity_value_ptr, 0, 99, channel_label, setting_id, nullptr, on_sensitivity_complete, COLOR_TEXT_WHITE)
+        }
     }
-    
-    // 如果没有启用的通道
-    if (cached_mapping_.enabled_channels_mask == 0) {
-        ADD_TEXT("该设备无启用通道", COLOR_YELLOW, LineAlign::CENTER)
-    }
-    
+
     PAGE_END()
 }
 
@@ -138,24 +146,86 @@ void SensitivityDevice::init_cached_values() {
     cached_sensitivity_values_.clear();
     cached_sensitivity_values_.resize(cached_mapping_.max_channels);
     
+    // 获取InputManager实例
+    InputManager* input_manager = InputManager::getInstance();
+    if (!input_manager) {
+        mapping_cached_ = true;
+        return;
+    }
+    
     // 复制当前的灵敏度值到缓存
     for (uint8_t ch = 0; ch < cached_mapping_.max_channels; ch++) {
-        cached_sensitivity_values_[ch] = static_cast<int32_t>(cached_mapping_.sensitivity[ch]);
+        // 获取对应的TouchSensor设备以判断灵敏度模式
+        TouchSensor* device = nullptr;
+        const auto& devices = input_manager->getTouchSensorDevices();
+        for (TouchSensor* sensor : devices) {
+            if (sensor && sensor->getModuleMask() == cached_mapping_.device_id_mask) {
+                device = sensor;
+                break;
+            }
+        }
+        if (!device) {
+            cached_sensitivity_values_[ch] = 0;
+            continue;
+        }
+
+        // 读取当前通道灵敏度
+        uint8_t sens = input_manager->getDeviceChannelSensitivity(cached_mapping_.device_id_mask, ch);
+        
+        // 根据设备的灵敏度模式设置初始值
+        if (device->isSensitivityRelativeMode()) {
+            // 相对模式：直接使用-127到127的原生范围
+            int8_t relative_sensitivity = static_cast<int8_t>(sens);
+            cached_sensitivity_values_[ch] = static_cast<int32_t>(relative_sensitivity);
+        } else {
+            // 绝对模式：直接使用0-99的绝对值
+            int sens_clamped = (sens > 99) ? 99 : sens;
+            cached_sensitivity_values_[ch] = static_cast<int32_t>(sens_clamped);
+        }
     }
     
     mapping_cached_ = true;
 }
 
 void SensitivityDevice::on_sensitivity_complete() {
-    // 将缓存的灵敏度值写回到InputManager配置
-    InputManager* input_manager = InputManager::getInstance();
-    if (!input_manager) {
-        return;
+    auto* input_manager = InputManager::getInstance();
+    if (!input_manager) return;
+
+    // 获取设备以判断灵敏度模式
+    TouchSensor* device = nullptr;
+    const auto& devices = input_manager->getTouchSensorDevices();
+    for (TouchSensor* sensor : devices) {
+        if (sensor && sensor->getModuleMask() == cached_mapping_.device_id_mask) {
+            device = sensor;
+            break;
+        }
     }
+    if (!device) return;
+
+    // 将缓存的相对灵敏度值写回到每个启用的通道
     for (uint8_t ch = 0; ch < cached_mapping_.max_channels; ch++) {
-        input_manager->setSensitivity(cached_mapping_.device_id_mask, ch, cached_sensitivity_values_[ch]);
+        // 直接从设备获取通道启用状态
+        if (!device->getChannelEnabled(ch)) {
+            continue; // 跳过未启用的通道
+        }
+
+        // 根据设备模式转换灵敏度值
+        uint8_t final_sensitivity;
+        if (device->isSensitivityRelativeMode()) {
+            // 相对模式：直接使用-127到127的原生范围
+            int clamped_value = (cached_sensitivity_values_[ch] < -127) ? -127 : 
+                               ((cached_sensitivity_values_[ch] > 127) ? 127 : cached_sensitivity_values_[ch]);
+            final_sensitivity = static_cast<uint8_t>(clamped_value);
+        } else {
+            // 绝对模式：直接使用0-99的绝对值
+            int clamped_value = (cached_sensitivity_values_[ch] < 0) ? 0 : 
+                               ((cached_sensitivity_values_[ch] > 99) ? 99 : cached_sensitivity_values_[ch]);
+            final_sensitivity = static_cast<uint8_t>(clamped_value);
+        }
+
+        // 设置通道灵敏度
+        input_manager->setDeviceChannelSensitivity(cached_mapping_.device_id_mask, ch, final_sensitivity);
     }
-    UIManager::log_debug_static("on_sensitivity_complete");
 }
 
 } // namespace ui

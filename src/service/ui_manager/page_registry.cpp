@@ -7,6 +7,8 @@
 #include "page/touch_settings/sensitivity/sensitivity_main.h"
 #include "page/touch_settings/sensitivity/sensitivity_device.h"
 #include "page/touch_settings/sensitivity/area_sensitivity.h"
+#include "page/touch_settings/sensitivity/area_sensitivity_zone.h"
+#include "page/touch_settings/sensitivity/area_sensitivity_detail.h"
 #include "page/touch_settings/device_custom_settings/ad7147_custom_settings.h"
 #include "page/binding_settings/binding_settings.h"
 #include "page/binding_settings/binding_info.h"
@@ -95,6 +97,12 @@ void PageRegistry::register_default_pages() {
     
     auto area_sensitivity_page = std::make_shared<AreaSensitivity>();
     register_page("area_sensitivity", area_sensitivity_page);
+    
+    auto area_sensitivity_zone_page = std::make_shared<AreaSensitivityZone>();
+    register_page("area_sensitivity_zone", area_sensitivity_zone_page);
+    
+    auto area_sensitivity_detail_page = std::make_shared<AreaSensitivityDetail>();
+    register_page("area_sensitivity_detail", area_sensitivity_detail_page);
     
     auto sensitivity_main_page = std::make_shared<SensitivityMain>();
     register_page("sensitivity_main", sensitivity_main_page);

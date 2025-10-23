@@ -17,7 +17,13 @@ AD7147::AD7147(HAL_I2C* i2c_hal, I2C_Bus i2c_bus, uint8_t device_addr)
     module_name = "AD7147";
     module_mask_ = TouchSensor::generateModuleMask(static_cast<uint8_t>(i2c_bus), device_addr);
     supported_channel_count_ = AD7147_MAX_CHANNELS;
-    supports_calibration_ = true;  // AD7147支持校准功能
+    
+    // 设置AD7147的功能标志：支持私有方式(位2) + 支持校准(位3)
+    sensor_flag_.supports_general_sensitivity = false;
+    sensor_flag_.sensitivity_relative_mode = false;
+    sensor_flag_.sensitivity_private_mode = true;
+    sensor_flag_.supports_calibration = true;
+    
     calibration_tools_.pthis = this;
     // 初始化sample_result_的touch_mask
     sample_result_.touch_mask = uint32_t(module_mask_ << 24);
@@ -228,7 +234,7 @@ bool AD7147::read_device_info(AD7147_DeviceInfo& info) {
 }
 
 // 设置通道灵敏度（统一接口，0-99）
-bool AD7147::setChannelSensitivity(uint8_t channel, uint8_t sensitivity) {
+bool AD7147::setChannelSensitivity(uint8_t channel, int8_t sensitivity) {
     // 直接返回true，不进行实际的寄存器操作
     return true;
 }

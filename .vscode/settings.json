@@ -90,7 +90,8 @@
         "bootrom.h": "c",
         "stdio_uart.h": "c",
         "global_irq.h": "c",
-        "*.clang-format-ignore": "cpp"
+        "*.clang-format-ignore": "cpp",
+        "irq.h": "c"
     },
     "java.project.explorer.showNonJavaResources": true,
     "java.dependency.syncWithFolderExplorer": false

@@ -29,8 +29,18 @@ void TouchStatus::render(PageTemplate& page_template) {
             for (int i = 0; i < device_count; i++) {
                 const auto& device = device_status[i];
                 
+                // 直接从设备实例获取enabled_channels_mask
+                uint32_t enabled_channels_mask = 0;
+                const auto& devices = input_manager->getTouchSensorDevices();
+                for (TouchSensor* sensor : devices) {
+                    if (sensor && sensor->getModuleMask() == device.touch_device.device_id_mask) {
+                        enabled_channels_mask = sensor->getEnabledChannelMask();
+                        break;
+                    }
+                }
+                
                 // 设备名称和bitmap在同一行
-                std::string bitmap = format_touch_bitmap(device.touch_states_32bit, device.touch_device.max_channels, device.touch_device.enabled_channels_mask);
+                std::string bitmap = format_touch_bitmap(device.touch_states_32bit, device.touch_device.max_channels, enabled_channels_mask);
                 std::string device_line = device.device_name + " " + bitmap;
                 Color device_color = device.is_connected ? COLOR_TEXT_WHITE : COLOR_RED;
                 ADD_TEXT(device_line, device_color, LineAlign::LEFT)

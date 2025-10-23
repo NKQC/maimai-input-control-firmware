@@ -77,7 +77,8 @@ public:
     // 构造函数和析构函数
     TouchSensor(uint8_t max_channels) : max_channels_(max_channels), 
                                         module_mask_(0),
-                                        supported_channel_count_(0) {}
+                                        supported_channel_count_(0),
+                                        sensor_flag_raw_(0) {}
     virtual ~TouchSensor() = default;
 
     // 纯虚函数接口 - 所有派生类必须实现
@@ -130,8 +131,8 @@ public:
     virtual bool getChannelEnabled(uint8_t channel) const { return false; }     // 获取单个通道使能状态
     virtual uint32_t getEnabledChannelMask() const { return (1UL << max_channels_) - 1; }  // 获取启用通道掩码，基于max_channels_自动生成（最大24通道）
     
-    // 灵敏度控制接口 - 子类可选实现 (统一使用0-99范围)
-    virtual bool setChannelSensitivity(uint8_t channel, uint8_t sensitivity) { return false; }  // 设置通道灵敏度 (0-99)
+    // 灵敏度控制接口 - 子类可选实现 (相对灵敏度模式使用-127到127范围)
+    virtual bool setChannelSensitivity(uint8_t channel, int8_t sensitivity) { return false; }  // 设置通道灵敏度 (相对模式:-127到127, 绝对模式:0-99)
     virtual uint8_t getChannelSensitivity(uint8_t channel) const { return 50; }  // 获取通道灵敏度 (0-99，默认50)
     
     // 配置管理接口 - 子类可选实现
@@ -152,8 +153,54 @@ public:
     // 异常通道检测接口 - 子类可选实现
     virtual uint32_t getAbnormalChannelMask() const { return 0; }  // 获取异常通道bitmap (格式同sample返回的channel_mask)
     
-    // 校准支持标志
-    bool supports_calibration_ = false;  // 该芯片是否支持校准功能
+    // 传感器功能标志位域定义
+    enum class SensorFlag : uint32_t {
+        SUPPORTS_GENERAL_SENSITIVITY = 0x01,  // 位0：是否支持一般灵敏度设置
+        SENSITIVITY_RELATIVE_MODE    = 0x02,  // 位1：灵敏度设置为相对设置开关
+        SENSITIVITY_PRIVATE_MODE     = 0x04,  // 位2：灵敏度使用私有方式
+        SUPPORTS_CALIBRATION         = 0x08   // 位3：是否支持校准功能（原supports_calibration_）
+    };
+    
+    /**
+     * 检查传感器是否支持指定功能
+     * @param flag 要检查的功能标志
+     * @return true=支持，false=不支持
+     */
+    bool hasSensorFlag(SensorFlag flag) const {
+        return (sensor_flag_raw_ & static_cast<uint32_t>(flag)) != 0;
+    }
+    
+    /**
+     * 检查传感器是否支持校准功能（兼容性接口）
+     * @return true=支持校准，false=不支持校准
+     */
+    bool supportsCalibration() const {
+        return sensor_flag_.supports_calibration;
+    }
+    
+    /**
+     * 检查传感器是否支持一般灵敏度设置
+     * @return true=支持，false=不支持
+     */
+    bool supportsGeneralSensitivity() const {
+        return sensor_flag_.supports_general_sensitivity;
+    }
+    
+    /**
+     * 检查传感器灵敏度设置是否为相对模式
+     * @return true=相对模式，false=绝对模式
+     */
+    bool isSensitivityRelativeMode() const {
+        return sensor_flag_.sensitivity_relative_mode;
+    }
+    
+    /**
+     * 检查传感器是否使用私有灵敏度方式
+     * @return true=私有方式，false=标准方式
+     */
+    bool isSensitivityPrivateMode() const {
+        return sensor_flag_.sensitivity_private_mode;
+    }
 
 protected:
     uint8_t max_channels_;  // 该IC支持的最大通道数（最大24）
@@ -161,6 +208,19 @@ protected:
     // 模块掩码相关成员变量
     uint8_t module_mask_;              // 8位模块掩码 (bit7=I2C总线编号, bit6-0=I2C 7位地址)
     uint32_t supported_channel_count_; // 支持的通道数量
+    
+    // 传感器功能标志位域（私有，仅允许构造函数设置）
+    union {
+        uint32_t sensor_flag_raw_ = 0;     // 原始32位标志值
+        struct {
+            bool supports_general_sensitivity : 1;  // 位0：是否支持一般灵敏度设置
+            bool sensitivity_relative_mode    : 1;  // 位1：灵敏度设置为相对设置开关
+            bool sensitivity_private_mode     : 1;  // 位2：灵敏度使用私有方式
+            bool supports_calibration        : 1;  // 位3：是否支持校准功能（原supports_calibration_）
+            uint32_t reserved                : 28; // 位4-31：保留位
+        } sensor_flag_;
+    };
+    
     
     /**
      * 配置保存器结构体 - 优化的顺序存储版本

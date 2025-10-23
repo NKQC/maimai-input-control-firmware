@@ -207,20 +207,24 @@ void capsense_apply_threshold_changes(void)
 
     for (uint8_t i = 0; i < CAPSENSE_WIDGET_COUNT; ++i) {
         if (pending & (1u << i)) {
-            int16_t add_steps = g_update.sensitivity_steps[i];
+            int16_t sensitivity_steps = g_update.sensitivity_steps[i];
             // clamp幅度
-            if (add_steps > (int16_t)TOUCH_SENSITIVITY_MAX_STEPS) {
-                add_steps = (int16_t)TOUCH_SENSITIVITY_MAX_STEPS;
-            } else if (add_steps < -(int16_t)TOUCH_SENSITIVITY_MAX_STEPS) {
-                add_steps = -(int16_t)TOUCH_SENSITIVITY_MAX_STEPS;
+            if (sensitivity_steps > (int16_t)TOUCH_SENSITIVITY_MAX_STEPS) {
+                sensitivity_steps = (int16_t)TOUCH_SENSITIVITY_MAX_STEPS;
+            } else if (sensitivity_steps < -(int16_t)TOUCH_SENSITIVITY_MAX_STEPS) {
+                sensitivity_steps = -(int16_t)TOUCH_SENSITIVITY_MAX_STEPS;
             }
-            if (add_steps > 0 && add_steps < (int16_t)TOUCH_INCREMENT_MIN_STEPS) {
-                add_steps = (int16_t)TOUCH_INCREMENT_MIN_STEPS;
+            if (sensitivity_steps > 0 && sensitivity_steps < (int16_t)TOUCH_INCREMENT_MIN_STEPS) {
+                sensitivity_steps = (int16_t)TOUCH_INCREMENT_MIN_STEPS;
             }
+            // 更新存储的值以反映clamp后的结果
+            g_update.sensitivity_steps[i] = sensitivity_steps;
+            
 #if (CY_CAPSENSE_SMARTSENSE_FULL_EN)
             // FULL模式：不对 fingerCap 做增量更新（由库/SmartSense管理）
 #else
-            int32_t total_steps = (int32_t)g_cp_steps[i] + (int32_t)add_steps;
+            // 相对模式下，sensitivity_steps现在表示相对于基础电容的累积偏移
+            int32_t total_steps = (int32_t)g_cp_steps[i] + (int32_t)sensitivity_steps;
             if (total_steps < 0) {
                 total_steps = 0;
             } else if (total_steps > (int32_t)TOUCH_CAP_TOTAL_MAX_STEPS) {
@@ -289,7 +293,7 @@ static void _capsense_preset_before_measurement(void)
         uint32_t cp_ff = 0u;
         (void)Cy_CapSense_MeasureCapacitanceSensor(widget_ids[i], 0u, &cp_ff, &cy_capsense_context);
         // 以0.01pF步进记录基数
-        uint32_t cp_steps = (cp_ff + 5u) / 10u;
+        uint32_t cp_steps = (((float)cp_ff + 5.0f) * CAPSENSOR_RATE) / 10u;
         if (cp_steps > TOUCH_CAP_TOTAL_MAX_STEPS) cp_steps = TOUCH_CAP_TOTAL_MAX_STEPS;
         g_cp_steps[i] = (uint16_t)cp_steps;
     }

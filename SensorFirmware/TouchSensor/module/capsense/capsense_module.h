@@ -9,6 +9,8 @@
 #define CAPSENSE_INTR_PRIORITY    (3u)
 #define CAPSENSE_WIDGET_COUNT     (12u)
 
+#define CAPSENSOR_RATE (1.2f)
+
 // TouchSensitivity相关定义（增量设置）：单位 0.01 pF
 #define TOUCH_SENSITIVITY_STEP_PF           (0.01f)     // 每步进对应0.01pF
 // 非FULL模式最低值可为0；FULL模式维持历史最小0.1pF（10步）

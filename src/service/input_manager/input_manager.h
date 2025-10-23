@@ -342,9 +342,9 @@ public:
     void requestCancelBinding();             // 请求取消绑定（UI层调用）
     
     // 灵敏度管理
-    void setSensitivity(uint8_t device_id_mask, uint8_t channel, uint8_t sensitivity);
+    void setSensitivity(uint8_t device_id_mask, uint8_t channel, int8_t sensitivity);
     uint8_t getSensitivity(uint8_t device_id_mask, uint8_t channel);
-    bool setSensitivityByDeviceName(const std::string& device_name, uint8_t channel, uint8_t sensitivity);
+    bool setSensitivityByDeviceName(const std::string& device_name, uint8_t channel, int8_t sensitivity);
     
     // 校准管理
     void calibrateAllSensors();                        // 校准所有支持校准的传感器
@@ -386,11 +386,11 @@ public:
     void setSerialMapping(uint8_t device_id_mask, uint8_t channel, Mai2_TouchArea area);
     
     // 设备通道灵敏度管理
-    void setDeviceChannelSensitivity(uint8_t device_id_mask, uint8_t channel, uint8_t sensitivity);
+    void setDeviceChannelSensitivity(uint8_t device_id_mask, uint8_t channel, int8_t sensitivity);
     uint8_t getDeviceChannelSensitivity(uint8_t device_id_mask, uint8_t channel);
     
     // 通过逻辑区域映射设置物理通道灵敏度
-    void setSerialAreaSensitivity(Mai2_TouchArea area, uint8_t sensitivity);
+    void setSerialAreaSensitivity(Mai2_TouchArea area, int8_t sensitivity);
     void setHIDAreaSensitivity(uint8_t hid_area_index, uint8_t sensitivity);
     void setKeyboardSensitivity(HID_KeyCode key, uint8_t sensitivity);
     // 设置映射 TODO: TouchHID暂未实现UI
@@ -644,6 +644,9 @@ private:
     // 异步采样相关函数
     static void async_touchsampleresult(const TouchSampleResult& result);  // 静态异步采样结果处理函数
     
+    // 异步灵敏度设置处理函数
+    inline void processSensitivityRequests();                     // 处理灵敏度设置请求（在task0中调用）
+    
     // 触摸响应延迟管理私有方法
     inline void storeDelayedSerialState();                     // 存储当前Serial状态到延迟缓冲区
 
@@ -708,5 +711,71 @@ private:
     void processSerialBinding();
     void backupChannelStates();
     void restoreChannelStates();
+    // 异步灵敏度设置环形缓冲区
+    struct SensitivityRequest {
+        uint8_t device_id;      // 设备ID
+        uint8_t channel;        // 通道号
+        uint8_t sensitivity;    // 灵敏度值
+        bool valid;             // 请求是否有效
+        
+        SensitivityRequest() : device_id(0), channel(0), sensitivity(0), valid(false) {}
+        SensitivityRequest(uint8_t dev_id, uint8_t ch, uint8_t sens) 
+            : device_id(dev_id), channel(ch), sensitivity(sens), valid(true) {}
+    };
+    
+    struct SensitivityRequestBuffer {
+        static constexpr uint8_t BUFFER_SIZE = 32;
+        SensitivityRequest requests[BUFFER_SIZE];   // 环形缓冲区数组
+        volatile uint8_t head;                      // 头指针（UI写入，task0读取）
+        volatile uint8_t tail;                      // 尾指针（task0写入，UI读取）
+        
+        SensitivityRequestBuffer() : head(0), tail(0) {
+            // 初始化所有请求为无效状态
+            for (uint8_t i = 0; i < BUFFER_SIZE; i++) {
+                requests[i].valid = false;
+            }
+        }
+        
+        // UI侧：推送请求到缓冲区（CPU1调用）
+        bool pushRequest(uint8_t device_id, uint8_t channel, uint8_t sensitivity) {
+            uint8_t next_head = (head + 1) % BUFFER_SIZE;
+            if (next_head == tail) {
+                return false; // 缓冲区满
+            }
+            
+            requests[head] = SensitivityRequest(device_id, channel, sensitivity);
+            head = next_head;
+            return true;
+        }
+        
+        // task0侧：从缓冲区获取请求（CPU0调用）
+        bool popRequest(SensitivityRequest& request) {
+            if (head == tail) {
+                return false; // 缓冲区空
+            }
+            
+            request = requests[tail];
+            requests[tail].valid = false; // 标记为无效（可选，用于调试）
+            tail = (tail + 1) % BUFFER_SIZE;
+            return true;
+        }
+        
+        // 检查缓冲区是否有数据
+        bool hasData() const {
+            return head != tail;
+        }
+        
+        // 获取缓冲区中的数据数量
+        uint8_t getDataCount() const {
+            if (head >= tail) {
+                return head - tail;
+            } else {
+                return BUFFER_SIZE - tail + head;
+            }
+        }
+    };
+    
+    SensitivityRequestBuffer sensitivity_request_buffer_;  // 异步灵敏度设置缓冲区
+    
     const char* getMai2AreaName(Mai2_TouchArea area);
 };

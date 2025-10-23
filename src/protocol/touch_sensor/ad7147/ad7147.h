@@ -368,7 +368,7 @@ public:
     bool init() override;
     void deinit() override;
     bool isInitialized() const override;
-    bool setChannelSensitivity(uint8_t channel, uint8_t sensitivity) override; // 设置通道灵敏度 (0-99)
+    bool setChannelSensitivity(uint8_t channel, int8_t sensitivity) override; // 设置通道灵敏度 (0-99)
     void sample(async_touchsampleresult callback) override;                       // 异步采样接口
     bool sample_ready() override;
 

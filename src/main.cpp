@@ -35,9 +35,9 @@ extern "C" {
 #include "service/ui_manager/ui_manager.h"
 
 // 系统配置
-#define DEBUG_INPUTMANAGER_LOG true
-#define DEBUG_LIGHTMANAGER_LOG true
-#define DEBUG_UIMANAGER_LOG true
+#define DEBUG_INPUTMANAGER_LOG false
+#define DEBUG_LIGHTMANAGER_LOG false
+#define DEBUG_UIMANAGER_LOG false
 
 #define SYSTEM_VERSION "3.0.2"
 #define HARDWARE_VERSION "3.0"

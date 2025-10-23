@@ -200,13 +200,8 @@ uint16_t i2c_handle_register_read(uint8_t reg_addr)
 
         case REG_CONTROL:
         {
-            i2c_control_reg_t v = g_control_reg;
-            // 以全局异步位域为准，反映校准请求/完成状态
-            v.bits.calibrate_req = g_capsense_async.bits.calibrate_req;
-            v.bits.calibration_done = g_capsense_async.bits.calibration_done;
-            return v.raw;
+            return g_capsense_async.raw & 0xFFFF;
         }
-
             // 触摸电容设置寄存器组已改为基址范围判断（见函数前部）
 
         default:
@@ -241,8 +236,11 @@ void i2c_handle_register_write(uint8_t reg_addr, uint16_t value)
             }
             capsense_set_touch_sensitivity(idx, (int16_t)delta);
         } else {
-            // 相对模式：value 为原始编码（0..8191），转换为步进增量
-            capsense_set_touch_sensitivity(idx, capsense_raw_count_to_sensitivity(value));
+            // 相对模式：value 为原始编码（0..8191），转换为步进偏移量并累积到当前值
+            int16_t offset_steps = capsense_raw_count_to_sensitivity(value);
+            int16_t current_steps = capsense_get_touch_sensitivity(idx);
+            int16_t new_steps = current_steps + offset_steps;
+            capsense_set_touch_sensitivity(idx, new_steps);
         }
         return;
     }
@@ -250,21 +248,27 @@ void i2c_handle_register_write(uint8_t reg_addr, uint16_t value)
     {
         case REG_CONTROL:
         {
-            i2c_control_reg_t in; in.raw = value;
+            i2c_control_reg_t in; 
+            in.raw = value;
+            
             // LED控制
             led_set_state(in.bits.led_on);
+            
             // 复位请求
-            if (in.bits.reset_req) { NVIC_SystemReset(); }
+            if (in.bits.reset_req) { 
+                NVIC_SystemReset(); 
+            }
+            
             // 校准请求：仅置位全局异步标志，由主循环在CapSense空闲时执行
             if (in.bits.calibrate_req) {
                 capsense_request_calibration();
             }
-            // 模式位：更新绝对/相对模式 和 LED触摸提示开关
-            g_control_reg.bits.absolute_mode = in.bits.absolute_mode;
-            g_control_reg.bits.led_feedback_en = in.bits.led_feedback_en;
-            // 保留原有LED位（读回时可见），bit2/bit3由全局异步位域统一管理
-            g_control_reg.bits.led_on = in.bits.led_on;
-            g_control_reg.bits.reset_req = in.bits.reset_req;
+            
+            // 完整更新g_control_reg，确保读写一致
+            // 注意：calibrate_req和calibration_done由g_capsense_async管理，这里保持g_control_reg同步
+            // 直接使用raw赋值，避免位域操作的潜在异常
+            g_control_reg.raw = in.raw;
+            
             break;
         }
 

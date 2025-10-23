@@ -15,6 +15,13 @@ GTX312L::GTX312L(HAL_I2C* i2c_hal, I2C_Bus i2c_bus, uint8_t device_addr)
     // 生成模块掩码：bit7=I2C总线编号，bit6-0=I2C地址
     module_name = "GTX312L";
     module_mask_ = generateModuleMask(static_cast<uint8_t>(i2c_bus), device_addr);
+    
+    // 设置GTX312L的功能标志：支持一般灵敏度设置(位0)
+    sensor_flag_.supports_general_sensitivity = true;
+    sensor_flag_.sensitivity_relative_mode = false;
+    sensor_flag_.sensitivity_private_mode = false;
+    sensor_flag_.supports_calibration = false;
+    sensor_flag_.reserved = 0;
 }
 
 // GTX312L析构函数
@@ -170,7 +177,7 @@ uint32_t GTX312L::getEnabledChannelMask() const {
     return enabled_channels_mask_;
 }
 
-bool GTX312L::setChannelSensitivity(uint8_t channel, uint8_t sensitivity) {
+bool GTX312L::setChannelSensitivity(uint8_t channel, int8_t sensitivity) {
     if (!initialized_ || channel >= GTX312L_MAX_CHANNELS || sensitivity > 99) {
         return false;
     }

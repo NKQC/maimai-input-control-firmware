@@ -117,7 +117,7 @@ public:
     bool setChannelEnabled(uint8_t channel, bool enabled) override;    // 设置单个通道使能
     bool getChannelEnabled(uint8_t channel) const override;            // 获取单个通道使能状态
     uint32_t getEnabledChannelMask() const override;                   // 获取启用通道掩码
-    bool setChannelSensitivity(uint8_t channel, uint8_t sensitivity) override;  // 设置通道灵敏度 (0-99)
+    bool setChannelSensitivity(uint8_t channel, int8_t sensitivity) override;  // 设置通道灵敏度 (0-99)
     uint8_t getChannelSensitivity(uint8_t channel) const override;     // 获取通道灵敏度 (0-99)
     
 private:

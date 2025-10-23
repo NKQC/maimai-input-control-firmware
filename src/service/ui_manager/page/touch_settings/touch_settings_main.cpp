@@ -118,13 +118,13 @@ void TouchSettingsMain::render(PageTemplate& page_template) {
             
             // 未开始校准，显示校准按钮
             ADD_BUTTON("校准全部传感器", onCalibrateButtonPressed, COLOR_TEXT_WHITE, LineAlign::CENTER)
-        }
-
-        // 按分区设置灵敏度选项（仅Serial模式）
-        if (input_manager->getWorkMode() == InputWorkMode::SERIAL_MODE) {
             ADD_MENU("按分区校准灵敏度", "zone_sensitivity", COLOR_TEXT_WHITE)
-            ADD_MENU("按区域调整灵敏度", "area_sensitivity", COLOR_TEXT_WHITE)
         }
+    }
+
+    // 按分区设置灵敏度选项（仅Serial模式）
+    if (input_manager->getWorkMode() == InputWorkMode::SERIAL_MODE) {
+        ADD_MENU("按区域调整灵敏度", "area_sensitivity", COLOR_TEXT_WHITE)
     }
 
     // 灵敏度调整菜单项

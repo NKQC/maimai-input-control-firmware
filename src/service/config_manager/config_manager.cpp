@@ -1267,7 +1267,7 @@ bool ConfigManager::save_config_task() {
     lightmanager_write_config_to_manager(light_config);
         
     _save_requested = false;  // 清除保存请求信号
-    
+    disable_interrupts();
     log_debug("Starting config save process...");
     log_debug("Runtime map size: " + std::to_string(_runtime_map.size()));
     multicore_lockout_start_blocking();
@@ -1279,6 +1279,7 @@ bool ConfigManager::save_config_task() {
         log_info("Config save successful");
     }
     multicore_lockout_end_blocking();
+    enable_interrupts();
     return result;
 }
 
