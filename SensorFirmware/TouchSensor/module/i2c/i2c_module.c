@@ -178,6 +178,11 @@ uint16_t i2c_handle_register_read(uint8_t reg_addr)
     {
         return capsense_get_total_touch_cap((uint8_t)(reg_addr - REG_TOTAL_TOUCH_CAP_BASE));
     }
+    // 触摸阈值设置寄存器组（范围1-65535）
+    if (reg_addr >= REG_TOUCH_THRESHOLD_BASE && reg_addr < (REG_TOUCH_THRESHOLD_BASE + CAPSENSE_WIDGET_COUNT))
+    {
+        return capsense_get_touch_threshold((uint8_t)(reg_addr - REG_TOUCH_THRESHOLD_BASE));
+    }
     // 触摸电容设置寄存器组（增量/绝对）范围判断
     if (reg_addr >= REG_TOUCH_CAP_SETTING_BASE && reg_addr < (REG_TOUCH_CAP_SETTING_BASE + CAPSENSE_WIDGET_COUNT))
     {
@@ -212,6 +217,12 @@ uint16_t i2c_handle_register_read(uint8_t reg_addr)
 // I2C寄存器写入
 void i2c_handle_register_write(uint8_t reg_addr, uint16_t value)
 {
+    // 触摸阈值设置寄存器组（范围1-65535）
+    if (reg_addr >= REG_TOUCH_THRESHOLD_BASE && reg_addr < (REG_TOUCH_THRESHOLD_BASE + CAPSENSE_WIDGET_COUNT))
+    {
+        capsense_set_touch_threshold((uint8_t)(reg_addr - REG_TOUCH_THRESHOLD_BASE), value);
+        return;
+    }
     // 触摸电容设置寄存器组（增量/绝对）范围写入
     if (reg_addr >= REG_TOUCH_CAP_SETTING_BASE && reg_addr < (REG_TOUCH_CAP_SETTING_BASE + CAPSENSE_WIDGET_COUNT))
     {

@@ -6,14 +6,14 @@
 
 static uint16_t g_touch_status_bitmap = 0;
 
-// 统一的全局异步位域变量
 volatile capsense_async_flags_t g_capsense_async = { .raw = 0u };
-// 独立的常驻更新掩码（每Widget一位）
-volatile uint16_t g_capsense_update_mask = 0u;
+// 独立的更新掩码结构体实例
+capsense_update_masks_t g_capsense_update_masks = {0u, 0u};
 
-// 异步更新结构：保存期望值（步进，表示增量设置）
+// 异步更新结构：保存期望值
 typedef struct {
     int16_t sensitivity_steps[CAPSENSE_WIDGET_COUNT];
+    uint16_t touch_thresholds[CAPSENSE_WIDGET_COUNT];
 } capsense_update_req_t;
 
 static capsense_update_req_t g_update = {
@@ -24,6 +24,11 @@ static capsense_update_req_t g_update = {
         (int16_t)TOUCH_SENSITIVITY_DEFAULT_STEPS, (int16_t)TOUCH_SENSITIVITY_DEFAULT_STEPS,
         (int16_t)TOUCH_SENSITIVITY_DEFAULT_STEPS, (int16_t)TOUCH_SENSITIVITY_DEFAULT_STEPS,
         (int16_t)TOUCH_SENSITIVITY_DEFAULT_STEPS, (int16_t)TOUCH_SENSITIVITY_DEFAULT_STEPS,
+    },
+    .touch_thresholds = {
+        TOUCH_THRESHOLD_DEFAULT, TOUCH_THRESHOLD_DEFAULT, TOUCH_THRESHOLD_DEFAULT, TOUCH_THRESHOLD_DEFAULT,
+        TOUCH_THRESHOLD_DEFAULT, TOUCH_THRESHOLD_DEFAULT, TOUCH_THRESHOLD_DEFAULT, TOUCH_THRESHOLD_DEFAULT,
+        TOUCH_THRESHOLD_DEFAULT, TOUCH_THRESHOLD_DEFAULT, TOUCH_THRESHOLD_DEFAULT, TOUCH_THRESHOLD_DEFAULT,
     },
 };
 
@@ -50,23 +55,32 @@ uint16_t capsense_get_touch_status_bitmap(void)
     return g_touch_status_bitmap;
 }
 
-int16_t capsense_get_threshold(uint8_t idx)
+// 触摸阈值API（fingerTh参数，范围1-65535）
+uint16_t capsense_get_touch_threshold(uint8_t idx)
 {
     if (idx >= CAPSENSE_WIDGET_COUNT) {
-        return 0;
+        return TOUCH_THRESHOLD_DEFAULT;
     }
-    return g_update.sensitivity_steps[idx];
+    return g_update.touch_thresholds[idx];
 }
 
-void capsense_set_threshold(uint8_t idx, int16_t value)
+void capsense_set_touch_threshold(uint8_t idx, uint16_t threshold)
 {
     if (idx >= CAPSENSE_WIDGET_COUNT) {
         return;
     }
-    g_update.sensitivity_steps[idx] = value;
-    capsense_mark_update(idx);
+    // 范围限制：1-65535
+    if (threshold < TOUCH_THRESHOLD_MIN) {
+        threshold = TOUCH_THRESHOLD_MIN;
+    } else if (threshold > TOUCH_THRESHOLD_MAX) {
+        threshold = TOUCH_THRESHOLD_MAX;
+    }
+    g_update.touch_thresholds[idx] = threshold;
+    // 异步：仅标记触摸阈值更新位，在主循环应用
+    capsense_mark_threshold_update(idx);
 }
 
+// 触摸灵敏度API（fingerCap参数，以0.01pF为单位的步进值）
 int16_t capsense_get_touch_sensitivity(uint8_t idx)
 {
     if (idx >= CAPSENSE_WIDGET_COUNT) {
@@ -90,13 +104,12 @@ void capsense_set_touch_sensitivity(uint8_t idx, int16_t sensitivity_steps)
         sensitivity_steps = (int16_t)TOUCH_INCREMENT_MIN_STEPS;
     }
     g_update.sensitivity_steps[idx] = sensitivity_steps;
-    // 异步：仅登记待更新位，在主循环应用
-    capsense_mark_update(idx);
+    // 异步：仅标记触摸灵敏度更新位，在主循环应用
+    capsense_mark_sensitivity_update(idx);
 }
 
 uint16_t capsense_sensitivity_to_raw_count(int16_t steps)
 {
-    // 同步clamp：保持与set函数一致
     if (steps > (int16_t)TOUCH_SENSITIVITY_MAX_STEPS) {
         steps = (int16_t)TOUCH_SENSITIVITY_MAX_STEPS;
     } else if (steps < -(int16_t)TOUCH_SENSITIVITY_MAX_STEPS) {
@@ -142,7 +155,7 @@ uint16_t capsense_get_total_touch_cap(uint8_t idx)
     return (uint16_t)total;
 }
 
-// 新增：读取Cp基数（单位步进，0.01 pF），供I2C绝对模式换算
+// 读取Cp基数（单位步进，0.01 pF），供I2C绝对模式换算
 uint16_t capsense_get_cp_base_steps(uint8_t idx)
 {
     if (idx >= CAPSENSE_WIDGET_COUNT) {
@@ -199,14 +212,15 @@ void capsense_update_touch_status(void)
 void capsense_apply_threshold_changes(void)
 {
     // 仅在有待更新位时应用；避免在扫描过程中修改
-    uint16_t pending = capsense_consume_updates();
+    capsense_update_masks_t pending = capsense_consume_updates();
 
-    if (pending == 0u) {
+    if (pending.sensitivity_mask == 0u && pending.threshold_mask == 0u) {
         return;
     }
 
     for (uint8_t i = 0; i < CAPSENSE_WIDGET_COUNT; ++i) {
-        if (pending & (1u << i)) {
+        // 处理触摸灵敏度（电容）更新
+        if (pending.sensitivity_mask & (1u << i)) {
             int16_t sensitivity_steps = g_update.sensitivity_steps[i];
             // clamp幅度
             if (sensitivity_steps > (int16_t)TOUCH_SENSITIVITY_MAX_STEPS) {
@@ -234,6 +248,16 @@ void capsense_apply_threshold_changes(void)
 #if (CY_CAPSENSE_ENABLE == CY_CAPSENSE_TST_WDGT_CRC_EN)
             Cy_CapSense_UpdateCrcWidget(widget_ids[i], &cy_capsense_context);
 #endif
+#endif
+        }
+
+        // 处理触摸阈值更新
+        if (pending.threshold_mask & (1u << i)) {
+            uint16_t threshold = g_update.touch_thresholds[i];
+            // 应用触摸阈值到CapSense上下文
+            cy_capsense_context.ptrWdContext[i].fingerTh = threshold;
+#if (CY_CAPSENSE_ENABLE == CY_CAPSENSE_TST_WDGT_CRC_EN)
+            Cy_CapSense_UpdateCrcWidget(widget_ids[i], &cy_capsense_context);
 #endif
         }
     }
@@ -293,7 +317,7 @@ static void _capsense_preset_before_measurement(void)
         uint32_t cp_ff = 0u;
         (void)Cy_CapSense_MeasureCapacitanceSensor(widget_ids[i], 0u, &cp_ff, &cy_capsense_context);
         // 以0.01pF步进记录基数
-        uint32_t cp_steps = (((float)cp_ff + 5.0f) * CAPSENSOR_RATE) / 10u;
+        uint32_t cp_steps = (cp_ff + 5u) / 10u;
         if (cp_steps > TOUCH_CAP_TOTAL_MAX_STEPS) cp_steps = TOUCH_CAP_TOTAL_MAX_STEPS;
         g_cp_steps[i] = (uint16_t)cp_steps;
     }

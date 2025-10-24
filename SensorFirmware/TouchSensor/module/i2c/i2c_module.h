@@ -20,12 +20,14 @@
 #define REG_CONTROL                 (0x2)    // 原REG_LED控制重命名
 // 触摸电容设置寄存器组（每Widget 1个）：按 0.01 pF 步进写增量（基址+范围：0x03..0x0E）
 #define REG_TOUCH_CAP_SETTING_BASE  (0x03)
+// 触摸阈值设置寄存器组（每Widget 1个）：范围1-65535（基址+范围：0x0F..0x1A）
+#define REG_TOUCH_THRESHOLD_BASE    (0x0F)   // CAP0触摸阈值地址起点：0x0F + i
 // 总触摸电容只读寄存器组（每Widget 1个）：Cp基数 + 设置增量，单位 0.01 pF
-#define REG_TOTAL_TOUCH_CAP_BASE    (0x0F)   // CAP0总触摸电容地址起点：0x0F + i
+#define REG_TOTAL_TOUCH_CAP_BASE    (0x1B)   // CAP0总触摸电容地址起点：0x1B + i
 
 // 噪声只读寄存器组（每Widget 1个）：正噪声阈值与负噪声阈值（顺位后移）
-#define REG_NOISE_TH_BASE           (0x1B)   // CAP0噪声阈值地址起点：0x1B + i
-#define REG_NNOISE_TH_BASE          (0x27)   // CAP0负噪声阈值地址起点：0x27 + i
+#define REG_NOISE_TH_BASE           (0x27)   // CAP0噪声阈值地址起点：0x27 + i
+#define REG_NNOISE_TH_BASE          (0x33)   // CAP0负噪声阈值地址起点：0x33 + i
 
 // 控制寄存器位域定义：
 // bit0: reset_req，置1发起软件复位

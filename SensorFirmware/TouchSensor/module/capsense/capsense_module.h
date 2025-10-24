@@ -9,8 +9,6 @@
 #define CAPSENSE_INTR_PRIORITY    (3u)
 #define CAPSENSE_WIDGET_COUNT     (12u)
 
-#define CAPSENSOR_RATE (1.2f)
-
 // TouchSensitivity相关定义（增量设置）：单位 0.01 pF
 #define TOUCH_SENSITIVITY_STEP_PF           (0.01f)     // 每步进对应0.01pF
 // 非FULL模式最低值可为0；FULL模式维持历史最小0.1pF（10步）
@@ -31,6 +29,11 @@
 #define TOUCH_SENSITIVITY_ZERO_BIAS         (4095u)
 #define TOUCH_SENSITIVITY_RAW_MIN           (0u)
 #define TOUCH_SENSITIVITY_RAW_MAX           (8191u)
+
+// 新增：触摸阈值相关定义（范围1-65535）
+#define TOUCH_THRESHOLD_MIN                     (1u)
+#define TOUCH_THRESHOLD_MAX                     (65535u)
+#define TOUCH_THRESHOLD_DEFAULT                 (110u)
 
 // 全局异步状态位域（统一管理）：
 // bit0: calibrate_req（校准请求）
@@ -56,22 +59,42 @@ static inline void capsense_request_calibration(void)
     g_capsense_async.bits.calibrate_req = 1u;
 }
 
-// 独立的常驻更新掩码（每Widget一位）：用于阈值/参数更新的挂起标记
-extern volatile uint16_t g_capsense_update_mask;
+// 独立的更新掩码结构体：分别控制触摸灵敏度和触摸阈值的更新
+typedef struct {
+    volatile uint16_t sensitivity_mask;  // 触摸灵敏度（fingerCap）更新掩码
+    volatile uint16_t threshold_mask;    // 触摸阈值（fingerTh）更新掩码
+} capsense_update_masks_t;
 
-static inline void capsense_mark_update(uint8_t idx)
+extern capsense_update_masks_t g_capsense_update_masks;
+
+// 标记触摸灵敏度更新
+static inline void capsense_mark_sensitivity_update(uint8_t idx)
 {
     if (idx < CAPSENSE_WIDGET_COUNT) {
-        // 在ISR上下文中不切换全局中断，仅进行原子位设置
-        g_capsense_update_mask |= (uint16_t)(1u << idx);
+        __disable_irq();
+        g_capsense_update_masks.sensitivity_mask |= (uint16_t)(1u << idx);
+        __enable_irq();
     }
 }
 
-static inline uint16_t capsense_consume_updates(void)
+// 标记触摸阈值更新
+static inline void capsense_mark_threshold_update(uint8_t idx)
 {
+    if (idx < CAPSENSE_WIDGET_COUNT) {
+        __disable_irq();
+        g_capsense_update_masks.threshold_mask |= (uint16_t)(1u << idx);
+        __enable_irq();
+    }
+}
+
+// 消费并返回待更新的掩码
+static inline capsense_update_masks_t capsense_consume_updates(void)
+{
+    capsense_update_masks_t pending;
     __disable_irq();
-    uint16_t pending = g_capsense_update_mask;
-    g_capsense_update_mask = 0u;
+    pending = g_capsense_update_masks;
+    g_capsense_update_masks.sensitivity_mask = 0u;
+    g_capsense_update_masks.threshold_mask = 0u;
     __enable_irq();
     return pending;
 }
@@ -88,17 +111,20 @@ static inline uint16_t capsense_get_nnoise_th(uint8_t idx)
 }
 
 uint16_t capsense_get_touch_status_bitmap(void);
-int16_t capsense_get_threshold(uint8_t idx);
-void    capsense_set_threshold(uint8_t idx, int16_t value);
 
-// TouchSensitivity相关函数（I2C按步进值读写，表示增量设置，以0.01pF为单位）
+// 触摸阈值API（fingerTh参数，范围1-65535）
+uint16_t capsense_get_touch_threshold(uint8_t idx);
+void     capsense_set_touch_threshold(uint8_t idx, uint16_t threshold);
+
+// 触摸灵敏度API（fingerCap参数，以0.01pF为单位的步进值）
 int16_t  capsense_get_touch_sensitivity(uint8_t idx);
 void     capsense_set_touch_sensitivity(uint8_t idx, int16_t sensitivity_steps);
 uint16_t capsense_sensitivity_to_raw_count(int16_t steps);
 int16_t  capsense_raw_count_to_sensitivity(uint16_t raw);
+
 // 读取总触摸电容（Cp基数 + 增量设置），单位步进（0.01 pF）
 uint16_t capsense_get_total_touch_cap(uint8_t idx);
-// 新增：读取Cp基数（单位步进，0.01 pF），供I2C绝对模式换算
+// 读取Cp基数（单位步进，0.01 pF），供I2C绝对模式换算
 uint16_t capsense_get_cp_base_steps(uint8_t idx);
 
 void capsense_init(void);

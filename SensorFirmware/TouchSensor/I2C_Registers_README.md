@@ -31,26 +31,35 @@
 | `0x0C` | `CAP9_TOUCH_CAP_SETTING` | R/W | 2 | `MIN..MAX_STEPS` | CAP9 触摸电容设置（增量/绝对，单位 0.01 pF 步进） | 默认 `100`（1.00 pF） |
 | `0x0D` | `CAPA_TOUCH_CAP_SETTING` | R/W | 2 | `MIN..MAX_STEPS` | CAPA 触摸电容设置（增量/绝对，单位 0.01 pF 步进） | 默认 `100`（1.00 pF） |
 | `0x0E` | `CAPB_TOUCH_CAP_SETTING` | R/W | 2 | `MIN..MAX_STEPS` | CAPB 触摸电容设置（增量/绝对，单位 0.01 pF 步进） | 默认 `100`（1.00 pF） |
-| `0x0F` | `CAP0_TOTAL_TOUCH_CAP` | R | 2 | `0..2200` | CAP0 总触摸电容（Cp 基数 + 设置增量，单位 0.01 pF） | 只读；FULL 模式返回 Cp 基数，非 FULL 模式返回 Cp+增量；总和不超过 22.00 pF |
-| `0x10` | `CAP1_TOTAL_TOUCH_CAP` | R | 2 | `0..2200` | CAP1 总触摸电容（Cp 基数 + 设置增量，单位 0.01 pF） | 只读；FULL 模式返回 Cp 基数，非 FULL 模式返回 Cp+增量；总和不超过 22.00 pF |
-| `0x11` | `CAP2_TOTAL_TOUCH_CAP` | R | 2 | `0..2200` | CAP2 总触摸电容（Cp 基数 + 设置增量，单位 0.01 pF） | 只读；FULL 模式返回 Cp 基数，非 FULL 模式返回 Cp+增量；总和不超过 22.00 pF |
-| `0x12` | `CAP3_TOTAL_TOUCH_CAP` | R | 2 | `0..2200` | CAP3 总触摸电容（Cp 基数 + 设置增量，单位 0.01 pF） | 只读；FULL 模式返回 Cp 基数，非 FULL 模式返回 Cp+增量；总和不超过 22.00 pF |
-| `0x13` | `CAP4_TOTAL_TOUCH_CAP` | R | 2 | `0..2200` | CAP4 总触摸电容（Cp 基数 + 设置增量，单位 0.01 pF） | 只读；FULL 模式返回 Cp 基数，非 FULL 模式返回 Cp+增量；总和不超过 22.00 pF |
-| `0x14` | `CAP5_TOTAL_TOUCH_CAP` | R | 2 | `0..2200` | CAP5 总触摸电容（Cp 基数 + 设置增量，单位 0.01 pF） | 只读；FULL 模式返回 Cp 基数，非 FULL 模式返回 Cp+增量；总和不超过 22.00 pF |
-| `0x15` | `CAP6_TOTAL_TOUCH_CAP` | R | 2 | `0..2200` | CAP6 总触摸电容（Cp 基数 + 设置增量，单位 0.01 pF） | 只读；FULL 模式返回 Cp 基数，非 FULL 模式返回 Cp+增量；总和不超过 22.00 pF |
-| `0x16` | `CAP7_TOTAL_TOUCH_CAP` | R | 2 | `0..2200` | CAP7 总触摸电容（Cp 基数 + 设置增量，单位 0.01 pF） | 只读；FULL 模式返回 Cp 基数，非 FULL 模式返回 Cp+增量；总和不超过 22.00 pF |
-| `0x17` | `CAP8_TOTAL_TOUCH_CAP` | R | 2 | `0..2200` | CAP8 总触摸电容（Cp 基数 + 设置增量，单位 0.01 pF） | 只读；FULL 模式返回 Cp 基数，非 FULL 模式返回 Cp+增量；总和不超过 22.00 pF |
-| `0x18` | `CAP9_TOTAL_TOUCH_CAP` | R | 2 | `0..2200` | CAP9 总触摸电容（Cp 基数 + 设置增量，单位 0.01 pF） | 只读；FULL 模式返回 Cp 基数，非 FULL 模式返回 Cp+增量；总和不超过 22.00 pF |
-| `0x19` | `CAPA_TOTAL_TOUCH_CAP` | R | 2 | `0..2200` | CAPA 总触摸电容（Cp 基数 + 设置增量，单位 0.01 pF） | 只读；FULL 模式返回 Cp 基数，非 FULL 模式返回 Cp+增量；总和不超过 22.00 pF |
-| `0x1A` | `CAPB_TOTAL_TOUCH_CAP` | R | 2 | `0..2200` | CAPB 总触摸电容（Cp 基数 + 设置增量，单位 0.01 pF） | 只读；FULL 模式返回 Cp 基数，非 FULL 模式返回 Cp+增量；总和不超过 22.00 pF |
+| `0x0F` | `CAP0_TOUCH_THRESHOLD` | R/W | 2 | `1..65535` | CAP0 触摸阈值设置 | 默认 `100` |
+| `0x10` | `CAP1_TOUCH_THRESHOLD` | R/W | 2 | `1..65535` | CAP1 触摸阈值设置 | 默认 `100` |
+| `0x11` | `CAP2_TOUCH_THRESHOLD` | R/W | 2 | `1..65535` | CAP2 触摸阈值设置 | 默认 `100` |
+| `0x12` | `CAP3_TOUCH_THRESHOLD` | R/W | 2 | `1..65535` | CAP3 触摸阈值设置 | 默认 `100` |
+| `0x13` | `CAP4_TOUCH_THRESHOLD` | R/W | 2 | `1..65535` | CAP4 触摸阈值设置 | 默认 `100` |
+| `0x14` | `CAP5_TOUCH_THRESHOLD` | R/W | 2 | `1..65535` | CAP5 触摸阈值设置 | 默认 `100` |
+| `0x15` | `CAP6_TOUCH_THRESHOLD` | R/W | 2 | `1..65535` | CAP6 触摸阈值设置 | 默认 `100` |
+| `0x16` | `CAP7_TOUCH_THRESHOLD` | R/W | 2 | `1..65535` | CAP7 触摸阈值设置 | 默认 `100` |
+| `0x17` | `CAP8_TOUCH_THRESHOLD` | R/W | 2 | `1..65535` | CAP8 触摸阈值设置 | 默认 `100` |
+| `0x18` | `CAP9_TOUCH_THRESHOLD` | R/W | 2 | `1..65535` | CAP9 触摸阈值设置 | 默认 `100` |
+| `0x19` | `CAPA_TOUCH_THRESHOLD` | R/W | 2 | `1..65535` | CAPA 触摸阈值设置 | 默认 `100` |
+| `0x1A` | `CAPB_TOUCH_THRESHOLD` | R/W | 2 | `1..65535` | CAPB 触摸阈值设置 | 默认 `100` |
+| `0x1B` | `CAP0_TOTAL_TOUCH_CAP` | R | 2 | `0..2200` | CAP0 总触摸电容（Cp 基数 + 设置增量，单位 0.01 pF） | 只读 总和不超过 22.00 pF |
+| `0x1C` | `CAP1_TOTAL_TOUCH_CAP` | R | 2 | `0..2200` | CAP1 总触摸电容（Cp 基数 + 设置增量，单位 0.01 pF） | 只读 总和不超过 22.00 pF |
+| `0x1D` | `CAP2_TOTAL_TOUCH_CAP` | R | 2 | `0..2200` | CAP2 总触摸电容（Cp 基数 + 设置增量，单位 0.01 pF） | 只读 总和不超过 22.00 pF |
+| `0x1E` | `CAP3_TOTAL_TOUCH_CAP` | R | 2 | `0..2200` | CAP3 总触摸电容（Cp 基数 + 设置增量，单位 0.01 pF） | 只读 总和不超过 22.00 pF |
+| `0x1F` | `CAP4_TOTAL_TOUCH_CAP` | R | 2 | `0..2200` | CAP4 总触摸电容（Cp 基数 + 设置增量，单位 0.01 pF） | 只读 总和不超过 22.00 pF |
+| `0x20` | `CAP5_TOTAL_TOUCH_CAP` | R | 2 | `0..2200` | CAP5 总触摸电容（Cp 基数 + 设置增量，单位 0.01 pF） | 只读 总和不超过 22.00 pF |
+| `0x21` | `CAP6_TOTAL_TOUCH_CAP` | R | 2 | `0..2200` | CAP6 总触摸电容（Cp 基数 + 设置增量，单位 0.01 pF） | 只读 总和不超过 22.00 pF |
+| `0x22` | `CAP7_TOTAL_TOUCH_CAP` | R | 2 | `0..2200` | CAP7 总触摸电容（Cp 基数 + 设置增量，单位 0.01 pF） | 只读 总和不超过 22.00 pF |
+| `0x23` | `CAP8_TOTAL_TOUCH_CAP` | R | 2 | `0..2200` | CAP8 总触摸电容（Cp 基数 + 设置增量，单位 0.01 pF） | 只读 总和不超过 22.00 pF |
+| `0x24` | `CAP9_TOTAL_TOUCH_CAP` | R | 2 | `0..2200` | CAP9 总触摸电容（Cp 基数 + 设置增量，单位 0.01 pF） | 只读 总和不超过 22.00 pF |
+| `0x25` | `CAPA_TOTAL_TOUCH_CAP` | R | 2 | `0..2200` | CAPA 总触摸电容（Cp 基数 + 设置增量，单位 0.01 pF） | 只读 总和不超过 22.00 pF |
+| `0x26` | `CAPB_TOTAL_TOUCH_CAP` | R | 2 | `0..2200` | CAPB 总触摸电容（Cp 基数 + 设置增量，单位 0.01 pF） | 只读 总和不超过 22.00 pF |
 
 - 触摸灵敏度寄存器采用零点偏置编码：`TOUCH_SENSITIVITY_ZERO_BIAS=4095`。
 - 原始值范围：`0..8191`（`TOUCH_SENSITIVITY_RAW_MIN..TOUCH_SENSITIVITY_RAW_MAX`）；`<4096` 为负偏移，`>4095` 为正偏移。
 - 写入：主机写原始值；固件转换为有符号步进偏移，正向偏移若小于 `TOUCH_INCREMENT_MIN_STEPS` 将按宏修正；偏移幅度限制为 `±TOUCH_SENSITIVITY_MAX_STEPS`。
 - 读取：返回原始值，即 `ZERO_BIAS + signed_steps`。
-- 主机侧 UI 灵敏度映射：`sensitivity(0..99)` 以 `49` 为零偏；写入原始值 `raw = 4095 + (sensitivity - 49) × 10`；每 1 位对应 10 步进（0.10 pF）；降低灵敏度为负向偏移，上调为正向偏移。
-- 换算关系：`steps = raw - ZERO_BIAS`；`pF = steps × 0.01`；总触摸电容为只读，且 Cp+增量不超过 `22.00 pF`（`2200` 步进）。
-- 最低设置值：非 `FULL` 模式可为 `0`；`FULL` 模式最低为 `10`（0.10 pF）。
 
 ### 绝对模式（CONTROL.bit4=1）
 - 写入 `CAPx_TOUCH_CAP_SETTING`：值表示总触摸电容的绝对步进（单位 0.01 pF）。固件将进行边界检查（`0..TOUCH_CAP_TOTAL_MAX_STEPS`），再以 `Cp基数` 为参考换算为增量并应用（正向增量若小于 `TOUCH_INCREMENT_MIN_STEPS` 会提升到最小步进）。
@@ -72,5 +81,3 @@
   - https://community.infineon.com/t5/CAPSENSE-MagSense/CapSense-Capacitive-Sensing-Tuning-and-Signal-to-Noise-Ratio/td-p/241650
 - Infineon 社区：RawCount/IDAC/Cp 与等式 3-6 讨论（Direct 时钟、IDAC 建议等）：
   - https://community.infineon.com/t5/PSoC-4/Regarding-RawCount-IDAC-and-CP-of-Capsense/td-p/235514
-- AN66271 – 旧器件族 CapSense 设计指南（初始 Finger Threshold 与 SNR≥5 调优流程）：
-  - https://www.infineon.com/assets/row/public/documents/cross-divisions/42/infineon-an66271-cy8c21x34-b-capsense-design-guide-applicationnotes-en.pdf?fileId=8ac78c8c7cdc391c017d0723006845ca

@@ -41,6 +41,7 @@ int main(void)
     capsense_start_scan();
     _last_scan_time = _get_system_time_us();
     led_on();
+    
     for (;;)
     {
         if (!capsense_is_busy())
@@ -49,6 +50,7 @@ int main(void)
             capsense_process_widgets();
             capsense_update_touch_status();
             capsense_apply_threshold_changes();
+            
             status = capsense_get_touch_status_bitmap();
             i2c_set_touch_status_snapshot(status);
             if (i2c_led_feedback_enabled()) {
