@@ -10,9 +10,10 @@ namespace ui {
 std::string SensitivityDevice::device_name_ = "";
 std::vector<int32_t> SensitivityDevice::cached_sensitivity_values_ = {};
 TouchDeviceMapping SensitivityDevice::cached_mapping_ = {};
+bool SensitivityDevice::mapping_cached_ = false;
 
-SensitivityDevice::SensitivityDevice() : mapping_cached_(false) {
-    // 构造函数无需特殊初始化
+SensitivityDevice::SensitivityDevice() {
+    // 构造函数无需特殊初始化，所有数据都是静态的
 }
 
 void SensitivityDevice::render(PageTemplate& page_template) {
@@ -27,7 +28,7 @@ void SensitivityDevice::render(PageTemplate& page_template) {
         return;
     }
 
-    // 初始化缓存的灵敏度值
+    // 初始化缓存的灵敏度值（只在设备切换时执行）
     init_cached_values();
     
     if (!mapping_cached_) {
@@ -98,7 +99,7 @@ void SensitivityDevice::render(PageTemplate& page_template) {
 void SensitivityDevice::jump_str(const std::string& str) {
     // 接收通过ADD_MENU_WITH_STR传递的设备名称
     device_name_ = str;
-    // 重置缓存状态
+    // 重置缓存状态，强制重新加载设备数据
     mapping_cached_ = false;
     cached_sensitivity_values_.clear();
 }

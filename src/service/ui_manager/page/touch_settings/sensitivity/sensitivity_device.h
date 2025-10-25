@@ -32,7 +32,7 @@ private:
     static std::string device_name_;  // 通过jump_str接收的设备名称
     static std::vector<int32_t> cached_sensitivity_values_;  // 缓存的灵敏度值
     static TouchDeviceMapping cached_mapping_;  // 缓存的设备映射
-    bool mapping_cached_;  // 映射是否已缓存
+    static bool mapping_cached_;  // 映射是否已缓存（改为静态变量）
     
     /**
      * 获取指定设备的映射信息

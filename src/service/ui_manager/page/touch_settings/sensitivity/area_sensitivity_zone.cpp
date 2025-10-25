@@ -69,25 +69,53 @@ void AreaSensitivityZone::render(PageTemplate& page_template) {
     } else {
         ADD_TEXT("选择要调整的区域", COLOR_WHITE, LineAlign::CENTER)
         
-        // 显示该区域组中的各个区域
+        // 收集已绑定的区域并按实际区域索引排序
+        struct BoundArea {
+            uint8_t area_index;
+            const AreaSensitivity::AreaInfo* area_info;
+        };
+        
+        BoundArea bound_areas[8];
+        uint8_t bound_count = 0;
+        
+        // 收集已绑定的区域
         for (uint8_t area_idx = 0; area_idx < 8; area_idx++) {
             const auto& area_info = zone_info.areas[area_idx];
-            
             if (area_info.is_bound) {
-                // 构建显示文本
-                static char area_text[64];
-                snprintf(area_text, sizeof(area_text), "%s - 当前: %ld", 
-                        area_info.name.c_str(), area_info.current_value);
-                
-                // 使用绿色表示已修改的区域
-                uint32_t text_color = area_info.has_modified ? COLOR_TEXT_GREEN : COLOR_TEXT_WHITE;
-                
-                // 传递区域索引作为参数
-                static char area_param[8];
-                snprintf(area_param, sizeof(area_param), "%d", area_info.area_index);
-                
-                ADD_MENU_WITH_STR(area_text, "area_sensitivity_detail", area_param, text_color);
+                bound_areas[bound_count].area_index = area_info.area_index;
+                bound_areas[bound_count].area_info = &area_info;
+                bound_count++;
             }
+        }
+        
+        // 按实际区域索引排序（冒泡排序，简单有效）
+        for (uint8_t i = 0; i < bound_count - 1; i++) {
+            for (uint8_t j = 0; j < bound_count - 1 - i; j++) {
+                if (bound_areas[j].area_index > bound_areas[j + 1].area_index) {
+                    BoundArea temp = bound_areas[j];
+                    bound_areas[j] = bound_areas[j + 1];
+                    bound_areas[j + 1] = temp;
+                }
+            }
+        }
+        
+        // 按排序后的顺序显示区域
+        for (uint8_t i = 0; i < bound_count; i++) {
+            const auto* area_info = bound_areas[i].area_info;
+            
+            // 构建显示文本
+            static char area_text[64];
+            snprintf(area_text, sizeof(area_text), "%s - 当前: %ld", 
+                    area_info->name.c_str(), area_info->current_value);
+            
+            // 使用绿色表示已修改的区域
+            uint32_t text_color = area_info->has_modified ? COLOR_TEXT_GREEN : COLOR_TEXT_WHITE;
+            
+            // 传递区域索引作为参数
+            static char area_param[8];
+            snprintf(area_param, sizeof(area_param), "%d", area_info->area_index);
+            
+            ADD_MENU_WITH_STR(area_text, "area_sensitivity_detail", area_param, text_color);
         }
     }
     

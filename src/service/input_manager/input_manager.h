@@ -716,11 +716,10 @@ private:
         uint8_t device_id;      // 设备ID
         uint8_t channel;        // 通道号
         uint8_t sensitivity;    // 灵敏度值
-        bool valid;             // 请求是否有效
         
-        SensitivityRequest() : device_id(0), channel(0), sensitivity(0), valid(false) {}
+        SensitivityRequest() : device_id(0), channel(0), sensitivity(0) {}
         SensitivityRequest(uint8_t dev_id, uint8_t ch, uint8_t sens) 
-            : device_id(dev_id), channel(ch), sensitivity(sens), valid(true) {}
+            : device_id(dev_id), channel(ch), sensitivity(sens) {}
     };
     
     struct SensitivityRequestBuffer {
@@ -729,12 +728,7 @@ private:
         volatile uint8_t head;                      // 头指针（UI写入，task0读取）
         volatile uint8_t tail;                      // 尾指针（task0写入，UI读取）
         
-        SensitivityRequestBuffer() : head(0), tail(0) {
-            // 初始化所有请求为无效状态
-            for (uint8_t i = 0; i < BUFFER_SIZE; i++) {
-                requests[i].valid = false;
-            }
-        }
+        SensitivityRequestBuffer() : head(0), tail(0) {}
         
         // UI侧：推送请求到缓冲区（CPU1调用）
         bool pushRequest(uint8_t device_id, uint8_t channel, uint8_t sensitivity) {
@@ -755,7 +749,6 @@ private:
             }
             
             request = requests[tail];
-            requests[tail].valid = false; // 标记为无效（可选，用于调试）
             tail = (tail + 1) % BUFFER_SIZE;
             return true;
         }

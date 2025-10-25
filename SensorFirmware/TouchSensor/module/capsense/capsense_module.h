@@ -202,14 +202,18 @@ uint16_t capsense_get_touch_threshold(uint8_t idx);
 void     capsense_set_touch_threshold(uint8_t idx, uint16_t threshold);
 
 // 触摸灵敏度API（fingerCap参数，以0.01pF为单位的步进值）
-int16_t  capsense_get_touch_sensitivity(uint8_t idx);
-void     capsense_set_touch_sensitivity(uint8_t idx, int16_t sensitivity_steps);
 uint16_t capsense_sensitivity_to_raw_count(int16_t steps);
 int16_t  capsense_raw_count_to_sensitivity(uint16_t raw);
 
 // 统一的fingercap电容值API
 uint16_t capsense_get_fingercap_steps(uint8_t idx);
 void     capsense_set_fingercap_steps(uint8_t idx, uint16_t steps);
+
+// 唯一的读写函数：直接操作cy_capsense_context
+uint16_t capsense_read_fingercap_from_context(uint8_t channel);
+uint16_t capsense_read_threshold_from_context(uint8_t channel);
+void capsense_write_fingercap_to_context(uint8_t channel, uint16_t fingercap_steps);
+void capsense_write_threshold_to_context(uint8_t channel, uint16_t threshold);
 
 uint16_t capsense_get_cp_base_steps(uint8_t idx);
 

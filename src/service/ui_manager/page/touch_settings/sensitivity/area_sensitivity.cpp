@@ -16,6 +16,12 @@ bool AreaSensitivity::s_initialized_ = false;
 uint8_t AreaSensitivity::s_current_zone_index_ = 0;
 int32_t AreaSensitivity::s_current_area_index_ = -1;
 
+// 当前编辑区域的静态数据存储
+int32_t AreaSensitivity::s_current_sensitivity_value_ = 0;
+std::string AreaSensitivity::s_current_area_name_ = "";
+uint8_t AreaSensitivity::s_current_device_mask_ = 0;
+uint8_t AreaSensitivity::s_current_channel_ = 0;
+
 AreaSensitivity::AreaSensitivity() {
     // 构造函数实现
 }
@@ -225,18 +231,31 @@ void AreaSensitivity::renderAreaDetail(PageTemplate& page_template) {
         ADD_TEXT("指定的区域未找到", COLOR_WHITE, LineAlign::CENTER)
         ADD_BACK_ITEM("返回", COLOR_TEXT_WHITE)
     } else {
+        // 只在区域切换时更新静态数据，避免每帧重复设置
+        if (s_current_area_name_ != current_area->area_name) {
+            s_current_area_name_ = current_area->area_name;
+            s_current_sensitivity_value_ = current_area->current_value;
+            s_current_device_mask_ = current_area->device_mask;
+            s_current_channel_ = current_area->channel;
+        }
+        
         static char title_text[64];
-        snprintf(title_text, sizeof(title_text), "%s 灵敏度设置", current_area->area_name.c_str());
+        snprintf(title_text, sizeof(title_text), "%s 灵敏度设置", s_current_area_name_.c_str());
         SET_TITLE(title_text, COLOR_WHITE)
         
         // 显示当前灵敏度值
         static char current_text[64];
-        snprintf(current_text, sizeof(current_text), "当前灵敏度: %ld", current_area->current_value);
+        snprintf(current_text, sizeof(current_text), "当前灵敏度: %ld", s_current_sensitivity_value_);
         ADD_TEXT(current_text, COLOR_WHITE, LineAlign::CENTER)
         
-        // 灵敏度调整控件
-        // 添加灵敏度调整设置
-        ADD_INT_SETTING(&current_area->current_value, 0, 99, "灵敏度", "调整灵敏度", nullptr, nullptr, COLOR_TEXT_WHITE);
+        // 灵敏度调整控件 - 使用静态变量和完成回调
+        ADD_INT_SETTING(&s_current_sensitivity_value_, 0, 99, "灵敏度", "调整灵敏度", 
+                       [](int32_t value) { 
+                           // 值变化时同步到静态成员变量
+                           s_current_sensitivity_value_ = value; 
+                       }, 
+                       on_sensitivity_complete,  // 使用完成回调
+                       COLOR_TEXT_WHITE);
         
         ADD_BACK_ITEM("返回", COLOR_TEXT_WHITE)
     }
@@ -338,26 +357,20 @@ void AreaSensitivity::on_sensitivity_change(int32_t new_value) {
 }
 
 void AreaSensitivity::on_sensitivity_complete() {
-    // 完成灵敏度设置时调用
-    if (s_current_area_index_ >= 0) {
-        // 获取InputManager实例
-        InputManager* input_manager = InputManager::getInstance();
-        if (!input_manager) {
-            return;
-        }
-        
-        // 找到当前区域信息
-        for (uint8_t zone_idx = 0; zone_idx < 5; zone_idx++) {
-            for (uint8_t area_idx = 0; area_idx < 8; area_idx++) {
-                AreaInfo& area = s_zone_infos_[zone_idx].areas[area_idx];
-                if (area.area_index == s_current_area_index_ && area.is_bound && area.supports_sensitivity) {
-                    // 调用InputManager设置灵敏度
-                    input_manager->setSensitivity(area.device_mask, area.channel, area.current_value);
-                    break;
-                }
-            }
-        }
+    // 使用静态成员变量获取当前区域信息
+    InputManager* input_manager = InputManager::getInstance();
+    if (!input_manager) return;
+    
+    // 检查是否有有效的区域数据
+    if (s_current_area_name_.empty() || s_current_device_mask_ == 0) {
+        return;
     }
+    
+    // 将灵敏度值转换为int8_t
+    int8_t sensitivity = static_cast<int8_t>(s_current_sensitivity_value_);
+    
+    // 设置设备通道灵敏度
+    input_manager->setSensitivity(s_current_device_mask_, s_current_channel_, sensitivity);
 }
 
 void AreaSensitivity::on_zone_select(uint8_t zone_index) {

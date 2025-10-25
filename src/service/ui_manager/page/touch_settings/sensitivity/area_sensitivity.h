@@ -69,6 +69,12 @@ private:
     static uint8_t s_current_zone_index_;
     static int32_t s_current_area_index_;
     
+    // 当前编辑区域的静态数据存储
+    static int32_t s_current_sensitivity_value_;  // 当前编辑的灵敏度值
+    static std::string s_current_area_name_;      // 当前编辑的区域名称
+    static uint8_t s_current_device_mask_;        // 当前区域的设备掩码
+    static uint8_t s_current_channel_;            // 当前区域的通道号
+    
     // 静态方法，供其他页面访问
 public:
     static ZoneInfo* getZoneInfos() { return s_zone_infos_; }

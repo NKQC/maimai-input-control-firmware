@@ -186,18 +186,16 @@ uint16_t i2c_handle_register_read(uint8_t reg_addr)
     // 触摸阈值设置寄存器组（范围1-65535）
     if (reg_addr >= REG_TOUCH_THRESHOLD_BASE && reg_addr < (REG_TOUCH_THRESHOLD_BASE + CAPSENSE_WIDGET_COUNT))
     {
-        return capsense_get_touch_threshold((uint8_t)(reg_addr - REG_TOUCH_THRESHOLD_BASE));
+        uint8_t idx = (uint8_t)(reg_addr - REG_TOUCH_THRESHOLD_BASE);
+        // 直接从cy_capsense_context读取阈值
+        return capsense_read_threshold_from_context(idx);
     }
     // 触摸电容设置寄存器组（增量/绝对）范围判断
     if (reg_addr >= REG_TOUCH_CAP_SETTING_BASE && reg_addr < (REG_TOUCH_CAP_SETTING_BASE + CAPSENSE_WIDGET_COUNT))
     {
         uint8_t idx = (uint8_t)(reg_addr - REG_TOUCH_CAP_SETTING_BASE);
-        // 读取时根据模式返回：绝对模式返回总触摸电容步进；相对模式返回原始编码值
-        if (g_control_reg.bits.absolute_mode) {
-            return capsense_get_fingercap_steps(idx);
-        } else {
-            return capsense_sensitivity_to_raw_count(capsense_get_touch_sensitivity(idx));
-        }
+        // 直接从cy_capsense_context读取fingercap步进值
+        return capsense_read_fingercap_from_context(idx);
     }
 
     switch (reg_addr)
@@ -225,39 +223,21 @@ void i2c_handle_register_write(uint8_t reg_addr, uint16_t value)
     // 触摸阈值设置寄存器组（范围1-65535）
     if (reg_addr >= REG_TOUCH_THRESHOLD_BASE && reg_addr < (REG_TOUCH_THRESHOLD_BASE + CAPSENSE_WIDGET_COUNT))
     {
-        capsense_set_touch_threshold((uint8_t)(reg_addr - REG_TOUCH_THRESHOLD_BASE), value);
+        uint8_t idx = (uint8_t)(reg_addr - REG_TOUCH_THRESHOLD_BASE);
+        // 通过g_capsense_update异步传递阈值配置
+        capsense_set_touch_threshold(idx, value);
         return;
     }
     // 触摸电容设置寄存器组（增量/绝对）范围写入
     if (reg_addr >= REG_TOUCH_CAP_SETTING_BASE && reg_addr < (REG_TOUCH_CAP_SETTING_BASE + CAPSENSE_WIDGET_COUNT))
     {
         uint8_t idx = (uint8_t)(reg_addr - REG_TOUCH_CAP_SETTING_BASE);
-        if (g_control_reg.bits.absolute_mode) {
-            // 绝对模式：value 为总触摸电容步进（0.01pF），进行边界检查并换算为增量
-            uint16_t cp_base = capsense_get_cp_base_steps(idx);
-            uint16_t total = value;
-            if (total > TOUCH_CAP_TOTAL_MAX_STEPS) {
-                total = TOUCH_CAP_TOTAL_MAX_STEPS;
-            }
-            // 计算增量（可为负值），并按规则夹取
-            int32_t delta = (int32_t)total - (int32_t)cp_base;
-            if (delta > (int32_t)TOUCH_SENSITIVITY_MAX_STEPS) {
-                delta = (int32_t)TOUCH_SENSITIVITY_MAX_STEPS;
-            } else if (delta < -(int32_t)TOUCH_SENSITIVITY_MAX_STEPS) {
-                delta = -(int32_t)TOUCH_SENSITIVITY_MAX_STEPS;
-            }
-            // 正向增量的最小步进（FULL模式下为10步）
-            if (delta > 0 && delta < (int32_t)TOUCH_INCREMENT_MIN_STEPS) {
-                delta = (int32_t)TOUCH_INCREMENT_MIN_STEPS;
-            }
-            capsense_set_touch_sensitivity(idx, (int16_t)delta);
-        } else {
-            // 相对模式：value 为原始编码（0..8191），转换为步进偏移量并累积到当前值
-            int16_t offset_steps = capsense_raw_count_to_sensitivity(value);
-            int16_t current_steps = capsense_get_touch_sensitivity(idx);
-            int16_t new_steps = current_steps + offset_steps;
-            capsense_set_touch_sensitivity(idx, new_steps);
+        // 通过g_capsense_update异步传递fingercap配置
+        uint16_t steps = value;
+        if (steps > TOUCH_CAP_TOTAL_MAX_STEPS) {
+            steps = TOUCH_CAP_TOTAL_MAX_STEPS;
         }
+        capsense_set_fingercap_steps(idx, steps);
         return;
     }
     switch (reg_addr)
@@ -280,9 +260,6 @@ void i2c_handle_register_write(uint8_t reg_addr, uint16_t value)
                 capsense_request_calibration();
             }
             
-            // 完整更新g_control_reg，确保读写一致
-            // 注意：calibrate_req和calibration_done由g_capsense_async管理，这里保持g_control_reg同步
-            // 直接使用raw赋值，避免位域操作的潜在异常
             g_control_reg.raw = in.raw;
             
             break;
