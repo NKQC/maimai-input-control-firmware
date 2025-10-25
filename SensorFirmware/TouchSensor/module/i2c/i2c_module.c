@@ -73,7 +73,12 @@ void i2c_init(uint8_t slave_address)
 // 读取LED触摸提示开关状态（CONTROL.bit5）
 bool i2c_led_feedback_enabled(void)
 {
-    return (g_control_reg.bits.led_feedback_en != 0u);
+    return g_control_reg.bits.led_feedback_en;
+}
+
+bool i2c_get_absolute_mode(void)
+{
+    return g_control_reg.bits.absolute_mode;
 }
 
 // 新增：由主循环提交触摸状态快照，I2C读取统一返回该值
@@ -176,7 +181,7 @@ uint16_t i2c_handle_register_read(uint8_t reg_addr)
     // 总触摸电容只读寄存器组
     if (reg_addr >= REG_TOTAL_TOUCH_CAP_BASE && reg_addr < (REG_TOTAL_TOUCH_CAP_BASE + CAPSENSE_WIDGET_COUNT))
     {
-        return capsense_get_total_touch_cap((uint8_t)(reg_addr - REG_TOTAL_TOUCH_CAP_BASE));
+        return capsense_get_fingercap_steps((uint8_t)(reg_addr - REG_TOTAL_TOUCH_CAP_BASE));
     }
     // 触摸阈值设置寄存器组（范围1-65535）
     if (reg_addr >= REG_TOUCH_THRESHOLD_BASE && reg_addr < (REG_TOUCH_THRESHOLD_BASE + CAPSENSE_WIDGET_COUNT))
@@ -189,7 +194,7 @@ uint16_t i2c_handle_register_read(uint8_t reg_addr)
         uint8_t idx = (uint8_t)(reg_addr - REG_TOUCH_CAP_SETTING_BASE);
         // 读取时根据模式返回：绝对模式返回总触摸电容步进；相对模式返回原始编码值
         if (g_control_reg.bits.absolute_mode) {
-            return capsense_get_total_touch_cap(idx);
+            return capsense_get_fingercap_steps(idx);
         } else {
             return capsense_sensitivity_to_raw_count(capsense_get_touch_sensitivity(idx));
         }

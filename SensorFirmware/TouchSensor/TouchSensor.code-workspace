@@ -29,7 +29,8 @@
             "led_module.h": "c",
             "cycfg_capsense.h": "c",
             "cy_capsense.h": "c",
-            "cy_capsense_csd_v2.h": "c"
+            "cy_capsense_csd_v2.h": "c",
+            "limits": "c"
         }
     },
     "extensions": {

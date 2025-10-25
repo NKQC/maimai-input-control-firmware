@@ -71,7 +71,7 @@
         <Property id="CSD_IDAC_GAIN_INIT_INDEX" value="GAIN_2400"/>
         <Property id="CSD_IDAC_MIN" value="20"/>
         <Property id="CSD_IDAC_COMP_EN" value="true"/>
-        <Property id="CSD_RAWCOUNT_CAL_LEVEL" value="60"/>
+        <Property id="CSD_RAWCOUNT_CAL_LEVEL" value="12"/>
         <Property id="CSD_VREF_CUSTOM" value="false"/>
         <Property id="CSD_VREF" value="1219"/>
         <Property id="CSD_SHIELD_EN" value="false"/>
@@ -125,7 +125,7 @@
                 <Property id="IDAC_GAIN_INDEX" value="GAIN_2400"/>
                 <Property id="MAX_RAW_COUNT" value="0"/>
                 <Property id="ROW_MAX_RAW_COUNT" value="0"/>
-                <Property id="FINGER_TH" value="115"/>
+                <Property id="FINGER_TH" value="90"/>
                 <Property id="PROX_TOUCH_TH" value="100"/>
                 <Property id="NOISE_TH" value="40"/>
                 <Property id="NNOISE_TH" value="40"/>
@@ -230,7 +230,7 @@
                 <Property id="IDAC_GAIN_INDEX" value="GAIN_2400"/>
                 <Property id="MAX_RAW_COUNT" value="0"/>
                 <Property id="ROW_MAX_RAW_COUNT" value="0"/>
-                <Property id="FINGER_TH" value="115"/>
+                <Property id="FINGER_TH" value="90"/>
                 <Property id="PROX_TOUCH_TH" value="100"/>
                 <Property id="NOISE_TH" value="40"/>
                 <Property id="NNOISE_TH" value="40"/>
@@ -335,7 +335,7 @@
                 <Property id="IDAC_GAIN_INDEX" value="GAIN_2400"/>
                 <Property id="MAX_RAW_COUNT" value="0"/>
                 <Property id="ROW_MAX_RAW_COUNT" value="0"/>
-                <Property id="FINGER_TH" value="115"/>
+                <Property id="FINGER_TH" value="90"/>
                 <Property id="PROX_TOUCH_TH" value="100"/>
                 <Property id="NOISE_TH" value="40"/>
                 <Property id="NNOISE_TH" value="40"/>
@@ -440,7 +440,7 @@
                 <Property id="IDAC_GAIN_INDEX" value="GAIN_2400"/>
                 <Property id="MAX_RAW_COUNT" value="0"/>
                 <Property id="ROW_MAX_RAW_COUNT" value="0"/>
-                <Property id="FINGER_TH" value="115"/>
+                <Property id="FINGER_TH" value="90"/>
                 <Property id="PROX_TOUCH_TH" value="100"/>
                 <Property id="NOISE_TH" value="40"/>
                 <Property id="NNOISE_TH" value="40"/>
@@ -545,7 +545,7 @@
                 <Property id="IDAC_GAIN_INDEX" value="GAIN_2400"/>
                 <Property id="MAX_RAW_COUNT" value="0"/>
                 <Property id="ROW_MAX_RAW_COUNT" value="0"/>
-                <Property id="FINGER_TH" value="115"/>
+                <Property id="FINGER_TH" value="90"/>
                 <Property id="PROX_TOUCH_TH" value="100"/>
                 <Property id="NOISE_TH" value="40"/>
                 <Property id="NNOISE_TH" value="40"/>
@@ -650,7 +650,7 @@
                 <Property id="IDAC_GAIN_INDEX" value="GAIN_2400"/>
                 <Property id="MAX_RAW_COUNT" value="0"/>
                 <Property id="ROW_MAX_RAW_COUNT" value="0"/>
-                <Property id="FINGER_TH" value="115"/>
+                <Property id="FINGER_TH" value="90"/>
                 <Property id="PROX_TOUCH_TH" value="100"/>
                 <Property id="NOISE_TH" value="40"/>
                 <Property id="NNOISE_TH" value="40"/>
@@ -755,7 +755,7 @@
                 <Property id="IDAC_GAIN_INDEX" value="GAIN_2400"/>
                 <Property id="MAX_RAW_COUNT" value="0"/>
                 <Property id="ROW_MAX_RAW_COUNT" value="0"/>
-                <Property id="FINGER_TH" value="115"/>
+                <Property id="FINGER_TH" value="90"/>
                 <Property id="PROX_TOUCH_TH" value="100"/>
                 <Property id="NOISE_TH" value="40"/>
                 <Property id="NNOISE_TH" value="40"/>
@@ -860,7 +860,7 @@
                 <Property id="IDAC_GAIN_INDEX" value="GAIN_2400"/>
                 <Property id="MAX_RAW_COUNT" value="0"/>
                 <Property id="ROW_MAX_RAW_COUNT" value="0"/>
-                <Property id="FINGER_TH" value="115"/>
+                <Property id="FINGER_TH" value="90"/>
                 <Property id="PROX_TOUCH_TH" value="100"/>
                 <Property id="NOISE_TH" value="40"/>
                 <Property id="NNOISE_TH" value="40"/>
@@ -965,7 +965,7 @@
                 <Property id="IDAC_GAIN_INDEX" value="GAIN_2400"/>
                 <Property id="MAX_RAW_COUNT" value="0"/>
                 <Property id="ROW_MAX_RAW_COUNT" value="0"/>
-                <Property id="FINGER_TH" value="115"/>
+                <Property id="FINGER_TH" value="90"/>
                 <Property id="PROX_TOUCH_TH" value="100"/>
                 <Property id="NOISE_TH" value="40"/>
                 <Property id="NNOISE_TH" value="40"/>
@@ -1070,7 +1070,7 @@
                 <Property id="IDAC_GAIN_INDEX" value="GAIN_2400"/>
                 <Property id="MAX_RAW_COUNT" value="0"/>
                 <Property id="ROW_MAX_RAW_COUNT" value="0"/>
-                <Property id="FINGER_TH" value="115"/>
+                <Property id="FINGER_TH" value="90"/>
                 <Property id="PROX_TOUCH_TH" value="100"/>
                 <Property id="NOISE_TH" value="40"/>
                 <Property id="NNOISE_TH" value="40"/>
@@ -1175,7 +1175,7 @@
                 <Property id="IDAC_GAIN_INDEX" value="GAIN_2400"/>
                 <Property id="MAX_RAW_COUNT" value="0"/>
                 <Property id="ROW_MAX_RAW_COUNT" value="0"/>
-                <Property id="FINGER_TH" value="115"/>
+                <Property id="FINGER_TH" value="90"/>
                 <Property id="PROX_TOUCH_TH" value="100"/>
                 <Property id="NOISE_TH" value="40"/>
                 <Property id="NNOISE_TH" value="40"/>
@@ -1280,7 +1280,7 @@
                 <Property id="IDAC_GAIN_INDEX" value="GAIN_2400"/>
                 <Property id="MAX_RAW_COUNT" value="0"/>
                 <Property id="ROW_MAX_RAW_COUNT" value="0"/>
-                <Property id="FINGER_TH" value="115"/>
+                <Property id="FINGER_TH" value="90"/>
                 <Property id="PROX_TOUCH_TH" value="100"/>
                 <Property id="NOISE_TH" value="40"/>
                 <Property id="NNOISE_TH" value="40"/>

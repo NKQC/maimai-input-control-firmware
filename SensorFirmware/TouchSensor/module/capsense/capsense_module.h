@@ -59,20 +59,57 @@ static inline void capsense_request_calibration(void)
     g_capsense_async.bits.calibrate_req = 1u;
 }
 
-// 独立的更新掩码结构体：分别控制触摸灵敏度和触摸阈值的更新
+// 统一的异步更新结构体：将数值和更新mask绑定在一起
 typedef struct {
-    volatile uint16_t sensitivity_mask;  // 触摸灵敏度（fingerCap）更新掩码
-    volatile uint16_t threshold_mask;    // 触摸阈值（fingerTh）更新掩码
-} capsense_update_masks_t;
+    // 电容值数组：统一的fingercap值（单位：0.01pF步进）
+    uint16_t fingercap_steps[CAPSENSE_WIDGET_COUNT];
+    // 触摸阈值数组
+    uint16_t touch_thresholds[CAPSENSE_WIDGET_COUNT];
+    // 更新掩码：标记哪些通道需要更新
+    volatile uint16_t fingercap_update_mask;
+    volatile uint16_t threshold_update_mask;
+} capsense_unified_update_t;
 
-extern capsense_update_masks_t g_capsense_update_masks;
+extern capsense_unified_update_t g_capsense_update;
 
-// 标记触摸灵敏度更新
-static inline void capsense_mark_sensitivity_update(uint8_t idx)
+// 内联限位函数：避免反复构造
+static inline uint16_t clamp_fingercap_steps(uint16_t steps)
+{
+    if (steps > TOUCH_CAP_TOTAL_MAX_STEPS) {
+        return TOUCH_CAP_TOTAL_MAX_STEPS;
+    }
+    return steps;
+}
+
+static inline uint16_t clamp_threshold(uint16_t threshold)
+{
+    if (threshold < TOUCH_THRESHOLD_MIN) {
+        return TOUCH_THRESHOLD_MIN;
+    } else if (threshold > TOUCH_THRESHOLD_MAX) {
+        return TOUCH_THRESHOLD_MAX;
+    }
+    return threshold;
+}
+
+static inline int16_t clamp_sensitivity_steps(int16_t steps)
+{
+    if (steps > (int16_t)TOUCH_SENSITIVITY_MAX_STEPS) {
+        steps = (int16_t)TOUCH_SENSITIVITY_MAX_STEPS;
+    } else if (steps < -(int16_t)TOUCH_SENSITIVITY_MAX_STEPS) {
+        steps = -(int16_t)TOUCH_SENSITIVITY_MAX_STEPS;
+    }
+    if (steps > 0 && steps < (int16_t)TOUCH_INCREMENT_MIN_STEPS) {
+        steps = (int16_t)TOUCH_INCREMENT_MIN_STEPS;
+    }
+    return steps;
+}
+
+// 标记fingercap更新
+static inline void capsense_mark_fingercap_update(uint8_t idx)
 {
     if (idx < CAPSENSE_WIDGET_COUNT) {
         __disable_irq();
-        g_capsense_update_masks.sensitivity_mask |= (uint16_t)(1u << idx);
+        g_capsense_update.fingercap_update_mask |= (uint16_t)(1u << idx);
         __enable_irq();
     }
 }
@@ -82,19 +119,67 @@ static inline void capsense_mark_threshold_update(uint8_t idx)
 {
     if (idx < CAPSENSE_WIDGET_COUNT) {
         __disable_irq();
-        g_capsense_update_masks.threshold_mask |= (uint16_t)(1u << idx);
+        g_capsense_update.threshold_update_mask |= (uint16_t)(1u << idx);
         __enable_irq();
     }
 }
 
-// 消费并返回待更新的掩码
-static inline capsense_update_masks_t capsense_consume_updates(void)
+// 中断安全的快照结构体：包含掩码和对应的数据
+typedef struct {
+    uint16_t fingercap_mask;
+    uint16_t threshold_mask;
+    uint16_t fingercap_steps[CAPSENSE_WIDGET_COUNT];
+    uint16_t touch_thresholds[CAPSENSE_WIDGET_COUNT];
+} capsense_update_snapshot_t;
+
+// 中断安全的快照函数：原子性地获取掩码和对应数据
+static inline void capsense_consume_updates_snapshot(capsense_update_snapshot_t* snapshot)
 {
-    capsense_update_masks_t pending;
     __disable_irq();
-    pending = g_capsense_update_masks;
-    g_capsense_update_masks.sensitivity_mask = 0u;
-    g_capsense_update_masks.threshold_mask = 0u;
+    // 获取掩码
+    snapshot->fingercap_mask = g_capsense_update.fingercap_update_mask;
+    snapshot->threshold_mask = g_capsense_update.threshold_update_mask;
+    
+    // 只有在有更新时才复制对应的数据
+    if (snapshot->fingercap_mask != 0u) {
+        for (uint8_t i = 0; i < CAPSENSE_WIDGET_COUNT; ++i) {
+            if (snapshot->fingercap_mask & (1u << i)) {
+                snapshot->fingercap_steps[i] = g_capsense_update.fingercap_steps[i];
+            }
+        }
+        // 清除已消费的掩码
+        g_capsense_update.fingercap_update_mask = 0u;
+    }
+    
+    if (snapshot->threshold_mask != 0u) {
+        for (uint8_t i = 0; i < CAPSENSE_WIDGET_COUNT; ++i) {
+            if (snapshot->threshold_mask & (1u << i)) {
+                snapshot->touch_thresholds[i] = g_capsense_update.touch_thresholds[i];
+            }
+        }
+        // 清除已消费的掩码
+        g_capsense_update.threshold_update_mask = 0u;
+    }
+    __enable_irq();
+}
+
+// 保留旧的函数以维持兼容性（但标记为已弃用）
+static inline uint16_t capsense_consume_fingercap_updates(void)
+{
+    uint16_t pending;
+    __disable_irq();
+    pending = g_capsense_update.fingercap_update_mask;
+    g_capsense_update.fingercap_update_mask = 0u;
+    __enable_irq();
+    return pending;
+}
+
+static inline uint16_t capsense_consume_threshold_updates(void)
+{
+    uint16_t pending;
+    __disable_irq();
+    pending = g_capsense_update.threshold_update_mask;
+    g_capsense_update.threshold_update_mask = 0u;
     __enable_irq();
     return pending;
 }
@@ -102,12 +187,12 @@ static inline capsense_update_masks_t capsense_consume_updates(void)
 // 噪声只读寄存器内联访问（直接从cy_capsense_tuner读取当前阈值）
 static inline uint16_t capsense_get_noise_th(uint8_t idx)
 {
-    return (idx < CAPSENSE_WIDGET_COUNT) ? cy_capsense_tuner.widgetContext[idx].noiseTh : 0u;
+    return cy_capsense_context.ptrWdContext[idx].noiseTh;
 }
 
 static inline uint16_t capsense_get_nnoise_th(uint8_t idx)
 {
-    return (idx < CAPSENSE_WIDGET_COUNT) ? cy_capsense_tuner.widgetContext[idx].nNoiseTh : 0u;
+    return cy_capsense_context.ptrWdContext[idx].nNoiseTh;
 }
 
 uint16_t capsense_get_touch_status_bitmap(void);
@@ -122,9 +207,10 @@ void     capsense_set_touch_sensitivity(uint8_t idx, int16_t sensitivity_steps);
 uint16_t capsense_sensitivity_to_raw_count(int16_t steps);
 int16_t  capsense_raw_count_to_sensitivity(uint16_t raw);
 
-// 读取总触摸电容（Cp基数 + 增量设置），单位步进（0.01 pF）
-uint16_t capsense_get_total_touch_cap(uint8_t idx);
-// 读取Cp基数（单位步进，0.01 pF），供I2C绝对模式换算
+// 统一的fingercap电容值API
+uint16_t capsense_get_fingercap_steps(uint8_t idx);
+void     capsense_set_fingercap_steps(uint8_t idx, uint16_t steps);
+
 uint16_t capsense_get_cp_base_steps(uint8_t idx);
 
 void capsense_init(void);
@@ -135,11 +221,11 @@ void capsense_start_scan(void);
 bool capsense_is_busy(void);
 void capsense_handle_async_ops(void);
 
-// 自动噪声测量并写入阈值（fingerTh/hysteresis/noiseTh/nNoiseTh等）
+// 自动调谐阈值
 void capsense_auto_tune_thresholds(uint8_t passes);
 
 #if CY_CAPSENSE_BIST_EN
 void capsense_measure_sensor_cp(void);
 #endif
 
-#endif /* CAPSENSE_MODULE_H */
+#endif // CAPSENSE_MODULE_H
