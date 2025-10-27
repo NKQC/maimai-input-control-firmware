@@ -560,67 +560,81 @@ private:
         Mai2Serial_TouchState serial_touch_state;      // Serial触摸状态
     };
     
-    // 新增：投票聚合状态结构体
+    // 新增：投票聚合状态结构体（按位投票）
     struct VotingAggregationState {
-        uint32_t trigger_count_state1;      // state1触发计数
-        uint32_t trigger_count_state2;      // state2触发计数
-        uint32_t non_trigger_count_state1;  // state1非触发计数
-        uint32_t non_trigger_count_state2;  // state2非触发计数
-        uint32_t total_samples;             // 总采样数
-        
-        VotingAggregationState() : trigger_count_state1(0), trigger_count_state2(0), 
-                                  non_trigger_count_state1(0), non_trigger_count_state2(0), 
-                                  total_samples(0) {}
-        
-        void reset() {
-            trigger_count_state1 = 0;
-            trigger_count_state2 = 0;
-            non_trigger_count_state1 = 0;
-            non_trigger_count_state2 = 0;
+        uint16_t ones_count_state1[32];     // state1各位的1计数
+        uint16_t ones_count_state2[32];     // state2各位的1计数（仅低3位有效）
+        uint16_t total_samples;             // 聚合窗口内样本数
+
+        VotingAggregationState() : ones_count_state1{0}, ones_count_state2{0}, total_samples(0) {}
+
+        inline void reset() {
+            // 使用循环清零，避免memset潜在的未对齐问题
+            for (int i = 0; i < 32; ++i) {
+                ones_count_state1[i] = 0;
+                ones_count_state2[i] = 0;
+            }
             total_samples = 0;
         }
-        
-        // 优化的位计数累加函数 - 一次性处理多个位
-        void addTriggerCounts(uint32_t state1_bits, uint32_t state2_bits) {
-            // 使用内建函数进行高效位计数
-            trigger_count_state1 += __builtin_popcount(state1_bits);
-            trigger_count_state2 += __builtin_popcount(state2_bits);
-            non_trigger_count_state1 += __builtin_popcount(~state1_bits);
-            non_trigger_count_state2 += __builtin_popcount(~state2_bits);
+
+        // 单样本累加：对每位进行计数
+        inline void accumulate(uint32_t state1_bits, uint32_t state2_bits) {
+            // 逐位计数，保证按位多数投票
+            for (int b = 0; b < 32; ++b) {
+                if (state1_bits & (1u << b)) ones_count_state1[b]++;
+            }
+            for (int b = 0; b < 32; ++b) {
+                if (state2_bits & (1u << b)) ones_count_state2[b]++;
+            }
             total_samples++;
         }
-        
-        // 批量处理多个状态的优化版本
-        void addTriggerCountsBatch(const uint32_t* state1_array, const uint32_t* state2_array, uint32_t count) {
-            for (uint32_t i = 0; i < count; i++) {
-                uint32_t s1 = state1_array[i];
-                uint32_t s2 = state2_array[i];
-                trigger_count_state1 += __builtin_popcount(s1);
-                trigger_count_state2 += __builtin_popcount(s2);
-                non_trigger_count_state1 += __builtin_popcount(~s1);
-                non_trigger_count_state2 += __builtin_popcount(~s2);
+
+        // 批量累加：遍历数组并调用单样本累加
+        inline void accumulateBatch(const uint32_t* state1_array, const uint32_t* state2_array, uint32_t count) {
+            for (uint32_t i = 0; i < count; ++i) {
+                accumulate(state1_array[i], state2_array[i]);
             }
-            total_samples += count;
         }
-        
-        // 获取投票结果
-        void getVotingResult(uint32_t& result_state1, uint32_t& result_state2, 
-                           const Mai2Serial_TouchState& last_emitted) const {
-            result_state1 = getVotedBits(trigger_count_state1, non_trigger_count_state1, last_emitted.parts.state1);
-            result_state2 = getVotedBits(trigger_count_state2, non_trigger_count_state2, last_emitted.parts.state2);
-        }
-        
-    private:
-        // 获取投票后的位结果
-        uint32_t getVotedBits(uint32_t trigger_count, uint32_t non_trigger_count, 
-                             uint32_t last_state) const {
-            if (trigger_count > non_trigger_count) {
-                return 0xFFFFFFFF;  // 触发获胜
-            } else if (trigger_count < non_trigger_count) {
-                return 0x00000000;  // 非触发获胜
-            } else {
-                return ~last_state; // 平票时取上次结果的反向
+
+        // 获取投票结果（按位多数；平票取上次结果反向）
+        inline void getVotingResult(uint32_t& result_state1, uint32_t& result_state2,
+                                    const Mai2Serial_TouchState& last_emitted) const {
+            uint32_t r1 = 0, r2 = 0;
+            if (total_samples == 0) {
+                // 无样本则不更改（由调用方决定是否沿用之前状态）
+                result_state1 = last_emitted.parts.state1;
+                result_state2 = last_emitted.parts.state2;
+                return;
             }
+            for (int b = 0; b < 32; ++b) {
+                uint16_t ones = ones_count_state1[b];
+                uint16_t zeros = static_cast<uint16_t>(total_samples - ones);
+                if (ones > zeros) {
+                    r1 |= (1u << b);
+                } else if (ones < zeros) {
+                    // 保持0
+                } else {
+                    // 平票取上次结果的反向
+                    if ((last_emitted.parts.state1 & (1u << b)) == 0) {
+                        r1 |= (1u << b);
+                    }
+                }
+            }
+            for (int b = 0; b < 32; ++b) {
+                uint16_t ones = ones_count_state2[b];
+                uint16_t zeros = static_cast<uint16_t>(total_samples - ones);
+                if (ones > zeros) {
+                    r2 |= (1u << b);
+                } else if (ones < zeros) {
+                    // 保持0
+                } else {
+                    if ((last_emitted.parts.state2 & (1u << b)) == 0) {
+                        r2 |= (1u << b);
+                    }
+                }
+            }
+            result_state1 = r1;
+            result_state2 = r2;
         }
     };
     

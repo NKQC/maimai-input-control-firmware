@@ -512,7 +512,6 @@ inline void InputManager::processSerialModeWithDelay()
         uint8_t all_flags;  // 用于一次性重置所有标志位
     } flags;
 
-    // 一次性重置所有标志位，降低CPU开销
     flags.all_flags = 0;
     
     // 如果缓冲区为空，直接返回
@@ -589,62 +588,62 @@ inline void InputManager::processSerialModeWithDelay()
     delayed_serial_state = delay_buffer_[buffer_idx].serial_touch_state;
 
 process_aggregation:
-    // 新的投票聚合处理
-    if (config_->data_aggregation_delay_ms > 0 && config_->touch_response_delay_ms >= config_->data_aggregation_delay_ms) {
+    // 新的投票聚合处理（按位多数投票 + 平票取反 + 无样本沿用）
+    if (config_->data_aggregation_delay_ms > 0) {
         // 重置投票状态
         serial_delay_state_.voting_state.reset();
-        
-        // 计算聚合时间范围
-        uint32_t aggregation_start_time = time_us_32() - (config_->touch_response_delay_ms * 1000U);
-        uint32_t aggregation_end_time = aggregation_start_time + (config_->data_aggregation_delay_ms * 1000U);
-        
-        // 优化：批量收集状态数据，减少函数调用开销
-        uint32_t state1_batch[32];  // 临时批量数组
-        uint32_t state2_batch[32];
-        uint32_t batch_count = 0;
-        
-        // 遍历聚合时间范围内的所有数据，进行投票计数
-        for (uint16_t i = 0; i < delay_buffer_count_; ++i) {
-            uint16_t check_idx = (delay_buffer_head_ - 1 - i) & (DELAY_BUFFER_SIZE - 1);
-            uint32_t check_timestamp = delay_buffer_[check_idx].timestamp_us;
-            
-            // 如果时间戳在聚合范围内
-            if (check_timestamp >= aggregation_start_time && check_timestamp <= aggregation_end_time) {
-                const Mai2Serial_TouchState& state = delay_buffer_[check_idx].serial_touch_state;
-                
-                // 收集到批量数组中
-                state1_batch[batch_count] = state.parts.state1;
-                state2_batch[batch_count] = state.parts.state2;
-                batch_count++;
-                
-                // 当批量数组满了或者是最后一个元素时，批量处理
-                if (batch_count == 32 || i == delay_buffer_count_ - 1) {
-                    serial_delay_state_.voting_state.addTriggerCountsBatch(state1_batch, state2_batch, batch_count);
-                    batch_count = 0;
-                }
-            } else if (check_timestamp < aggregation_start_time) {
+
+        // 使用静态变量，减少栈分配和提升缓存命中
+        static uint32_t anchor_end_time;
+        static uint32_t agg_us;
+        static uint32_t aggregation_start_time;
+        static uint16_t idx;
+        static uint16_t i;
+        static uint32_t check_timestamp;
+
+        // 计算聚合时间范围：以选定的“目标时间”作为结束点
+        // 非零延迟：窗口结束于target_time；零延迟：窗口结束于当前选中样本的时间戳
+        anchor_end_time = (config_->touch_response_delay_ms > 0)
+            ? target_time
+            : delay_buffer_[buffer_idx].timestamp_us;
+        agg_us = static_cast<uint32_t>(config_->data_aggregation_delay_ms) * 1000U;
+        aggregation_start_time = (anchor_end_time >= agg_us)
+            ? (anchor_end_time - agg_us)
+            : 0U;
+
+        // 从已命中的索引(buffer_idx)开始，向过去方向遍历，减少“过新样本”判断和无效扫描
+        i = 0;
+        idx = buffer_idx;
+        while (i < delay_buffer_count_) {
+            check_timestamp = delay_buffer_[idx].timestamp_us;
+            if (check_timestamp < aggregation_start_time) {
                 break;  // 时间戳过旧，停止搜索
             }
+            const Mai2Serial_TouchState &state = delay_buffer_[idx].serial_touch_state;
+            serial_delay_state_.voting_state.accumulate(state.parts.state1, state.parts.state2);
+            // 递减索引并继续向过去遍历
+            idx = (uint16_t)((idx - 1) & (DELAY_BUFFER_SIZE - 1));
+            ++i;
         }
-        
-        // 处理剩余的批量数据
-        if (batch_count > 0) {
-            serial_delay_state_.voting_state.addTriggerCountsBatch(state1_batch, state2_batch, batch_count);
-        }
-        
+
         // 使用投票聚合算法计算最终状态
-        Mai2Serial_TouchState aggregated_state;
-        aggregated_state.raw = 0;
-        uint32_t temp_state1, temp_state2;
+        static uint32_t temp_state1, temp_state2;
+        temp_state1 = 0;
+        temp_state2 = 0;
         serial_delay_state_.voting_state.getVotingResult(
-            temp_state1, 
-            temp_state2, 
+            temp_state1,
+            temp_state2,
             serial_delay_state_.last_emitted_result
         );
-        aggregated_state.parts.state1 = temp_state1;
-        aggregated_state.parts.state2 = temp_state2;
-        
-        delayed_serial_state = aggregated_state;
+
+        // 若窗口内存在样本，更新聚合状态；否则沿用之前的 delayed_serial_state
+        if (serial_delay_state_.voting_state.total_samples > 0) {
+            static Mai2Serial_TouchState aggregated_state;  // 使用静态，避免重复栈分配
+            aggregated_state.raw = 0;
+            aggregated_state.parts.state1 = temp_state1;
+            aggregated_state.parts.state2 = temp_state2;
+            delayed_serial_state = aggregated_state;
+        }
     }
     
     // 功能2: 仅改变时发送判断
@@ -670,10 +669,9 @@ process_aggregation:
             remaining_extra_sends_ = config_->extra_send_count;
         }
     }
-    
+    serial_state_ = delayed_serial_state;  // 始终同步
     // 发送数据
     if (should_send) {
-        serial_state_ = delayed_serial_state;  // 为确保当外键映射启用时时间是同步的
         // 仅在发送成功时更新last_sent_serial_state_，确保发送失败时保持差异检测
         if (mai2_serial_->send_touch_data(delayed_serial_state)) {
             last_sent_serial_state_ = delayed_serial_state;  // 更新上次发送状态
@@ -763,26 +761,25 @@ const std::vector<TouchKeyboardMapping>& InputManager::getTouchKeyboardMappings(
 }
 
 inline void InputManager::checkTouchKeyboardTrigger()
-{       
+{
     // 缓存当前时间，避免重复系统调用
     touch_keyboard_current_time_cache_ = us_to_ms(time_us_32());
-    
-    // 遍历所有触摸键盘映射，独立处理每个映射
-    for (auto& mapping : config_->touch_keyboard_mappings) {
-        // 使用位操作宏进行高效区域匹配检查
-          touch_keyboard_areas_matched_cache_ = MAI2_TOUCH_CHECK_MASK(serial_state_, mapping.area_mask);
-          if (__builtin_expect(touch_keyboard_areas_matched_cache_, 0)) {
-              // 区域匹配，检查是否刚开始按下
-              if (__builtin_expect(mapping.press_timestamp == 0, 0)) {
-                  mapping.press_timestamp = touch_keyboard_current_time_cache_;
-              }
-  
-              touch_keyboard_hold_satisfied_cache_ = (mapping.hold_time_ms == 0) || 
-                                                    ((touch_keyboard_current_time_cache_ - mapping.press_timestamp) >= mapping.hold_time_ms);
-            
+    // 遍历所有触摸键盘映射，采用静态缓存变量，直接调用HID接口置位按键
+    for (auto &mapping : config_->touch_keyboard_mappings) {
+        touch_keyboard_areas_matched_cache_ = MAI2_TOUCH_CHECK_MASK(serial_state_, mapping.area_mask);
+
+        if (__builtin_expect(touch_keyboard_areas_matched_cache_, 0)) {
+            // 区域匹配，检查是否刚开始按下
+            if (__builtin_expect(mapping.press_timestamp == 0, 0)) {
+                mapping.press_timestamp = touch_keyboard_current_time_cache_;
+            }
+
+            touch_keyboard_hold_satisfied_cache_ = (mapping.hold_time_ms == 0) ||
+                                                   ((touch_keyboard_current_time_cache_ - mapping.press_timestamp) >= mapping.hold_time_ms);
+
             // 处理触发逻辑
             if (mapping.trigger_once) {
-                // trigger_once：同一次触摸只触发一次；必须离开区域后才能再次触发；触发后下一次检查立即松开
+                // trigger_once：同一次触摸只触发一次；离开区域后才能再次触发
                 if (mapping.has_triggered == TOUCH_KEYBOARD_TRIGGLE_STAGE_NONE) {
                     if (__builtin_expect(touch_keyboard_hold_satisfied_cache_, 0)) {
                         hid_->press_key(mapping.key);
@@ -790,30 +787,33 @@ inline void InputManager::checkTouchKeyboardTrigger()
                         mapping.has_triggered = TOUCH_KEYBOARD_TRIGGLE_STAGE_PRESS;
                     }
                 } else if (mapping.has_triggered == TOUCH_KEYBOARD_TRIGGLE_STAGE_PRESS) {
-                    // 立即松开（下一次检查）
+                    // 下一次检查立即松开
                     hid_->release_key(mapping.key);
+                    mapping.key_pressed = false;
                     mapping.has_triggered = TOUCH_KEYBOARD_TRIGGLE_STAGE_RELEASE;
+                } else {
+                    // RELEASE 状态下不触发，等待离开区域后在else分支中重置为 NONE
+                    mapping.key_pressed = false;
                 }
-                // RELEASE 状态下保持不触发，直到区域不匹配时在else分支中重置为 NONE
             } else {
-                // 正常模式：满足条件就按下按键
-                if (__builtin_expect(touch_keyboard_hold_satisfied_cache_ && !mapping.key_pressed, 0)) {
-                    hid_->press_key(mapping.key);
-                    mapping.key_pressed = true;
+                // 正常模式：满足条件就按下按键（持续触发）
+                if (__builtin_expect(touch_keyboard_hold_satisfied_cache_, 0)) {
+                    if (!mapping.key_pressed) {
+                        hid_->press_key(mapping.key);
+                        mapping.key_pressed = true;
+                    }
                 }
             }
         } else {
-            // 区域不匹配，释放按键
+            // 区域不匹配，释放按键并重置触发阶段
             if (__builtin_expect(mapping.key_pressed, 0)) {
-                mapping.has_triggered = TOUCH_KEYBOARD_TRIGGLE_STAGE_NONE;
                 hid_->release_key(mapping.key);
                 mapping.key_pressed = false;
             }
+            mapping.has_triggered = TOUCH_KEYBOARD_TRIGGLE_STAGE_NONE;
             mapping.press_timestamp = 0;
         }
     }
-    
-    return;
 }
 
 // 设置工作模式
@@ -869,7 +869,7 @@ void InputManager::task0()
 void InputManager::task1()
 {
     updateGPIOStates();
-    processGPIOKeyboard(); // 现在直接调用HID的press_key/release_key方法
+    processGPIOKeyboard(); // 物理键盘按键变化检测并直接发送HID
 
     switch (config_->work_mode)
     {
@@ -877,9 +877,10 @@ void InputManager::task1()
             sendHIDTouchData();
             break;
         case InputWorkMode::SERIAL_MODE:
-            // 检查触摸键盘触发
-            if (config_->touch_keyboard_enabled)
+            // 串口模式下进行触摸键盘触发检查并直接置位键盘
+            if (config_->touch_keyboard_enabled) {
                 checkTouchKeyboardTrigger();
+            }
             break;
         default:
             break;
@@ -2224,30 +2225,25 @@ void InputManager::processGPIOKeyboard()
         }
     }
 
-    // 比较当前状态与上一次状态，发送按键变化事件
-    if (hid_)
-    {
-        for (uint8_t i = 0; i < SUPPORTED_KEYS_COUNT; i++)
-        {
+    // 直接对比变化并通过HID发送按键按下/释放，避免额外聚合开销
+    if (hid_) {
+        for (uint8_t i = 0; i < SUPPORTED_KEYS_COUNT; i++) {
             HID_KeyCode key = supported_keys[i];
-            bool current_pressed = current_keyboard_state.getKey(key);
-            bool prev_pressed = prev_keyboard_state.getKey(key);
-
-            if (current_pressed != prev_pressed)
-            {
-                if (current_pressed)
-                {
+            bool curr = current_keyboard_state.getKey(key);
+            bool prev = prev_keyboard_state.getKey(key);
+            if (curr != prev) {
+                if (curr) {
                     hid_->press_key(key);
-                }
-                else
-                {
+                } else {
                     hid_->release_key(key);
                 }
             }
         }
     }
 
-    // 更新上一次状态
+    // 更新位图缓存供其它模块参考（非发送路径）
+    gpio_keyboard_bitmap_ = current_keyboard_state;
+    // 更新上一次状态（用于下一次变化计算）
     prev_keyboard_state = current_keyboard_state;
     mcu_gpio_previous_states_ = mcu_gpio_states_;
     mcp_gpio_previous_states_ = mcp_gpio_states_;
@@ -2316,8 +2312,7 @@ inline void InputManager::sanityCheckPhysicalKeyboard(const PhysicalKeyboardMapp
     if (pressed_interpretation)
     {
         log_warning("物理键映射添加时检测到当前为按下状态: GPIO=0x" + std::to_string(mapping.gpio) +
-                    ", 触发电平=" + std::to_string(static_cast<uint8_t>(mapping.trigger_level)) +
-                    ". 如果这是空闲状态，请检查上拉/下拉与触发电平配置是否一致。");
+                    ", 触发电平=" + std::to_string(static_cast<uint8_t>(mapping.trigger_level)));
     }
 }
 

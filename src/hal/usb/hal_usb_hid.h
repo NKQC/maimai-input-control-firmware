@@ -29,7 +29,7 @@
 
 #define TOUCH_LOCAL_NUM         64      // 最大触摸点数
 #define KEYBOARD_NUM            3       // 键盘数量 要和描述符保持一致
-#define KEYBOARD_SIMUL_PRESS    12      // 键盘最大同时报告数
+#define KEYBOARD_SIMUL_PRESS    18      // 键盘最大同时报告数，与3个键盘端点 * 每端点6键一致
 
 static const uint8_t hid_report_descriptor[] = {
     0x05, 0x0D,

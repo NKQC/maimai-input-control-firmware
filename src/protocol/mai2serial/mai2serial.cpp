@@ -286,13 +286,14 @@ void Mai2Serial::send_command_response(uint8_t lr, uint8_t sensor, uint8_t cmd, 
     }
     
     // 响应格式: '(' + lr + sensor + cmd + value + ')'
-    uint8_t response[6];
+    static uint8_t response[7] = {0};
     response[0] = MAI2SERIAL_TOUCH_START_BYTE;  // '('
     response[1] = lr;
     response[2] = sensor;
     response[3] = cmd;
     response[4] = value;
     response[5] = MAI2SERIAL_TOUCH_END_BYTE;    // ')'
+    response[6] = 0;    // 预留隔离位
     
     // 使用新的DMA接口：写入TX缓冲区会自动处理DMA传输
     (void)uart_hal_->write_to_tx_buffer(response, sizeof(response));
