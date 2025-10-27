@@ -502,7 +502,7 @@ bool MCP23S17::configure_device() {
     // 高效批量配置：使用寄存器对写入提高效率
     bool result = true;
     result &= write_register_pair(MCP23S17_REG_IODIRA, 0xFF, MCP23S17_REG_IODIRB, 0xFF);  // 全部输入
-    result &= write_register_pair(MCP23S17_REG_GPPUA, 0xFF, MCP23S17_REG_GPPUB, 0xFF);    // 全部上拉
+    result &= write_register_pair(MCP23S17_REG_GPPUA, 0x00, MCP23S17_REG_GPPUB, 0x00);    // 禁用所有内部上拉，实现高阻输入
     
     return result;
 }

@@ -9,6 +9,41 @@
     "version": "0.2.0",
     "configurations": [
         {
+            "cwd": "${workspaceRoot}",
+            "executable": "F:/maimaicontrol-V3.0/maimai-input-control-firmware/.pio/build/pico/firmware.elf",
+            "name": "Debug RP2040 with OpenOCD (DAPLink)",
+            "request": "launch",
+            "type": "cortex-debug",
+            "servertype": "openocd",
+            "serverpath": "C:/Users/asdfg/.platformio/packages/tool-openocd-rp2040-earlephilhower/bin/openocd.exe",
+            "configFiles": [
+                "interface/cmsis-dap.cfg",
+                "target/rp2040.cfg"
+            ],
+            "searchDir": [
+                "C:/Users/asdfg/.platformio/packages/tool-openocd-rp2040-earlephilhower/share/openocd/scripts"
+            ],
+            "runToEntryPoint": "main",
+            "showDevDebugOutput": "parsed",
+            "svdFile": "C:/Users/asdfg/.platformio/platforms/raspberrypi@src-ff76a3915224135aafad379817f41edd/misc/svd/rp2040.svd",
+            "openOCDLaunchCommands": [
+                "adapter speed 5000",
+                "transport select swd",
+                "set CHIPNAME rp2040",
+                "set CONNECT_UNDER_RESET 1"
+            ],
+            "preLaunchCommands": [
+                "set mem inaccessible-by-default off",
+                "set architecture arm",
+                "monitor adapter speed 5000"
+            ],
+            "postAttachCommands": [
+                "monitor reset halt",
+                "monitor sleep 100",
+                "monitor reset halt"
+            ]
+        },
+        {
             "type": "platformio-debug",
             "request": "launch",
             "name": "PIO Debug",

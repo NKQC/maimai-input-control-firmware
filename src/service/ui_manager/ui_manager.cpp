@@ -244,20 +244,20 @@ bool UIManager::init(const UIManager_Config& config) {
 
 // GPIO初始化
 bool UIManager::init_gpio() {
-    // 初始化摇杆A按钮
+    // 初始化摇杆A按钮（高阻输入，不启用内部上下拉）
     gpio_init(joystick_a_pin_);
     gpio_set_dir(joystick_a_pin_, GPIO_IN);
-    gpio_pull_up(joystick_a_pin_);
+    gpio_disable_pulls(joystick_a_pin_);
     
-    // 初始化摇杆B按钮
+    // 初始化摇杆B按钮（高阻输入，不启用内部上下拉）
     gpio_init(joystick_b_pin_);
     gpio_set_dir(joystick_b_pin_, GPIO_IN);
-    gpio_pull_up(joystick_b_pin_);
+    gpio_disable_pulls(joystick_b_pin_);
     
-    // 初始化确认按钮
+    // 初始化确认按钮（高阻输入，不启用内部上下拉）
     gpio_init(joystick_confirm_pin_);
     gpio_set_dir(joystick_confirm_pin_, GPIO_IN);
-    gpio_pull_up(joystick_confirm_pin_);
+    gpio_disable_pulls(joystick_confirm_pin_);
     
     log_debug("GPIO initialized successfully");
     return true;

@@ -94,5 +94,7 @@
         "irq.h": "c"
     },
     "java.project.explorer.showNonJavaResources": true,
-    "java.dependency.syncWithFolderExplorer": false
+    "java.dependency.syncWithFolderExplorer": false,
+    "cortex-debug.armToolchainPath": "C:/Users/asdfg/.platformio/packages/toolchain-rp2040-earlephilhower/bin",
+    "cortex-debug.gdbPath": "C:/Users/asdfg/.platformio/packages/toolchain-rp2040-earlephilhower/bin/arm-none-eabi-gdb.exe"
 }

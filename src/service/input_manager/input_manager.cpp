@@ -12,10 +12,16 @@
 InputManager *InputManager::instance_ = nullptr;
 // 静态配置变量
 static InputManager_PrivateConfig static_config_;
+// 常量空逻辑映射表
+static const LogicalKeyMapping EMPTY_LOGICAL_MAPPINGS[1] = { LogicalKeyMapping() };
 // Debug开关静态变量
 bool InputManager::debug_enabled_ = false;
 // 频率限制相关静态成员变量
 uint32_t InputManager::min_interval_us_ = 8333;  // 默认120Hz对应的间隔时间（微秒）
+// 新增：静态状态管理变量
+InputManager::SerialModeDelayState InputManager::serial_delay_state_;
+uint32_t InputManager::device_completed_bitmap_ = 0;
+uint8_t InputManager::total_device_count_ = 0;
 
 // 单例模式实现
 InputManager *InputManager::getInstance()
@@ -29,8 +35,57 @@ InputManager *InputManager::getInstance()
 
 // 私有构造函数
 InputManager::InputManager()
-    : delay_buffer_head_(0), delay_buffer_count_(0), mcu_gpio_states_(0), mcu_gpio_previous_states_(0), serial_state_(), touch_keyboard_current_time_cache_(0), touch_keyboard_areas_matched_cache_(false), touch_keyboard_hold_satisfied_cache_(false), sample_counter_(0), last_reset_time_(0), current_sample_rate_(0), binding_active_(false), binding_callback_(), binding_state_(BindingState::IDLE), current_binding_index_(0), binding_start_time_(0), binding_timeout_ms_(30000),
-      binding_hardware_ops_pending_(false), binding_cancel_pending_(false), calibration_request_pending_(CalibrationRequestType::IDLE), calibration_sensitivity_target_(2), calibration_in_progress_(false), mai2_serial_(nullptr), hid_(nullptr), mcp23s17_(nullptr), config_(inputmanager_get_config_holder()), mcp23s17_available_(false), ui_manager_(nullptr), gpio_keyboard_bitmap_(), touch_bitmap_cache_(), mcp_gpio_states_(), mcp_gpio_previous_states_(), last_sent_serial_state_(), remaining_extra_sends_(0), serial_state_changed_(false)
+    : delay_buffer_head_(0)
+    , delay_buffer_count_(0)
+    , mcu_gpio_states_(0)
+    , mcu_gpio_previous_states_(0)
+    , serial_state_()
+    , touch_keyboard_current_time_cache_(0)
+    , touch_keyboard_areas_matched_cache_(false)
+    , touch_keyboard_hold_satisfied_cache_(false)
+    , sample_counter_(0)
+    , last_reset_time_(0)
+    , current_sample_rate_(0)
+    , binding_active_(false)
+    , binding_callback_()
+    , binding_state_(BindingState::IDLE)
+    , current_binding_index_(0)
+    , binding_start_time_(0)
+    , binding_timeout_ms_(30000)
+    , binding_hardware_ops_pending_(false)
+    , binding_cancel_pending_(false)
+    , calibration_request_pending_(CalibrationRequestType::IDLE)
+    , calibration_sensitivity_target_(2)
+    , calibration_in_progress_(false)
+    , mai2_serial_(nullptr)
+    , hid_(nullptr)
+    , mcp23s17_(nullptr)
+    , config_(inputmanager_get_config_holder())
+    , mcp23s17_available_(false)
+    , ui_manager_(nullptr)
+    , gpio_keyboard_bitmap_()
+    , touch_bitmap_cache_()
+    , mcp_gpio_states_()
+    , mcp_gpio_previous_states_()
+    , gpio_mcu_changed_(0)
+    , gpio_mcu_inverted_(0)
+    , gpio_mcp_changed_a_(0)
+    , gpio_mcp_changed_b_(0)
+    , gpio_mcp_inverted_a_(0)
+    , gpio_mcp_inverted_b_(0)
+    , gpio_mappings_cache_(nullptr)
+    , gpio_mapping_count_cache_(0)
+    , gpio_logical_mappings_cache_(EMPTY_LOGICAL_MAPPINGS)
+    , gpio_logical_count_cache_(0)
+    , gpio_pin_cache_(0)
+    , gpio_pin_num_cache_(0)
+    , gpio_bit_pos_cache_(0)
+    , gpio_current_state_cache_(false)
+    , gpio_mapping_ptr_cache_(nullptr)
+    , gpio_keys_ptr_cache_(nullptr)
+    , last_sent_serial_state_()
+    , remaining_extra_sends_(0)
+    , serial_state_changed_(false)
 {
 
     // 初始化32位触摸状态数组
@@ -70,6 +125,8 @@ bool InputManager::init(const InitConfig &config)
     
     // 加载配置
     inputmanager_load_config_from_manager();
+    // 基于已加载的键盘映射重建反转位图（ACTIVE_LOW位翻转掩码）
+    rebuildGPIOInversionMasks();
     
     // 应用mai2serial配置到实例
     if (mai2_serial_) {
@@ -176,6 +233,16 @@ void InputManager::start() {
                        " - no free stages on I2C" + std::to_string(device_i2c_bus));
         }
     }
+    
+    // 初始化设备采样bitmap
+    device_completed_bitmap_ = 0;
+    total_device_count_ = 0;
+    for (const auto& device : touch_sensor_devices_) {
+        if (device) {
+            total_device_count_++;
+        }
+    }
+    log_info("Initialized device sampling bitmap for " + std::to_string(total_device_count_) + " devices");
     
     log_info("InputManager start completed");
 }
@@ -318,19 +385,91 @@ void InputManager::load_touch_device_config(TouchSensor *device)
 }
 
 // 物理键盘映射管理方法
-bool InputManager::addPhysicalKeyboard(MCU_GPIO gpio, HID_KeyCode default_key)
+bool InputManager::addPhysicalKeyboard(MCU_GPIO gpio, HID_KeyCode default_key, GPIOTriggerLevel trigger_level)
 {
+    // 计算有效触发电平（AUTO模式下采样当前电平作为未触发电平）
+    GPIOTriggerLevel effective_level = trigger_level;
+    if (trigger_level == GPIOTriggerLevel::AUTO) {
+        uint8_t pin_num = get_gpio_pin_number(static_cast<uint8_t>(gpio));
+        bool raw_level = ((sio_hw->gpio_in >> pin_num) & 1) != 0;
+        // 当前电平视为“未触发”，按键触发电平取反
+        effective_level = raw_level ? GPIOTriggerLevel::ACTIVE_LOW : GPIOTriggerLevel::ACTIVE_HIGH;
+    }
     // 添加新映射
-    PhysicalKeyboardMapping new_mapping(gpio, default_key);
+    PhysicalKeyboardMapping new_mapping(gpio, default_key, effective_level);
     config_->physical_keyboard_mappings.push_back(new_mapping);
+    // 增量更新MCU反转位图
+    uint8_t pin_num = get_gpio_pin_number(static_cast<uint8_t>(gpio));
+    if (effective_level == GPIOTriggerLevel::ACTIVE_LOW) {
+        gpio_mcu_inverted_ |= (1u << pin_num);
+    } else {
+        gpio_mcu_inverted_ &= ~(1u << pin_num);
+    }
+    // 运行时电平有效性检查（仅日志提示，不更改配置）
+    sanityCheckPhysicalKeyboard(new_mapping);
     return true;
 }
 
-bool InputManager::addPhysicalKeyboard(MCP_GPIO gpio, HID_KeyCode default_key)
+bool InputManager::addPhysicalKeyboard(MCP_GPIO gpio, HID_KeyCode default_key, GPIOTriggerLevel trigger_level)
 {
+    // 计算有效触发电平（AUTO模式下采样当前电平作为未触发电平）
+    GPIOTriggerLevel effective_level = trigger_level;
+    if (trigger_level == GPIOTriggerLevel::AUTO) {
+        uint8_t raw = static_cast<uint8_t>(gpio);
+        uint8_t pin_num = get_gpio_pin_number(raw);
+        bool raw_level = false;
+        bool level_read = false;
+        // 优先从MCP读取一次最新GPIO状态
+        if (mcp23s17_available_ && mcp23s17_) {
+            MCP23S17_GPIO_State tmp{};
+            if (mcp23s17_->read_all_gpio(tmp)) {
+                level_read = true;
+                if (pin_num <= 8) {
+                    raw_level = ((tmp.port_a >> (pin_num - 1)) & 1) != 0;
+                } else {
+                    raw_level = ((tmp.port_b >> (pin_num - 9)) & 1) != 0;
+                }
+            }
+        }
+        // 回退使用当前缓存状态（在init后updateGPIOStates会刷新）
+        if (!level_read) {
+            if (pin_num <= 8) {
+                raw_level = ((mcp_gpio_states_.port_a >> (pin_num - 1)) & 1) != 0;
+            } else {
+                raw_level = ((mcp_gpio_states_.port_b >> (pin_num - 9)) & 1) != 0;
+            }
+            level_read = true;
+        }
+        // 如果仍不可读，采用常见默认（上拉输入空闲为高 -> ACTIVE_LOW）
+        if (!level_read) {
+            effective_level = GPIOTriggerLevel::ACTIVE_LOW;
+        } else {
+            effective_level = raw_level ? GPIOTriggerLevel::ACTIVE_LOW : GPIOTriggerLevel::ACTIVE_HIGH;
+        }
+    }
     // 添加新映射
-    PhysicalKeyboardMapping new_mapping(gpio, default_key);
+    PhysicalKeyboardMapping new_mapping(gpio, default_key, effective_level);
     config_->physical_keyboard_mappings.push_back(new_mapping);
+    // 增量更新MCP反转位图
+    uint8_t raw = static_cast<uint8_t>(gpio);
+    uint8_t pin_num = get_gpio_pin_number(raw);
+    if (pin_num <= 8) {
+        uint8_t bit_pos = pin_num - 1;
+        if (effective_level == GPIOTriggerLevel::ACTIVE_LOW) {
+            gpio_mcp_inverted_a_ |= (1u << bit_pos);
+        } else {
+            gpio_mcp_inverted_a_ &= ~(1u << bit_pos);
+        }
+    } else {
+        uint8_t bit_pos = pin_num - 9;
+        if (effective_level == GPIOTriggerLevel::ACTIVE_LOW) {
+            gpio_mcp_inverted_b_ |= (1u << bit_pos);
+        } else {
+            gpio_mcp_inverted_b_ &= ~(1u << bit_pos);
+        }
+    }
+    // 运行时电平有效性检查（仅日志提示，不更改配置）
+    sanityCheckPhysicalKeyboard(new_mapping);
     return true;
 }
 
@@ -346,6 +485,8 @@ bool InputManager::removePhysicalKeyboard(uint8_t gpio_pin)
     if (it != config_->physical_keyboard_mappings.end())
     {
         config_->physical_keyboard_mappings.erase(it);
+        // 删除映射后重建一次反转位图，保证一致性
+        rebuildGPIOInversionMasks();
         return true;
     }
 
@@ -354,11 +495,10 @@ bool InputManager::removePhysicalKeyboard(uint8_t gpio_pin)
 
 inline void InputManager::processSerialModeWithDelay()
 {
-    // 函数级静态变量，避免暴露在类外面
+    // 使用静态结构体管理所有静态变量
     static Mai2Serial_TouchState delayed_serial_state;
     static uint32_t target_time;
     static uint16_t buffer_idx;
-    static uint16_t last_hit_offset = 0;  // 上次命中位置相对于head的偏移
     static uint32_t current_timestamp;
     static uint16_t search_offset;
     static uint32_t last_rate_limit_time = 0;  // 上次发送时间（频率限制用）
@@ -401,21 +541,21 @@ inline void InputManager::processSerialModeWithDelay()
     target_time = time_us_32() - (config_->touch_response_delay_ms * 1000U);
     
     // 限制偏移范围，防止越界
-    if (last_hit_offset >= delay_buffer_count_) {
-        last_hit_offset = delay_buffer_count_ / 2;  // 重置到中间位置
+    if (serial_delay_state_.last_hit_offset >= delay_buffer_count_) {
+        serial_delay_state_.last_hit_offset = delay_buffer_count_ / 2;  // 重置到中间位置
     }
     
     // 从上次命中位置开始搜索
-    buffer_idx = (delay_buffer_head_ - last_hit_offset) & (DELAY_BUFFER_SIZE - 1);
+    buffer_idx = (delay_buffer_head_ - serial_delay_state_.last_hit_offset) & (DELAY_BUFFER_SIZE - 1);
     current_timestamp = delay_buffer_[buffer_idx].timestamp_us;
     
     if (current_timestamp <= target_time) {
         // 当前位置时间戳过旧，需要向最新方向搜索最贴近目标的位置
         uint16_t best_idx = buffer_idx;
-        uint16_t best_offset = last_hit_offset;
+        uint16_t best_offset = serial_delay_state_.last_hit_offset;
         
         // 向最新方向搜索，找到最后一个符合条件的位置
-        for (search_offset = last_hit_offset - 1; search_offset > 0; --search_offset) {
+        for (search_offset = serial_delay_state_.last_hit_offset - 1; search_offset > 0; --search_offset) {
             buffer_idx = (delay_buffer_head_ - search_offset) & (DELAY_BUFFER_SIZE - 1);
             if (delay_buffer_[buffer_idx].timestamp_us <= target_time) {
                 best_idx = buffer_idx;
@@ -426,16 +566,16 @@ inline void InputManager::processSerialModeWithDelay()
         }
         
         buffer_idx = best_idx;
-        last_hit_offset = best_offset;
+        serial_delay_state_.last_hit_offset = best_offset;
         delayed_serial_state = delay_buffer_[buffer_idx].serial_touch_state;
         goto process_aggregation;
     }
     
     // 当前位置时间戳过新，需要向过去方向搜索第一个符合条件的位置
-    for (search_offset = last_hit_offset + 1; search_offset <= delay_buffer_count_; ++search_offset) {
+    for (search_offset = serial_delay_state_.last_hit_offset + 1; search_offset <= delay_buffer_count_; ++search_offset) {
         buffer_idx = (delay_buffer_head_ - search_offset) & (DELAY_BUFFER_SIZE - 1);
         if (delay_buffer_[buffer_idx].timestamp_us <= target_time) {
-            last_hit_offset = search_offset;
+            serial_delay_state_.last_hit_offset = search_offset;
             flags.found = 1;
             break;
         }
@@ -449,28 +589,60 @@ inline void InputManager::processSerialModeWithDelay()
     delayed_serial_state = delay_buffer_[buffer_idx].serial_touch_state;
 
 process_aggregation:
-    // 功能1: 触发数据聚合处理
+    // 新的投票聚合处理
     if (config_->data_aggregation_delay_ms > 0 && config_->touch_response_delay_ms >= config_->data_aggregation_delay_ms) {
-        // 计算聚合时间范围的起始时间点
+        // 重置投票状态
+        serial_delay_state_.voting_state.reset();
+        
+        // 计算聚合时间范围
         uint32_t aggregation_start_time = time_us_32() - (config_->touch_response_delay_ms * 1000U);
         uint32_t aggregation_end_time = aggregation_start_time + (config_->data_aggregation_delay_ms * 1000U);
         
-        // 遍历聚合时间范围内的所有数据，进行AND运算
-        Mai2Serial_TouchState aggregated_state = delayed_serial_state;  // 初始化为当前状态
+        // 优化：批量收集状态数据，减少函数调用开销
+        uint32_t state1_batch[32];  // 临时批量数组
+        uint32_t state2_batch[32];
+        uint32_t batch_count = 0;
         
+        // 遍历聚合时间范围内的所有数据，进行投票计数
         for (uint16_t i = 0; i < delay_buffer_count_; ++i) {
             uint16_t check_idx = (delay_buffer_head_ - 1 - i) & (DELAY_BUFFER_SIZE - 1);
             uint32_t check_timestamp = delay_buffer_[check_idx].timestamp_us;
             
             // 如果时间戳在聚合范围内
             if (check_timestamp >= aggregation_start_time && check_timestamp <= aggregation_end_time) {
-                // 进行AND运算：只有在整个时间段内都触发的通道才保持触发状态
-                aggregated_state.parts.state1 &= delay_buffer_[check_idx].serial_touch_state.parts.state1;
-                aggregated_state.parts.state2 &= delay_buffer_[check_idx].serial_touch_state.parts.state2;
+                const Mai2Serial_TouchState& state = delay_buffer_[check_idx].serial_touch_state;
+                
+                // 收集到批量数组中
+                state1_batch[batch_count] = state.parts.state1;
+                state2_batch[batch_count] = state.parts.state2;
+                batch_count++;
+                
+                // 当批量数组满了或者是最后一个元素时，批量处理
+                if (batch_count == 32 || i == delay_buffer_count_ - 1) {
+                    serial_delay_state_.voting_state.addTriggerCountsBatch(state1_batch, state2_batch, batch_count);
+                    batch_count = 0;
+                }
             } else if (check_timestamp < aggregation_start_time) {
                 break;  // 时间戳过旧，停止搜索
             }
         }
+        
+        // 处理剩余的批量数据
+        if (batch_count > 0) {
+            serial_delay_state_.voting_state.addTriggerCountsBatch(state1_batch, state2_batch, batch_count);
+        }
+        
+        // 使用投票聚合算法计算最终状态
+        Mai2Serial_TouchState aggregated_state;
+        aggregated_state.raw = 0;
+        uint32_t temp_state1, temp_state2;
+        serial_delay_state_.voting_state.getVotingResult(
+            temp_state1, 
+            temp_state2, 
+            serial_delay_state_.last_emitted_result
+        );
+        aggregated_state.parts.state1 = temp_state1;
+        aggregated_state.parts.state2 = temp_state2;
         
         delayed_serial_state = aggregated_state;
     }
@@ -505,6 +677,7 @@ process_aggregation:
         // 仅在发送成功时更新last_sent_serial_state_，确保发送失败时保持差异检测
         if (mai2_serial_->send_touch_data(delayed_serial_state)) {
             last_sent_serial_state_ = delayed_serial_state;  // 更新上次发送状态
+            serial_delay_state_.last_emitted_result = delayed_serial_state;  // 更新上次发出结果
             
             // 更新频率限制时间戳（仅在发送成功时更新）
             if (config_->rate_limit_enabled) {
@@ -518,6 +691,10 @@ process_aggregation:
 void InputManager::clearPhysicalKeyboards()
 {
     config_->physical_keyboard_mappings.clear();
+    // 同步清空反转位图
+    gpio_mcu_inverted_ = 0;
+    gpio_mcp_inverted_a_ = 0;
+    gpio_mcp_inverted_b_ = 0;
 }
 
 // 触摸键盘映射管理方法
@@ -1966,24 +2143,27 @@ void InputManager::processGPIOKeyboard()
     static KeyboardBitmap current_keyboard_state;
 
     gpio_mcu_changed_ = mcu_gpio_states_ ^ mcu_gpio_previous_states_;
-    gpio_mcu_inverted_ = ~mcu_gpio_states_; // 低电平有效
     gpio_mcp_changed_a_ = mcp_gpio_states_.port_a ^ mcp_gpio_previous_states_.port_a;
     gpio_mcp_changed_b_ = mcp_gpio_states_.port_b ^ mcp_gpio_previous_states_.port_b;
-    gpio_mcp_inverted_a_ = ~mcp_gpio_states_.port_a; // 低电平有效
-    gpio_mcp_inverted_b_ = ~mcp_gpio_states_.port_b;
 
     // 快速跳过：如果没有GPIO变化则直接返回
     if (!gpio_mcu_changed_ && !gpio_mcp_changed_a_ && !gpio_mcp_changed_b_)
     {
         return;
     }
-
-    current_keyboard_state.clear();
+    // 仅更新发生变化的键，避免整表重算：先复制上一帧状态
+    current_keyboard_state = prev_keyboard_state;
 
     // 零内存分配：使用类成员缓存变量获取所有指针和计数
     gpio_mappings_cache_ = config_->physical_keyboard_mappings.data();
     gpio_mapping_count_cache_ = config_->physical_keyboard_mappings.size();
 
+    // 预先计算按键“有效状态”（已按下=1）后的整体位图，用于快速读取
+    // MCU：对ACTIVE_LOW映射的位执行异或翻转
+    const uint32_t effective_mcu_states = mcu_gpio_states_ ^ gpio_mcu_inverted_;
+    // MCP：分别处理A/B端口的ACTIVE_LOW异或翻转
+    const uint8_t effective_mcp_a = static_cast<uint8_t>(mcp_gpio_states_.port_a) ^ static_cast<uint8_t>(gpio_mcp_inverted_a_ & 0xFF);
+    const uint8_t effective_mcp_b = static_cast<uint8_t>(mcp_gpio_states_.port_b) ^ static_cast<uint8_t>(gpio_mcp_inverted_b_ & 0xFF);
 
     for (size_t i = 0; i < gpio_mapping_count_cache_; ++i)
     {
@@ -1991,45 +2171,53 @@ void InputManager::processGPIOKeyboard()
         gpio_pin_cache_ = gpio_mapping_ptr_cache_->gpio;
         gpio_pin_num_cache_ = get_gpio_pin_number(gpio_pin_cache_);
 
-        // 使用位运算快速判断GPIO类型和状态
+        // 使用位运算快速判断GPIO类型；根据变化位图仅处理发生变化的引脚
         if ((gpio_pin_cache_ & 0xC0) == 0x00)
         { // MCU GPIO
-            gpio_current_state_cache_ = (gpio_mcu_inverted_ >> gpio_pin_num_cache_) & 1;
+            if (((gpio_mcu_changed_ >> gpio_pin_num_cache_) & 1) == 0) {
+                continue; // 未变化，跳过
+            }
+            gpio_current_state_cache_ = (effective_mcu_states >> gpio_pin_num_cache_) & 1;
         }
         else
         { // MCP GPIO
             if (gpio_pin_num_cache_ <= 8)
             { // PORTA
                 gpio_bit_pos_cache_ = gpio_pin_num_cache_ - 1;
-                gpio_current_state_cache_ = (gpio_mcp_inverted_a_ >> gpio_bit_pos_cache_) & 1;
+                if (((gpio_mcp_changed_a_ >> gpio_bit_pos_cache_) & 1) == 0) {
+                    continue; // 未变化，跳过
+                }
+                gpio_current_state_cache_ = (effective_mcp_a >> gpio_bit_pos_cache_) & 1;
             }
             else
             { // PORTB
                 gpio_bit_pos_cache_ = gpio_pin_num_cache_ - 9;
-                gpio_current_state_cache_ = (gpio_mcp_inverted_b_ >> gpio_bit_pos_cache_) & 1;
+                if (((gpio_mcp_changed_b_ >> gpio_bit_pos_cache_) & 1) == 0) {
+                    continue; // 未变化，跳过
+                }
+                gpio_current_state_cache_ = (effective_mcp_b >> gpio_bit_pos_cache_) & 1;
             }
         }
 
-        // 普通键盘处理：设置当前状态
-        if (gpio_current_state_cache_)
+        // 普通键盘处理：根据当前状态设置或清除按键
+        if (gpio_mapping_ptr_cache_->default_key != HID_KeyCode::KEY_NONE)
         {
-            if (gpio_mapping_ptr_cache_->default_key != HID_KeyCode::KEY_NONE)
-            {
-                current_keyboard_state.setKey(gpio_mapping_ptr_cache_->default_key, true);
-            }
-            // 内联逻辑键处理避免函数调用，使用类成员缓存变量
+            current_keyboard_state.setKey(gpio_mapping_ptr_cache_->default_key, gpio_current_state_cache_);
+        }
+        // 逻辑键处理：将关联的逻辑键同步为当前状态
+        if (gpio_logical_mappings_cache_ && gpio_logical_count_cache_)
+        {
             for (size_t j = 0; j < gpio_logical_count_cache_; ++j)
             {
                 if (gpio_logical_mappings_cache_[j].gpio_id == gpio_pin_cache_)
                 {
-                    // 使用类成员缓存指针和位运算展开循环
                     gpio_keys_ptr_cache_ = gpio_logical_mappings_cache_[j].keys;
                     if (gpio_keys_ptr_cache_[0] != HID_KeyCode::KEY_NONE)
-                        current_keyboard_state.setKey(gpio_keys_ptr_cache_[0], true);
+                        current_keyboard_state.setKey(gpio_keys_ptr_cache_[0], gpio_current_state_cache_);
                     if (gpio_keys_ptr_cache_[1] != HID_KeyCode::KEY_NONE)
-                        current_keyboard_state.setKey(gpio_keys_ptr_cache_[1], true);
+                        current_keyboard_state.setKey(gpio_keys_ptr_cache_[1], gpio_current_state_cache_);
                     if (gpio_keys_ptr_cache_[2] != HID_KeyCode::KEY_NONE)
-                        current_keyboard_state.setKey(gpio_keys_ptr_cache_[2], true);
+                        current_keyboard_state.setKey(gpio_keys_ptr_cache_[2], gpio_current_state_cache_);
                     break;
                 }
             }
@@ -2063,6 +2251,74 @@ void InputManager::processGPIOKeyboard()
     prev_keyboard_state = current_keyboard_state;
     mcu_gpio_previous_states_ = mcu_gpio_states_;
     mcp_gpio_previous_states_ = mcp_gpio_states_;
+}
+
+// 基于当前物理键盘映射重建MCU/MCP反转位图（ACTIVE_LOW需要位翻转）
+inline void InputManager::rebuildGPIOInversionMasks()
+{
+    gpio_mcu_inverted_ = 0;
+    gpio_mcp_inverted_a_ = 0;
+    gpio_mcp_inverted_b_ = 0;
+
+    const auto &mappings = config_->physical_keyboard_mappings;
+    for (const auto &m : mappings)
+    {
+        const bool invert = (m.trigger_level == GPIOTriggerLevel::ACTIVE_LOW);
+        const uint8_t pin = get_gpio_pin_number(m.gpio);
+        if (is_mcu_gpio(m.gpio))
+        {
+            if (invert) gpio_mcu_inverted_ |= (1u << pin);
+        }
+        else if (is_mcp_gpio(m.gpio))
+        {
+            if (pin <= 8)
+            {
+                uint8_t bit = pin - 1;
+                if (invert) gpio_mcp_inverted_a_ |= (1u << bit);
+            }
+            else
+            {
+                uint8_t bit = pin - 9;
+                if (invert) gpio_mcp_inverted_b_ |= (1u << bit);
+            }
+        }
+    }
+}
+
+// 新增映射时进行电平有效性检查（仅日志提示，不更改配置）
+inline void InputManager::sanityCheckPhysicalKeyboard(const PhysicalKeyboardMapping& mapping)
+{
+    // 仅在可读状态时检查
+    bool raw_level = false;
+    uint8_t pin = get_gpio_pin_number(mapping.gpio);
+    if (is_mcu_gpio(mapping.gpio))
+    {
+        // 直接读取SIO输入寄存器（避免引入额外依赖）
+        raw_level = ((sio_hw->gpio_in >> pin) & 1) != 0;
+    }
+    else if (is_mcp_gpio(mapping.gpio) && mcp23s17_available_ && mcp23s17_)
+    {
+        MCP23S17_GPIO_State tmp{};
+        if (mcp23s17_->read_all_gpio(tmp))
+        {
+            if (pin <= 8) {
+                uint8_t bit = pin - 1;
+                raw_level = ((tmp.port_a >> bit) & 1) != 0;
+            } else {
+                uint8_t bit = pin - 9;
+                raw_level = ((tmp.port_b >> bit) & 1) != 0;
+            }
+        }
+    }
+
+    bool pressed_interpretation = (mapping.trigger_level == GPIOTriggerLevel::ACTIVE_LOW) ? (!raw_level) : raw_level;
+    // 如果在添加时就被解释为按下，提示可能的触发电平配置问题
+    if (pressed_interpretation)
+    {
+        log_warning("物理键映射添加时检测到当前为按下状态: GPIO=0x" + std::to_string(mapping.gpio) +
+                    ", 触发电平=" + std::to_string(static_cast<uint8_t>(mapping.trigger_level)) +
+                    ". 如果这是空闲状态，请检查上拉/下拉与触发电平配置是否一致。");
+    }
 }
 
 // 获取触摸IC采样速率
@@ -2558,14 +2814,26 @@ void InputManager::async_touchsampleresult(const TouchSampleResult& result) {
         instance->touch_device_states_[device_index].current_touch_mask;
     instance->touch_device_states_[device_index].current_touch_mask = result.touch_mask;
     instance->touch_device_states_[device_index].timestamp_us = result.timestamp_us;
+    
+    // 标记该设备已完成采样（使用device_index）
+    if (device_index < 32) {
+        instance->device_completed_bitmap_ |= (1u << device_index);
+    }
+    
+    // 检查是否所有设备都已完成采样
+    uint32_t expected_bitmap = (1u << instance->total_device_count_) - 1;
+    if (instance->device_completed_bitmap_ == expected_bitmap) {
+        // 所有设备完成采样，执行一次性处理
+        instance->incrementSampleCounter();
+        instance->storeDelayedSerialState();
+        
+        // 重置bitmap为下一轮采样做准备
+        instance->device_completed_bitmap_ = 0;
+    }
+    
     // 解锁当前阶段并递增到下一个阶段
     instance->i2c_sampling_stages_[i2c_bus].stage_locked = false;
     instance->i2c_sampling_stages_[i2c_bus].next_stage();
-
-    // 增加采样计数器
-    instance->incrementSampleCounter();
-    // 存储延迟状态
-    instance->storeDelayedSerialState();
 }
 
 // 设备注册到阶段的接口实现

@@ -487,21 +487,20 @@ bool init_service_layer() {
     // 设置GPIOB8为输出模式并输出高电平以点亮LED
     mcp23s17->set_pin_direction(MCP23S17_PORT_B, 7, MCP23S17_OUTPUT); // GPIOB8是端口B的第7位(0-7)
     mcp23s17->write_pin(MCP23S17_PORT_B, 7, 0);
-
     // 注册按键
-    input_manager->addPhysicalKeyboard(MCP_GPIO::GPIOA0, HID_KeyCode::KEY_W);
-    input_manager->addPhysicalKeyboard(MCP_GPIO::GPIOA1, HID_KeyCode::KEY_E);
-    input_manager->addPhysicalKeyboard(MCP_GPIO::GPIOA2, HID_KeyCode::KEY_D);
-    input_manager->addPhysicalKeyboard(MCP_GPIO::GPIOA3, HID_KeyCode::KEY_C);
-    input_manager->addPhysicalKeyboard(MCP_GPIO::GPIOA4, HID_KeyCode::KEY_X);
-    input_manager->addPhysicalKeyboard(MCP_GPIO::GPIOA5, HID_KeyCode::KEY_Z);
-    input_manager->addPhysicalKeyboard(MCP_GPIO::GPIOA6, HID_KeyCode::KEY_A);
-    input_manager->addPhysicalKeyboard(MCP_GPIO::GPIOA7, HID_KeyCode::KEY_Q);
+    input_manager->addPhysicalKeyboard(MCP_GPIO::GPIOA0, HID_KeyCode::KEY_W, GPIOTriggerLevel::AUTO);
+    input_manager->addPhysicalKeyboard(MCP_GPIO::GPIOA1, HID_KeyCode::KEY_E, GPIOTriggerLevel::AUTO);
+    input_manager->addPhysicalKeyboard(MCP_GPIO::GPIOA2, HID_KeyCode::KEY_D, GPIOTriggerLevel::AUTO);
+    input_manager->addPhysicalKeyboard(MCP_GPIO::GPIOA3, HID_KeyCode::KEY_C, GPIOTriggerLevel::AUTO);
+    input_manager->addPhysicalKeyboard(MCP_GPIO::GPIOA4, HID_KeyCode::KEY_X, GPIOTriggerLevel::AUTO);
+    input_manager->addPhysicalKeyboard(MCP_GPIO::GPIOA5, HID_KeyCode::KEY_Z, GPIOTriggerLevel::AUTO);
+    input_manager->addPhysicalKeyboard(MCP_GPIO::GPIOA6, HID_KeyCode::KEY_A, GPIOTriggerLevel::AUTO);
+    input_manager->addPhysicalKeyboard(MCP_GPIO::GPIOA7, HID_KeyCode::KEY_Q, GPIOTriggerLevel::AUTO);
 
-    input_manager->addPhysicalKeyboard(MCP_GPIO::GPIOB0, HID_KeyCode::KEY_8);
-    input_manager->addPhysicalKeyboard(MCP_GPIO::GPIOB1, HID_KeyCode::KEY_3);
-    input_manager->addPhysicalKeyboard(MCP_GPIO::GPIOB2, HID_KeyCode::KEY_ENTER);
-    input_manager->addPhysicalKeyboard(MCP_GPIO::GPIOB3, HID_KeyCode::KEY_SPACE);
+    input_manager->addPhysicalKeyboard(MCP_GPIO::GPIOB0, HID_KeyCode::KEY_8, GPIOTriggerLevel::AUTO);
+    input_manager->addPhysicalKeyboard(MCP_GPIO::GPIOB1, HID_KeyCode::KEY_3, GPIOTriggerLevel::AUTO);
+    input_manager->addPhysicalKeyboard(MCP_GPIO::GPIOB2, HID_KeyCode::KEY_ENTER, GPIOTriggerLevel::AUTO);
+    input_manager->addPhysicalKeyboard(MCP_GPIO::GPIOB3, HID_KeyCode::KEY_SPACE, GPIOTriggerLevel::AUTO);
 
     // 注册Serial TouchArea -> Keyboard
     input_manager->addTouchKeyboardMapping(MAI2_A1_AREA, 1000, HID_KeyCode::KEY_W);
@@ -538,7 +537,6 @@ bool init_service_layer() {
     
     // 标记服务层初始化完成
     init_sync.service_ready = 1;
-    
     return true;
 }
 

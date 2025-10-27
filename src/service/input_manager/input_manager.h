@@ -61,6 +61,13 @@ inline uint8_t get_gpio_pin_number(uint8_t gpio_val) {
     return gpio_val & 0x3F;
 }
 
+// GPIO触发电平枚举
+enum class GPIOTriggerLevel : uint8_t {
+    ACTIVE_HIGH = 0,    // 高电平有效（按下时为高电平）
+    ACTIVE_LOW = 1,     // 低电平有效（按下时为低电平）
+    AUTO = 2            // 自动模式：加入映射时采样当前电平作为“未触发”电平
+};
+
 // 物理键盘映射结构体
 struct PhysicalKeyboardMapping {
     union {
@@ -69,10 +76,11 @@ struct PhysicalKeyboardMapping {
         uint8_t gpio;  // 原始GPIO值
     };
     HID_KeyCode default_key;
+    GPIOTriggerLevel trigger_level;  // 触发电平选择
     
-    PhysicalKeyboardMapping() : gpio(static_cast<uint8_t>(MCU_GPIO::GPIO_NONE)), default_key(HID_KeyCode::KEY_NONE) {}
-    PhysicalKeyboardMapping(MCU_GPIO mcu, HID_KeyCode key) : mcu_gpio(mcu), default_key(key) {}
-    PhysicalKeyboardMapping(MCP_GPIO mcp, HID_KeyCode key) : mcp_gpio(mcp), default_key(key) {}
+    PhysicalKeyboardMapping() : gpio(static_cast<uint8_t>(MCU_GPIO::GPIO_NONE)), default_key(HID_KeyCode::KEY_NONE), trigger_level(GPIOTriggerLevel::ACTIVE_LOW) {}
+    PhysicalKeyboardMapping(MCU_GPIO mcu, HID_KeyCode key, GPIOTriggerLevel level = GPIOTriggerLevel::ACTIVE_LOW) : mcu_gpio(mcu), default_key(key), trigger_level(level) {}
+    PhysicalKeyboardMapping(MCP_GPIO mcp, HID_KeyCode key, GPIOTriggerLevel level = GPIOTriggerLevel::ACTIVE_LOW) : mcp_gpio(mcp), default_key(key), trigger_level(level) {}
 };
 
 // 单次触发时的状态枚举
@@ -404,8 +412,8 @@ public:
     bool hasAvailableSerialMapping() const;
     
     // 物理键盘GPIO映射方法
-    bool addPhysicalKeyboard(MCU_GPIO gpio, HID_KeyCode default_key = HID_KeyCode::KEY_NONE);
-    bool addPhysicalKeyboard(MCP_GPIO gpio, HID_KeyCode default_key = HID_KeyCode::KEY_NONE);
+    bool addPhysicalKeyboard(MCU_GPIO gpio, HID_KeyCode default_key = HID_KeyCode::KEY_NONE, GPIOTriggerLevel trigger_level = GPIOTriggerLevel::ACTIVE_LOW);
+    bool addPhysicalKeyboard(MCP_GPIO gpio, HID_KeyCode default_key = HID_KeyCode::KEY_NONE, GPIOTriggerLevel trigger_level = GPIOTriggerLevel::ACTIVE_LOW);
     bool removePhysicalKeyboard(uint8_t gpio_id);
     void clearPhysicalKeyboards();
     const std::vector<PhysicalKeyboardMapping>& getPhysicalKeyboards() const;
@@ -430,7 +438,7 @@ public:
     void clearSerialMappings();  // 清空当前绑区的串口映射
     void updateChannelStatesAfterBinding();  // 绑定后更新通道状态
     
-    // 性能监控
+    // 监控
     uint32_t getTouchSampleRate();  // 获取触摸IC采样速率
     uint32_t getHIDReportRate();                           // 获取HID键盘回报速率
     
@@ -544,16 +552,99 @@ private:
     
     // 统一使用TouchDeviceState
 
-    // 延迟缓冲区管理 - 优化为只存储Serial数据
+    // 延迟缓冲区管理
+    // 延迟处理相关结构体和常量
     static constexpr uint16_t DELAY_BUFFER_SIZE = 512;  // 扩充缓冲区大小，支持更长延迟和更多数据
     struct DelayedSerialState {
-        Mai2Serial_TouchState serial_touch_state;  // 存储64位Serial触摸状态（支持34分区）
-        uint32_t timestamp_us;                     // 微秒级时间戳
+        uint32_t timestamp_us;                          // 时间戳（微秒）
+        Mai2Serial_TouchState serial_touch_state;      // Serial触摸状态
     };
+    
+    // 新增：投票聚合状态结构体
+    struct VotingAggregationState {
+        uint32_t trigger_count_state1;      // state1触发计数
+        uint32_t trigger_count_state2;      // state2触发计数
+        uint32_t non_trigger_count_state1;  // state1非触发计数
+        uint32_t non_trigger_count_state2;  // state2非触发计数
+        uint32_t total_samples;             // 总采样数
+        
+        VotingAggregationState() : trigger_count_state1(0), trigger_count_state2(0), 
+                                  non_trigger_count_state1(0), non_trigger_count_state2(0), 
+                                  total_samples(0) {}
+        
+        void reset() {
+            trigger_count_state1 = 0;
+            trigger_count_state2 = 0;
+            non_trigger_count_state1 = 0;
+            non_trigger_count_state2 = 0;
+            total_samples = 0;
+        }
+        
+        // 优化的位计数累加函数 - 一次性处理多个位
+        void addTriggerCounts(uint32_t state1_bits, uint32_t state2_bits) {
+            // 使用内建函数进行高效位计数
+            trigger_count_state1 += __builtin_popcount(state1_bits);
+            trigger_count_state2 += __builtin_popcount(state2_bits);
+            non_trigger_count_state1 += __builtin_popcount(~state1_bits);
+            non_trigger_count_state2 += __builtin_popcount(~state2_bits);
+            total_samples++;
+        }
+        
+        // 批量处理多个状态的优化版本
+        void addTriggerCountsBatch(const uint32_t* state1_array, const uint32_t* state2_array, uint32_t count) {
+            for (uint32_t i = 0; i < count; i++) {
+                uint32_t s1 = state1_array[i];
+                uint32_t s2 = state2_array[i];
+                trigger_count_state1 += __builtin_popcount(s1);
+                trigger_count_state2 += __builtin_popcount(s2);
+                non_trigger_count_state1 += __builtin_popcount(~s1);
+                non_trigger_count_state2 += __builtin_popcount(~s2);
+            }
+            total_samples += count;
+        }
+        
+        // 获取投票结果
+        void getVotingResult(uint32_t& result_state1, uint32_t& result_state2, 
+                           const Mai2Serial_TouchState& last_emitted) const {
+            result_state1 = getVotedBits(trigger_count_state1, non_trigger_count_state1, last_emitted.parts.state1);
+            result_state2 = getVotedBits(trigger_count_state2, non_trigger_count_state2, last_emitted.parts.state2);
+        }
+        
+    private:
+        // 获取投票后的位结果
+        uint32_t getVotedBits(uint32_t trigger_count, uint32_t non_trigger_count, 
+                             uint32_t last_state) const {
+            if (trigger_count > non_trigger_count) {
+                return 0xFFFFFFFF;  // 触发获胜
+            } else if (trigger_count < non_trigger_count) {
+                return 0x00000000;  // 非触发获胜
+            } else {
+                return ~last_state; // 平票时取上次结果的反向
+            }
+        }
+    };
+    
+    // 新增：processSerialModeWithDelay静态变量管理结构体
+    struct SerialModeDelayState {
+        uint16_t last_hit_offset;                    // 上次命中偏移量
+        Mai2Serial_TouchState last_emitted_result;   // 上次发出的结果（用于平票时取反向）
+        VotingAggregationState voting_state;        // 投票聚合状态
+        
+        SerialModeDelayState() : last_hit_offset(0) {
+            last_emitted_result.raw = 0;
+        }
+    };
+    
+    // 新增：设备采样完成状态bitmap结构体
     DelayedSerialState delay_buffer_[DELAY_BUFFER_SIZE]; // 延迟缓冲区
     uint16_t delay_buffer_head_;                        // 缓冲区头指针
     uint16_t delay_buffer_count_;                       // 缓冲区中的有效数据数量
     
+    // 新增：静态状态管理实例
+    static SerialModeDelayState serial_delay_state_;    // processSerialModeWithDelay静态状态
+    static uint32_t device_completed_bitmap_;           // 设备采样完成状态bitmap
+    static uint8_t total_device_count_;                 // 总设备数量
+
     // GPIO状态管理
     uint32_t mcu_gpio_states_;               // MCU GPIO状态位图
     uint32_t mcu_gpio_previous_states_;      // MCU GPIO上一次状态
@@ -561,7 +652,7 @@ private:
     // Serial状态桥梁变量 - 用于触摸键盘转换
     Mai2Serial_TouchState serial_state_;    // 当前Serial触摸状态，作为task0和task1之间的桥梁
     
-    // 触摸键盘性能优化缓存变量（避免函数调用和局部变量）
+    // 触摸键盘缓存变量
     mutable uint32_t touch_keyboard_current_time_cache_; // 当前时间缓存
     mutable bool touch_keyboard_areas_matched_cache_;    // 区域匹配结果缓存
     mutable bool touch_keyboard_hold_satisfied_cache_;   // 长按时间满足缓存
@@ -680,6 +771,10 @@ private:
     inline void updateGPIOStates();          // 更新GPIO状态
     inline void processGPIOKeyboard();       // 处理GPIO键盘输入
     inline void processTouchKeyboard();      // 处理触摸键盘映射
+
+    // 优化与校验辅助函数
+    inline void rebuildGPIOInversionMasks(); // 基于映射重建MCU/MCP反转位图
+    inline void sanityCheckPhysicalKeyboard(const PhysicalKeyboardMapping& mapping); // 新增映射时进行电平有效性检查
 
     // 32位物理通道地址处理辅助函数
     static inline uint32_t encodePhysicalChannelAddress(uint8_t device_mask, uint32_t channel_mask) {
