@@ -1,6 +1,7 @@
 #include "i2c_module.h"
 #include "../capsense/capsense_module.h"
 #include "../led/led_module.h"
+#include "../trigger/fast_trigger.h"
 
 static cy_stc_scb_i2c_context_t i2c_context;
 static uint16_t g_scan_rate_per_second = 0;
@@ -198,6 +199,19 @@ uint16_t i2c_handle_register_read(uint8_t reg_addr)
         return capsense_read_fingercap_from_context(idx);
     }
 
+    if (reg_addr == REG_FAST_TRIG_DROP_PCT) {
+        return 0;
+    }
+    if (reg_addr == REG_FAST_TRIG_RISE_PCT) {
+        return 0;
+    }
+    if (reg_addr == REG_FAST_TRIG_ENABLE_MASK) {
+        return fast_trigger_get_enable_mask();
+    }
+    if (reg_addr == REG_FAST_TRIG_X_PERMILLE) {
+        return fast_trigger_get_x_permille();
+    }
+
     switch (reg_addr)
     {
         case REG_SCAN_RATE:
@@ -238,6 +252,23 @@ void i2c_handle_register_write(uint8_t reg_addr, uint16_t value)
             steps = TOUCH_CAP_TOTAL_MAX_STEPS;
         }
         capsense_set_fingercap_steps(idx, steps);
+        return;
+    }
+
+    if (reg_addr == REG_FAST_TRIG_DROP_PCT) {
+        (void)value;
+        return;
+    }
+    if (reg_addr == REG_FAST_TRIG_RISE_PCT) {
+        (void)value;
+        return;
+    }
+    if (reg_addr == REG_FAST_TRIG_ENABLE_MASK) {
+        fast_trigger_set_enable_mask(value);
+        return;
+    }
+    if (reg_addr == REG_FAST_TRIG_X_PERMILLE) {
+        fast_trigger_set_x_permille(value);
         return;
     }
     switch (reg_addr)

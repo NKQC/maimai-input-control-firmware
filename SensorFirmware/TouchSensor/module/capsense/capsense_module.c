@@ -4,6 +4,7 @@
 #include "cy_capsense_processing.h"
 #include "cy_capsense_filter.h"
 #include "cy_capsense_selftest.h"
+#include "fast_trigger.h"
 
 static uint16_t g_touch_status_bitmap = 0;
 
@@ -109,7 +110,6 @@ void capsense_process_widgets(void)
                 widget_ids[i],
                 (uint32_t)(
                     CY_CAPSENSE_PROCESS_FILTER |
-                    // CY_CAPSENSE_PROCESS_DIFFCOUNTS |
                     // CY_CAPSENSE_PROCESS_THRESHOLDS |
                     // CY_CAPSENSE_PROCESS_BASELINE |
                     // CY_CAPSENSE_PROCESS_CALC_NOISE |
@@ -241,6 +241,8 @@ void capsense_handle_async_ops(void)
         // 噪声测量/阈值计算
         capsense_auto_tune_thresholds(8u);
 
+        fast_trigger_init();
+
         g_capsense_async.bits.calibrating = 0u;
         g_capsense_async.bits.calibrate_req = 0u;
         g_capsense_async.bits.calibration_done = 1u;
@@ -317,4 +319,21 @@ void capsense_write_threshold_to_context(uint8_t channel, uint16_t threshold)
     // 更新CRC使配置生效
     Cy_CapSense_UpdateCrcWidget(widget_ids[channel], &cy_capsense_context);
 #endif
+}
+
+
+uint16_t capsense_get_raw_filtered(uint8_t idx)
+{
+    if (idx >= CAPSENSE_WIDGET_COUNT) {
+        return 0u;
+    }
+    return (uint16_t)cy_capsense_tuner.sensorContext[idx].raw;
+}
+
+uint16_t capsense_get_baseline(uint8_t idx)
+{
+    if (idx >= CAPSENSE_WIDGET_COUNT) {
+        return 0u;
+    }
+    return (uint16_t)cy_capsense_tuner.sensorContext[idx].bsln;
 }

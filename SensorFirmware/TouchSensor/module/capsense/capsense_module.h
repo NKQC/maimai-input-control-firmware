@@ -232,4 +232,9 @@ void capsense_auto_tune_thresholds(uint8_t passes);
 void capsense_measure_sensor_cp(void);
 #endif
 
+// 新增：读取通道滤波后的原始计数（raw）
+uint16_t capsense_get_raw_filtered(uint8_t idx);
+// 新增：读取通道当前基线（bsln）
+uint16_t capsense_get_baseline(uint8_t idx);
+
 #endif // CAPSENSE_MODULE_H

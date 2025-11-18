@@ -30,8 +30,14 @@
             "cycfg_capsense.h": "c",
             "cy_capsense.h": "c",
             "cy_capsense_csd_v2.h": "c",
-            "limits": "c"
-        }
+            "limits": "c",
+            "fast_trigger.h": "c",
+            "cy_capsense_selftest.h": "c",
+            "capsense_module.h": "c"
+        },
+        "clangd.arguments": [
+            "--background-index"
+        ]
     },
     "extensions": {
         "recommendations": [ "marus25.cortex-debug", "ms-vscode.cpptools", "dan-c-underwood.arm" ]
