@@ -9,22 +9,22 @@
 #define CAPSENSE_INTR_PRIORITY    (3u)
 #define CAPSENSE_WIDGET_COUNT     (12u)
 
-// TouchSensitivity相关定义（增量设置）：单位 0.01 pF
-#define TOUCH_SENSITIVITY_STEP_PF           (0.01f)     // 每步进对应0.01pF
-// 非FULL模式最低值可为0；FULL模式维持历史最小0.1pF（10步）
+// TouchSensitivity相关定义（增量设置）：单位 0.001 pF
+#define TOUCH_SENSITIVITY_STEP_PF           (0.001f)
+// 非FULL模式最低值可为0；FULL模式维持历史最小0.1pF（100步）
 #if (CY_CAPSENSE_SMARTSENSE_FULL_EN)
-    #define TOUCH_INCREMENT_MIN_STEPS       (10u)
-    // FULL模式：最大值=1.00pF（100步进）
-    #define TOUCH_SENSITIVITY_MAX_STEPS     (100u)
+    #define TOUCH_INCREMENT_MIN_STEPS       (100u)
+    // FULL模式：最大值=1.00pF（1000步进）
+    #define TOUCH_SENSITIVITY_MAX_STEPS     (1000u)
 #else
     #define TOUCH_INCREMENT_MIN_STEPS       (0u)
-    // 非FULL模式：最大值=20.00pF（2000步进），满足部分SmartSense场景
-    #define TOUCH_SENSITIVITY_MAX_STEPS     (2000u)
+    // 非FULL模式：最大值=20.00pF（20000步进），满足部分SmartSense场景
+    #define TOUCH_SENSITIVITY_MAX_STEPS     (20000u)
 #endif
-// 默认增量为1.00pF（100步进）
-#define TOUCH_SENSITIVITY_DEFAULT_STEPS     (100u)
+// 默认增量为1.00pF（1000步进）
+#define TOUCH_SENSITIVITY_DEFAULT_STEPS     (1000u)
 // 总触摸电容上限（Cp+增量，不超过22pF）
-#define TOUCH_CAP_TOTAL_MAX_STEPS           (2200u)
+#define TOUCH_CAP_TOTAL_MAX_STEPS           (22000u)
 // 新增：触摸灵敏度寄存器原始值编码（有符号偏移），零点为4095
 #define TOUCH_SENSITIVITY_ZERO_BIAS         (4095u)
 #define TOUCH_SENSITIVITY_RAW_MIN           (0u)
@@ -34,6 +34,10 @@
 #define TOUCH_THRESHOLD_MIN                     (1u)
 #define TOUCH_THRESHOLD_MAX                     (65535u)
 #define TOUCH_THRESHOLD_DEFAULT                 (110u)
+
+// 电容值基数扩展因子（默认1.0）
+// 用于调整测量到的电容值，防止过敏感或过迟钝
+#define CAPSENSE_CP_BASE_EXPANSION              1
 
 // 全局异步状态位域（统一管理）：
 // bit0: calibrate_req（校准请求）
@@ -61,7 +65,7 @@ static inline void capsense_request_calibration(void)
 
 // 统一的异步更新结构体：将数值和更新mask绑定在一起
 typedef struct {
-    // 电容值数组：统一的fingercap值（单位：0.01pF步进）
+    // 电容值数组：统一的fingercap值（单位：0.001pF步进）
     uint16_t fingercap_steps[CAPSENSE_WIDGET_COUNT];
     // 触摸阈值数组
     uint16_t touch_thresholds[CAPSENSE_WIDGET_COUNT];
@@ -163,17 +167,6 @@ static inline void capsense_consume_updates_snapshot(capsense_update_snapshot_t*
     __enable_irq();
 }
 
-// 保留旧的函数以维持兼容性（但标记为已弃用）
-static inline uint16_t capsense_consume_fingercap_updates(void)
-{
-    uint16_t pending;
-    __disable_irq();
-    pending = g_capsense_update.fingercap_update_mask;
-    g_capsense_update.fingercap_update_mask = 0u;
-    __enable_irq();
-    return pending;
-}
-
 static inline uint16_t capsense_consume_threshold_updates(void)
 {
     uint16_t pending;
@@ -214,6 +207,7 @@ uint16_t capsense_read_fingercap_from_context(uint8_t channel);
 uint16_t capsense_read_threshold_from_context(uint8_t channel);
 void capsense_write_fingercap_to_context(uint8_t channel, uint16_t fingercap_steps);
 void capsense_write_threshold_to_context(uint8_t channel, uint16_t threshold);
+void capsense_apply_config_changes(void);
 
 uint16_t capsense_get_cp_base_steps(uint8_t idx);
 
@@ -233,8 +227,12 @@ void capsense_measure_sensor_cp(void);
 #endif
 
 // 新增：读取通道滤波后的原始计数（raw）
-uint16_t capsense_get_raw_filtered(uint8_t idx);
+uint16_t capsense_get_diff(uint8_t idx);
 // 新增：读取通道当前基线（bsln）
 uint16_t capsense_get_baseline(uint8_t idx);
+
+// 新增：读取运行态分辨率与最大原始计数
+uint8_t  capsense_get_resolution(uint8_t idx);
+uint16_t capsense_get_max_raw_count(uint8_t idx);
 
 #endif // CAPSENSE_MODULE_H

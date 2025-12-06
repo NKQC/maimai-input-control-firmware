@@ -200,16 +200,13 @@ uint16_t i2c_handle_register_read(uint8_t reg_addr)
     }
 
     if (reg_addr == REG_FAST_TRIG_DROP_PCT) {
-        return 0;
+        return FAST_TRIG_DROP_PERMILLE_DEFAULT;
     }
     if (reg_addr == REG_FAST_TRIG_RISE_PCT) {
-        return 0;
+        return FAST_TRIG_RISE_PERMILLE_DEFAULT;
     }
     if (reg_addr == REG_FAST_TRIG_ENABLE_MASK) {
         return fast_trigger_get_enable_mask();
-    }
-    if (reg_addr == REG_FAST_TRIG_X_PERMILLE) {
-        return fast_trigger_get_x_permille();
     }
 
     switch (reg_addr)
@@ -256,19 +253,15 @@ void i2c_handle_register_write(uint8_t reg_addr, uint16_t value)
     }
 
     if (reg_addr == REG_FAST_TRIG_DROP_PCT) {
-        (void)value;
+        fast_trigger_set_drop_permille(value);
         return;
     }
     if (reg_addr == REG_FAST_TRIG_RISE_PCT) {
-        (void)value;
+        fast_trigger_set_rise_permille(value);
         return;
     }
     if (reg_addr == REG_FAST_TRIG_ENABLE_MASK) {
         fast_trigger_set_enable_mask(value);
-        return;
-    }
-    if (reg_addr == REG_FAST_TRIG_X_PERMILLE) {
-        fast_trigger_set_x_permille(value);
         return;
     }
     switch (reg_addr)

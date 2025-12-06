@@ -5,7 +5,7 @@ echo ========================================
 echo Firmware Flash Script
 echo ========================================
 
-set HEX_FILE=build\TouchSensor\Debug\TouchSensor.hex
+set HEX_FILE=build\TouchSensor\Release\TouchSensor.hex
 set ABS_HEX_FILE=%~dp0%HEX_FILE%
 set ABS_HEX_FILE_UNIX=%ABS_HEX_FILE:\=/%
 

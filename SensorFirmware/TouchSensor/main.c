@@ -13,7 +13,6 @@
 
 static uint64_t _last_scan_time = 0;
 static volatile uint64_t _systick_ms_epoch = 0;
-static uint16_t _last_status = 0;
 
 static inline uint64_t get_system_time_ms(void)
 {
@@ -51,14 +50,14 @@ int main(void)
     Cy_SysTick_SetCallback(0UL, &SysTick_Handler);
     Cy_SysTick_Enable();
 
-    led_init();
-
     i2c_init(_get_i2c_address());
+
+    led_init();
+    
     capsense_init();
     capsense_start_scan();
     _last_scan_time = get_system_time_ms();
     led_on();
-    
     for (;;)
     {
         if (!capsense_is_busy())
@@ -67,14 +66,16 @@ int main(void)
             capsense_process_widgets();
             capsense_update_touch_status();
             capsense_apply_threshold_changes();
-            
             status = capsense_get_touch_status_bitmap();
             status = fast_trigger_process(get_system_time_ms(), status);
             i2c_set_touch_status_snapshot(status);
             if (i2c_led_feedback_enabled()) {
-                led_set_state(status != _last_status);
-                _last_status = status;
+                led_set_state(status);
             }
+            // for (uint8_t i = 0; i < 12; i++)
+            // {
+            //     cap = capsense_read_fingercap_from_context(i);
+            // }
             _update_scan_rate();
             capsense_start_scan();
         }

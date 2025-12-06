@@ -33,7 +33,6 @@
 #define REG_FAST_TRIG_DROP_PCT       (0x41)
 #define REG_FAST_TRIG_RISE_PCT       (0x42)
 #define REG_FAST_TRIG_ENABLE_MASK    (0x43)
-#define REG_FAST_TRIG_X_PERMILLE     (0x44)
 
 // 控制寄存器位域定义：
 // bit0: reset_req，置1发起软件复位

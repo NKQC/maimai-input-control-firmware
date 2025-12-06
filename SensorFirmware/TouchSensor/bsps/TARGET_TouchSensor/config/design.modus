@@ -15,10 +15,10 @@
                         <Param id="CapSenseCore" value="0"/>
                         <Param id="CapSenseEnable" value="true"/>
                         <Param id="CapacitorCount" value="1"/>
-                        <Param id="CsdAdcEnable" value="false"/>
+                        <Param id="CsdAdcEnable" value="true"/>
                         <Param id="CsdIdacAselect" value="CY_CSDIDAC_GPIO"/>
                         <Param id="CsdIdacBselect" value="CY_CSDIDAC_DISABLED"/>
-                        <Param id="CsdIdacEnable" value="false"/>
+                        <Param id="CsdIdacEnable" value="true"/>
                         <Param id="SensorCount" value="13"/>
                         <Param id="SensorName0" value="Cmod"/>
                         <Param id="SensorName1" value="CAP0_Sns0"/>
@@ -275,18 +275,8 @@
                         <Param id="vtrip" value="CY_GPIO_VTRIP_CMOS"/>
                     </Parameters>
                 </Personality>
-                <Personality template="m0s8peripheralclock" version="1.0" instance="1vPZujutIQQ">
+                <Personality template="m0s8peripheralclock" version="1.0" instance="2PV4Jdoybk8">
                     <Block location="peri[0].div_16[0]" locked="true"/>
-                    <Parameters>
-                        <Param id="calc" value="man"/>
-                        <Param id="desFreq" value="48000000.000000"/>
-                        <Param id="fracDivider" value="0"/>
-                        <Param id="intDivider" value="1"/>
-                        <Param id="startOnReset" value="true"/>
-                    </Parameters>
-                </Personality>
-                <Personality template="m0s8peripheralclock" version="1.0" instance="q9TGdX61hO8">
-                    <Block location="peri[0].div_16[1]" locked="true"/>
                     <Parameters>
                         <Param id="calc" value="man"/>
                         <Param id="desFreq" value="48000000.000000"/>
@@ -295,7 +285,7 @@
                         <Param id="startOnReset" value="true"/>
                     </Parameters>
                 </Personality>
-                <Personality template="m0s8peripheralclock" version="1.0" instance="CM9RY1zlghQ">
+                <Personality template="m0s8peripheralclock" version="1.0" instance="jIjJu_Oju-w">
                     <Block location="peri[0].div_16_5[0]" locked="true"/>
                     <Parameters>
                         <Param id="calc" value="man"/>
@@ -344,7 +334,7 @@
                         <Param id="sourceClock" value="IMO"/>
                     </Parameters>
                 </Personality>
-                <Personality template="m0s8ilo" version="2.0" instance="COCNPSF9fPE">
+                <Personality template="m0s8ilo" version="2.0" instance="RryQ-rkoYHg">
                     <Block location="srss[0].clock[0].ilo[0]" locked="true"/>
                 </Personality>
                 <Personality template="m0s8imo" version="1.0" instance="uR4Pa7HyTY8">
@@ -354,7 +344,7 @@
                         <Param id="trim" value="2"/>
                     </Parameters>
                 </Personality>
-                <Personality template="m0s8lfclk" version="1.0" instance="nQU-sz7BEAQ">
+                <Personality template="m0s8lfclk" version="1.0" instance="mLX9T48WTFk">
                     <Block location="srss[0].clock[0].lfclk[0]" locked="true"/>
                     <Parameters>
                         <Param id="sourceClock" value="ILO"/>
@@ -413,7 +403,7 @@
                 </Net>
                 <Net>
                     <Port name="csd[0].csd[0].clock[0]"/>
-                    <Port name="peri[0].div_16[0].clk[0]"/>
+                    <Port name="peri[0].div_16_5[0].clk[0]"/>
                 </Net>
                 <Net>
                     <Port name="ioss[0].port[2].pin[0].digital_inout[0]"/>
@@ -424,9 +414,19 @@
                     <Port name="scb[1].i2c_sda[0]"/>
                 </Net>
                 <Net>
-                    <Port name="peri[0].div_16[1].clk[0]"/>
+                    <Port name="peri[0].div_16[0].clk[0]"/>
                     <Port name="scb[1].clock[0]"/>
                 </Net>
+                <Mux name="adcChannel" location="csd[0].csd[0]">
+                    <Arm>
+                        <Port name="ioss[0].port[0].pin[0].analog[0]"/>
+                    </Arm>
+                </Mux>
+                <Mux name="idacA" location="csd[0].csd[0]">
+                    <Arm>
+                        <Port name="ioss[0].port[0].pin[0].analog[0]"/>
+                    </Arm>
+                </Mux>
                 <Mux name="sense" location="csd[0].csd[0]">
                     <Arm>
                         <Port name="ioss[0].port[4].pin[2].analog[0]"/>

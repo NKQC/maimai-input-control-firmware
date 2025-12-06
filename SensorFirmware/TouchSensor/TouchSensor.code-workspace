@@ -33,7 +33,10 @@
             "limits": "c",
             "fast_trigger.h": "c",
             "cy_capsense_selftest.h": "c",
-            "capsense_module.h": "c"
+            "capsense_module.h": "c",
+            "type_traits": "c",
+            "cmath": "c",
+            "compare": "c"
         },
         "clangd.arguments": [
             "--background-index"
