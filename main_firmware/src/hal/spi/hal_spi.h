@@ -1,0 +1,185 @@
+#pragma once
+
+#include <stdint.h>
+#include <string>
+#include <functional>
+
+extern "C" {
+#include "../global_irq.h"
+}
+
+/**
+ * HAL层 - SPI接口抽象类
+ * 提供底层SPI接口，支持SPI0和SPI1两个实例
+ * 使用DMA实现高效的数据传输
+ */
+
+class HAL_SPI {
+public:
+    using dma_callback_t = std::function<void(bool success)>;
+    
+    virtual ~HAL_SPI() = default;
+    
+    // 初始化SPI接口
+    virtual bool init(uint8_t sck_pin, uint8_t mosi_pin, uint8_t miso_pin, uint32_t frequency = 1000000) = 0;
+    
+    // 释放SPI资源
+    virtual void deinit() = 0;
+    
+    // DMA操作 - 完全DMA化
+    virtual bool write_dma(const uint8_t* data, size_t length, dma_callback_t callback = nullptr) = 0;
+    virtual bool read_dma(uint8_t* buffer, size_t length, dma_callback_t callback = nullptr) = 0;
+    
+    // 扁平化DMA接口 - 避免重复设置IRQ
+    virtual bool start_dma_transfer(const uint8_t* data, size_t length, dma_callback_t callback = nullptr) = 0;
+    virtual bool continue_dma_transfer(const uint8_t* data, size_t length) = 0;
+    
+    // 同步传输方法
+    virtual size_t write(const uint8_t* data, size_t length) = 0;
+    virtual size_t read(uint8_t* buffer, size_t length) = 0;
+    virtual size_t transfer(const uint8_t* tx_data, uint8_t* rx_data, size_t length) = 0;
+    
+    // 检查DMA传输状态8
+    virtual bool is_busy() const = 0;
+    
+    // 设置CS引脚
+    virtual void set_cs_pin(uint8_t cs_pin, bool active_low = true) = 0;
+    
+    // CS控制
+    virtual void cs_select() = 0;
+    virtual void cs_deselect() = 0;
+    
+    // 设置SPI格式 (bit_order: 0=MSB_FIRST, 1=LSB_FIRST)
+    virtual void set_format(uint8_t data_bits, uint8_t cpol, uint8_t cpha, uint8_t bit_order = 0) = 0;
+    virtual void set_frequency(uint32_t frequency) = 0;
+    
+    // 获取实例名称
+    virtual std::string get_name() const = 0;
+    
+    // 检查SPI是否就绪
+    virtual bool is_ready() const = 0;
+};
+
+// SPI0实例
+class HAL_SPI0 : public HAL_SPI {
+public:
+    static HAL_SPI0* getInstance();
+    ~HAL_SPI0();
+    
+    bool init(uint8_t sck_pin, uint8_t mosi_pin, uint8_t miso_pin, uint32_t frequency = 1000000) override;
+    void deinit() override;
+    bool write_dma(const uint8_t* data, size_t length, dma_callback_t callback = nullptr) override;
+    bool read_dma(uint8_t* buffer, size_t length, dma_callback_t callback = nullptr) override;
+    bool write_async(const uint8_t* data, size_t length, dma_callback_t callback);
+    bool read_async(uint8_t* buffer, size_t length, dma_callback_t callback);
+    bool transfer_async(const uint8_t* tx_data, uint8_t* rx_data, size_t length, dma_callback_t callback);
+    
+    // 扁平化DMA接口实现
+    bool start_dma_transfer(const uint8_t* data, size_t length, dma_callback_t callback = nullptr) override;
+    bool continue_dma_transfer(const uint8_t* data, size_t length) override;
+    
+    // 同步传输方法
+    size_t write(const uint8_t* data, size_t length) override;
+    size_t read(uint8_t* buffer, size_t length) override;
+    size_t transfer(const uint8_t* tx_data, uint8_t* rx_data, size_t length) override;
+    
+    bool is_busy() const override;
+    void set_cs_pin(uint8_t cs_pin, bool active_low = true) override;
+    void cs_select() override;
+    void cs_deselect() override;
+    void set_format(uint8_t data_bits, uint8_t cpol, uint8_t cpha, uint8_t bit_order = 0) override;
+    void set_frequency(uint32_t frequency) override;
+    std::string get_name() const override { return "SPI0"; }
+    bool is_ready() const override { return initialized_; }
+
+    // 友元函数声明
+    friend void spi0_dma_callback(bool success);
+
+private:
+    bool initialized_;
+    uint8_t sck_pin_;
+    uint8_t mosi_pin_;
+    uint8_t miso_pin_;
+    uint8_t cs_pin_;
+    bool cs_active_low_;
+    uint32_t frequency_;
+    int32_t dma_tx_channel_;
+    int32_t dma_rx_channel_;
+    bool dma_busy_;
+    bool dma_irq_initialized_;
+    dma_callback_t dma_callback_;
+    
+    // TX环形缓冲区
+    static constexpr size_t TX_BUFFER_SIZE = 256;
+    uint8_t tx_buffer_[TX_BUFFER_SIZE];
+    volatile size_t tx_head_;
+    volatile size_t tx_tail_;
+    volatile bool tx_dma_active_;
+    
+    // RX环形缓冲区
+    static constexpr size_t RX_BUFFER_SIZE = 256;
+    uint8_t rx_buffer_[RX_BUFFER_SIZE];
+    volatile size_t rx_head_;
+    volatile size_t rx_tail_;
+    
+    static HAL_SPI0* instance_;
+    
+    // 私有构造函数（单例模式）
+    HAL_SPI0();
+    HAL_SPI0(const HAL_SPI0&) = delete;
+    HAL_SPI0& operator=(const HAL_SPI0&) = delete;
+};
+
+// SPI1实例
+class HAL_SPI1 : public HAL_SPI {
+public:
+    static HAL_SPI1* getInstance();
+    ~HAL_SPI1();
+    
+    bool init(uint8_t sck_pin, uint8_t mosi_pin, uint8_t miso_pin, uint32_t frequency = 1000000) override;
+    void deinit() override;
+    bool write_dma(const uint8_t* data, size_t length, dma_callback_t callback = nullptr) override;
+    bool read_dma(uint8_t* buffer, size_t length, dma_callback_t callback = nullptr) override;
+    size_t write(const uint8_t* data, size_t length) override;
+    size_t read(uint8_t* buffer, size_t length) override;
+    size_t transfer(const uint8_t* tx_data, uint8_t* rx_data, size_t length) override;
+    bool write_async(const uint8_t* data, size_t length, dma_callback_t callback);
+    bool read_async(uint8_t* buffer, size_t length, dma_callback_t callback);
+    bool transfer_async(const uint8_t* tx_data, uint8_t* rx_data, size_t length, dma_callback_t callback);
+    
+    // 扁平化DMA接口实现
+    bool start_dma_transfer(const uint8_t* data, size_t length, dma_callback_t callback = nullptr) override;
+    bool continue_dma_transfer(const uint8_t* data, size_t length) override;
+    bool is_busy() const override;
+    void set_cs_pin(uint8_t cs_pin, bool active_low = true) override;
+    void cs_select() override;
+    void cs_deselect() override;
+    void set_format(uint8_t data_bits, uint8_t cpol, uint8_t cpha, uint8_t bit_order = 0) override;
+    void set_frequency(uint32_t frequency) override;
+    std::string get_name() const override;
+    bool is_ready() const override;
+
+    // 友元函数声明
+    friend void spi1_dma_callback(bool success);
+
+private:
+    bool initialized_;
+    uint8_t sck_pin_;
+    uint8_t mosi_pin_;
+    uint8_t miso_pin_;
+    uint8_t cs_pin_;
+    bool cs_active_low_;
+    uint32_t frequency_;
+    int32_t dma_tx_channel_;
+    int32_t dma_rx_channel_;
+    bool dma_busy_;
+    bool dma_irq_initialized_;
+    dma_callback_t dma_callback_;
+    
+    static HAL_SPI1* instance_;
+    
+    // 私有构造函数（单例模式）
+    HAL_SPI1();
+    HAL_SPI1(const HAL_SPI1&) = delete;
+    HAL_SPI1& operator=(const HAL_SPI1&) = delete;
+};

@@ -1,0 +1,59 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "type": "platformio-debug",
+      "request": "launch",
+      "name": "PIO Debug",
+      "executable": "F:/mai2control/mai2control-v4/.pio/build/pico/firmware.elf",
+      "projectEnvName": "pico",
+      "toolchainBinDir": "C:/Users/asdfg/.platformio/packages/toolchain-rp2040-earlephilhower/bin",
+      "internalConsoleOptions": "openOnSessionStart",
+      "svdPath": "C:/Users/asdfg/.platformio/platforms/raspberrypi@src-ff76a3915224135aafad379817f41edd/misc/svd/rp2040.svd",
+      "preLaunchTask": {
+        "type": "PlatformIO",
+        "task": "Pre-Debug"
+      }
+    },
+    {
+      "type": "platformio-debug",
+      "request": "launch",
+      "name": "PIO Debug (skip Pre-Debug)",
+      "executable": "F:/mai2control/mai2control-v4/.pio/build/pico/firmware.elf",
+      "projectEnvName": "pico",
+      "toolchainBinDir": "C:/Users/asdfg/.platformio/packages/toolchain-rp2040-earlephilhower/bin",
+      "internalConsoleOptions": "openOnSessionStart",
+      "svdPath": "C:/Users/asdfg/.platformio/platforms/raspberrypi@src-ff76a3915224135aafad379817f41edd/misc/svd/rp2040.svd"
+    },
+    {
+      "type": "platformio-debug",
+      "request": "launch",
+      "name": "PIO Debug (without uploading)",
+      "executable": "F:/mai2control/mai2control-v4/.pio/build/pico/firmware.elf",
+      "projectEnvName": "pico",
+      "toolchainBinDir": "C:/Users/asdfg/.platformio/packages/toolchain-rp2040-earlephilhower/bin",
+      "internalConsoleOptions": "openOnSessionStart",
+      "svdPath": "C:/Users/asdfg/.platformio/platforms/raspberrypi@src-ff76a3915224135aafad379817f41edd/misc/svd/rp2040.svd",
+      "loadMode": "manual"
+    },
+    {
+      "name": "C/C++ Runner: Debug Session",
+      "type": "cppdbg",
+      "request": "launch",
+      "args": [],
+      "stopAtEntry": false,
+      "externalConsole": true,
+      "cwd": "f:/mai2control/mai2control-v4/main_firmware/src",
+      "program": "f:/mai2control/mai2control-v4/main_firmware/src/build/Debug/outDebug",
+      "MIMode": "gdb",
+      "miDebuggerPath": "C:/Users/asdfg/.platformio/packages/toolchain-rp2040-earlephilhower/bin/arm-none-eabi-gdb.exe",
+      "setupCommands": [
+        {
+          "description": "Enable pretty-printing for gdb",
+          "text": "-enable-pretty-printing",
+          "ignoreFailures": true
+        }
+      ]
+    }
+  ]
+}
