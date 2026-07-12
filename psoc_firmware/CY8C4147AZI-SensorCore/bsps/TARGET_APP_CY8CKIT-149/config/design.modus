@@ -296,7 +296,7 @@
                 <Personality template="m0s8pin" version="2.0" instance="jt0uymp8dmQ">
                     <Block location="ioss[0].port[1].pin[1]" locked="true"/>
                     <Parameters>
-                        <Param id="DriveModes" value="CY_GPIO_DM_ANALOG"/>
+                        <Param id="DriveModes" value="CY_GPIO_DM_STRONG_IN_OFF"/>
                         <Param id="inFlash" value="true"/>
                         <Param id="initialState" value="1"/>
                         <Param id="isrTrigger" value="CY_GPIO_INTR_DISABLE"/>
@@ -1376,6 +1376,10 @@
                 <Net>
                     <Port name="ioss[0].port[1].pin[0].digital_inout[0]"/>
                     <Port name="scb[0].spi_mosi[0]"/>
+                </Net>
+                <Net>
+                    <Port name="ioss[0].port[1].pin[1].digital_inout[0]"/>
+                    <Port name="scb[0].spi_miso[0]"/>
                 </Net>
                 <Net>
                     <Port name="ioss[0].port[1].pin[2].digital_inout[0]"/>

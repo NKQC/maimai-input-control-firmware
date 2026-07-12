@@ -119,6 +119,10 @@ bool HAL_PIO0::sm_configure(uint8_t sm, const PIOStateMachineConfig& config) {
     
     // 配置程序包装
     ::sm_config_set_wrap(&configs_[sm], config.wrap_target, config.wrap);
+
+    // 配置移位寄存器（默认与 pico 默认一致，SWD 等可指定右移=LSB first）
+    ::sm_config_set_out_shift(&configs_[sm], config.out_shift_right, config.autopull, config.pull_threshold);
+    ::sm_config_set_in_shift(&configs_[sm], config.in_shift_right, config.autopush, config.push_threshold);
     
     // 初始化状态机
     pio_sm_init(pio0, sm, config.program_offset, &configs_[sm]);
@@ -172,6 +176,38 @@ bool HAL_PIO0::sm_is_rx_fifo_empty(uint8_t sm) {
         return pio_sm_is_rx_fifo_empty(pio0, sm);
     }
     return true;
+}
+
+void HAL_PIO0::sm_exec(uint8_t sm, uint16_t instr) {
+    if (initialized_ && sm < 4) {
+        pio_sm_exec(pio0, sm, instr);
+    }
+}
+
+void HAL_PIO0::sm_clear_fifos(uint8_t sm) {
+    if (initialized_ && sm < 4) {
+        pio_sm_clear_fifos(pio0, sm);
+    }
+}
+
+void HAL_PIO0::sm_restart(uint8_t sm) {
+    if (initialized_ && sm < 4) {
+        pio_sm_restart(pio0, sm);
+        pio_sm_clkdiv_restart(pio0, sm);
+    }
+}
+
+void HAL_PIO0::init_pin(uint8_t gpio) {
+    if (initialized_) {
+        pio_gpio_init(pio0, gpio);
+        gpio_set_function(gpio, GPIO_FUNC_PIO0);
+    }
+}
+
+void HAL_PIO0::sm_set_pindirs_out(uint8_t sm, uint8_t base, uint8_t count) {
+    if (initialized_ && sm < 4) {
+        pio_sm_set_consecutive_pindirs(pio0, sm, base, count, true);
+    }
 }
 
 
@@ -292,6 +328,10 @@ bool HAL_PIO1::sm_configure(uint8_t sm, const PIOStateMachineConfig& config) {
     
     // 配置程序包装
     ::sm_config_set_wrap(&configs_[sm], config.wrap_target, config.wrap);
+
+    // 配置移位寄存器（默认与 pico 默认一致，SWD 等可指定右移=LSB first）
+    ::sm_config_set_out_shift(&configs_[sm], config.out_shift_right, config.autopull, config.pull_threshold);
+    ::sm_config_set_in_shift(&configs_[sm], config.in_shift_right, config.autopush, config.push_threshold);
     
     // 初始化状态机
     pio_sm_init(pio1, sm, config.program_offset, &configs_[sm]);
@@ -345,4 +385,36 @@ bool HAL_PIO1::sm_is_rx_fifo_empty(uint8_t sm) {
         return pio_sm_is_rx_fifo_empty(pio1, sm);
     }
     return true;
+}
+
+void HAL_PIO1::sm_exec(uint8_t sm, uint16_t instr) {
+    if (initialized_ && sm < 4) {
+        pio_sm_exec(pio1, sm, instr);
+    }
+}
+
+void HAL_PIO1::sm_clear_fifos(uint8_t sm) {
+    if (initialized_ && sm < 4) {
+        pio_sm_clear_fifos(pio1, sm);
+    }
+}
+
+void HAL_PIO1::sm_restart(uint8_t sm) {
+    if (initialized_ && sm < 4) {
+        pio_sm_restart(pio1, sm);
+        pio_sm_clkdiv_restart(pio1, sm);
+    }
+}
+
+void HAL_PIO1::init_pin(uint8_t gpio) {
+    if (initialized_) {
+        pio_gpio_init(pio1, gpio);
+        gpio_set_function(gpio, GPIO_FUNC_PIO1);
+    }
+}
+
+void HAL_PIO1::sm_set_pindirs_out(uint8_t sm, uint8_t base, uint8_t count) {
+    if (initialized_ && sm < 4) {
+        pio_sm_set_consecutive_pindirs(pio1, sm, base, count, true);
+    }
 }

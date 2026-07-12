@@ -29,7 +29,16 @@ struct PIOStateMachineConfig {
     
     // 程序偏移
     uint8_t program_offset = 0;
-    
+
+    // 移位寄存器配置（默认值等价 pico_get_default_sm_config：左移、无自动、阈值32）
+    // 默认保持与原行为一致，避免影响 NeoPixel 等既有使用者
+    bool out_shift_right = false;   // OUT 方向右移（LSB first）
+    bool autopull = false;
+    uint8_t pull_threshold = 32;
+    bool in_shift_right = false;    // IN 方向右移（LSB first）
+    bool autopush = false;
+    uint8_t push_threshold = 32;
+
     // 是否启用状态机
     bool enabled = false;
 };
@@ -74,7 +83,19 @@ public:
     virtual uint32_t sm_get_blocking(uint8_t sm) = 0;
     virtual bool sm_is_tx_fifo_full(uint8_t sm) = 0;
     virtual bool sm_is_rx_fifo_empty(uint8_t sm) = 0;
-    
+
+    // ---- 以下为多引脚 / bit-bang 协议（如 SWD）所需的通用扩展 ----
+    // 直接执行单条 PIO 指令（用于 pindirs/jmp 等即时控制）
+    virtual void sm_exec(uint8_t sm, uint16_t instr) = 0;
+    // 清空指定状态机的 TX/RX FIFO
+    virtual void sm_clear_fifos(uint8_t sm) = 0;
+    // 重启状态机及其时钟分频计数
+    virtual void sm_restart(uint8_t sm) = 0;
+    // 将额外的 GPIO 交给本 PIO 实例（多引脚协议，如 SWD 的 SWCLK）
+    virtual void init_pin(uint8_t gpio) = 0;
+    // 将连续 count 个引脚（自 base 起）方向设为输出
+    virtual void sm_set_pindirs_out(uint8_t sm, uint8_t base, uint8_t count) = 0;
+
     // 获取实例名称
     virtual std::string get_name() const = 0;
     
@@ -101,6 +122,11 @@ public:
     uint32_t sm_get_blocking(uint8_t sm) override;
     bool sm_is_tx_fifo_full(uint8_t sm) override;
     bool sm_is_rx_fifo_empty(uint8_t sm) override;
+    void sm_exec(uint8_t sm, uint16_t instr) override;
+    void sm_clear_fifos(uint8_t sm) override;
+    void sm_restart(uint8_t sm) override;
+    void init_pin(uint8_t gpio) override;
+    void sm_set_pindirs_out(uint8_t sm, uint8_t base, uint8_t count) override;
 
     std::string get_name() const override { return "PIO0"; }
     bool is_ready() const override { return initialized_; }
@@ -138,6 +164,11 @@ public:
     uint32_t sm_get_blocking(uint8_t sm) override;
     bool sm_is_tx_fifo_full(uint8_t sm) override;
     bool sm_is_rx_fifo_empty(uint8_t sm) override;
+    void sm_exec(uint8_t sm, uint16_t instr) override;
+    void sm_clear_fifos(uint8_t sm) override;
+    void sm_restart(uint8_t sm) override;
+    void init_pin(uint8_t gpio) override;
+    void sm_set_pindirs_out(uint8_t sm, uint8_t base, uint8_t count) override;
 
     std::string get_name() const override { return "PIO1"; }
     bool is_ready() const override { return initialized_; }

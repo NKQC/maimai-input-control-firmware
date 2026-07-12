@@ -1,6 +1,5 @@
 #include "mai2light.h"
 #include "pico/time.h"
-#include "../../protocol/usb_serial_logs/usb_serial_logs.h"
 #include <cstring>
 #include <cstdio>
 #include <algorithm>
@@ -796,18 +795,13 @@ void Mai2Light::send_ack(Mai2Light_Command command, Mai2Light_AckStatus status,
 }
 
 // 日志输出
+// 日志通道（原 usb_serial_logs）已裁剪，暂置为空实现。
 void Mai2Light::log_debug(const std::string& message) {
-    auto* logger = USB_SerialLogs::get_global_instance();
-    if (logger) {
-        logger->debug(message, "Mai2Light");
-    }
+    (void)message;
 }
 
 void Mai2Light::log_error(const std::string& message) {
-    auto* logger = USB_SerialLogs::get_global_instance();
-    if (logger) {
-        logger->error(message, "Mai2Light");
-    }
+    (void)message;
 }
 
 // 字符串指令解析实现

@@ -1,8 +1,4 @@
 #include "config_manager.h"
-#include "../input_manager/input_manager.h"
-#include "../light_manager/light_manager.h"
-#include "../ui_manager/ui_manager.h"
-#include "../../protocol/usb_serial_logs/usb_serial_logs.h"
 #include <cstring>
 #include <algorithm>
 #include <sstream>
@@ -63,15 +59,12 @@ void ConfigManager::initialize_defaults() {
     _default_map.clear();
     _string_cache.clear();
     
-    // 调用所有注册的初始化函数
+    // 只调用外部通过 register_init_function 注册的初始化函数。
+    // ConfigManager 不再直接引用任何具体服务：各服务/上层自行注册默认配置，
+    // 使 config 成为纯粹的、可被任意层调用的外部接口。
     for (const auto& init_func : _init_functions) {
         init_func(_default_map);
     }
-    
-    // 调用各服务的默认配置注册函数
-    inputmanager_register_default_configs(_default_map);
-    lightmanager_register_default_configs(_default_map);
-    uimanager_register_default_configs(_default_map);
 }
 
 // 计算config_map的CRC32校验码
@@ -1255,17 +1248,10 @@ bool ConfigManager::save_config_task() {
     if (!_save_requested) {
         return true;  // 没有保存请求，直接返回成功
     }
-    
-    // 调用各服务的配置写入函数
-    InputManager_PrivateConfig input_config = inputmanager_get_config_copy();
-    inputmanager_write_config_to_manager(input_config);
-    
-    UIManager_PrivateConfig ui_config = ui_manager_get_config_copy();
-    ui_manager_write_config_to_manager(ui_config);
-    
-    LightManager_PrivateConfig light_config = lightmanager_get_config_copy();
-    lightmanager_write_config_to_manager(light_config);
-        
+
+    // 解耦：各服务通过 ConfigManager 静态 get/set 外部接口自行写回配置，
+    // 此处不再反向调用具体服务。
+
     _save_requested = false;  // 清除保存请求信号
     disable_interrupts();
     log_debug("Starting config save process...");
@@ -1339,26 +1325,18 @@ bool ConfigManager::is_valid_string(const std::string& str) {
 }
 
 // 内部日志接口实现
+// 日志通道（原 usb_serial_logs）已裁剪，暂置为空实现。
+// 后续统一的日志接口将作为独立的跨层外部接口重新接入，而非服务内耦合。
 void ConfigManager::log_debug(const std::string& message) {
-    if (!_debug_output_enabled) return;
-    auto* logger = USB_SerialLogs::get_global_instance();
-    if (logger) {
-        logger->debug(message, "ConfigManager");
-    }
+    (void)message;
 }
 
 void ConfigManager::log_info(const std::string& message) {
-    auto* logger = USB_SerialLogs::get_global_instance();
-    if (logger) {
-        logger->info(message, "ConfigManager");
-    }
+    (void)message;
 }
 
 void ConfigManager::log_error(const std::string& message) {
-    auto* logger = USB_SerialLogs::get_global_instance();
-    if (logger) {
-        logger->error(message, "ConfigManager");
-    }
+    (void)message;
 }
 
 bool ConfigManager::is_littlefs_ready() {
