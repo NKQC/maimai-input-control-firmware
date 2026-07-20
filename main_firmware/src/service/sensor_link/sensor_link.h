@@ -1,68 +1,63 @@
 #pragma once
 
-#include <stdint.h>
-#include <stddef.h>
+#include <cstdint>
+#include "../../protocol/host_cmd/host_cmd.h"
 
-class HAL_SPI;
+#define SENSOR_LINK_CHANNELS 36
+#define TELEM_FIELD_RAW      0x01
+#define TELEM_FIELD_BASELINE 0x02
+#define TELEM_FIELD_DIFF     0x04
+#define TELEM_FIELD_STATUS   0x08
+#define TELEM_FIELD_STATS    0x10
+static constexpr uint8_t TELEM_FIELD_LATENCY = 0x20;
 
 /**
- * SensorLink - RP2040 <-> PSoC 传感器 SPI 通信服务（单例）
- * 本里程碑只实现定长 ping/pong 帧的骨架，DATA 帧留给后续里程碑。
- *
- * 解耦原则：本服务只依赖下层 HAL_SPI（由上层以指针注入），不耦合任何同层服务。
- * 链路状态通过 link_ok() 对外暴露，由上层（main/app）读取后自行驱动 LED 等。
+ * SensorLink exposes immutable PSoC CapSense snapshots on HostCmd telemetry.
+ * Unsupported PSoC mutation commands explicitly return NOT_IMPLEMENTED.
  */
-
-// 帧魔数，用于校验帧头合法性
-static constexpr uint8_t SENSOR_FRAME_MAGIC = 0xA5;
-
-enum class SensorCmd : uint8_t {
-    PING = 0x01,
-    PONG = 0x02,
-    DATA = 0x10, // 预留 DATA 帧用于后续里程碑
-};
-
-static constexpr size_t SENSOR_FRAME_PAYLOAD_SIZE = 4;
-
-// 定长协议帧，禁止动态内存
-struct SensorFrame {
-    uint8_t magic = SENSOR_FRAME_MAGIC;
-    uint8_t cmd = 0;
-    uint8_t seq = 0;
-    uint8_t payload[SENSOR_FRAME_PAYLOAD_SIZE] = {};
-
-    void clear() {
-        magic = SENSOR_FRAME_MAGIC;
-        cmd = 0;
-        seq = 0;
-        for (auto& b : payload) b = 0;
-    }
-};
-
 class SensorLink {
 public:
     static SensorLink* getInstance();
 
-    // 依赖注入：只接收下层 HAL_SPI，由上层传入
-    bool init(HAL_SPI* spi);
+    void init();
+    void tick();
 
-    // 20ms 节流，内部发送 PING 并判定 PONG，刷新链路状态
-    void update();
-
-    // 对外暴露链路状态，供上层决定如何指示（如驱动 LED）
-    bool link_ok() const { return _link_ok; }
+    // 停止遥测流(清 _streaming + 关快照慢路)。新主机会话(HELLO)时调用,
+    // 使遗留遥测流不再淹没 vendor 端点、DEVICE_INFO 可正常送达。
+    void stop();
 
 private:
     SensorLink();
     SensorLink(const SensorLink&) = delete;
     SensorLink& operator=(const SensorLink&) = delete;
 
-    HAL_SPI* _spi;
-    bool _initialized;
-    bool _link_ok;
-
-    uint32_t _last_update_ms;
-    uint8_t _seq;
-
     static SensorLink* _instance;
+
+    bool _streaming;
+    uint8_t _mode;
+    uint16_t _rate_hz;
+    uint8_t _fields;
+    uint64_t _ch_mask;
+    uint32_t _last_emit_us;
+    uint8_t _stream_seq;
+    uint8_t _tx_buf[512];
+    HostFrame _telem_frame;
+
+    static inline bool _channel_selected(uint64_t channel_mask, uint8_t channel) {
+        return ((channel_mask >> channel) & 1ULL) != 0;
+    }
+
+    static void _handle_telem_start(const HostFrame& frame, uint8_t* response, uint16_t* response_length);
+    static void _handle_telem_stop(const HostFrame& frame, uint8_t* response, uint16_t* response_length);
+    static void _handle_unsupported(const HostFrame& frame, uint8_t* response, uint16_t* response_length);
+
+    // Phase A：CSD 运行时调参（转发 PSoC SPI 指令通道）
+    static void _handle_param_set(const HostFrame& frame, uint8_t* response, uint16_t* response_length);
+    static void _handle_param_get(const HostFrame& frame, uint8_t* response, uint16_t* response_length);
+    static void _handle_param_get_all(const HostFrame& frame, uint8_t* response, uint16_t* response_length);
+    static void _handle_calibrate(const HostFrame& frame, uint8_t* response, uint16_t* response_length);
+    static void _handle_mode_set(const HostFrame& frame, uint8_t* response, uint16_t* response_length);
+    static void _handle_csd_capture(const HostFrame& frame, uint8_t* response, uint16_t* response_length);
+    static void _handle_cp_measure(const HostFrame& frame, uint8_t* response, uint16_t* response_length);
+    static void _handle_cp_get(const HostFrame& frame, uint8_t* response, uint16_t* response_length);
 };

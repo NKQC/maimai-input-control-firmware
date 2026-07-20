@@ -10,9 +10,13 @@
 // RP2040 LittleFS支持
 #ifdef PICO_PLATFORM
 #include "pico/stdlib.h"
+#include "pico/multicore.h"
 #include "hardware/flash.h"
 #include "hardware/sync.h"
 #endif
+
+#include "../../flash_guard.h"
+#include "../usb_debug.h"
 
 // 常量定义
 const char ConfigManager::CONFIG_FILE_PATH[] = "/config.bin";
@@ -242,7 +246,7 @@ void ConfigManager::close_file(File& file) {
 
 // 私有接口：保存config_map到文件
 bool ConfigManager::config_save(const config_map_t* config_map) {
-    // 使用新的流式保存机制
+    // 使用新的流式保存机制（flash 写死锁由 main 的运行态哨兵+看门狗自持恢复兜底）
     bool result = config_save_streaming(config_map);
     return result;
 }
@@ -974,21 +978,42 @@ bool ConfigManager::initialize() {
     initialize_defaults();
     log_debug("Default configs initialized, count: " + std::to_string(_default_map.size()));
     
-    // 检查配置文件是否存在
+    // ★健壮加载★：始终以完整 schema 默认打底，保证所有 key 恒存在；再用已保存值覆盖。
+    // 消除"文件损坏/空 → config_read 返回 true 但 0 项 → _runtime_map 空 → CFG_GET_ALL 收 0 项"的整机失效。
+    _runtime_map = _default_map;
+
     bool config_exists = littlefs_file_exists();
     log_debug("Config file exists: " + std::string(config_exists ? "true" : "false"));
-    if (config_exists && config_read(&_runtime_map)) {
-        log_debug("Config file read, runtime map size: " + std::to_string(_runtime_map.size()));
-    }else {
-        
-        bool result = LittleFS.format();
-        
-        if (result && config_save(&_default_map)) {
+    if (config_exists) {
+        config_map_t loaded;
+        if (config_read(&loaded) && !loaded.empty()) {
+            // 仅覆盖 schema 中存在的 key，忽略陌生/过时 key，保持配置面完整。
+            uint32_t applied = 0;
+            for (const auto& kv : loaded) {
+                auto dit = _default_map.find(kv.first);
+                // 仅覆盖 schema 中存在且类型一致的 key：拒绝损坏文件里类型错乱/垃圾项，
+                // 防止其污染 _runtime_map 导致 CFG_GET_ALL 编码异常。
+                if (dit != _default_map.end() && dit->second.type == kv.second.type) {
+                    _runtime_map[kv.first] = kv.second;
+                    applied++;
+                }
+            }
+            log_debug("Config overlaid from file: applied " + std::to_string(applied) +
+                      "/" + std::to_string(loaded.size()) + ", runtime size " +
+                      std::to_string(_runtime_map.size()));
+        } else {
+            // 文件损坏/空：保持 schema 默认(已打底)，并重写一份健康默认文件。
+            log_error("Config file corrupt/empty; keep defaults + rewrite healthy file");
+            LittleFS.format();
+            config_save(&_default_map);
+        }
+    } else {
+        // 文件缺失：写入默认。
+        if (LittleFS.format() && config_save(&_default_map)) {
             log_debug("Save default config successful");
-        }else {
+        } else {
             log_error("Format and save default config failed");
         }
-        _runtime_map = _default_map;
     }
 
     _config_valid = true;
@@ -1253,26 +1278,39 @@ bool ConfigManager::save_config_task() {
     // 此处不再反向调用具体服务。
 
     _save_requested = false;  // 清除保存请求信号
-    disable_interrupts();
     log_debug("Starting config save process...");
     log_debug("Runtime map size: " + std::to_string(_runtime_map.size()));
+    // ★照抄 v3.1 双核安全 flash 写★：禁本核中断 + lockout core1(core1 已 multicore_lockout_victim_init)。
+    // 两核在 flash 擦写(XIP 禁用)期间都不取指/访问总线，flash 安全完成且 USB 快速恢复。
+    // 前提：main 已 multicore_launch_core1 且 core1 入口调用 multicore_lockout_victim_init()——
+    // 否则 multicore_lockout_start_blocking() 会永久死锁(这正是之前 wedge 的根因)。
+#ifdef PICO_PLATFORM
+    uint32_t _irq = save_and_disable_interrupts();
     multicore_lockout_start_blocking();
     bool result = config_save(&_runtime_map);
+    multicore_lockout_end_blocking();
+    restore_interrupts(_irq);
+#else
+    bool result = config_save(&_runtime_map);
+#endif
     if (!result) {
         _error_count++;
         log_error("Config save failed! Error count: " + std::to_string(_error_count));
     } else {
         log_info("Config save successful");
     }
-    multicore_lockout_end_blocking();
-    enable_interrupts();
+#ifdef PICO_PLATFORM
+    g_usb_dbg.flash_write_count++;
+    g_usb_dbg.loop_at_last_flash = g_usb_dbg.loop_count;
+#endif
     return result;
 }
 
 // 重置到默认配置
 bool ConfigManager::reset_to_defaults() {
     _runtime_map = _default_map;
-    return save_config_task();
+    _save_requested = true;   // 延迟到主循环安全窗口落地：避免在 handler 上下文 flash 写打断 USB 事务
+    return true;
 }
 
 void ConfigManager::enable_debug_output(bool enable) {

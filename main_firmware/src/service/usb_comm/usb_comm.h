@@ -1,8 +1,12 @@
 #pragma once
 
+#include "protocol/host_cmd/host_cmd.h"
+
 /**
- * UsbComm - USB 通信服务骨架（单例）
- * 3xCDC 逻辑延后到后续里程碑，当前只提供空实现占位。
+ * UsbComm - USB 通信服务
+ * 单例模式，负责:
+ * - init(): 初始化编解码器
+ * - update(): 从 CDC 读入字节喂给接收状态机，解析帧后分发，响应写回 CDC
  */
 class UsbComm {
 public:
@@ -17,4 +21,31 @@ private:
     UsbComm& operator=(const UsbComm&) = delete;
 
     static UsbComm* _instance;
+    
+    HostCmdCodec _codec;
+    uint8_t _resp_buf[2048];  // CFG_GET_ALL 全量响应(~40+项)可达 ~900B，需 >512
+    HostFrame _frame;  // Reuse frame buffer across loop iterations to avoid stack bloat
+    
+    struct RebootState {
+        enum class Stage : uint8_t {
+            IDLE,
+            ACK_DRAIN,
+            DETACHED,
+        };
+
+        Stage stage = Stage::IDLE;
+        uint8_t mode = 0;
+        uint32_t deadline_ms = 0;
+
+        void clear() {
+            stage = Stage::IDLE;
+            mode = 0;
+            deadline_ms = 0;
+        }
+    };
+
+    RebootState _reboot;
 };
+
+// 编译宏：是否启用二进制帧模式（禁用时文本诊断保留，但不污染二进制流）
+#define HOST_CMD_BINARY_MODE 1

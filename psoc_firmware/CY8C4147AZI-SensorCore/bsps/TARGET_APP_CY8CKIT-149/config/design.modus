@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <Configuration app="BACKEND" formatVersion="15" lastSavedWith="Configurator Backend" lastSavedWithVersion="3.60.0" toolsPackage="ModusToolbox 3.6.0" xmlns="http://cypress.com/xsd/cydesignfile_v6">
     <Devices>
-        <Device mpn="CY8C4147AZI-S475">
+        <Device mpn="CY8C4147AZI-S455">
             <BlockConfig>
                 <Block location="peri[0].div_16[1]">
                     <Aliases>
@@ -99,49 +99,51 @@
                     <Parameters>
                         <Param id="CapSenseCore" value="0"/>
                         <Param id="CapSenseEnable" value="true"/>
-                        <Param id="CapacitorCount" value="1"/>
+                        <Param id="CapacitorCount" value="2"/>
                         <Param id="CsdAdcEnable" value="false"/>
                         <Param id="CsdIdacAselect" value="CY_CSDIDAC_GPIO"/>
                         <Param id="CsdIdacBselect" value="CY_CSDIDAC_DISABLED"/>
                         <Param id="CsdIdacEnable" value="false"/>
-                        <Param id="SensorCount" value="37"/>
+                        <Param id="SensorCount" value="39"/>
                         <Param id="SensorName0" value="Cmod"/>
-                        <Param id="SensorName1" value="Button0_Sns0"/>
-                        <Param id="SensorName10" value="Button9_Sns0"/>
-                        <Param id="SensorName11" value="Button10_Sns0"/>
-                        <Param id="SensorName12" value="Button11_Sns0"/>
-                        <Param id="SensorName13" value="Button12_Sns0"/>
-                        <Param id="SensorName14" value="Button13_Sns0"/>
-                        <Param id="SensorName15" value="Button14_Sns0"/>
-                        <Param id="SensorName16" value="Button15_Sns0"/>
-                        <Param id="SensorName17" value="Button16_Sns0"/>
-                        <Param id="SensorName18" value="Button17_Sns0"/>
-                        <Param id="SensorName19" value="Button18_Sns0"/>
-                        <Param id="SensorName2" value="Button1_Sns0"/>
-                        <Param id="SensorName20" value="Button19_Sns0"/>
-                        <Param id="SensorName21" value="Button20_Sns0"/>
-                        <Param id="SensorName22" value="Button21_Sns0"/>
-                        <Param id="SensorName23" value="Button22_Sns0"/>
-                        <Param id="SensorName24" value="Button23_Sns0"/>
-                        <Param id="SensorName25" value="Button24_Sns0"/>
-                        <Param id="SensorName26" value="Button25_Sns0"/>
-                        <Param id="SensorName27" value="Button26_Sns0"/>
-                        <Param id="SensorName28" value="Button27_Sns0"/>
-                        <Param id="SensorName29" value="Button28_Sns0"/>
-                        <Param id="SensorName3" value="Button2_Sns0"/>
-                        <Param id="SensorName30" value="Button29_Sns0"/>
-                        <Param id="SensorName31" value="Button30_Sns0"/>
-                        <Param id="SensorName32" value="Button31_Sns0"/>
-                        <Param id="SensorName33" value="Button32_Sns0"/>
-                        <Param id="SensorName34" value="Button33_Sns0"/>
-                        <Param id="SensorName35" value="Button34_Sns0"/>
-                        <Param id="SensorName36" value="Button35_Sns0"/>
-                        <Param id="SensorName4" value="Button3_Sns0"/>
-                        <Param id="SensorName5" value="Button4_Sns0"/>
-                        <Param id="SensorName6" value="Button5_Sns0"/>
-                        <Param id="SensorName7" value="Button6_Sns0"/>
-                        <Param id="SensorName8" value="Button7_Sns0"/>
-                        <Param id="SensorName9" value="Button8_Sns0"/>
+                        <Param id="SensorName1" value="Csh"/>
+                        <Param id="SensorName10" value="Button7_Sns0"/>
+                        <Param id="SensorName11" value="Button8_Sns0"/>
+                        <Param id="SensorName12" value="Button9_Sns0"/>
+                        <Param id="SensorName13" value="Button10_Sns0"/>
+                        <Param id="SensorName14" value="Button11_Sns0"/>
+                        <Param id="SensorName15" value="Button12_Sns0"/>
+                        <Param id="SensorName16" value="Button13_Sns0"/>
+                        <Param id="SensorName17" value="Button14_Sns0"/>
+                        <Param id="SensorName18" value="Button15_Sns0"/>
+                        <Param id="SensorName19" value="Button16_Sns0"/>
+                        <Param id="SensorName2" value="Shield0"/>
+                        <Param id="SensorName20" value="Button17_Sns0"/>
+                        <Param id="SensorName21" value="Button18_Sns0"/>
+                        <Param id="SensorName22" value="Button19_Sns0"/>
+                        <Param id="SensorName23" value="Button20_Sns0"/>
+                        <Param id="SensorName24" value="Button21_Sns0"/>
+                        <Param id="SensorName25" value="Button22_Sns0"/>
+                        <Param id="SensorName26" value="Button23_Sns0"/>
+                        <Param id="SensorName27" value="Button24_Sns0"/>
+                        <Param id="SensorName28" value="Button25_Sns0"/>
+                        <Param id="SensorName29" value="Button26_Sns0"/>
+                        <Param id="SensorName3" value="Button0_Sns0"/>
+                        <Param id="SensorName30" value="Button27_Sns0"/>
+                        <Param id="SensorName31" value="Button28_Sns0"/>
+                        <Param id="SensorName32" value="Button29_Sns0"/>
+                        <Param id="SensorName33" value="Button30_Sns0"/>
+                        <Param id="SensorName34" value="Button31_Sns0"/>
+                        <Param id="SensorName35" value="Button32_Sns0"/>
+                        <Param id="SensorName36" value="Button33_Sns0"/>
+                        <Param id="SensorName37" value="Button34_Sns0"/>
+                        <Param id="SensorName38" value="Button35_Sns0"/>
+                        <Param id="SensorName4" value="Button1_Sns0"/>
+                        <Param id="SensorName5" value="Button2_Sns0"/>
+                        <Param id="SensorName6" value="Button3_Sns0"/>
+                        <Param id="SensorName7" value="Button4_Sns0"/>
+                        <Param id="SensorName8" value="Button5_Sns0"/>
+                        <Param id="SensorName9" value="Button6_Sns0"/>
                         <Param id="acqTime" value="10"/>
                         <Param id="autoCalibrInterval" value="30"/>
                         <Param id="azTime" value="5"/>
@@ -1394,6 +1396,12 @@
                     <Port name="scb[0].clock[0]"/>
                 </Net>
                 <Mux name="sense" location="csd[0].csd[0]">
+                    <Arm>
+                        <Port name="ioss[0].port[4].pin[2].analog[0]"/>
+                    </Arm>
+                    <Arm>
+                        <Port name="ioss[0].port[4].pin[3].analog[0]"/>
+                    </Arm>
                     <Arm>
                         <Port name="ioss[0].port[4].pin[1].analog[0]"/>
                     </Arm>

@@ -1,0 +1,2 @@
+set log_output to "fam.log"
+Unexpected command line argument: shutdown

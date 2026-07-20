@@ -1,0 +1,2238 @@
+===PAGE 1===
+ 
+Application note 
+Please read the sections “Important notice” and “Warnings” at the end of this document 
+001-84858 Rev. *O 
+www.infineon.com 
+ 
+2024-03-06 
+ 
+  
+AN84858 
+PSoC™ 4 programming using an external 
+microcontroller (HSSP) 
+About this document 
+Scope and purpose 
+AN84858 details the implementation of PSoC™ 4 device programming with an external microcontroller using 
+modular C code. In this process, called host sourced serial programming (HSSP), the host microcontroller 
+programs PSoC™ 4 through the serial wire debug (SWD) interface. The C code is ported to any microcontroller 
+with minimal changes, speeding up the HSSP application development for PSoC™ 4. 
+Intended audience 
+The intended audience for this document are design engineers, technicians, and developers of electronic 
+systems. 
+ 
+
+===PAGE 2===
+ 
+Application note 
+2 
+001-84858 Rev. *O
+ 
+2024-03-06
+ 
+ 
+PSoC™ 4 programming using an external microcontroller (HSSP) 
+ 
+Table of contents 
+Table of contents 
+About this document ....................................................................................................................... 1 
+Table of contents ............................................................................................................................ 2 
+1 
+Introduction .......................................................................................................................... 4 
+ 
+Terms and definitions ............................................................................................................................. 5 
+2 
+HSSP firmware architecture .................................................................................................... 6 
+ 
+SWD protocol physical layer ................................................................................................................... 7 
+ 
+SWD protocol packet layer ...................................................................................................................... 7 
+ 
+Fetching programming data ................................................................................................................... 7 
+ 
+HSSP programming steps ....................................................................................................................... 8 
+ 
+HSSP timeout parameters ...................................................................................................................... 8 
+ 
+HSSP programming data ........................................................................................................................ 9 
+ 
+Main application code ............................................................................................................................. 9 
+ 
+HSSP error status .................................................................................................................................. 10 
+3 
+Hardware connections for HSSP programming ......................................................................... 11 
+4 
+Porting the HSSP application to a host programmer ................................................................. 12 
+ 
+Files that must be ported ...................................................................................................................... 12 
+ 
+Code changes required while porting .................................................................................................. 12 
+5 
+Calculating HSSP timeout parameters ..................................................................................... 14 
+ 
+DEVICE_ACQUIRE_TIMEOUT ................................................................................................................. 14 
+ 
+SROM_POLLING_TIMEOUT ................................................................................................................... 15 
+ 
+XRES_PULSE_100US ............................................................................................................................. 16 
+6 
+Interface for receiving HSSP programming data ....................................................................... 18 
+7 
+HSSP timing validation .......................................................................................................... 20 
+8 
+Power cycle mode programming ............................................................................................. 21 
+9 
+Testing the example projects .................................................................................................. 22 
+ 
+For kits with onboard PSoC™ 5LP programmer (KitProg) ................................................................... 22 
+ 
+For kits with onboard PSoC™ 5LP programmer (KitProg2) ................................................................. 25 
+10 
+Tips and tricks for debugging HSSP issues ................................................................................ 30 
+11 
+Summary ............................................................................................................................. 31 
+12 
+List of attached projects ........................................................................................................ 32 
+13 
+Appendix A: Hex File Parser application ................................................................................... 33 
+ 
+Using the Hex File Parser application ................................................................................................... 33 
+ 
+Adding the generated files to PSoC™ Creator example project .......................................................... 34 
+13.2.1 
+Using the HexImage.c, HexImage.h files for the PSoC™ 4xxxL/ PSoC™ 41x8_BLE/ 42x8_BLE/ 
+41XXS plus family devices: ............................................................................................................... 36 
+14 
+Appendix B: Status codes for SROM request ............................................................................. 37 
+15 
+Appendix C: Bit field definitions of HSSP Error Status register .................................................... 39 
+ 
+Bits[2:0] – SWD acknowledge response (SWD ACK [2:0]) ..................................................................... 39 
+ 
+Bit 3 – SWD Read Data Parity error ....................................................................................................... 39 
+ 
+Bit 4 – Port Acquire Timeout ................................................................................................................. 39 
+ 
+Bit 5 – SROM Polling Timeout error ...................................................................................................... 40 
+ 
+Bit 6 – Verification Failure ..................................................................................................................... 40 
+ 
+Bit 7 – Transition error .......................................................................................................................... 40 
+16 
+Appendix D: HSSP functions ................................................................................................... 41 
+
+===PAGE 3===
+ 
+Application note 
+3 
+001-84858 Rev. *O
+ 
+2024-03-06
+ 
+ 
+PSoC™ 4 programming using an external microcontroller (HSSP) 
+ 
+Table of contents 
+References .................................................................................................................................... 44 
+Revision history............................................................................................................................. 45 
+Disclaimer..................................................................................................................................... 47 
+ 
+
+===PAGE 4===
+  
+Application note 
+4 
+001-84858 Rev. *O
+ 
+2024-03-06
+ 
+ 
+PSoC™ 4 programming using an external microcontroller (HSSP) 
+ 
+Introduction 
+1 
+Introduction 
+The PSoC™ 4 device programming refers specifically to the programming of the non-volatile memory in PSoC™ 
+4 by using an external host programmer. The host can be the programmer supplied by Infineon (CY8CKIT-002 
+MiniProg3), a third-party programmer, or a custom programmer (for example, an onboard microcontroller). 
+This application note explains how to implement a host programmer to program a PSoC™ 4 device. For more 
+information on the PSoC™ 4 architecture and to learn how to create projects for PSoC™ 4 using the PSoC™ 
+Creator software, see AN79953 – Getting started with PSoC™ 4.  
+A programmer is a hardware-software system that stores a binary program (hex file) in the device's program 
+(flash) memory. The programmer is an essential component of the engineer's prototyping environment or an 
+integral element of the manufacturing environment (mass programming). Figure 1-1 illustrates a high-level 
+view of the development environment. 
+Figure 1 
+Programmer in development environment 
+In a manufacturing environment, the integrated development environment (IDE) block is absent because its 
+main purpose is to produce a hex file. The programmer performs three functions:  
+• Parses the hex file and extracts the necessary information  
+• Connects with the silicon as a serial wire debug (SWD) master  
+• Implements the programming algorithm by translating the hex data into SWD signals  
+This document does not discuss the specific implementation of the programmer. It focuses on data flow, the 
+physical connection, and algorithms. Specifically, it covers the following topics, which correspond to the three 
+functions of the programmer:  
+• Data to be programmed 
+• Interface with the chip 
+• Algorithm used to program the target device 
+See PSoC™ programming solutions for more information. 
+ 
+ 
+
+===PAGE 5===
+  
+Application note 
+5 
+001-84858 Rev. *O
+ 
+2024-03-06
+ 
+ 
+PSoC™ 4 programming using an external microcontroller (HSSP) 
+ 
+Introduction 
+ 
+Terms and definitions 
+• Serial wire debug (SWD): Developed by ARM, the SWD protocol uses only two wires—SWDCLK (clock) and 
+SWDIO (bidirectional data line)—to program and debug. 
+• Debug access port (DAP): DAP is the program/debug interface between SWD and the CPU in PSoC™ 4 It 
+includes a debug port (DP) and an access port (AP). 
+− DP is responsible for the physical connection to the programmer/debugger. 
+− AP provides the interface between the DAP module and the Cortex-M0 CPU, the flash memory, and so on. 
+• HSSP: HSSP refers to the programming of the target device on the board using a host microcontroller. The 
+target is programmed through the SWD interface. In this application note, HSSP uses a bit-banging 
+implementation to program the target device. Bit-banging programming refers to the technique in which 
+programming pins are manipulated using a software code that resides in the host programmer. 
+• Differences between bootloading and HSSP: In embedded systems, bootloaders are also used to update the 
+system firmware. Bootloading and HSSP differ in the following key aspects: 
+− Bootloaders are used to update the flash memory of the device over a standard communication protocol. 
+Bootloaders can update only a specific portion of the flash memory, known as the bootloadable area.  
+− On the other hand, HSSP supports complete programming of the flash memory in the target device.  
+− Bootloaders can use any standard communication interface (such as, USB, I2C, SPI, and UART) to update 
+the firmware, while HSSP uses an SWD or JTAG interface to program the flash. PSoC™ 4 supports only 
+SWD interfaces. 
+ 
+
+===PAGE 6===
+  
+Application note 
+6 
+001-84858 Rev. *O
+ 
+2024-03-06
+ 
+ 
+PSoC™ 4 programming using an external microcontroller (HSSP) 
+ 
+HSSP firmware architecture 
+2 
+HSSP firmware architecture 
+The HSSP for the target device is implemented in multiple layers using modular C code. These layers are as 
+follows: 
+• SWD Protocol Physical layer 
+• SWD Protocol Packet layer 
+• HSSP Programming Steps layer 
+See Figure 1 for the flow of control among these layers. 
+Note: 
+See the A_Hssp_Programmer project, which uses PSoC™ 5LP as the external host programmer, 
+attached with this application note for the implementation of this firmware. 
+ 
+ 
+Figure 1 
+HSSP firmware architecture 
+The HSSP Programming Steps layer uses the “Fetching Programming Data” interface to extract the 
+programming data from the source of the data (for example, the hex file data provided by any communication 
+Host Programmer
+SWDIO
+SWDCK
+XRES(1)
+Target PSoC 4
+device
+RegisterDefines.h,
+SWD_PhysicalLayer.h,
+SWD_PhysicalLayer.c
+SWD Protocol Physical Layer 
+SWD_PacketLayer.h,
+SwdPacketLayer.c
+SWD_UpperPacketLayer.h,
+Swd_UpperPacketLayer.c
+SWD Protocol Packet Layer 
+Timeout.h,
+Timeout.c
+HSSP Timeout 
+Parameters
+ProgrammingSteps.h,
+ProgrammingSteps.c
+HSSP Programming Steps
+ 
+DataFetch.h,
+DataFetch.c
+ Fetching Programming 
+Data
+ HexImage.h,
+HexImage.c
+ Programming 
+Data
+main.c
+Main application code
+Device Acquire
+Verify Silicon ID
+Erase all Flash
+Checksum Privileged Calculation
+Program Flash
+Exit HSSP Programming mode
+Verify Flash
+Program Protection Settings
+Verify Protection Settings
+Verify Checksum
+HSSP Implementation Flow
+1.
+2.
+3.
+4.
+5.
+6.
+7.
+8.
+9.
+10.
+(1)For power cycle mode programming, device power rails need to be 
+   toggled instead of the reset (XRES) pin
+
+===PAGE 7===
+  
+Application note 
+7 
+001-84858 Rev. *O
+ 
+2024-03-06
+ 
+ 
+PSoC™ 4 programming using an external microcontroller (HSSP) 
+ 
+HSSP firmware architecture 
+interface—I2C, SPI, UART, or USB or host flash—as shown in Figure 1. In addition, the “HSSP Programming Step” 
+layer uses the HSSP Timeout Parameters interface to configure timeouts in its programming APIs. 
+All layers used in the firmware architecture, as shown in Figure 1, are discussed in the following sections. 
+ 
+SWD protocol physical layer 
+The files that constitute the SWD protocol physical layer are described in Table 1. 
+Table 1 
+SWD protocol physical layer files 
+Source files 
+Description 
+RegisterDefines 
+(.h file) 
+This file defines the port number, pin number, input/output register, and drive mode 
+register of the programming pins. 
+SWD_PhysicalLayer 
+(.c and .h files) 
+These files contain macros and functions to manipulate the programming pins. The 
+pins are defined in the RegisterDefines.h file. 
+The codes in these files are written for PSoC™ 5LP as the host microcontroller. If these files are ported to any 
+other host microcontroller, then you should modify all the functions and macros appropriately. 
+Note: 
+See “Pin Names and Requirements” in the programming specifications of the respective device 
+listed in the References section for details on the pin configurations on the host side.  
+ 
+SWD protocol packet layer 
+The files that constitute the SWD Protocol Packet layer are described in Table 2: 
+Table 2 
+SWD protocol packet layer files 
+Source files 
+Description 
+SWD_PacketLayer 
+(.c and .h files) 
+These files define the packet routines for sending the SWD Read 
+and SWD Write packets per the SWD protocol. 
+SWD_UpperPacketLayer 
+(.c and .h files) 
+These files use the functions defined in SWD_PacketLayer to 
+implement functions that directly read and write to the DAP 
+register and CPU address space. 
+The functions defined in this layer are called directly by the functions in the ProgrammingSteps.c file.  
+All these SWD packet functions operate on three global variables—swd_PacketHeader, swd_PacketAck, 
+and swd_PacketData[]—that are accessed by the functions in the top layer files, as Figure 1 shows. 
+ 
+Fetching programming data 
+Files used for fetching the programming data to the upper layer functions are described in Table 3: 
+Table 3 
+Data fetch layer file 
+Source file 
+Description 
+DataFetch 
+(.c and .h files) 
+These files contain the routines to fetch the programming data from the HexImage.c 
+file and then pass that data to the functions in the ProgrammingSteps.c file.  
+The programming data includes flash row data, flash protection data, chip protection 
+data, Silicon ID, checksum, and the total number of flash rows. 
+
+===PAGE 8===
+  
+Application note 
+8 
+001-84858 Rev. *O
+ 
+2024-03-06
+ 
+ 
+PSoC™ 4 programming using an external microcontroller (HSSP) 
+ 
+HSSP firmware architecture 
+Modify the definitions of the functions based on the method that you use to get the HSSP programming data. 
+Note: 
+See the section Interface for receiving HSSP programming data for information on how to modify 
+the HSSP source code. 
+ 
+HSSP programming steps 
+This layer includes the files named ProgrammingSteps.c and ProgrammingSteps.h. These files contain the top-
+level functions of the HSSP application. These functions are described in sequence as follows: 
+1. Device acquire: In this step, the device is acquired by sending a specific sequence through the SWD 
+interface after a device reset. As a result, the host programmer can control the Cortex-M0 CPU and other 
+system resources, such as SRAM and registers. The PSoC™ 40xx, PSoC™ 4xx7_BLE, PSoC™ 40xxS PSoC™ 
+41xxS and PSoC™ 4100PS family of devices requires the internal main oscillator (IMO) frequency to be set at 
+48 MHz before flash erase/write operations. This operation is also included in the Device Acquire routine for 
+these devices.  
+Note: 
+Some of the devices in the PSoC™ 4000 family do not have a dedicated reset (XRES) pin and have to 
+be reset by toggling the device power rails. This is referred to as Power Cycle Mode programming. 
+Refer to the Power cycle mode programming section for details on the changes required for 
+modifying the code to support power cycle mode programming. 
+2. Verify Silicon ID: This step verifies that the acquired device is the same as the one for which the hex file was 
+generated.  
+3. Erase All flash: This step erases all user rows and corresponding flash protection. 
+4. Checksum privileged calculation: After all the user rows are erased, this step calculates the checksum of 
+the privileged rows, which is used to verify the checksum of the user rows in Step 9. 
+5. Program flash: In this step, flash is programmed using the programming data in the hex file and SROM API 
+calls. 
+6. Verify flash: This step is used to verify the flash data programmed in the previous step with the data in the 
+hex file. This step is optional but highly recommended. 
+7. Program protection settings: In this step, row protection settings and chip protection settings from the 
+hex file are written to the specific flash area. 
+8. Verify protection settings: Both protection settings are matched with the settings in the hex file. 
+9. Verify checksum: This step matches the checksum of the user data in the flash with the checksum in the 
+hex file. It uses the checksum of the privileged rows calculated in step 4. 
+10. Exit HSSP programming mode: This step releases the target device from programming mode. 
+Each of these steps is described by functions made up of basic SWD instructions. See the programming 
+specifications document of the respective device listed in the References section for detailed information. 
+The functions declared in the ProgrammingSteps.h file access the functions, definitions, and global variables 
+from three layers: SWD Protocol Packet layer, DataFetch layer, and Timeout layer. The functions provided in the 
+ProgrammingSteps.c and ProgrammingSteps.h files cover all the steps required to program the target device. 
+ 
+ 
+HSSP timeout parameters 
+Table 4 
+Timeout layer files 
+
+===PAGE 9===
+  
+Application note 
+9 
+001-84858 Rev. *O
+ 
+2024-03-06
+ 
+ 
+PSoC™ 4 programming using an external microcontroller (HSSP) 
+ 
+HSSP firmware architecture 
+Source file 
+Description 
+Timeout (.c and .h 
+files) 
+These files contain the timestamp definitions and the delay routines used in HSSP. 
+Timestamp definitions are derived from the electrical timing specifications provided in the Device 
+Programming Specifications. The values of these timestamp parameter definitions in Timeout.h are for a 
+PSoC™ 5LP host programmer running at a clock frequency of 63 MHz. 
+Timestamp definitions and the delay routine are used in the function definitions in the ProgrammingSteps.c 
+file. 
+To calculate the timestamp parameters for a specific host programmer, see the section Calculating HSSP 
+timeout parameters. 
+ 
+HSSP programming data 
+Files that contain the programming data to be stored in the host programmer are described: 
+Table 5 
+Files containing the programming data 
+Source file 
+Description 
+HexImage 
+(.c and .h files) 
+These files contain the data to be programmed into the target device. 
+They also store the target device parameters used in HSSP programming, such as silicon ID, 
+checksum, total number of flash rows, and number of bytes per flash row. 
+The data in these files is stored in PSoC™ 5LP flash memory as an array of constants. 
+These files are generated by the C# application Hex File Parser, which is provided with this application note. 
+This application generates these files by taking the target device hex file as the input. The details of this 
+application are provided in Appendix A. 
+For details on the hex file format, see “Appendix B. Intel Hex File Format” in the programming specifications 
+document of the respective device listed in the References section of this document. 
+For host programmers that lack the memory capacity to store the programming data in the on-chip memory, 
+the HexImage.c and HexImage.h files are not required. In such cases, the HSSP programming data is typically 
+sent to the host as packets through a communication interface, such as I2C, UART, or USB. 
+Note: 
+See the  Interface for receiving HSSP programming data for information on modifying the HSSP 
+source code according to the method used to get the programming data. 
+ 
+Main application code 
+The main.c file is the main application code that calls the top-level HSSP programming steps in the sequence 
+shown in Figure 1. The function ProgramDevice() in main.c executes all the steps. Each step must be 
+executed successfully before you can proceed to the next step. 
+The HSSP operation is aborted if a FAILURE is returned after any step. The error status returned by the 
+ReadHsspErrorStatus()function is used to identify the cause of the error. The status of the HSSP 
+operation, along with the error status register, is displayed on a character LCD in the attached HSSP project. 
+Note: 
+The character LCD and Pin_Start routines are specific to the PSoC™ 5LP host programmer 
+and, therefore, should be modified as required for any other host programmer. 
+
+===PAGE 10===
+  
+Application note 
+10 
+001-84858 Rev. *O
+ 
+2024-03-06
+ 
+ 
+PSoC™ 4 programming using an external microcontroller (HSSP) 
+ 
+HSSP firmware architecture 
+ 
+HSSP error status 
+When any of the top-level steps in the HSSP application returns a failure status, the 
+ReadHsspErrorStatus() function is called from the main application code to get the details of the error. 
+This function returns the status byte. Use the status byte to infer error details from the bit field definitions.  
+See Figure 2 for the bit fields returned by this function. 
+ 
+Bit 7
+Bit 6
+Bit 5
+Bit 4
+Bit 3
+Bit 2
+Bit 1
+Bit 0
+ 
+SWD ACK [2:0] response
+SWD Read Data 
+Parity Error
+SROM Polling Timeout
+Port Acquire Timeout
+Transition Error
+Verification Failure
+ 
+Figure 2 
+HSSP Error Status register 
+Table 6 describes the bit field definitions of this Status register. 
+Table 6 
+HSSP Error Status register 
+Bit 
+Field name 
+Description 
+[2:0] 
+SWD ACK 
+These three bits store the acknowledge response of previous SWD 
+transactions. 
+3 
+SWD Read Data Parity 
+Error 
+If this bit is set, it indicates a parity error in the data received by the host. 
+4 
+Port Acquire Timeout 
+If this bit is set, it indicates that the device was not acquired within the 
+timeout window. 
+5 
+SROM Polling Timeout 
+If this bit is set, it indicates that SROM operations exceed 1 second. 
+6 
+Verification Failure 
+This bit is set in multiple steps. Depending upon the step where failure 
+occurred, the reason can be inferred. 
+7. 
+Transition Error 
+If this bit is set, it indicates that the chip protection settings read from the 
+chip and the hex file indicates a wrong transition. 
+For more information on register and bit fields, see Appendix C: Bit field definitions of HSSP Error Status 
+register. 
+
+===PAGE 11===
+  
+Application note 
+11 
+001-84858 Rev. *O
+ 
+2024-03-06
+ 
+ 
+PSoC™ 4 programming using an external microcontroller (HSSP) 
+ 
+Hardware connections for HSSP programming 
+3 
+Hardware connections for HSSP programming 
+The HSSP programming in PSoC™ 4 uses the SWD interface pins (SWDIO and SWDCK) and the external reset pin 
+(XRES). The host programmer pin drive mode requirements are explained in the “Physical Layer” section in the 
+programming specifications document listed in the References section of this document. Figure 3 shows the 
+basic hardware connection required between the host programmer and the target device. 
+ 
+ 
+Host 
+Programmer
+PSoC 40xx
+VDD
+VDDD
+SWDCK
+XRES
+SWDIO
+GND
+SWDCK ( P3[1]] )
+XRES(1)
+SWDIO ( P3[0] )
+GND
+VSSD
+0.1 uF
+Host 
+Programmer
+PSoC 4xxx/
+PSoC 4xxxM/
+PSoC 4xxxL/PSoC 40xxS/PSoC 
+41xxS/ PSoC 4100PS/ PSoC 
+4100S Plus
+VDD
+VDDD
+SWDCK
+XRES
+SWDIO
+GND
+SWDCK ( P3[3]] )
+XRES
+SWDIO ( P3[2] )
+VDD
+GND
+VSSD
+1.8 V – 5.5 V
+0.1 uF
+Host 
+Programmer
+PSoC 4xx7_BLE/
+ PSoC 4xx8_BLE
+VDD
+VDDD
+SWDCK
+XRES
+SWDIO
+GND
+SWDCK ( P0[7] )
+XRES
+SWDIO ( P0[6] )
+VDD
+GND
+VSSD
+1.8 V – 5.5 V
+0.1 uF
+(1) Toggle VDDD pin for devices 
+    that do not have an XRES pin
+ 
+Figure 3 
+Basic host/target connections 
+ 
+
+===PAGE 12===
+  
+Application note 
+12 
+001-84858 Rev. *O
+ 
+2024-03-06
+ 
+ 
+PSoC™ 4 programming using an external microcontroller (HSSP) 
+ 
+Porting the HSSP application to a host programmer 
+4 
+Porting the HSSP application to a host programmer 
+The project A_Hssp_Programmer, provided with this application note, uses PSoC™ 5LP as the host programmer 
+for the target device. In the HSSP application, the host programmer can be any other microcontroller. This 
+section explains the changes required to port the HSSP application code to the specific host used to program 
+the target device. 
+ 
+Files that must be ported 
+The PSoC™ 5LP host programmer-based project includes files specific to PSoC™ 5LP. While porting the HSSP 
+application code to any other host programmer, you must port only the files listed: 
+Table 7 
+Files that must be ported 
+Header files to be ported 
+Source files to be ported 
+SWD_PhysicalLayer.h 
+SWD_PhysicalLayer.c 
+SWD_PacketLayer.h 
+SWD_PacketLayer.c 
+SWD_UpperPacketLayer.h 
+SWD_UpperPacketLayer.c 
+Timeout.h 
+Timeout.c 
+HexImage.h 
+HexImage.c 
+DataFetch.h 
+DataFetch.c 
+ProgrammingSteps.h 
+ProgrammingSteps.c 
+RegisterDefines.h 
+ 
+Code changes required while porting 
+Make the following changes to each of the files while porting the attached HSSP application code to any host 
+programmer other than PSoC™ 5LP. Note that only some files need to be modified while porting. 
+• RegisterDefines.h: Modify the definitions in this header file for the port numbers, pin numbers, mask values, 
+output registers, input registers, and drive mode registers according to the host programmer used. 
+• SWD_PhysicalLayer.h: All the bit-banging macros defined in this header file are used in the function 
+definitions in the SWD_PhysicalLayer.c file. Modify these macros according to the host programmer used. 
+• SWD_PhysicalLayer.c: Modify all the bit-banging functions defined in this file according to the host 
+programmer used. 
+• Timeout.h: Modify the three timeout parameter definitions described according to the host programmer 
+used. 
+Table 8 
+Timing parameters 
+S.No. 
+Timing parameter 
+1 
+XRES_PULSE_100US 
+2 
+DEVICE_ACQUIRE_TIMEOUT 
+3 
+SROM_POLLING_TIMEOUT 
+To calculate the timeout parameters for a specific host programmer, see Calculating HSSP timeout parameters. 
+• HexImage.c, HexImage.h: These files contain the data to be programmed into the target device, defined as 
+an array of constants. For the PSoC™ 5LP host programmer, the data to be programmed is stored in the 
+flash memory of the host PSoC™ 5LP. 
+
+===PAGE 13===
+  
+Application note 
+13 
+001-84858 Rev. *O
+ 
+2024-03-06
+ 
+ 
+PSoC™ 4 programming using an external microcontroller (HSSP) 
+ 
+Porting the HSSP application to a host programmer 
+Some host programmers may lack the capacity to store the programming data in their on-chip memory. 
+Instead, they can use a communication interface, such as USB, SPI, or UART, to get the programming data. In 
+such a case, remove these files. 
+• DataFetch.c: The definitions for the functions should be modified based on the method used to get the 
+programming data. 
+See Interface for receiving HSSP programming data for information on modifying the HSSP source code 
+according to the method used to get the programming data. 
+• main.c: The APIs for the character LCD and Pin_Start pin in the main.c file are specific to a PSoC™ 5LP host 
+programmer. Therefore, you should either remove them or modify them while porting to any other host 
+programmer. 
+In the above specified files, the following comments precede the code that needs to be modified-based on the 
+host programmer. This helps you identify the code to be modified. 
+/******USER ATTENTION REQUIRED******/ 
+/******HOST PROCESSOR SPECIFIC******/ 
+ 
+
+===PAGE 14===
+  
+Application note 
+14 
+001-84858 Rev. *O
+ 
+2024-03-06
+ 
+ 
+PSoC™ 4 programming using an external microcontroller (HSSP) 
+ 
+Calculating HSSP timeout parameters 
+5 
+Calculating HSSP timeout parameters 
+Modify the values of the timeout parameters defined in the Timeout.h file according to the host programmer 
+used. 
+A separate test project, “C_Hssp_TimeoutCalc,” is provided with the application note. This project illustrates 
+the procedure to calculate the timeout parameters for a PSoC™ 5LP host programmer. Create a similar test 
+project for any other host programmer to calculate those timeout values. 
+The test project provides test functions in two files: TimeoutCalc.h andTimeoutCalc.c. These test functions 
+toggle a test pin during code execution. The timeout parameters are measured by measuring the LOW pulse 
+width of the signal on the test pin using an oscilloscope. 
+To calculate these timeout parameters, see the explanation in the macro definitions in the TimeoutCalc.h 
+header file of the project.  
+ 
+DEVICE_ACQUIRE_TIMEOUT 
+This macro is used in the function DeviceAcquire()in the ProgrammingSteps.c file. To program the device, 
+the device must be acquired within the maximum time window for acquiring the device after you do a device 
+reset using the XRES pin. Maximum time window for acquiring the device is defined:  
+Table 9 
+Timeout for acquiring device 
+Device family 
+Timeout (ms)1  
+PSoC40xx 
+2.0 
+PSoC41/42xx 
+1.5 
+PSoC4xxxM 
+2.0 
+PSoC™ 4xxxL 
+2.0 
+PSoC4xx7_BLE / PSoC4xx8_BLE 
+2.0 
+PSoC™ 4000S/ PSoC™ 4100S/ PSoC™ 4100PS 
+2.0 
+PSoC™ 4100S Plus 
+5.0 
+Note: 
+The recommended minimum frequency of the SWDCK clock, which meets the timing requirement 
+to acquire the device, is 1.5 MHz. See the “Step 1. Acquire Chip” subsection of the programming 
+specifications document of the respective device listed in the References section for more details. 
+The device-acquiring sequence consists of two steps: 
+1. Do a line Reset, which is a standard ARM command to reset the debug access port (DAP).  
+2. Read the DAP. 
+DEVICE_ACQUIRE_TIMEOUT indicates the maximum number of times a host can send the device-acquiring 
+sequence in a specific time window after device reset as given in Table 9.  
+To calculate this macro, uncomment the TestModeTimeout() function in the main.c file of the project, and 
+then program the device. 
+                                                                    
+1 The timeout for acquiring the device in the case of Power Cycle mode programming must be longer, ~ 30 ms. 
+
+===PAGE 15===
+  
+Application note 
+15 
+001-84858 Rev. *O
+ 
+2024-03-06
+ 
+ 
+PSoC™ 4 programming using an external microcontroller (HSSP) 
+ 
+Calculating HSSP timeout parameters 
+Measure the LOW pulse width on the test pin for one iteration of the device-acquiring sequence by using an 
+oscilloscope. Then, calculate this macro as follows: 
+DEVICE_ACQUIRE_TIMEOUT = (X ms/low pulse width), where X is the maximum time window for acquiring the 
+device as defined in Table 9. 
+Code Listing 1 
+Calculating DEVICE_ACQUIRE_TIMEOUT parameter 
+Unsignedshort timestamp = 0; 
+Unsignedlongchip_DAP_Id = 0; 
+ 
+ 
+/* Make the pin LOW before sending SWD clock train */ 
+TESTPIN_OUTPUT_LOW;  
+ 
+ 
+for(timestamp = 0; timestamp < 1; timestamp++) 
+{ 
+ 
+Swd_LineReset(); 
+ 
+Read_DAP(DPACC_DP_IDCODE_READ, &chip_DAP_Id); 
+} 
+/* Make the pin HIGH after sending SWD clock train */ 
+TESTPIN_OUTPUT_HIGH; 
+ 
+SROM_POLLING_TIMEOUT 
+This macro is used in the SROM polling operations during HSSP programming. It is used while polling the result 
+of the nonvolatile memory read and write operations through SROM requests in the target device. 
+When the host requests a SROM system call through the SWD interface, it waits a maximum of one second while 
+reading the CPUSS_SYSREQ register for status. If a response is not received, the host aborts the HSSP 
+operation. 
+SROM_POLLING_TIMEOUT indicates the maximum number of times the CPUSS_SYSREQ register can be read in 
+a time window of one second. 
+To calculate this macro, uncomment the TestSromPollingTimeout() function in the main.c file of the 
+project, and then program the device. 
+Measure the LOW pulse width on the test pin after sending 10 iterations of the SROM polling sequence by using 
+an oscilloscope. Then calculate the macro as follows: 
+SROM_POLLING_TIMEOUT = (1 s/LOW pulse width)*10 
+ 
+Code Listing 2 
+Calculating the SROM_POLLING_TIMEOUT parameter 
+Unsignedshort timestamp = 0; 
+UnsignedlongstatusCode = 0; 
+
+===PAGE 16===
+  
+Application note 
+16 
+001-84858 Rev. *O
+ 
+2024-03-06
+ 
+ 
+PSoC™ 4 programming using an external microcontroller (HSSP) 
+ 
+Calculating HSSP timeout parameters 
+ 
+ 
+/* Make the pin low before sending SWD clock train */ 
+TESTPIN_OUTPUT_LOW; 
+ 
+ 
+for(timestamp = 0; timestamp < 10; timestamp++) 
+{ 
+ 
+Read_IO (CPUSS_SYSREQ, &statusCode); 
+ 
+ 
+ 
+/*performing SROM_SYSREQ_BIT | SROM_PRIVILEGED_BIT */ 
+statusCode &= (SROM_SYSREQ_BIT | SROM_PRIVILEGED_BIT); 
+} 
+/* Make the pin high after sending SWD clock train */ 
+TESTPIN_OUTPUT_HIGH; 
+This macro signifies the number of times CPUSS_SYSREQ can be read and checked if SROM_SYSREQ_BIT and 
+SROM_PRIVILEGED_BIT are set to 0 in a 1-second interval. 
+ 
+XRES_PULSE_100US 
+To reset the target device, the host generates an active LOW signal with a minimum pulse width of 5 µs on the 
+XRES line. In the HSSP code, a pulse width of 100 µs is generated on the XRES pin.  
+The function TestDelayHundredUs() is defined in the TimeoutCalc.c file. 
+In the C_Hssp_TimeoutCalc project provided with the application note, this function is implemented using the 
+CyDelayUs() API.  Uncomment the line in TimeoutCalc.h to implement this function using microcontrollers 
+other than PSoC™ as host programmer. 
+#define XRES_PULSE_100US  600  
+Modify the code in TestDelayHundredUs() defined in the TimeoutCalc.c as given in code 3. 
+To calculate this macro, uncomment the TestDelayHundredUs() function in the main.c file of the project, 
+and then program the device. Measure the pulse width of the test pin on an oscilloscope.  
+Code Listing 3 
+Delay routine 
+unsignedshort timestamp; 
+ 
+/* Make the pin low before start of the delay */ 
+TESTPIN_OUTPUT_LOW; 
+ 
+
+===PAGE 17===
+  
+Application note 
+17 
+001-84858 Rev. *O
+ 
+2024-03-06
+ 
+ 
+PSoC™ 4 programming using an external microcontroller (HSSP) 
+ 
+Calculating HSSP timeout parameters 
+/* For loop to introduce the 100 us delay  
+for(timestamp = 0; timestamp < XRES_PULSE_100US; timestamp++) 
+{ 
+ 
+/* Do Nothing */ 
+} 
+ 
+/* Make the pin high after end of the delay */ 
+TESTPIN_OUTPUT_HIGH; 
+The A_HSSP_Programmer and B_HSSP_Pioneer projects implement a 100-µs delay using the CyDelayUs () 
+API. For microcontrollers other than PSoC™ as the host programmer, the XRES_PULSE_100US parameter has to 
+be defined in Timeout.h and the delay should be implemented using this parameter in the DelayHundredUs 
+function of Timeout.c.   
+For power cycle mode programming, this delay routine signifies the time for which the device power rails are 
+OFF. For power cycle mode programming, there are no requirements for this pulse width. The recommendation 
+is to have a 1-ms delay before turning ON the power rails. 
+
+===PAGE 18===
+  
+Application note 
+18 
+001-84858 Rev. *O
+ 
+2024-03-06
+ 
+ 
+PSoC™ 4 programming using an external microcontroller (HSSP) 
+ 
+Interface for receiving HSSP programming data 
+6 
+Interface for receiving HSSP programming data 
+The files DataFetch.c and DataFetch.h contain the functions to fetch the data to be programmed into the target 
+device. 
+In the example project, the programming data is stored in the on-chip flash memory of the PSoC™ 5LP host 
+programmer in the files HexImage.c and HexImage.h. The data fetch routines access this data from the 
+PSoC™ 5LP flash memory to perform HSSP. 
+However, not all host programmers may have the on-chip memory to store the HSSP programming data. When 
+that is the case, the programmer can use a communication interface (such as SPI, USB, or UART) to get the 
+programming data. Also, all the function definitions in the DataFetch.c file should be modified appropriately. 
+The following example is a reference that shows the modifications required for the Hex_ReadRowData() 
+function. You can perform similar modifications for other functions as well. 
+Original code 
+Code Listing 4 
+Original code to get flash data 
+void HEX_ReadRowData(unsignedshortrowCount, unsignedchar * rowData) 
+{ 
+/* Maximum value of 'i' can be 256 */ 
+unsignedshort i; 
+ 
+for(i = 0; i<BYTES_PER_FLASH_ROW; i++) 
+    { 
+rowData[i] = FlashData_HexFile[rowCount][i]; 
+    } 
+} 
+Modified code 
+If the programming data is received through a communication interface, then the modified code is shown 
+below. 
+Code Listing 5 
+Modified code to get flash data 
+void HEX_ReadRowData(unsignedshortrowCount, unsignedchar * rowData) 
+{ 
+/* Maximum value of 'i' can be 256 */ 
+unsignedshort i; 
+ 
+/* ADD WAITING CODE HERE FOR THE UART BUFFER TO GET THE FLASH DATA */ 
+
+===PAGE 19===
+  
+Application note 
+19 
+001-84858 Rev. *O
+ 
+2024-03-06
+ 
+ 
+PSoC™ 4 programming using an external microcontroller (HSSP) 
+ 
+Interface for receiving HSSP programming data 
+ 
+for(i = 0; i<BYTES_PER_FLASH_ROW; i++) 
+    { 
+rowData[i] = /* PLACE THE UART BUFFER ARRAY HERE */ 
+    } 
+} 
+
+===PAGE 20===
+  
+Application note 
+20 
+001-84858 Rev. *O
+ 
+2024-03-06
+ 
+ 
+PSoC™ 4 programming using an external microcontroller (HSSP) 
+ 
+HSSP timing validation 
+7 
+HSSP timing validation 
+The host programmer must meet the timing specifications for the target device programming to achieve a 
+robust HSSP implementation. Those specifications are given in “Appendix D. Timing Specifications of the SWD 
+Interface” of the programming specifications document of the respective device listed in the References 
+section. 
+The host programmer must meet the timing parameters specified for the SWD interface and programming 
+mode entry. To validate the timing, capture the SWDIO, SWDCK, and XRES signals on an oscilloscope. For power 
+cycle mode programming, the device power rails should be monitored instead of the XRES pin. Using the 
+captured waveforms, you can verify the timing parameters against the corresponding values provided in the 
+programming specification. 
+
+===PAGE 21===
+  
+Application note 
+21 
+001-84858 Rev. *O
+ 
+2024-03-06
+ 
+ 
+PSoC™ 4 programming using an external microcontroller (HSSP) 
+ 
+Power cycle mode programming 
+8 
+Power cycle mode programming 
+The device programming starts with a device reset to acquire the device and enter programming mode. The 
+recommended method of resetting the device from the host side is to toggle the device XRES pin. But some 
+lower pin count devices in the PSoC™ 4000 family do not have an XRES pin, and the host has to toggle the 
+device Vdd pin to reset the device (power cycle mode). All the projects provided with the application note work 
+using the XRES programming mode because the PSoC™ 5LP host processor on the development kit does not 
+have the hardware connections to toggle the power supply of the target PSoC™ 4 device. So, when porting the 
+projects to your host processor and adding power cycle mode support, the following changes and 
+considerations need to be made in the project. 
+1. The DEVICE_ACQUIRE_TIMEOUT value, discussed in the section DEVICE_ACQUIRE_TIMEOUT, has to be 
+modified to reflect the much longer 30-ms timeout window required for power cycle mode programming. 
+So, for example, if the DEVICE_ACQUIRE_TIMEOUT define has been calculated to be 20 for a 2 ms XRES 
+mode acquire timing, then that define should be changed to 300 for a 30 ms power cycle mode acquire 
+timing. 
+2. The function definitions related to toggling of the XRES pin on the host side should be modified as 
+appropriate to toggle the device power rails. These functions are - SetXresHigh(),SetXresLow(). 
+3. If an I/O pin of the host processor is used to power the PSoC™ 4 device directly to toggle the power from the 
+host side, ensure that the I/O pin can source the current required for device operation as specified in the 
+respective PSoC™ 4 device datasheet. If the I/O pin is not able to source the required current, the output 
+voltage (VOH) typically decreases, and can potentially go even below the minimum PSoC™ 4 device operating 
+voltage. This can cause programming failures. Such a voltage droop scenario can be identified by observing 
+the power rail voltages on the oscilloscope. 
+
+===PAGE 22===
+  
+Application note 
+22 
+001-84858 Rev. *O
+ 
+2024-03-06
+ 
+ 
+PSoC™ 4 programming using an external microcontroller (HSSP) 
+ 
+Testing the example projects 
+9 
+Testing the example projects 
+The project file HexImage.h defines parameters CY8C40xx_FAMILY, CY8C4xxxM_FAMILY, CY8C4xx7_BL_FAMILY, 
+CY8C4xx8_BL_FAMILY, CY8C4xxxL_FAMILY, CY8C40xxS_FAMILY, CY8C41xxS_FAMILY, CY8C41xxS_PLUS_FAMILY, 
+and CY8C41xxPS_FAMILY. These parameters are automatically set to 1 if the hex file parser application for the 
+respective family is used to generate the HexImage.c and HexImage.h files. 
+ 
+For kits with onboard PSoC™ 5LP programmer (KitProg) 
+To test the HSSP project on the kits listed in Table 10, use the B_Hssp_Pioneer project attached with this 
+application note. Using this kit, you do not need an external host microcontroller; PSoC™ 5LP is present as an 
+onboard microcontroller. 
+The onboard PSoC™ 5LP has bootloader firmware that can load and run new bootloadable applications 
+through USB. Therefore, the HSSP project is built as a bootloadable project, and you can download the 
+B_Hssp_Pioneer.cyacd project to PSoC™ 5LP via USB to be used as an HSSP host programmer. 
+This project uses a USB-to-UART component to display the programming outputs on a HyperTerminal, which is 
+a standard program used for serial communication. 
+The project requires the changes listed in Table 10 to work on CY8CKIT-040, CY8CKIT-042, CY8CKIT-044, 
+CY8CKIT-042-BLE. Note that corresponding changes should be done in the RegisterDefines.h file in the project. 
+Table 10 
+Pin assignments for different kits 
+Host pin 
+CY8CKIT-040 CY8CKIT-042 CY8CKIT-043 CY8CKIT-044 CY8CKIT-046 CY8CKIT-042-BLE 
+Pin_SWDCK 
+P12[3] 
+P2[1] 
+P12[3] 
+P12[3] 
+P12[3] 
+P12[3] 
+Pin_SWDIO 
+P12[2] 
+P2[0] 
+P12[2] 
+P12[2] 
+P12[2] 
+P12[2] 
+Pin_XRES 
+P12[4] 
+P2[4] 
+P12[4] 
+P12[4] 
+P12[4] 
+P12[4] 
+ 
+To test this project, follow these steps: 
+1. Prepare the B_Hssp_Pioneer project: 
+a) Generate the files containing the programming data (HexImage.c, HexImage.h) for your target PSoC™ 4 
+device using the HexFile Parser.  
+b) Replace the existing HexImage.c and HexImage.h files with the generated ones.  
+c) Double-click the bootloadable Component in TopDesign.cysch.  
+d) Select the Dependencies tab and click on the browse button associated with Bootloader HEX file as 
+shown in Figure 4.  
+e) Navigate to the PSoC™ 5LP Bootloader Files > KitProg folder provided with the application note and 
+select KitProg_Bootloader.hex.  
+The Bootloader ELF file is automatically generated when you select the Bootloader HEX file. 
+
+===PAGE 23===
+  
+Application note 
+23 
+001-84858 Rev. *O
+ 
+2024-03-06
+ 
+ 
+PSoC™ 4 programming using an external microcontroller (HSSP) 
+ 
+Testing the example projects 
+ 
+ 
+Figure 4 
+Bootloadable dependencies for KitProg 
+f) Build the B_Hssp_Pioneer project. 
+2. Enter PSoC™ 5LP bootloader in the Pioneer kit: 
+a) Remove the power supply by unplugging the USB cable. 
+b) Press and hold the reset switch (SW1) of the kit and plug in the USB cable. 
+The status LED starts to blink, indicating that PSoC™ 5LP is in the bootloader mode. Figure 5 shows the 
+PSoC™ 4 Pioneer Kit and the location of the status LED and reset switch. 
+ 
+ 
+Figure 5 
+PSoC™ 4 Pioneer Kit 
+3. Bootload the HSSP project to PSoC™ 5LP: 
+a) Open the bootloader host tool. Choose Tools>Bootloader Host in PSoC™ Creator. 
+b) Click Filter, and then select the Show USB Devices checkbox. 
+c) Enter ‘0xF13B’ in the PID field (see Figure 6). 
+PSoC™ 5LP bootloader is listed as USB Human Interface Device in the Port list. 
+d) Click Open in the GUI and select the B_Hssp_Pioneer.cyacd file from the following path: 
+
+===PAGE 24===
+  
+Application note 
+24 
+001-84858 Rev. *O
+ 
+2024-03-06
+ 
+ 
+PSoC™ 4 programming using an external microcontroller (HSSP) 
+ 
+Testing the example projects 
+..\ AN84858 \ B_Hssp_Pioneer.cydsn \ CortexM3 \ARM_GCC_441 \Debug \B_Hssp_Pioneer.cyacd 
+e) Click Program to bootload the file to PSoC™ 5LP. 
+ 
+ 
+Figure 6 
+Bootloader host 
+4. Install the USBUART driver for the kit: 
+a) Unplug and reconnect the USB cable. 
+b) If Windows fails to install the USBUART drivers, open the Device Manager. Make sure that USBUART is 
+present in the Other devices list.  
+c) Double-click USBUART to open its properties. 
+d) Click Update Driver. 
+e) Select the option Browse my computer for driver software. 
+f) The driver is provided in the attached project under the folder USBUART. Navigate to the location where 
+you saved the project attached with this application note, and select the driver in the USBUART driver 
+folder.  
+g) Click Next. Windows generates a warning because the driver files are not signed. Ignore the warning and 
+proceed. Now the USBUART driver is installed on your machine. 
+ 
+5. Use HyperTerminal to start HSSP programming: 
+a) Open HyperTerminal on your computer. If you do not have it, download any terminal application for 
+serial communication from the Internet. 
+b) In the UART configuration window, set the baud rate at 9600, data bits as 8, stop bits as 1, parity as No 
+Parity, and Hardware Control as None. 
+c) Press any alphanumeric button on the keyboard to start programming. If the operation is successful, the 
+terminal shows “HSSP Success” (see Figure 7). 
+If the programming operation fails, the terminal displays the step and error code that you can use to 
+debug the project (see Figure 7). 
+
+===PAGE 25===
+  
+Application note 
+25 
+001-84858 Rev. *O
+ 
+2024-03-06
+ 
+ 
+PSoC™ 4 programming using an external microcontroller (HSSP) 
+ 
+Testing the example projects 
+ 
+ 
+ 
+Figure 7 
+Terminal display 
+6. Reprogram PSoC™ 5LP with the kit firmware: 
+a) Open PSoC Programmer.  
+b) Enter the bootloader as described in step 2. 
+c) Go to the Utilities tab and click Upgrade Firmware to reprogram PSoC™ 5LP with the original kit 
+firmware (Figure 8). 
+ 
+ 
+Figure 8 
+Upgrade Firmware using PSoC Programmer 
+ 
+For kits with onboard PSoC™ 5LP programmer (KitProg2) 
+To test the HSSP project on kits listed in Table 10, use the B_Hssp_Pioneer project attached with this 
+application note. When using this kit, you do not need an external host microcontroller; PSoC™ 5LP is present 
+as an onboard microcontroller. 
+The onboard PSoC™ 5LP device has the bootloader firmware that can load and run new bootloadable 
+applications through USB. Therefore, the HSSP project is built as a bootloadable project, and you can 
+download the B_Hssp_Pioneer.cyacd project to PSoC™ 5LP via USB to be used as an HSSP host programmer. 
+This project uses a USB-to-UART Component to display the programming outputs on HyperTerminal, which is a 
+standard program used for serial communication. 
+
+===PAGE 26===
+  
+Application note 
+26 
+001-84858 Rev. *O
+ 
+2024-03-06
+ 
+ 
+PSoC™ 4 programming using an external microcontroller (HSSP) 
+ 
+Testing the example projects 
+The project requires the changes listed in Table 10 to work with the CY8CKIT-041-40xx kits. Note that 
+corresponding changes should be done in the RegisterDefines.h file in the project. 
+Table 11 
+Pin assignments for different kits 
+Host pin 
+CY8CKIT-041-40xx 
+CY8CKIT-149 
+CY8CKIT-147 
+Pin_SWDCK 
+P12[3] 
+P12[3] 
+P12[3] 
+Pin_SWDIO 
+P12[2] 
+P12[2] 
+P12[2] 
+Pin_XRES 
+P12[4] 
+P12[4] 
+P12[4] 
+To test this project, follow these steps: 
+1. Prepare the B_Hssp_Pioneer project: 
+a) Generate the files containing the programming data (HexImage.c, HexImage.h) for your target device 
+using the HexFile Parser.  
+b) Replace the existing HexImage.c and HexImage.h files with the generated ones.  
+c) Double-click the bootloadable Component in TopDesign.cysch.  
+d) Select the Dependencies tab and click Browse associated with the Bootloader HEX file as shown in  
+Figure 9.  
+e) Navigate to the PSoC 5LP Bootloader Files > KitPog2 folder provided with the application note and 
+select KitProg2_Bootloader.hex for the Bootloader HEX file field.  
+The Bootloader ELF file will be automatically generated on selecting the Bootloader HEX file.    
+ 
+ 
+Figure 9 
+Bootloadable dependencies for KitProg2 
+f) Build the B_Hssp_Pioneer project. 
+ 
+2. Enter PSoC™ 5LP bootloader in the Pioneer Kit: 
+a) Remove the power supply by unplugging the USB cable. 
+b) Press and hold SW3 of the kit and plug in the USB cable. 
+
+===PAGE 27===
+  
+Application note 
+27 
+001-84858 Rev. *O
+ 
+2024-03-06
+ 
+ 
+PSoC™ 4 programming using an external microcontroller (HSSP) 
+ 
+Testing the example projects 
+LED2 starts to blink, indicating that PSoC™ 5LP is in the bootloader mode. Figure 10 shows the PSoC™ 
+CY8CKIT-041-040xx Kit and the location of LED2 and SW3.  
+ 
+ 
+Figure 10 
+CY8CKIT – 041-040xx  
+3. Bootload the HSSP project to PSoC™ 5LP: 
+a) Open the bootloader host tool. Choose Tools > Bootloader Host in PSoC™ Creator. 
+b) Click on the Filter button, and then click on the Show USB Device’ checkbox. 
+c) Enter ‘0XF146’ in the PID field. 
+d) PSoC™ 5LP bootloader is listed as USB Human Interface Device in the Port list. 
+e) Click Open the GUI and select the B_Hssp_Pioneer.cyacd file from the following path: 
+..\ AN84858 \ B_Hssp_Pioneer.cydsn \ CortexM3 \ARM_GCC_441 \Debug \B_Hssp_Pioneer_2.cyacd 
+f) Click Program to bootload the file to PSoC™ 5LP. 
+ 
+ 
+Figure 11 
+Bootloader host application 
+4. Install the USBUART driver for the kit: 
+a) Unplug and reconnect the USB cable. 
+b) If Windows fails to install the USBUART drivers do the following: 
+a. Open Device Manager. Make sure USBUART is present in the Other devices list.  
+
+===PAGE 28===
+  
+Application note 
+28 
+001-84858 Rev. *O
+ 
+2024-03-06
+ 
+ 
+PSoC™ 4 programming using an external microcontroller (HSSP) 
+ 
+Testing the example projects 
+b. Double-click the USBUART entry to open its properties. 
+c. Click Update Driver. 
+d. Select the Browse my computer for driver software option. 
+e. Navigate to the location where you saved the project attached with this application note, and 
+select the driver in the USBUART driver folder.  
+f. 
+Click Next. Windows generates a warning because the driver files are not signed. Ignore the 
+warning and proceed. Now the USBUART driver is installed on your machine 
+5. Use HyperTerminal to start HSSP programming: 
+a) Open HyperTerminal on your computer. If you do not have it, download any terminal application for 
+serial communication from the Internet. 
+b) In the UART configuration window, set the baud rate at 9600, data bits as 8, stop bits as 1, parity as No 
+Parity, and Hardware Control as None. 
+c) Press any alphanumeric button on the keyboard to start programming. If the operation is successful, the 
+terminal shows “HSSP Success”. 
+d) If the programming operation fails, the terminal displays the step and error code that you can use to 
+debug the project. 
+ 
+ 
+ 
+Figure 12 
+Terminal display 
+6. Reprogram PSoC™ 5LP with the kit firmware: 
+a) Open PSoC™ Programmer. 
+b) Enter the bootloader as described in step 2. 
+c) Go to the Utilities tab and click Upgrade Firmware to reprogram PSoC™ 5LP with the original kit 
+firmware. 
+
+===PAGE 29===
+  
+Application note 
+29 
+001-84858 Rev. *O
+ 
+2024-03-06
+ 
+ 
+PSoC™ 4 programming using an external microcontroller (HSSP) 
+ 
+Testing the example projects 
+ 
+ 
+Figure 13 
+Upgrade firmware using PSoC™ Programmer 
+
+===PAGE 30===
+  
+Application note 
+30 
+001-84858 Rev. *O
+ 
+2024-03-06
+ 
+ 
+PSoC™ 4 programming using an external microcontroller (HSSP) 
+ 
+Tips and tricks for debugging HSSP issues 
+10 
+Tips and tricks for debugging HSSP issues  
+Porting the HSSP code from the PSoC™ 5LP host processor used in the code example to your own processor 
+architecture might be a complex task depending on the other system level constraints on the host processor 
+side. This section helps you in troubleshooting the most commonly encountered issues while developing an 
+HSSP application for your hardware platform. 
+• Hardware setup validation: The first step is to ensure that the hardware connections are done properly for 
+the HSSP operation. This includes making the correct pin connections between the host processor and the 
+target PSoC™ 4 device, powering of all the PSoC™ 4 voltage domains, and ensuring the host SWD pins drive 
+mode settings are configured appropriately. 
+• Timing Validation: When porting the host PSoC™ 5LP code to your host processor, ensure that the timeout 
+parameters used in the code are modified to reflect the host processor code timing. See the section - 
+Calculating HSSP timeout parameters – for information on modifying the timeout parameters while porting 
+the code.  
+The first step of the HSSP “Device Acquire” has strict timing requirements with regards to entering the 
+programming mode. One of the important requirements is to ensure that the frequency of SWDCK clock line is 
+at least 1.5 MHz to meet the acquire window timing. Ensure that there are no interrupt events in the host 
+processor, which can affect the code execution time for completing the “Device Acquire” step on the host 
+processor side. Ensure that the host processor meets all the timing requirements explained in “Step 1 – Acquire 
+Chip” of the respective device programming specification document.  
+• HSSP algorithm validation:  
+− While porting the HSSP code, if any changes were made to the SWD packet layer files shown in Figure 1, 
+ensure that the SWD packet format is the same as that mentioned in the section “Serial Wire Debug (SWD) 
+Format” in the device programming specification. 
+− Infineon  qualified programmers like MiniProg3, KitProg can be used to validate and debug the steps like 
+“Erase Flash”, “Program Flash” in Figure 1. For example, to check if the host processor erased the entire 
+flash memory, the MiniProg3 programmer and the “Read” option in the PSoC Programmer GUI can be 
+used to verify that the entire flash data is zero. The “Checksum” option in PSoC Programmer GUI can be 
+used to ensure that the checksum of the flash data programmed into the device matches the checksum of 
+the hex file that is fed as the input file to the GUI. Additionally, the “Patch Image” option in the PSoC™ 
+Programmer GUI can be used to identify the number of flash rows for which there is a data mismatch 
+between the device flash content and the hex file data. 
+
+===PAGE 31===
+  
+Application note 
+31 
+001-84858 Rev. *O
+ 
+2024-03-06
+ 
+ 
+PSoC™ 4 programming using an external microcontroller (HSSP) 
+ 
+Summary 
+11 
+Summary 
+The HSSP application is useful for developing in-system programming solutions for PSoC™ 4 devices. It 
+provides a cheap and robust method for programming PSoC™ 4 devices using an onboard embedded 
+microcontroller as a host programmer. The portable and modular C code provided with this application note 
+greatly reduces the time it takes to develop such HSSP applications. 
+
+===PAGE 32===
+  
+Application note 
+32 
+001-84858 Rev. *O
+ 
+2024-03-06
+ 
+ 
+PSoC™ 4 programming using an external microcontroller (HSSP) 
+ 
+List of attached projects 
+12 
+List of attached projects 
+AN84858.cywrk: This workspace contains three projects to demonstrate the HSSP application. 
+• A_Hssp_Programmer: This is PSoC™ 4 HSSP application project. It has a PSoC™ 5LP device, which acts as 
+the host programmer to program the target PSoC™ 4 device. This project is developed using modular C code 
+to program the device according to the steps described in the programming specifications document of the 
+respective device listed in the References section. 
+• B_Hssp_Pioneer: This is the PSoC™ 4 HSSP application project for testing on the PSoC™ 4 Pioneer Kit. It uses 
+the onboard PSoC™ 5LP programmer to program PSoC™ 4 devices. 
+• C_Hssp_TimeoutCalc: This project is used to calculate the timestamp parameters used in the PSoC™ 4 HSSP 
+projects. 
+In addition, a C# application to extract information from the hex file is attached with the application note: 
+• Hex File Parser application: This C# application extracts the required information from the hex file and 
+parses it in a .c/h file. This file is stored in the flash of the microcontroller and is used to directly access the 
+programming data. 
+ 
+ 
+
+===PAGE 33===
+  
+Application note 
+33 
+001-84858 Rev. *O
+ 
+2024-03-06
+ 
+ 
+PSoC™ 4 programming using an external microcontroller (HSSP) 
+ 
+Appendix A: Hex File Parser application 
+13 
+Appendix A: Hex File Parser application 
+The data for programming PSoC™ 4 is available in the hex file (.hex) format, which is explained in the section 
+“Appendix B. Intel Hex File Format“ of the programming specifications document of the respective device listed 
+in the References section. 
+The hex file is not in a format that can be used by a host to program the target device. This file, which is 
+generated by the PSoC™ Creator software, contains both the programming data and the metadata in 
+hexadecimal format. The metadata includes information on the hex file record type, extended linear address 
+data, and so on. This metadata is used to categorize the programming data into flash code region data, flash 
+configuration region data, flash protection data, and so on. 
+A C# application has been developed in the Visual Studio development environment that parses the hex file and 
+generates the .c and .h (HexImage.c, HexImage.h) files, which store only the programming data from the hex 
+files. The programming data is stored as an array of constants in the HexImage.c and HexImage.h files.  
+The C# application with the source code is provided along with the application note. To use the C# application, 
+you must install .NET Framework version 3.5 or higher on your computer. 
+Note: 
+Separate Hex File Parser applications are provided for the PSoC™ 4000, PSoC™ 4100/4200,  
+PSoC™ 4100M/4200M, PSoC™ 4xx7_BLE, PSoC™ 4xx8_BLE, PSoC™ 4xxxL, PSoC™ 40xxS, PSoC™ 
+41xxS, PSoC™ 41xxS Plus, and PSoC™ 41xxPS device families. 
+C# application name: Hex File Parser  
+Development environment: Microsoft Visual Studio Express 2013 (Version 12.0.31101.00 Update 4) 
+Source code: See the C# source project for details. The project source code can be viewed and edited by 
+downloading and installing the freely available Microsoft Visual Studio 2013 Express edition. Simply right-click 
+the Form1.cs file in the Solution Explorer window and select the View Code option. This action opens the 
+source code of Form1.cs. 
+ 
+Using the Hex File Parser application 
+Nine sets of parser applications are available in the folder ‘C# Application’. Choose the appropriate application 
+depending on the PSoC™ 4 family. 
+Open the executable file of the Hex File Parser application in the folder C# Application\HexFile Parser.exe of the 
+attached .zip file. A GUI screen pops up, as shown in Figure 14. 
+
+===PAGE 34===
+  
+Application note 
+34 
+001-84858 Rev. *O
+ 
+2024-03-06
+ 
+ 
+PSoC™ 4 programming using an external microcontroller (HSSP) 
+ 
+Appendix A: Hex File Parser application 
+ 
+ 
+Figure 14 
+Hex File Parser application 
+1. Select the hex file that needs to be programmed by clicking Open Source P4 Hex File and navigating to the 
+location of the file. 
+2. Select the destination folder location in which the parsed .c and .h files (HexImage.h, HexImage.c) should be 
+created. Click Select Target File Folder to select the folder location. 
+Note: 
+Make sure that there are no files with the names HexImage.h or HexImage.c already in the target 
+folder location. Delete any such files or select a new folder location. A message is displayed to 
+notify you if the same file names are already present in the target folder location. 
+3. After selecting the hex file and the target folder location, click Parse Hex File to generate the .c and .h files. 
+After parsing is complete, a message is displayed. 
+ 
+Adding the generated files to PSoC™ Creator example project 
+To add the generated HexImage.c and HexImage.h files to the PSoC™ Creator example project provided with 
+this application note, follow the steps in this section. They are required if you need to program a hex file into a 
+target device using PSoC™ 5LP as a host programmer. These steps apply to the project A_Hssp_Programmer 
+and B_Hssp_Pioneer for PSoC™ 4 HSSP. 
+1. Select the Target File Folder location in the GUI, as shown in Figure 14. This is the folder in which the main.c 
+file of the project is located. 
+2. After the HexImage.c and HexImage.h files have been generated in the previous location, add those files to 
+the project workspace in PSoC™ Creator by clicking Add Existing Item in Workspace Explorer, as shown in 
+Figure 15. 
+
+===PAGE 35===
+  
+Application note 
+35 
+001-84858 Rev. *O
+ 
+2024-03-06
+ 
+ 
+PSoC™ 4 programming using an external microcontroller (HSSP) 
+ 
+Appendix A: Hex File Parser application 
+ 
+ 
+Figure 15 
+Adding files to PSoC™ Creator project 
+3. After these files are selected, the Workspace Explorer window appears as shown in Figure 16: 
+ 
+ 
+Figure 16 
+Project workspace showing HexImage.c and HexImage.h files 
+If you need to replace these files in the project with those corresponding to a different hex file, delete the 
+existing files from the Workspace Explorer and project folder by right-clicking and deleting the files. Then follow 
+steps 1 through Figure 15 to add the new files to the project. 
+
+===PAGE 36===
+  
+Application note 
+36 
+001-84858 Rev. *O
+ 
+2024-03-06
+ 
+ 
+PSoC™ 4 programming using an external microcontroller (HSSP) 
+ 
+Appendix A: Hex File Parser application 
+13.2.1 
+Using the HexImage.c, HexImage.h files for the PSoC™ 4xxxL/ PSoC™ 
+41x8_BLE/ 42x8_BLE/ 41XXS plus family devices:  
+1. The HSSP code examples use a PSoC™ 5LP device as a host programmer to program the target PSoC™ 
+4device. Because the HSSP algorithm in the host PSoC™ 5LP will consume a portion of its 256 KB Flash 
+memory, the entire hex file data of larger flash memory devices, like the devices belonging to the 256 KB 
+PSoC™ 4xxxL/PSoC™ 41x8_BLE/42x8_BLE families, cannot be stored in the flash memory of the host 
+PSoC™ 5LP.  
+2. In B_HSSP_Pioneer project, the entire 128 KB of PSoC™ 41xxS Plus device cannot be stored in the onboard 
+PSoC™ 5 of CY8CKIT-159 as it uses KitProg2 which has dual application image bootloading.  
+3. To meet the code size requirements, the programming data corresponding to the last few flash rows is 
+deleted from the HexImage.c and HexImage.h files. The corresponding logic has also been incorporated in 
+the HEX_ReadRowData(…) function in the DataFetch.c file. The changes done are listed below. See the 
+project code for viewing the exact changes.  
+4. In the HexImage.h file, the number of flash rows in the array declaration is reduced by 256 by editing the 
+array declaration as below:  
+extern unsigned char const 
+flashData_HexFile[(NUMBER_OF_FLASH_ROWS_HEX_FILE -     
+256)][FLASH_ROW_BYTE_SIZE_HEX_FILE]; 
+The choice of 256 rows was arrived so that the code size of the project fits the host PSoC™ 5LP flash memory 
+capacity for all target devices. 
+5. In the HexImage.c file, the last 256 flash rows are deleted from the definition of the array 
+flashData_HexFile[][] corresponding to the changes done in the array declaration in the 
+HexImage.h file. 
+6. In the definition of the function HEX_ReadRowData (…) in the DataFetch.c file, the entire flash row data is 
+loaded with zero in the case of the flash row number being in the last 256 rows of the target device.   
+ 
+
+===PAGE 37===
+  
+Application note 
+37 
+001-84858 Rev. *O
+ 
+2024-03-06
+ 
+ 
+PSoC™ 4 programming using an external microcontroller (HSSP) 
+ 
+Appendix B: Status codes for SROM request 
+14 
+Appendix B: Status codes for SROM request 
+All programming-related operations are implemented as system call functions. They are executed out of the 
+SROM in the privileged mode of operation. 
+You have no access to read or modify the SROM code. The DAP or the Cortex-M0 CPU requests the system call 
+by writing the function opcode and function parameters to certain registers and then requesting the SROM to 
+execute the function. Based on the function opcode, the SROM executes the corresponding system call from its 
+memory and updates the function execution status in a register. The DAP or the CPU should read this status 
+register for the pass/fail result of the function execution. 
+When SROM_SYSREQ_BIT (bit 31) and SROM_PRIVILEGED_BIT (bit 28) of the CPUSS_SYSREQ register are 
+cleared, that indicates the completion of the system call. The CPUSS_SYSARG register is read to check the 
+success or failure status of the system call. 
+If the 32-bit value read from the register is 0xAXXXXXXX (X denotes don’t care values), the system call was 
+successful. If the value read from the register is in the form 0xF00000YY, it indicates failure, and YY indicates the 
+reason for failure. Table 12 shows the list of error codes. 
+For more details, see the “Nonvolatile Memory Programming” chapters of the respective PSoC™ 4 architecture 
+reference manuals listed in the References section. 
+Table 12 
+Error status codes and reason for failure 
+Status code 
+(32-Bit Value in 
+CPUSS_SYSARG 
+Register) 
+Description 
+0xAXXXXXXX 
+Success. The value “X” denotes the “don’t care” value, which contains 0 as 
+returned by the SROM unless the API returns the parameter directly to the 
+CPUSS_SYSARG register. 
+0x F0000001 
+Invalid Chip Protection Mode: This API is not available during the current chip 
+protection mode. 
+0x F0000003 
+Invalid Page Latch Address: The address within the page latch buffer is either out 
+of bounds or the size provided is too large for the page address. 
+0x F0000004 
+Invalid Address: The row ID or byte address provided is outside the available 
+memory. 
+0x F0000005 
+Row Protected: The row ID provided is that of a protected row. 
+0x F0000006 
+SRAM Address Invalid: The SRAM address is out of bounds. 
+0x F0000007 
+Resume Completed: All non-blocking APIs have been completed. The resume API 
+cannot be called until the next non-blocking API. 
+0x F0000008 
+Pending Resume: A non-blocking API was initiated, and it must be completed by 
+calling the resume API before any other APIs may be called. 
+0x F0000009 
+System Call Still In Progress: A resume or non-blocking API is still in progress. The 
+SPC ISR must fire before attempting the next resume. 
+0x F000000A 
+Checksum Zero Failed: The calculated checksum was not zero. 
+0x F000000B 
+Invalid Opcode: The opcode is not a valid API opcode. 
+0x F000000C 
+Key Opcode Mismatch; The opcode provided does not match key1 and key2. 
+0x F000000E 
+Invalid Start Address: The start address is greater than the end address provided. 
+
+===PAGE 38===
+  
+Application note 
+38 
+001-84858 Rev. *O
+ 
+2024-03-06
+ 
+ 
+PSoC™ 4 programming using an external microcontroller (HSSP) 
+ 
+Appendix B: Status codes for SROM request 
+Status code 
+(32-Bit Value in 
+CPUSS_SYSARG 
+Register) 
+Description 
+0xF0000012 
+Invalid Flash Clock: The CY8C40xx family of devices must set the IMO to 48 MHz 
+and the HF clock source to the IMO clock before write/erase operations. 
+ 
+
+===PAGE 39===
+  
+Application note 
+39 
+001-84858 Rev. *O
+ 
+2024-03-06
+ 
+ 
+PSoC™ 4 programming using an external microcontroller (HSSP) 
+ 
+Appendix C: Bit field definitions of HSSP Error Status register 
+15 
+Appendix C: Bit field definitions of HSSP Error Status register 
+The HSSP Error Status Register contains the status of the current HSSP operation. When any of the top-level 
+steps in the HSSP application returns a failure status, the ReadHsspErrorStatus() function is called from 
+the main application code to get the details of the error. This function returns the contents of this register. See 
+Figure 2 for the bit fields returned by this function. 
+For a successful HSSP operation, all bits except bit 0 of this 8-bit register must be zero. If bit 0 is set, it indicates 
+that the SWD packet received an OK ACK, as Table 13 shows. 
+ 
+Bits[2:0] – SWD acknowledge response (SWD ACK [2:0]) 
+This is the 3-bit acknowledgment response for an SWD packet sent by the target device to the host 
+programmer. The possible ACK codes are listed:  
+Table 13 
+SWD ACK response codes 
+ACK[2:0] 
+ACK response 
+meaning 
+Description 
+001 
+OK (SUCCESS) 
+This means that a previous SWD transaction was successful. 
+010 
+WAIT 
+This error code indicates that the target has returned five WAIT ACK 
+responses consecutively. 
+100 
+FAULT 
+This error code indicates that there is a parity error in the 4-byte data 
+packet sent by the host during the previous SWD write packet. 
+Any other 
+code 
+Undefined code 
+Treat this as a FAULT response. 
+All the responses except the OK ACK response require that the host abort the HSSP operation and restart from 
+the first step. Even for an OK ACK, the rest of the bit fields (bits 3 to 6) in the status register in Figure 2 should 
+not be set. If any of the other bit fields are set even with the OK ACK, the HSSP operation must be aborted and 
+restarted. 
+WAIT ACK is received if the host programmer tries to clock SWDCK at a frequency higher than the maximum 
+specified value of SWDCK in the programming specifications. 
+ 
+Bit 3 – SWD Read Data Parity error 
+The host programmer sets this bit if a parity error occurs in the data received from the target device. The host 
+must abort the HSSP operation and try again. 
+ 
+Bit 4 – Port Acquire Timeout 
+This bit is set if the SWD packets that are part of acquiring the target device (Step 1. The 
+DeviceAcquire()function in the ProgrammingSteps.c file) are not completed successfully. If this bit is set, 
+the HSSP operation must be aborted and retried. 
+There are two possible causes for this timeout error: Either the hardware connection fails between the host 
+programmer and the target device, or the host programmer fails to meet the timing requirements to enter the 
+target device programming mode. 
+For details on the timing requirements to enter the PSoC™ 4 programming mode, see “Step 1: Acquire Chip” in 
+the programming specifications document of the respective device listed in the References section. 
+
+===PAGE 40===
+  
+Application note 
+40 
+001-84858 Rev. *O
+ 
+2024-03-06
+ 
+ 
+PSoC™ 4 programming using an external microcontroller (HSSP) 
+ 
+Appendix C: Bit field definitions of HSSP Error Status register 
+ 
+Bit 5 – SROM Polling Timeout error 
+Flash programming in PSoC™ 4 is done by using SROM APIs. This bit is set when the PollSromStatus() 
+function returns an error status. The CPUSS_SYSREQ register is polled for the status code for 1 second. This bit 
+is set if the time exceeds 1 second or if the status code returned by this function corresponds to FAILURE. This 
+function is called in all the HSSP steps to read the status of SROM system requests. 
+If this bit is set, the host programmer must call the ReadSromStatus() function in ProgrammingSteps.h to 
+read and display the value of the status code returned during polling. 
+For more details on SROM status codes, see Appendix B: Status codes for SROM request. 
+ 
+Bit 6 – Verification Failure 
+This error bit, which is set in multiple steps, can fail in verification for multiple reasons, as shown in Table 14. 
+Table 14 
+Verification errors – steps and reasons 
+Error step 
+Error 
+Reason for error 
+Device Acquire (step 1) 
+Device ID Verification 
+Error 
+IDCODE returned by device does not match the Cortex-
+M0 DAP ID (0x0BB11477). 
+Verify Silicon ID (step 2) 
+Silicon ID Verification 
+Error 
+Silicon ID information in the hex file does not match 
+the Silicon ID read from the target device. 
+Verify Flash (step 6) 
+Flash Data Verification 
+Error 
+Flash data does not match the data in the hex file. 
+Verify Protection Settings 
+(step 7)  
+Flash Protection Data 
+Verification Error 
+Row protection data or chip protection data read from 
+the silicon does not match the hex file data. 
+Verify Checksum (step 9) 
+Checksum Verification 
+Error 
+Checksum value of the flash data in the target device 
+does not match the checksum data in the hex file. 
+It is clear from the previous conditions that bit 6 can be set in many verification error cases. Based on the step 
+in which the bit is set, you can infer the cause of the verification failure. For example, if the bit is set in the 
+“Verify Silicon ID” step, the host programmer application can determine that the error is due to the mismatch 
+of the silicon ID.  
+ 
+Bit 7 – Transition error 
+This bit is set when the chip protection settings read from the chip and the chip protection settings stored in 
+the hex file indicate a wrong transition. 
+See “Appendix A. Chip-Level Protection” of the programming specifications document of the respective device 
+listed in the References section to learn about protection modes and the state diagram for valid and invalid 
+transitions. 
+
+===PAGE 41===
+  
+Application note 
+41 
+001-84858 Rev. *O
+ 
+2024-03-06
+ 
+ 
+PSoC™ 4 programming using an external microcontroller (HSSP) 
+ 
+Appendix D: HSSP functions 
+16 
+Appendix D: HSSP functions 
+The following tables list the public functions defined in each layer of the HSSP firmware architecture. These 
+functions are used to communicate between the layers of the HSSP firmware, as shown in Figure 1. 
+Table 15 
+Functions in SWD_PhysicalLayer.h 
+Function  
+Description 
+SetSwdckHigh() 
+Sets the host SWDCK pin HIGH. 
+SetSwdioHigh() 
+Sets the host SWDIO pin HIGH. 
+SetXresHigh() 
+Sets the host XRES pin HIGH. 
+SetSwdckLow() 
+Sets the host SWDCK pin LOW. 
+SetSwdioLow() 
+Sets the host SWDIO pin LOW. 
+SetXresLow() 
+Sets the host XRES pin LOW. 
+SetSwdckCmosOutput() 
+Configures the host SWDCK pin for CMOS output drive mode. 
+SetSwdioCmosOutput() 
+Configures the host SWDIO pin for CMOS output drive mode. 
+SetXresCmosOutput() 
+Configures the host XRES pin for CMOS output drive mode. 
+SetSwdckHizInput() 
+Configures the host SWDCK pin for High-Z digital input drive mode. 
+SetSwdioHizInput() 
+Configures the host SWDIO pin for High-Z digital input drive mode. 
+SetXresHizInput() 
+Configures the host XRES pin for High-Z digital input drive mode. 
+ReadSwdio() 
+Returns the current state of the SWDIO input pin. 
+ 
+Table 16 
+Functions in SWD_PacketLayer.h 
+Function  
+Description 
+Swd_WritePacket() 
+Sends an SWD write packet. This function operates on the global variables 
+swd_PacketHeader, swd_PacketAck, and swd_PacketData[]. 
+Swd_ReadPacket() 
+Sends a single SWD read packet. This function operates on the global 
+variables swd_PacketHeader, swd_PacketAck, and swd_PacketData[]. This 
+function is used for reading from a specific address. 
+SwdLineReset() 
+Resets the SWD line by sending 51 SWDCK clock cycles with SWDIO line 
+HIGH. Used to acquire the debug access port (DAP) during step 1 of 
+programming. 
+ 
+Table 17 
+Functions in SWD_UpperPacketLayer.h 
+Function  
+Description 
+Read_DAP() 
+Reads a 32-bit data from the specific DAP register and writes it to 
+Swd_PacketData().This function uses the Swd_ReadPacket() 
+function to read the data. 
+Write_DAP() 
+Writes a 32-bit data to the specific DAP register. This function uses the 
+Swd_WritePacket() function to write the data. 
+Read_IO() 
+Reads a 32-bit data from the specified address of the CPU address space. 
+This function is implemented by using the Read_DAP() and 
+Write_DAP() functions. Returns “true” if all SWD transactions 
+succeeded (ACKed). 
+
+===PAGE 42===
+  
+Application note 
+42 
+001-84858 Rev. *O
+ 
+2024-03-06
+ 
+ 
+PSoC™ 4 programming using an external microcontroller (HSSP) 
+ 
+Appendix D: HSSP functions 
+Function  
+Description 
+Write_IO() 
+Writes a 32-bit data into the specified address of the CPU address space. 
+This function is implemented by using the Write_DAP() function. 
+Returns “true” if all SWD transactions succeeded. 
+ 
+Table 18 
+Function in Timeout.h 
+Function  
+Description 
+DelayHundredUs() 
+Introduces a delay of 100 µs to generate an active LOW pulse signal lasting 
+for 100 µs on the XRES pin. 
+ 
+Table 19 
+Functions in DataFetch.h 
+Function  
+Description 
+HEX_ReadSiliconId() 
+Copies the device silicon ID data from the HexImage.c file to an 
+indicated destination array. 
+HEX_ReadRowData() 
+Copies the flash row data from the HexImage.c file to an indicated 
+destination array. The flash row number is also passed as a 
+parameter to this function. 
+HEX_ReadRowProtectionData() Copies the flash row protection data from the HexImage.c file to an 
+indicated destination array. The byte size of the protection data is 
+also passed as a parameter to this function. 
+HEX_ReadChipProtectionData Copies the chip protection data from the HexImage.c file to an 
+indicated destination. 
+HEX_ReadChecksumData() 
+Copies the checksum data from the HexImage.c file to an indicated 
+destination. 
+GetFlashRowCount() 
+Returns the total number of flash rows in the target device from the 
+HexImage.c file. 
+ 
+Table 20 
+Functions in ProgrammingSteps.h 
+Function  
+Description 
+DeviceAcquire()  
+Enters the programming mode and acquires the target device. 
+VerifySiliconId() 
+Verifies whether the silicon ID of the target device and the hex file 
+match. 
+EraseAllFlash() 
+Erases the entire flash memory of the target device, including the 
+flash protection data. 
+ChecksumPrivileged() 
+Calculates the checksum of the privileged data in flash. 
+ProgramFlash() 
+Programs the flash memory of the target device. 
+VerifyFlash() 
+Verifies whether the flash data programmed to the target device 
+matches the hex file flash data. 
+ProgramProtectionSettings() Programs the row protection data and chip protection data to the 
+target device. 
+VerifyProtectionSettings() Verifies whether the row protection data and chip protection data 
+programmed to the target device matches the data in the hex file. 
+
+===PAGE 43===
+  
+Application note 
+43 
+001-84858 Rev. *O
+ 
+2024-03-06
+ 
+ 
+PSoC™ 4 programming using an external microcontroller (HSSP) 
+ 
+Appendix D: HSSP functions 
+Function  
+Description 
+VerifyChecksum() 
+Verifies whether the checksum data read from the target device 
+matches the hex file checksum data. 
+ExitProgrammingMode() 
+Exits the target device programming mode by generating an active 
+LOW pulse signal on the XRES pin. 
+ReadHsspErrorStatus() 
+Returns the error status of the HSSP operation. 
+ReadSromStatus() 
+Returns the CPUSS_SYSARG status register value in the case of an 
+SROM polling timeout error condition. 
+
+===PAGE 44===
+ 
+Application note 
+44 
+001-84858 Rev. *O
+ 
+2024-03-06
+ 
+ 
+PSoC™ 4 programming using an external microcontroller (HSSP) 
+ 
+References 
+References 
+ 
+Application notes 
+• AN73054 – PSoC™ 3 / PSoC™ 5LP programming using an external microcontroller (HSSP) 
+• AN44168 – PSoC™ 1 Device Programming using External Microcontroller (HSSP) 
+ 
+Code example 
+Modus Toolbox™ 
+ 
+Programming specifications 
+CY8C4XXX, CYBLXXXX Programming specifications 
+ 
+Architecture reference manuals 
+• PSoC™ 4000 family: PSoC™ 4 architecture reference manual 
+• PSoC™ 4100 and 4200 Family: PSoC™ 4 architecture reference manual 
+• PSoC™ 4100M/4200M Family: PSoC™ 4 architecture reference manual 
+• PSoC™ 41X7_BLE/42X7_BLE Family: PSoC™ 4 BLE architecture reference manual 
+• PSoC™ 4100S and PSoC™ 4100S Plus: PSoC™ 4 architecture reference manual 
+• PSoC™ 4000S: PSoC™ 4 architecture reference manual 
+• PSoC™ 4100PS: PSoC™ 4 architecture reference manual 
+ 
+Register reference manuals 
+ 
+Training videos 
+ 
+ 
+
+===PAGE 45===
+ 
+Application note 
+45 
+001-84858 Rev. *O
+ 
+2024-03-06
+ 
+ 
+PSoC™ 4 programming using an external microcontroller (HSSP) 
+ 
+Revision history 
+Revision history 
+Document 
+revision 
+Date 
+Description of changes 
+** 
+2013-05-14 
+New Application Note for HSSP applications on PSoC™ 4 
+*A 
+2013-07-22 
+Removed submit document feedback link 
+*B 
+2013-11-05 
+Updated associated project 
+*C 
+2013-12-17 
+Added information on CY8C40xx family 
+*D 
+2014-04-15 
+Updated projects for PSoC™ Creator 3.0 SP1 
+Completing Sunset Review 
+*E 
+2015-03-04 
+Updated for PSoC™ 4xxxM family 
+*F 
+2015-05-19 
+Updated for the PSoC™ 4xx7_BL family 
+Added Timeout for acquiring device 
+*G 
+2015-08-24 
+Updated the C# application to work with hex files of all the devices in 
+the supported families 
+Added sections on Power cycle mode programming, Tips and Tricks for 
+debugging HSSP issues 
+Projects updated to add support for PSoC™ 41xx8_BLE/42xx8_BLE 
+families 
+*H 
+2015-09-16 
+Updated for the PSoC™ 4xxxL family 
+Updated the example projects to support CY8CKIT-046 
+*I 
+2015-12-30 
+Updated the example projects to PSoC™ Creator 3.3 SP1 
+*J 
+2017-03-23 
+AN updated to support PSoC™ 4000S, PSoC™ 4100S and PSoC Analog 
+Coprocessor 
+Modified Figure 3 to include PSoC™ 4000S, PSoC™ 4100S and PSoC 
+Analog Coprocessor  
+Modified table 9 to include PSoC™ 4000S, PSoC™ 4100S and PSoC 
+Analog Coprocessor  
+Modified section 5.3 to calculate XRES_PULSE_100US 
+Modified Section 9.2 to update the path for Bootloader hex files and 
+removed mention of the default LED blinking project 
+Added Section 9.3 for Kits with Onboard PSoC™ Programmer (KitProg2) 
+Updated related documentation section 
+Updated template  
+*K 
+2017-11-01 
+Updated template 
+Updated with the information of PSoC™ 4100S Plus devices 
+Updated with the information of PSoC™ 4100S Plus devices 
+Updated with the information of Architecture TRM of PSoC™ 4100S Plus 
+devices 
+*L 
+2018-02-02 
+Updated to modify PSoC™ 4100S Plus timeout constraint parameter.  
+Updated with pin assignments for PSoC™ 4100S Plus. 
+Updated Section 13.2.1 to include PSoC™ 4100S Plus information.  
+Updated projects and hex file parser to support PSoC™ 4100S Plus. 
+*M 
+2018-08-30 
+Updated for PSoC™ 4100PS 
+
+===PAGE 46===
+ 
+Application note 
+46 
+001-84858 Rev. *O
+ 
+2024-03-06
+ 
+ 
+PSoC™ 4 programming using an external microcontroller (HSSP) 
+ 
+Revision history 
+Document 
+revision 
+Date 
+Description of changes 
+*N 
+2021-03-23 
+Updated to Infineon template 
+*O 
+2024-03-06 
+Fixed broken links 
+Deleted section For CY8CKIT-038 PSoC™ 4 Development Kit 
+Updated References section 
+Updated Introduction section 
+
+===PAGE 47===
+ 
+ 
+ 
+ 
+Important notice 
+Warnings 
+Edition 2024-03-06 
+Published by 
+Infineon Technologies AG 
+81726 Munich, Germany 
+© 2024 Infineon Technologies AG. 
+All Rights Reserved. 
+Do you have a question about this 
+document? 
+Email: erratum@infineon.com 
+Document reference 
+001-84858 Rev. *O 
+The information contained in this application note 
+is given as a hint for the implementation of the 
+product only and shall in no event be regarded as a 
+description or warranty of a certain functionality, 
+condition or quality of the product. Before 
+implementation of the product, the recipient of this 
+application note must verify any function and other 
+technical information given herein in the real 
+application. 
+Infineon 
+Technologies 
+hereby 
+disclaims any and all warranties and liabilities of 
+any kind (including without limitation warranties of 
+non-infringement of intellectual property rights of 
+any third party) with respect to any and all 
+information given in this application note.  
+ 
+The data contained in this document is exclusively 
+intended for technically trained staff. It is the 
+responsibility of customer’s technical departments 
+to evaluate the suitability of the product for the 
+intended application and the completeness of the 
+product information given in this document with 
+respect to such application. 
+Due to technical requirements products may contain 
+dangerous substances. For information on the types 
+in question please contact your nearest Infineon 
+Technologies office. 
+ 
+Except as otherwise explicitly approved by Infineon 
+Technologies in a written document signed by 
+authorized representatives of Infineon Technologies, 
+Infineon Technologies’ products may not be used in 
+any applications where a failure of the product or any 
+consequences of the use thereof can reasonably be 
+expected to result in personal injury. 
+Trademarks 
+All referenced product or service names and trademarks are the property of their respective owners. 
+Disclaimer 
+

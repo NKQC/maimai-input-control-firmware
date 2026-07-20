@@ -1,0 +1,1687 @@
+import { Button, ComboBox, VerticalBox, HorizontalBox, GroupBox, ListView, CheckBox, SpinBox, LineEdit, ScrollView, TabWidget } from "std-widgets.slint";
+
+// ============================================================================
+// 配置页 (#6e-2)
+// ============================================================================
+
+// 一条配置行的展平数据,由 main.rs::build_config_rows 从 ConfigEntry 转换而来。
+// kind: 0=Bool(CheckBox) 1=Number(SpinBox) 2=Enum(ComboBox,当前仅 mode.work)
+//       3=String(LineEdit)
+// type_code 沿用 proto::config::ConfigValueType 编码(Bool=0..String=6),
+// 用于 main.rs 回调里按原类型重建 CfgValue。
+export struct ConfigRow {
+    key: string,
+    label: string,
+    group: string,
+    kind: int,
+    type_code: int,
+    bool_val: bool,
+    num_val: float,
+    min_val: float,
+    max_val: float,
+    has_range: bool,
+    enum_index: int,
+    str_val: string,
+}
+
+// 注:属性名不能叫 `row`,该名字与 GridLayout 子元素自动注入的 row/col
+// 附加属性冲突(编译报 "Cannot override property 'row'")。用 `entry` 代替。
+component ConfigRowItem inherits Rectangle {
+    in property <ConfigRow> entry;
+
+    callback set_bool(string, bool);
+    callback set_number(string, float);
+    callback set_enum(string, int);
+    callback set_string(string, string);
+
+    vertical-stretch: 0;
+    clip: true;
+
+    HorizontalBox {
+        padding: 0px;
+        spacing: 8px;
+
+        Text {
+            text: root.entry.label;
+            min-width: 160px;
+            vertical-alignment: center;
+        }
+
+        if root.entry.kind == 0: CheckBox {
+            checked: root.entry.bool_val;
+            toggled => {
+                root.set_bool(root.entry.key, self.checked);
+            }
+        }
+
+        if root.entry.kind == 1: SpinBox {
+            minimum: Math.round(root.entry.min_val);
+            maximum: Math.round(root.entry.max_val);
+            value: Math.round(root.entry.num_val);
+            edited(v) => {
+                root.set_number(root.entry.key, v);
+            }
+        }
+
+        if root.entry.kind == 2: ComboBox {
+            model: ["Serial", "HID"];
+            current-index: root.entry.enum_index;
+            selected(_) => {
+                root.set_enum(root.entry.key, self.current-index);
+            }
+        }
+
+        if root.entry.kind == 3: LineEdit {
+            text: root.entry.str_val;
+            edited(v) => {
+                root.set_string(root.entry.key, v);
+            }
+        }
+    }
+}
+
+// 展示 `rows` 中 group == group_title 的条目。过滤在 for 循环体内按条件
+// 渲染(Slint 不支持数组推导式 filter 语法),故传入完整 rows,由每个
+// section 各自筛选自己关心的组。
+component ConfigGroupSection inherits GroupBox {
+    in property <string> group_title;
+    in property <[ConfigRow]> rows;
+
+    callback set_bool(string, bool);
+    callback set_number(string, float);
+    callback set_enum(string, int);
+    callback set_string(string, string);
+
+    title: root.group_title;
+
+    VerticalBox {
+        padding: 0px;
+        spacing: 4px;
+
+        for row in root.rows: ConfigRowItem {
+            entry: row;
+            // Slint 的 `for` 不支持直接接 `if` 元素(该组合在语法上不合法),
+            // 故按行自身是否属于当前分组来控制显隐与占位高度,而不是从
+            // 数据源过滤元素列表。
+            visible: row.group == root.group_title;
+            height: row.group == root.group_title ? 34px : 0px;
+            set_bool(key, v) => { root.set_bool(key, v); }
+            set_number(key, v) => { root.set_number(key, v); }
+            set_enum(key, v) => { root.set_enum(key, v); }
+            set_string(key, v) => { root.set_string(key, v); }
+        }
+    }
+}
+
+component ConfigPage inherits Rectangle {
+    in property <[ConfigRow]> rows;
+
+    callback cfg_set_bool(string, bool);
+    callback cfg_set_number(string, float);
+    callback cfg_set_enum(string, int);
+    callback cfg_set_string(string, string);
+    callback cfg_load();
+    callback cfg_save();
+    callback cfg_reset();
+
+    VerticalBox {
+        padding: 8px;
+        spacing: 8px;
+
+        HorizontalBox {
+            padding: 0px;
+            spacing: 8px;
+
+            Button {
+                text: "加载";
+                clicked => { root.cfg_load(); }
+            }
+            Button {
+                text: "保存到设备";
+                clicked => { root.cfg_save(); }
+            }
+            Button {
+                text: "恢复默认";
+                clicked => { root.cfg_reset(); }
+            }
+        }
+
+        ScrollView {
+            VerticalBox {
+                padding: 0px;
+                spacing: 8px;
+
+                ConfigGroupSection {
+                    group_title: "通信";
+                    rows: root.rows;
+                    set_bool(k, v) => { root.cfg_set_bool(k, v); }
+                    set_number(k, v) => { root.cfg_set_number(k, v); }
+                    set_enum(k, v) => { root.cfg_set_enum(k, v); }
+                    set_string(k, v) => { root.cfg_set_string(k, v); }
+                }
+
+                ConfigGroupSection {
+                    group_title: "模式";
+                    rows: root.rows;
+                    set_bool(k, v) => { root.cfg_set_bool(k, v); }
+                    set_number(k, v) => { root.cfg_set_number(k, v); }
+                    set_enum(k, v) => { root.cfg_set_enum(k, v); }
+                    set_string(k, v) => { root.cfg_set_string(k, v); }
+                }
+
+                ConfigGroupSection {
+                    group_title: "灯效";
+                    rows: root.rows;
+                    set_bool(k, v) => { root.cfg_set_bool(k, v); }
+                    set_number(k, v) => { root.cfg_set_number(k, v); }
+                    set_enum(k, v) => { root.cfg_set_enum(k, v); }
+                    set_string(k, v) => { root.cfg_set_string(k, v); }
+                }
+            }
+        }
+    }
+}
+
+// ============================================================================
+// 绑区页 (#6f)
+// ============================================================================
+
+// 一个绑区槽位的展平数据,由 main.rs::build_zone_cells 从
+// AppController::binding_channel_of()/telem_latest() 转换而来。34 个
+// (index 0..33)。ring: 分组标签("A".."E"),沿用既有分组约定。
+// channel: 绑定的物理通道索引(0..35),-1=未映射。
+// touched: 绑定通道当前是否被触摸(status bit0),驱动几何图实时高亮。
+// cx/cy: 该分区圆心在画布 0..1000 归一化坐标系下的位置,由 main.rs 按
+// maimai 圆形分区几何(A/D 外环,B/E 内环,C 中心)预先算好回填,UI 侧
+// 只管按比例绘制,不在 Slint 里做三角函数计算(更稳)。
+export struct ZoneCell {
+    index: int,
+    label: string,
+    ring: string,
+    channel: int,
+    touched: bool,
+    cx: float,
+    cy: float,
+}
+
+// 几何绘制的圆形 maimai 分区图:纯 Slint Rectangle/Text 绘制,不引用任何
+// 位图资源。三个同心圆环仅作视觉参考(纯描边),34 个分区各画一个小圆
+// (按 cell.cx/cy 绝对定位)+ 分区名文字,点击圆选中。
+component BindingCanvas inherits Rectangle {
+    in property <[ZoneCell]> zones: [];
+    in property <int> selected_zone: -1;
+
+    callback zone_selected(int);
+
+    // 固定 360x360:内部是绝对定位子元素(对布局无尺寸贡献),不锁死尺寸时父
+    // HorizontalBox 会把它压扁 → 分区圆挤成一团点不到、选不中。用 min=max 锁死
+    // (Slint 不允许 width 与 min-width 并存,故不写 width/height)。
+    min-width: 360px;
+    max-width: 360px;
+    min-height: 360px;
+    max-height: 360px;
+    horizontal-stretch: 0;
+    background: #15181c;
+    border-radius: 6px;
+    border-width: 1px;
+    border-color: #2a2f36;
+    clip: true;
+
+    // 外环参考线(对齐 A/D 环几何半径 430,同比例缩放到画布)
+    Rectangle {
+        x: parent.width / 2 - 155px;
+        y: parent.height / 2 - 155px;
+        width: 310px;
+        height: 310px;
+        border-radius: 155px;
+        border-width: 1px;
+        border-color: #333a42;
+        background: transparent;
+    }
+    // 内环参考线(对齐 B/E 环几何半径 240)
+    Rectangle {
+        x: parent.width / 2 - 86px;
+        y: parent.height / 2 - 86px;
+        width: 173px;
+        height: 173px;
+        border-radius: 86px;
+        border-width: 1px;
+        border-color: #333a42;
+        background: transparent;
+    }
+    // 中心参考线(对齐 C 区)
+    Rectangle {
+        x: parent.width / 2 - 25px;
+        y: parent.height / 2 - 25px;
+        width: 50px;
+        height: 50px;
+        border-radius: 25px;
+        border-width: 1px;
+        border-color: #333a42;
+        background: transparent;
+    }
+
+    for cell in root.zones: Rectangle {
+        x: parent.width * cell.cx / 1000 - 20px;
+        y: parent.height * cell.cy / 1000 - 20px;
+        width: 40px;
+        height: 40px;
+        border-radius: 20px;
+        border-width: cell.index == root.selected_zone ? 3px : 1px;
+        border-color: cell.index == root.selected_zone ? #4fc3f7 : #55606a;
+        background: cell.touched ? #2b8a3e : #2b3038;
+
+        Text {
+            text: cell.label;
+            color: #ffffff;
+            font-size: 10px;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+
+        TouchArea {
+            clicked => { root.zone_selected(cell.index); }
+        }
+    }
+}
+
+component ZoneListRow inherits Rectangle {
+    in property <ZoneCell> entry;
+    in property <bool> selected;
+
+    callback clicked();
+
+    height: 28px;
+    border-width: selected ? 2px : 1px;
+    border-color: selected ? #4fc3f7 : #33393f;
+    background: selected ? #23303a : #1c2024;
+
+    TouchArea {
+        clicked => { root.clicked(); }
+    }
+
+    HorizontalBox {
+        padding: 4px;
+        spacing: 8px;
+        Text {
+            text: root.entry.label;
+            color: #ffffff;
+            font-weight: 700;
+            min-width: 40px;
+        }
+        Text {
+            text: root.entry.channel >= 0 ? "CH" + root.entry.channel : "未绑定";
+            color: #b0b8c0;
+            min-width: 60px;
+        }
+        Rectangle {
+            width: 8px;
+            height: 8px;
+            border-radius: 4px;
+            background: root.entry.touched ? #2b8a3e : #444444;
+        }
+    }
+}
+
+component ZoneList inherits Rectangle {
+    in property <[ZoneCell]> zones: [];
+    in property <int> selected_zone: -1;
+
+    callback zone_selected(int);
+
+    background: transparent;
+
+    ScrollView {
+        VerticalBox {
+            padding: 0px;
+            spacing: 2px;
+
+            for cell in root.zones: ZoneListRow {
+                entry: cell;
+                selected: cell.index == root.selected_zone;
+                clicked => { root.zone_selected(cell.index); }
+            }
+        }
+    }
+}
+
+component BindingDetail inherits GroupBox {
+    in property <int> selected_zone: -1;
+    in property <string> selected_zone_label: "";
+    in property <int> selected_channel: -1;
+
+    callback channel_set(int);
+    callback touch_start();
+    callback unbind();
+
+    title: root.selected_zone >= 0 ? "区 " + root.selected_zone_label + " 详情" : "详情";
+
+    VerticalBox {
+        padding: 4px;
+        spacing: 6px;
+
+        if root.selected_zone >= 0: VerticalBox {
+            padding: 0px;
+            spacing: 6px;
+
+            Text {
+                text: root.selected_channel >= 0 ? ("当前绑定: CH" + root.selected_channel) : "当前绑定: 未绑定";
+                color: #b0b8c0;
+            }
+
+            HorizontalBox {
+                padding: 0px;
+                spacing: 8px;
+                Text {
+                    text: "通道:";
+                    vertical-alignment: center;
+                }
+                SpinBox {
+                    minimum: 0;
+                    maximum: 35;
+                    value: root.selected_channel >= 0 ? root.selected_channel : 0;
+                    edited(v) => { root.channel_set(v); }
+                }
+            }
+
+            HorizontalBox {
+                padding: 0px;
+                spacing: 8px;
+                Button {
+                    text: "指触绑定";
+                    clicked => { root.touch_start(); }
+                }
+                Button {
+                    text: "清除";
+                    clicked => { root.unbind(); }
+                }
+            }
+        }
+
+        if root.selected_zone < 0: Text {
+            text: "请在左侧图上或列表中选择一个分区";
+            color: #666666;
+            wrap: word-wrap;
+        }
+    }
+}
+
+component BindingPage inherits Rectangle {
+    in property <[ZoneCell]> zones: [];
+    in property <string> bind_status: "";
+    in-out property <int> selected_zone: -1;
+    in property <string> selected_zone_label: "";
+    in property <int> selected_channel: -1;
+
+    callback bind_load();
+    callback zone_selected(int);
+    callback zone_channel_set(int, int);
+    callback bind_touch_start(int);
+    callback zone_unbind(int);
+
+    VerticalBox {
+        padding: 8px;
+        spacing: 8px;
+
+        HorizontalBox {
+            padding: 0px;
+            spacing: 8px;
+
+            Button {
+                text: "从设备加载";
+                clicked => { root.bind_load(); }
+            }
+            Text {
+                text: root.bind_status;
+                vertical-alignment: center;
+                color: #a05a00;
+            }
+        }
+
+        HorizontalBox {
+            padding: 0px;
+            spacing: 12px;
+            vertical-stretch: 1;
+
+            BindingCanvas {
+                zones: root.zones;
+                selected_zone: root.selected_zone;
+                zone_selected(i) => { root.selected_zone = i; root.zone_selected(i); }
+            }
+
+            VerticalBox {
+                padding: 0px;
+                spacing: 8px;
+                horizontal-stretch: 1;
+
+                BindingDetail {
+                    selected_zone: root.selected_zone;
+                    selected_zone_label: root.selected_zone_label;
+                    selected_channel: root.selected_channel;
+                    channel_set(v) => { root.zone_channel_set(root.selected_zone, v); }
+                    touch_start() => { root.bind_touch_start(root.selected_zone); }
+                    unbind() => { root.zone_unbind(root.selected_zone); }
+                }
+
+                GroupBox {
+                    title: "全部绑定列表";
+                    vertical-stretch: 1;
+
+                    ZoneList {
+                        zones: root.zones;
+                        selected_zone: root.selected_zone;
+                        zone_selected(i) => { root.selected_zone = i; root.zone_selected(i); }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ============================================================================
+// 曲线页 (#6g-2)
+// ============================================================================
+
+// 一条参数行的展平数据,由 main.rs::build_param_rows 从
+// AppController::param(ch, pid) 转换而来。
+export struct ParamRow {
+    param_id: int,
+    label: string,
+    value: int,
+}
+
+// ============================================================================
+// 全通道实时状态页
+// ============================================================================
+
+// 单通道实时状态，由 main.rs 每 tick 从 AppController::telem_latest(ch) 构建(36 个)。
+// grid_col/grid_row 和 binding_text 均在 Rust 侧计算，Slint 仅消费明确数据。
+export struct ChannelStatus {
+    index: int,
+    label: string,
+    active: bool,
+    raw: int,
+    diff: int,
+    grid_col: int,
+    grid_row: int,
+    binding_text: string,
+}
+
+component ChannelStatusCell inherits Rectangle {
+    in property <ChannelStatus> entry;
+    in property <bool> selected: false;
+
+    callback activated(int);
+
+    width: 124px;
+    height: 76px;
+    border-width: root.selected ? 2px : 1px;
+    border-color: root.selected ? #4fc3f7 : touch.has-hover ? #6b8191 : #3a434c;
+    // 触摸、选择和 hover 都有区分明确的反馈。
+    background: root.selected ? #203b4a : touch.has-hover ? #242c33 : root.entry.active ? #245f35 : #1a1e22;
+    border-radius: 5px;
+
+    VerticalBox {
+        padding: 5px;
+        spacing: 1px;
+        HorizontalBox {
+            padding: 0px;
+            spacing: 4px;
+            Text {
+                text: root.entry.label;
+                font-weight: 700;
+                color: #ffffff;
+                min-width: 38px;
+            }
+            Text {
+                text: root.entry.active ? "触摸" : "空闲";
+                font-size: 10px;
+                color: root.entry.active ? #d0ffd0 : #85929d;
+            }
+        }
+        Text {
+            text: "raw " + root.entry.raw + "  diff " + root.entry.diff;
+            font-size: 11px;
+            color: #c4ccd3;
+        }
+        Text {
+            text: "逻辑区: " + root.entry.binding_text;
+            font-size: 10px;
+            color: root.entry.binding_text == "未绑定" ? #77828c : #8fd6ff;
+        }
+    }
+
+    touch := TouchArea {
+        clicked => { root.activated(root.entry.index); }
+    }
+}
+
+component AllChannelsPage inherits Rectangle {
+    in property <[ChannelStatus]> channels: [];
+    in property <int> selected_channel: 0;
+    // 由 main.rs 每 tick 从 AppController::telem_samples_per_sec()/telem_scan_period_us() 回填
+    in property <int> sample_rate_hz: 0;
+    in property <int> channel_delay_us: 0;
+
+    callback telem_start();
+    callback telem_stop();
+    callback channel_selected(int);
+
+    VerticalBox {
+        padding: 8px;
+        spacing: 8px;
+
+        HorizontalBox {
+            padding: 0px;
+            spacing: 8px;
+            Button {
+                text: "开始实时";
+                clicked => { root.telem_start(); }
+            }
+            Button {
+                text: "停止";
+                clicked => { root.telem_stop(); }
+            }
+            Text {
+                text: "全 36 通道实时状态；点击卡片进入单通道精调。";
+                vertical-alignment: center;
+                color: #89949e;
+            }
+            Text {
+                text: "采样率 " + root.sample_rate_hz + " Hz  通道延迟 " + root.channel_delay_us + " us";
+                vertical-alignment: center;
+                color: #8fd6ff;
+            }
+        }
+
+        // 6x6 明确网格：定位只读取 Rust 回填的 grid_col/grid_row，完全不依赖循环索引。
+        ScrollView {
+            vertical-stretch: 1;
+            Rectangle {
+                min-width: 768px;
+                min-height: 492px;
+                for cell in root.channels: ChannelStatusCell {
+                    entry: cell;
+                    selected: cell.index == root.selected_channel;
+                    x: cell.grid_col * 128px;
+                    y: cell.grid_row * 82px;
+                    activated(ch) => { root.channel_selected(ch); }
+                }
+            }
+        }
+    }
+}
+
+component CurvesPage inherits Rectangle {
+    // 选中通道(0..35),main.rs 每 tick 读取判断是否变化以决定是否
+    // request_params/重建曲线。
+    in-out property <int> sel_channel: 0;
+    in-out property <bool> show_raw: false;
+    in-out property <bool> show_bsln: false;
+    in-out property <bool> show_diff: true;
+    // CSD 处理模式：0=自动校准, 1=半自动手动。半自动下手动阈值/参数才持久生效。
+    in-out property <int> scan_mode: 0;
+
+    // 由 main.rs::build_curve_paths 回填的 SVG path 命令串,viewbox 1000x1000
+    in property <string> diff_path: "";
+    in property <string> raw_path: "";
+    in property <string> bsln_path: "";
+    // 所有勾选序列共享的纵轴尺度，由 main.rs 计算后回填。
+    in property <float> curve_y_min: 0;
+    in property <float> curve_y_mid: 0;
+    in property <float> curve_y_max: 0;
+    in property <int> curve_point_count: 0;
+
+    // 阈值线在共享纵轴尺度的 viewbox 坐标(0..1000)，由 main.rs 换算回填
+    in property <float> finger_th_y: 500;
+    in property <float> noise_th_y: 500;
+    // 阈值当前值(退化方案:SpinBox 直接编辑,视觉线只读展示)
+    in property <int> finger_th_val: 0;
+    in property <int> noise_th_val: 0;
+
+    in property <[ParamRow]> params: [];
+    in property <string> cp_text: "读取中…";
+
+    callback telem_start();
+    callback telem_stop();
+    callback calibrate();
+    callback baseline_reset();
+    callback measure_cp();
+    // 退化方案:阈值通过 SpinBox 直接编辑值,回调 (param_id, value)
+    callback threshold_set(int, int);
+    callback param_edited(int, int);
+    callback param_apply_all(int, int);
+    // CSD 模式切换(0=全自动,1=半自动) + 从设备捕获当前(自整定)参数为半自动手动起点
+    callback mode_changed(int);
+    callback capture_params();
+
+    VerticalBox {
+        padding: 8px;
+        spacing: 8px;
+
+        HorizontalBox {
+            padding: 0px;
+            spacing: 8px;
+
+            Text {
+                text: "通道:";
+                vertical-alignment: center;
+            }
+            SpinBox {
+                minimum: 0;
+                maximum: 35;
+                value: root.sel_channel;
+                edited(v) => { root.sel_channel = v; }
+            }
+            Button {
+                text: "开始";
+                clicked => { root.telem_start(); }
+            }
+            Button {
+                text: "停止";
+                clicked => { root.telem_stop(); }
+            }
+            CheckBox {
+                text: "RAW";
+                checked: root.show_raw;
+                toggled => { root.show_raw = self.checked; }
+            }
+            CheckBox {
+                text: "BASELINE";
+                checked: root.show_bsln;
+                toggled => { root.show_bsln = self.checked; }
+            }
+            CheckBox {
+                text: "DIFF";
+                checked: root.show_diff;
+                toggled => { root.show_diff = self.checked; }
+            }
+            Button {
+                text: "校准";
+                clicked => { root.calibrate(); }
+            }
+            Button {
+                text: "基线复位";
+                clicked => { root.baseline_reset(); }
+            }
+            Text {
+                text: root.cp_text;
+                vertical-alignment: center;
+                color: #8fd6ff;
+            }
+            Button {
+                text: "测量全部电极电容";
+                clicked => { root.measure_cp(); }
+            }
+        }
+
+        HorizontalBox {
+            padding: 0px;
+            spacing: 8px;
+
+            Text {
+                text: "CSD 模式:";
+                vertical-alignment: center;
+            }
+            ComboBox {
+                model: ["自动校准", "半自动手动"];
+                current-index: root.scan_mode;
+                selected(_) => {
+                    root.scan_mode = self.current-index;
+                    root.mode_changed(self.current-index);
+                }
+            }
+            Button {
+                text: "捕获当前值→手动";
+                clicked => { root.capture_params(); }
+            }
+            Text {
+                text: root.scan_mode == 1 ? "半自动手动：手动阈值/参数生效并可保存" : "自动校准：设备自动更新校准值";
+                vertical-alignment: center;
+                color: root.scan_mode == 1 ? #2b8a3e : #8fd6ff;
+            }
+        }
+
+        HorizontalBox {
+            padding: 0px;
+            spacing: 8px;
+
+            Text {
+                text: "手指阈值:";
+                vertical-alignment: center;
+            }
+            SpinBox {
+                minimum: 0;
+                maximum: 65535;
+                value: root.finger_th_val;
+                edited(v) => { root.threshold_set(1, v); }
+            }
+            Text {
+                text: "噪声阈值:";
+                vertical-alignment: center;
+            }
+            SpinBox {
+                minimum: 0;
+                maximum: 65535;
+                value: root.noise_th_val;
+                edited(v) => { root.threshold_set(2, v); }
+            }
+        }
+
+        Rectangle {
+            min-height: 300px;
+            vertical-stretch: 1;
+            clip: true;
+            background: #101418;
+            border-width: 1px;
+            border-color: #3a3a3a;
+
+            // 绘图区刻意留出左、下边距给纵轴与横轴标记，路径不会遮挡标签。
+            plot := Rectangle {
+                x: 62px;
+                y: 12px;
+                width: parent.width - 74px;
+                height: parent.height - 48px;
+                background: #12181d;
+                border-width: 1px;
+                border-color: #29323a;
+            }
+
+            // 五条横向网格线，所有曲线与阈值使用同一共享尺度。
+            Rectangle { x: plot.x; y: plot.y; width: plot.width; height: 1px; background: #33404a; }
+            Rectangle { x: plot.x; y: plot.y + plot.height * 0.25; width: plot.width; height: 1px; background: #29323a; }
+            Rectangle { x: plot.x; y: plot.y + plot.height * 0.5; width: plot.width; height: 1px; background: #3b4650; }
+            Rectangle { x: plot.x; y: plot.y + plot.height * 0.75; width: plot.width; height: 1px; background: #29323a; }
+            Rectangle { x: plot.x; y: plot.y + plot.height - 1px; width: plot.width; height: 1px; background: #33404a; }
+
+            Path {
+                x: plot.x;
+                y: plot.y;
+                width: plot.width;
+                height: plot.height;
+                viewbox-width: 1000;
+                viewbox-height: 1000;
+                commands: root.bsln_path;
+                stroke: #ffaa00;
+                stroke-width: 2px;
+                visible: root.show_bsln && root.curve_point_count > 0;
+            }
+            Path {
+                x: plot.x;
+                y: plot.y;
+                width: plot.width;
+                height: plot.height;
+                viewbox-width: 1000;
+                viewbox-height: 1000;
+                commands: root.raw_path;
+                stroke: #3399ff;
+                stroke-width: 2px;
+                visible: root.show_raw && root.curve_point_count > 0;
+            }
+            Path {
+                x: plot.x;
+                y: plot.y;
+                width: plot.width;
+                height: plot.height;
+                viewbox-width: 1000;
+                viewbox-height: 1000;
+                commands: root.diff_path;
+                stroke: #33cc33;
+                stroke-width: 2px;
+                visible: root.show_diff && root.curve_point_count > 0;
+            }
+
+            // 阈值线只读展示，数值仍由上方 SpinBox 编辑。
+            Rectangle {
+                x: plot.x;
+                y: plot.y + plot.height * (root.finger_th_y / 1000);
+                width: plot.width;
+                height: 1px;
+                background: #ff4444;
+                visible: root.curve_point_count > 0;
+            }
+            Rectangle {
+                x: plot.x;
+                y: plot.y + plot.height * (root.noise_th_y / 1000);
+                width: plot.width;
+                height: 1px;
+                background: #ffee44;
+                visible: root.curve_point_count > 0;
+            }
+
+            Text {
+                x: 4px;
+                y: plot.y - 7px;
+                width: 54px;
+                height: 16px;
+                text: Math.round(root.curve_y_max);
+                color: #aeb9c2;
+                font-size: 10px;
+                horizontal-alignment: right;
+            }
+            Text {
+                x: 4px;
+                y: plot.y + plot.height * 0.5 - 7px;
+                width: 54px;
+                height: 16px;
+                text: Math.round(root.curve_y_mid);
+                color: #aeb9c2;
+                font-size: 10px;
+                horizontal-alignment: right;
+            }
+            Text {
+                x: 4px;
+                y: plot.y + plot.height - 12px;
+                width: 54px;
+                height: 16px;
+                text: Math.round(root.curve_y_min);
+                color: #aeb9c2;
+                font-size: 10px;
+                horizontal-alignment: right;
+            }
+            Text {
+                x: plot.x;
+                y: parent.height - 28px;
+                text: "较早";
+                color: #7f8c96;
+                font-size: 10px;
+            }
+            Text {
+                x: plot.x + plot.width - 30px;
+                y: parent.height - 28px;
+                text: "现在";
+                color: #7f8c96;
+                font-size: 10px;
+            }
+            Text {
+                x: plot.x + 38px;
+                y: parent.height - 28px;
+                width: plot.width - 76px;
+                text: "样本 " + root.curve_point_count;
+                color: #7f8c96;
+                font-size: 10px;
+                horizontal-alignment: center;
+            }
+            Text {
+                x: plot.x;
+                y: plot.y + plot.height * 0.5 - 10px;
+                width: plot.width;
+                height: 20px;
+                text: "等待遥测数据";
+                color: #7f8c96;
+                font-size: 14px;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+                visible: root.curve_point_count == 0;
+            }
+        }
+
+        GroupBox {
+            title: "通道参数";
+
+            ScrollView {
+                VerticalBox {
+                    padding: 0px;
+                    spacing: 4px;
+
+                    for row in root.params: HorizontalBox {
+                        padding: 0px;
+                        spacing: 8px;
+
+                        Text {
+                            text: row.label;
+                            min-width: 160px;
+                            vertical-alignment: center;
+                        }
+                        SpinBox {
+                            minimum: 0;
+                            maximum: 65535;
+                            value: row.value;
+                            edited(v) => { root.param_edited(row.param_id, v); }
+                        }
+                        Button {
+                            text: "此项应用全部通道";
+                            clicked => { root.param_apply_all(row.param_id, row.value); }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ============================================================================
+// 主页 - 仪表盘 (Phase 1 UI 现代化)
+// ============================================================================
+
+component DashboardPage inherits Rectangle {
+    in property <[string]> device_labels: [];
+    in-out property <int> selected_device: 0;
+    in property <string> conn_status: "未连接";
+    in property <string> device_info_text: "未获取到设备信息";
+    in property <int> sample_rate_hz: 0;
+    in property <int> channel_delay_us: 0;
+    in-out property <int> scan_mode: 0;
+    in property <int> latency_total_us: 0;
+    in property <int> latency_spi_us: 0;
+    in property <int> latency_proc_us: 0;
+    in property <int> latency_usb_us: 0;
+    in property <int> latency_sensor_us: 0;
+    in-out property <bool> measure_latency: false;
+    in property <string> log_text: "";
+
+    callback refresh();
+    callback connect_clicked();
+    callback disconnect_clicked();
+    callback reboot_device();
+    callback reboot_bootloader();
+    callback mode_changed(int);
+    callback latency_measure_toggled(bool);
+
+    background: #15181c;
+
+    ScrollView {
+        VerticalBox {
+            padding: 12px;
+            spacing: 12px;
+
+            HorizontalBox {
+                padding: 0px;
+                spacing: 12px;
+
+                Rectangle {
+                    border-radius: 8px;
+                    background: #23282e;
+                    min-height: 190px;
+                    horizontal-stretch: 1;
+
+                    VerticalBox {
+                        padding: 12px;
+                        spacing: 8px;
+
+                        Text {
+                            text: "设备连接";
+                            font-weight: 700;
+                            color: #ffffff;
+                        }
+
+                        HorizontalBox {
+                            padding: 0px;
+                            spacing: 6px;
+                            ComboBox {
+                                model: root.device_labels;
+                                current-index <=> root.selected_device;
+                                horizontal-stretch: 1;
+                            }
+                            Button {
+                                text: "刷新";
+                                clicked => { root.refresh(); }
+                            }
+                        }
+
+                        HorizontalBox {
+                            padding: 0px;
+                            spacing: 6px;
+                            Button {
+                                text: "连接";
+                                clicked => { root.connect_clicked(); }
+                            }
+                            Button {
+                                text: "断开";
+                                clicked => { root.disconnect_clicked(); }
+                            }
+                        }
+
+                        HorizontalBox {
+                            padding: 0px;
+                            spacing: 6px;
+                            Button {
+                                text: "重启设备";
+                                clicked => { root.reboot_device(); }
+                            }
+                            Button {
+                                text: "进烧录模式";
+                                clicked => { root.reboot_bootloader(); }
+                            }
+                        }
+
+                        Text {
+                            text: "状态: " + root.conn_status;
+                            color: #b0b8c0;
+                            wrap: word-wrap;
+                        }
+                    }
+                }
+
+                Rectangle {
+                    border-radius: 8px;
+                    background: #23282e;
+                    min-height: 190px;
+                    horizontal-stretch: 1;
+
+                    VerticalBox {
+                        padding: 12px;
+                        spacing: 8px;
+
+                        Text {
+                            text: "系统状态";
+                            font-weight: 700;
+                            color: #ffffff;
+                        }
+
+                        Text {
+                            text: root.device_info_text;
+                            color: #b0b8c0;
+                            wrap: word-wrap;
+                        }
+
+                        HorizontalBox {
+                            padding: 0px;
+                            spacing: 6px;
+                            Text {
+                                text: "CSD 模式:";
+                                color: #b0b8c0;
+                                vertical-alignment: center;
+                            }
+                            ComboBox {
+                                model: ["自动校准", "半自动手动"];
+                                current-index: root.scan_mode;
+                                selected(_) => {
+                                    root.scan_mode = self.current-index;
+                                    root.mode_changed(self.current-index);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            HorizontalBox {
+                padding: 0px;
+                spacing: 12px;
+
+                Rectangle {
+                    border-radius: 8px;
+                    background: #23282e;
+                    min-height: 130px;
+                    horizontal-stretch: 1;
+
+                    VerticalBox {
+                        padding: 12px;
+                        spacing: 6px;
+
+                        Text {
+                            text: "采样";
+                            font-weight: 700;
+                            color: #ffffff;
+                        }
+                        Text {
+                            text: root.sample_rate_hz + " Hz";
+                            font-size: 28px;
+                            color: #8fd6ff;
+                        }
+                        Text {
+                            text: "通道延迟 " + root.channel_delay_us + " us";
+                            color: #b0b8c0;
+                        }
+                    }
+                }
+
+                Rectangle {
+                    border-radius: 8px;
+                    background: #23282e;
+                    min-height: 130px;
+                    horizontal-stretch: 2;
+
+                    VerticalBox {
+                        padding: 12px;
+                        spacing: 6px;
+
+                        HorizontalBox {
+                            padding: 0px;
+                            spacing: 8px;
+                            Text {
+                                text: "延迟(Phase2 固件填值)";
+                                font-weight: 700;
+                                color: #ffffff;
+                                horizontal-stretch: 1;
+                            }
+                            CheckBox {
+                                text: "测量";
+                                checked: root.measure_latency;
+                                toggled => {
+                                    root.measure_latency = self.checked;
+                                    root.latency_measure_toggled(self.checked);
+                                }
+                            }
+                        }
+
+                        Text {
+                            text: "总计 " + root.latency_total_us + " us";
+                            font-size: 20px;
+                            color: #8fd6ff;
+                        }
+
+                        Text {
+                            text: "SPI " + root.latency_spi_us + "us  RP处理 " + root.latency_proc_us + "us  USB " + root.latency_usb_us + "us  传感器 " + root.latency_sensor_us + "us";
+                            font-size: 11px;
+                            color: #b0b8c0;
+                            wrap: word-wrap;
+                        }
+                    }
+                }
+            }
+
+            Rectangle {
+                border-radius: 8px;
+                background: #23282e;
+                min-height: 170px;
+
+                VerticalBox {
+                    padding: 12px;
+                    spacing: 6px;
+
+                    Text {
+                        text: "连接 / 调试日志";
+                        font-weight: 700;
+                        color: #ffffff;
+                    }
+
+                    ScrollView {
+                        min-height: 130px;
+
+                        Text {
+                            text: root.log_text;
+                            color: #9fe0b0;
+                            font-size: 11px;
+                            wrap: word-wrap;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ============================================================================
+// 触控键盘映射 / 物理键盘 占位页 (Phase 1)
+// ============================================================================
+
+component KeyMapPage inherits Rectangle {
+    in property <bool> keyboard_map_en: false;
+
+    callback set_keyboard_map_en(bool);
+
+    VerticalBox {
+        padding: 8px;
+        spacing: 8px;
+
+        Text {
+            text: "触控→键盘映射：需固件支持（多组合+延迟），当前仅暴露开关";
+            color: #b0b8c0;
+            wrap: word-wrap;
+        }
+
+        CheckBox {
+            text: "启用触控键盘映射";
+            checked: root.keyboard_map_en;
+            toggled => { root.set_keyboard_map_en(self.checked); }
+        }
+    }
+}
+
+component PhysKbdPage inherits Rectangle {
+    VerticalBox {
+        padding: 8px;
+        spacing: 8px;
+
+        Text {
+            text: "物理键盘(GPIO1-12)：需固件支持，尚未实现";
+            color: #b0b8c0;
+            wrap: word-wrap;
+        }
+    }
+}
+
+// ============================================================================
+// 设置页容器:6 个子标签,原样挂载现有页面组件 + 新占位页
+// ============================================================================
+
+component SettingsPage inherits Rectangle {
+    // 显式绑定 TabWidget current-index，供通道卡点击后切到“单通道精调”。
+    in-out property <int> settings_tab: 0;
+    in property <[ConfigRow]> config_rows: [];
+    callback cfg_set_bool(string, bool);
+    callback cfg_set_number(string, float);
+    callback cfg_set_enum(string, int);
+    callback cfg_set_string(string, string);
+    callback cfg_load();
+    callback cfg_save();
+    callback cfg_reset();
+
+    in property <[ZoneCell]> zones: [];
+    in property <string> bind_status: "";
+    in-out property <int> selected_zone: -1;
+    in property <string> selected_zone_label: "";
+    in property <int> selected_channel: -1;
+    callback bind_load();
+    callback zone_selected(int);
+    callback zone_channel_set(int, int);
+    callback bind_touch_start(int);
+    callback zone_unbind(int);
+
+    in-out property <int> sel_channel: 0;
+    in-out property <bool> show_raw: false;
+    in-out property <bool> show_bsln: false;
+    in-out property <bool> show_diff: true;
+    in-out property <int> scan_mode: 0;
+    in property <string> diff_path: "";
+    in property <string> raw_path: "";
+    in property <string> bsln_path: "";
+    in property <float> curve_y_min: 0;
+    in property <float> curve_y_mid: 0;
+    in property <float> curve_y_max: 0;
+    in property <int> curve_point_count: 0;
+    in property <float> finger_th_y: 500;
+    in property <float> noise_th_y: 500;
+    in property <int> finger_th_val: 0;
+    in property <int> noise_th_val: 0;
+    in property <[ParamRow]> curve_params: [];
+    in property <string> cp_text: "读取中…";
+    callback telem_start();
+    callback telem_stop();
+    callback curve_calibrate();
+    callback curve_baseline_reset();
+    callback curve_measure_cp();
+    callback threshold_set(int, int);
+    callback curve_param_edited(int, int);
+    callback curve_param_apply_all(int, int);
+    callback curve_mode_changed(int);
+    callback curve_capture_params();
+
+    in property <[ChannelStatus]> all_channels: [];
+    in property <int> sample_rate_hz: 0;
+    in property <int> channel_delay_us: 0;
+
+    in property <bool> keyboard_map_en: false;
+    callback set_keyboard_map_en(bool);
+    callback channel_selected(int);
+
+    TabWidget {
+        current-index <=> root.settings_tab;
+        Tab {
+            title: "分区绑定";
+
+            BindingPage {
+                zones: root.zones;
+                bind_status: root.bind_status;
+                selected_zone: root.selected_zone;
+                selected_zone_label: root.selected_zone_label;
+                selected_channel: root.selected_channel;
+                bind_load() => { root.bind_load(); }
+                zone_selected(i) => { root.selected_zone = i; root.zone_selected(i); }
+                zone_channel_set(z, v) => { root.zone_channel_set(z, v); }
+                bind_touch_start(z) => { root.bind_touch_start(z); }
+                zone_unbind(z) => { root.zone_unbind(z); }
+            }
+        }
+
+        Tab {
+            title: "触控通道调整";
+
+            AllChannelsPage {
+                channels: root.all_channels;
+                selected_channel: root.sel_channel;
+                sample_rate_hz: root.sample_rate_hz;
+                channel_delay_us: root.channel_delay_us;
+                telem_start() => { root.telem_start(); }
+                telem_stop() => { root.telem_stop(); }
+                channel_selected(ch) => {
+                    root.sel_channel = ch;
+                    root.settings_tab = 2;
+                    root.channel_selected(ch);
+                }
+            }
+        }
+
+        Tab {
+            title: "单通道精调";
+
+            CurvesPage {
+                sel_channel <=> root.sel_channel;
+                show_raw <=> root.show_raw;
+                show_bsln <=> root.show_bsln;
+                show_diff <=> root.show_diff;
+                scan_mode <=> root.scan_mode;
+                diff_path: root.diff_path;
+                raw_path: root.raw_path;
+                bsln_path: root.bsln_path;
+                curve_y_min: root.curve_y_min;
+                curve_y_mid: root.curve_y_mid;
+                curve_y_max: root.curve_y_max;
+                curve_point_count: root.curve_point_count;
+                finger_th_y: root.finger_th_y;
+                noise_th_y: root.noise_th_y;
+                finger_th_val: root.finger_th_val;
+                noise_th_val: root.noise_th_val;
+                params: root.curve_params;
+                cp_text: root.cp_text;
+                telem_start() => { root.telem_start(); }
+                telem_stop() => { root.telem_stop(); }
+                calibrate() => { root.curve_calibrate(); }
+                baseline_reset() => { root.curve_baseline_reset(); }
+                measure_cp() => { root.curve_measure_cp(); }
+                threshold_set(pid, v) => { root.threshold_set(pid, v); }
+                param_edited(pid, v) => { root.curve_param_edited(pid, v); }
+                param_apply_all(pid, v) => { root.curve_param_apply_all(pid, v); }
+                mode_changed(m) => { root.curve_mode_changed(m); }
+                capture_params() => { root.curve_capture_params(); }
+            }
+        }
+
+        Tab {
+            title: "触控键盘映射";
+
+            KeyMapPage {
+                keyboard_map_en: root.keyboard_map_en;
+                set_keyboard_map_en(v) => { root.set_keyboard_map_en(v); }
+            }
+        }
+
+        Tab {
+            title: "物理键盘";
+
+            PhysKbdPage { }
+        }
+
+        Tab {
+            title: "通信系统";
+
+            ConfigPage {
+                rows: root.config_rows;
+                cfg_set_bool(k, v) => { root.cfg_set_bool(k, v); }
+                cfg_set_number(k, v) => { root.cfg_set_number(k, v); }
+                cfg_set_enum(k, v) => { root.cfg_set_enum(k, v); }
+                cfg_set_string(k, v) => { root.cfg_set_string(k, v); }
+                cfg_load() => { root.cfg_load(); }
+                cfg_save() => { root.cfg_save(); }
+                cfg_reset() => { root.cfg_reset(); }
+            }
+        }
+    }
+}
+
+export component AppWindow inherits Window {
+    title: "mai2control-ui";
+    preferred-width: 900px;
+    preferred-height: 600px;
+    min-width: 900px;
+    min-height: 600px;
+
+    // 设备下拉列表文本(由 main.rs 从 AppController::device_labels 回填)
+    in property <[string]> device_labels: [];
+    // 当前选中的设备索引(与 device_labels 对应)
+    in-out property <int> selected_device: 0;
+    // 连接状态文本(由 AppController::status_line 回填)
+    in property <string> conn_status: "未连接";
+    // DEVICE_INFO 展示文本(多行,由 AppController::device_info_text 回填)
+    in property <string> device_info_text: "未获取到设备信息";
+    // 配置页行数据(由 main.rs::build_config_rows 回填,version-gated 重建)
+    in property <[ConfigRow]> config_rows: [];
+
+    // 绑区页数据(几何绘制版,由 main.rs::build_zone_cells 回填,每 tick 刷新
+    // 以支持触摸实时高亮)
+    in property <[ZoneCell]> zones: [];
+    in property <string> bind_status: "";
+    in-out property <int> selected_zone: -1;
+    in property <string> selected_zone_label: "";
+    in property <int> selected_channel: -1;
+
+    // 曲线页数据 (#6g-2,由 main.rs::build_curve_paths/build_param_rows 回填)
+    in-out property <int> sel_channel: 0;
+    in-out property <bool> show_raw: false;
+    in-out property <bool> show_bsln: false;
+    in-out property <bool> show_diff: true;
+    in-out property <int> scan_mode: 0;
+    in property <string> diff_path: "";
+    in property <string> raw_path: "";
+    in property <string> bsln_path: "";
+    in property <float> curve_y_min: 0;
+    in property <float> curve_y_mid: 0;
+    in property <float> curve_y_max: 0;
+    in property <int> curve_point_count: 0;
+    in property <float> finger_th_y: 500;
+    in property <float> noise_th_y: 500;
+    in property <int> finger_th_val: 0;
+    in property <int> noise_th_val: 0;
+    in property <[ParamRow]> curve_params: [];
+    in property <string> cp_text: "读取中…";
+
+    // 全通道实时状态页数据(由 main.rs 每 tick 从 telem_latest 构建)
+    in property <[ChannelStatus]> all_channels: [];
+    // 采样率(Hz)与通道刷新延迟(us)，由 main.rs 每 tick 从 AppController 回填
+    in property <int> sample_rate_hz: 0;
+    in property <int> channel_delay_us: 0;
+
+    // Phase 1 UI 现代化:左栏导航当前视图(0=主页,1=设置),纯 UI 内部状态
+    in-out property <int> current_view: 0;
+    // 设置页当前子标签，与 SettingsPage/TabWidget 双向绑定。
+    in-out property <int> settings_tab: 0;
+    // 延迟卡数据(Phase 2 由固件填值,当前默认 0)
+    in property <int> latency_total_us: 0;
+    in property <int> latency_spi_us: 0;
+    in property <int> latency_proc_us: 0;
+    in property <int> latency_usb_us: 0;
+    in property <int> latency_sensor_us: 0;
+    in-out property <bool> measure_latency: false;
+    in property <string> log_text: "";
+    // 触控键盘映射开关(由 main.rs 从 config_cache 的 comm.keyboard_map_en 回填)
+    in property <bool> keyboard_map_en: false;
+
+    // 顶层由 UI 侧(main.rs)绑定,驱动 AppController 对应方法
+    callback refresh();
+    callback connect_clicked();
+    callback disconnect_clicked();
+    callback reboot_device();
+    callback reboot_bootloader();
+    // 延迟测量开关(Phase 2 前先接 no-op)
+    callback latency_measure_toggled(bool);
+    // 触控键盘映射开关 → CFG_SET(comm.keyboard_map_en)
+    callback set_keyboard_map_en(bool);
+
+    // 配置页回调(透传给内部 ConfigPage 实例)
+    callback cfg_set_bool(string, bool);
+    callback cfg_set_number(string, float);
+    callback cfg_set_enum(string, int);
+    callback cfg_set_string(string, string);
+    callback cfg_load();
+    callback cfg_save();
+    callback cfg_reset();
+
+    // 绑区页回调(几何绘制版,透传给内部 BindingPage 实例)
+    callback bind_load();
+    callback zone_selected(int);
+    callback zone_channel_set(int, int);
+    callback bind_touch_start(int);
+    callback zone_unbind(int);
+
+    // 曲线页回调 (#6g-2,透传给内部 CurvesPage 实例)
+    callback telem_start();
+    callback telem_stop();
+    callback curve_calibrate();
+    callback curve_baseline_reset();
+    callback curve_measure_cp();
+    callback threshold_set(int, int);
+    callback curve_param_edited(int, int);
+    callback curve_param_apply_all(int, int);
+    callback curve_mode_changed(int);
+    callback curve_capture_params();
+    callback channel_selected(int);
+
+    background: #15181c;
+
+    HorizontalBox {
+        padding: 0px;
+        spacing: 0px;
+
+        // 左侧导航栏
+        Rectangle {
+            width: 160px;
+            background: #1a1e22;
+
+            VerticalBox {
+                padding: 10px;
+                spacing: 4px;
+
+                Rectangle {
+                    height: 40px;
+                    border-radius: 6px;
+                    background: root.current_view == 0 ? #2b7de9 : transparent;
+
+                    TouchArea {
+                        clicked => { root.current_view = 0; }
+                    }
+
+                    Text {
+                        text: "主页";
+                        color: #ffffff;
+                        vertical-alignment: center;
+                        horizontal-alignment: center;
+                    }
+                }
+
+                Rectangle {
+                    height: 40px;
+                    border-radius: 6px;
+                    background: root.current_view == 1 ? #2b7de9 : transparent;
+
+                    TouchArea {
+                        clicked => { root.current_view = 1; }
+                    }
+
+                    Text {
+                        text: "设置";
+                        color: #ffffff;
+                        vertical-alignment: center;
+                        horizontal-alignment: center;
+                    }
+                }
+
+                Rectangle {
+                    vertical-stretch: 1;
+                }
+
+                HorizontalBox {
+                    padding: 4px;
+                    spacing: 6px;
+
+                    Rectangle {
+                        width: 10px;
+                        height: 10px;
+                        border-radius: 5px;
+                        background: root.conn_status == "已连接" ? #2b8a3e : #888888;
+                        vertical-stretch: 0;
+                    }
+
+                    Text {
+                        text: root.conn_status;
+                        color: #b0b8c0;
+                        font-size: 11px;
+                        wrap: word-wrap;
+                        horizontal-stretch: 1;
+                    }
+                }
+            }
+        }
+
+        // 右侧主区
+        Rectangle {
+            horizontal-stretch: 1;
+            background: #15181c;
+
+            if root.current_view == 0: DashboardPage {
+                device_labels: root.device_labels;
+                selected_device <=> root.selected_device;
+                conn_status: root.conn_status;
+                device_info_text: root.device_info_text;
+                sample_rate_hz: root.sample_rate_hz;
+                channel_delay_us: root.channel_delay_us;
+                scan_mode <=> root.scan_mode;
+                latency_total_us: root.latency_total_us;
+                latency_spi_us: root.latency_spi_us;
+                latency_proc_us: root.latency_proc_us;
+                latency_usb_us: root.latency_usb_us;
+                latency_sensor_us: root.latency_sensor_us;
+                measure_latency <=> root.measure_latency;
+                log_text: root.log_text;
+                refresh() => { root.refresh(); }
+                connect_clicked() => { root.connect_clicked(); }
+                disconnect_clicked() => { root.disconnect_clicked(); }
+                reboot_device() => { root.reboot_device(); }
+                reboot_bootloader() => { root.reboot_bootloader(); }
+                mode_changed(m) => { root.curve_mode_changed(m); }
+                latency_measure_toggled(v) => { root.latency_measure_toggled(v); }
+            }
+
+            if root.current_view == 1: SettingsPage {
+                settings_tab <=> root.settings_tab;
+                config_rows: root.config_rows;
+                cfg_set_bool(k, v) => { root.cfg_set_bool(k, v); }
+                cfg_set_number(k, v) => { root.cfg_set_number(k, v); }
+                cfg_set_enum(k, v) => { root.cfg_set_enum(k, v); }
+                cfg_set_string(k, v) => { root.cfg_set_string(k, v); }
+                cfg_load() => { root.cfg_load(); }
+                cfg_save() => { root.cfg_save(); }
+                cfg_reset() => { root.cfg_reset(); }
+
+                zones: root.zones;
+                bind_status: root.bind_status;
+                selected_zone: root.selected_zone;
+                selected_zone_label: root.selected_zone_label;
+                selected_channel: root.selected_channel;
+                bind_load() => { root.bind_load(); }
+                zone_selected(i) => { root.selected_zone = i; root.zone_selected(i); }
+                zone_channel_set(z, v) => { root.zone_channel_set(z, v); }
+                bind_touch_start(z) => { root.bind_touch_start(z); }
+                zone_unbind(z) => { root.zone_unbind(z); }
+
+                sel_channel <=> root.sel_channel;
+                show_raw <=> root.show_raw;
+                show_bsln <=> root.show_bsln;
+                show_diff <=> root.show_diff;
+                scan_mode <=> root.scan_mode;
+                diff_path: root.diff_path;
+                raw_path: root.raw_path;
+                bsln_path: root.bsln_path;
+                curve_y_min: root.curve_y_min;
+                curve_y_mid: root.curve_y_mid;
+                curve_y_max: root.curve_y_max;
+                curve_point_count: root.curve_point_count;
+                finger_th_y: root.finger_th_y;
+                noise_th_y: root.noise_th_y;
+                finger_th_val: root.finger_th_val;
+                noise_th_val: root.noise_th_val;
+                curve_params: root.curve_params;
+                cp_text: root.cp_text;
+                telem_start() => { root.telem_start(); }
+                telem_stop() => { root.telem_stop(); }
+                curve_calibrate() => { root.curve_calibrate(); }
+                curve_baseline_reset() => { root.curve_baseline_reset(); }
+                curve_measure_cp() => { root.curve_measure_cp(); }
+                threshold_set(pid, v) => { root.threshold_set(pid, v); }
+                curve_param_edited(pid, v) => { root.curve_param_edited(pid, v); }
+                curve_param_apply_all(pid, v) => { root.curve_param_apply_all(pid, v); }
+                curve_mode_changed(m) => { root.curve_mode_changed(m); }
+                curve_capture_params() => { root.curve_capture_params(); }
+                channel_selected(ch) => { root.channel_selected(ch); }
+
+                all_channels: root.all_channels;
+                sample_rate_hz: root.sample_rate_hz;
+                channel_delay_us: root.channel_delay_us;
+
+                keyboard_map_en: root.keyboard_map_en;
+                set_keyboard_map_en(v) => { root.set_keyboard_map_en(v); }
+            }
+        }
+    }
+}

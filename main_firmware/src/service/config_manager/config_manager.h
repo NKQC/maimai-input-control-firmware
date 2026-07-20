@@ -103,6 +103,7 @@ public:
     // 保存配置到文件
     static bool save_config_task();
     static void save_config();  // 置位保存信号
+    static bool has_pending_save() { return _save_requested; }  // 主循环据此在安全窗口落地 flash
     
     // 重置到默认配置
     static bool reset_to_defaults();

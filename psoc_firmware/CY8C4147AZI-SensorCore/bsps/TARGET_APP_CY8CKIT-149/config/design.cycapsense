@@ -35,7 +35,7 @@
         <Property id="IREF_SOURCE" value="SRSS"/>
         <Property id="PROX_TOUCH_COEFF" value="300"/>
         <Property id="CDAC_TRIM_EN" value="false"/>
-        <Property id="BIST_EN" value="false"/>
+        <Property id="BIST_EN" value="true"/>
         <Property id="BIST_WDGT_CRC_EN" value="true"/>
         <Property id="BIST_BSLN_DUPLICATION_EN" value="true"/>
         <Property id="BIST_BSLN_RAW_OUT_RANGE_EN" value="true"/>
@@ -61,7 +61,7 @@
         <Property id="NUM_CENTROIDS" value="1"/>
     </GeneralProperties>
     <CsdProperties>
-        <Property id="CSD_AUTOTUNE" value="HWTH"/>
+        <Property id="CSD_AUTOTUNE" value="NONE"/>
         <Property id="CSD_MOD_CLK_DIVIDER" value="1"/>
         <Property id="CSD_INACTIVE_SNS_CONNECTION" value="GROUND"/>
         <Property id="CSD_CHARGE_TRANSFER" value="SOURCING"/>
@@ -74,12 +74,12 @@
         <Property id="CSD_RAWCOUNT_CAL_LEVEL" value="85"/>
         <Property id="CSD_VREF_CUSTOM" value="false"/>
         <Property id="CSD_VREF" value="1219"/>
-        <Property id="CSD_SHIELD_EN" value="false"/>
+        <Property id="CSD_SHIELD_EN" value="true"/>
         <Property id="CSD_SHIELD_TANK_EN" value="false"/>
         <Property id="CSD_SHIELD_DELAY" value="DELAY_0NS"/>
         <Property id="CSD_TOTAL_SHIELD_COUNT" value="1"/>
         <Property id="CSD_INIT_SWITCH_RES" value="MEDIUM"/>
-        <Property id="CSD_SHIELD_SWITCH_RES" value="MEDIUM"/>
+        <Property id="CSD_SHIELD_SWITCH_RES" value="LOW_EMI"/>
         <Property id="CSD_FINE_INIT_TIME" value="10"/>
         <Property id="CSD_CALIBRATION_ERROR" value="10"/>
         <Property id="CSD_R_CONST" value="1000"/>

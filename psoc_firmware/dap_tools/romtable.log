@@ -1,0 +1,23 @@
+set log_output to "romtable.log"
+0x0bc11477
+Warn : DEPRECATED: auto-selecting transport "swd". Use 'transport select swd' to suppress this message.
+ocd_process_reset_inner
+Warn : Transport "swd" was already selected
+Info : CMSIS-DAP: SWD supported
+Info : CMSIS-DAP: Atomic commands supported
+Info : CMSIS-DAP: Test domain timer supported
+Info : CMSIS-DAP: FW Version = 2.0.0
+Info : CMSIS-DAP: Interface Initialised (SWD)
+Info : SWCLK/TCK = 0 SWDIO/TMS = 0 TDI = 0 TDO = 0 nTRST = 0 nRESET = 1
+Info : CMSIS-DAP: Interface ready
+Info : clock speed 1000 kHz
+Info : SWD DPIDR 0x0bc11477
+Info : [psoc4.cpu] Cortex-M0+ r0p1 processor detected
+Info : [psoc4.cpu] target has 4 breakpoints, 2 watchpoints
+Info : [psoc4.cpu] Examination succeed
+Info : [psoc4.cpu] starting gdb server on 3333
+Info : Listening on port 3333 for gdb connections
+Info : SWD DPIDR 0x0bc11477
+[psoc4.cpu] halted due to debug-request, current mode: Thread 
+xPSR: 0x61000000 pc: 0x10000040 msp: 0x20003fe8
+shutdown command invoked
