@@ -1,4 +1,4 @@
-import { Button, ComboBox, VerticalBox, HorizontalBox, GroupBox, ListView, CheckBox, SpinBox, LineEdit, ScrollView, TabWidget } from "std-widgets.slint";
+import { Button, ComboBox, VerticalBox, HorizontalBox, GroupBox, ListView, CheckBox, SpinBox, LineEdit, ScrollView, TabWidget, TextEdit } from "std-widgets.slint";
 
 // ============================================================================
 // 配置页 (#6e-2)
@@ -6,12 +6,13 @@ import { Button, ComboBox, VerticalBox, HorizontalBox, GroupBox, ListView, Check
 
 // 一条配置行的展平数据,由 main.rs::build_config_rows 从 ConfigEntry 转换而来。
 // kind: 0=Bool(CheckBox) 1=Number(SpinBox) 2=Enum(ComboBox,当前仅 mode.work)
-//       3=String(LineEdit)
+//       3=String(LineEdit) 4=LedColor(专用颜色 ComboBox)
 // type_code 沿用 proto::config::ConfigValueType 编码(Bool=0..String=6),
 // 用于 main.rs 回调里按原类型重建 CfgValue。
 export struct ConfigRow {
     key: string,
     label: string,
+    desc: string,
     group: string,
     kind: int,
     type_code: int,
@@ -22,6 +23,10 @@ export struct ConfigRow {
     has_range: bool,
     enum_index: int,
     str_val: string,
+    // 数字型配置的十六进制口径: hex_val=当前值(如 "0x1E"), range_hex=取值范围(如 "0x00–0xFF (0–255)")。
+    // 仅整数型(U8/U16/U32/I8)非空; 浮点/布尔/枚举/字符串为空串。
+    hex_val: string,
+    range_hex: string,
 }
 
 // 注:属性名不能叫 `row`,该名字与 GridLayout 子元素自动注入的 row/col
@@ -31,6 +36,7 @@ component ConfigRowItem inherits Rectangle {
 
     callback set_bool(string, bool);
     callback set_number(string, float);
+    callback set_number_hex(string, string);   // 数字配置以十六进制串下发, 由 Rust 侧解析+夹取范围
     callback set_enum(string, int);
     callback set_string(string, string);
 
@@ -38,13 +44,37 @@ component ConfigRowItem inherits Rectangle {
     clip: true;
 
     HorizontalBox {
-        padding: 0px;
-        spacing: 8px;
+        padding-left: 2px;
+        padding-right: 2px;
+        padding-top: 3px;
+        padding-bottom: 3px;
+        spacing: 10px;
 
-        Text {
-            text: root.entry.label;
-            min-width: 160px;
-            vertical-alignment: center;
+        // 左侧: 中文名 + 小字说明(控制内容) + 取值范围(hex 口径)。
+        VerticalLayout {
+            min-width: 210px;
+            horizontal-stretch: 0;
+            spacing: 1px;
+            Text {
+                text: root.entry.label;
+                vertical-alignment: center;
+                color: #e0e6ec;
+            }
+            Text {
+                text: root.entry.desc;
+                font-size: 10px;
+                color: #7f8c96;
+                visible: root.entry.desc != "";
+                overflow: elide;
+            }
+            // 取值范围(十六进制, 附十进制)。仅数字整数型有 range_hex。
+            Text {
+                text: root.entry.range_hex;
+                font-size: 10px;
+                color: #6f7a84;
+                visible: root.entry.range_hex != "";
+                overflow: elide;
+            }
         }
 
         if root.entry.kind == 0: CheckBox {
@@ -54,7 +84,9 @@ component ConfigRowItem inherits Rectangle {
             }
         }
 
+        // 通信系统配置一律十进制 SpinBox(hex 口径仅用于需寄存器处理的 CSD 内容, 见触控全局调整页)。
         if root.entry.kind == 1: SpinBox {
+            horizontal-stretch: 1;
             minimum: Math.round(root.entry.min_val);
             maximum: Math.round(root.entry.max_val);
             value: Math.round(root.entry.num_val);
@@ -64,14 +96,27 @@ component ConfigRowItem inherits Rectangle {
         }
 
         if root.entry.kind == 2: ComboBox {
-            model: ["Serial", "HID"];
+            horizontal-stretch: 1;
+            model: ["Serial(游戏串口)", "HID(触摸屏+键盘)"];
             current-index: root.entry.enum_index;
             selected(_) => {
                 root.set_enum(root.entry.key, self.current-index);
             }
         }
 
+        // 固件 schema 以 U8 提供 LED 颜色，未携带 enum options；仅这四个
+        // led.color_* 键使用专用 kind=4，仍经 set_number 保持原有 U8 写入路径。
+        if root.entry.kind == 4: ComboBox {
+            horizontal-stretch: 1;
+            model: ["熄灭", "红", "绿", "黄", "蓝", "紫", "青", "白"];
+            current-index: root.entry.enum_index;
+            selected(_) => {
+                root.set_number(root.entry.key, self.current-index);
+            }
+        }
+
         if root.entry.kind == 3: LineEdit {
+            horizontal-stretch: 1;
             text: root.entry.str_val;
             edited(v) => {
                 root.set_string(root.entry.key, v);
@@ -89,6 +134,7 @@ component ConfigGroupSection inherits GroupBox {
 
     callback set_bool(string, bool);
     callback set_number(string, float);
+    callback set_number_hex(string, string);
     callback set_enum(string, int);
     callback set_string(string, string);
 
@@ -96,17 +142,19 @@ component ConfigGroupSection inherits GroupBox {
 
     VerticalBox {
         padding: 0px;
-        spacing: 4px;
+        // spacing 设 0: 不属于本组的行 height=0, 若有 spacing 会累积成大段空白(旧 bug 根因)。
+        // 行间距改由 ConfigRowItem 自身上下 padding + 分隔线提供。
+        spacing: 0px;
 
         for row in root.rows: ConfigRowItem {
             entry: row;
-            // Slint 的 `for` 不支持直接接 `if` 元素(该组合在语法上不合法),
-            // 故按行自身是否属于当前分组来控制显隐与占位高度,而不是从
-            // 数据源过滤元素列表。
+            // Slint 的 `for` 不支持直接接 `if` 元素, 故按行是否属于当前组控制显隐与占位高度。
             visible: row.group == root.group_title;
-            height: row.group == root.group_title ? 34px : 0px;
+            // 数字整数行多一行 hex 取值范围, 高度略增避免范围文字被裁。
+            height: row.group == root.group_title ? (row.range_hex != "" ? 60px : 48px) : 0px;
             set_bool(key, v) => { root.set_bool(key, v); }
             set_number(key, v) => { root.set_number(key, v); }
+            set_number_hex(key, v) => { root.set_number_hex(key, v); }
             set_enum(key, v) => { root.set_enum(key, v); }
             set_string(key, v) => { root.set_string(key, v); }
         }
@@ -115,9 +163,11 @@ component ConfigGroupSection inherits GroupBox {
 
 component ConfigPage inherits Rectangle {
     in property <[ConfigRow]> rows;
+    in property <bool> config_dirty: false;
 
     callback cfg_set_bool(string, bool);
     callback cfg_set_number(string, float);
+    callback cfg_set_number_hex(string, string);
     callback cfg_set_enum(string, int);
     callback cfg_set_string(string, string);
     callback cfg_load();
@@ -144,6 +194,17 @@ component ConfigPage inherits Rectangle {
                 text: "恢复默认";
                 clicked => { root.cfg_reset(); }
             }
+            Text {
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+                wrap: no-wrap;
+                overflow: elide;
+                text: root.config_dirty
+                    ? "● 有草稿未保存(编辑仅暂存, 点击“保存到设备”后才下发并生效)"
+                    : "✓ 已与设备同步";
+                color: root.config_dirty ? #f5a623 : #2b8a3e;
+                font-size: 12px;
+            }
         }
 
         ScrollView {
@@ -156,6 +217,7 @@ component ConfigPage inherits Rectangle {
                     rows: root.rows;
                     set_bool(k, v) => { root.cfg_set_bool(k, v); }
                     set_number(k, v) => { root.cfg_set_number(k, v); }
+                    set_number_hex(k, v) => { root.cfg_set_number_hex(k, v); }
                     set_enum(k, v) => { root.cfg_set_enum(k, v); }
                     set_string(k, v) => { root.cfg_set_string(k, v); }
                 }
@@ -165,6 +227,7 @@ component ConfigPage inherits Rectangle {
                     rows: root.rows;
                     set_bool(k, v) => { root.cfg_set_bool(k, v); }
                     set_number(k, v) => { root.cfg_set_number(k, v); }
+                    set_number_hex(k, v) => { root.cfg_set_number_hex(k, v); }
                     set_enum(k, v) => { root.cfg_set_enum(k, v); }
                     set_string(k, v) => { root.cfg_set_string(k, v); }
                 }
@@ -174,6 +237,7 @@ component ConfigPage inherits Rectangle {
                     rows: root.rows;
                     set_bool(k, v) => { root.cfg_set_bool(k, v); }
                     set_number(k, v) => { root.cfg_set_number(k, v); }
+                    set_number_hex(k, v) => { root.cfg_set_number_hex(k, v); }
                     set_enum(k, v) => { root.cfg_set_enum(k, v); }
                     set_string(k, v) => { root.cfg_set_string(k, v); }
                 }
@@ -199,89 +263,122 @@ export struct ZoneCell {
     label: string,
     ring: string,
     channel: int,
+    binding_text: string,
+    cp_text: string,
     touched: bool,
-    cx: float,
-    cy: float,
+    binding_active: bool,
+    path: string,
+    path_x: float,
+    path_y: float,
+    path_width: float,
+    path_height: float,
+    label_x: float,
+    label_y: float,
 }
 
-// 几何绘制的圆形 maimai 分区图:纯 Slint Rectangle/Text 绘制,不引用任何
-// 位图资源。三个同心圆环仅作视觉参考(纯描边),34 个分区各画一个小圆
-// (按 cell.cx/cy 绝对定位)+ 分区名文字,点击圆选中。
+// 真实 34 区路径画布。所有 Path 共用同一个 SCREEN_FRAME viewbox(见
+// touch_geometry::SCREEN_W/SCREEN_H, 1000x562.5, 16:9)绘制精确 DXF 几何
+// (含 bulge 圆弧); 命中检测改为独立的透明矩形层, 按各区包围盒(path_x/y/
+// path_width/path_height, 同一坐标系)定位, 避免局部 viewbox 造成的圆弧/
+// 缩放失真。画布容器按 16:9 letterbox, 不做非等比拉伸。
 component BindingCanvas inherits Rectangle {
     in property <[ZoneCell]> zones: [];
     in property <int> selected_zone: -1;
+    property <bool> binding_blink: false;
+
+    // 绘制视框 = 分区几何并集 bbox(main.rs 从 touch_geometry::content_bbox 回填, SCREEN 坐标系)。
+    // 用内容 bbox 而非整幅 16:9 SCREEN, 使圆形分区图缩放铺满画布元素, 去除四周留白。
+    in property <float> view_x: 0;
+    in property <float> view_y: 0;
+    in property <float> view_w: 1000;
+    in property <float> view_h: 562.5;
 
     callback zone_selected(int);
+    callback zone_activated(int);
+    // 精确命中检测: 传入 SCREEN 坐标系的点, 返回分区 index(未命中 -1)。
+    // 由 main.rs 绑定到 touch_geometry::hit_test(point-in-polygon)。
+    pure callback zone_hit_test(float, float) -> int;
 
-    // 固定 360x360:内部是绝对定位子元素(对布局无尺寸贡献),不锁死尺寸时父
-    // HorizontalBox 会把它压扁 → 分区圆挤成一团点不到、选不中。用 min=max 锁死
-    // (Slint 不允许 width 与 min-width 并存,故不写 width/height)。
+    // 响应式: 画布随可用空间放大; 内部按内容 bbox 宽高比等比缩放铺满(居中)。
     min-width: 360px;
-    max-width: 360px;
-    min-height: 360px;
-    max-height: 360px;
-    horizontal-stretch: 0;
+    min-height: 220px;
+    horizontal-stretch: 3;
     background: #15181c;
     border-radius: 6px;
     border-width: 1px;
     border-color: #2a2f36;
     clip: true;
 
-    // 外环参考线(对齐 A/D 环几何半径 430,同比例缩放到画布)
-    Rectangle {
-        x: parent.width / 2 - 155px;
-        y: parent.height / 2 - 155px;
-        width: 310px;
-        height: 310px;
-        border-radius: 155px;
-        border-width: 1px;
-        border-color: #333a42;
-        background: transparent;
-    }
-    // 内环参考线(对齐 B/E 环几何半径 240)
-    Rectangle {
-        x: parent.width / 2 - 86px;
-        y: parent.height / 2 - 86px;
-        width: 173px;
-        height: 173px;
-        border-radius: 86px;
-        border-width: 1px;
-        border-color: #333a42;
-        background: transparent;
-    }
-    // 中心参考线(对齐 C 区)
-    Rectangle {
-        x: parent.width / 2 - 25px;
-        y: parent.height / 2 - 25px;
-        width: 50px;
-        height: 50px;
-        border-radius: 25px;
-        border-width: 1px;
-        border-color: #333a42;
-        background: transparent;
+    Timer {
+        interval: 450ms;
+        running: true;
+        triggered => { root.binding_blink = !root.binding_blink; }
     }
 
-    for cell in root.zones: Rectangle {
-        x: parent.width * cell.cx / 1000 - 20px;
-        y: parent.height * cell.cy / 1000 - 20px;
-        width: 40px;
-        height: 40px;
-        border-radius: 20px;
-        border-width: cell.index == root.selected_zone ? 3px : 1px;
-        border-color: cell.index == root.selected_zone ? #4fc3f7 : #55606a;
-        background: cell.touched ? #2b8a3e : #2b3038;
+    // 按内容 bbox 宽高比等比缩放并居中铺满可用区域; 图层/标签/命中均相对它定位。
+    letterbox := Rectangle {
+        width: Math.min(parent.width, parent.height * root.view_w / root.view_h);
+        height: self.width * root.view_h / root.view_w;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
 
-        Text {
-            text: cell.label;
-            color: #ffffff;
-            font-size: 10px;
-            horizontal-alignment: center;
-            vertical-alignment: center;
+    // 图形层: 34 个 Path 共用同一 viewbox(=内容 bbox), 每个只绘制自己的闭合区域, 保留 DXF 圆弧。
+    for cell in root.zones: Path {
+        x: 0;
+        y: 0;
+        width: parent.width;
+        height: parent.height;
+        viewbox-x: root.view_x;
+        viewbox-y: root.view_y;
+        viewbox-width: root.view_w;
+        viewbox-height: root.view_h;
+        commands: cell.path;
+        fill: cell.touched ? #2b8a3e
+            : cell.binding_active ? (root.binding_blink ? #248eea : #174f86)
+            : cell.index == root.selected_zone ? #245b78 : #2b3038;
+        stroke: cell.index == root.selected_zone ? #7edbff
+            : cell.binding_active ? #8fd6ff : #55606a;
+        stroke-width: cell.index == root.selected_zone ? 4px : 2px;
+    }
+
+    for cell in root.zones: Text {
+        x: parent.width * (cell.label_x - root.view_x) / root.view_w - 24px;
+        y: parent.height * (cell.label_y - root.view_y) / root.view_h - 14px;
+        width: 48px;
+        height: 13px;
+        text: cell.label;
+        color: #ffffff;
+        font-size: 10px;
+        font-weight: 700;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+    for cell in root.zones: Text {
+        x: parent.width * (cell.label_x - root.view_x) / root.view_w - 29px;
+        y: parent.height * (cell.label_y - root.view_y) / root.view_h - 1px;
+        width: 58px;
+        height: 11px;
+        text: cell.binding_text;
+        color: cell.touched ? #d6ffd9 : cell.channel >= 0 ? #b9e6ff : #9aa3aa;
+        font-size: 7px;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    // 单一命中层: 覆盖整个 letterbox, 把点击像素换算回 SCREEN 坐标系(经 bbox 偏移+缩放),
+    // 交给精确 point-in-polygon(hit_test)判定, 消除旧 34 个重叠 bbox 的误选。
+    hit_area := TouchArea {
+        property <int> hit: -1;
+        mouse-cursor: pointer;
+        clicked => {
+            self.hit = root.zone_hit_test(root.view_x + self.mouse-x / self.width * root.view_w, root.view_y + self.mouse-y / self.height * root.view_h);
+            if (self.hit >= 0) { root.zone_selected(self.hit); }
         }
-
-        TouchArea {
-            clicked => { root.zone_selected(cell.index); }
+        double-clicked => {
+            self.hit = root.zone_hit_test(root.view_x + self.mouse-x / self.width * root.view_w, root.view_y + self.mouse-y / self.height * root.view_h);
+            if (self.hit >= 0) { root.zone_selected(self.hit); root.zone_activated(self.hit); }
         }
+    }
     }
 }
 
@@ -290,35 +387,74 @@ component ZoneListRow inherits Rectangle {
     in property <bool> selected;
 
     callback clicked();
+    callback activated();
+    callback channel_set(int);   // 更改通道
+    callback listen();           // 侦听下一次触摸绑定
+    callback unbind();           // 移除分区绑定
 
-    height: 28px;
+    height: 40px;
     border-width: selected ? 2px : 1px;
     border-color: selected ? #4fc3f7 : #33393f;
-    background: selected ? #23303a : #1c2024;
-
-    TouchArea {
-        clicked => { root.clicked(); }
-    }
+    background: entry.touched ? #245f35 : selected ? #23303a : #1c2024;
 
     HorizontalBox {
         padding: 4px;
-        spacing: 8px;
-        Text {
-            text: root.entry.label;
-            color: #ffffff;
-            font-weight: 700;
-            min-width: 40px;
+        spacing: 6px;
+
+        // 标签 + 状态点区域: 单击选中, 双击进入单通道精调。
+        TouchArea {
+            width: 92px;
+            mouse-cursor: pointer;
+            clicked => { root.clicked(); }
+            double-clicked => { root.clicked(); root.activated(); }
+            HorizontalBox {
+                padding: 0px;
+                spacing: 6px;
+                Rectangle {
+                    width: 8px;
+                    height: 8px;
+                    border-radius: 4px;
+                    background: root.entry.touched ? #2b8a3e : root.entry.binding_active ? #2b7de9 : #444444;
+                }
+                Text {
+                    text: root.entry.label;
+                    color: #ffffff;
+                    font-weight: 700;
+                    vertical-alignment: center;
+                }
+                Text {
+                    text: root.entry.binding_text;
+                    color: #b0b8c0;
+                    font-size: 11px;
+                    vertical-alignment: center;
+                    overflow: elide;
+                    horizontal-stretch: 1;
+                }
+            }
         }
         Text {
-            text: root.entry.channel >= 0 ? "CH" + root.entry.channel : "未绑定";
-            color: #b0b8c0;
-            min-width: 60px;
+            text: root.entry.cp_text;
+            color: #8fd6ff;
+            font-size: 10px;
+            vertical-alignment: center;
+            min-width: 54px;
         }
-        Rectangle {
-            width: 8px;
-            height: 8px;
-            border-radius: 4px;
-            background: root.entry.touched ? #2b8a3e : #444444;
+        // 三操作: 更改通道(SpinBox) / 侦听绑定 / 移除
+        SpinBox {
+            width: 72px;
+            minimum: 0;
+            maximum: 35;
+            value: root.entry.channel >= 0 ? root.entry.channel : 0;
+            edited(v) => { root.channel_set(v); }
+        }
+        Button {
+            text: root.entry.binding_active ? "侦听中" : "侦听";
+            clicked => { root.listen(); }
+        }
+        Button {
+            text: "移除";
+            enabled: root.entry.channel >= 0;
+            clicked => { root.unbind(); }
         }
     }
 }
@@ -328,6 +464,10 @@ component ZoneList inherits Rectangle {
     in property <int> selected_zone: -1;
 
     callback zone_selected(int);
+    callback zone_activated(int);
+    callback zone_channel_set(int, int);
+    callback zone_listen(int);
+    callback zone_unbind(int);
 
     background: transparent;
 
@@ -340,6 +480,10 @@ component ZoneList inherits Rectangle {
                 entry: cell;
                 selected: cell.index == root.selected_zone;
                 clicked => { root.zone_selected(cell.index); }
+                activated => { root.zone_activated(cell.index); }
+                channel_set(v) => { root.zone_channel_set(cell.index, v); }
+                listen => { root.zone_listen(cell.index); }
+                unbind => { root.zone_unbind(cell.index); }
             }
         }
     }
@@ -352,6 +496,7 @@ component BindingDetail inherits GroupBox {
 
     callback channel_set(int);
     callback touch_start();
+    callback listen_cancel();
     callback unbind();
 
     title: root.selected_zone >= 0 ? "区 " + root.selected_zone_label + " 详情" : "详情";
@@ -388,13 +533,23 @@ component BindingDetail inherits GroupBox {
                 padding: 0px;
                 spacing: 8px;
                 Button {
-                    text: "指触绑定";
+                    text: "侦听绑定";
                     clicked => { root.touch_start(); }
+                }
+                Button {
+                    text: "取消侦听";
+                    clicked => { root.listen_cancel(); }
                 }
                 Button {
                     text: "清除";
                     clicked => { root.unbind(); }
                 }
+            }
+            Text {
+                text: "侦听绑定: 点击后触摸目标分区, 上位机捕获该物理通道并暂存为草稿, 保存后生效。";
+                color: #7f8c96;
+                font-size: 11px;
+                wrap: word-wrap;
             }
         }
 
@@ -415,21 +570,39 @@ component BindingPage inherits Rectangle {
 
     callback bind_load();
     callback zone_selected(int);
+    callback zone_activated(int);
     callback zone_channel_set(int, int);
     callback bind_touch_start(int);
+    callback bind_listen_cancel();
     callback zone_unbind(int);
+    pure callback zone_hit_test(float, float) -> int;
+    // 分区图绘制视框(内容 bbox, SCREEN 坐标系), 由 AppWindow 从 touch_geometry::content_bbox 回填。
+    in property <float> view_x: 0;
+    in property <float> view_y: 0;
+    in property <float> view_w: 1000;
+    in property <float> view_h: 562.5;
+    // 右栏子标签: 0=详情 1=列表(互相切换, 不再上下抢占空间)。
+    property <int> right_tab: 0;
 
     VerticalBox {
         padding: 8px;
-        spacing: 8px;
+        spacing: 6px;
 
+        // 顶部信息条: 精简单行, 不再占用大块高度, 把空间留给分区画布。
         HorizontalBox {
             padding: 0px;
             spacing: 8px;
-
             Button {
                 text: "从设备加载";
                 clicked => { root.bind_load(); }
+            }
+            Text {
+                text: "单击选中 · 双击进精调 · 列表内可改通道/侦听/移除";
+                vertical-alignment: center;
+                color: #7f8c96;
+                font-size: 11px;
+                horizontal-stretch: 1;
+                overflow: elide;
             }
             Text {
                 text: root.bind_status;
@@ -440,37 +613,73 @@ component BindingPage inherits Rectangle {
 
         HorizontalBox {
             padding: 0px;
-            spacing: 12px;
+            spacing: 10px;
             vertical-stretch: 1;
 
+            // 分区画布占主要宽度(stretch 3), 详情/列表占右侧(stretch 2)。
             BindingCanvas {
                 zones: root.zones;
                 selected_zone: root.selected_zone;
+                view_x: root.view_x;
+                view_y: root.view_y;
+                view_w: root.view_w;
+                view_h: root.view_h;
                 zone_selected(i) => { root.selected_zone = i; root.zone_selected(i); }
+                zone_activated(i) => { root.selected_zone = i; root.zone_activated(i); }
+                zone_hit_test(x, y) => { return root.zone_hit_test(x, y); }
             }
 
+            // 右栏: 详情/列表 两个子标签互相切换, 各自占满高度, 不再上下挤占。
+            // ★固定 min-width★: 详情/列表两个 GroupBox 标题长短不同(首选宽度不同), 若不钉死,
+            // 切换子标签时右栏 min-width 跳变 → 与左侧画布的分界随之左右偏移。固定后切换不再抖。
             VerticalBox {
                 padding: 0px;
-                spacing: 8px;
-                horizontal-stretch: 1;
+                spacing: 6px;
+                horizontal-stretch: 2;
+                min-width: 360px;
 
-                BindingDetail {
+                HorizontalBox {
+                    padding: 0px;
+                    spacing: 6px;
+                    Rectangle {
+                        width: 96px; height: 30px; border-radius: 4px;
+                        background: root.right_tab == 0 ? #2b7de9 : #23282e;
+                        Text { text: "详情"; color: #ffffff; horizontal-alignment: center; vertical-alignment: center; }
+                        TouchArea { clicked => { root.right_tab = 0; } }
+                    }
+                    Rectangle {
+                        width: 96px; height: 30px; border-radius: 4px;
+                        background: root.right_tab == 1 ? #2b7de9 : #23282e;
+                        Text { text: "列表"; color: #ffffff; horizontal-alignment: center; vertical-alignment: center; }
+                        TouchArea { clicked => { root.right_tab = 1; } }
+                    }
+                    Rectangle { horizontal-stretch: 1; }
+                }
+
+                if root.right_tab == 0: BindingDetail {
+                    vertical-stretch: 1;
                     selected_zone: root.selected_zone;
                     selected_zone_label: root.selected_zone_label;
                     selected_channel: root.selected_channel;
                     channel_set(v) => { root.zone_channel_set(root.selected_zone, v); }
                     touch_start() => { root.bind_touch_start(root.selected_zone); }
+                    listen_cancel() => { root.bind_listen_cancel(); }
                     unbind() => { root.zone_unbind(root.selected_zone); }
                 }
 
-                GroupBox {
-                    title: "全部绑定列表";
+                if root.right_tab == 1: GroupBox {
+                    // 标题精简(原长标题使该 GroupBox 首选宽度远大于"详情"页, 是切换偏移的主因之一)。
+                    title: "全部绑定";
                     vertical-stretch: 1;
 
                     ZoneList {
                         zones: root.zones;
                         selected_zone: root.selected_zone;
                         zone_selected(i) => { root.selected_zone = i; root.zone_selected(i); }
+                        zone_activated(i) => { root.selected_zone = i; root.zone_activated(i); }
+                        zone_channel_set(z, v) => { root.zone_channel_set(z, v); }
+                        zone_listen(z) => { root.bind_touch_start(z); }
+                        zone_unbind(z) => { root.zone_unbind(z); }
                     }
                 }
             }
@@ -490,6 +699,33 @@ export struct ParamRow {
     value: int,
 }
 
+// 单通道参数编辑行。分辨率等需全通道一致的参数由 Rust 侧统一处理, 不再提供逐行"应用全部"。
+component ParamEditorRow inherits HorizontalBox {
+    in property <ParamRow> entry;
+    callback edited(int, int);
+
+    padding: 0px;
+    spacing: 6px;
+    height: 34px;
+
+    // 标签占剩余宽度并在过窄时省略, 保证 SpinBox 与按钮始终在 360px 参数区内不越界。
+    Text {
+        text: root.entry.label;
+        horizontal-stretch: 1;
+        overflow: elide;
+        wrap: no-wrap;
+        vertical-alignment: center;
+    }
+    param_value := SpinBox {
+        horizontal-stretch: 0;
+        min-width: 92px;
+        minimum: 0;
+        maximum: 65535;
+        value: root.entry.value;
+        edited(v) => { root.edited(root.entry.param_id, v); }
+    }
+}
+
 // ============================================================================
 // 全通道实时状态页
 // ============================================================================
@@ -505,16 +741,18 @@ export struct ChannelStatus {
     grid_col: int,
     grid_row: int,
     binding_text: string,
+    cp_text: string,
 }
 
 component ChannelStatusCell inherits Rectangle {
     in property <ChannelStatus> entry;
     in property <bool> selected: false;
 
-    callback activated(int);
+    callback activated(int);   // 双击 → 进入单通道精调
+    callback selected_click(int); // 单击 → 仅高亮选中
 
     width: 124px;
-    height: 76px;
+    height: 90px;
     border-width: root.selected ? 2px : 1px;
     border-color: root.selected ? #4fc3f7 : touch.has-hover ? #6b8191 : #3a434c;
     // 触摸、选择和 hover 都有区分明确的反馈。
@@ -549,19 +787,28 @@ component ChannelStatusCell inherits Rectangle {
             font-size: 10px;
             color: root.entry.binding_text == "未绑定" ? #77828c : #8fd6ff;
         }
+        Text {
+            text: root.entry.cp_text;
+            font-size: 10px;
+            color: #8fd6ff;
+        }
     }
 
     touch := TouchArea {
-        clicked => { root.activated(root.entry.index); }
+        mouse-cursor: pointer;
+        clicked => { root.selected_click(root.entry.index); }
+        double-clicked => { root.activated(root.entry.index); }
     }
 }
 
 component AllChannelsPage inherits Rectangle {
     in property <[ChannelStatus]> channels: [];
-    in property <int> selected_channel: 0;
+    in-out property <int> selected_channel: 0;
     // 由 main.rs 每 tick 从 AppController::telem_samples_per_sec()/telem_scan_period_us() 回填
     in property <int> sample_rate_hz: 0;
-    in property <int> channel_delay_us: 0;
+    in property <string> curve_threshold_warning: "";
+    // 设备实测探测周期(ms, 两位小数), 由 telem_scan_period_us / 1000.0 换算回填。
+    in property <float> scan_period_ms: 0;
 
     callback telem_start();
     callback telem_stop();
@@ -583,32 +830,81 @@ component AllChannelsPage inherits Rectangle {
                 clicked => { root.telem_stop(); }
             }
             Text {
-                text: "全 36 通道实时状态；点击卡片进入单通道精调。";
+                text: "全 36 通道实时状态；单击选中，双击卡片进入单通道精调。";
                 vertical-alignment: center;
                 color: #89949e;
             }
             Text {
-                text: "采样率 " + root.sample_rate_hz + " Hz  通道延迟 " + root.channel_delay_us + " us";
+                text: "采样率 " + root.sample_rate_hz + " Hz  探测周期 " + Math.round(root.scan_period_ms * 100) / 100 + " ms";
                 vertical-alignment: center;
                 color: #8fd6ff;
             }
         }
 
-        // 6x6 明确网格：定位只读取 Rust 回填的 grid_col/grid_row，完全不依赖循环索引。
+        // 6 列网格：定位用循环索引自身(Math.mod/Math.floor)，不依赖 Rust 字段，
+        // 杜绝旧实现的"仅渲染 6 格斜向级联"故障。124px 宽 + 6px 间距 = 130px 列距。
         ScrollView {
             vertical-stretch: 1;
             Rectangle {
-                min-width: 768px;
-                min-height: 492px;
-                for cell in root.channels: ChannelStatusCell {
+                min-width: 792px;
+                min-height: 600px;
+                for cell[idx] in root.channels: ChannelStatusCell {
                     entry: cell;
                     selected: cell.index == root.selected_channel;
-                    x: cell.grid_col * 128px;
-                    y: cell.grid_row * 82px;
+                    x: Math.mod(idx, 6) * 130px;
+                    y: Math.floor(idx / 6) * 100px;
+                    selected_click(ch) => { root.selected_channel = ch; }
                     activated(ch) => { root.channel_selected(ch); }
                 }
             }
         }
+    }
+}
+
+// 算法上报变量折线(main.rs::build_algo_trace_view 回填): idx 对应 io->report[idx](0..3),
+// name 来自源码 ALGO_REPORT(idx,"name") 声明; 未声明的 idx 该行 visible=false。
+// ★定义前置★: CurvesPage(算法可选叠加)与 AlgoPage 都用到, 须在两者之前声明(Slint 先声明后使用)。
+export struct AlgoReportLine {
+    idx: int,
+    name: string,
+    path: string,
+    visible: bool,
+    line_color: color,
+}
+
+// 算法可调变量行(main.rs::build_algo_setting_rows 回填): idx 对应 io->cfg[idx](0..7),
+// name/default_val 来自源码 ALGO_SETTING(idx,"name",defval) 声明, value 为当前 cfg[idx]。
+export struct AlgoSettingRow {
+    idx: int,
+    name: string,
+    default_val: int,
+    value: int,
+}
+
+// 可调变量编辑行: 0..255(u8), 与 ParamEditorRow 分开(范围不同, 语义是共享算法 cfg 而非 CSD 参数)。
+component AlgoSettingEditorRow inherits HorizontalBox {
+    in property <AlgoSettingRow> entry;
+    callback edited(int, int);
+
+    padding: 0px;
+    spacing: 6px;
+    height: 34px;
+
+    Text {
+        text: root.entry.name + " (cfg[" + root.entry.idx + "], 默认 " + root.entry.default_val + ")";
+        horizontal-stretch: 1;
+        overflow: elide;
+        wrap: no-wrap;
+        vertical-alignment: center;
+        color: #d8e0e8;
+    }
+    SpinBox {
+        horizontal-stretch: 0;
+        min-width: 92px;
+        minimum: 0;
+        maximum: 255;
+        value: root.entry.value;
+        edited(v) => { root.edited(root.entry.idx, v); }
     }
 }
 
@@ -619,7 +915,7 @@ component CurvesPage inherits Rectangle {
     in-out property <bool> show_raw: false;
     in-out property <bool> show_bsln: false;
     in-out property <bool> show_diff: true;
-    // CSD 处理模式：0=自动校准, 1=半自动手动。半自动下手动阈值/参数才持久生效。
+    // CSD 处理模式：0=自动校准/标准完整处理, 1=半自动手动。半自动下手动阈值/参数才持久生效。
     in-out property <int> scan_mode: 0;
 
     // 由 main.rs::build_curve_paths 回填的 SVG path 命令串,viewbox 1000x1000
@@ -641,19 +937,62 @@ component CurvesPage inherits Rectangle {
 
     in property <[ParamRow]> params: [];
     in property <string> cp_text: "读取中…";
+    // 当前通道最新数值读数(raw/diff/baseline + 阈值), 由 main.rs 每 tick 回填。
+    in property <string> curve_readout: "";
+    // 阈值可判定区域警告(main.rs 计算): 当 2^分辨率-基线 < 手指阈值 时非空 → 该通道永不触发。空=正常。
+    in property <string> threshold_warning: "";
+
+    // 算法触发判定追踪(out_active, 0/1 阶梯线), 由 main.rs::build_algo_trace_view 回填。
+    // 与 diff/raw/bsln 折线独立成一条窄带, 避免与主曲线共享纵轴导致 0/1 阶梯被压扁看不清。
+    in property <string> active_path: "";
+    in property <int> active_point_count: 0;
+    in-out property <bool> show_active: true;
+
+    // ★算法可选叠加(合并自原独立"算法"页的上报折线/可调变量)★: 勾选后在本页追加显示
+    // 算法 report[] 折线 + 图例 + cfg[8] 可调变量行(与选中通道一致)。默认关闭, 不干扰精调。
+    in-out property <bool> show_algo_overlay: false;
+    in property <[AlgoReportLine]> algo_report_lines: [];
+    in property <int> algo_trace_point_count: 0;
+    in property <[AlgoSettingRow]> algo_setting_rows: [];
+    callback algo_setting_edited(int, int);
 
     callback telem_start();
     callback telem_stop();
     callback calibrate();
     callback baseline_reset();
+    // 阻塞类操作进行中: 锁定校准/基线按钮 + 显示运行标识。
+    in property <bool> op_busy: false;
+    in property <string> op_label: "";
     callback measure_cp();
     // 退化方案:阈值通过 SpinBox 直接编辑值,回调 (param_id, value)
     callback threshold_set(int, int);
     callback param_edited(int, int);
-    callback param_apply_all(int, int);
-    // CSD 模式切换(0=全自动,1=半自动) + 从设备捕获当前(自整定)参数为半自动手动起点
+    // CSD 模式切换(0=自动校准/标准完整处理,1=半自动手动) + 捕获当前参数作为手动起点
     callback mode_changed(int);
     callback capture_params();
+
+    // 当前采样率(Hz), 供把横向可见窗口(样本数)换算成真实时间跨度显示。
+    in property <int> sample_rate_hz: 0;
+    in property <string> curve_threshold_warning: "";
+
+    // 折线图视图变换(viewbox 坐标系 0..1000): 横=时间窗口, 纵=数值范围。
+    // 滚轮缩放时间(横, 锚定右缘=现在), Shift+滚轮缩放纵轴, 拖拽平移, 双击复位。全览默认 0/1000。
+    property <float> view_x: 0;
+    property <float> view_w: 1000;
+    // 当前横向可见时间跨度(ms): 可见样本数 / 采样率。可见样本 = (view_w/1000)×总样本。
+    property <float> visible_ms: (root.sample_rate_hz > 0 && root.curve_point_count > 0)
+        ? (root.view_w / 1000 * root.curve_point_count / root.sample_rate_hz * 1000)
+        : 0;
+    property <float> view_y: 0;
+    property <float> view_h: 1000;
+    property <float> drag_start_vx: 0;
+    property <float> drag_start_vy: 0;
+    // 可见范围回算的数值(纵轴刻度)与样本索引(时间条)。
+    property <float> vis_top: root.curve_y_max - root.view_y / 1000 * (root.curve_y_max - root.curve_y_min);
+    property <float> vis_bot: root.curve_y_max - (root.view_y + root.view_h) / 1000 * (root.curve_y_max - root.curve_y_min);
+    function reset-view() {
+        root.view_x = 0; root.view_w = 1000; root.view_y = 0; root.view_h = 1000;
+    }
 
     VerticalBox {
         padding: 8px;
@@ -696,49 +1035,39 @@ component CurvesPage inherits Rectangle {
                 checked: root.show_diff;
                 toggled => { root.show_diff = self.checked; }
             }
+            CheckBox {
+                text: "触发判定";
+                checked: root.show_active;
+                toggled => { root.show_active = self.checked; }
+            }
+        }
+
+        // 第二行工具栏：校准/测量类操作。拆两行避免窄窗口右侧按钮被截断。
+        HorizontalBox {
+            padding: 0px;
+            spacing: 8px;
+
             Button {
-                text: "校准";
+                // 自动模式由中间件自动校准, 手动"校准"无意义 → 锁定; 切半自动手动模式后可用。
+                // 运行中(op_busy)锁定并显示运行标识, 完成后自动解锁。
+                text: root.op_busy ? ("⏳ " + root.op_label) : (root.scan_mode == 1 ? "校准" : "校准(自动模式锁定)");
+                enabled: root.scan_mode == 1 && !root.op_busy;
                 clicked => { root.calibrate(); }
             }
             Button {
                 text: "基线复位";
+                enabled: !root.op_busy;
                 clicked => { root.baseline_reset(); }
-            }
-            Text {
-                text: root.cp_text;
-                vertical-alignment: center;
-                color: #8fd6ff;
             }
             Button {
                 text: "测量全部电极电容";
                 clicked => { root.measure_cp(); }
             }
-        }
-
-        HorizontalBox {
-            padding: 0px;
-            spacing: 8px;
-
             Text {
-                text: "CSD 模式:";
+                text: root.cp_text;
                 vertical-alignment: center;
-            }
-            ComboBox {
-                model: ["自动校准", "半自动手动"];
-                current-index: root.scan_mode;
-                selected(_) => {
-                    root.scan_mode = self.current-index;
-                    root.mode_changed(self.current-index);
-                }
-            }
-            Button {
-                text: "捕获当前值→手动";
-                clicked => { root.capture_params(); }
-            }
-            Text {
-                text: root.scan_mode == 1 ? "半自动手动：手动阈值/参数生效并可保存" : "自动校准：设备自动更新校准值";
-                vertical-alignment: center;
-                color: root.scan_mode == 1 ? #2b8a3e : #8fd6ff;
+                color: #8fd6ff;
+                horizontal-stretch: 1;
             }
         }
 
@@ -768,9 +1097,97 @@ component CurvesPage inherits Rectangle {
             }
         }
 
+        // 当前通道最新数值读数(raw/diff/baseline + 量程 + 阈值)。
+        Text {
+            text: root.curve_readout;
+            color: #cfe6ff;
+            font-size: 12px;
+            wrap: word-wrap;
+        }
+
+        // ★算法可选叠加(合并自原独立"算法"页)★: 开关控制, 勾选后追加显示算法 report[] 折线 + 图例 +
+        // cfg[8] 可调变量行(与本页选中通道一致)。默认关闭, 不占空间/不干扰精调。
+        HorizontalBox {
+            padding: 0px;
+            spacing: 8px;
+            CheckBox {
+                text: "叠加算法上报折线 / 可调变量(cfg)";
+                checked: root.show_algo_overlay;
+                toggled => { root.show_algo_overlay = self.checked; }
+            }
+            Rectangle { horizontal-stretch: 1; }
+        }
+        if root.show_algo_overlay: VerticalBox {
+            padding: 0px;
+            spacing: 6px;
+
+            Text {
+                text: "算法上报变量(report[]) — 追踪 CH" + root.sel_channel;
+                color: #8fd6ff;
+                font-size: 12px;
+            }
+            Rectangle {
+                height: 180px;
+                background: #101418;
+                border-width: 1px;
+                border-color: #29323a;
+                clip: true;
+                for line in root.algo_report_lines: Path {
+                    x: 4px; y: 4px;
+                    width: parent.width - 8px; height: parent.height - 8px;
+                    viewbox-x: 0; viewbox-y: 0; viewbox-width: 1000; viewbox-height: 1000;
+                    commands: line.path;
+                    stroke: line.line_color;
+                    stroke-width: 2px;
+                    visible: line.visible && root.algo_trace_point_count > 0;
+                }
+                Text {
+                    x: 8px; y: 4px;
+                    text: root.algo_trace_point_count > 0 ? "" : "暂无追踪数据(需已连接且源码已声明 ALGO_REPORT)";
+                    color: #77828c;
+                    font-size: 11px;
+                }
+            }
+            // 图例
+            HorizontalBox {
+                padding: 0px;
+                spacing: 12px;
+                for line in root.algo_report_lines: HorizontalBox {
+                    padding: 0px;
+                    spacing: 4px;
+                    visible: line.visible;
+                    Rectangle { width: 10px; height: 10px; background: line.line_color; }
+                    Text { text: line.name; color: #b0b8c0; font-size: 11px; vertical-alignment: center; }
+                }
+            }
+            // cfg[8] 可调变量行
+            Text {
+                text: "可调变量(cfg[8], ALGO_SETTING 声明; 修改立即下发并持久化)";
+                color: #b0b8c0;
+                font-size: 12px;
+            }
+            if root.algo_setting_rows.length == 0: Text {
+                text: "当前源码未声明任何 ALGO_SETTING(idx,\"name\",defval)。";
+                color: #77828c;
+                font-size: 11px;
+            }
+            for row in root.algo_setting_rows: AlgoSettingEditorRow {
+                entry: row;
+                edited(idx, v) => { root.algo_setting_edited(idx, v); }
+            }
+        }
+
+        // 主体左右结构(手动绝对布局: HorizontalBox 在本嵌套下不尊重 min-width 会把参数区挤没,
+        // 改为容器 Rectangle + 绝对 x/width——参数区固定右侧 360px, 折线图占左侧剩余)。
         Rectangle {
-            min-height: 300px;
             vertical-stretch: 1;
+            min-height: 300px;
+
+        Rectangle {
+            x: 0;
+            y: 0;
+            width: parent.width - 372px;
+            height: (root.show_active && root.active_point_count > 0) ? parent.height - 44px : parent.height;
             clip: true;
             background: #101418;
             border-width: 1px;
@@ -794,59 +1211,179 @@ component CurvesPage inherits Rectangle {
             Rectangle { x: plot.x; y: plot.y + plot.height * 0.75; width: plot.width; height: 1px; background: #29323a; }
             Rectangle { x: plot.x; y: plot.y + plot.height - 1px; width: plot.width; height: 1px; background: #33404a; }
 
-            Path {
+            // 曲线裁剪区 = plot 大小; 三条 Path 用 viewbox 视图变换实现缩放/平移, 超出被裁剪。
+            clipbox := Rectangle {
                 x: plot.x;
                 y: plot.y;
                 width: plot.width;
                 height: plot.height;
-                viewbox-width: 1000;
-                viewbox-height: 1000;
-                commands: root.bsln_path;
-                stroke: #ffaa00;
-                stroke-width: 2px;
-                visible: root.show_bsln && root.curve_point_count > 0;
+                clip: true;
+
+                Path {
+                    x: 0; y: 0; width: parent.width; height: parent.height;
+                    viewbox-x: root.view_x;
+                    viewbox-y: root.view_y;
+                    viewbox-width: root.view_w;
+                    viewbox-height: root.view_h;
+                    commands: root.bsln_path;
+                    stroke: #ffaa00;
+                    stroke-width: 2px;
+                    visible: root.show_bsln && root.curve_point_count > 0;
+                }
+                Path {
+                    x: 0; y: 0; width: parent.width; height: parent.height;
+                    viewbox-x: root.view_x;
+                    viewbox-y: root.view_y;
+                    viewbox-width: root.view_w;
+                    viewbox-height: root.view_h;
+                    commands: root.raw_path;
+                    stroke: #3399ff;
+                    stroke-width: 2px;
+                    visible: root.show_raw && root.curve_point_count > 0;
+                }
+                Path {
+                    x: 0; y: 0; width: parent.width; height: parent.height;
+                    viewbox-x: root.view_x;
+                    viewbox-y: root.view_y;
+                    viewbox-width: root.view_w;
+                    viewbox-height: root.view_h;
+                    commands: root.diff_path;
+                    stroke: #33cc33;
+                    stroke-width: 2px;
+                    visible: root.show_diff && root.curve_point_count > 0;
+                }
+
+                // 交互: 滚轮缩放时间(横), Shift+滚轮缩放纵轴, 拖拽平移, 双击复位。
+                TouchArea {
+                    mouse-cursor: grab;
+                    pointer-event(e) => {
+                        if (e.kind == PointerEventKind.down) {
+                            root.drag_start_vx = root.view_x;
+                            root.drag_start_vy = root.view_y;
+                        }
+                    }
+                    moved => {
+                        if (self.pressed) {
+                            root.view_x = Math.clamp(
+                                root.drag_start_vx - (self.mouse-x - self.pressed-x) / self.width * root.view_w,
+                                0, 1000 - root.view_w);
+                            root.view_y = Math.clamp(
+                                root.drag_start_vy - (self.mouse-y - self.pressed-y) / self.height * root.view_h,
+                                0, 1000 - root.view_h);
+                        }
+                    }
+                    scroll-event(e) => {
+                        if (e.modifiers.shift) {
+                            // 纵轴缩放(围绕当前窗口中心)。上滚放大(窗口变窄)。
+                            root.view_y = Math.clamp(
+                                root.view_y + root.view_h * (1 - (e.delta-y > 0 ? 0.85 : 1.1765)) / 2,
+                                0, 1000 - root.view_h * (e.delta-y > 0 ? 0.85 : 1.1765));
+                            root.view_h = Math.clamp(root.view_h * (e.delta-y > 0 ? 0.85 : 1.1765), 40, 1000);
+                        } else {
+                            // 横轴(时间)缩放: ★硬锚定右缘=现在(x=1000)★, 缩放只改"显示多长的近端时间窗口"。
+                            // 视图恒为 [1000-view_w, 1000], 始终贴在最新数据右缘, 杜绝露出右侧无数据(始终无效)区。
+                            root.view_w = Math.clamp(root.view_w * (e.delta-y > 0 ? 0.85 : 1.1765), 40, 1000);
+                            root.view_x = 1000 - root.view_w;
+                        }
+                        return accept;
+                    }
+                    double-clicked => { root.reset-view(); }
+                }
             }
-            Path {
+
+            // 横向滚动条(时间): 缩放后显示当前窗口在全量中的位置, 可点击/拖动平移。
+            htrack := Rectangle {
                 x: plot.x;
-                y: plot.y;
+                y: plot.y + plot.height + 3px;
                 width: plot.width;
-                height: plot.height;
-                viewbox-width: 1000;
-                viewbox-height: 1000;
-                commands: root.raw_path;
-                stroke: #3399ff;
-                stroke-width: 2px;
-                visible: root.show_raw && root.curve_point_count > 0;
+                height: 6px;
+                background: #1a2129;
+                border-radius: 3px;
+                visible: root.view_w < 999;
+                Rectangle {
+                    x: parent.width * (root.view_x / 1000);
+                    width: Math.max(parent.width * (root.view_w / 1000), 10px);
+                    height: parent.height;
+                    border-radius: 3px;
+                    background: hta.pressed ? #6a7580 : #4a5560;
+                }
+                hta := TouchArea {
+                    moved => { if (self.pressed) {
+                        root.view_x = Math.clamp((self.mouse-x / htrack.width) * 1000 - root.view_w / 2, 0, 1000 - root.view_w);
+                    } }
+                    clicked => {
+                        root.view_x = Math.clamp((self.mouse-x / htrack.width) * 1000 - root.view_w / 2, 0, 1000 - root.view_w);
+                    }
+                }
             }
-            Path {
-                x: plot.x;
+            // 纵向滚动条(数值): 缩放后显示当前纵轴窗口位置, 可点击/拖动。
+            vtrack := Rectangle {
+                x: plot.x + plot.width + 3px;
                 y: plot.y;
-                width: plot.width;
+                width: 6px;
                 height: plot.height;
-                viewbox-width: 1000;
-                viewbox-height: 1000;
-                commands: root.diff_path;
-                stroke: #33cc33;
-                stroke-width: 2px;
-                visible: root.show_diff && root.curve_point_count > 0;
+                background: #1a2129;
+                border-radius: 3px;
+                visible: root.view_h < 999;
+                Rectangle {
+                    y: parent.height * (root.view_y / 1000);
+                    height: Math.max(parent.height * (root.view_h / 1000), 10px);
+                    width: parent.width;
+                    border-radius: 3px;
+                    background: vta.pressed ? #6a7580 : #4a5560;
+                }
+                vta := TouchArea {
+                    moved => { if (self.pressed) {
+                        root.view_y = Math.clamp((self.mouse-y / vtrack.height) * 1000 - root.view_h / 2, 0, 1000 - root.view_h);
+                    } }
+                    clicked => {
+                        root.view_y = Math.clamp((self.mouse-y / vtrack.height) * 1000 - root.view_h / 2, 0, 1000 - root.view_h);
+                    }
+                }
             }
 
             // 阈值线只读展示，数值仍由上方 SpinBox 编辑。
             Rectangle {
+                property <float> ff: (root.finger_th_y - root.view_y) / root.view_h;
                 x: plot.x;
-                y: plot.y + plot.height * (root.finger_th_y / 1000);
+                y: plot.y + plot.height * ff;
                 width: plot.width;
                 height: 1px;
                 background: #ff4444;
-                visible: root.curve_point_count > 0;
+                visible: root.curve_point_count > 0 && ff >= 0 && ff <= 1;
             }
             Rectangle {
+                property <float> nf: (root.noise_th_y - root.view_y) / root.view_h;
                 x: plot.x;
-                y: plot.y + plot.height * (root.noise_th_y / 1000);
+                y: plot.y + plot.height * nf;
                 width: plot.width;
                 height: 1px;
                 background: #ffee44;
-                visible: root.curve_point_count > 0;
+                visible: root.curve_point_count > 0 && nf >= 0 && nf <= 1;
+            }
+
+            // 阈值线数值标注(贴线右端)。
+            Text {
+                property <float> ff: (root.finger_th_y - root.view_y) / root.view_h;
+                x: plot.x + plot.width - 96px;
+                y: plot.y + plot.height * ff - 14px;
+                text: "手指阈值 " + root.finger_th_val;
+                color: #ff8888;
+                font-size: 10px;
+                horizontal-alignment: right;
+                width: 92px;
+                visible: root.curve_point_count > 0 && ff >= 0 && ff <= 1;
+            }
+            Text {
+                property <float> nf: (root.noise_th_y - root.view_y) / root.view_h;
+                x: plot.x + plot.width - 96px;
+                y: plot.y + plot.height * nf + 2px;
+                text: "噪声阈值 " + root.noise_th_val;
+                color: #ffee88;
+                font-size: 10px;
+                horizontal-alignment: right;
+                width: 92px;
+                visible: root.curve_point_count > 0 && nf >= 0 && nf <= 1;
             }
 
             Text {
@@ -854,7 +1391,7 @@ component CurvesPage inherits Rectangle {
                 y: plot.y - 7px;
                 width: 54px;
                 height: 16px;
-                text: Math.round(root.curve_y_max);
+                text: Math.round(root.vis_top);
                 color: #aeb9c2;
                 font-size: 10px;
                 horizontal-alignment: right;
@@ -864,7 +1401,7 @@ component CurvesPage inherits Rectangle {
                 y: plot.y + plot.height * 0.5 - 7px;
                 width: 54px;
                 height: 16px;
-                text: Math.round(root.curve_y_mid);
+                text: Math.round((root.vis_top + root.vis_bot) / 2);
                 color: #aeb9c2;
                 font-size: 10px;
                 horizontal-alignment: right;
@@ -874,7 +1411,7 @@ component CurvesPage inherits Rectangle {
                 y: plot.y + plot.height - 12px;
                 width: 54px;
                 height: 16px;
-                text: Math.round(root.curve_y_min);
+                text: Math.round(root.vis_bot);
                 color: #aeb9c2;
                 font-size: 10px;
                 horizontal-alignment: right;
@@ -897,7 +1434,11 @@ component CurvesPage inherits Rectangle {
                 x: plot.x + 38px;
                 y: parent.height - 28px;
                 width: plot.width - 76px;
-                text: "样本 " + root.curve_point_count;
+                text: "时间窗 " + (Math.round(root.visible_ms * 10) / 10) + " ms"
+                    + "  样本 " + Math.round(root.view_x / 1000 * root.curve_point_count) + "–"
+                    + Math.round((root.view_x + root.view_w) / 1000 * root.curve_point_count)
+                    + "/" + root.curve_point_count + "  " + (Math.round(10000 / root.view_w) / 10) + "×"
+                    + "  (滚轮=时间窗 Shift+滚轮=纵轴 拖拽=平移 双击=复位)";
                 color: #7f8c96;
                 font-size: 10px;
                 horizontal-alignment: center;
@@ -916,36 +1457,77 @@ component CurvesPage inherits Rectangle {
             }
         }
 
-        GroupBox {
-            title: "通道参数";
+        // 触发判定追踪窄带(算法 out_active, 0/1 阶梯线): 独立纵轴避免被主曲线压扁。
+        Rectangle {
+            x: 0;
+            y: parent.height - 40px;
+            width: parent.width - 372px;
+            height: 36px;
+            visible: root.show_active && root.active_point_count > 0;
+            background: #101418;
+            border-width: 1px;
+            border-color: #3a3a3a;
+            clip: true;
+            Text { x: 4px; y: 2px; text: "触发判定"; color: #ff3399; font-size: 9px; }
+            Path {
+                x: 4px; y: 4px;
+                width: parent.width - 8px; height: parent.height - 8px;
+                viewbox-x: 0; viewbox-y: 0; viewbox-width: 1000; viewbox-height: 1000;
+                commands: root.active_path;
+                stroke: #ff3399;
+                stroke-width: 2px;
+            }
+        }
 
-            ScrollView {
-                VerticalBox {
-                    padding: 0px;
-                    spacing: 4px;
+        // 右侧: 通道参数调整区(绝对锚定右侧 360px, 全高)。
+        Rectangle {
+            x: parent.width - 360px;
+            y: 0;
+            width: 360px;
+            height: parent.height;
+            // GroupBox 是纯 Rectangle 容器的子元素, 不会自动撑满父宽 → 必须显式撑满,
+            // 否则塌缩到内容最小宽度(表现为参数区只剩窄窄一条)。
+            GroupBox {
+                width: parent.width;
+                // 底部为阈值可判定区域警告预留空间(有警告时显示红框)。
+                height: root.threshold_warning != "" ? parent.height - 104px : parent.height;
+                title: "通道参数";
 
-                    for row in root.params: HorizontalBox {
+                ScrollView {
+                    VerticalBox {
                         padding: 0px;
-                        spacing: 8px;
+                        spacing: 4px;
 
-                        Text {
-                            text: row.label;
-                            min-width: 160px;
-                            vertical-alignment: center;
-                        }
-                        SpinBox {
-                            minimum: 0;
-                            maximum: 65535;
-                            value: row.value;
-                            edited(v) => { root.param_edited(row.param_id, v); }
-                        }
-                        Button {
-                            text: "此项应用全部通道";
-                            clicked => { root.param_apply_all(row.param_id, row.value); }
+                        for row in root.params: ParamEditorRow {
+                            entry: row;
+                            edited(pid, v) => { root.param_edited(pid, v); }
                         }
                     }
                 }
             }
+
+            // 阈值可判定区域警告(图4 位置): 2^分辨率-基线 < 手指阈值 → 该通道永不触发, 红框警示 + 建议。
+            Rectangle {
+                x: 0;
+                y: parent.height - 100px;
+                width: parent.width;
+                height: 96px;
+                visible: root.threshold_warning != "";
+                border-radius: 6px;
+                border-width: 2px;
+                border-color: #e0403a;
+                background: #2a1416;
+                Text {
+                    x: 8px; y: 6px;
+                    width: parent.width - 16px; height: parent.height - 12px;
+                    text: root.threshold_warning;
+                    color: #ff6b64;
+                    font-size: 11px;
+                    wrap: word-wrap;
+                    vertical-alignment: center;
+                }
+            }
+        }
         }
     }
 }
@@ -959,8 +1541,11 @@ component DashboardPage inherits Rectangle {
     in-out property <int> selected_device: 0;
     in property <string> conn_status: "未连接";
     in property <string> device_info_text: "未获取到设备信息";
+    in property <string> sensor_health: "";
+    in property <int> sensor_health_level: 0;
     in property <int> sample_rate_hz: 0;
-    in property <int> channel_delay_us: 0;
+    in property <string> curve_threshold_warning: "";
+    in property <float> scan_period_ms: 0;
     in-out property <int> scan_mode: 0;
     in property <int> latency_total_us: 0;
     in property <int> latency_spi_us: 0;
@@ -969,12 +1554,23 @@ component DashboardPage inherits Rectangle {
     in property <int> latency_sensor_us: 0;
     in-out property <bool> measure_latency: false;
     in property <string> log_text: "";
+    // 延迟历史折线(总延迟 us): SVG path(viewbox 1000x1000) + 量程 + 点数, 由 main.rs 回填。
+    in property <string> lat_path: "";
+    in property <float> lat_y_max: 1;
+    in property <float> lat_y_min: 0;
+    in property <int> lat_point_count: 0;
+    // 延迟图横向视图窗口(viewbox 0..1000): 滚轮缩放时间 + 拖拽/滚动条平移 + 双击复位。
+    property <float> view_lx: 0;
+    property <float> view_lw: 1000;
+    // 绘图区宽高比回传(见延迟图 Path viewbox 说明): main.rs 据此把曲线 x 拉伸到铺满宽度。
+    callback lat_area_resized(float);
 
     callback refresh();
     callback connect_clicked();
     callback disconnect_clicked();
     callback reboot_device();
     callback reboot_bootloader();
+    callback reboot_psoc();
     callback mode_changed(int);
     callback latency_measure_toggled(bool);
 
@@ -1043,6 +1639,10 @@ component DashboardPage inherits Rectangle {
                                 text: "进烧录模式";
                                 clicked => { root.reboot_bootloader(); }
                             }
+                            Button {
+                                text: "重启PSoC";
+                                clicked => { root.reboot_psoc(); }
+                            }
                         }
 
                         Text {
@@ -1058,6 +1658,7 @@ component DashboardPage inherits Rectangle {
                     background: #23282e;
                     min-height: 190px;
                     horizontal-stretch: 1;
+                    clip: true;
 
                     VerticalBox {
                         padding: 12px;
@@ -1069,29 +1670,18 @@ component DashboardPage inherits Rectangle {
                             color: #ffffff;
                         }
 
-                        Text {
-                            text: root.device_info_text;
-                            color: #b0b8c0;
-                            wrap: word-wrap;
-                        }
-
-                        HorizontalBox {
-                            padding: 0px;
-                            spacing: 6px;
+                        // 诊断文本可能很长(多行), 固定高度可滚动区域避免溢出卡片。
+                        ScrollView {
+                            height: 110px;
+                            horizontal-stretch: 1;
                             Text {
-                                text: "CSD 模式:";
+                                width: parent.width;
+                                text: root.device_info_text;
                                 color: #b0b8c0;
-                                vertical-alignment: center;
-                            }
-                            ComboBox {
-                                model: ["自动校准", "半自动手动"];
-                                current-index: root.scan_mode;
-                                selected(_) => {
-                                    root.scan_mode = self.current-index;
-                                    root.mode_changed(self.current-index);
-                                }
+                                wrap: word-wrap;
                             }
                         }
+                        // CSD 模式切换属于精细化设置(单通道精调页), 主页不再提供。
                     }
                 }
             }
@@ -1116,13 +1706,29 @@ component DashboardPage inherits Rectangle {
                             color: #ffffff;
                         }
                         Text {
+                            // ★固定像素宽度★: 数值(181→1810 Hz)变化不再改变文本首选宽度, 从而不驱动本块
+                            // 首选宽度 → HorizontalBox 的 stretch 分配恒定 → 与相邻延迟块的间隙(分割)不抖。
+                            // (不能用 width:parent.width, 会与 stretch 块形成 width↔layoutinfo 绑定环。)
+                            min-width: 150px;
                             text: root.sample_rate_hz + " Hz";
                             font-size: 28px;
+                            horizontal-alignment: left;
                             color: #8fd6ff;
                         }
                         Text {
-                            text: "通道延迟 " + root.channel_delay_us + " us";
+                            min-width: 150px;
+                            text: "探测周期: " + Math.round(root.scan_period_ms * 100) / 100 + " ms";
+                            horizontal-alignment: left;
                             color: #b0b8c0;
+                        }
+                        // 传感器/PSoC 健康总结(异常时给出大致原因)。level: 0正常/1警告/2错误。
+                        Text {
+                            text: root.sensor_health;
+                            wrap: word-wrap;
+                            font-size: 11px;
+                            color: root.sensor_health_level == 0 ? #4caf50
+                                : root.sensor_health_level == 2 ? #e05a5a
+                                : #f5a623;
                         }
                     }
                 }
@@ -1137,36 +1743,120 @@ component DashboardPage inherits Rectangle {
                         padding: 12px;
                         spacing: 6px;
 
-                        HorizontalBox {
-                            padding: 0px;
-                            spacing: 8px;
-                            Text {
-                                text: "延迟(Phase2 固件填值)";
-                                font-weight: 700;
-                                color: #ffffff;
-                                horizontal-stretch: 1;
-                            }
-                            CheckBox {
-                                text: "测量";
-                                checked: root.measure_latency;
-                                toggled => {
-                                    root.measure_latency = self.checked;
-                                    root.latency_measure_toggled(self.checked);
-                                }
-                            }
+                        Text {
+                            text: "延迟(Phase2 固件填值)";
+                            font-weight: 700;
+                            color: #ffffff;
                         }
 
                         Text {
+                            // 固定 min-width 吸收数值宽度变化, 避免驱动块宽 → 分割抖动(同采样块, 不用 parent.width 防绑定环)。
+                            min-width: 240px;
                             text: "总计 " + root.latency_total_us + " us";
                             font-size: 20px;
+                            horizontal-alignment: left;
                             color: #8fd6ff;
                         }
 
                         Text {
+                            min-width: 240px;
                             text: "SPI " + root.latency_spi_us + "us  RP处理 " + root.latency_proc_us + "us  USB " + root.latency_usb_us + "us  传感器 " + root.latency_sensor_us + "us";
                             font-size: 11px;
+                            horizontal-alignment: left;
                             color: #b0b8c0;
                             wrap: word-wrap;
+                        }
+                    }
+                }
+            }
+
+            // 总延迟历史折线图(独占整宽, 加高, 右锚定自动滚动)。
+            Rectangle {
+                border-radius: 8px;
+                background: #23282e;
+                min-height: 220px;
+
+                VerticalBox {
+                    padding: 12px;
+                    spacing: 6px;
+
+                    Text {
+                        text: "总延迟历史 (us)";
+                        font-weight: 700;
+                        color: #ffffff;
+                    }
+
+                    Rectangle {
+                        vertical-stretch: 1;
+                        min-height: 160px;
+                        background: #12181d;
+                        border-width: 1px;
+                        border-color: #29323a;
+                        clip: true;
+
+                        // 量程网格线: 顶(峰值) / 中(半程) / 底(0)。
+                        Rectangle {
+                            x: 0; y: 0; width: parent.width; height: 1px;
+                            background: #2a343c;
+                        }
+                        Rectangle {
+                            x: 0; y: parent.height / 2; width: parent.width; height: 1px;
+                            background: #222b32;
+                        }
+
+        latplot := Rectangle {
+                            x: 2px; y: 2px;
+                            width: parent.width - 4px;
+                            height: parent.height - 4px;
+                            clip: true;
+                            changed width => { root.lat_area_resized(self.height > 0px ? self.width / self.height : 1); }
+                            changed height => { root.lat_area_resized(self.height > 0px ? self.width / self.height : 1); }
+                            Path {
+                                x: 0; y: 0; width: parent.width; height: parent.height;
+                                // 1.17 Path 无 image-fit(默认 contain): 让 viewbox 宽高比 = 绘图区宽高比,
+                                // contain 缩放即正好铺满; main.rs 据同一 aspect 把曲线 x 拉伸到 [0,1000*aspect]。
+                                // 否则方形 1000x1000 viewbox 会被居中成"中间一小块"。
+                                viewbox-x: 0;
+                                viewbox-y: 0;
+                                viewbox-width: parent.height > 0px ? 1000 * (parent.width / parent.height) : 1000;
+                                viewbox-height: 1000;
+                                commands: root.lat_path;
+                                stroke: #8fd6ff;
+                                stroke-width: 1.5px;
+                                visible: root.lat_point_count > 0;
+                            }
+                        }
+                        Text {
+                            x: 4px; y: 2px;
+                            text: Math.round(root.lat_y_max) + "us";
+                            color: #7f8c96;
+                            font-size: 10px;
+                        }
+                        Text {
+                            x: 4px; y: parent.height / 2 - 6px;
+                            text: Math.round((root.lat_y_max + root.lat_y_min) / 2) + "us";
+                            color: #5f6a73;
+                            font-size: 9px;
+                        }
+                        Text {
+                            x: 4px; y: parent.height - 14px;
+                            text: Math.round(root.lat_y_min) + "us";
+                            color: #5f6a73;
+                            font-size: 9px;
+                        }
+                        Text {
+                            x: parent.width - 90px; y: 2px;
+                            text: "当前 " + root.latency_total_us + "us";
+                            color: #8fd6ff;
+                            font-size: 10px;
+                        }
+                        Text {
+                            text: root.lat_point_count == 0 ? "无延迟数据(需固件填值)" : "";
+                            color: #7f8c96;
+                            font-size: 12px;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                            visible: root.lat_point_count == 0;
                         }
                     }
                 }
@@ -1207,19 +1897,72 @@ component DashboardPage inherits Rectangle {
 // 触控键盘映射 / 物理键盘 占位页 (Phase 1)
 // ============================================================================
 
+// 组合键捕获输入框: 点击聚焦后按物理键盘, key-pressed 携带主键字符 + 修饰键状态, 直接录入。
+component KeyCaptureBox inherits Rectangle {
+    in property <string> display;
+    callback captured(string, bool, bool, bool, bool);  // text, ctrl, shift, alt, gui
+    height: 28px;
+    border-width: 1px;
+    border-radius: 4px;
+    border-color: fs.has-focus ? #4a90d9 : #3a434c;
+    background: fs.has-focus ? #16222e : #262b31;
+
+    fs := FocusScope {
+        key-pressed(e) => {
+            root.captured(e.text, e.modifiers.control, e.modifiers.shift, e.modifiers.alt, e.modifiers.meta);
+            return accept;
+        }
+    }
+    TouchArea {
+        mouse-cursor: pointer;
+        clicked => { fs.focus(); }
+    }
+    // 始终显示当前组合键(捕获后立即更新, 不再被焦点占位符遮挡); 焦点时右侧显示"录制中"角标。
+    Text {
+        x: 8px;
+        width: parent.width - 74px;
+        vertical-alignment: center;
+        overflow: elide;
+        text: root.display;
+        color: fs.has-focus ? #8fd6ff : #d0d6dd;
+    }
+    Text {
+        x: parent.width - 64px;
+        width: 60px;
+        vertical-alignment: center;
+        horizontal-alignment: right;
+        font-size: 10px;
+        text: fs.has-focus ? "⌨ 录制中" : "";
+        color: #8fd6ff;
+    }
+}
+
 component KeyMapPage inherits Rectangle {
     in property <bool> keyboard_map_en: false;
+    // 34 分区当前选择的键码下拉索引(由 main.rs 从 kbd_touch_keycode 换算), 共享键名表。
+    in property <[string]> zone_display: []; // 34 分区当前组合键显示
+    in property <[string]> zone_names: []; // 34 分区名 A1-E8
 
     callback set_keyboard_map_en(bool);
+    callback zone_captured(int, string, bool, bool, bool, bool);  // zone, text, ctrl,shift,alt,gui
+    callback zone_cleared(int);
+    callback refresh_kbd();
 
     VerticalBox {
         padding: 8px;
         spacing: 8px;
 
-        Text {
-            text: "触控→键盘映射：需固件支持（多组合+延迟），当前仅暴露开关";
-            color: #b0b8c0;
-            wrap: word-wrap;
+        HorizontalBox {
+            padding: 0px;
+            spacing: 8px;
+            Text {
+                text: "触控→键盘映射：开启后, 触摸各逻辑分区将输出所选 HID 键(游戏 serial 模式同样生效)。";
+                color: #b0b8c0;
+                wrap: word-wrap;
+                horizontal-stretch: 1;
+                vertical-alignment: center;
+            }
+            Button { text: "刷新"; clicked => { root.refresh_kbd(); } }
         }
 
         CheckBox {
@@ -1227,48 +1970,1032 @@ component KeyMapPage inherits Rectangle {
             checked: root.keyboard_map_en;
             toggled => { root.set_keyboard_map_en(self.checked); }
         }
+
+        ScrollView {
+            vertical-stretch: 1;
+            VerticalBox {
+                padding: 0px;
+                spacing: 4px;
+                for z in 34: HorizontalBox {
+                    padding: 2px;
+                    spacing: 6px;
+                    Text {
+                        text: root.zone_names[z];
+                        color: #b0b8c0;
+                        vertical-alignment: center;
+                        min-width: 56px;
+                    }
+                    KeyCaptureBox {
+                        horizontal-stretch: 1;
+                        display: z < root.zone_display.length ? root.zone_display[z] : "";
+                        captured(t, c, s, a, g) => { root.zone_captured(z, t, c, s, a, g); }
+                    }
+                    Button {
+                        text: "清除";
+                        clicked => { root.zone_cleared(z); }
+                    }
+                }
+            }
+        }
     }
 }
 
 component PhysKbdPage inherits Rectangle {
+    in property <[bool]> phys_pressed: [];   // 12 键实时按下态
+    in property <[string]> phys_display: []; // 12 键当前组合键显示
+
+    callback phys_captured(int, string, bool, bool, bool, bool);  // idx, text, ctrl,shift,alt,gui
+    callback phys_cleared(int);
+    callback refresh_kbd();
+
     VerticalBox {
         padding: 8px;
         spacing: 8px;
 
-        Text {
-            text: "物理键盘(GPIO1-12)：需固件支持，尚未实现";
-            color: #b0b8c0;
-            wrap: word-wrap;
+        HorizontalBox {
+            padding: 0px;
+            spacing: 8px;
+            Text {
+                text: "物理键盘 GPIO1-12 → HID 键盘。指示灯绿=按下; 为每个物理键选择输出的按键。";
+                color: #b0b8c0;
+                wrap: word-wrap;
+                horizontal-stretch: 1;
+                vertical-alignment: center;
+            }
+            Button { text: "刷新"; clicked => { root.refresh_kbd(); } }
+        }
+
+        ScrollView {
+            vertical-stretch: 1;
+            VerticalBox {
+                padding: 0px;
+                spacing: 5px;
+                for i in 12: HorizontalBox {
+                    padding: 2px;
+                    spacing: 6px;
+                    Rectangle {
+                        width: 18px;
+                        height: 18px;
+                        border-radius: 4px;
+                        border-width: 1px;
+                        border-color: #3a434c;
+                        background: (i < root.phys_pressed.length && root.phys_pressed[i]) ? #2b8a3e : #262b31;
+                    }
+                    Text {
+                        text: "键 " + (i + 1) + " (GPIO" + (i + 1) + ")";
+                        color: #d0d6dd;
+                        vertical-alignment: center;
+                        min-width: 96px;
+                    }
+                    KeyCaptureBox {
+                        horizontal-stretch: 1;
+                        display: i < root.phys_display.length ? root.phys_display[i] : "";
+                        captured(t, c, s, a, g) => { root.phys_captured(i, t, c, s, a, g); }
+                    }
+                    Button {
+                        text: "清除";
+                        clicked => { root.phys_cleared(i); }
+                    }
+                }
+            }
         }
     }
 }
 
 // ============================================================================
-// 设置页容器:6 个子标签,原样挂载现有页面组件 + 新占位页
+// 算法页:JIT 触控算法管理 + C→ASM 编译器 + 全局 CSD 设置
+// ============================================================================
+
+component AlgoPage inherits Rectangle {
+    in property <string> algo_info_text: "算法信息未读取";
+    in-out property <string> algo_c_source;
+    in property <string> algo_line_numbers: "1";   // 行号列(由 main.rs 随源码行数回填)
+    in property <string> algo_status: "";
+    in property <string> algo_asm: "";   // 编译产物反汇编(objdump -d .text)
+    in property <int> algo_asm_bytes: 0;      // 最近一次编译产物字节数(进度条用)
+    in property <int> algo_asm_capacity: 1024; // PSoC 可执行槽容量(字节)
+    property <int> editor_tab: 0;        // 0=C 源 1=反汇编 ASM(复用同一编辑面板)
+    // 右侧子标签: 0=原生(C源/反汇编) 1=算法上报(report[]折线+触发判定追踪) 2=可调变量(cfg[8])
+    property <int> content_tab: 0;
+    callback algo_refresh();
+    callback algo_reset_default();
+    callback algo_compile(string);       // 仅编译(算 ASM 大小/塞得下校验), 不上传
+    callback algo_upload();              // 上传最近一次编译产物
+    callback algo_load_template();       // 载入内置 v3.1 HDR 模板到编辑器
+    callback algo_source_edited(string); // 编辑时回传, main.rs 据此刷新行号
+
+    // 算法上报(report[]折线 + 触发判定追踪), 由 main.rs::build_algo_trace_view 回填。
+    in property <int> algo_sel_channel: 0;    // 当前追踪通道(与单通道精调页 sel_channel 一致, 只读展示)
+    in property <[AlgoReportLine]> algo_report_lines: [];
+    in property <string> algo_active_path: "";     // 触发判定(out_active)追踪折线
+    in property <int> algo_trace_point_count: 0;
+    // 可调变量(cfg[8]), 由 main.rs::build_algo_setting_rows 回填。
+    in property <[AlgoSettingRow]> algo_setting_rows: [];
+    callback algo_setting_edited(int, int);
+
+    VerticalBox {
+        padding: 10px;
+        spacing: 8px;
+
+        Text { text: "JIT 触控算法"; color: #e0e6ee; font-size: 16px; }
+        HorizontalBox {
+            spacing: 8px;
+            Button { text: "读取信息"; clicked => { root.algo_refresh(); } }
+            Button { text: "加载模板(v3.1)"; clicked => { root.algo_load_template(); } }
+            Text { text: root.algo_info_text; color: #b0b8c0; wrap: word-wrap; horizontal-stretch: 1; vertical-alignment: center; }
+        }
+
+        // 右侧三子标签: 原生 / 算法上报 / 可调变量, 明确分界线与顶部工具栏分离。
+        HorizontalBox {
+            spacing: 6px;
+            Rectangle {
+                width: 90px; height: 30px; border-radius: 4px;
+                background: root.content_tab == 0 ? #2b7de9 : #23282e;
+                Text { text: "原生"; color: #ffffff; horizontal-alignment: center; vertical-alignment: center; }
+                TouchArea { clicked => { root.content_tab = 0; } }
+            }
+            Rectangle {
+                width: 110px; height: 30px; border-radius: 4px;
+                background: root.content_tab == 1 ? #2b7de9 : #23282e;
+                Text { text: "算法上报"; color: #ffffff; horizontal-alignment: center; vertical-alignment: center; }
+                TouchArea { clicked => { root.content_tab = 1; } }
+            }
+            Rectangle {
+                width: 110px; height: 30px; border-radius: 4px;
+                background: root.content_tab == 2 ? #2b7de9 : #23282e;
+                Text { text: "可调变量"; color: #ffffff; horizontal-alignment: center; vertical-alignment: center; }
+                TouchArea { clicked => { root.content_tab = 2; } }
+            }
+            Rectangle { horizontal-stretch: 1; }
+        }
+        Rectangle { height: 1px; background: #3a434c; }
+
+        if root.content_tab == 0: VerticalBox {
+            padding: 0px;
+            spacing: 8px;
+
+            // C 源 / 反汇编 子标签(复用下方同一编辑面板, 而非上下两块)。
+            HorizontalBox {
+                spacing: 6px;
+                Rectangle {
+                    width: 90px; height: 30px; border-radius: 4px;
+                    background: root.editor_tab == 0 ? #2b7de9 : #23282e;
+                    Text { text: "C 源"; color: #ffffff; horizontal-alignment: center; vertical-alignment: center; }
+                    TouchArea { clicked => { root.editor_tab = 0; } }
+                }
+                Rectangle {
+                    width: 120px; height: 30px; border-radius: 4px;
+                    background: root.editor_tab == 1 ? #2b7de9 : #23282e;
+                    Text { text: "反汇编 ASM"; color: #ffffff; horizontal-alignment: center; vertical-alignment: center; }
+                    TouchArea { clicked => { root.editor_tab = 1; } }
+                }
+                Rectangle { horizontal-stretch: 1; }
+            }
+            Text {
+                text: root.editor_tab == 0
+                    ? "C 源: 入口 void algo(algo_io_t* io); 禁 libc/除法/64位; 见 psoc_algo_abi.h"
+                    : "反汇编 (编译产物 .text 的 Thumb 指令, 只读)";
+                color: #b0b8c0; wrap: word-wrap;
+            }
+
+            // 编辑面板: 固定高度, C 源(行号 gutter + 可编辑) 与 ASM(只读) 共用此区域。
+            Rectangle {
+                height: 360px;
+                background: #14181c;
+                border-width: 1px;
+                border-color: #3a3a3a;
+                clip: true;
+
+                // C 源: Flickable 内 gutter + TextInput 同步滚动, 行号与代码始终对齐。
+                Flickable {
+                    visible: root.editor_tab == 0;
+                    HorizontalLayout {
+                        spacing: 6px;
+                        alignment: start;
+                        Rectangle {
+                            width: 48px;
+                            background: #1c2228;
+                            Text {
+                                x: 0; y: 4px; width: parent.width - 8px;
+                                text: root.algo_line_numbers;
+                                color: #6b7680;
+                                font-size: 13px;
+                                font-family: "Consolas";
+                                horizontal-alignment: right;
+                            }
+                        }
+                        TextInput {
+                            text <=> root.algo_c_source;
+                            single-line: false;
+                            wrap: no-wrap;
+                            color: #d8e0e8;
+                            font-size: 13px;
+                            font-family: "Consolas";
+                            edited => { root.algo_source_edited(self.text); }
+                        }
+                    }
+                }
+                // 反汇编: 只读 TextEdit(自带滚动条, 可查看全部指令)。
+                TextEdit {
+                    visible: root.editor_tab == 1;
+                    width: parent.width;
+                    height: parent.height;
+                    read-only: true;
+                    text: root.algo_asm;
+                    font-size: 12px;
+                }
+            }
+
+            // 编译/上传分离: 先"编译"算出 ASM 占用并做塞得下校验, 再"上传"下发。
+            HorizontalBox {
+                spacing: 8px;
+                Button { text: "编译"; clicked => { root.algo_compile(root.algo_c_source); } }
+                Button {
+                    text: "上传";
+                    enabled: root.algo_asm_bytes > 0;
+                    clicked => { root.algo_upload(); }
+                }
+                Text { text: root.algo_status; color: #e0e6ee; wrap: word-wrap; horizontal-stretch: 1; vertical-alignment: center; }
+            }
+
+            // ASM 空间占用进度条: 占用 = 编译产物字节 / PSoC 槽容量。满槽=红, 富余=绿。
+            VerticalBox {
+                padding: 0px;
+                spacing: 3px;
+                Text {
+                    text: "ASM 空间: " + root.algo_asm_bytes + " / " + root.algo_asm_capacity + " 字节"
+                        + (root.algo_asm_capacity > 0
+                            ? ("  (" + Math.round(root.algo_asm_bytes * 100 / root.algo_asm_capacity) + "%)")
+                            : "")
+                        + (root.algo_asm_bytes > 0 ? "  可上传" : "  未编译");
+                    color: #b0b8c0;
+                    font-size: 11px;
+                }
+                Rectangle {
+                    height: 10px;
+                    border-radius: 5px;
+                    background: #23282e;
+                    clip: true;
+                    Rectangle {
+                        x: 0;
+                        width: root.algo_asm_capacity > 0
+                            ? (parent.width * Math.min(1.0, root.algo_asm_bytes / root.algo_asm_capacity))
+                            : 0px;
+                        height: parent.height;
+                        border-radius: 5px;
+                        background: (root.algo_asm_bytes * 10 > root.algo_asm_capacity * 9) ? #f5a623 : #2b8a3e;
+                    }
+                }
+            }
+        }
+
+        if root.content_tab == 1: VerticalBox {
+            padding: 0px;
+            spacing: 8px;
+
+            Text {
+                text: "追踪通道: CH" + root.algo_sel_channel + " (与\"单通道精调\"页选中通道一致)";
+                color: #8fd6ff;
+                font-size: 12px;
+            }
+
+            // 上报变量折线图: 静态 viewbox(main.rs 已归一化到 0..1000), 无交互缩放(信息量小, 从简)。
+            Rectangle {
+                height: 260px;
+                background: #101418;
+                border-width: 1px;
+                border-color: #3a3a3a;
+                clip: true;
+
+                report_plot := Rectangle {
+                    x: 8px; y: 8px;
+                    width: parent.width - 16px;
+                    height: parent.height - 16px;
+                    background: #12181d;
+                    border-width: 1px;
+                    border-color: #29323a;
+
+                    for line in root.algo_report_lines: Path {
+                        x: 0; y: 0; width: parent.width; height: parent.height;
+                        viewbox-x: 0; viewbox-y: 0; viewbox-width: 1000; viewbox-height: 1000;
+                        commands: line.path;
+                        stroke: line.line_color;
+                        stroke-width: 2px;
+                        visible: line.visible && root.algo_trace_point_count > 0;
+                    }
+                }
+                Text {
+                    x: 12px; y: 4px;
+                    text: root.algo_trace_point_count > 0 ? "" : "暂无追踪数据(需已连接且已声明 ALGO_REPORT)";
+                    color: #77828c;
+                    font-size: 11px;
+                }
+            }
+            // 图例: 逐个上报变量名称+色块。
+            HorizontalBox {
+                spacing: 12px;
+                for line in root.algo_report_lines: HorizontalBox {
+                    padding: 0px;
+                    spacing: 4px;
+                    visible: line.visible;
+                    Rectangle { width: 10px; height: 10px; background: line.line_color; }
+                    Text { text: line.name; color: #b0b8c0; font-size: 11px; vertical-alignment: center; }
+                }
+            }
+
+            Text { text: "触发判定追踪(out_active): 折线接近顶部=已触发, 接近底部=空闲"; color: #b0b8c0; font-size: 11px; }
+            Rectangle {
+                height: 90px;
+                background: #101418;
+                border-width: 1px;
+                border-color: #3a3a3a;
+                clip: true;
+                Path {
+                    x: 4px; y: 4px;
+                    width: parent.width - 8px; height: parent.height - 8px;
+                    viewbox-x: 0; viewbox-y: 0; viewbox-width: 1000; viewbox-height: 1000;
+                    commands: root.algo_active_path;
+                    stroke: #ff3399;
+                    stroke-width: 2px;
+                    visible: root.algo_trace_point_count > 0;
+                }
+            }
+        }
+
+        if root.content_tab == 2: VerticalBox {
+            padding: 0px;
+            spacing: 6px;
+            Text {
+                text: "可调变量(ALGO_SETTING 声明, 对应算法共享 cfg[8]); 修改立即下发并持久化。";
+                color: #b0b8c0;
+                wrap: word-wrap;
+            }
+            if root.algo_setting_rows.length == 0: Text {
+                text: "当前源码未声明任何 ALGO_SETTING(idx,\"name\",defval)。";
+                color: #77828c;
+            }
+            ScrollView {
+                vertical-stretch: 1;
+                VerticalBox {
+                    padding: 0px;
+                    spacing: 2px;
+                    for row in root.algo_setting_rows: AlgoSettingEditorRow {
+                        entry: row;
+                        edited(idx, v) => { root.algo_setting_edited(idx, v); }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ============================================================================
+// 触控全局调整页:CSD 处理模式 + 全局 CSD 硬件设置(从单通道精调/算法页集中迁入)
+// ============================================================================
+
+// 时钟树只读固定节点卡片: 灰底, 无编辑控件, 仅展示名称 + 值。
+component ClockFixedNode inherits Rectangle {
+    in property <string> node_title;
+    in property <string> node_value;
+
+    width: 128px;
+    height: 54px;
+    border-radius: 6px;
+    background: #1c2228;
+    border-width: 1px;
+    border-color: #3a434c;
+
+    VerticalBox {
+        padding: 6px;
+        spacing: 2px;
+        alignment: center;
+        Text {
+            text: root.node_title;
+            font-size: 11px;
+            color: #8a949e;
+            horizontal-alignment: center;
+            wrap: word-wrap;
+        }
+        Text {
+            text: root.node_value;
+            font-size: 13px;
+            font-weight: 700;
+            color: #d8e0e8;
+            horizontal-alignment: center;
+            wrap: word-wrap;
+        }
+    }
+}
+
+// 水平连接箭头(→), 用于同一行节点之间。
+component ClockArrowRight inherits Text {
+    text: "→";
+    color: #4a5560;
+    font-size: 18px;
+    vertical-alignment: center;
+    horizontal-alignment: center;
+    width: 22px;
+}
+
+// 垂直连接箭头(↓), 用于跨行连接。
+component ClockArrowDown inherits Text {
+    text: "↓";
+    color: #4a5560;
+    font-size: 18px;
+    horizontal-alignment: center;
+    height: 20px;
+}
+
+component GlobalTunePage inherits Rectangle {
+    in-out property <int> scan_mode: 0;
+    in property <int> g_inactive_sns: 1;   // 1=GND 2=High-Z 4=Shield
+    in property <int> g_idac_gain: 4;
+    in property <int> g_idac_sense_config: 0;   // 0=IDAC sourcing, 1=IDAC sinking
+    in property <int> g_auto_calibrate: 1;      // 1=自动校准, 0=固定IDAC(不自动校准)
+    in property <int> g_idac_min: 20;
+    in property <int> g_raw_target: 85;
+    in property <int> g_mfs_div_f1: 1;
+    in property <int> g_mfs_div_f2: 2;
+    // 以下三项始终显示 CH0 的当前值，编辑时统一写入全部 36 通道。
+    in property <int> csd_sns_clk_div: 0;
+    in property <int> csd_resolution: 0;
+    in property <int> csd_sns_clk_source: 0;
+    // 设备实测探测周期(ms, 两位小数), 时钟树末端节点展示。
+    in property <float> scan_period_ms: 0;
+    // 设备实测探测周期(µs 原值), 用于与"期望周期"精确比较并显示差值。
+    in property <int> scan_period_us: 0;
+    // 由当前 CSD 参数(分辨率)解算的理论采集周期下限(µs); 0=参数超范围无法解算。
+    in property <int> expected_period_us: 0;
+    // 是否有未保存草稿(供撤销按钮与提示)。
+    in property <bool> config_dirty: false;
+    callback mode_changed(int);
+    callback capture_params();
+    callback algo_global_set(int, int);   // gparam_id, value
+    callback csd_param_set(int, int);     // param_id, value → set_param_all
+    callback csd_refresh();               // 重新请求 CH0 代表值
+    callback reboot_psoc();               // 脉冲 XRES 重启 PSoC
+    callback reset_defaults();            // 恢复设备默认配置
+    callback discard_draft();             // 撤销全部未保存草稿
+    callback auto_tune();                 // 频率自适应下探(逐档降频重校准至能压到目标%)
+    // 阻塞类操作进行中(校准/基线/重启/自适应): 锁定触发按钮 + 显示运行中标识。
+    in property <bool> op_busy: false;
+    in property <string> op_label: "";
+    // 频率自适应结果文案(成功: 找到的分频; 失败: 超硬件能力)。
+    in property <string> auto_tune_status: "";
+
+    ScrollView {
+        // ★铺满并滚动★: 显式绑定 Rectangle 尺寸(TabWidget 给出可用高度), 内容超高时内部滚动,
+        // 而非把整页撑高挤出 SettingsPage 底部"保存到设备"栏(本页保存栏丢失的根因)。
+        x: 0; y: 0;
+        width: parent.width;
+        height: parent.height;
+        VerticalBox {
+            padding: 10px;
+            spacing: 10px;
+
+            Text { text: "触控全局调整"; color: #e0e6ee; font-size: 16px; }
+
+            GroupBox {
+                title: "安全操作(调崩可恢复)";
+                VerticalBox {
+                    spacing: 6px;
+                    HorizontalBox {
+                        spacing: 8px;
+                        Button {
+                            text: "撤销未保存改动";
+                            enabled: root.config_dirty;
+                            clicked => { root.discard_draft(); }
+                        }
+                        Button {
+                            text: "重启 PSoC";
+                            clicked => { root.reboot_psoc(); }
+                        }
+                        Button {
+                            text: "恢复默认值";
+                            clicked => { root.reset_defaults(); }
+                        }
+                        Rectangle { horizontal-stretch: 1; }
+                    }
+                    Text {
+                        text: root.config_dirty
+                            ? "● 有未保存草稿:在页面底部“保存到设备”生效, 或点“撤销未保存改动”放弃"
+                            : "✓ 已与设备同步";
+                        color: root.config_dirty ? #f5a623 : #2b8a3e;
+                        font-size: 12px;
+                        wrap: word-wrap;
+                    }
+                    Text {
+                        text: "调崩恢复顺序: ① 先“撤销未保存改动”回到设备当前值; ② 若已保存且异常, 再“恢复默认值”并“重启 PSoC”。";
+                        color: #7f8c96;
+                        font-size: 11px;
+                        wrap: word-wrap;
+                    }
+                }
+            }
+
+            GroupBox {
+                title: "CSD 处理模式";
+                VerticalBox {
+                    spacing: 6px;
+                    HorizontalBox {
+                        spacing: 8px;
+                        Text { text: "CSD 模式:"; color: #b0b8c0; vertical-alignment: center; }
+                        ComboBox {
+                            model: ["自动校准", "半自动手动"];
+                            current-index: root.scan_mode;
+                            selected(_) => {
+                                root.scan_mode = self.current-index;
+                                root.mode_changed(self.current-index);
+                            }
+                        }
+                        Button {
+                            text: "捕获当前值→手动";
+                            clicked => { root.capture_params(); }
+                        }
+                    }
+                    Text {
+                        text: root.scan_mode == 1 ? "半自动手动:手动阈值/参数生效并可保存" : "自动校准:运行标准完整处理";
+                        color: root.scan_mode == 1 ? #2b8a3e : #8fd6ff;
+                        wrap: word-wrap;
+                    }
+                }
+            }
+
+            GroupBox {
+                // ★去重★: 采样时钟分频/分辨率/时钟源/MFS 一律在下方"CSD 时钟树"里编辑(唯一入口),
+                // 本组只保留时钟树未覆盖的全局校准项, 避免两处重复导致的不同步。
+                title: "全局 CSD 校准设置(编辑仅暂存, 保存后下发并重初始化)";
+                VerticalBox {
+                    spacing: 6px;
+                    HorizontalBox {
+                        spacing: 8px;
+                        Text { text: "全局校准项; 采样时钟/分辨率/MFS 见下方时钟树。"; color: #8fd6ff; horizontal-stretch: 1; vertical-alignment: center; }
+                        Button { text: "刷新 CH0 参数"; clicked => { root.csd_refresh(); } }
+                    }
+                    HorizontalBox {
+                        spacing: 8px;
+                        Text { text: "未激活传感器连接:"; color: #b0b8c0; vertical-alignment: center; }
+                        ComboBox {
+                            model: ["GND", "High-Z", "Shield"];
+                            current-index: root.g_inactive_sns == 4 ? 2 : (root.g_inactive_sns == 2 ? 1 : 0);
+                            selected(v) => {
+                                root.algo_global_set(1, self.current-index == 2 ? 4 : (self.current-index == 1 ? 2 : 1));
+                            }
+                        }
+                    }
+                    Text { text: "作用: 非激活电极接法。GND 抗噪最好; High-Z 降互容耦合; Shield 主动屏蔽。取值: GND/High-Z/Shield。"; color: #7f8c96; font-size: 10px; wrap: word-wrap; }
+                    HorizontalBox {
+                        spacing: 8px;
+                        Text { text: "IDAC 感应配置:"; color: #b0b8c0; vertical-alignment: center; }
+                        ComboBox {
+                            model: ["IDAC sourcing", "IDAC sinking"];
+                            current-index: root.g_idac_sense_config == 1 ? 1 : 0;
+                            selected(v) => { root.algo_global_set(7, self.current-index); }
+                        }
+                    }
+                    Text { text: "作用: IDAC 充电方向。sourcing(灌入)/sinking(拉出) 影响灵敏度极性与稳定范围; 某些电极换向可脱离 railed。取值: sourcing/sinking。"; color: #7f8c96; font-size: 10px; wrap: word-wrap; }
+                    HorizontalBox {
+                        spacing: 8px;
+                        CheckBox {
+                            text: "启用自动校准 (IDAC auto-calibration)";
+                            checked: root.g_auto_calibrate == 1;
+                            toggled => { root.algo_global_set(8, self.checked ? 1 : 0); }
+                        }
+                        Rectangle { horizontal-stretch: 1; }
+                    }
+                    Text { text: "作用: 开=每次初始化/应用自动校准 IDAC(默认); 关=用固定 IDAC(配置/手动值)换取稳定灵敏度范围, 修某些通道自动校准发散(raw 满量程 railed)。无论开关, 点上方“校准”按钮都执行【单次】显式校准。"; color: #7f8c96; font-size: 10px; wrap: word-wrap; }
+                    HorizontalBox {
+                        spacing: 8px;
+                        Text { text: "IDAC 增益档:"; color: #b0b8c0; vertical-alignment: center; }
+                        SpinBox { value: root.g_idac_gain; minimum: 0; maximum: 6; edited(v) => { root.algo_global_set(2, v); } }
+                        Text { text: "IDAC min:"; color: #b0b8c0; vertical-alignment: center; }
+                        SpinBox { value: root.g_idac_min; minimum: 0; maximum: 127; edited(v) => { root.algo_global_set(3, v); } }
+                        Text { text: "校准目标%:"; color: #b0b8c0; vertical-alignment: center; }
+                        SpinBox { value: root.g_raw_target; minimum: 1; maximum: 99; edited(v) => { root.algo_global_set(4, v); } }
+                    }
+                    Text { text: "作用: 校准电流源。IDAC 增益档 0–6 越大电流越强(过大易 railed 满量程; 增益表仅7档, 超范围会致扫描挂死); IDAC min 0–127 校准下限; 校准目标% 1–99 基线 raw 占满量程比例(默认 85, 过高/过低都易 railed)。改后需重新校准生效。"; color: #7f8c96; font-size: 10px; wrap: word-wrap; }
+
+                    // ★频率自适应下探★: 固定当前 IDAC/目标%, 从高频逐档降频(升 snsClk 分频)重校准,
+                    // 找到能把 raw 压到目标%的最高频率并自动写回全通道; 超硬件能力则失败提示。
+                    HorizontalBox {
+                        spacing: 8px;
+                        Button {
+                            text: root.op_busy ? ("⏳ " + root.op_label) : "IDAC 频率自适应(自动下探)";
+                            enabled: !root.op_busy;
+                            clicked => { root.auto_tune(); }
+                        }
+                        Text {
+                            text: root.auto_tune_status;
+                            color: #8fd6ff;
+                            vertical-alignment: center;
+                            horizontal-stretch: 1;
+                            wrap: word-wrap;
+                        }
+                    }
+                    Text { text: "作用: 保持当前 IDAC 设置不变, 自动降低采样频率(增大 snsClk 分频)直到校准能把基线 raw 压到目标% 且不饱和, 并把分频回填到全部通道。高 Cp(如 ~100pF)面板必需。若到硬件下限仍压不到=失败(需降低目标%或改 IDAC)。运行中按钮锁定。"; color: #7f8c96; font-size: 10px; wrap: word-wrap; }
+                }
+            }
+
+            GroupBox {
+                title: "CSD 时钟树(生成配置)";
+                VerticalBox {
+                    spacing: 10px;
+
+                    // 第一行: 固定只读的振荡器/PLL/外设时钟链, 横向箭头连接。
+                    HorizontalBox {
+                        spacing: 0px;
+                        alignment: start;
+                        ClockFixedNode { node_title: "ECO 晶振"; node_value: "12 MHz"; }
+                        ClockArrowRight { }
+                        ClockFixedNode { node_title: "PLL / HFCLK"; node_value: "48 MHz"; }
+                        ClockArrowRight { }
+                        ClockFixedNode { node_title: "PERI / CSD"; node_value: "48 MHz"; }
+                        ClockArrowRight { }
+                        ClockFixedNode { node_title: "外设分频 DIV ÷1"; node_value: "48.00 MHz"; }
+                    }
+
+                    // 竖直箭头: 从外设分频落到下一行的 ModClk + MFS。
+                    HorizontalBox {
+                        spacing: 0px;
+                        alignment: start;
+                        Rectangle { width: 128px + 22px + 128px + 22px + 128px + 22px; }
+                        ClockArrowDown { }
+                    }
+
+                    // 第二行: ModClk(只读) + MFS F1/F2(可编辑, SpinBox 直接嵌节点卡内)。
+                    HorizontalBox {
+                        spacing: 0px;
+                        alignment: start;
+                        Rectangle { width: 128px + 22px + 128px + 22px + 128px + 22px - 128px - 22px; }
+                        ClockFixedNode { node_title: "ModClk ÷modCsdClk=1"; node_value: "48.00 MHz"; }
+                        ClockArrowRight { }
+                        Rectangle {
+                            width: 232px;
+                            height: 88px;
+                            border-radius: 6px;
+                            background: #17222b;
+                            border-width: 1px;
+                            border-color: #2f6fa8;
+                            VerticalBox {
+                                padding: 6px;
+                                spacing: 2px;
+                                Text { text: "MFS DIV F1 / F2"; font-size: 11px; color: #8fd6ff; }
+                                HorizontalBox {
+                                    padding: 0px;
+                                    spacing: 6px;
+                                    SpinBox {
+                                        horizontal-stretch: 1;
+                                        value: root.g_mfs_div_f1;
+                                        minimum: 0;
+                                        maximum: 65535;
+                                        edited(v) => { root.algo_global_set(5, v); }
+                                    }
+                                    SpinBox {
+                                        horizontal-stretch: 1;
+                                        value: root.g_mfs_div_f2;
+                                        minimum: 0;
+                                        maximum: 65535;
+                                        edited(v) => { root.algo_global_set(6, v); }
+                                    }
+                                }
+                                // 多频抗噪: 启用后每传感器 3 个频点各扫一次(周期≈×3)。
+                                Text {
+                                    text: "多频抗噪 F0/F1/F2 (周期×频点数)";
+                                    font-size: 10px; color: #9fe0b0; horizontal-alignment: center; wrap: word-wrap;
+                                }
+                            }
+                        }
+                    }
+
+                    // 竖直箭头: 从 MFS 节点落到第三行的 SnsClk/Resolution。
+                    HorizontalBox {
+                        spacing: 0px;
+                        alignment: start;
+                        Rectangle { width: 128px + 22px + 128px; }
+                        ClockArrowDown { }
+                    }
+
+                    // 第三行: SnsClk DIV / Resolution / SnsClk Source(均可编辑, 统一写全部 36 通道)。
+                    HorizontalBox {
+                        spacing: 0px;
+                        alignment: start;
+                        Rectangle { width: 128px + 22px; }
+                        Rectangle {
+                            width: 150px;
+                            height: 72px;
+                            border-radius: 6px;
+                            background: #17222b;
+                            border-width: 1px;
+                            border-color: #2f6fa8;
+                            VerticalBox {
+                                padding: 6px;
+                                spacing: 2px;
+                                Text { text: "SnsClk DIV"; font-size: 11px; color: #8fd6ff; }
+                                SpinBox {
+                                    value: root.csd_sns_clk_div;
+                                    minimum: 1;
+                                    maximum: 255;
+                                    edited(v) => { root.csd_param_set(8, v); }
+                                }
+                                // 传感激励时钟 = ModClk(48MHz) / snsClkDiv。★只改激励频率, 不改扫描时长★
+                                Text {
+                                    text: root.csd_sns_clk_div > 0
+                                        ? ("SnsClk = " + (Math.round(48000 / root.csd_sns_clk_div) / 1000) + " MHz")
+                                        : "SnsClk = —";
+                                    font-size: 10px; color: #9fe0b0; horizontal-alignment: center;
+                                }
+                            }
+                        }
+                        ClockArrowRight { }
+                        Rectangle {
+                            width: 150px;
+                            height: 72px;
+                            border-radius: 6px;
+                            background: #17222b;
+                            border-width: 1px;
+                            border-color: #2f6fa8;
+                            VerticalBox {
+                                padding: 6px;
+                                spacing: 2px;
+                                Text { text: "采样分辨率(位)"; font-size: 11px; color: #8fd6ff; }
+                                SpinBox {
+                                    value: root.csd_resolution;
+                                    minimum: 6;
+                                    maximum: 16;
+                                    edited(v) => { root.csd_param_set(7, v); }
+                                }
+                                // 子转换数 = 2^N; 单传感器换能时长 ≈ 2^N / 48MHz。★决定扫描时长的就是它★
+                                Text {
+                                    text: "2^N=" + Math.round(Math.pow(2, root.csd_resolution))
+                                        + " 换能≈" + (Math.round(Math.pow(2, root.csd_resolution) / 48)) + " µs";
+                                    font-size: 10px; color: #9fe0b0; horizontal-alignment: center;
+                                }
+                            }
+                        }
+                        ClockArrowRight { }
+                        Rectangle {
+                            width: 150px;
+                            height: 72px;
+                            border-radius: 6px;
+                            background: #17222b;
+                            border-width: 1px;
+                            border-color: #2f6fa8;
+                            VerticalBox {
+                                padding: 6px;
+                                spacing: 2px;
+                                Text { text: "时钟源(协议数值)"; font-size: 11px; color: #8fd6ff; }
+                                SpinBox {
+                                    value: root.csd_sns_clk_source;
+                                    minimum: 0;
+                                    maximum: 255;
+                                    edited(v) => { root.csd_param_set(10, v); }
+                                }
+                                // 非频率: 选择直连/PRS/SSC 展频方式(bit7=自动)。
+                                Text {
+                                    text: (root.csd_sns_clk_source >= 128 ? "自动+" : "")
+                                        + ((Math.mod(root.csd_sns_clk_source, 128) == 0) ? "直连"
+                                          : (Math.mod(root.csd_sns_clk_source, 128) <= 4 ? "SSC" : "PRS"));
+                                    font-size: 10px; color: #9fe0b0; horizontal-alignment: center;
+                                }
+                            }
+                        }
+                    }
+
+                    // 竖直箭头: 汇聚到末端"设备实测探测周期"节点。
+                    HorizontalBox {
+                        spacing: 0px;
+                        alignment: start;
+                        Rectangle { width: 128px + 22px + 75px; }
+                        ClockArrowDown { }
+                    }
+
+                    // 末端节点: 设备实测探测周期(唯一由固件遥测回填的真实值,非生成配置推算)。
+                    HorizontalBox {
+                        spacing: 0px;
+                        alignment: start;
+                        Rectangle { width: 128px + 22px; }
+                        Rectangle {
+                            width: 220px;
+                            height: 54px;
+                            border-radius: 6px;
+                            background: #16301f;
+                            border-width: 1px;
+                            border-color: #2b8a3e;
+                            VerticalBox {
+                                padding: 6px;
+                                spacing: 2px;
+                                alignment: center;
+                                Text { text: "设备实测探测周期"; font-size: 11px; color: #9fe0b0; horizontal-alignment: center; }
+                                Text {
+                                    text: (Math.round(root.scan_period_ms * 100) / 100) + " ms";
+                                    font-size: 15px;
+                                    font-weight: 700;
+                                    color: #d6ffd9;
+                                    horizontal-alignment: center;
+                                }
+                            }
+                        }
+                    }
+
+                    // 期望 vs 实际探测周期比较: 期望由当前分辨率参数解算(理论采集下限, 不含处理),
+                    // 实际为设备遥测实测值。差值/倍率用于区分"真实异常"与"设置期望异常"。
+                    HorizontalBox {
+                        spacing: 8px;
+                        alignment: start;
+                        Text {
+                            text: root.expected_period_us > 0
+                                ? ("期望(解算) " + (Math.round(root.expected_period_us / 10) / 100) + " ms"
+                                    + "  实际 " + (Math.round(root.scan_period_us / 10) / 100) + " ms"
+                                    + "  差值 " + (root.scan_period_us - root.expected_period_us) + " µs"
+                                    + (root.expected_period_us > 0
+                                        ? ("  倍率 ×" + (Math.round(root.scan_period_us * 10 / root.expected_period_us) / 10))
+                                        : ""))
+                                : ("实际 " + (Math.round(root.scan_period_us / 10) / 100) + " ms  (分辨率参数超范围, 期望无法解算)");
+                            color: (root.expected_period_us > 0 && root.scan_period_us > root.expected_period_us * 3)
+                                ? #f5a623 : #9fe0b0;
+                            vertical-alignment: center;
+                            wrap: word-wrap;
+                            horizontal-stretch: 1;
+                        }
+                    }
+
+                    Text {
+                        text: "期望=按当前分辨率解算的理论采集下限(36×2^分辨率/48MHz, 不含基线/滤波/自动校准)。"
+                            + "倍率≈1 说明周期主要由分辨率设置决定(期望设置偏大); 倍率远大于1 说明处理/模式开销主导"
+                            + "(真实异常线索: 优先切半自动手动模式、降分辨率, 并排查 PSoC 扫描是否被 SPI 轮询节流)。";
+                        color: #7f8c96;
+                        font-size: 11px;
+                        wrap: word-wrap;
+                    }
+                }
+            }
+            Rectangle { vertical-stretch: 1; }
+        }
+    }
+}
+
+// ============================================================================
+// 设置页容器:子标签,原样挂载现有页面组件 + 算法页
+// ============================================================================
+
+// ============================================================================
+// 工具箱页: 自动设置端口 + 虚拟扫码摄像头(占位)
+// ============================================================================
+
+component ToolboxPage inherits Rectangle {
+    // 子标签: 0=自动设置端口 1=虚拟扫码摄像头(占位)
+    property <int> tb_tab: 0;
+
+    in property <bool> auto_port_enabled: false;
+    in property <int> serial_com: 3;
+    in property <int> light_com: 21;
+    in property <string> port_status: "";
+
+    callback set_auto_port_enabled(bool);
+    callback set_serial_com(int);
+    callback set_light_com(int);
+    callback apply_ports();
+
+    VerticalBox {
+        padding: 8px;
+        spacing: 8px;
+
+        HorizontalBox {
+            padding: 0px;
+            spacing: 6px;
+            Rectangle {
+                width: 140px; height: 30px; border-radius: 4px;
+                background: root.tb_tab == 0 ? #2b7de9 : #23282e;
+                Text { text: "自动设置端口"; color: #ffffff; horizontal-alignment: center; vertical-alignment: center; }
+                TouchArea { clicked => { root.tb_tab = 0; } }
+            }
+            Rectangle {
+                width: 140px; height: 30px; border-radius: 4px;
+                background: root.tb_tab == 1 ? #2b7de9 : #23282e;
+                Text { text: "虚拟扫码摄像头"; color: #ffffff; horizontal-alignment: center; vertical-alignment: center; }
+                TouchArea { clicked => { root.tb_tab = 1; } }
+            }
+            Rectangle { horizontal-stretch: 1; }
+        }
+
+        if root.tb_tab == 0: GroupBox {
+            title: "自动设置端口";
+            vertical-stretch: 1;
+
+            VerticalBox {
+                padding: 4px;
+                spacing: 10px;
+
+                CheckBox {
+                    text: "启动时自动设置端口号";
+                    checked: root.auto_port_enabled;
+                    toggled => { root.set_auto_port_enabled(self.checked); }
+                }
+
+                HorizontalBox {
+                    padding: 0px;
+                    spacing: 8px;
+                    Text { text: "触控串口(mai2serial) COM:"; vertical-alignment: center; }
+                    SpinBox {
+                        minimum: 1;
+                        maximum: 255;
+                        value: root.serial_com;
+                        edited(v) => { root.set_serial_com(v); }
+                    }
+                }
+
+                HorizontalBox {
+                    padding: 0px;
+                    spacing: 8px;
+                    Text { text: "灯效串口(mai2light) COM:"; vertical-alignment: center; }
+                    SpinBox {
+                        minimum: 1;
+                        maximum: 255;
+                        value: root.light_com;
+                        edited(v) => { root.set_light_com(v); }
+                    }
+                }
+
+                Button {
+                    text: "立即应用";
+                    clicked => { root.apply_ports(); }
+                }
+
+                Text {
+                    text: root.port_status;
+                    color: #a05a00;
+                    wrap: word-wrap;
+                }
+
+                Text {
+                    text: "说明: 把识别到的 mai2serial / mai2light 设备固定改名为上面指定的 COM 口号, 供街机侧使用固定端口。"
+                        + "需以管理员权限运行本程序才能修改注册表; 改名后需重新插拔设备或重启电脑才会生效; "
+                        + "若目标 COM 口已被其他设备占用, 会在上方提示冲突, 不会强制覆盖。";
+                    color: #7f8c96;
+                    font-size: 11px;
+                    wrap: word-wrap;
+                }
+
+                Rectangle { vertical-stretch: 1; }
+            }
+        }
+
+        if root.tb_tab == 1: GroupBox {
+            title: "虚拟扫码摄像头";
+            vertical-stretch: 1;
+            Text {
+                text: "该功能开发中(HID扫码→原生虚拟相机)";
+                color: #7f8c96;
+                wrap: word-wrap;
+            }
+        }
+    }
+}
+
+// ============================================================================
+// 设置页容器:子标签,原样挂载现有页面组件 + 算法页
 // ============================================================================
 
 component SettingsPage inherits Rectangle {
     // 显式绑定 TabWidget current-index，供通道卡点击后切到“单通道精调”。
     in-out property <int> settings_tab: 0;
     in property <[ConfigRow]> config_rows: [];
+    in property <bool> config_dirty: false;
+    in property <int> config_dirty_count: 0;
+    in property <bool> mode_change_needs_reboot: false;
     callback cfg_set_bool(string, bool);
     callback cfg_set_number(string, float);
+    callback cfg_set_number_hex(string, string);
     callback cfg_set_enum(string, int);
     callback cfg_set_string(string, string);
     callback cfg_load();
     callback cfg_save();
     callback cfg_reset();
+    callback reboot_psoc();
+    callback discard_draft();
+    callback auto_tune();                 // 频率自适应下探(透传给 GlobalTunePage → AppWindow)
+    // 阻塞类操作状态(透传): 供各页锁定按钮/显示运行标识。
+    in property <bool> op_busy: false;
+    in property <string> op_label: "";
+    in property <string> auto_tune_status: "";
 
     in property <[ZoneCell]> zones: [];
     in property <string> bind_status: "";
     in-out property <int> selected_zone: -1;
     in property <string> selected_zone_label: "";
     in property <int> selected_channel: -1;
+    in property <float> zone_view_x: 0;
+    in property <float> zone_view_y: 0;
+    in property <float> zone_view_w: 1000;
+    in property <float> zone_view_h: 562.5;
     callback bind_load();
     callback zone_selected(int);
+    callback zone_activated(int);
     callback zone_channel_set(int, int);
     callback bind_touch_start(int);
+    callback bind_listen_cancel();
     callback zone_unbind(int);
+    pure callback zone_hit_test(float, float) -> int;
 
     in-out property <int> sel_channel: 0;
     in-out property <bool> show_raw: false;
@@ -1288,6 +3015,10 @@ component SettingsPage inherits Rectangle {
     in property <int> noise_th_val: 0;
     in property <[ParamRow]> curve_params: [];
     in property <string> cp_text: "读取中…";
+    in property <string> curve_readout: "";
+    in property <string> active_path: "";
+    in property <int> active_point_count: 0;
+    in-out property <bool> show_active: true;
     callback telem_start();
     callback telem_stop();
     callback curve_calibrate();
@@ -1295,20 +3026,82 @@ component SettingsPage inherits Rectangle {
     callback curve_measure_cp();
     callback threshold_set(int, int);
     callback curve_param_edited(int, int);
-    callback curve_param_apply_all(int, int);
     callback curve_mode_changed(int);
     callback curve_capture_params();
 
     in property <[ChannelStatus]> all_channels: [];
     in property <int> sample_rate_hz: 0;
-    in property <int> channel_delay_us: 0;
+    in property <string> curve_threshold_warning: "";
+    in property <float> scan_period_ms: 0;
+    in property <int> scan_period_us: 0;
+    in property <int> scan_period_expected_us: 0;
 
     in property <bool> keyboard_map_en: false;
     callback set_keyboard_map_en(bool);
     callback channel_selected(int);
 
-    TabWidget {
-        current-index <=> root.settings_tab;
+    // 键盘页(物理键盘 + 触控键盘映射)
+    in property <[bool]> kbd_phys_pressed: [];
+    in property <[int]> kbd_phys_choice: [];
+    in property <[int]> kbd_phys_mod: [];
+    in property <[int]> kbd_zone_choice: [];
+    in property <[int]> kbd_zone_mod: [];
+    in property <[string]> kbd_zone_names: [];
+    in property <[string]> kbd_key_choices: [];
+    in property <[string]> kbd_phys_display: [];
+    in property <[string]> kbd_zone_display: [];
+    callback kbd_set_phys(int, int, int);
+    callback kbd_set_zone(int, int, int);
+    callback kbd_capture_phys(int, string, bool, bool, bool, bool);
+    callback kbd_capture_zone(int, string, bool, bool, bool, bool);
+    callback kbd_clear_phys(int);
+    callback kbd_clear_zone(int);
+    callback kbd_refresh();
+
+    // 算法页
+    in property <string> algo_info_text: "算法信息未读取";
+    in-out property <string> algo_c_source;
+    in property <string> algo_line_numbers: "1";
+    in property <string> algo_status: "";
+    in property <string> algo_asm: "";
+    in property <int> algo_asm_bytes: 0;
+    in property <int> algo_asm_capacity: 1024;
+    // 算法上报(report[]折线+触发判定追踪) + 可调变量(cfg[8])
+    in property <int> algo_sel_channel: 0;
+    in property <[AlgoReportLine]> algo_report_lines: [];
+    in property <string> algo_active_path: "";
+    in property <int> algo_trace_point_count: 0;
+    in property <[AlgoSettingRow]> algo_setting_rows: [];
+    callback algo_setting_edited(int, int);
+    // 全局 CSD(现由"触控全局调整"页使用)
+    in property <int> g_inactive_sns: 1;
+    in property <int> g_idac_gain: 4;
+    in property <int> g_idac_sense_config: 0;   // 0=IDAC sourcing, 1=IDAC sinking
+    in property <int> g_auto_calibrate: 1;      // 1=自动校准, 0=固定IDAC(不自动校准)
+    in property <int> g_idac_min: 20;
+    in property <int> g_raw_target: 85;
+    in property <int> g_mfs_div_f1: 1;
+    in property <int> g_mfs_div_f2: 2;
+    in property <int> csd_sns_clk_div: 0;
+    in property <int> csd_resolution: 0;
+    in property <int> csd_sns_clk_source: 0;
+    callback algo_refresh();
+    callback algo_reset_default();
+    callback algo_compile(string);
+    callback algo_upload();
+    callback algo_load_template();
+    callback algo_source_edited(string);
+    callback algo_global_set(int, int);
+    callback csd_param_set(int, int);
+    callback csd_refresh();
+
+    VerticalBox {
+        padding: 0px;
+        spacing: 0px;
+
+        TabWidget {
+            vertical-stretch: 1;
+            current-index <=> root.settings_tab;
         Tab {
             title: "分区绑定";
 
@@ -1318,11 +3111,18 @@ component SettingsPage inherits Rectangle {
                 selected_zone: root.selected_zone;
                 selected_zone_label: root.selected_zone_label;
                 selected_channel: root.selected_channel;
+                view_x: root.zone_view_x;
+                view_y: root.zone_view_y;
+                view_w: root.zone_view_w;
+                view_h: root.zone_view_h;
                 bind_load() => { root.bind_load(); }
                 zone_selected(i) => { root.selected_zone = i; root.zone_selected(i); }
+                zone_activated(i) => { root.selected_zone = i; root.zone_activated(i); }
                 zone_channel_set(z, v) => { root.zone_channel_set(z, v); }
                 bind_touch_start(z) => { root.bind_touch_start(z); }
+                bind_listen_cancel() => { root.bind_listen_cancel(); }
                 zone_unbind(z) => { root.zone_unbind(z); }
+                zone_hit_test(x, y) => { return root.zone_hit_test(x, y); }
             }
         }
 
@@ -1333,14 +3133,50 @@ component SettingsPage inherits Rectangle {
                 channels: root.all_channels;
                 selected_channel: root.sel_channel;
                 sample_rate_hz: root.sample_rate_hz;
-                channel_delay_us: root.channel_delay_us;
+                scan_period_ms: root.scan_period_ms;
                 telem_start() => { root.telem_start(); }
                 telem_stop() => { root.telem_stop(); }
                 channel_selected(ch) => {
                     root.sel_channel = ch;
-                    root.settings_tab = 2;
+                    // Tab 顺序: 0绑区 1触控通道调整 2触控全局调整 3单通道精调 → 双击跳 3。
+                    root.settings_tab = 3;
                     root.channel_selected(ch);
                 }
+            }
+        }
+
+        Tab {
+            title: "触控全局调整";
+
+            GlobalTunePage {
+                scan_mode <=> root.scan_mode;
+                g_inactive_sns: root.g_inactive_sns;
+                g_idac_gain: root.g_idac_gain;
+                g_idac_sense_config: root.g_idac_sense_config;
+                g_auto_calibrate: root.g_auto_calibrate;
+                g_idac_min: root.g_idac_min;
+                g_raw_target: root.g_raw_target;
+                g_mfs_div_f1: root.g_mfs_div_f1;
+                g_mfs_div_f2: root.g_mfs_div_f2;
+                csd_sns_clk_div: root.csd_sns_clk_div;
+                csd_resolution: root.csd_resolution;
+                csd_sns_clk_source: root.csd_sns_clk_source;
+                scan_period_ms: root.scan_period_ms;
+                scan_period_us: root.scan_period_us;
+                expected_period_us: root.scan_period_expected_us;
+                config_dirty: root.config_dirty;
+                mode_changed(m) => { root.curve_mode_changed(m); }
+                capture_params() => { root.curve_capture_params(); }
+                algo_global_set(id, v) => { root.algo_global_set(id, v); }
+                csd_param_set(id, v) => { root.csd_param_set(id, v); }
+                csd_refresh() => { root.csd_refresh(); }
+                reboot_psoc() => { root.reboot_psoc(); }
+                reset_defaults() => { root.cfg_reset(); }
+                discard_draft() => { root.discard_draft(); }
+                op_busy: root.op_busy;
+                op_label: root.op_label;
+                auto_tune_status: root.auto_tune_status;
+                auto_tune() => { root.auto_tune(); }
             }
         }
 
@@ -1366,6 +3202,12 @@ component SettingsPage inherits Rectangle {
                 noise_th_val: root.noise_th_val;
                 params: root.curve_params;
                 cp_text: root.cp_text;
+                curve_readout: root.curve_readout;
+                active_path: root.active_path;
+                active_point_count: root.active_point_count;
+                show_active <=> root.show_active;
+                sample_rate_hz: root.sample_rate_hz;
+                threshold_warning: root.curve_threshold_warning;
                 telem_start() => { root.telem_start(); }
                 telem_stop() => { root.telem_stop(); }
                 calibrate() => { root.curve_calibrate(); }
@@ -1373,9 +3215,14 @@ component SettingsPage inherits Rectangle {
                 measure_cp() => { root.curve_measure_cp(); }
                 threshold_set(pid, v) => { root.threshold_set(pid, v); }
                 param_edited(pid, v) => { root.curve_param_edited(pid, v); }
-                param_apply_all(pid, v) => { root.curve_param_apply_all(pid, v); }
                 mode_changed(m) => { root.curve_mode_changed(m); }
                 capture_params() => { root.curve_capture_params(); }
+                op_busy: root.op_busy;
+                op_label: root.op_label;
+                algo_report_lines: root.algo_report_lines;
+                algo_trace_point_count: root.algo_trace_point_count;
+                algo_setting_rows: root.algo_setting_rows;
+                algo_setting_edited(idx, v) => { root.algo_setting_edited(idx, v); }
             }
         }
 
@@ -1384,14 +3231,25 @@ component SettingsPage inherits Rectangle {
 
             KeyMapPage {
                 keyboard_map_en: root.keyboard_map_en;
+                zone_display: root.kbd_zone_display;
+                zone_names: root.kbd_zone_names;
                 set_keyboard_map_en(v) => { root.set_keyboard_map_en(v); }
+                zone_captured(z, t, c, s, a, g) => { root.kbd_capture_zone(z, t, c, s, a, g); }
+                zone_cleared(z) => { root.kbd_clear_zone(z); }
+                refresh_kbd() => { root.kbd_refresh(); }
             }
         }
 
         Tab {
             title: "物理键盘";
 
-            PhysKbdPage { }
+            PhysKbdPage {
+                phys_pressed: root.kbd_phys_pressed;
+                phys_display: root.kbd_phys_display;
+                phys_captured(i, t, c, s, a, g) => { root.kbd_capture_phys(i, t, c, s, a, g); }
+                phys_cleared(i) => { root.kbd_clear_phys(i); }
+                refresh_kbd() => { root.kbd_refresh(); }
+            }
         }
 
         Tab {
@@ -1399,8 +3257,10 @@ component SettingsPage inherits Rectangle {
 
             ConfigPage {
                 rows: root.config_rows;
+                config_dirty: root.config_dirty;
                 cfg_set_bool(k, v) => { root.cfg_set_bool(k, v); }
                 cfg_set_number(k, v) => { root.cfg_set_number(k, v); }
+                cfg_set_number_hex(k, v) => { root.cfg_set_number_hex(k, v); }
                 cfg_set_enum(k, v) => { root.cfg_set_enum(k, v); }
                 cfg_set_string(k, v) => { root.cfg_set_string(k, v); }
                 cfg_load() => { root.cfg_load(); }
@@ -1408,15 +3268,68 @@ component SettingsPage inherits Rectangle {
                 cfg_reset() => { root.cfg_reset(); }
             }
         }
+
+        Tab {
+            title: "算法";
+
+            AlgoPage {
+                algo_info_text: root.algo_info_text;
+                algo_c_source <=> root.algo_c_source;
+                algo_line_numbers: root.algo_line_numbers;
+                algo_status: root.algo_status;
+                algo_asm: root.algo_asm;
+                algo_asm_bytes: root.algo_asm_bytes;
+                algo_asm_capacity: root.algo_asm_capacity;
+                algo_sel_channel: root.algo_sel_channel;
+                algo_report_lines: root.algo_report_lines;
+                algo_active_path: root.algo_active_path;
+                algo_trace_point_count: root.algo_trace_point_count;
+                algo_setting_rows: root.algo_setting_rows;
+                algo_refresh() => { root.algo_refresh(); }
+                algo_reset_default() => { root.algo_reset_default(); }
+                algo_compile(s) => { root.algo_compile(s); }
+                algo_upload() => { root.algo_upload(); }
+                algo_load_template() => { root.algo_load_template(); }
+                algo_source_edited(s) => { root.algo_source_edited(s); }
+                algo_setting_edited(idx, v) => { root.algo_setting_edited(idx, v); }
+            }
+        }
+        }
+
+        // 全局保存栏(设置页左下角常驻): 无改动锁定并提示, 有改动提示项数, 保存后即时反馈。
+        HorizontalBox {
+            height: 46px;
+            padding-left: 12px;
+            padding-right: 12px;
+            spacing: 10px;
+            Button {
+                text: "保存到设备";
+                enabled: root.config_dirty;
+                clicked => { root.cfg_save(); }
+            }
+            Text {
+                text: root.mode_change_needs_reboot
+                    ? (root.config_dirty_count + " 项未保存 — 含 Serial/HID 模式切换, 保存后将自动重启设备生效")
+                    : (root.config_dirty
+                        ? (root.config_dirty_count + " 项改动未保存 — 点击保存写入设备 flash")
+                        : "无改动 (已与设备 flash 同步)");
+                color: root.mode_change_needs_reboot ? #f5a623
+                    : (root.config_dirty ? #f5a623 : #2b8a3e);
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+            }
+        }
     }
 }
 
 export component AppWindow inherits Window {
     title: "mai2control-ui";
-    preferred-width: 900px;
-    preferred-height: 600px;
-    min-width: 900px;
-    min-height: 600px;
+    // 默认更宽敞, 且允许缩到较小尺寸: 布局用 HorizontalBox/VerticalBox stretch 自适应回流,
+    // 窄窗口下工具栏已拆多行, 不再右侧截断。
+    preferred-width: 1040px;
+    preferred-height: 700px;
+    min-width: 720px;
+    min-height: 520px;
 
     // 设备下拉列表文本(由 main.rs 从 AppController::device_labels 回填)
     in property <[string]> device_labels: [];
@@ -1426,6 +3339,9 @@ export component AppWindow inherits Window {
     in property <string> conn_status: "未连接";
     // DEVICE_INFO 展示文本(多行,由 AppController::device_info_text 回填)
     in property <string> device_info_text: "未获取到设备信息";
+    // 传感器健康总结 + 等级(0正常/1警告/2错误), 由 main.rs 回填。
+    in property <string> sensor_health: "";
+    in property <int> sensor_health_level: 0;
     // 配置页行数据(由 main.rs::build_config_rows 回填,version-gated 重建)
     in property <[ConfigRow]> config_rows: [];
 
@@ -1436,6 +3352,11 @@ export component AppWindow inherits Window {
     in-out property <int> selected_zone: -1;
     in property <string> selected_zone_label: "";
     in property <int> selected_channel: -1;
+    // 分区图绘制视框(内容 bbox), main.rs 从 touch_geometry::content_bbox 一次性回填。
+    in property <float> zone_view_x: 0;
+    in property <float> zone_view_y: 0;
+    in property <float> zone_view_w: 1000;
+    in property <float> zone_view_h: 562.5;
 
     // 曲线页数据 (#6g-2,由 main.rs::build_curve_paths/build_param_rows 回填)
     in-out property <int> sel_channel: 0;
@@ -1456,14 +3377,23 @@ export component AppWindow inherits Window {
     in property <int> noise_th_val: 0;
     in property <[ParamRow]> curve_params: [];
     in property <string> cp_text: "读取中…";
+    in property <string> curve_readout: "";
+    in property <string> active_path: "";
+    in property <int> active_point_count: 0;
+    in-out property <bool> show_active: true;
 
     // 全通道实时状态页数据(由 main.rs 每 tick 从 telem_latest 构建)
     in property <[ChannelStatus]> all_channels: [];
-    // 采样率(Hz)与通道刷新延迟(us)，由 main.rs 每 tick 从 AppController 回填
+    // 采样率(Hz)与设备实测探测周期(ms,两位小数)，由 main.rs 每 tick 从 AppController 回填
     in property <int> sample_rate_hz: 0;
-    in property <int> channel_delay_us: 0;
+    in property <string> curve_threshold_warning: "";
+    in property <float> scan_period_ms: 0;
+    // 设备实测探测周期原值(µs)，供 CSD 页与"期望周期"精确比较。
+    in property <int> scan_period_us: 0;
+    // 由当前 CSD 参数解算的理论采集周期下限(µs)，main.rs 每 tick 回填。
+    in property <int> scan_period_expected_us: 0;
 
-    // Phase 1 UI 现代化:左栏导航当前视图(0=主页,1=设置),纯 UI 内部状态
+    // Phase 1 UI 现代化:左栏导航当前视图(0=主页,1=设置,2=工具箱),纯 UI 内部状态
     in-out property <int> current_view: 0;
     // 设置页当前子标签，与 SettingsPage/TabWidget 双向绑定。
     in-out property <int> settings_tab: 0;
@@ -1475,8 +3405,29 @@ export component AppWindow inherits Window {
     in property <int> latency_sensor_us: 0;
     in-out property <bool> measure_latency: false;
     in property <string> log_text: "";
+    in property <string> lat_path: "";
+    in property <float> lat_y_max: 1;
+    in property <float> lat_y_min: 0;
+    in property <int> lat_point_count: 0;
+    // 延迟图绘图区宽高比回传(main.rs 据此把曲线 x 拉伸铺满宽度)。
+    callback lat_area_resized(float);
     // 触控键盘映射开关(由 main.rs 从 config_cache 的 comm.keyboard_map_en 回填)
     in property <bool> keyboard_map_en: false;
+    // 设置有未保存到 flash 的改动(main.rs 从 AppController::is_config_dirty 回填)。
+    in property <bool> config_dirty: false;
+    in property <int> config_dirty_count: 0;   // 未保存项数(main.rs 回填)
+    // 草稿含 mode.work(Serial/HID)改动: 需整机重启重枚举生效, 保存后自动重启并提示。
+    in property <bool> mode_change_needs_reboot: false;
+    // 键盘页数据(物理键盘 + 触控键盘映射), 由 main.rs 回填。
+    in property <[bool]> kbd_phys_pressed: [];
+    in property <[int]> kbd_phys_choice: [];
+    in property <[int]> kbd_phys_mod: [];
+    in property <[int]> kbd_zone_choice: [];
+    in property <[int]> kbd_zone_mod: [];
+    in property <[string]> kbd_zone_names: [];
+    in property <[string]> kbd_key_choices: [];
+    in property <[string]> kbd_phys_display: [];
+    in property <[string]> kbd_zone_display: [];
 
     // 顶层由 UI 侧(main.rs)绑定,驱动 AppController 对应方法
     callback refresh();
@@ -1484,26 +3435,45 @@ export component AppWindow inherits Window {
     callback disconnect_clicked();
     callback reboot_device();
     callback reboot_bootloader();
+    callback reboot_psoc();
+    callback auto_tune();               // 频率自适应下探 → AppController::auto_tune()
+    // 阻塞类操作(校准/基线/重启/自适应)状态: main.rs 每 tick 回填, 驱动各页按钮锁定+运行标识。
+    in property <bool> op_busy: false;
+    in property <string> op_label: "";
+    in property <string> auto_tune_status: "";
     // 延迟测量开关(Phase 2 前先接 no-op)
     callback latency_measure_toggled(bool);
     // 触控键盘映射开关 → CFG_SET(comm.keyboard_map_en)
     callback set_keyboard_map_en(bool);
+    // 键盘映射回调
+    callback kbd_set_phys(int, int, int);
+    callback kbd_set_zone(int, int, int);
+    callback kbd_capture_phys(int, string, bool, bool, bool, bool);
+    callback kbd_capture_zone(int, string, bool, bool, bool, bool);
+    callback kbd_clear_phys(int);
+    callback kbd_clear_zone(int);
+    callback kbd_refresh();
 
     // 配置页回调(透传给内部 ConfigPage 实例)
     callback cfg_set_bool(string, bool);
     callback cfg_set_number(string, float);
+    callback cfg_set_number_hex(string, string);
     callback cfg_set_enum(string, int);
     callback cfg_set_string(string, string);
     callback cfg_load();
     callback cfg_save();
     callback cfg_reset();
+    callback discard_draft();
 
     // 绑区页回调(几何绘制版,透传给内部 BindingPage 实例)
     callback bind_load();
     callback zone_selected(int);
+    callback zone_activated(int);
     callback zone_channel_set(int, int);
     callback bind_touch_start(int);
+    callback bind_listen_cancel();
     callback zone_unbind(int);
+    pure callback zone_hit_test(float, float) -> int;
 
     // 曲线页回调 (#6g-2,透传给内部 CurvesPage 实例)
     callback telem_start();
@@ -1513,10 +3483,54 @@ export component AppWindow inherits Window {
     callback curve_measure_cp();
     callback threshold_set(int, int);
     callback curve_param_edited(int, int);
-    callback curve_param_apply_all(int, int);
     callback curve_mode_changed(int);
     callback curve_capture_params();
     callback channel_selected(int);
+
+    // 算法页(透传给 SettingsPage → AlgoPage)
+    in property <string> algo_info_text: "算法信息未读取";
+    in-out property <string> algo_c_source;
+    in property <string> algo_line_numbers: "1";
+    in property <string> algo_status: "";
+    in property <string> algo_asm: "";
+    in property <int> algo_asm_bytes: 0;
+    in property <int> algo_asm_capacity: 1024;
+    in property <int> algo_sel_channel: 0;
+    in property <[AlgoReportLine]> algo_report_lines: [];
+    in property <string> algo_active_path: "";
+    in property <int> algo_trace_point_count: 0;
+    in property <[AlgoSettingRow]> algo_setting_rows: [];
+    callback algo_setting_edited(int, int);
+    in property <int> g_inactive_sns: 1;
+    in property <int> g_idac_gain: 4;
+    in property <int> g_idac_sense_config: 0;   // 0=IDAC sourcing, 1=IDAC sinking
+    in property <int> g_auto_calibrate: 1;      // 1=自动校准, 0=固定IDAC(不自动校准)
+    in property <int> g_idac_min: 20;
+    in property <int> g_raw_target: 85;
+    in property <int> g_mfs_div_f1: 1;
+    in property <int> g_mfs_div_f2: 2;
+    in property <int> csd_sns_clk_div: 0;
+    in property <int> csd_resolution: 0;
+    in property <int> csd_sns_clk_source: 0;
+    callback algo_refresh();
+    callback algo_reset_default();
+    callback algo_compile(string);
+    callback algo_upload();
+    callback algo_load_template();
+    callback algo_source_edited(string);
+    callback algo_global_set(int, int);
+    callback csd_param_set(int, int);
+    callback csd_refresh();
+
+    // 工具箱页(透传给内部 ToolboxPage 实例)
+    in property <bool> auto_port_enabled: false;
+    in property <int> serial_com: 3;
+    in property <int> light_com: 21;
+    in property <string> port_status: "";
+    callback set_auto_port_enabled(bool);
+    callback set_serial_com(int);
+    callback set_light_com(int);
+    callback apply_ports();
 
     background: #15181c;
 
@@ -1568,6 +3582,23 @@ export component AppWindow inherits Window {
                 }
 
                 Rectangle {
+                    height: 40px;
+                    border-radius: 6px;
+                    background: root.current_view == 2 ? #2b7de9 : transparent;
+
+                    TouchArea {
+                        clicked => { root.current_view = 2; }
+                    }
+
+                    Text {
+                        text: "工具箱";
+                        color: #ffffff;
+                        vertical-alignment: center;
+                        horizontal-alignment: center;
+                    }
+                }
+
+                Rectangle {
                     vertical-stretch: 1;
                 }
 
@@ -1604,8 +3635,10 @@ export component AppWindow inherits Window {
                 selected_device <=> root.selected_device;
                 conn_status: root.conn_status;
                 device_info_text: root.device_info_text;
+                sensor_health: root.sensor_health;
+                sensor_health_level: root.sensor_health_level;
                 sample_rate_hz: root.sample_rate_hz;
-                channel_delay_us: root.channel_delay_us;
+                scan_period_ms: root.scan_period_ms;
                 scan_mode <=> root.scan_mode;
                 latency_total_us: root.latency_total_us;
                 latency_spi_us: root.latency_spi_us;
@@ -1614,11 +3647,17 @@ export component AppWindow inherits Window {
                 latency_sensor_us: root.latency_sensor_us;
                 measure_latency <=> root.measure_latency;
                 log_text: root.log_text;
+                lat_path: root.lat_path;
+                lat_y_max: root.lat_y_max;
+                lat_y_min: root.lat_y_min;
+                lat_point_count: root.lat_point_count;
+                lat_area_resized(a) => { root.lat_area_resized(a); }
                 refresh() => { root.refresh(); }
                 connect_clicked() => { root.connect_clicked(); }
                 disconnect_clicked() => { root.disconnect_clicked(); }
                 reboot_device() => { root.reboot_device(); }
                 reboot_bootloader() => { root.reboot_bootloader(); }
+                reboot_psoc() => { root.reboot_psoc(); }
                 mode_changed(m) => { root.curve_mode_changed(m); }
                 latency_measure_toggled(v) => { root.latency_measure_toggled(v); }
             }
@@ -1626,24 +3665,41 @@ export component AppWindow inherits Window {
             if root.current_view == 1: SettingsPage {
                 settings_tab <=> root.settings_tab;
                 config_rows: root.config_rows;
+                config_dirty: root.config_dirty;
+                config_dirty_count: root.config_dirty_count;
+                mode_change_needs_reboot: root.mode_change_needs_reboot;
                 cfg_set_bool(k, v) => { root.cfg_set_bool(k, v); }
                 cfg_set_number(k, v) => { root.cfg_set_number(k, v); }
+                cfg_set_number_hex(k, v) => { root.cfg_set_number_hex(k, v); }
                 cfg_set_enum(k, v) => { root.cfg_set_enum(k, v); }
                 cfg_set_string(k, v) => { root.cfg_set_string(k, v); }
                 cfg_load() => { root.cfg_load(); }
                 cfg_save() => { root.cfg_save(); }
                 cfg_reset() => { root.cfg_reset(); }
+                reboot_psoc() => { root.reboot_psoc(); }
+                discard_draft() => { root.discard_draft(); }
+                auto_tune() => { root.auto_tune(); }
+                op_busy: root.op_busy;
+                op_label: root.op_label;
+                auto_tune_status: root.auto_tune_status;
 
                 zones: root.zones;
                 bind_status: root.bind_status;
                 selected_zone: root.selected_zone;
                 selected_zone_label: root.selected_zone_label;
                 selected_channel: root.selected_channel;
+                zone_view_x: root.zone_view_x;
+                zone_view_y: root.zone_view_y;
+                zone_view_w: root.zone_view_w;
+                zone_view_h: root.zone_view_h;
                 bind_load() => { root.bind_load(); }
                 zone_selected(i) => { root.selected_zone = i; root.zone_selected(i); }
+                zone_activated(i) => { root.selected_zone = i; root.zone_activated(i); }
                 zone_channel_set(z, v) => { root.zone_channel_set(z, v); }
                 bind_touch_start(z) => { root.bind_touch_start(z); }
+                bind_listen_cancel() => { root.bind_listen_cancel(); }
                 zone_unbind(z) => { root.zone_unbind(z); }
+                zone_hit_test(x, y) => { return root.zone_hit_test(x, y); }
 
                 sel_channel <=> root.sel_channel;
                 show_raw <=> root.show_raw;
@@ -1663,6 +3719,10 @@ export component AppWindow inherits Window {
                 noise_th_val: root.noise_th_val;
                 curve_params: root.curve_params;
                 cp_text: root.cp_text;
+                curve_readout: root.curve_readout;
+                active_path: root.active_path;
+                active_point_count: root.active_point_count;
+                show_active <=> root.show_active;
                 telem_start() => { root.telem_start(); }
                 telem_stop() => { root.telem_stop(); }
                 curve_calibrate() => { root.curve_calibrate(); }
@@ -1670,17 +3730,81 @@ export component AppWindow inherits Window {
                 curve_measure_cp() => { root.curve_measure_cp(); }
                 threshold_set(pid, v) => { root.threshold_set(pid, v); }
                 curve_param_edited(pid, v) => { root.curve_param_edited(pid, v); }
-                curve_param_apply_all(pid, v) => { root.curve_param_apply_all(pid, v); }
                 curve_mode_changed(m) => { root.curve_mode_changed(m); }
                 curve_capture_params() => { root.curve_capture_params(); }
                 channel_selected(ch) => { root.channel_selected(ch); }
 
                 all_channels: root.all_channels;
                 sample_rate_hz: root.sample_rate_hz;
-                channel_delay_us: root.channel_delay_us;
+                curve_threshold_warning: root.curve_threshold_warning;
+                scan_period_ms: root.scan_period_ms;
+                scan_period_us: root.scan_period_us;
+                scan_period_expected_us: root.scan_period_expected_us;
 
                 keyboard_map_en: root.keyboard_map_en;
                 set_keyboard_map_en(v) => { root.set_keyboard_map_en(v); }
+
+                kbd_phys_pressed: root.kbd_phys_pressed;
+                kbd_phys_choice: root.kbd_phys_choice;
+                kbd_phys_mod: root.kbd_phys_mod;
+                kbd_zone_choice: root.kbd_zone_choice;
+                kbd_zone_mod: root.kbd_zone_mod;
+                kbd_zone_names: root.kbd_zone_names;
+                kbd_key_choices: root.kbd_key_choices;
+                kbd_phys_display: root.kbd_phys_display;
+                kbd_zone_display: root.kbd_zone_display;
+                kbd_set_phys(i, ci, m) => { root.kbd_set_phys(i, ci, m); }
+                kbd_set_zone(z, ci, m) => { root.kbd_set_zone(z, ci, m); }
+                kbd_capture_phys(i, t, c, s, a, g) => { root.kbd_capture_phys(i, t, c, s, a, g); }
+                kbd_capture_zone(z, t, c, s, a, g) => { root.kbd_capture_zone(z, t, c, s, a, g); }
+                kbd_clear_phys(i) => { root.kbd_clear_phys(i); }
+                kbd_clear_zone(z) => { root.kbd_clear_zone(z); }
+                kbd_refresh() => { root.kbd_refresh(); }
+
+                algo_info_text: root.algo_info_text;
+                algo_c_source <=> root.algo_c_source;
+                algo_line_numbers: root.algo_line_numbers;
+                algo_status: root.algo_status;
+                algo_asm: root.algo_asm;
+                algo_sel_channel: root.algo_sel_channel;
+                algo_report_lines: root.algo_report_lines;
+                algo_active_path: root.algo_active_path;
+                algo_trace_point_count: root.algo_trace_point_count;
+                algo_setting_rows: root.algo_setting_rows;
+                algo_setting_edited(idx, v) => { root.algo_setting_edited(idx, v); }
+                g_inactive_sns: root.g_inactive_sns;
+                g_idac_gain: root.g_idac_gain;
+                g_idac_sense_config: root.g_idac_sense_config;
+                g_auto_calibrate: root.g_auto_calibrate;
+                g_idac_min: root.g_idac_min;
+                g_raw_target: root.g_raw_target;
+                g_mfs_div_f1: root.g_mfs_div_f1;
+                g_mfs_div_f2: root.g_mfs_div_f2;
+                csd_sns_clk_div: root.csd_sns_clk_div;
+                csd_resolution: root.csd_resolution;
+                csd_sns_clk_source: root.csd_sns_clk_source;
+                algo_asm_bytes: root.algo_asm_bytes;
+                algo_asm_capacity: root.algo_asm_capacity;
+                algo_refresh() => { root.algo_refresh(); }
+                algo_reset_default() => { root.algo_reset_default(); }
+                algo_compile(s) => { root.algo_compile(s); }
+                algo_upload() => { root.algo_upload(); }
+                algo_load_template() => { root.algo_load_template(); }
+                algo_source_edited(s) => { root.algo_source_edited(s); }
+                algo_global_set(id, v) => { root.algo_global_set(id, v); }
+                csd_param_set(id, v) => { root.csd_param_set(id, v); }
+                csd_refresh() => { root.csd_refresh(); }
+            }
+
+            if root.current_view == 2: ToolboxPage {
+                auto_port_enabled: root.auto_port_enabled;
+                serial_com: root.serial_com;
+                light_com: root.light_com;
+                port_status: root.port_status;
+                set_auto_port_enabled(v) => { root.set_auto_port_enabled(v); }
+                set_serial_com(v) => { root.set_serial_com(v); }
+                set_light_com(v) => { root.set_light_com(v); }
+                apply_ports() => { root.apply_ports(); }
             }
         }
     }

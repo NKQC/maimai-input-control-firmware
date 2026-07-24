@@ -1,0 +1,52 @@
+﻿**********************
+Windows PowerShell 脚本开始
+开始时间: 20260721014323
+用户名: ITX-HUHUZHU\asdfg
+RunAs 用户: ITX-HUHUZHU\asdfg
+配置名称: 
+计算机: ITX-HUHUZHU (Microsoft Windows NT 10.0.26200.0)
+主机应用程序: C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe -ExecutionPolicy Bypass -File .\main_firmware\build.ps1
+进程 ID: 21892
+PSVersion: 5.1.26100.8875
+PSEdition: Desktop
+PSCompatibleVersions: 1.0, 2.0, 3.0, 4.0, 5.0, 5.1.26100.8875
+BuildVersion: 10.0.26100.8875
+CLRVersion: 4.0.30319.42000
+WSManStackVersion: 3.0
+PSRemotingProtocolVersion: 2.3
+SerializationVersion: 1.1.0.1
+**********************
+Workflow round: 20260720T174323637Z-fe0a6340
+Workflow log: F:\mai2control\mai2control-v4\main_firmware\.workflow-logs\workflow-20260720T174323637Z-fe0a6340.log
+Workflow mode: Build
+Safety: UF2 writes require one removable RPI-RP2 volume and INFO_UF2.TXT; no fixed drive letter is used.
+
+=== Build PSoC firmware ===
+cwd: F:\mai2control\mai2control-v4\psoc_firmware\CY8C4147AZI-SensorCore
+exe: C:\Users\asdfg\ModusToolbox\tools_3.6\modus-shell\bin\make.exe
+args: build -j8
+
+
+=== Embed PSoC HEX (0x0000040B) ===
+cwd: F:\mai2control\mai2control-v4\main_firmware
+exe: C:\Users\asdfg\.platformio\penv\Scripts\python.exe
+args: F:\mai2control\mai2control-v4\main_firmware\tools\psoc_hex_to_c.py F:\mai2control\mai2control-v4\psoc_firmware\CY8C4147AZI-SensorCore\build\last_config\mtb-example-psoc4-capsense-smartsense-buttons-slider.hex F:\mai2control\mai2control-v4\main_firmware\src\protocol\psoc\psoc_fw_image.h 0x0000040B
+
+
+=== Build RP2040 firmware ===
+cwd: F:\mai2control\mai2control-v4\main_firmware
+exe: C:\Users\asdfg\.platformio\penv\Scripts\platformio.exe
+args: run -e pico
+
+RP2040 UF2 identity: SHA256=92FD70C5D73272739F93BECD03A1810FEF2CF7522D0398DE6770EF9061F6D30F size=988672 mtime_utc=2026-07-20T17:43:33.1708107Z
+
+=== Build Rust UI and selftest ===
+cwd: F:\mai2control\mai2control-v4\control_software
+exe: C:\Users\asdfg\.cargo\bin\cargo.exe
+args: build --locked --bins
+
+BUILD PASS: PSoC HEX embedded, RP2040 UF2 built, WinUSB selftest compiled.
+**********************
+Windows PowerShell 脚本结束
+结束时间: 20260721014339
+**********************

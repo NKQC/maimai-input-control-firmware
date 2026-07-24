@@ -29,6 +29,10 @@ extern volatile UsbDebugCounters g_usb_dbg;
 // 可在 vendor 卡死时仍软件触发进烧录模式，免去物理 BOOTSEL。loop() 检测到后 reset_usb_boot。
 extern volatile uint8_t g_bootsel_request;
 
+// 经 host_cmd(REBOOT_PSOC=0x06)置位的 PSoC 重启请求。loop() 检测到后脉冲 XRES 复位 PSoC 进运行态,
+// 使"需重启生效"的 PSoC 改动(如全局 CSD 重初始化)真正生效; 链路重连后自动重新下发算法/CSD。
+extern volatile uint8_t g_psoc_reboot_request;
+
 // 最近一次收到主机(上位机)host_cmd 帧的 millis 时间戳。UsbComm 每次分发帧时更新。
 // loop() 据此判定"主机已连接"(近 2s 内有帧)→ 绿灯常亮，否则心跳闪烁。
 extern volatile uint32_t g_last_host_cmd_ms;

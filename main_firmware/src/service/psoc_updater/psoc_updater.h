@@ -48,6 +48,7 @@ struct PsocBringupReport {
     bool snapshot_valid = false;
     bool clock_config_ok = false;
     bool erase_scan_complete = false;
+    bool skipped_flash = false;   // 本次启动 PSoC flash 内容已与镜像一致, 跳过擦写(省寿命)
 
     uint32_t idcode = 0;
     uint32_t actual_silicon_id = 0;

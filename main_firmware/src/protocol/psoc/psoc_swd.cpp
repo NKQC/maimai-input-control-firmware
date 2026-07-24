@@ -156,6 +156,7 @@ bool SwdProgrammer::init() {
     gpio_init(_rst_pin);
     gpio_set_dir(_rst_pin, true);
     gpio_put(_rst_pin, 1);
+    _rst_ready = true;   // 本机拥有 XRES 控制权; 即使随后 release_swd() 也保留(供运行时 REBOOT_PSOC 复位)
 
     // SWDIO 上拉，空闲高
     gpio_pull_up(_io_pin);
@@ -658,7 +659,11 @@ bool SwdProgrammer::read_clk_trim_snapshot() {
 }
 
 void SwdProgrammer::reset_target_run() {
-    if (!_ready) return;
+    // ★不能用 _ready 守卫★: release_swd() 后 _ready=false 但 XRES 仍是本机 GPIO 输出,
+    // 之前该守卫导致运行时 REBOOT_PSOC 静默无效(XRES 从不脉冲→PSoC 不重启→启动白灯不亮)。
+    // 只要 init() 配置过 XRES(_rst_ready) 即可脉冲复位; SWD_RELEASE_TO_EXTERNAL(未 init)不驱动。
+    if (!_rst_ready) return;
+    gpio_set_dir(_rst_pin, true);   // 确保为输出(release_swd 后仍是 OUT, 这里冗余保险)
     // 仅脉冲 XRES 复位。复位后不发送 SWD line reset / 不进 Test Mode，
     // 目标在启动窗口内无调试握手即引导用户固件正常运行。
     gpio_put(_rst_pin, 0);

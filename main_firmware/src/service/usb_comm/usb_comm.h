@@ -23,8 +23,9 @@ private:
     static UsbComm* _instance;
     
     HostCmdCodec _codec;
-    uint8_t _resp_buf[2048];  // CFG_GET_ALL 全量响应(~40+项)可达 ~900B，需 >512
+    uint8_t _resp_buf[HOST_CMD_RESP_BUF_MAX];  // 全量 CFG_GET_ALL(~140 项 ~2.1KB)整帧, 见 host_cmd.h
     HostFrame _frame;  // Reuse frame buffer across loop iterations to avoid stack bloat
+    uint32_t _frame_open_since = 0;  // 当前半帧起始 millis(0=空闲), 供陈旧半帧超时复位
     
     struct RebootState {
         enum class Stage : uint8_t {

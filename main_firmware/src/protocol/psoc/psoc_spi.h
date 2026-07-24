@@ -39,10 +39,32 @@ public:
     bool get_param(uint8_t ch, uint8_t param_id, uint32_t* out_value);
     bool get_raw(uint8_t ch, uint16_t* out_raw);                   // 指定通道实时 CSD 计数
     bool get_stats(uint32_t* out_scan_count);                      // 读全局扫描计数(自由递增)
-    bool measure_cp();                                             // 触发逐电极寄生电容 BIST 测量(异步)
-    bool get_cp(uint8_t ch, uint32_t* out_cp);                     // 读指定通道最近 Cp 值(fF)
+    bool measure_cp();                                             // 发送命令并确认 PSoC SPI ACK；测量本身在 PSoC 主循环异步执行
+    bool get_cp(uint8_t ch, uint32_t* out_cp);                     // 测量中=0，成功=fF，失败/未测量=0xFFFFFF
     bool apply();                                                   // 应用硬件参数(重扫/重校准)
-    bool set_mode(uint8_t mode);                                   // 0=全自动 SmartSense, 1=半自动/手动
+    bool calibrate();
+    bool baseline_reset();
+    // 频率自适应下探: 触发后轮询 busy 至完成(逐档升分频重校准, 数秒), 再读结果。
+    // out_result: 0=进行中/未知 1=成功 2=失败(超硬件能力); out_div: 成功时找到的统一 snsClk 分频。
+    bool auto_tune(uint8_t* out_result, uint16_t* out_div);
+    bool set_mode(uint8_t mode);                                   // 0=自动校准/标准完整处理，1=半自动手动
+
+    // ---- JIT 算法 blob 下发（分页事务；仅启动/更新用，非延迟关键）----
+    bool algo_begin(uint16_t len);                                 // 复位暂存 + 记录期望 len(<=1024)
+    bool algo_page(uint8_t page, const uint8_t four[4]);           // 写第 page 页(4 字节)
+    bool algo_end(uint16_t crc16, bool* out_ok, uint16_t* out_len);// 触发 commit；回读 ok/len 回显
+    bool algo_info(bool* out_valid, uint16_t* out_len);            // 读 PSoC 端算法 valid/len
+    // 完整下发: begin→逐页→end→轮询 info 直到 valid 且 len 一致(内部含 commit 等待)。
+    bool upload_algo(const uint8_t* data, uint16_t len, uint16_t crc16);
+    bool set_algo_rom(uint8_t ch, uint16_t rom);                   // 设每通道 16 位只读 ROM(回显校验)
+    bool get_algo_rom(uint8_t ch, uint16_t* out_rom);              // 读每通道 16 位 ROM
+    // 算法运行时追踪/可调变量(ABI cfg[8]/report[4]/out_active, 见 psoc_algo_abi.h)
+    bool algo_get_trace(uint8_t ch, uint8_t idx, uint8_t* out_active, uint16_t* out_report);
+    bool algo_set_cfg(uint8_t idx, uint8_t val);                   // 设共享 cfg[idx](回显校验)
+    bool algo_get_cfg(uint8_t idx, uint8_t* out_val);
+    bool set_global(uint8_t gparam_id, uint32_t value);            // 写全局 CSD 配置(仅影子, 不重初始化)
+    bool get_global(uint8_t gparam_id, uint32_t* out_value);       // 读全局 CSD 配置
+    bool global_commit();                                          // 全局项设完后触发一次完整重初始化
 
 
 
@@ -66,6 +88,9 @@ private:
     psoc::Frame _make_request(psoc::Cmd command);
     static bool _response_matches(const psoc::Frame& response, psoc::Cmd command, uint8_t sequence);
     static uint16_t _read_u16(const uint8_t* bytes);
+    // 轮询 GET_STATS 的 busy 字节(resp[2])至 PSoC 主循环真正完成重操作(busy 1→0)或超时。
+    // 用于 calibrate/apply/baseline_reset 的真实完成反馈, 替代原固定 sleep 盲等。返回 true=真实完成。
+    bool _wait_op_done(uint32_t timeout_ms);
 
     uint8_t _sck_pin;
     uint8_t _mosi_pin;

@@ -37,8 +37,25 @@ enum class Cmd : uint8_t {
     APPLY     = 0x33,
     GET_RAW   = 0x34,
     GET_STATS = 0x35,
-    MEASURE_CP = 0x36,   // 触发逐电极寄生电容 BIST 测量(异步,PSoC 主循环执行)
-    GET_CP     = 0x37,   // 读指定通道最近 Cp 值(fF)；响应 [magic,GET_CP,ch,val24]
+    MEASURE_CP = 0x36,   // 发送后确认 SPI ACK；PSoC 主循环异步执行实际测量
+    GET_CP     = 0x37,   // 测量中=0，成功=fF，失败/未测量=0xFFFFFF
+    SET_GLOBAL = 0x38,   // 全局 CSD 配置写(RAM 影子, 不重初始化)
+    GET_GLOBAL = 0x39,   // 全局 CSD 配置读：响应 [magic,GET_GLOBAL,gparam_id,0,val24]
+    GLOBAL_COMMIT = 0x3A,
+    CALIBRATE = 0x3B,      // 真正的 IDAC 重校准 + 基线复位(主循环执行, 耗时)
+    BASELINE_RESET = 0x3C, // 仅重置全部通道基线(主循环执行)// 全部全局项设完后触发一次完整重初始化(合并, 防反复重校准漂移)
+    AUTO_TUNE = 0x3D,      // 频率自适应下探(主循环逐档升 snsClk 分频重校准, 耗时数秒)
+    GET_AUTO_TUNE = 0x3E,  // 读自适应结果: [magic,GET_AUTO_TUNE,result(0进行中/1成功/2失败),0,div24]
+    // JIT 可加载算法引擎：分页下发 blob 到 PSoC 的 1KB 可执行槽（ABI v1，见 jit-algo-engine.md）
+    ALGO_BEGIN = 0x40,   // [magic,ALGO_BEGIN,len_lo,len_hi,0,0,0] 复位暂存写指针+记录期望 len
+    ALGO_PAGE  = 0x41,   // [magic,ALGO_PAGE,page,d0,d1,d2,d3] 每页 4 字节写 staging[page*4..+4]
+    ALGO_END   = 0x42,   // [magic,ALGO_END,crc_lo,crc_hi,0,0,0] 触发主循环 commit(CRC16 校验+拷入槽)
+    ALGO_INFO  = 0x43,   // 响应 [magic,ALGO_INFO,valid,0,len_lo,len_hi,0]
+    ALGO_SET_ROM = 0x44, // [magic,ALGO_SET_ROM,ch,rom_lo,rom_hi,0,0] 设每通道 16 位只读 ROM
+    ALGO_GET_ROM = 0x45, // [magic,ALGO_GET_ROM,ch,0,0,0,0] → 响应 [.. ,ch,0,rom_lo,rom_hi,0]
+    ALGO_GET_TRACE = 0x46, // [magic,GET_TRACE,ch,idx,0,0,0] → 响应 [..,ch,out_active,report[idx]_lo,report[idx]_hi,0]
+    ALGO_SET_CFG = 0x47,   // [magic,SET_CFG,idx,val,0,0,0] 设共享 cfg[idx] → 响应回显 [..,idx,0,cfg[idx],0,0]
+    ALGO_GET_CFG = 0x48,   // [magic,GET_CFG,idx,0,0,0,0] → 响应 [..,idx,0,cfg[idx],0,0]
     SNAPSHOT_INFO = 0x11,
     SNAPSHOT_PAGE = 0x12,
     SNAPSHOT_DATA = 0x13,

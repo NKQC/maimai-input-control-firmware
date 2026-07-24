@@ -11,21 +11,91 @@
 #   bootsel     令当前运行的 RP2040 进入 BOOTSEL (G:), 等待就绪
 #   flash-rp    复制 firmware.uf2 到 G: (需已在 BOOTSEL)
 #   cycle       一键: 进BOOTSEL -> 烧RP2040 -> 等重启+自动烧PSoC -> 打印诊断
+#   reflash     可靠刷写: 新鲜BOOTSEL -> 复制 -> 确认离开BOOTSEL -> 等bringup -> 诊断
+#   build-all   全量构建: PSoC make + embed + RP2040 UF2 + Rust UI/selftest (调 build.ps1)
+#   build-blob  编译默认HDR算法blob: gcc->objcopy->nm/objdump校验->生成C数组头+CRC16
 #   status      打印 G: 状态 + 关键产物是否存在
 
 param(
     [Parameter(Position=0)]
     [string]$Action = 'status',
     [Parameter(Position=1)]
-    [string]$Version = '0x00000401'
+    [string]$Version = ''
 )
 
 $ErrorActionPreference = 'Continue'
 $root     = $PSScriptRoot
 $fw       = Join-Path $root 'main_firmware'
 $cs       = Join-Path $root 'control_software'
+$psoc     = Join-Path $root 'psoc_firmware\CY8C4147AZI-SensorCore'
+$psocMain = Join-Path $psoc 'main.c'
+$psocHexDir = Join-Path $psoc 'build\last_config'
+$psocConverter = Join-Path $fw 'tools\psoc_hex_to_c.py'
+$psocImage = Join-Path $fw 'src\protocol\psoc\psoc_fw_image.h'
 $uf2      = Join-Path $fw '.pio\build\pico\firmware.uf2'
 $selftest = Join-Path $cs 'target\debug\selftest.exe'
+$buildAll = Join-Path $fw 'build.ps1'
+$blobDir  = Join-Path $root 'psoc_firmware\algo'
+$blobSrc  = Join-Path $blobDir 'psoc_algo_default.c'
+$blobObj  = Join-Path $blobDir 'psoc_algo_default.o'
+$blobBin  = Join-Path $blobDir 'psoc_algo_default.bin'
+$blobHdr  = Join-Path $fw 'src\service\psoc_algo\psoc_algo_default.h'
+
+function Get-Crc16Ccitt([byte[]]$data) {
+    $crc = 0xFFFF
+    foreach ($x in $data) {
+        $crc = $crc -bxor ([int]$x -shl 8)
+        for ($i = 0; $i -lt 8; $i++) {
+            if ($crc -band 0x8000) { $crc = (($crc -shl 1) -bxor 0x1021) -band 0xFFFF }
+            else { $crc = ($crc -shl 1) -band 0xFFFF }
+        }
+    }
+    return $crc
+}
+
+function Invoke-NativeTail(
+    [string]$Name,
+    [string]$WorkingDirectory,
+    [string]$FilePath,
+    [string[]]$Arguments,
+    [int]$TailLines
+) {
+    Push-Location -LiteralPath $WorkingDirectory
+    $output = @()
+    $exitCode = 1
+    try {
+        $output = @(& $FilePath @Arguments 2>&1)
+        $exitCode = $LASTEXITCODE
+        if ($null -eq $exitCode) { $exitCode = 1 }
+    }
+    catch {
+        $output += $_
+        $exitCode = 1
+    }
+    finally {
+        Pop-Location
+    }
+    $output | Select-Object -Last $TailLines
+    if ($exitCode -ne 0) {
+        Write-Error "$Name failed with exit code $exitCode"
+        exit $exitCode
+    }
+}
+
+function Get-PsocVersionHex {
+    $source = Get-Content -LiteralPath $psocMain -Raw
+    $major = [regex]::Match($source, '#define\s+FW_VERSION_MAJOR\s+\((\d+)u\)')
+    $minor = [regex]::Match($source, '#define\s+FW_VERSION_MINOR\s+\((\d+)u\)')
+    $patch = [regex]::Match($source, '#define\s+FW_VERSION_PATCH\s+\((\d+)u\)')
+    if (-not ($major.Success -and $minor.Success -and $patch.Success)) {
+        Write-Error "Unable to parse PSoC version from $psocMain"
+        exit 1
+    }
+    $value = ([int]$major.Groups[1].Value -shl 16) -bor
+             ([int]$minor.Groups[1].Value -shl 8) -bor
+             [int]$patch.Groups[1].Value
+    return '0x{0:X8}' -f $value
+}
 
 function Wait-Bootsel([int]$timeoutSec = 10) {
     for ($i = 0; $i -lt $timeoutSec; $i++) {
@@ -38,37 +108,46 @@ function Wait-Bootsel([int]$timeoutSec = 10) {
 function Ensure-Selftest() {
     if (-not (Test-Path $selftest)) {
         Write-Output "selftest.exe 不存在, 先 build-ui"
-        Push-Location $cs; cargo build --bins 2>&1 | Select-Object -Last 6; Pop-Location
+        Invoke-NativeTail 'build-ui' $cs 'cargo' @('build', '--locked', '--bins') 20
     }
 }
 
 switch ($Action) {
     'build-rp' {
-        Push-Location $fw
-        pio run 2>&1 | Select-Object -Last 14
-        Pop-Location
+        Invoke-NativeTail 'build-rp' $fw 'pio' @('run') 14
     }
     'build-ui' {
-        Push-Location $cs
-        cargo build --bins 2>&1 | Select-Object -Last 20
-        Pop-Location
+        Invoke-NativeTail 'build-ui' $cs 'cargo' @('build', '--locked', '--bins') 20
     }
     'build-ui-release' {
-        Push-Location $cs
-        cargo build --release --bin mai2control-ui 2>&1 | Select-Object -Last 20
-        Pop-Location
+        Invoke-NativeTail 'build-ui-release' $cs 'cargo' @('build', '--locked', '--release', '--bin', 'mai2control-ui') 20
     }
     'diagnose' {
         Ensure-Selftest
-        & $selftest --diagnose 2>$null
+        Invoke-NativeTail 'diagnose' $root $selftest @('--diagnose') 200
     }
     'smoke' {
         Ensure-Selftest
-        & $selftest --smoke 2>$null
+        Invoke-NativeTail 'smoke' $root $selftest @('--smoke') 200
     }
     'full' {
         Ensure-Selftest
-        & $selftest 2>$null
+        Invoke-NativeTail 'full' $root $selftest @() 300
+    }
+    'algo' {
+        # JIT 算法引擎闭环: 读信息→编译上传测试算法→校验→恢复默认→校验
+        Ensure-Selftest
+        Invoke-NativeTail 'algo' $root $selftest @('--algo') 60
+    }
+    'global' {
+        # 全局 CSD 配置闭环: 读全部→设 High-Z→设备回读校验→恢复 GND
+        Ensure-Selftest
+        Invoke-NativeTail 'global' $root $selftest @('--global') 60
+    }
+    'kbd' {
+        # 键盘闭环: 读物理键码/触控映射/物理实时态 + SET_MAP round-trip 校验
+        Ensure-Selftest
+        Invoke-NativeTail 'kbd' $root $selftest @('--kbd') 60
     }
     'enum' {
         # monitor device enumeration presence ~12s: intermittent=reboot loop, stable-but-nocomm=main loop hang
@@ -151,13 +230,23 @@ switch ($Action) {
         & $selftest --diagnose 2>$null
     }
     'build-psoc' {
+        # bash -lc 登录 shell 会切到 $HOME, 必须在命令内显式 cd 回工程目录(cygdrive 路径), 否则
+        # make 在 $HOME 找不到 Makefile 目标 → "no rule to make target build"。
         $bash = 'C:\Users\asdfg\ModusToolbox\tools_3.6\modus-shell\bin\bash.exe'
-        & $bash -lc "cd /cygdrive/f/mai2control/mai2control-v4/psoc_firmware/CY8C4147AZI-SensorCore && make build -j8 2>&1 | tail -n 25"
+        $drive = $psoc.Substring(0,1).ToLower()
+        $cyg = "/cygdrive/$drive" + ($psoc.Substring(2) -replace '\\','/')
+        Invoke-NativeTail 'build-psoc' $psoc $bash @('-lc', "cd '$cyg' && make build -j8") 30
     }
     'embed-psoc' {
-        $hex = 'F:\mai2control\mai2control-v4\psoc_firmware\CY8C4147AZI-SensorCore\build\APP_CY8CKIT-149\Debug\mtb-example-psoc4-capsense-smartsense-buttons-slider.hex'
-        $out = 'F:\mai2control\mai2control-v4\main_firmware\src\protocol\psoc\psoc_fw_image.h'
-        python 'F:\mai2control\mai2control-v4\main_firmware\tools\psoc_hex_to_c.py' $hex $out $Version
+        $hexFiles = @(Get-ChildItem -LiteralPath $psocHexDir -Filter '*.hex' -File)
+        if ($hexFiles.Count -ne 1) {
+            Write-Error "Expected exactly one PSoC HEX in $psocHexDir, found $($hexFiles.Count)"
+            exit 1
+        }
+        $sourceVersion = Get-PsocVersionHex
+        Invoke-NativeTail 'embed-psoc' $fw 'python' @(
+            $psocConverter, $hexFiles[0].FullName, $psocImage, $sourceVersion
+        ) 20
     }
     'imgsum' {
         $img = 'F:\mai2control\mai2control-v4\main_firmware\src\protocol\psoc\psoc_fw_image.h'
@@ -196,6 +285,79 @@ switch ($Action) {
         & $selftest --ctrl-bootsel 2>$null
         if (Wait-Bootsel 10) { "G_EXISTS (BOOTSEL ready)" } else { "G_ABSENT (ctrl-bootsel failed)" }
     }
+    'build-all' {
+        # 全量构建: PSoC make + embed + RP2040 UF2 + Rust UI/selftest (调用固定的 build.ps1)
+        & $buildAll
+        if ($LASTEXITCODE -ne 0) { Write-Error "build-all failed (exit=$LASTEXITCODE)"; exit $LASTEXITCODE }
+    }
+    'reflash' {
+        # 可靠刷写: 新鲜进 BOOTSEL -> 复制 UF2 -> 轮询确认离开 BOOTSEL(设备已接收并重启) -> 等 PSoC bringup -> 诊断
+        Ensure-Selftest
+        if (-not (Test-Path G:\)) {
+            & $selftest --reboot-bootloader-only 2>$null
+            Wait-Bootsel 10 | Out-Null
+        }
+        if (-not (Test-Path G:\)) { "REFLASH FAIL: no BOOTSEL"; break }
+        Copy-Item $uf2 'G:\' -Force
+        "COPIED firmware.uf2 -> G:; waiting for device to leave BOOTSEL..."
+        $left = $false
+        for ($i = 0; $i -lt 15; $i++) {
+            Start-Sleep -Seconds 1
+            if (-not (Test-Path G:\)) { $left = $true; "left BOOTSEL at t=$($i + 1)s (flash accepted)"; break }
+        }
+        if (-not $left) { "REFLASH WARN: still in BOOTSEL after 15s" }
+        Start-Sleep -Seconds 10
+        & $selftest --diagnose 2>$null
+    }
+    'build-blob' {
+        # 固定编译默认 HDR 算法 blob: gcc -> objcopy binary -> nm/objdump 校验 -> 生成 C 数组头 + CRC16
+        $gccDirs = @(
+            'C:\Users\asdfg\ModusToolbox\tools_3.6\gcc\bin',
+            'C:\Users\asdfg\.platformio\packages\toolchain-rp2040-earlephilhower\bin'
+        )
+        $gccBin = $null
+        foreach ($d in $gccDirs) { if (Test-Path (Join-Path $d 'arm-none-eabi-gcc.exe')) { $gccBin = $d; break } }
+        if (-not $gccBin) { Write-Error 'arm-none-eabi-gcc not found in known toolchain dirs'; exit 1 }
+        if (-not (Test-Path $blobSrc)) { Write-Error "blob source missing: $blobSrc"; exit 1 }
+        $gcc     = Join-Path $gccBin 'arm-none-eabi-gcc.exe'
+        $objcopy = Join-Path $gccBin 'arm-none-eabi-objcopy.exe'
+        $nm      = Join-Path $gccBin 'arm-none-eabi-nm.exe'
+        $objdump = Join-Path $gccBin 'arm-none-eabi-objdump.exe'
+        Write-Output "gcc: $gcc"
+        & $gcc '-mcpu=cortex-m0plus' '-mthumb' '-Os' '-ffreestanding' '-fno-jump-tables' '-fomit-frame-pointer' '-fno-common' '-nostdlib' "-I$psoc" '-c' $blobSrc '-o' $blobObj
+        if ($LASTEXITCODE -ne 0) { Write-Error 'blob compile failed'; exit 1 }
+        & $objcopy '-O' 'binary' '-j' '.text' $blobObj $blobBin
+        if ($LASTEXITCODE -ne 0) { Write-Error 'objcopy failed'; exit 1 }
+        Write-Output '--- nm (must show NO undefined "U" symbol except algo defined "T") ---'
+        & $nm $blobObj
+        Write-Output '--- objdump -dr (must show NO R_ARM_* reloc in .text; algo at offset 0) ---'
+        & $objdump '-dr' $blobObj
+        $bytes = [System.IO.File]::ReadAllBytes($blobBin)
+        $crc = Get-Crc16Ccitt $bytes
+        Write-Output ("--- blob len={0} bytes crc16=0x{1:X4} (limit 1024) ---" -f $bytes.Length, $crc)
+        if ($bytes.Length -gt 1024) { Write-Error "blob too large: $($bytes.Length) > 1024"; exit 1 }
+        $sb = New-Object System.Text.StringBuilder
+        [void]$sb.AppendLine('/* AUTO-GENERATED by dev.ps1 build-blob. Do not edit by hand. */')
+        [void]$sb.AppendLine('#ifndef PSOC_ALGO_DEFAULT_H')
+        [void]$sb.AppendLine('#define PSOC_ALGO_DEFAULT_H')
+        [void]$sb.AppendLine('')
+        [void]$sb.AppendLine('static const unsigned char PSOC_ALGO_DEFAULT[] = {')
+        for ($i = 0; $i -lt $bytes.Length; $i += 12) {
+            $line = '    '
+            $end = [Math]::Min($i + 12, $bytes.Length)
+            for ($j = $i; $j -lt $end; $j++) { $line += ('0x{0:X2}, ' -f $bytes[$j]) }
+            [void]$sb.AppendLine($line.TrimEnd())
+        }
+        [void]$sb.AppendLine('};')
+        [void]$sb.AppendLine(('static const unsigned int   PSOC_ALGO_DEFAULT_LEN   = {0}u;' -f $bytes.Length))
+        [void]$sb.AppendLine(('static const unsigned short PSOC_ALGO_DEFAULT_CRC16 = 0x{0:X4}u;' -f $crc))
+        [void]$sb.AppendLine('')
+        [void]$sb.AppendLine('#endif /* PSOC_ALGO_DEFAULT_H */')
+        $hdrDir = Split-Path $blobHdr
+        if (-not (Test-Path $hdrDir)) { New-Item -ItemType Directory -Path $hdrDir -Force | Out-Null }
+        Set-Content -LiteralPath $blobHdr -Value $sb.ToString() -Encoding ASCII
+        "WROTE $blobHdr"
+    }
     'status' {
         if (Test-Path G:\)      { "G: EXISTS (BOOTSEL)" } else { "G: ABSENT (app running or disconnected)" }
         if (Test-Path $uf2)     { "uf2 OK: $uf2" }        else { "uf2 MISSING" }
@@ -203,6 +365,6 @@ switch ($Action) {
     }
     default {
         "Unknown action: $Action"
-        "Actions: build-rp build-ui diagnose smoke full bootsel flash-rp cycle status"
+        "Actions: build-rp build-ui build-all build-psoc embed-psoc build-blob diagnose smoke full bootsel flash-rp cycle reflash status"
     }
 }

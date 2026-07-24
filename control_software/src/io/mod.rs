@@ -26,6 +26,9 @@ const CONFIG_EP_IN: u8 = 0x81;
 const TRANSFER_SIZE: usize = 4096;
 const IO_TIMEOUT: Duration = Duration::from_millis(20);
 const IDLE_SLEEP: Duration = Duration::from_millis(1);
+/// 单条命令写入的最大尝试次数。首次写超时常因设备刚枚举/复位后 vendor OUT 端点尚未 re-arm,
+/// 需给固件主循环 vendor_service() 几个周期武装; 每次失败都 drop+重开主机端点(释放 claim,清 host stall)。
+const WRITE_MAX_ATTEMPTS: u32 = 6;
 
 #[derive(Debug, Clone)]
 pub struct DeviceCandidate {
@@ -229,8 +232,10 @@ pub fn spawn(device_selector: &str) -> Result<IoHandle> {
         .context("Failed to claim mai2 config interface 0")?;
 
     // 连接时先主动清两端点 halt 并建 reader/writer（消除上一会话残留的 stall）。
-    let mut writer = open_writer(&interface)?;
-    let mut reader = open_reader(&interface)?;
+    // 用 Option 持有: 重开端点前必须先 drop 旧端点释放独占 claim, 否则 nusb 重新 endpoint() 会失败
+    // (报 "Missing ... endpoint")——这正是"一次写超时即断开"的根因。
+    let mut writer = Some(open_writer(&interface)?);
+    let mut reader = Some(open_reader(&interface)?);
 
     let (cmd_tx, cmd_rx) = mpsc::channel::<Frame>();
     let (evt_tx, evt_rx) = mpsc::channel::<IoEvent>();
@@ -255,46 +260,61 @@ pub fn spawn(device_selector: &str) -> Result<IoHandle> {
                 match cmd_rx.try_recv() {
                     Ok(frame) => {
                         let bytes = encode(&frame);
-                        if let Err(e) = writer.write_all(&bytes).and_then(|_| writer.flush()) {
-                            warn!(
-                                "WinUSB write failed: {e} (kind={:?})，尝试清 halt 重建 OUT 端点并重发",
-                                e.kind()
-                            );
-                            match open_writer(&interface) {
-                                Ok(w) => {
-                                    writer = w;
-                                    if let Err(e2) =
-                                        writer.write_all(&bytes).and_then(|_| writer.flush())
-                                    {
-                                        error!("WinUSB 重发仍失败: {e2}");
-                                        let _ = evt_tx.send(IoEvent::Error(e2.to_string()));
-                                        let _ = evt_tx.send(IoEvent::Disconnected);
-                                        return;
-                                    }
-                                    info!("OUT 端点恢复成功，命令已重发");
+                        let mut sent = false;
+                        for attempt in 0..WRITE_MAX_ATTEMPTS {
+                            let res = {
+                                let w = writer.as_mut().unwrap();
+                                w.write_all(&bytes).and_then(|_| w.flush())
+                            };
+                            match res {
+                                Ok(()) => {
+                                    sent = true;
+                                    break;
                                 }
-                                Err(e2) => {
-                                    error!("OUT 端点恢复失败: {e2}");
-                                    let _ = evt_tx.send(IoEvent::Error(e2.to_string()));
-                                    let _ = evt_tx.send(IoEvent::Disconnected);
-                                    return;
+                                Err(e) => {
+                                    warn!(
+                                        "WinUSB write 尝试 #{}/{} 失败: {e} (kind={:?})",
+                                        attempt + 1,
+                                        WRITE_MAX_ATTEMPTS,
+                                        e.kind()
+                                    );
+                                    // 给固件主循环几个周期 re-arm vendor OUT。
+                                    thread::sleep(Duration::from_millis(8));
+                                    // 先 drop 旧 writer 释放端点 claim, 再重开(清 host 侧 stall)。
+                                    drop(writer.take());
+                                    match open_writer(&interface) {
+                                        Ok(w) => writer = Some(w),
+                                        Err(e2) => {
+                                            error!("OUT 端点重建失败: {e2}");
+                                            let _ = evt_tx.send(IoEvent::Error(e2.to_string()));
+                                            let _ = evt_tx.send(IoEvent::Disconnected);
+                                            return;
+                                        }
+                                    }
                                 }
                             }
-                        } else {
-                            debug!(
-                                "Sent WinUSB frame cmd=0x{:02X} seq={} len={}",
-                                frame.cmd,
-                                frame.seq,
-                                bytes.len()
-                            );
                         }
+                        if !sent {
+                            error!("WinUSB 写 {} 次仍失败，判定断开", WRITE_MAX_ATTEMPTS);
+                            let _ = evt_tx
+                                .send(IoEvent::Error("write failed after retries".into()));
+                            let _ = evt_tx.send(IoEvent::Disconnected);
+                            return;
+                        }
+                        debug!(
+                            "Sent WinUSB frame cmd=0x{:02X} seq={} len={}",
+                            frame.cmd,
+                            frame.seq,
+                            bytes.len()
+                        );
                     }
                     Err(mpsc::TryRecvError::Empty) => break,
                     Err(mpsc::TryRecvError::Disconnected) => return,
                 }
             }
 
-            match reader.read(&mut read_buf) {
+            let read_res = reader.as_mut().unwrap().read(&mut read_buf);
+            match read_res {
                 Ok(0) => thread::sleep(IDLE_SLEEP),
                 Ok(count) => {
                     debug!(
@@ -342,10 +362,12 @@ pub fn spawn(device_selector: &str) -> Result<IoHandle> {
                         let _ = evt_tx.send(IoEvent::Disconnected);
                         return;
                     }
-                    // 旧 reader 在下面赋值时被丢弃(其 pending 传输随之取消)，再由 open_reader 清 halt。
+                    // 先 drop 旧 reader 释放端点 claim(其 pending 传输随之取消)，再 open_reader 重开;
+                    // 否则 endpoint() 因端点仍被占用而失败(与 OUT 同源的双 claim bug)。
+                    drop(reader.take());
                     match open_reader(&interface) {
                         Ok(r) => {
-                            reader = r;
+                            reader = Some(r);
                             decoder = Decoder::new();
                             info!("IN 端点已清 halt 重建，连接继续");
                         }

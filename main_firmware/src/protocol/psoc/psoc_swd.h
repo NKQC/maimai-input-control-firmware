@@ -174,6 +174,10 @@ private:
     uint8_t _sm;
     uint8_t _offset;
     bool _ready;
+    // XRES(RST) 引脚是否已被本 SwdProgrammer 配置为受控 GPIO 输出。init() 成功后置位。
+    // 与 _ready 分离: release_swd() 让出 SWD 总线(_ready=false)后, XRES 仍是我们的 GPIO 输出,
+    // 故运行时 REBOOT_PSOC 仍可脉冲复位; 仅 SWD_RELEASE_TO_EXTERNAL(从未 init)时保持 false 不驱动。
+    bool _rst_ready = false;
     uint32_t _last_idcode;
 
     // 诊断

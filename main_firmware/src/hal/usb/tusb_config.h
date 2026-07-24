@@ -79,7 +79,9 @@
 // HID buffer size Should be sufficient to hold ID (if any) + Data
 #define CFG_TUD_HID_EP_BUFSIZE  (64)
 
-// Vendor(WinUSB config 通道)缓冲区，参考 Adafruit webusb_serial 示例取值。
+// Vendor(WinUSB config 通道)缓冲区。回退到已验证值(64): 实测增大 TX FIFO 后写入 FIFO 的数据
+// 无法被泵到 IN 端点送出(host 收不到 DEVICE_INFO)。保持 64 与已 DIAGNOSE PASS 的配置一致。
+// 高吞吐稳定性改由 上层"定时任务队列+续期制降频" + config_write"有限忙等+pump+超时拒绝"治理。
 #define CFG_TUD_VENDOR_RX_BUFSIZE (64)
 #define CFG_TUD_VENDOR_TX_BUFSIZE (64)
 

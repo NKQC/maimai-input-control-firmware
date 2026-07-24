@@ -33,6 +33,9 @@ constexpr uint32_t PSOC_SPI_SCK_HZ  = 3000000;  // SCK 频率（延后采样补�
 // 启动时若读到它=上次运行中被复位(任何看门狗超时:死锁/跑飞/flash异步冲突)→一律进 BOOTSEL 自动重烧。
 // 读后立即清零，恢复重烧后正常启动，打破循环。首次上电 scratch=0→正常；主动重启前清 0→回 app。
 constexpr uint32_t WD_RUNNING_MAGIC = 0xB007C0DEu;
+// 运行时指令 DEBUG_CRASH_BOOTSEL 武装标志(存 watchdog scratch[6], 跨复位存活、掉电清零):
+// =此值 → 启用"运行中崩溃自动进 BOOTSEL"(自持 debug 便于 dev.ps1 自动重烧); 0 → 崩溃仅正常重启(默认)。
+constexpr uint32_t DEBUG_BOOTSEL_MAGIC = 0xDEB6B007u;
 constexpr uint32_t PSOC_SNAPSHOT_PAGE_DELAY_US = 60;   // 每页请求-应答间隔（< 旧 150us，仍留 ISR 余量）
 constexpr uint8_t  PSOC_SNAPSHOT_PAGES_PER_PUMP = 4;   // 每次 update 读取的页数（4×~80us≈320us < 触控预算，与触控快路交织）
 
@@ -59,6 +62,11 @@ constexpr bool SWD_RELEASE_TO_EXTERNAL = false;
 // WS2812 / NeoPixel（v4 硬件改为 13/14，v3 遗留代码用的是 11，不要复用）
 constexpr uint8_t PIN_WS2812_0 = 13;
 constexpr uint8_t PIN_WS2812_1 = 14;
+
+// 特性/诊断开关: 键盘 HID(物理键盘 GPIO1-12 + 触控键盘映射 + serial 模式枚举键盘 HID 接口)。
+// 二分已确认: 进精调掉线根因是 vendor IN 高吞吐 stall, 与 HID 无关(无 HID 版同样掉)。
+// 故恢复键盘 HID=1; 掉线改由"降遥测负载 + config_write 忙等 pump tud_task"治理。
+#define MAI2_ENABLE_SERIAL_HID 1
 
 // 系统版本
 constexpr const char* SYSTEM_VERSION = "4.0.0";

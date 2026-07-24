@@ -21,6 +21,10 @@
 #define HOST_CMD_SOF1           0x55
 #define HOST_CMD_PAYLOAD_MAX    4096  // payload 上限，超限丢弃保护
 #define HOST_CMD_HEADER_SIZE    7     // SOF0 SOF1 cmd flags seq len(2B)
+// 完整编码帧上限 = 头(7) + 满载 payload(4096) + CRC(2), 余量取整。响应缓冲与
+// encode_frame max_len 统一用它: 避免全量 CFG_GET_ALL(~140 项 ~2.1KB)超旧 2048/512
+// 上限时 encode_frame 返回 0 → 主机收 0 项 → 设置页空白。
+#define HOST_CMD_RESP_BUF_MAX   (HOST_CMD_PAYLOAD_MAX + 16)
 
 // flags 定义
 #define HOST_CMD_FLAG_RESPONSE  0x01  // bit0=1 表示响应
@@ -35,6 +39,8 @@ enum class HostCmd : uint8_t {
     PING            = 0x03,
     REBOOT          = 0x04,
     REBOOT_BOOTLOADER = 0x05,
+    REBOOT_PSOC     = 0x06,  // 脉冲 XRES 重启 PSoC 使"需重启生效"的改动生效
+    DEBUG_CRASH_BOOTSEL = 0x07,  // 运行时武装/解除"崩溃→进BOOTSEL"(自持debug); payload[0]: 1=武装 0=解除
     SAVE_CONFIG     = 0x0E,
     RESET_DEFAULTS  = 0x0F,
     
@@ -51,10 +57,14 @@ enum class HostCmd : uint8_t {
     PARAM_GET_ALL   = 0x22,
     CALIBRATE       = 0x23,
     BASELINE_RESET  = 0x24,
-    MODE_SET        = 0x25,  // payload=mode(u8): 0=自动校准, 1=半自动/手动
+    MODE_SET        = 0x25,  // payload=mode(u8): 0=自动校准/标准完整处理, 1=半自动手动
     CSD_CAPTURE     = 0x26,  // 空: 从 PSoC 读当前参数入 RP2040 store(半自动种子)
     CP_MEASURE      = 0x27,  // 空: 异步触发全部电极的寄生电容测量
     CP_GET          = 0x28,  // payload=channel(u8): 读取最近一次 Cp(fF)
+    GLOBAL_GET      = 0x29,  // payload=gparam_id(u8) → 响应 [gparam_id, value(u32 LE)]
+    GLOBAL_SET      = 0x2A,  // payload=[gparam_id(u8), value(u32 LE)] 写全局CSD配置+APPLY → ACK
+    GLOBAL_GET_ALL  = 0x2B,  // 空 → 响应 [count(u8), (gparam_id, value u32 LE)×count]
+    AUTO_TUNE       = 0x2C,  // 空 → 频率自适应下探; 响应 [result(u8: 0进行中/1成功/2失败), div(u16 LE)]
     
     // 遥测流域 0x30-0x3F
     TELEM_START     = 0x30,
@@ -73,7 +83,28 @@ enum class HostCmd : uint8_t {
     LED_GET         = 0x50,
     LED_SET_REGION  = 0x51,
     LED_PREVIEW     = 0x52,
-    
+
+    // JIT 触控算法域 0x60-0x6F
+    ALGO_GET_INFO      = 0x60,  // 空 → 响应 [is_default(u8),psoc_valid(u8),len(u16 LE),crc16(u16 LE)]
+    ALGO_UPLOAD        = 0x61,  // payload=[len(u16 LE),crc16(u16 LE),data[len]] 存储+校验+下发 → ACK/NAK
+    ALGO_APPLY         = 0x62,  // 空 → 把当前存储算法下发 PSoC → ACK/NAK
+    ALGO_RESET_DEFAULT = 0x63,  // 空 → 回退内嵌默认(v3.1 HDR)+下发 → ACK
+    ALGO_SET_ROM       = 0x64,  // payload=[ch(u8),rom(u16 LE)]×count 设每通道 ROM+下发 → ACK
+    ALGO_GET_ROM       = 0x65,  // 空 → 响应 36×u16 LE (每通道 ROM 表)
+    ALGO_GET_SRC       = 0x66,  // 空 → 响应 [len(u16 LE), src bytes] RP 存的算法 C 源(已滤注释)
+    ALGO_SET_SRC       = 0x67,  // payload=[len(u16 LE), src bytes] 存算法 C 源(映射表)+持久化 → ACK
+    ALGO_GET_CODE      = 0x68,  // 空 → 响应 [len(u16 LE), asm bytes] RP 存的算法 ASM 机器码回读
+    ALGO_GET_TRACE     = 0x69,  // payload=[ch(u8),idx(u8)] → 响应 [ch,out_active(u8),report(u16 LE)]
+    ALGO_SET_CFG       = 0x6A,  // payload=[idx(u8),val(u8)] 设共享 cfg[idx]+持久化+下发 → ACK
+    ALGO_GET_CFG       = 0x6B,  // payload=[idx(u8)] → 响应 [idx,cfg(u8)]
+
+    // 物理键盘 / 触控键盘映射域 0x70-0x7D
+    KBD_GET_STATE    = 0x70,  // 空 → [phys_state(u16 LE)] 物理键 GPIO1-12 实时按下位
+    KBD_GET_MAP      = 0x71,  // 空 → [count(u8)=12, keycode(u8)×12] 物理键 HID 键码表
+    KBD_SET_MAP      = 0x72,  // [idx(u8),keycode(u8)]×n 设物理键 HID 键码 → ACK
+    KBD_GET_TOUCHMAP = 0x73,  // 空 → [en(u8), count(u8)=34, keycode(u8)×34] 触控→键盘映射表
+    KBD_SET_TOUCHMAP = 0x74,  // [zone(u8),keycode(u8)]×n 设触控→键盘键码 → ACK
+
     // 应答 0x7E-0x7F
     ACK             = 0x7E,
     NAK             = 0x7F,
@@ -152,7 +183,11 @@ public:
     
     // 复位状态机
     void reset();
-    
+
+    // 是否处于空闲(未在解析半帧)。供上层做"陈旧半帧超时复位"判断:
+    // 截断/损坏帧声明了大 len 时会卡在 READ_PAYLOAD, 吞掉后续新命令(如重连后的 HELLO)。
+    bool is_idle() const { return _state == RxState::FIND_SOF0; }
+
 private:
     enum class RxState {
         FIND_SOF0,

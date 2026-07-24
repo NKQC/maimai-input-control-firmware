@@ -314,8 +314,8 @@ try {
     Write-Host ("RP2040 UF2 identity: SHA256={0} size={1} mtime_utc={2:o}" -f
         $uf2Hash, $uf2Item.Length, $uf2Item.LastWriteTimeUtc)
 
-    Invoke-NativeStep "Build WinUSB selftest" $CargoExe @(
-        "build", "--locked", "--bin", "selftest"
+    Invoke-NativeStep "Build Rust UI and selftest" $CargoExe @(
+        "build", "--locked", "--bins"
     ) $ControlDir
     Assert-Path $SelftestPath "WinUSB selftest executable"
 

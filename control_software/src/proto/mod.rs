@@ -18,11 +18,12 @@
 
 #![allow(dead_code)]
 
+pub mod algo;
 pub mod config;
 pub mod telemetry;
 
 use std::convert::TryFrom;
-pub use config::{CfgValue, ConfigEntry, ConfigValueType, decode_entries, decode_entry, encode_entry};
+pub use config::{CfgValue, ConfigEntry, ConfigValueType, decode_entries, decode_entry, encode_entry, encode_entries};
 pub use telemetry::{
     ChannelSample, FIELD_RAW, FIELD_BASELINE, FIELD_DIFF, FIELD_STATUS, FIELD_STATS, FIELD_LATENCY,
     KNOWN_PARAM_IDS, PARAM_FINGER_TH, PARAM_NOISE_TH, PARAM_NEG_NOISE_TH,
@@ -67,6 +68,8 @@ pub enum HostCmd {
     Ping = 0x03,
     Reboot = 0x04,
     RebootBootloader = 0x05,
+    RebootPsoc = 0x06,
+    DebugCrashBootsel = 0x07,
     SaveConfig = 0x0E,
     ResetDefaults = 0x0F,
 
@@ -87,6 +90,10 @@ pub enum HostCmd {
     CsdCapture = 0x26,
     CpMeasure = 0x27,
     CpGet = 0x28,
+    GlobalGet = 0x29,
+    GlobalSet = 0x2A,
+    GlobalGetAll = 0x2B,
+    AutoTune = 0x2C,
 
     // Telemetry stream domain 0x30-0x3F
     TelemStart = 0x30,
@@ -106,6 +113,27 @@ pub enum HostCmd {
     LedSetRegion = 0x51,
     LedPreview = 0x52,
 
+    // JIT algorithm domain 0x60-0x6F
+    AlgoGetInfo = 0x60,
+    AlgoUpload = 0x61,
+    AlgoApply = 0x62,
+    AlgoResetDefault = 0x63,
+    AlgoSetRom = 0x64,
+    AlgoGetRom = 0x65,
+    AlgoGetSrc = 0x66,
+    AlgoSetSrc = 0x67,
+    AlgoGetCode = 0x68,
+    AlgoGetTrace = 0x69,
+    AlgoSetCfg = 0x6A,
+    AlgoGetCfg = 0x6B,
+
+    // Keyboard (physical GPIO1-12 + touch->key) domain 0x70-0x7D
+    KbdGetState = 0x70,
+    KbdGetMap = 0x71,
+    KbdSetMap = 0x72,
+    KbdGetTouchmap = 0x73,
+    KbdSetTouchmap = 0x74,
+
     // Response codes 0x7E-0x7F
     Ack = 0x7E,
     Nak = 0x7F,
@@ -122,6 +150,8 @@ impl TryFrom<u8> for HostCmd {
             0x03 => Ok(Ping),
             0x04 => Ok(Reboot),
             0x05 => Ok(RebootBootloader),
+            0x06 => Ok(RebootPsoc),
+            0x07 => Ok(DebugCrashBootsel),
             0x0E => Ok(SaveConfig),
             0x0F => Ok(ResetDefaults),
             0x10 => Ok(CfgGet),
@@ -138,6 +168,10 @@ impl TryFrom<u8> for HostCmd {
             0x26 => Ok(CsdCapture),
             0x27 => Ok(CpMeasure),
             0x28 => Ok(CpGet),
+            0x29 => Ok(GlobalGet),
+            0x2A => Ok(GlobalSet),
+            0x2B => Ok(GlobalGetAll),
+            0x2C => Ok(AutoTune),
             0x30 => Ok(TelemStart),
             0x31 => Ok(TelemStop),
             0x32 => Ok(TelemData),
@@ -150,6 +184,23 @@ impl TryFrom<u8> for HostCmd {
             0x50 => Ok(LedGet),
             0x51 => Ok(LedSetRegion),
             0x52 => Ok(LedPreview),
+            0x60 => Ok(AlgoGetInfo),
+            0x61 => Ok(AlgoUpload),
+            0x62 => Ok(AlgoApply),
+            0x63 => Ok(AlgoResetDefault),
+            0x64 => Ok(AlgoSetRom),
+            0x65 => Ok(AlgoGetRom),
+            0x66 => Ok(AlgoGetSrc),
+            0x67 => Ok(AlgoSetSrc),
+            0x68 => Ok(AlgoGetCode),
+            0x69 => Ok(AlgoGetTrace),
+            0x6A => Ok(AlgoSetCfg),
+            0x6B => Ok(AlgoGetCfg),
+            0x70 => Ok(KbdGetState),
+            0x71 => Ok(KbdGetMap),
+            0x72 => Ok(KbdSetMap),
+            0x73 => Ok(KbdGetTouchmap),
+            0x74 => Ok(KbdSetTouchmap),
             0x7E => Ok(Ack),
             0x7F => Ok(Nak),
             _ => Err(HostCmdError::Unknown),

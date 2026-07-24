@@ -1,4 +1,5 @@
 #include "hal_usb.h"
+#include "../../config.h"   // MAI2_ENABLE_SERIAL_HID 开关
 #include "../../service/config_manager/config_manager.h"
 #include <pico/stdlib.h>
 #include <tusb.h>
@@ -25,6 +26,7 @@ volatile UsbDebugCounters g_usb_dbg = { 0xDB01u, (uint16_t)sizeof(UsbDebugCounte
     0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u };
 
 volatile uint8_t g_bootsel_request = 0u;
+volatile uint8_t g_psoc_reboot_request = 0u;
 
 volatile uint32_t g_last_host_cmd_ms = 0u;
 
@@ -64,14 +66,10 @@ static const tusb_desc_device_t device_descriptor = {
 // vendor(WinUSB)，两个 CDC 让给 serial/light。见 usb-multicdc.md。
 // ============================================================
 
-// ---- 变体A：Serial 模式 —— vendor(config) + 2×CDC(serial/light) ----
-enum {
-    ITF_S_VENDOR_CFG = 0,
-    ITF_S_CDC_SERIAL = 1,    // + ITF_S_CDC_SERIAL+1 = CDC数据接口
-    ITF_S_CDC_LIGHT = 3,
-    ITF_S_TOTAL = 5
-};
-
+// ---- 变体A：Serial 模式 —— vendor(config) + 2×CDC(serial/light) + HID(键盘) ----
+// ★键盘始终可用★：serial 模式也带 HID(触摸+键盘 report ID), 使 触控→键盘映射 与 物理键盘
+// GPIO1-12 在游戏(serial)模式下同样能输出 HID 键。HID 接口排在最后, itf0 仍为 vendor,
+// 不影响 MS OS 2.0/WinUSB 绑定。新增 HID IN 端点 0x86(不与既有端点冲突)。
 #define EPNUM_S_CFG_OUT       0x01
 #define EPNUM_S_CFG_IN        0x81
 #define EPNUM_S_SERIAL_NOTIF  0x82
@@ -80,6 +78,35 @@ enum {
 #define EPNUM_S_LIGHT_NOTIF   0x84
 #define EPNUM_S_LIGHT_OUT     0x05
 #define EPNUM_S_LIGHT_IN      0x85
+#define EPNUM_S_HID           0x86
+
+#if MAI2_ENABLE_SERIAL_HID
+enum {
+    ITF_S_VENDOR_CFG = 0,
+    ITF_S_CDC_SERIAL = 1,    // + ITF_S_CDC_SERIAL+1 = CDC数据接口
+    ITF_S_CDC_LIGHT = 3,
+    ITF_S_HID = 5,
+    ITF_S_TOTAL = 6
+};
+
+#define CONFIG_SERIAL_TOTAL_LEN (TUD_CONFIG_DESC_LEN + TUD_VENDOR_DESC_LEN + 2 * TUD_CDC_DESC_LEN + TUD_HID_DESC_LEN)
+
+static const uint8_t desc_configuration_serial[] = {
+    TUD_CONFIG_DESCRIPTOR(1, ITF_S_TOTAL, 0, CONFIG_SERIAL_TOTAL_LEN, TUSB_DESC_CONFIG_ATT_REMOTE_WAKEUP, 100),
+
+    TUD_VENDOR_DESCRIPTOR(ITF_S_VENDOR_CFG, 4, EPNUM_S_CFG_OUT, EPNUM_S_CFG_IN, CFG_TUD_VENDOR_EPSIZE),
+    TUD_CDC_DESCRIPTOR(ITF_S_CDC_SERIAL, 5, EPNUM_S_SERIAL_NOTIF, 8, EPNUM_S_SERIAL_OUT, EPNUM_S_SERIAL_IN, 64),
+    TUD_CDC_DESCRIPTOR(ITF_S_CDC_LIGHT, 6, EPNUM_S_LIGHT_NOTIF, 8, EPNUM_S_LIGHT_OUT, EPNUM_S_LIGHT_IN, 64),
+    TUD_HID_DESCRIPTOR(ITF_S_HID, 7, HID_ITF_PROTOCOL_NONE, sizeof(hid_report_descriptor), EPNUM_S_HID, CFG_TUD_HID_EP_BUFSIZE, 1)
+};
+#else
+// 诊断: serial 模式回退到 vendor + 2×CDC(无 HID), 用于二分"进精调掉线"回归。
+enum {
+    ITF_S_VENDOR_CFG = 0,
+    ITF_S_CDC_SERIAL = 1,    // + ITF_S_CDC_SERIAL+1 = CDC数据接口
+    ITF_S_CDC_LIGHT = 3,
+    ITF_S_TOTAL = 5
+};
 
 #define CONFIG_SERIAL_TOTAL_LEN (TUD_CONFIG_DESC_LEN + TUD_VENDOR_DESC_LEN + 2 * TUD_CDC_DESC_LEN)
 
@@ -90,6 +117,7 @@ static const uint8_t desc_configuration_serial[] = {
     TUD_CDC_DESCRIPTOR(ITF_S_CDC_SERIAL, 5, EPNUM_S_SERIAL_NOTIF, 8, EPNUM_S_SERIAL_OUT, EPNUM_S_SERIAL_IN, 64),
     TUD_CDC_DESCRIPTOR(ITF_S_CDC_LIGHT, 6, EPNUM_S_LIGHT_NOTIF, 8, EPNUM_S_LIGHT_OUT, EPNUM_S_LIGHT_IN, 64)
 };
+#endif
 
 // ---- 变体B：HID 模式 —— vendor(config) + HID ----
 enum {
@@ -407,39 +435,46 @@ bool HAL_USB_Device::config_write(const uint8_t* data, size_t length) {
         return length == 0;
     }
 
+    // ★有限忙等分段发送(已验证 DIAGNOSE PASS 的机制)★: 按字节流分段写入 vendor TX FIFO(64B),
+    // FIFO 满时 pump tud_task 推进 IN 泵出 + 短 sleep 让 USB IRQ 完成传输, 腾空后写余下段。
+    // 超时(TIMEOUT_US)仍写不完 = 过载, 返回 false(命令响应→上位机重试; 遥测→下周期再发)。
+    // 有上限、不永久阻塞; 配合上层"定时任务队列+续期降频"避免频繁触发忙等。
     static uint64_t last_avail_time = 0;
-    const uint64_t TIMEOUT_US = 10000; // 10ms timeout
-
+    // 10ms 上限: 大响应帧(如 CFG_GET_ALL ~3KB)在 64B FIFO 下需分约 50 段, 每段等 IN 泵出,
+    // 3ms 不足以发完→超时丢帧。10ms 为已验证 PASS 值。大帧仅连接时偶发, 单次阻塞可接受;
+    // 遥测等高频帧较小(分段少), 且由定时任务队列降频, 不会频繁触发满忙等。
+    const uint64_t TIMEOUT_US = 10000;
     size_t total_written = 0;
-    uint64_t start_time = time_us_64();
-
+    const uint64_t start_time = time_us_64();
     while (total_written < length) {
-        uint32_t available = tud_vendor_write_available();
-
+        const uint32_t available = tud_vendor_write_available();
         if (available > 0) {
-            size_t to_write = std::min((size_t)available, length - total_written);
-            uint32_t written = tud_vendor_write(data + total_written, to_write);
-
+            const size_t chunk = std::min((size_t)available, length - total_written);
+            const uint32_t written = tud_vendor_write(data + total_written, (uint32_t)chunk);
             if (written > 0) {
                 total_written += written;
                 last_avail_time = time_us_64();
                 tud_vendor_write_flush();
             }
         } else {
-            uint64_t current_time = time_us_64();
-            if (current_time - start_time > TIMEOUT_US ||
-                (last_avail_time > 0 && current_time - last_avail_time > TIMEOUT_US)) {
-                break; // Timeout reached
+            const uint64_t now = time_us_64();
+            if (now - start_time > TIMEOUT_US ||
+                (last_avail_time > 0 && now - last_avail_time > TIMEOUT_US)) {
+                break;   // 过载超时: 放弃(拒绝)
             }
-
-            sleep_us(100);
+            if (initialized_) tud_task();       // 推进 IN 泵出腾 FIFO
             tud_vendor_write_flush();
+            sleep_us(50);                       // 给 USB IRQ 完成 IN 传输的时间窗口
         }
     }
-
     g_usb_dbg.vendor_tx_calls++;
     g_usb_dbg.vendor_tx_bytes += (uint32_t)total_written;
     return total_written == length;
+}
+
+size_t HAL_USB_Device::config_write_available() const {
+    if (!initialized_) return 0;
+    return tud_vendor_write_available();
 }
 
 size_t HAL_USB_Device::config_read(uint8_t* buffer, size_t max_length) {

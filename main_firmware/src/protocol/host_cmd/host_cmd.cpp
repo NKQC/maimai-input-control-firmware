@@ -700,7 +700,7 @@ static void _handle_cfg_get_group(const HostFrame& frame, uint8_t* resp_buf, uin
         resp.len += entry_len;
     }
     
-    *resp_len = HostCmdCodec::encode_frame(resp, resp_buf, 512);
+    *resp_len = HostCmdCodec::encode_frame(resp, resp_buf, HOST_CMD_RESP_BUF_MAX);
 }
 
 static void _handle_cfg_get_all(const HostFrame& frame, uint8_t* resp_buf, uint16_t* resp_len) {
@@ -733,8 +733,9 @@ static void _handle_cfg_get_all(const HostFrame& frame, uint8_t* resp_buf, uint1
         resp.len += entry_len;
     }
     
-    // ⚠ 全量配置响应可达 ~900B，需用大 max_len（_resp_buf 已扩到 2048）；旧硬编码 512 会截断→上位机收0项。
-    *resp_len = HostCmdCodec::encode_frame(resp, resp_buf, 2048);
+    // ⚠ 全量配置响应随 schema 增长(键盘/绑区 key 后 ~140 项 ~2.1KB)。max_len 与 _resp_buf 统一用
+    // HOST_CMD_RESP_BUF_MAX(满载帧上限); 旧硬编码 2048 会让 encode_frame 返回 0 → 上位机收 0 项。
+    *resp_len = HostCmdCodec::encode_frame(resp, resp_buf, HOST_CMD_RESP_BUF_MAX);
 }
 
 static void _handle_cfg_set_batch(const HostFrame& frame, uint8_t* resp_buf, uint16_t* resp_len) {
@@ -797,8 +798,15 @@ static void _handle_save_config(const HostFrame& frame, uint8_t* resp_buf, uint1
     *resp_len = HostCmdCodec::encode_ack(frame.seq, resp_buf, 512);
 }
 
+// PSoC 重启请求(定义于 hal_usb.cpp): 置 1 → 主循环脉冲 XRES 重启 PSoC。
+extern volatile uint8_t g_psoc_reboot_request;
+
 static void _handle_reset_defaults(const HostFrame& frame, uint8_t* resp_buf, uint16_t* resp_len) {
-    // RESET_DEFAULTS(0x0F): 空 → reset_to_defaults()
+    // RESET_DEFAULTS(0x0F): 恢复默认。除普通 config 外, 一并清空 CSD 参数 store 并重启 PSoC:
+    // 清 store 后 PSoC 启动 provisioning 跳过参数下发 → 用其生成的出厂默认(已验证 180Hz 正常),
+    // 从而把被调崩(railed/降速)的 CSD 恢复到可用基线。
     ConfigManager::reset_to_defaults();
+    CsdConfig::getInstance()->clear();   // 清 CSD store(参数/全局无效) + 请求持久化
+    g_psoc_reboot_request = 1u;          // 重启 PSoC, 使其以出厂默认重新初始化 CSD
     *resp_len = HostCmdCodec::encode_ack(frame.seq, resp_buf, 512);
 }

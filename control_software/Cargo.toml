@@ -22,6 +22,7 @@ log = "0.4.33"
 nusb = "=0.2.4"
 serialport = "4.9.0"
 slint = "1.17.1"
+zip = { version = "2", default-features = false, features = ["deflate"] }
 windows = { version = "0.62.2", default-features = false, features = [
     "Win32_Foundation",
     "Win32_Devices_DeviceAndDriverInstallation",

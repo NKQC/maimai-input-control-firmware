@@ -7,3 +7,4 @@ pub mod app_state;
 pub mod comport;
 pub mod io;
 pub mod proto;
+pub mod touch_geometry;

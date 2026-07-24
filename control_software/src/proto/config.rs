@@ -303,6 +303,23 @@ pub fn decode_entry(buf: &[u8]) -> Result<(ConfigEntry, usize), String> {
     Ok((entry, pos))
 }
 
+/// Encode multiple entries to buffer in format: count(u16 LE) + Entry×count.
+/// 与固件 CFG_SET_BATCH(0x14) 请求 payload 格式一致(host_cmd.cpp
+/// `_handle_cfg_set_batch`), 供上位机一次性批量下发草稿中的普通配置项。
+pub fn encode_entries(entries: &[ConfigEntry]) -> Result<Vec<u8>, String> {
+    if entries.len() > u16::MAX as usize {
+        return Err(format!("Too many entries: {}", entries.len()));
+    }
+    let mut out = Vec::new();
+    let count = entries.len() as u16;
+    out.push((count & 0xFF) as u8);
+    out.push((count >> 8) as u8);
+    for entry in entries {
+        out.extend_from_slice(&encode_entry(entry)?);
+    }
+    Ok(out)
+}
+
 /// Decode multiple entries from buffer in format: count(u16 LE) + Entry×count
 pub fn decode_entries(buf: &[u8]) -> Result<Vec<ConfigEntry>, String> {
     if buf.len() < 2 {

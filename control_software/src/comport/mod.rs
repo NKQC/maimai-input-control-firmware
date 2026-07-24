@@ -11,19 +11,17 @@
 //! 用 `serialport` crate);本模块专注 Windows 特有的"实例 ID → 功能"识别与
 //! "改名到目标 COM"的注册表操作,不重复造轮子。
 //!
-//! ## MI 接口号 ↔ 功能映射(⚠ 待与固件 #5x 多 CDC 描述符对齐)
+//! ## MI 接口号 ↔ 功能映射
 //!
-//! TinyUSB 下每个 CDC-ACM 功能占用 2 个 USB 接口(控制 + 数据),因此接口号
-//! 依次为偶数起始。当前约定(与 `protocol_design.md` R3/R4 一致的占位约定):
+//! 与固件实际多 CDC 描述符顺序一致:
 //!
 //! | MI 接口号 | 功能 |
 //! |---|---|
-//! | MI_00 | Serial (mai2serial,CDC-A) |
-//! | MI_02 | Light (mai2light,CDC-B) |
-//! | MI_04 | Config (host 配置协议,CDC-C) |
+//! | MI_00 | Config (host 配置协议) |
+//! | MI_01 | Serial (mai2serial) |
+//! | MI_03 | Light (mai2light) |
 //!
-//! 固件侧多 CDC 描述符改造(#5x)尚未落地,实际接口号顺序以固件描述符为准;
-//! 一旦固件确定,只需改 [`mi_to_function`] 一处。
+//! 若固件描述符顺序变化,只需改 [`mi_to_function`] 一处。
 
 use anyhow::{anyhow, Result};
 
@@ -31,9 +29,9 @@ use anyhow::{anyhow, Result};
 // 公开数据结构(跨平台可见,便于上层无条件引用类型)
 // ============================================================================
 
-/// 目标 VID/PID(复用 #6c `io` 模块的约定,避免重复定义/漂移)
-const TARGET_VID: u16 = 0x0CA3;
-const TARGET_PID: u16 = 0x0024;
+/// 目标 VID/PID(与设备实际固件一致; 2025 修正: 曾误写为 0x0CA3/0x0024)
+const TARGET_VID: u16 = 0x2E8A;
+const TARGET_PID: u16 = 0x000A;
 
 /// CDC 功能分类,按 MI 接口号映射得出
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -77,19 +75,51 @@ pub struct AssignmentAction {
     pub function: CdcFunction,
 }
 
+/// `auto_assign` 中单个功能(Serial/Light)的处理结果,供 UI 中文展示。
+#[derive(Debug, Clone)]
+pub struct AutoAssignItem {
+    pub function: CdcFunction,
+    /// 中文描述,如 "触控串口: COM7 -> COM3 (已应用)"。
+    pub message: String,
+}
+
+/// `auto_assign` 的整体结果:是否找到目标设备、每项处理结果、是否需要管理员/重插。
+#[derive(Debug, Clone)]
+pub struct AutoAssignResult {
+    pub device_found: bool,
+    pub items: Vec<AutoAssignItem>,
+    pub needs_admin: bool,
+    pub needs_replug: bool,
+}
+
+impl AutoAssignResult {
+    /// 汇总为一段供 UI `port_status` 直接展示的中文多行文本。
+    pub fn summary_text(&self) -> String {
+        if !self.device_found {
+            return "未检测到设备(未插入或未识别 Serial/Light 接口)".to_string();
+        }
+        let mut lines: Vec<String> = self.items.iter().map(|i| i.message.clone()).collect();
+        if self.needs_admin {
+            lines.push("改端口号需以管理员运行本程序".to_string());
+        }
+        if self.needs_replug {
+            lines.push("改名将在设备重新插拔或重启后生效".to_string());
+        }
+        lines.join("\n")
+    }
+}
+
 // ============================================================================
 // MI 接口号 → 功能映射(易改的单一映射点)
 // ============================================================================
 
-/// 按 MI 接口号返回对应功能。
-///
-/// ⚠ 待与固件 #5x 多 CDC 描述符对齐:当前为占位约定(MI_00=Serial /
-/// MI_02=Light / MI_04=Config),固件确定接口顺序后如有出入,只需改这里。
+/// 按 MI 接口号返回对应功能(与固件多 CDC 描述符顺序一致: MI_00=Config /
+/// MI_01=Serial / MI_03=Light)。固件接口顺序如有变化,只需改这里。
 fn mi_to_function(mi: u8) -> CdcFunction {
     match mi {
-        0x00 => CdcFunction::Serial,
-        0x02 => CdcFunction::Light,
-        0x04 => CdcFunction::Config,
+        0x00 => CdcFunction::Config,
+        0x01 => CdcFunction::Serial,
+        0x03 => CdcFunction::Light,
         _ => CdcFunction::Unknown,
     }
 }
@@ -166,9 +196,11 @@ mod windows_impl {
 
     use windows::core::{GUID, PCWSTR};
     use windows::Win32::Devices::DeviceAndDriverInstallation::{
-        SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInfo, SetupDiGetClassDevsW,
-        SetupDiGetDeviceInstanceIdW, SetupDiOpenDevRegKey, DICS_FLAG_GLOBAL, DIGCF_PRESENT,
-        DIREG_DEV, SP_DEVINFO_DATA,
+        SetupDiCallClassInstaller, SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInfo,
+        SetupDiGetClassDevsW, SetupDiGetDeviceInstanceIdW, SetupDiOpenDevRegKey,
+        SetupDiSetClassInstallParamsW, DICS_FLAG_CONFIGSPECIFIC, DICS_FLAG_GLOBAL, DICS_PROPCHANGE,
+        DIF_PROPERTYCHANGE, DIGCF_PRESENT, DIREG_DEV, HDEVINFO, SP_CLASSINSTALL_HEADER,
+        SP_DEVINFO_DATA, SP_PROPCHANGE_PARAMS,
     };
     use windows::Win32::Foundation::CloseHandle;
     use windows::Win32::Security::{
@@ -243,6 +275,171 @@ mod windows_impl {
 
         result?;
         Ok(results)
+    }
+
+    /// 枚举全系统 Ports 类设备的 (instance_id, port_name),★不按 VID/PID 过滤★。
+    /// 用于 [`com_in_use`] 判断目标 COM 口是否已被"别的设备"占用(不限于本设备的
+    /// Serial/Light 接口),只读操作,失败返回空 Vec,不 panic。
+    fn enum_all_com_ports() -> Vec<(String, String)> {
+        match enum_all_com_ports_inner() {
+            Ok(v) => v,
+            Err(e) => {
+                log::warn!("enum_all_com_ports failed: {}", e);
+                Vec::new()
+            }
+        }
+    }
+
+    fn enum_all_com_ports_inner() -> Result<Vec<(String, String)>> {
+        let mut results = Vec::new();
+
+        let h_devinfo = unsafe {
+            SetupDiGetClassDevsW(
+                Some(&GUID_DEVCLASS_PORTS as *const GUID),
+                PCWSTR::null(),
+                None,
+                DIGCF_PRESENT,
+            )
+        }
+        .map_err(|e| anyhow!("SetupDiGetClassDevsW failed: {}", e))?;
+
+        let result = (|| -> Result<()> {
+            let mut index = 0u32;
+            loop {
+                let mut devinfo_data = SP_DEVINFO_DATA {
+                    cbSize: std::mem::size_of::<SP_DEVINFO_DATA>() as u32,
+                    ..Default::default()
+                };
+                let enum_result =
+                    unsafe { SetupDiEnumDeviceInfo(h_devinfo, index, &mut devinfo_data) };
+                if enum_result.is_err() {
+                    break;
+                }
+                index += 1;
+
+                let Some(instance_id) = get_device_instance_id(h_devinfo, &devinfo_data) else {
+                    continue;
+                };
+                let Some(port_name) = get_port_name(h_devinfo, &devinfo_data) else {
+                    continue;
+                };
+                results.push((instance_id, port_name));
+            }
+            Ok(())
+        })();
+
+        unsafe {
+            let _ = SetupDiDestroyDeviceInfoList(h_devinfo);
+        }
+
+        result?;
+        Ok(results)
+    }
+
+    /// 判断目标 COM 口(如 COM3)是否已被"其他设备"占用。`exclude_instance_id` 传入
+    /// 即将改名的设备自身实例 ID,避免把它自己(改名前仍是旧口)误判为占用者。
+    pub fn com_in_use(com: u16, exclude_instance_id: &str) -> bool {
+        let target = format!("COM{}", com);
+        enum_all_com_ports()
+            .iter()
+            .any(|(iid, name)| iid != exclude_instance_id && name.eq_ignore_ascii_case(&target))
+    }
+
+    /// 按设备实例 ID 直接把 `PortName` 改写为 `COM{target_com}`(需管理员权限)。
+    /// 供 [`auto_assign`] 与上层单独调用复用,不要求先经 `plan_assignment`。
+    pub fn set_port_name(instance_id: &str, target_com: u16) -> Result<()> {
+        if !is_elevated() {
+            return Err(anyhow!("需要管理员权限才能修改 COM 口注册表分配"));
+        }
+        let action = AssignmentAction {
+            instance_id: instance_id.to_string(),
+            from_port: String::new(),
+            to_port: format!("COM{}", target_com),
+            function: CdcFunction::Unknown,
+        };
+        apply_one_action(&action)
+    }
+
+    /// 一键"自动设置端口"组合入口:识别本机 Serial/Light 接口 → 已是目标口则跳过 →
+    /// 目标口被别的设备占用则标记冲突不改 → 否则改名。返回结构含中文文案,
+    /// 供 UI `port_status` 直接展示。只读识别失败/未插入设备时 `device_found=false`。
+    pub fn auto_assign(serial_com: u16, light_com: u16) -> AutoAssignResult {
+        let ports = identify_ports();
+        let elevated = is_elevated();
+        let mut items = Vec::new();
+        let mut device_found = false;
+        let mut needs_admin = false;
+        let mut needs_replug = false;
+
+        let targets: [(CdcFunction, u16, &str); 2] = [
+            (CdcFunction::Serial, serial_com, "触控串口(mai2serial)"),
+            (CdcFunction::Light, light_com, "灯效串口(mai2light)"),
+        ];
+
+        for (function, target_com, label) in targets {
+            let Some(port) = ports.iter().find(|p| p.function == function) else {
+                continue;
+            };
+            device_found = true;
+            let target_name = format!("COM{}", target_com);
+
+            if port.port_name.eq_ignore_ascii_case(&target_name) {
+                items.push(AutoAssignItem {
+                    function,
+                    message: format!("{}: 已是 {}, 无需更改", label, target_name),
+                });
+                continue;
+            }
+
+            if com_in_use(target_com, &port.instance_id) {
+                items.push(AutoAssignItem {
+                    function,
+                    message: format!(
+                        "{}: 目标 {} 已被其他设备占用, 未修改({} 保持不变)",
+                        label, target_name, port.port_name
+                    ),
+                });
+                continue;
+            }
+
+            if !elevated {
+                needs_admin = true;
+                items.push(AutoAssignItem {
+                    function,
+                    message: format!(
+                        "{}: {} -> {} 需要管理员权限, 未修改",
+                        label, port.port_name, target_name
+                    ),
+                });
+                continue;
+            }
+
+            match set_port_name(&port.instance_id, target_com) {
+                Ok(()) => {
+                    needs_replug = true;
+                    items.push(AutoAssignItem {
+                        function,
+                        message: format!("{}: {} -> {} 已应用", label, port.port_name, target_name),
+                    });
+                }
+                Err(e) => {
+                    items.push(AutoAssignItem {
+                        function,
+                        message: format!(
+                            "{}: {} -> {} 失败: {}",
+                            label, port.port_name, target_name, e
+                        ),
+                    });
+                }
+            }
+        }
+
+        AutoAssignResult {
+            device_found,
+            items,
+            needs_admin,
+            needs_replug,
+        }
     }
 
     /// 处理单个设备信息元素:取实例 ID → 过滤 VID/PID → 取 COM 口名。
@@ -417,7 +614,15 @@ mod windows_impl {
                     let _ = RegCloseKey(hkey);
                 }
 
-                return write_result;
+                write_result?;
+
+                // ★关键: 写 PortName 后必须重启该设备节点★, 让串口驱动(usbser)重新读取 PortName 并
+                // 刷新 HKLM\HARDWARE\DEVICEMAP\SERIALCOMM 与设备管理器显示的 COM 号。仅写注册表而不重启,
+                // 设备管理器"详情"里的 Device Parameters 已是新值, 但显示的端口号(及 SERIALCOMM 活动映射)
+                // 不会更新——这正是"手动改(设备管理器内部会 DIF_PROPERTYCHANGE 重启设备)立即生效, 而本程序
+                // 只写注册表+重插仍不变"的根因。此处复刻设备管理器的属性变更重启序列使其立即生效。
+                restart_device_node(h_devinfo, &devinfo_data)?;
+                return Ok(());
             }
             Err(anyhow!(
                 "未找到实例 ID 对应的设备(可能已拔出): {}",
@@ -430,6 +635,37 @@ mod windows_impl {
         }
 
         result
+    }
+
+    /// 重启指定设备节点(等价设备管理器"停用→启用"的属性变更), 使驱动重读 PortName 立即生效。
+    /// 复刻 Device Manager 改 COM 口时内部执行的 DIF_PROPERTYCHANGE / DICS_PROPCHANGE 序列。
+    fn restart_device_node(h_devinfo: HDEVINFO, devinfo_data: &SP_DEVINFO_DATA) -> Result<()> {
+        let mut params = SP_PROPCHANGE_PARAMS {
+            ClassInstallHeader: SP_CLASSINSTALL_HEADER {
+                cbSize: std::mem::size_of::<SP_CLASSINSTALL_HEADER>() as u32,
+                InstallFunction: DIF_PROPERTYCHANGE,
+            },
+            StateChange: DICS_PROPCHANGE,          // 属性变更 → 触发设备重启(而非 enable/disable)
+            Scope: DICS_FLAG_CONFIGSPECIFIC,        // 仅当前配置(等价设备管理器默认行为)
+            HwProfile: 0,
+        };
+        // SAFETY: h_devinfo/devinfo_data 有效; params 为合法 SP_PROPCHANGE_PARAMS。
+        unsafe {
+            SetupDiSetClassInstallParamsW(
+                h_devinfo,
+                Some(devinfo_data as *const SP_DEVINFO_DATA),
+                Some(&mut params.ClassInstallHeader as *mut SP_CLASSINSTALL_HEADER),
+                std::mem::size_of::<SP_PROPCHANGE_PARAMS>() as u32,
+            )
+            .map_err(|e| anyhow!("SetupDiSetClassInstallParamsW 失败: {}", e))?;
+            SetupDiCallClassInstaller(
+                DIF_PROPERTYCHANGE,
+                h_devinfo,
+                Some(devinfo_data as *const SP_DEVINFO_DATA),
+            )
+            .map_err(|e| anyhow!("SetupDiCallClassInstaller(DIF_PROPERTYCHANGE) 失败: {}", e))?;
+        }
+        Ok(())
     }
 
     /// 向已打开的注册表键写入一个 REG_SZ 字符串值(含 null 终止符)。
@@ -485,7 +721,9 @@ mod windows_impl {
 }
 
 #[cfg(windows)]
-pub use windows_impl::{apply_assignment, identify_ports, is_elevated};
+pub use windows_impl::{
+    apply_assignment, auto_assign, com_in_use, identify_ports, is_elevated, set_port_name,
+};
 
 // ============================================================================
 // 非 Windows 降级实现(保证跨平台可编译)
@@ -516,38 +754,38 @@ mod tests {
 
     #[test]
     fn test_mi_to_function_mapping() {
-        assert_eq!(mi_to_function(0x00), CdcFunction::Serial);
-        assert_eq!(mi_to_function(0x02), CdcFunction::Light);
-        assert_eq!(mi_to_function(0x04), CdcFunction::Config);
+        assert_eq!(mi_to_function(0x00), CdcFunction::Config);
+        assert_eq!(mi_to_function(0x01), CdcFunction::Serial);
+        assert_eq!(mi_to_function(0x03), CdcFunction::Light);
         assert_eq!(mi_to_function(0x06), CdcFunction::Unknown);
         assert_eq!(mi_to_function(0xFF), CdcFunction::Unknown);
     }
 
     #[test]
     fn test_parse_instance_id_full() {
-        let id = r"USB\VID_0CA3&PID_0024&MI_04\6&2a3b1c&0&0004";
+        let id = r"USB\VID_2E8A&PID_000A&MI_00\6&2a3b1c&0&0004";
         let (vid, pid, mi) = parse_instance_id(id);
-        assert_eq!(vid, Some(0x0CA3));
-        assert_eq!(pid, Some(0x0024));
-        assert_eq!(mi, Some(0x04));
+        assert_eq!(vid, Some(0x2E8A));
+        assert_eq!(pid, Some(0x000A));
+        assert_eq!(mi, Some(0x00));
         assert_eq!(mi.map(mi_to_function), Some(CdcFunction::Config));
     }
 
     #[test]
     fn test_parse_instance_id_case_insensitive() {
-        let id = r"usb\vid_0ca3&pid_0024&mi_00\6&2a3b1c&0&0000";
+        let id = r"usb\vid_2e8a&pid_000a&mi_01\6&2a3b1c&0&0000";
         let (vid, pid, mi) = parse_instance_id(id);
-        assert_eq!(vid, Some(0x0CA3));
-        assert_eq!(pid, Some(0x0024));
-        assert_eq!(mi, Some(0x00));
+        assert_eq!(vid, Some(0x2E8A));
+        assert_eq!(pid, Some(0x000A));
+        assert_eq!(mi, Some(0x01));
     }
 
     #[test]
     fn test_parse_instance_id_missing_mi() {
-        let id = r"USB\VID_0CA3&PID_0024\6&2a3b1c&0&0000";
+        let id = r"USB\VID_2E8A&PID_000A\6&2a3b1c&0&0000";
         let (vid, pid, mi) = parse_instance_id(id);
-        assert_eq!(vid, Some(0x0CA3));
-        assert_eq!(pid, Some(0x0024));
+        assert_eq!(vid, Some(0x2E8A));
+        assert_eq!(pid, Some(0x000A));
         assert_eq!(mi, None);
     }
 
@@ -566,7 +804,7 @@ mod tests {
             interface_index: mi,
             function,
             instance_id: format!(
-                r"USB\VID_0CA3&PID_0024&MI_{:02X}\fake-instance-{}",
+                r"USB\VID_2E8A&PID_000A&MI_{:02X}\fake-instance-{}",
                 mi.unwrap_or(0xFF),
                 port_name
             ),
@@ -576,9 +814,9 @@ mod tests {
     #[test]
     fn test_plan_assignment_generates_actions_when_mismatched() {
         let ports = vec![
-            make_port("COM7", CdcFunction::Serial, Some(0x00)),
-            make_port("COM8", CdcFunction::Light, Some(0x02)),
-            make_port("COM9", CdcFunction::Config, Some(0x04)),
+            make_port("COM7", CdcFunction::Serial, Some(0x01)),
+            make_port("COM8", CdcFunction::Light, Some(0x03)),
+            make_port("COM9", CdcFunction::Config, Some(0x00)),
         ];
         let target = ComAssignment {
             serial_com: 3,

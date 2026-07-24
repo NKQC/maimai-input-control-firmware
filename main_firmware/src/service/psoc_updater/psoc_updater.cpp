@@ -21,6 +21,7 @@ constexpr uint16_t FLAG_LINK = 1u << 11;
 constexpr uint16_t FLAG_SNAPSHOT = 1u << 12;
 constexpr uint16_t FLAG_CLOCK_CONFIG = 1u << 13;
 constexpr uint16_t FLAG_ERASE_SCAN_COMPLETE = 1u << 14;
+constexpr uint16_t FLAG_SKIPPED_FLASH = 1u << 15;
 }
 
 uint16_t PsocBringupReport::flags() const {
@@ -38,7 +39,8 @@ uint16_t PsocBringupReport::flags() const {
            (link_ok ? FLAG_LINK : 0) |
            (snapshot_valid ? FLAG_SNAPSHOT : 0) |
            (clock_config_ok ? FLAG_CLOCK_CONFIG : 0) |
-           (erase_scan_complete ? FLAG_ERASE_SCAN_COMPLETE : 0);
+           (erase_scan_complete ? FLAG_ERASE_SCAN_COMPLETE : 0) |
+           (skipped_flash ? FLAG_SKIPPED_FLASH : 0);
 }
 
 PsocUpdater* PsocUpdater::_instance = nullptr;
@@ -113,6 +115,26 @@ bool PsocUpdater::run(Psoc* psoc) {
         return _fail(psoc, PsocBringupStage::PROTECTION);
     }
     _report.row_protection = psoc->read_row_protection();
+
+    // ★烧录版本/内容检查(省 PSoC flash 寿命)★：每次上电无条件擦写会快速耗尽 PSoC flash 擦写次数。
+    // erase 前先只读 AHB 逐字比对当前 flash 与嵌入镜像; 一致则跳过 erase/program/verify, 直接运行。
+    // 只读比对不消耗寿命; 内容不同(升级/损坏)时才擦写, 天然等价"版本检查"。
+    _report.last_stage = PsocBringupStage::VERIFY;
+    if (psoc->verify(PSOC_FW_IMAGE, PSOC_FW_IMAGE_LEN)) {
+        _report.skipped_flash = true;
+        _report.erase_ok = true;
+        _report.program_ok = true;
+        _report.checksum_ok = true;
+        _report.verify_ok = true;
+        _report.verify_acquired = true;
+        psoc->reset_run();
+        psoc->release_swd();
+        sleep_ms(50);
+        _report.last_stage = PsocBringupStage::RUN;
+        return true;
+    }
+    // 内容不一致 → 需要烧录, 记录首个不符地址供诊断。
+    _report.fail_addr = psoc->last_fail_addr();
 
     _report.last_stage = PsocBringupStage::IMO;
     _report.imo_ok = psoc->set_imo();

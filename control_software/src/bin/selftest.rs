@@ -26,6 +26,11 @@ const HELLO_TIMEOUT_MS: u64 = 1500;
 const CFG_GET_ALL_TIMEOUT_MS: u64 = 1000;
 const TELEM_TIMEOUT_MS: u64 = 800;
 const PARAM_GET_ALL_TIMEOUT_MS: u64 = 1000;
+const CP_MEASURE_TIMEOUT_MS: u64 = 10_000;
+const CP_GET_TIMEOUT_MS: u64 = 1_000;
+const CP_REQUEST_INTERVAL_MS: u64 = 500;
+const CP_CHANNEL_COUNT: u8 = 36;
+const CP_FAILURE_VALUE: u32 = 0x00FF_FFFF;
 
 fn main() {
     env_logger::init();
@@ -37,12 +42,17 @@ fn main() {
     let diagnose_only = args.iter().any(|a| a == "--diagnose");
     let csd_provision = args.iter().any(|a| a == "--csd-provision");
     let csd_verify = args.iter().any(|a| a == "--csd-verify");
+    let algo_test = args.iter().any(|a| a == "--algo");
+    let global_test = args.iter().any(|a| a == "--global");
+    let kbd_test = args.iter().any(|a| a == "--kbd");
     let soak = args.iter().any(|a| a == "--soak");
     let list_only = args.iter().any(|a| a == "--list-only");
     let debug_read = args.iter().any(|a| a == "--debug-read");
     let ctrl_bootsel = args.iter().any(|a| a == "--ctrl-bootsel");
     // 只请求配置并观测：每 200ms 打印 config_entries 数，持续 ~2.5s，看是否/何时到达及项数。
     let cfg_only = args.iter().any(|a| a == "--cfg-only");
+    // 只读遥测: 握手后直接 TELEM_START, 打印全 36 通道 raw/bsln/diff/status, 排查"计数打满"。
+    let telem_only = args.iter().any(|a| a == "--telem-only");
     // 纯空闲复现：连接+DEVICE_INFO 后立即 idle(不驱动任何功能)，模拟 GUI "连上就放着看"。
     let idle_only = args.iter().any(|a| a == "--idle-only");
     // 恢复设备配置：发 RESET_DEFAULTS 令固件 _runtime_map = _default_map(完整 schema) 并保存。
@@ -146,10 +156,12 @@ fn main() {
     // 小延迟让连接建立
     thread::sleep(Duration::from_millis(100));
 
-    // Step 3: 轮询等待 HELLO 并收 DEVICE_INFO
+    // Step 3: 轮询等待 HELLO 并收 DEVICE_INFO。重连场景下设备端 bulk OUT data toggle 与新句柄
+    // 不同步会丢弃首个 HELLO, 故每 ~300ms 重发 HELLO(丢一包后 toggle 自动重同步), 与 UI 侧一致。
     println!("[SELFTEST] 轮询 DEVICE_INFO...");
     let start = std::time::Instant::now();
     let timeout = Duration::from_millis(HELLO_TIMEOUT_MS);
+    let mut last_hello = std::time::Instant::now();
     loop {
         ctrl.poll();
         if ctrl.device_info_text() != "未获取到设备信息" {
@@ -157,11 +169,24 @@ fn main() {
             println!("{}", ctrl.device_info_text());
             break;
         }
+        if last_hello.elapsed() > Duration::from_millis(300) {
+            let _ = ctrl.resend_hello();
+            last_hello = std::time::Instant::now();
+        }
         if start.elapsed() > timeout {
             println!("[SELFTEST] FAIL 未在 {}ms 内收到 DEVICE_INFO", HELLO_TIMEOUT_MS);
             std::process::exit(1);
         }
         thread::sleep(Duration::from_millis(50));
+    }
+
+    // 重启 RP2040 到应用(不进 BOOTSEL): 用于验证下次启动的 PSoC 烧录跳过(版本/内容一致则不擦写)。
+    if args.iter().any(|a| a == "--reboot-app") {
+        println!("[SELFTEST] 发送 REBOOT(RP2040 重启到应用)...");
+        let _ = ctrl.reboot();
+        thread::sleep(Duration::from_millis(300));
+        println!("[SELFTEST] REBOOT sent");
+        std::process::exit(0);
     }
 
     // 仅用于自持烧录：握手成功后立即请求 BOOTSEL，不执行耗时遥测测试。
@@ -182,6 +207,550 @@ fn main() {
         std::process::exit(0);
     }
 
+    // 只读遥测: 直接开流并打印全通道 raw/bsln/diff/status + 全通道 Cp, 排查"计数打满"根因。
+    if telem_only {
+        use mai2control_ui::proto::{FIELD_RAW, FIELD_BASELINE, FIELD_DIFF, FIELD_STATUS};
+        let _ = ctrl.start_telemetry(30, FIELD_RAW | FIELD_BASELINE | FIELD_DIFF | FIELD_STATUS, u64::MAX);
+        let start = std::time::Instant::now();
+        while start.elapsed() < Duration::from_millis(1500) {
+            ctrl.poll();
+            thread::sleep(Duration::from_millis(20));
+        }
+        // 同时请求各通道 Cp(fF), 便于判断是否传感器/短路导致饱和。
+        for ch in 0..36u8 { let _ = ctrl.request_cp(ch); }
+        let cp_start = std::time::Instant::now();
+        while cp_start.elapsed() < Duration::from_millis(800) { ctrl.poll(); thread::sleep(Duration::from_millis(20)); }
+        // 读回 CH0 参数与全局 CSD 配置, 定位导致全通道饱和的非法值。
+        let _ = ctrl.request_params(0);
+        let _ = ctrl.request_params(3);
+        let _ = ctrl.global_get_all();
+        let g_start = std::time::Instant::now();
+        while g_start.elapsed() < Duration::from_millis(600) { ctrl.poll(); thread::sleep(Duration::from_millis(20)); }
+        let pname = |id: u8| match id {
+            0x01=>"FINGER_TH",0x02=>"NOISE_TH",0x03=>"NEG_NOISE_TH",0x04=>"HYSTERESIS",
+            0x05=>"ON_DEBOUNCE",0x06=>"LOW_BSLN_RST",0x07=>"RESOLUTION",0x08=>"SNS_CLK_DIV",
+            0x09=>"IDAC_MOD",0x0A=>"SNS_CLK_SOURCE",0x0B=>"IDAC_GAIN",_=>"?",
+        };
+        for ch in [0u8, 3u8] {
+            println!("[PARAM] --- CH{} ---", ch);
+            for (id, v) in ctrl.params_of(ch) { println!("[PARAM] CH{} {:>14}(0x{:02X}) = {}", ch, pname(id), id, v); }
+        }
+        let gname = |id: u8| match id { 1=>"INACTIVE_SNS",2=>"IDAC_GAIN_INIT",3=>"IDAC_MIN",4=>"RAW_TARGET",5=>"MFS_DIV_F1",6=>"MFS_DIV_F2",_=>"?" };
+        for id in 1u8..=6 { println!("[GLOBAL] {:>14}(0x{:02X}) = {:?}", gname(id), id, ctrl.global(id)); }
+        println!("[TELEM] scan_period_us={} samples_per_sec={}", ctrl.telem_scan_period_us(), ctrl.telem_samples_per_sec());
+        for ch in 0..36u8 {
+            let s = ctrl.telem_latest(ch);
+            let (raw, bsln, diff, status) = match s {
+                Some(ref x) => (x.raw, x.bsln, x.diff, x.status),
+                None => (None, None, None, None),
+            };
+            println!(
+                "[TELEM] CH{:02} raw={:?} bsln={:?} diff={:?} status={:?} cp_fF={:?}",
+                ch, raw, bsln, diff, status, ctrl.cp(ch)
+            );
+        }
+        let _ = ctrl.stop_telemetry();
+        println!("[SELFTEST] TELEM-ONLY DONE");
+        std::process::exit(0);
+    }
+
+    // Cp 测量实验: 触发 MEASURE_CP(BIST 逐电极电容) → 等 → 读回各通道 Cp, 定位"启动测量失败"。
+    if args.iter().any(|a| a == "--cp-measure-test") {
+        println!("[CP] 触发 MEASURE_CP...");
+        match ctrl.measure_cp() {
+            Ok(()) => println!("[CP] measure_cp 命令已发"),
+            Err(e) => println!("[CP] measure_cp 失败: {}", e),
+        }
+        let s = std::time::Instant::now();
+        while s.elapsed() < Duration::from_millis(4000) {
+            ctrl.poll();
+            thread::sleep(Duration::from_millis(30));
+        }
+        for ch in 0..36u8 { let _ = ctrl.request_cp(ch); }
+        let s2 = std::time::Instant::now();
+        while s2.elapsed() < Duration::from_millis(1000) { ctrl.poll(); thread::sleep(Duration::from_millis(20)); }
+        for ch in [0u8,1,2,3,10,20,35] {
+            println!("[CP] CH{:02} cp_fF={:?}", ch, ctrl.cp(ch));
+        }
+        std::process::exit(0);
+    }
+
+    // CSD 恢复默认实验: RESET_DEFAULTS(清 CSD store + 重启 PSoC 用出厂默认) → 等 → 读 raw/频率,
+    // 验证"清掉被保存的坏参数后 PSoC 回到 180Hz 正常" 的根因假设。
+    if args.iter().any(|a| a == "--csd-reset-test") {
+        use mai2control_ui::proto::{FIELD_RAW, FIELD_BASELINE, FIELD_DIFF, FIELD_STATUS};
+        let _ = ctrl.start_telemetry(30, FIELD_RAW | FIELD_BASELINE | FIELD_DIFF | FIELD_STATUS, u64::MAX);
+        let s = std::time::Instant::now();
+        while s.elapsed() < Duration::from_millis(1000) { ctrl.poll(); thread::sleep(Duration::from_millis(20)); }
+        let dump = |ctrl: &AppController, tag: &str| {
+            let f = |ch: u8| ctrl.telem_latest(ch).map(|x| (x.raw, x.diff)).unwrap_or((None, None));
+            println!("[CSDRST-{}] scan_period_us={} CH0={:?} CH3={:?} CH20={:?}",
+                tag, ctrl.telem_scan_period_us(), f(0), f(3), f(20));
+        };
+        dump(&ctrl, "BEFORE");
+        println!("[CSDRST] 发送 RESET_DEFAULTS(清 CSD store + 重启 PSoC)...");
+        let _ = ctrl.reset_defaults();
+        let w = std::time::Instant::now();
+        while w.elapsed() < Duration::from_millis(9000) { ctrl.poll(); thread::sleep(Duration::from_millis(20)); }
+        dump(&ctrl, "AFTER-RESET");
+        // 再显式校准 + 基线复位, 看 raw 是否从满量程回落(判断 railing 是否只是缺校准)。
+        println!("[CSDRST] 发送 CALIBRATE(all) + BASELINE_RESET(all)...");
+        let _ = ctrl.calibrate(u64::MAX);
+        thread::sleep(Duration::from_millis(1500));
+        let _ = ctrl.baseline_reset(u64::MAX);
+        let w2 = std::time::Instant::now();
+        while w2.elapsed() < Duration::from_millis(2500) { ctrl.poll(); thread::sleep(Duration::from_millis(20)); }
+        dump(&ctrl, "AFTER-CALIB");
+        let _ = ctrl.stop_telemetry();
+        std::process::exit(0);
+    }
+
+    // 参数防护验证: 读回 CH0 分辨率原值 → 尝试写非法值(99) → 回读应仍为原值(被固件拒绝)。
+    if args.iter().any(|a| a == "--guard-test") {
+        let _ = ctrl.request_params(0);
+        let s = std::time::Instant::now();
+        while s.elapsed() < Duration::from_millis(500) { ctrl.poll(); thread::sleep(Duration::from_millis(20)); }
+        let before = ctrl.param(0, 0x07);
+        println!("[GUARD] CH0 RESOLUTION before = {:?}", before);
+        let _ = ctrl.set_param(0, 0x07, 99);   // 非法(合法 6..16), 仅暂存草稿
+        let _ = ctrl.save_config();            // 提交草稿 → 实际发 PARAM_SET(99) 到设备
+        thread::sleep(Duration::from_millis(150));
+        // 从设备回读真实值(PARAM_GET_ALL 响应覆盖乐观缓存): 防护生效则仍为原值。
+        let _ = ctrl.request_params(0);
+        let s2 = std::time::Instant::now();
+        while s2.elapsed() < Duration::from_millis(700) { ctrl.poll(); thread::sleep(Duration::from_millis(20)); }
+        let after = ctrl.param(0, 0x07);
+        println!("[GUARD] CH0 RESOLUTION after commit 99 = {:?}", after);
+        println!("[GUARD] {}", if after == before && after != Some(99) { "PASS 非法值被设备拒绝" } else { "FAIL 非法值被接受" });
+        std::process::exit(0);
+    }
+
+    // 分辨率全通道下发诊断: 分别测【路径A UI草稿+save_config】与【路径B 直接debug_param_now】,
+    // 各自对全 36 通道设同一分辨率并逐通道回读, 统计真正生效的通道数, 定位"只改1-2通道"丢在哪一层。
+    if args.iter().any(|a| a == "--res-all-test") {
+        let read_all = |ctrl: &mut AppController| -> Vec<Option<u32>> {
+            for ch in 0..36u8 { let _ = ctrl.request_params(ch); }
+            let s = std::time::Instant::now();
+            while s.elapsed() < Duration::from_millis(1200) { ctrl.poll(); thread::sleep(Duration::from_millis(12)); }
+            (0..36u8).map(|ch| ctrl.param(ch, 0x07)).collect()
+        };
+        println!("[RESALL] 切半自动手动模式(SET_MODE=1)...");
+        let _ = ctrl.debug_mode_now(1);
+        let s = std::time::Instant::now();
+        while s.elapsed() < Duration::from_millis(500) { ctrl.poll(); thread::sleep(Duration::from_millis(20)); }
+        let base = read_all(&mut ctrl);
+        println!("[RESALL] 基线分辨率: {:?}", base);
+
+        // 路径A: 完全复现 UI 全局改分辨率(set_param 0x07 内部重定向 set_param_all → 写36草稿) + save_config(背靠背发36条PARAM_SET+CALIBRATE)。
+        let ta = 14u32;
+        let _ = ctrl.set_param(0, 0x07, ta);
+        let _ = ctrl.save_config();
+        thread::sleep(Duration::from_millis(500));
+        let a = read_all(&mut ctrl);
+        let a_ok = a.iter().filter(|v| **v == Some(ta)).count();
+        println!("[RESALL] 路径A(UI草稿+save) 目标={} 生效={}/36", ta, a_ok);
+        println!("[RESALL]   回读A: {:?}", a);
+
+        // 路径B: 直接逐通道 debug_param_now + calibrate(与 clk-probe 同法)。
+        let tb = 12u32;
+        for ch in 0..36u8 { let _ = ctrl.debug_param_now(ch, 0x07, tb); }
+        let _ = ctrl.calibrate(u64::MAX);
+        thread::sleep(Duration::from_millis(500));
+        let b = read_all(&mut ctrl);
+        let b_ok = b.iter().filter(|v| **v == Some(tb)).count();
+        println!("[RESALL] 路径B(直接debug_param_now) 目标={} 生效={}/36", tb, b_ok);
+        println!("[RESALL]   回读B: {:?}", b);
+
+        println!("[RESALL] 判读: A<<36且B==36 → 丢在UI save路径(草稿/背靠背发送); A和B都<36 → 丢在RP2040/PSoC中继; 都==36 → 分辨率下发正常(问题在别处)");
+        let _ = ctrl.debug_mode_now(0);
+        std::process::exit(0);
+    }
+
+    // SEMI 模式校准效力诊断: 扫 IDAC增益 × snsClkDiv, 每档 calibrate 后读全36通道 raw,
+    // 判断 100pF 面板能否在合法参数内把 raw 拉离满量程(4095)。
+    if args.iter().any(|a| a == "--semi-calib-probe") {
+        use mai2control_ui::proto::{FIELD_RAW, FIELD_BASELINE, FIELD_DIFF};
+        let stat = |ctrl: &mut AppController| -> (u32, u32, u32, usize) {
+            let mut mn = u32::MAX; let mut mx = 0u32; let mut sum = 0u64; let mut railed = 0usize;
+            for ch in 0..36u8 {
+                if let Some(s) = ctrl.telem_latest(ch) {
+                    let r = s.raw.unwrap_or(0) as u32;
+                    if r < mn { mn = r; } if r > mx { mx = r; }
+                    sum += r as u64;
+                    if r >= 4090 { railed += 1; }
+                }
+            }
+            (mn, mx, (sum / 36) as u32, railed)
+        };
+        let settle = |ctrl: &mut AppController, ms: u64| { let s = std::time::Instant::now(); while s.elapsed() < Duration::from_millis(ms) { ctrl.poll(); thread::sleep(Duration::from_millis(15)); } };
+        println!("[CALIB] 切 SEMI(半自动手动)...");
+        let _ = ctrl.debug_mode_now(1);
+        settle(&mut ctrl, 400);
+        let _ = ctrl.start_telemetry(30, FIELD_RAW | FIELD_BASELINE | FIELD_DIFF, u64::MAX);
+        settle(&mut ctrl, 600);
+        let (mn, mx, av, rl) = stat(&mut ctrl);
+        println!("[CALIB] 初始 raw: min={} max={} avg={} railed(>=4090)={}/36", mn, mx, av, rl);
+
+        for &div in &[8u32, 20u32, 40u32, 80u32] {
+            for &gain in &[4u32, 5u32, 6u32] {
+                for ch in 0..36u8 { let _ = ctrl.debug_param_now(ch, 0x08, div); }   // SNS_CLK_DIV
+                let _ = ctrl.debug_global_now(0x02, gain);                            // IDAC_GAIN_INIT
+                let _ = ctrl.calibrate(u64::MAX);
+                settle(&mut ctrl, 700);
+                let (mn, mx, av, rl) = stat(&mut ctrl);
+                println!("[CALIB] div={:>3} gain={} → raw min={} max={} avg={} railed={}/36", div, gain, mn, mx, av, rl);
+            }
+        }
+        // 基线复位效力: 复位后 diff 应≈0, 随后不动应保持稳定小噪声。
+        let _ = ctrl.baseline_reset(u64::MAX);
+        settle(&mut ctrl, 500);
+        let mut diff_nonzero = 0usize;
+        for ch in 0..36u8 { if let Some(s) = ctrl.telem_latest(ch) { if (s.diff.unwrap_or(0) as i32).abs() > 3 { diff_nonzero += 1; } } }
+        println!("[CALIB] baseline_reset 后 |diff|>3 的通道数={}/36 (应≈0)", diff_nonzero);
+
+        let _ = ctrl.stop_telemetry();
+        // 复位到安全默认。
+        let _ = ctrl.debug_global_now(0x02, 4);
+        for ch in 0..36u8 { let _ = ctrl.debug_param_now(ch, 0x08, 8); }
+        let _ = ctrl.debug_mode_now(0);
+        println!("[CALIB] 判读: 若某 div/gain 组合 railed 显著下降=校准可用(需设该默认); 若全组合都 railed=36=CSD扫描/时钟根本问题");
+        std::process::exit(0);
+    }
+
+    // 频率自适应(AUTO_TUNE)端到端验证: 触发自适应, 等结果, 校验成功后全通道离轨且有抖动。
+    if args.iter().any(|a| a == "--auto-tune-test") {
+        use mai2control_ui::proto::FIELD_RAW;
+        let settle = |ctrl: &mut AppController, ms: u64| { let s = std::time::Instant::now(); while s.elapsed() < Duration::from_millis(ms) { ctrl.poll(); thread::sleep(Duration::from_millis(10)); } };
+        let target: u32 = args.iter().position(|a| a == "--target").and_then(|i| args.get(i + 1)).and_then(|s| s.parse().ok()).unwrap_or(50);
+        println!("[AUTOTUNE] SEMI + 目标{}% + 触发频率自适应下探...", target);
+        let _ = ctrl.debug_mode_now(1);
+        settle(&mut ctrl, 300);
+        let _ = ctrl.debug_global_now(0x04, target);
+        settle(&mut ctrl, 500);
+        let _ = ctrl.auto_tune();
+        let t0 = std::time::Instant::now();
+        while ctrl.auto_tune_result() == 0 && t0.elapsed() < Duration::from_millis(15000) {
+            ctrl.poll(); thread::sleep(Duration::from_millis(50));
+        }
+        let res = ctrl.auto_tune_result();
+        let div = ctrl.auto_tune_div();
+        println!("[AUTOTUNE] 结果 result={} (1=成功 2=失败) 找到分频div={} 耗时~{}ms", res, div, t0.elapsed().as_millis());
+        // 校验: 成功则全通道应离轨且有抖动。
+        let _ = ctrl.start_telemetry(30, FIELD_RAW, u64::MAX);
+        settle(&mut ctrl, 700);
+        let mut railed = 0usize;
+        let mut seen: Vec<std::collections::BTreeSet<u16>> = vec![std::collections::BTreeSet::new(); 36];
+        for _ in 0..12 { for ch in 0..36u8 { if let Some(s) = ctrl.telem_latest(ch) { let r = s.raw.unwrap_or(0); seen[ch as usize].insert(r); } } settle(&mut ctrl, 60); }
+        for ch in 0..36 { if let Some(&mx) = seen[ch].iter().max() { if mx >= 4090 { railed += 1; } } }
+        let frozen: Vec<usize> = (0..36).filter(|&c| seen[c].len() <= 1).collect();
+        println!("[AUTOTUNE] 自适应后: railed={}/36 frozen={:?}", railed, frozen);
+        let _ = ctrl.stop_telemetry();
+        let _ = ctrl.debug_mode_now(0);
+        let pass = res == 1 && railed == 0 && frozen.is_empty();
+        println!("[AUTOTUNE] {}", if pass { "PASS 自适应成功且全通道离轨/有抖动" } else { "CHECK 见上(result/railed/frozen)" });
+        std::process::exit(0);
+    }
+
+    // 校准跟踪 + 抖动 诊断: 随机切换校准目标%并校准, 验证全通道 raw 准确跟到 target%*maxRaw;
+    // 并采样多帧检测抖动(某通道多帧取值恒定=frozen=故障)。
+    if args.iter().any(|a| a == "--calib-track") {
+        use mai2control_ui::proto::FIELD_RAW;
+        let settle = |ctrl: &mut AppController, ms: u64| { let s = std::time::Instant::now(); while s.elapsed() < Duration::from_millis(ms) { ctrl.poll(); thread::sleep(Duration::from_millis(10)); } };
+        let div: u32 = args.iter().position(|a| a == "--div").and_then(|i| args.get(i + 1)).and_then(|s| s.parse().ok()).unwrap_or(24);
+        println!("[TRACK] SEMI + 统一 res=12/snsClk={} + gain_init=4(auto-gain 开)...", div);
+        let _ = ctrl.debug_mode_now(1);
+        settle(&mut ctrl, 300);
+        for ch in 0..36u8 { let _ = ctrl.debug_param_now(ch, 0x07, 12); let _ = ctrl.debug_param_now(ch, 0x08, div); }
+        let _ = ctrl.debug_global_now(0x02, 4);
+        let _ = ctrl.start_telemetry(30, FIELD_RAW, u64::MAX);
+        settle(&mut ctrl, 500);
+        let max_raw = 4095.0f32;   // res=12
+        for &target in &[25u32, 50, 40, 70, 30, 60, 85] {
+            let _ = ctrl.debug_global_now(0x04, target);   // 设目标%(RP2040 自动 commit → Init+Enable 自动校准)
+            let _ = ctrl.calibrate(u64::MAX);              // 再显式校准一次确保收敛
+            settle(&mut ctrl, 900);
+            let expected = target as f32 / 100.0 * max_raw;
+            let mut sum = 0f32; let mut within = 0usize; let mut railed = 0usize; let mut n = 0usize;
+            for ch in 0..36u8 {
+                if let Some(s) = ctrl.telem_latest(ch) {
+                    let r = s.raw.unwrap_or(0) as f32;
+                    sum += r; n += 1;
+                    if r >= 4090.0 { railed += 1; }
+                    if (r - expected).abs() <= expected * 0.25 + 60.0 { within += 1; }
+                }
+            }
+            let avg = if n > 0 { sum / n as f32 } else { 0.0 };
+            println!("[TRACK] target={:>2}% 期望raw≈{:>4.0} 实测avg={:>6.0} 命中(±25%)={:>2}/36 railed={:>2}/36",
+                target, expected, avg, within, railed);
+        }
+        // 抖动检测: 固定校准后采样 15 帧, 统计每通道不同取值数; 恒定(仅1种值)=frozen。
+        let _ = ctrl.debug_global_now(0x04, 50);
+        let _ = ctrl.calibrate(u64::MAX);
+        settle(&mut ctrl, 600);
+        let mut seen: Vec<std::collections::BTreeSet<u16>> = vec![std::collections::BTreeSet::new(); 36];
+        for _ in 0..15 {
+            for ch in 0..36u8 { if let Some(s) = ctrl.telem_latest(ch) { seen[ch as usize].insert(s.raw.unwrap_or(0)); } }
+            settle(&mut ctrl, 60);
+        }
+        let frozen: Vec<usize> = (0..36).filter(|&c| seen[c].len() <= 1).collect();
+        println!("[TRACK] 抖动检测(15帧): frozen(恒定不变)通道 = {:?}", frozen);
+        let _ = ctrl.stop_telemetry();
+        let _ = ctrl.debug_mode_now(0);
+        println!("[TRACK] {}", if frozen.is_empty() { "PASS 无 frozen 通道(均有抖动)" } else { "FAIL 存在 frozen 通道(无抖动=未扫描/卡死)" });
+        std::process::exit(0);
+    }
+
+    // 综合压力测试: 随机排列组合 半自动/全自动 + IDAC全形态(增益/min/目标/sense/autocal) + 时钟分频
+    // + 分辨率 + inactive + 校准 + 基线复位 + 重启, 每步后验证设备存活+链路恢复。任一步链路无法恢复=FAIL。
+    // 用法: selftest.exe --soak-csd [次数] [--seed N]
+    if args.iter().any(|a| a == "--soak-csd") {
+        use mai2control_ui::proto::FIELD_RAW;
+        let iters: u32 = args.iter().position(|a| a == "--soak-csd")
+            .and_then(|i| args.get(i + 1)).and_then(|s| s.parse().ok()).unwrap_or(40);
+        let mut seed: u32 = args.iter().position(|a| a == "--seed")
+            .and_then(|i| args.get(i + 1)).and_then(|s| s.parse().ok()).unwrap_or(12345);
+        let mut rng = move || { seed = seed.wrapping_mul(1664525).wrapping_add(1013904223); (seed >> 8) & 0x7FFF };
+        let settle = |ctrl: &mut AppController, ms: u64| { let s = std::time::Instant::now(); while s.elapsed() < Duration::from_millis(ms) { ctrl.poll(); thread::sleep(Duration::from_millis(10)); } };
+        // 验证设备存活: resend_hello + 轮询 link_valid 恢复(reboot/重初始化给更久预算)。
+        let check_alive = |ctrl: &mut AppController, budget_ms: u64| -> Option<u128> {
+            let t0 = std::time::Instant::now();
+            while t0.elapsed() < Duration::from_millis(budget_ms) {
+                let _ = ctrl.resend_hello();
+                let s = std::time::Instant::now();
+                while s.elapsed() < Duration::from_millis(200) { ctrl.poll(); thread::sleep(Duration::from_millis(10)); }
+                if ctrl.device_info().map(|d| d.psoc_link_valid).unwrap_or(false) { return Some(t0.elapsed().as_millis()); }
+            }
+            None
+        };
+        println!("[SOAK] 开始综合压测: {} 次随机操作 (seed 起始)", iters);
+        let _ = ctrl.start_telemetry(30, FIELD_RAW, u64::MAX);
+        settle(&mut ctrl, 300);
+        let mut fails = 0u32;
+        for i in 0..iters {
+            let op = rng() % 14;
+            let mut desc: String;
+            let mut budget = 2000u64;
+            match op {
+                0 => { let _ = ctrl.debug_mode_now(1); desc = "mode=SEMI".into(); budget = 1500; }
+                1 => { let _ = ctrl.debug_mode_now(0); desc = "mode=AUTO".into(); budget = 1500; }
+                2 => { let g = rng() % 7; let _ = ctrl.debug_global_now(0x02, g); desc = format!("gain_init={}", g); budget = 2800; }
+                3 => { let v = rng() % 128; let _ = ctrl.debug_global_now(0x03, v); desc = format!("idac_min={}", v); budget = 2800; }
+                4 => { let v = 1 + rng() % 99; let _ = ctrl.debug_global_now(0x04, v); desc = format!("raw_target={}", v); budget = 2800; }
+                5 => { let opts = [1u32, 2, 4]; let v = opts[(rng() % 3) as usize]; let _ = ctrl.debug_global_now(0x01, v); desc = format!("inactive={}", v); budget = 2800; }
+                6 => { let v = rng() % 2; let _ = ctrl.debug_global_now(0x07, v); desc = format!("sense_cfg={}", v); budget = 2800; }
+                7 => { let v = rng() % 2; let _ = ctrl.debug_global_now(0x08, v); desc = format!("autocal={}", v); budget = 2800; }
+                8 => { let d = 4 + rng() % 29; for ch in 0..36u8 { let _ = ctrl.debug_param_now(ch, 0x08, d); } desc = format!("snsClkDiv_all={}", d); }
+                9 => { let r = 8 + rng() % 7; for ch in 0..36u8 { let _ = ctrl.debug_param_now(ch, 0x07, r); } desc = format!("resolution_all={}", r); }
+                10 => { let g = rng() % 7; for ch in 0..36u8 { let _ = ctrl.debug_param_now(ch, 0x0B, g); } desc = format!("idac_gain_all={}", g); }
+                11 => { let _ = ctrl.calibrate(u64::MAX); desc = "CALIBRATE".into(); budget = 2800; }
+                12 => { let _ = ctrl.baseline_reset(u64::MAX); desc = "BASELINE_RESET".into(); budget = 1500; }
+                _ => { let _ = ctrl.reboot_psoc(); desc = "REBOOT_PSOC".into(); budget = 6000; }
+            }
+            settle(&mut ctrl, 120);
+            match check_alive(&mut ctrl, budget) {
+                Some(ms) => println!("[SOAK] #{:02} {:22} -> OK (存活, 恢复~{}ms)", i, desc, ms),
+                None => {
+                    fails += 1;
+                    println!("[SOAK] #{:02} {:22} -> FAIL 链路 {}ms 内未恢复!", i, desc, budget);
+                    // 尝试用重启自救, 便于后续步骤继续观察
+                    let _ = ctrl.reboot_psoc();
+                    let _ = check_alive(&mut ctrl, 6000);
+                }
+            }
+        }
+        // 收尾: 半自动 + 统一分辨率 + 中等增益 + 校准, 确认全通道能离轨。
+        let _ = ctrl.debug_mode_now(1);
+        for ch in 0..36u8 { let _ = ctrl.debug_param_now(ch, 0x07, 12); let _ = ctrl.debug_param_now(ch, 0x08, 8); }
+        let _ = ctrl.debug_global_now(0x02, 5);
+        let _ = ctrl.calibrate(u64::MAX);
+        settle(&mut ctrl, 800);
+        let mut railed = 0usize;
+        for ch in 0..36u8 { if let Some(s) = ctrl.telem_latest(ch) { if s.raw.unwrap_or(0) >= 4090 { railed += 1; } } }
+        let _ = ctrl.stop_telemetry();
+        let _ = ctrl.debug_mode_now(0);
+        println!("[SOAK] ===== 结果: {} 步, 失败 {} 步; 收尾校准后 railed={}/36 =====", iters, fails, railed);
+        println!("[SOAK] {}", if fails == 0 { "PASS 全部操作后设备均存活/链路可恢复" } else { "FAIL 存在使设备失联且无法自恢复的操作组合" });
+        std::process::exit(if fails == 0 { 0 } else { 1 });
+    }
+
+    // PSoC 重启(XRES)生效诊断: 物理信号法。SEMI 下校准使 raw 离轨(IDAC 校准值存于 PSoC RAM);
+    // XRES 重启会丢失该 RAM 校准, 重新 provision(SEMI 走 APPLY 不重校准)→ raw 重新 railed。
+    // 故"校准后离轨 → 重启后重新 railed"即证明 PSoC 真正复位。
+    if args.iter().any(|a| a == "--reboot-test") {
+        let settle = |ctrl: &mut AppController, ms: u64| { let s = std::time::Instant::now(); while s.elapsed() < Duration::from_millis(ms) { ctrl.poll(); thread::sleep(Duration::from_millis(15)); } };
+        let read_res0 = |ctrl: &mut AppController| -> Option<u32> {
+            for ch in 0..36u8 { let _ = ctrl.request_params(ch); }
+            let s = std::time::Instant::now();
+            while s.elapsed() < Duration::from_millis(1000) { ctrl.poll(); thread::sleep(Duration::from_millis(15)); }
+            ctrl.param(0, 0x07)
+        };
+        println!("[REBOOT] 切 SEMI...");
+        let _ = ctrl.debug_mode_now(1);
+        settle(&mut ctrl, 300);
+        // 在 CH0 widgetContext 写入异常分辨率 16(生成默认为 10/12)。PSoC XRES 重启会把 widgetContext
+        // 重置为生成默认; XRES(~2ms)+boot(~5ms) << 400ms 去抖, RP2040 不会重 provision → 16 应消失。
+        println!("[REBOOT] 在 CH0 设分辨率=16(标记值)...");
+        let _ = ctrl.debug_param_now(0, 0x07, 16);
+        settle(&mut ctrl, 200);
+        let before = read_res0(&mut ctrl);
+        println!("[REBOOT] 重启前 CH0 分辨率={:?} (应=16)", before);
+        println!("[REBOOT] 发送 REBOOT_PSOC(脉冲 XRES)...");
+        let _ = ctrl.reboot_psoc();
+        // 轮询链路恢复(宽限修复关键验证): 最多 8s, 报告恢复耗时。
+        let t0 = std::time::Instant::now();
+        let mut recovered_ms: Option<u128> = None;
+        while t0.elapsed() < Duration::from_millis(8000) {
+            let _ = ctrl.resend_hello();
+            settle(&mut ctrl, 250);
+            if ctrl.device_info().map(|d| d.psoc_link_valid).unwrap_or(false) {
+                recovered_ms = Some(t0.elapsed().as_millis());
+                break;
+            }
+        }
+        match recovered_ms {
+            Some(ms) => println!("[REBOOT] 链路在重启后 ~{}ms 恢复 link_valid=true (宽限修复生效)", ms),
+            None => println!("[REBOOT] FAIL 链路 8s 内未恢复(仍需修复)"),
+        }
+        settle(&mut ctrl, 500);
+        let after = read_res0(&mut ctrl);
+        println!("[REBOOT] 重启后 CH0 分辨率={:?} (若≠16=widgetContext 已重置=真正重启, 白灯应闪亮)", after);
+        let _ = ctrl.debug_param_now(0, 0x07, 12);
+        println!("[REBOOT] {}", if after != Some(16) && before == Some(16) { "PASS PSoC 已真正 XRES 重启(标记分辨率被重置)" } else { "FAIL 标记分辨率仍在, XRES 复位未生效" });
+        std::process::exit(0);
+    }
+
+    // IDAC增益夹紧(防越界崩溃) + inactive屏障 生效性诊断。
+    if args.iter().any(|a| a == "--gain-inactive-test") {
+        let get_g = |ctrl: &mut AppController, id: u8| -> Option<u32> {
+            let _ = ctrl.global_get(id);
+            let s = std::time::Instant::now();
+            while s.elapsed() < Duration::from_millis(400) { ctrl.poll(); thread::sleep(Duration::from_millis(12)); }
+            ctrl.global(id)
+        };
+        println!("[GI] 基线: IDAC_GAIN_INIT(0x02)={:?} INACTIVE_SNS(0x01)={:?}", get_g(&mut ctrl, 0x02), get_g(&mut ctrl, 0x01));
+
+        // 增益=7(越界值): 应被夹紧拒绝且设备不崩溃。用 debug_global_now(不写草稿)使回读=设备真值。
+        let _ = ctrl.debug_global_now(0x02, 7);
+        thread::sleep(Duration::from_millis(300));
+        let g7 = get_g(&mut ctrl, 0x02);
+        println!("[GI] 设增益=7后回读(设备真值)={:?} → {}", g7, if g7 != Some(7) { "PASS 被拒(未越界)" } else { "FAIL 接受了7(会越界崩溃)" });
+        // 增益=6(合法上限): 应被接受。
+        let _ = ctrl.debug_global_now(0x02, 6);
+        thread::sleep(Duration::from_millis(300));
+        let g6 = get_g(&mut ctrl, 0x02);
+        println!("[GI] 设增益=6后回读(设备真值)={:?} → {}", g6, if g6 == Some(6) { "PASS 接受" } else { "FAIL 未接受合法值6" });
+
+        // per-channel IDAC_GAIN(0x0B) ch0: 7 拒 / 6 收。
+        let _ = ctrl.debug_param_now(0, 0x0B, 7);
+        thread::sleep(Duration::from_millis(200));
+        let _ = ctrl.request_params(0);
+        let s = std::time::Instant::now();
+        while s.elapsed() < Duration::from_millis(500) { ctrl.poll(); thread::sleep(Duration::from_millis(12)); }
+        let p7 = ctrl.param(0, 0x0B);
+        println!("[GI] CH0 param增益=7后回读={:?} → {}", p7, if p7 != Some(7) { "PASS 被拒" } else { "FAIL 接受7" });
+
+        // inactive: 2(High-Z)/4(Shield) 应生效(RP2040 自动 global_commit → PSoC Init 重算)。设备真值回读。
+        let _ = ctrl.debug_global_now(0x01, 2);
+        thread::sleep(Duration::from_millis(400));
+        let iz = get_g(&mut ctrl, 0x01);
+        println!("[GI] 设inactive=2(High-Z)后回读(设备真值)={:?} → {}", iz, if iz == Some(2) { "PASS 生效" } else { "FAIL 未生效" });
+        let _ = ctrl.debug_global_now(0x01, 4);
+        thread::sleep(Duration::from_millis(400));
+        let ish = get_g(&mut ctrl, 0x01);
+        println!("[GI] 设inactive=4(Shield)后回读(设备真值)={:?} → {}", ish, if ish == Some(4) { "PASS 生效" } else { "FAIL 未生效" });
+
+        // 复位到安全默认(GND, 增益4)。
+        let _ = ctrl.debug_global_now(0x01, 1);
+        let _ = ctrl.debug_global_now(0x02, 4);
+        for ch in 0..36u8 { let _ = ctrl.debug_param_now(ch, 0x0B, 4); }
+        thread::sleep(Duration::from_millis(300));
+        println!("[GI] 已复位 inactive=GND 增益=4; 全程设备存活(能回读)=未崩溃");
+        std::process::exit(0);
+    }
+
+    // 时钟生效实验: 半自动模式下, 直接把全 36 通道 SNS_CLK_DIV 设成不同值 + APPLY,
+    // 测每档的设备实测扫描周期(scan_period_us)。周期应随 div 近似线性变化; 若恒定=时钟未真正生效。
+    if args.iter().any(|a| a == "--clk-probe") {
+        use mai2control_ui::proto::FIELD_STATS;
+        const CLK_DIV: u8 = 0x08;
+        println!("[CLK] 切半自动手动模式(SET_MODE=1)...");
+        let _ = ctrl.debug_mode_now(1);
+        let s = std::time::Instant::now();
+        while s.elapsed() < Duration::from_millis(400) { ctrl.poll(); thread::sleep(Duration::from_millis(20)); }
+        const CLK_RES: u8 = 0x07;   // PARAM_RESOLUTION
+        // (A) 固定分辨率, 变 div 8→48: 验证 div 是否影响周期(CSDv2 预期: 不影响, 因 conversionsNum∝1/div 抵消)。
+        for &div in &[8u32, 48u32] {
+            for ch in 0..36u8 { let _ = ctrl.debug_param_now(ch, CLK_DIV, div); }
+            let _ = ctrl.calibrate(u64::MAX);
+            let _ = ctrl.start_telemetry(30, FIELD_STATS, u64::MAX);
+            let w = std::time::Instant::now();
+            while w.elapsed() < Duration::from_millis(2000) { ctrl.poll(); thread::sleep(Duration::from_millis(20)); }
+            println!("[CLK] (A) SNS_CLK_DIV={:>2} res=固定 → scan_period_us={} sps={}",
+                div, ctrl.telem_scan_period_us(), ctrl.telem_samples_per_sec());
+            let _ = ctrl.stop_telemetry();
+            thread::sleep(Duration::from_millis(150));
+        }
+        // (B) 固定 div=8, 变分辨率 8→10→12: 验证分辨率是否驱动周期(CSDv2 预期: 周期∝2^res)。
+        for ch in 0..36u8 { let _ = ctrl.debug_param_now(ch, CLK_DIV, 8); }
+        for &res in &[8u32, 10u32, 12u32] {
+            for ch in 0..36u8 { let _ = ctrl.debug_param_now(ch, CLK_RES, res); }
+            let _ = ctrl.calibrate(u64::MAX);
+            let _ = ctrl.start_telemetry(30, FIELD_STATS, u64::MAX);
+            let w = std::time::Instant::now();
+            while w.elapsed() < Duration::from_millis(2000) { ctrl.poll(); thread::sleep(Duration::from_millis(20)); }
+            println!("[CLK] (B) RESOLUTION={:>2} div=8 → scan_period_us={} sps={}",
+                res, ctrl.telem_scan_period_us(), ctrl.telem_samples_per_sec());
+            let _ = ctrl.stop_telemetry();
+            thread::sleep(Duration::from_millis(150));
+        }
+        for ch in 0..36u8 { let _ = ctrl.debug_param_now(ch, CLK_RES, 10); }   // 复位分辨率
+        let _ = ctrl.calibrate(u64::MAX);
+        let _ = ctrl.debug_mode_now(0);   // 复位回自动模式
+        println!("[CLK] 若周期随 div 近似线性(8→48 约 6×)则时钟生效; 恒定则未真正实时控制");
+        std::process::exit(0);
+    }
+
+    // 算法回读实验: 读设备信息 + C 源(映射表) + ASM 机器码, 打印长度与内容首部,
+    // 确认"读取信息"能否真正取回设备保存的(已滤注释)C 源与机器码。
+    if args.iter().any(|a| a == "--algo-dump") {
+        let _ = ctrl.algo_get_info();
+        let _ = ctrl.request_algo_src();
+        let _ = ctrl.request_algo_code();
+        let s = std::time::Instant::now();
+        while s.elapsed() < Duration::from_millis(1200) { ctrl.poll(); thread::sleep(Duration::from_millis(20)); }
+        match ctrl.algo_info() {
+            Some(i) => println!("[ALGO] info: is_default={} psoc_valid={} len={} crc16=0x{:04X}",
+                i.is_default, i.psoc_valid, i.len, i.crc16),
+            None => println!("[ALGO] info: <未取到>"),
+        }
+        let src = ctrl.algo_device_src();
+        println!("[ALGO] device C src: {} 字节", src.len());
+        for (n, line) in src.lines().take(6).enumerate() { println!("[ALGO]   src[{}]: {}", n, line); }
+        let code = ctrl.algo_device_code_hex();
+        println!("[ALGO] device ASM code hex: {} 字符", code.len());
+        std::process::exit(0);
+    }
+
+    // 自持 debug: 武装/解除"崩溃→进 BOOTSEL"。武装后固件一旦看门狗复位即进烧录, 便于自动重烧恢复。
+    if args.iter().any(|a| a == "--arm-crash-bootsel") {
+        match ctrl.set_crash_bootsel(true) {
+            Ok(()) => println!("[DBG] 已武装: 运行中崩溃将自动进 BOOTSEL(自持 debug)"),
+            Err(e) => println!("[DBG] 武装失败: {}", e),
+        }
+        let s = std::time::Instant::now();
+        while s.elapsed() < Duration::from_millis(300) { ctrl.poll(); thread::sleep(Duration::from_millis(20)); }
+        std::process::exit(0);
+    }
+    if args.iter().any(|a| a == "--disarm-crash-bootsel") {
+        match ctrl.set_crash_bootsel(false) {
+            Ok(()) => println!("[DBG] 已解除: 运行中崩溃仅正常重启(默认/生产)"),
+            Err(e) => println!("[DBG] 解除失败: {}", e),
+        }
+        let s = std::time::Instant::now();
+        while s.elapsed() < Duration::from_millis(300) { ctrl.poll(); thread::sleep(Duration::from_millis(20)); }
+        std::process::exit(0);
+    }
+
     // Strict smoke requires the unambiguous diagnostic RP image and a complete S455 path.
     if smoke_only {
         let Some(info) = ctrl.device_info() else {
@@ -195,7 +764,7 @@ fn main() {
         let silicon_device_mask = 0xFFFF_00FFu32; // programming spec: ignore revision byte
         let identity_ok = info.fw_version == 0x0000_0401
             && diag.rp_build_id == RP_BUILD_ID_DIAGNOSTIC_V1
-            && diag.embedded_psoc_version == 0x0000_0401
+            && diag.embedded_psoc_version == env!("EXPECTED_PSOC_FW_VERSION").parse::<u32>().expect("valid generated PSoC version")
             && (diag.actual_silicon_id & silicon_device_mask)
                 == (EXPECTED_PSOC_S455_ID & silicon_device_mask);
         let runtime_ok = diag.flash_ok()
@@ -222,7 +791,7 @@ fn main() {
     // Phase B 配置阶段:把 CSD 配置写入 RP2040 真相源并持久化(供重启/重刷后下发)。
     if csd_provision {
         const FT: u8 = 0x01; // FINGER_TH
-        println!("[SELFTEST] CSD provision: 捕获 PSoC 自整定参数入 store...");
+        println!("[SELFTEST] CSD provision: 捕获 PSoC 当前参数入 store...");
         if let Err(e) = ctrl.csd_capture() {
             println!("[SELFTEST] FAIL csd_capture: {}", e);
             std::process::exit(1);
@@ -280,6 +849,112 @@ fn main() {
                 std::process::exit(1);
             }
         }
+    }
+
+    // JIT 算法引擎闭环: 读信息 → 编译并上传测试算法 → 校验 psoc_valid+非默认 → 恢复默认 → 校验默认。
+    if algo_test {
+        let pump = |ctrl: &mut AppController, n: u32| {
+            for _ in 0..n { ctrl.poll(); thread::sleep(Duration::from_millis(20)); }
+        };
+        println!("[SELFTEST] ALGO: 读取当前算法信息...");
+        let _ = ctrl.algo_get_info();
+        pump(&mut ctrl, 30);
+        match ctrl.algo_info() {
+            Some(i) => println!("[SELFTEST]   is_default={} psoc_valid={} len={} crc16=0x{:04X}",
+                i.is_default, i.psoc_valid, i.len, i.crc16),
+            None => { println!("[SELFTEST] FAIL 未收到 ALGO_INFO"); std::process::exit(1); }
+        }
+        let src = "#include <stddef.h>\n#include \"psoc_algo_abi.h\"\nvoid algo(algo_io_t* io){ io->out_active = (io->base_active!=0u)?1u:0u; }\n";
+        println!("[SELFTEST] ALGO: 编译并上传测试算法(base_active 透传)...");
+        if let Err(e) = ctrl.compile_and_upload(src) {
+            println!("[SELFTEST] FAIL 编译/上传: {}", e);
+            std::process::exit(1);
+        }
+        pump(&mut ctrl, 40);
+        let _ = ctrl.algo_get_info();
+        pump(&mut ctrl, 40);
+        match ctrl.algo_info() {
+            Some(i) if i.psoc_valid && !i.is_default && i.len > 0 =>
+                println!("[SELFTEST]   上传后 is_default={} psoc_valid={} len={}", i.is_default, i.psoc_valid, i.len),
+            other => {
+                println!("[SELFTEST] ALGO UPLOAD FAIL: {:?}", other.map(|i| (i.is_default, i.psoc_valid, i.len)));
+                std::process::exit(1);
+            }
+        }
+        println!("[SELFTEST] ALGO: 恢复默认(v3.1 HDR)...");
+        let _ = ctrl.algo_reset_default();
+        pump(&mut ctrl, 50);
+        let _ = ctrl.algo_get_info();
+        pump(&mut ctrl, 40);
+        match ctrl.algo_info() {
+            Some(i) if i.is_default && i.psoc_valid => {
+                println!("[SELFTEST] ALGO PASS: 上传+恢复默认均生效");
+                std::process::exit(0);
+            }
+            other => {
+                println!("[SELFTEST] ALGO RESET FAIL: {:?}", other.map(|i| (i.is_default, i.psoc_valid, i.len)));
+                std::process::exit(1);
+            }
+        }
+    }
+
+    // 全局 CSD 配置闭环: 读全部 → 设未激活传感器=High-Z(2) → 设备回读校验 → 恢复 GND(1)。
+    if global_test {
+        let pump = |ctrl: &mut AppController, n: u32| {
+            for _ in 0..n { ctrl.poll(); thread::sleep(Duration::from_millis(20)); }
+        };
+        println!("[SELFTEST] GLOBAL: 读取全部全局配置...");
+        let _ = ctrl.global_get_all();
+        pump(&mut ctrl, 30);
+        for id in 1u8..=6 {
+            if let Some(v) = ctrl.global(id) { println!("[SELFTEST]   gparam {} = {}", id, v); }
+        }
+        println!("[SELFTEST] GLOBAL: 设未激活传感器连接=High-Z(2) + APPLY...");
+        let _ = ctrl.global_set(1, 2);
+        pump(&mut ctrl, 40);
+        let _ = ctrl.global_get(1);   // 设备回读覆盖本地乐观值,真正校验设备
+        pump(&mut ctrl, 30);
+        let got = ctrl.global(1);
+        let _ = ctrl.global_set(1, 1);  // 恢复 GND
+        pump(&mut ctrl, 40);
+        match got {
+            Some(2) => { println!("[SELFTEST] GLOBAL PASS: inactive_sns 设备回读=2(High-Z)"); std::process::exit(0); }
+            other => { println!("[SELFTEST] GLOBAL FAIL: 期望 2 实得 {:?}", other); std::process::exit(1); }
+        }
+    }
+
+    // 键盘闭环: 读物理键码表(12) + 触控映射表(34) + 物理实时态; SET_MAP round-trip 校验设备回读。
+    if kbd_test {
+        let pump = |ctrl: &mut AppController, n: u32| {
+            for _ in 0..n { ctrl.poll(); thread::sleep(Duration::from_millis(20)); }
+        };
+        println!("[SELFTEST] KBD: 读取物理键码表 / 触控映射表 / 物理实时态...");
+        let _ = ctrl.kbd_request_map();
+        let _ = ctrl.kbd_request_touchmap();
+        let _ = ctrl.kbd_request_state();
+        pump(&mut ctrl, 30);
+        let phys: Vec<u8> = (0..12u8).map(|i| ctrl.kbd_map(i)).collect();
+        println!("[SELFTEST]   物理键码(12) = {:02X?}", phys);
+        println!("[SELFTEST]   物理实时态 = 0x{:03X} (需按键才非0)", ctrl.kbd_state());
+        let zones: Vec<u8> = (0..34u8).map(|z| ctrl.kbd_touch_keycode(z)).collect();
+        println!("[SELFTEST]   触控映射(34, 0=不映射) = {:02X?}", zones);
+        // round-trip: 物理键0 改成 KEY_A(0x04) → 设备回读校验 → 恢复原值。
+        let orig = ctrl.kbd_map(0);
+        let test_code: u8 = if orig == 0x04 { 0x05 } else { 0x04 };
+        println!("[SELFTEST] KBD: SET_MAP 键0 {:#04X} -> {:#04X} (写穿+save)...", orig, test_code);
+        let _ = ctrl.kbd_set_map(0, test_code, 0);
+        pump(&mut ctrl, 30);
+        let _ = ctrl.kbd_request_map();   // 设备回读覆盖本地乐观值
+        pump(&mut ctrl, 30);
+        let got = ctrl.kbd_map(0);
+        let _ = ctrl.kbd_set_map(0, orig, 0);  // 恢复
+        pump(&mut ctrl, 30);
+        if got == test_code {
+            println!("[SELFTEST] KBD PASS: SET_MAP 设备回读={:#04X}", got);
+            std::process::exit(0);
+        }
+        println!("[SELFTEST] KBD FAIL: 期望 {:#04X} 实得 {:#04X}", test_code, got);
+        std::process::exit(1);
     }
 
     // 无头 soak：完全模拟 UI 的持久连接 + 16ms 轮询，逐个驱动所有功能，最后长时 idle。
@@ -497,7 +1172,7 @@ fn main() {
     }
 
     // Step 7b: SET_PARAM round-trip 验证(证明写入真正落地 PSoC widgetContext,非仅回显)
-    // 用 onDebounce(0x05):SmartSense 不自动管理,不会被每周期处理覆盖,可干净验证写入机制。
+    // 用 onDebounce(0x05)：标准完整处理链不会重写该字段，可干净验证写入机制。
     const TEST_PARAM: u8 = 0x05; // ON_DEBOUNCE
     let orig_val = match ctrl.param(0, TEST_PARAM) {
         Some(v) => v,
@@ -543,10 +1218,10 @@ fn main() {
     let _ = ctrl.set_param(0, TEST_PARAM, orig_val);
     thread::sleep(Duration::from_millis(50));
 
-    // Step 7c: 半自动模式 + 阈值持久验证
-    // 证明 SET_MODE 生效:semi 模式下 SmartSense 阈值自整定被跳过,手动 FINGER_TH 跨多个处理周期不被覆盖。
-    const TH_PARAM: u8 = 0x01; // FINGER_TH (全自动模式下会被 SmartSense 每周期重算)
-    println!("[SELFTEST] 切换半自动模式(SET_MODE=1)...");
+    // Step 7c: 半自动手动模式 + 阈值持久验证
+    // 证明 SET_MODE 生效：半自动手动模式跳过阈值处理，FINGER_TH 跨多个标准处理周期保持手动值。
+    const TH_PARAM: u8 = 0x01; // FINGER_TH（自动校准模式运行标准完整处理）
+    println!("[SELFTEST] 切换半自动手动模式(SET_MODE=1)...");
     if let Err(e) = ctrl.set_mode(1) {
         println!("[SELFTEST] FAIL set_mode(semi): {}", e);
         std::process::exit(1);
@@ -557,7 +1232,7 @@ fn main() {
         println!("[SELFTEST] FAIL set_param(FINGER_TH): {}", e);
         std::process::exit(1);
     }
-    thread::sleep(Duration::from_millis(200)); // 跨多个处理周期,验证不被 SmartSense 覆盖
+    thread::sleep(Duration::from_millis(200)); // 跨多个处理周期，验证手动阈值保持不变
     let base_ver = ctrl.param_version();
     if let Err(e) = ctrl.request_params(0) {
         println!("[SELFTEST] FAIL request_params(semi回读): {}", e);
@@ -582,16 +1257,16 @@ fn main() {
         }
         other => {
             println!(
-                "[SELFTEST] FAIL semi-mode 阈值未持久: 期望 {} 实得 {:?} (SmartSense 未被跳过?)",
+                "[SELFTEST] FAIL semi-mode 阈值未持久: 期望 {} 实得 {:?} (半自动手动处理未保持阈值?)",
                 th_test, other
             );
             let _ = ctrl.set_mode(0);
             std::process::exit(1);
         }
     }
-    // Step 7d: 半自动模式硬件参数 APPLY 重初始化验证
-    // 证明"模式修改重初始化"生效:semi 模式改 SNS_CLK_DIV + CALIBRATE(APPLY) 后,
-    // 硬件参数持久且手动 FINGER_TH(199) 不被重初始化覆盖(Initialize 不重跑 SmartSense)。
+    // Step 7d: 半自动手动模式硬件参数 APPLY 重初始化验证
+    // 证明模式修改重初始化生效：改 SNS_CLK_DIV + CALIBRATE(APPLY) 后，
+    // 硬件参数持久且手动 FINGER_TH(199) 不被重初始化覆盖。
     const CLK_PARAM: u8 = 0x08; // SNS_CLK_DIV
     let clk_orig = ctrl.param(0, CLK_PARAM).unwrap_or(16);
     let clk_test = if clk_orig >= 8 && clk_orig < 250 { clk_orig + 2 } else { 16 };
@@ -638,9 +1313,130 @@ fn main() {
         }
     }
 
-    // 切回全自动(PSoC 无状态,重启亦恢复)
-    let _ = ctrl.set_mode(0);
+    // 切回自动校准/标准完整处理，并在可选重启前验收一次完整的实机 Cp 测量。
+    if let Err(e) = ctrl.set_mode(0) {
+        println!("[SELFTEST] FAIL set_mode(auto): {}", e);
+        std::process::exit(1);
+    }
     thread::sleep(Duration::from_millis(50));
+
+    println!("[SELFTEST] CP 实机验收: 启动全通道测量...");
+    let cp_acceptance_start = std::time::Instant::now();
+    let ch0_version_before_measure = ctrl.cp_channel_version(0);
+    if let Err(e) = ctrl.measure_cp() {
+        println!("[SELFTEST] FAIL measure_cp: {}", e);
+        std::process::exit(1);
+    }
+
+    let mut ch0_version = ch0_version_before_measure;
+    let mut next_ch0_request = std::time::Instant::now();
+    let ch0_measurement = loop {
+        if std::time::Instant::now() >= next_ch0_request {
+            if let Err(e) = ctrl.request_cp(0) {
+                println!("[SELFTEST] FAIL request_cp(ch0): {}", e);
+                std::process::exit(1);
+            }
+            next_ch0_request = std::time::Instant::now()
+                + Duration::from_millis(CP_REQUEST_INTERVAL_MS);
+        }
+
+        cp_poll_or_fail(&mut ctrl, "等待 ch0 测量完成");
+        let latest_version = ctrl.cp_channel_version(0);
+        if latest_version > ch0_version {
+            ch0_version = latest_version;
+            match ctrl.cp(0) {
+                Some(CP_FAILURE_VALUE) => break CP_FAILURE_VALUE,
+                Some(0) => {}
+                Some(value) => break value,
+                None => {
+                    println!("[SELFTEST] FAIL CP ch0 收到新版本但无测量值");
+                    std::process::exit(1);
+                }
+            }
+        }
+        if cp_acceptance_start.elapsed() >= Duration::from_millis(CP_MEASURE_TIMEOUT_MS) {
+            println!(
+                "[SELFTEST] FAIL CP ch0 测量未在 {}ms 内完成",
+                CP_MEASURE_TIMEOUT_MS
+            );
+            std::process::exit(1);
+        }
+        thread::sleep(Duration::from_millis(16));
+    };
+    if ch0_measurement == CP_FAILURE_VALUE {
+        println!(
+            "[SELFTEST] CP ch0 测量返回失败标记 0x{CP_FAILURE_VALUE:08X}; 继续收集全部通道"
+        );
+    } else {
+        println!(
+            "[SELFTEST] CP ch0 测量完成: {}fF (+{}ms)",
+            ch0_measurement,
+            cp_acceptance_start.elapsed().as_millis()
+        );
+    }
+
+    let mut cp_values = Vec::with_capacity(CP_CHANNEL_COUNT as usize);
+    let mut cp_results = Vec::with_capacity(CP_CHANNEL_COUNT as usize);
+    let mut cp_failed_channels = Vec::new();
+    for ch in 0..CP_CHANNEL_COUNT {
+        let version_before_request = ctrl.cp_channel_version(ch);
+        if let Err(e) = ctrl.request_cp(ch) {
+            println!("[SELFTEST] FAIL request_cp(ch{}): {}", ch, e);
+            std::process::exit(1);
+        }
+
+        let request_start = std::time::Instant::now();
+        loop {
+            cp_poll_or_fail(&mut ctrl, &format!("等待 CP ch{}", ch));
+            if ctrl.cp_channel_version(ch) > version_before_request {
+                match ctrl.cp(ch) {
+                    Some(CP_FAILURE_VALUE) | Some(0) => {
+                        let value = ctrl.cp(ch).expect("CP value present");
+                        cp_failed_channels.push(ch);
+                        cp_results.push((ch, value));
+                        break;
+                    }
+                    Some(value) => {
+                        cp_values.push(value);
+                        cp_results.push((ch, value));
+                        break;
+                    }
+                    None => {
+                        println!("[SELFTEST] FAIL CP ch{} 收到新版本但无测量值", ch);
+                        std::process::exit(1);
+                    }
+                }
+            }
+            if request_start.elapsed() >= Duration::from_millis(CP_GET_TIMEOUT_MS) {
+                println!(
+                    "[SELFTEST] FAIL CP ch{} 未在 {}ms 内收到新响应",
+                    ch, CP_GET_TIMEOUT_MS
+                );
+                std::process::exit(1);
+            }
+            thread::sleep(Duration::from_millis(16));
+        }
+    }
+
+    let cp_distribution = cp_results
+        .iter()
+        .map(|(ch, value)| format!("ch{}={}fF", ch, value))
+        .collect::<Vec<_>>()
+        .join(", ");
+    println!("[SELFTEST] CP values: [{}]", cp_distribution);
+    if !cp_failed_channels.is_empty() {
+        println!("[SELFTEST] FAIL CP channels={:?}", cp_failed_channels);
+        std::process::exit(1);
+    }
+
+    let cp_min = cp_values.iter().copied().min().expect("36 Cp values");
+    let cp_max = cp_values.iter().copied().max().expect("36 Cp values");
+    println!(
+        "[SELFTEST] CP PASS: 总测量耗时={}ms, 36通道 min={}fF max={}fF",
+        cp_acceptance_start.elapsed().as_millis(),
+        cp_min,
+        cp_max
+    );
 
     // Step 8: 可选进烧录模式
     if reboot_bootloader {
@@ -657,6 +1453,24 @@ fn main() {
     println!("[SELFTEST] SELFTEST PASS");
     println!("[SELFTEST] ========================================");
     std::process::exit(0);
+}
+
+/// CP 验收的 16ms 轮询：任何连接/协议错误均立即使完整自测失败。
+fn cp_poll_or_fail(ctrl: &mut AppController, label: &str) {
+    ctrl.poll();
+    if ctrl.state() == ConnState::Disconnected {
+        println!(
+            "[SELFTEST] FAIL CP {}期间连接断开: status='{}' err={:?}",
+            label,
+            ctrl.status_line(),
+            ctrl.last_error()
+        );
+        std::process::exit(1);
+    }
+    if let Some(error) = ctrl.last_error() {
+        println!("[SELFTEST] FAIL CP {}期间通信错误: {}", label, error);
+        std::process::exit(1);
+    }
 }
 
 /// soak 轮询泵：模拟 UI 16ms 定时器 poll，期间检测断开；断开即打印上下文并 exit(1)。
@@ -764,8 +1578,8 @@ fn run_soak(ctrl: &mut AppController, idle_s: u64) {
     println!("[SOAK] D2: 持续遥测 5s(并发压测)");
     soak_pump(ctrl, 5000, "telemetry_run");
 
-    // E. 半自动 + 捕获 + 调参 + 校准 + 回全自动
-    println!("[SOAK] E: set_mode(semi)/capture/set_param/calibrate/set_mode(auto)");
+    // E. 半自动手动 + 捕获 + 调参 + 校准 + 回自动校准/标准完整处理
+    println!("[SOAK] E: 半自动手动/捕获/调参/校准/自动校准标准完整处理");
     let _ = ctrl.set_mode(1);
     soak_pump(ctrl, 200, "set_mode_semi");
     let _ = ctrl.csd_capture();

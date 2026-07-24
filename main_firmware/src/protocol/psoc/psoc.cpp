@@ -4,10 +4,22 @@
 #include <Arduino.h>
 #include <pico/stdlib.h>
 #include <hardware/sync.h>   // __dmb() / __sev() 跨核内存屏障
+#include <hardware/watchdog.h>   // watchdog_update(): 重操作阻塞等待期间喂狗
 
 namespace {
 constexpr uint32_t CORE1_CYCLE_US = 1000;        // core1 固定周期 1ms(1kHz), 保证传感器时序恒定
 constexpr uint32_t SPI_CMD_TIMEOUT_US = 100000;  // core0 命令信箱等待上限 100ms
+// 失效兜底阈值:
+//   链路丢失: 连续 ~200 个 1ms 周期(≈200ms)read_touch 失败 = PSoC 崩溃/掉线。
+//   主循环卡死: scan_count 连续 8 个统计间隔(每间隔 ~500ms ⇒ ≈4s)不推进 = 主循环卡死(疑似坏算法)。
+//     阈值刻意高于最长合法主循环停顿(MEASURE_CP 逐电极测量 ~1.5s), 避免测量期间误复位。
+constexpr uint32_t LINK_FAIL_RESET_CYCLES = 200;
+constexpr uint32_t HANG_STATS_INTERVALS   = 8;
+// ★XRES 复位后 PSoC 启动宽限★: XRES 复位(手动 REBOOT_PSOC 或失效兜底)后 PSoC 需重跑
+// initialize_capsense(含 Cy_CapSense_Enable 全通道自动校准)才恢复 SPI 应答, 耗时可达数百 ms,
+// 远超 LINK_FAIL_RESET_CYCLES(200ms)。若不设宽限, 兜底会在 PSoC 启动完成前又发 XRES →
+// 永久复位死循环 → 链路永不恢复(表现: 重启后 link 掉、需重烧)。宽限期内不累计失败/不再触发复位。
+constexpr uint32_t RESET_BOOT_GRACE_MS    = 1500;
 }
 
 Psoc* Psoc::_instance = nullptr;
@@ -47,7 +59,7 @@ void Psoc::_spi_service() {
         if (_cmd_tail == _cmd_head) break;          // 队空
         SpiCmd& c = _cmd_ring[_cmd_tail];
         uint32_t r = 0;
-        const bool ok = _exec_cmd(c.op, c.ch, c.pid, c.val, &r);
+        const bool ok = _exec_cmd(c.op, c.ch, c.pid, c.val, &r, c.data);
         c.result = r;
         c.ok = ok;
         __dmb();
@@ -70,6 +82,21 @@ void Psoc::_spi_service() {
     _pub_touch_read_us = tr;
     __dmb();
     _pub_seq++;                       // 离开写临界区(偶)
+
+    // 失效兜底(链路丢失): 链路曾就绪后连续多周期失败 = PSoC 崩溃/掉线 → 请求 XRES 复位。
+    // 复位窗口内 PSoC 短暂无响应(~数周期)远低于阈值, 不会误触发。
+    if (ok) {
+        _link_established = true;
+        _link_fail_run = 0;
+    } else if (_link_established) {
+        // XRES 复位后的启动宽限期内: 不累计失败、不触发复位, 让 PSoC 有时间跑完 initialize_capsense
+        // 并恢复 SPI 应答, 避免"启动未完成→又复位"的死循环。宽限过后仍失败才判为真崩溃。
+        if ((int32_t)(_reset_grace_until_ms - millis()) > 0) {
+            _link_fail_run = 0;
+        } else if (++_link_fail_run >= LINK_FAIL_RESET_CYCLES && _pub_reset_reason == 0) {
+            _pub_reset_reason = 1;
+        }
+    }
 
     // 链路存活指示(遥测未激活时): 仅 bump generation/valid 单字段(原子, 无需 seqlock)。
     if (ok && !_telem_active) {
@@ -100,6 +127,17 @@ void Psoc::_spi_service() {
                 const uint32_t dcount = sc - _stats_last_scan;
                 _samples_per_sec = (uint32_t)(((uint64_t)dcount * 1000000ULL) / dt);
                 _scan_period_us = (_samples_per_sec > 0u) ? (1000000u / _samples_per_sec) : 0u;
+                // 失效兜底(主循环卡死): scan_count 长时间不推进 = PSoC 主循环卡死(疑似坏算法死循环)。
+                // 注意 read_touch 仍由 PSoC SPI ISR 应答, 故 link_ok 不掉, 只能靠 scan_count 检测。
+                if (_link_established) {
+                    if (dcount == 0u) {
+                        if (++_hang_intervals >= HANG_STATS_INTERVALS && _pub_reset_reason == 0) {
+                            _pub_reset_reason = 2;
+                        }
+                    } else {
+                        _hang_intervals = 0;
+                    }
+                }
             }
             _stats_last_scan = sc;
             _stats_last_us = stats_now_us;
@@ -129,7 +167,7 @@ void Psoc::update() {
 }
 
 // 实际 SPI 指令执行体: core1 处理信箱时调用, 或 setup 阶段(_core1_running=false)由 _submit 直调。
-bool Psoc::_exec_cmd(SpiOp op, uint8_t ch, uint8_t pid, uint32_t val, uint32_t* out) {
+bool Psoc::_exec_cmd(SpiOp op, uint8_t ch, uint8_t pid, uint32_t val, uint32_t* out, const uint8_t* data) {
     switch (op) {
         case SpiOp::SET_PARAM:
             return _spi.set_param(ch, pid, val);
@@ -149,12 +187,69 @@ bool Psoc::_exec_cmd(SpiOp op, uint8_t ch, uint8_t pid, uint32_t val, uint32_t* 
             return _spi.set_mode(ch);   // mode 复用 ch 字段
         case SpiOp::APPLY:
             return _spi.apply();
+        case SpiOp::CALIBRATE:
+            return _spi.calibrate();
+        case SpiOp::BASELINE_RESET:
+            return _spi.baseline_reset();
         case SpiOp::MEASURE_CP:
             return _spi.measure_cp();
         case SpiOp::GET_CP: {
             uint32_t v = 0;
             const bool ok = _spi.get_cp(ch, &v);
             if (out) *out = v;
+            return ok;
+        }
+        case SpiOp::UPLOAD_ALGO: {
+            // val 打包 crc16<<16 | len; data 为 blob 指针(调用方持久缓冲)
+            const uint16_t len = (uint16_t)(val & 0xFFFFu);
+            const uint16_t crc = (uint16_t)((val >> 16) & 0xFFFFu);
+            return _spi.upload_algo(data, len, crc);
+        }
+        case SpiOp::GET_ALGO_INFO: {
+            bool valid = false;
+            uint16_t l = 0;
+            const bool ok = _spi.algo_info(&valid, &l);
+            if (out) *out = ((uint32_t)(valid ? 1u : 0u) << 16) | l;
+            return ok;
+        }
+        case SpiOp::SET_ALGO_ROM:
+            return _spi.set_algo_rom(ch, (uint16_t)val);
+        case SpiOp::GET_ALGO_ROM: {
+            uint16_t v = 0;
+            const bool ok = _spi.get_algo_rom(ch, &v);
+            if (out) *out = v;
+            return ok;
+        }
+        case SpiOp::ALGO_GET_TRACE: {
+            // ch=通道, pid=report idx(复用); out 打包 active<<16 | report
+            uint8_t active = 0;
+            uint16_t report = 0;
+            const bool ok = _spi.algo_get_trace(ch, pid, &active, &report);
+            if (out) *out = ((uint32_t)active << 16) | report;
+            return ok;
+        }
+        case SpiOp::ALGO_SET_CFG:
+            return _spi.algo_set_cfg(ch, (uint8_t)val);   // ch 字段复用为 cfg idx
+        case SpiOp::ALGO_GET_CFG: {
+            uint8_t v = 0;
+            const bool ok = _spi.algo_get_cfg(ch, &v);   // ch 字段复用为 cfg idx
+            if (out) *out = v;
+            return ok;
+        }
+        case SpiOp::SET_GLOBAL:
+            return _spi.set_global(ch, val);   // ch 字段复用为 gparam_id
+        case SpiOp::GET_GLOBAL: {
+            uint32_t v = 0;
+            const bool ok = _spi.get_global(ch, &v);
+            if (out) *out = v;
+            return ok;
+        }
+        case SpiOp::GLOBAL_COMMIT:
+            return _spi.global_commit();
+        case SpiOp::AUTO_TUNE: {
+            uint8_t result = 0; uint16_t div = 0;
+            const bool ok = _spi.auto_tune(&result, &div);
+            if (out) *out = (uint32_t)result | ((uint32_t)div << 8);
             return ok;
         }
         default:
@@ -164,10 +259,10 @@ bool Psoc::_exec_cmd(SpiOp op, uint8_t ch, uint8_t pid, uint32_t val, uint32_t* 
 
 // core0 侧: 入队一条 SPI 指令。写类(out==null)异步立即返回; 读类阻塞等本条结果。
 // core1 未接管(setup 阶段)时本核直执行, 避免死等无人消费的队列。
-bool Psoc::_submit(SpiOp op, uint8_t ch, uint8_t pid, uint32_t val, uint32_t* out) {
+bool Psoc::_submit(SpiOp op, uint8_t ch, uint8_t pid, uint32_t val, uint32_t* out, const uint8_t* data, uint32_t timeout_us) {
     if (!_spi_ready) return false;
     if (!_core1_running) {
-        return _exec_cmd(op, ch, pid, val, out);
+        return _exec_cmd(op, ch, pid, val, out, data);
     }
 
     const bool wait = (out != nullptr);   // 读类需返回值
@@ -185,6 +280,7 @@ bool Psoc::_submit(SpiOp op, uint8_t ch, uint8_t pid, uint32_t val, uint32_t* ou
     c.ch = ch;
     c.pid = pid;
     c.val = val;
+    c.data = data;
     c.result = 0;
     c.ok = false;
     c.done = false;
@@ -194,10 +290,14 @@ bool Psoc::_submit(SpiOp op, uint8_t ch, uint8_t pid, uint32_t val, uint32_t* ou
 
     if (!wait) return true;   // 写类: 异步, 立即返回
 
-    // 读类: 单生产者, 入队后本条槽位在读到 done 前不会被复用, 阻塞等结果。
+    // 读类/需等真实完成类: 单生产者, 入队后本条槽位在读到 done 前不会被复用, 阻塞等结果。
+    // 重操作(校准/apply/基线复位)在 core1 内轮询 PSoC busy 至真实完成, 耗时可达 ~1.5s,
+    // 故允许调用方给更长 timeout_us(默认 SPI_CMD_TIMEOUT_US)。
+    const uint32_t eff_timeout = (timeout_us != 0u) ? timeout_us : SPI_CMD_TIMEOUT_US;
     const uint32_t start = time_us_32();
     while (!c.done) {
-        if (time_us_32() - start > SPI_CMD_TIMEOUT_US) return false;   // 超时
+        if (time_us_32() - start > eff_timeout) return false;   // 超时
+        watchdog_update();   // 重操作阻塞等待可达~1.5s, 期间喂狗防 5s 看门狗误复位
         tight_loop_contents();
     }
     __dmb();
@@ -244,17 +344,112 @@ bool Psoc::get_raw(uint8_t ch, uint16_t* out) {
     if (out) *out = (uint16_t)r;
     return ok;
 }
+// ★真实完成反馈★: 改为阻塞等待——core1 执行时在 _spi.* 内轮询 PSoC busy 至真实完成,
+// 本调用直到 PSoC 主循环把重操作做完(或超时)才返回, 使 host ACK = 真正完成而非"命令已收到"。
+// timeout_us 需大于对应 _spi 内 _wait_op_done 上限 + SPI 往返余量。
 bool Psoc::apply_params() {
-    return _submit(SpiOp::APPLY, 0, 0, 0, nullptr);
+    uint32_t done = 0;
+    return _submit(SpiOp::APPLY, 0, 0, 0, &done, nullptr, 1200000u);
+}
+bool Psoc::calibrate() {
+    uint32_t done = 0;
+    return _submit(SpiOp::CALIBRATE, 0, 0, 0, &done, nullptr, 2000000u);
+}
+bool Psoc::baseline_reset() {
+    uint32_t done = 0;
+    return _submit(SpiOp::BASELINE_RESET, 0, 0, 0, &done, nullptr, 800000u);
+}
+// 频率自适应: 阻塞至 PSoC 逐档重校准完成(最多 ~10s)。out 打包 result(低8位) | div<<8。
+bool Psoc::auto_tune(uint8_t* out_result, uint16_t* out_div) {
+    uint32_t packed = 0;
+    const bool ok = _submit(SpiOp::AUTO_TUNE, 0, 0, 0, &packed, nullptr, 12000000u);
+    if (out_result) *out_result = (uint8_t)(packed & 0xFFu);
+    if (out_div) *out_div = (uint16_t)((packed >> 8) & 0xFFFFu);
+    return ok;
 }
 bool Psoc::set_mode(uint8_t mode) {
     return _submit(SpiOp::SET_MODE, mode, 0, 0, nullptr);
 }
 bool Psoc::measure_cp() {
-    return _submit(SpiOp::MEASURE_CP, 0, 0, 0, nullptr);   // 异步(写类), 立即返回
+    uint32_t acknowledged = 0;
+    // MEASURE_CP 必须等待 core1 完成实际 SPI 事务并收到 PSoC ACK，Host 才能回复 ACK。
+    return _submit(SpiOp::MEASURE_CP, 0, 0, 0, &acknowledged);
 }
 bool Psoc::get_cp(uint8_t ch, uint32_t* out) {
     return _submit(SpiOp::GET_CP, ch, 0, 0, out);          // 读类, 阻塞等结果
+}
+
+bool Psoc::upload_algo(const uint8_t* data, uint16_t len, uint16_t crc16) {
+    if (data == nullptr || len == 0 || len > 1024) return false;
+    // val 打包 crc16<<16 | len; 阻塞(out 非空)等 core1 完成整段下发+PSoC commit 校验。
+    uint32_t done = 0;
+    const uint32_t packed = ((uint32_t)crc16 << 16) | (uint32_t)len;
+    return _submit(SpiOp::UPLOAD_ALGO, 0, 0, packed, &done, data);
+}
+
+bool Psoc::get_algo_info(bool* out_valid, uint16_t* out_len) {
+    uint32_t r = 0;
+    const bool ok = _submit(SpiOp::GET_ALGO_INFO, 0, 0, 0, &r);
+    if (ok) {
+        if (out_valid) *out_valid = ((r >> 16) & 1u) != 0u;
+        if (out_len) *out_len = (uint16_t)(r & 0xFFFFu);
+    }
+    return ok;
+}
+
+bool Psoc::set_algo_rom(uint8_t ch, uint16_t rom) {
+    uint32_t done = 0;
+    return _submit(SpiOp::SET_ALGO_ROM, ch, 0, rom, &done);   // 阻塞, 校验 PSoC 回显
+}
+
+bool Psoc::get_algo_rom(uint8_t ch, uint16_t* out_rom) {
+    uint32_t r = 0;
+    const bool ok = _submit(SpiOp::GET_ALGO_ROM, ch, 0, 0, &r);
+    if (ok && out_rom) *out_rom = (uint16_t)(r & 0xFFFFu);
+    return ok;
+}
+
+bool Psoc::algo_get_trace(uint8_t ch, uint8_t idx, uint8_t* out_active, uint16_t* out_report) {
+    uint32_t r = 0;
+    const bool ok = _submit(SpiOp::ALGO_GET_TRACE, ch, idx, 0, &r);
+    if (ok) {
+        if (out_active) *out_active = (uint8_t)((r >> 16) & 0xFFu);
+        if (out_report) *out_report = (uint16_t)(r & 0xFFFFu);
+    }
+    return ok;
+}
+
+bool Psoc::algo_set_cfg(uint8_t idx, uint8_t val) {
+    uint32_t done = 0;
+    return _submit(SpiOp::ALGO_SET_CFG, idx, 0, val, &done);   // idx 走 ch 字段, 阻塞校验回显
+}
+
+bool Psoc::algo_get_cfg(uint8_t idx, uint8_t* out_val) {
+    uint32_t r = 0;
+    const bool ok = _submit(SpiOp::ALGO_GET_CFG, idx, 0, 0, &r);
+    if (ok && out_val) *out_val = (uint8_t)(r & 0xFFu);
+    return ok;
+}
+
+bool Psoc::set_global(uint8_t gparam_id, uint32_t value) {
+    uint32_t done = 0;
+    return _submit(SpiOp::SET_GLOBAL, gparam_id, 0, value, &done);   // gparam_id 走 ch 字段, 阻塞校验
+}
+
+bool Psoc::get_global(uint8_t gparam_id, uint32_t* out_value) {
+    return _submit(SpiOp::GET_GLOBAL, gparam_id, 0, 0, out_value);   // 读类, 阻塞
+}
+
+bool Psoc::global_commit() {
+    uint32_t done = 0;
+    return _submit(SpiOp::GLOBAL_COMMIT, 0, 0, 0, &done);   // 阻塞等 PSoC 完整重初始化触发确认
+}
+
+void Psoc::reset_run() {
+    _swd.reset_target_run();   // 脉冲 XRES 复位 PSoC 进运行态
+    // 设启动宽限: XRES 后 PSoC 需数百 ms 跑完 initialize_capsense 才恢复 SPI, 期间失效兜底
+    // 不得触发新的复位, 否则形成永久复位死循环(链路永不恢复)。core1 的失效检测读此截止时间。
+    _reset_grace_until_ms = millis() + RESET_BOOT_GRACE_MS;
 }
 
 bool Psoc::prepare_flash_indicator() {

@@ -228,7 +228,7 @@ bool PsocSpi::get_stats(uint32_t* out_scan_count) {
 }
 
 bool PsocSpi::measure_cp() {
-    // 触发逐电极 BIST 测量(PSoC 主循环执行,耗时);此处仅确认 ack,结果稍后经 get_cp 读回。
+    // 命令发送后等待并校验 PSoC SPI ACK；实际逐电极测量仍由 PSoC 主循环异步执行。
     uint8_t resp[7];
     if (!_cmd_txn((uint8_t)psoc::Cmd::MEASURE_CP, 0, 0, 0, resp)) return false;
     return resp[1] == (uint8_t)psoc::Cmd::MEASURE_CP;
@@ -242,17 +242,74 @@ bool PsocSpi::get_cp(uint8_t ch, uint32_t* out_cp) {
     return true;
 }
 
+// 轮询 GET_STATS.busy(resp[2]) 至 PSoC 主循环真正完成重操作。两阶段避免竞态:
+// 阶段1 等 busy 置起(确认命令已被 PSoC ISR 接收, 最多 40ms; 若操作极快已完成则超时后进阶段2);
+// 阶段2 等 busy 落下(真实完成, 最多 timeout_ms)。返回 true=真实完成, false=超时。
+bool PsocSpi::_wait_op_done(uint32_t timeout_ms) {
+    uint8_t resp[7];
+    // 阶段1: 等 busy=1
+    absolute_time_t d1 = make_timeout_time_ms(40);
+    for (;;) {
+        if (_cmd_txn((uint8_t)psoc::Cmd::GET_STATS, 0, 0, 0, resp) &&
+            resp[1] == (uint8_t)psoc::Cmd::GET_STATS && resp[2] != 0u) {
+            break;   // 已进入处理中
+        }
+        if (time_reached(d1)) break;   // 可能操作极快或已完成, 直接进阶段2
+        sleep_ms(2);
+    }
+    // 阶段2: 等 busy=0
+    absolute_time_t d2 = make_timeout_time_ms(timeout_ms);
+    for (;;) {
+        if (_cmd_txn((uint8_t)psoc::Cmd::GET_STATS, 0, 0, 0, resp) &&
+            resp[1] == (uint8_t)psoc::Cmd::GET_STATS && resp[2] == 0u) {
+            return true;   // 处理中锁定解除 = 真实完成
+        }
+        if (time_reached(d2)) return false;
+        sleep_ms(3);
+    }
+}
+
 bool PsocSpi::apply() {
     if (!_ready) return false;
-    // 发 APPLY（PSoC 主循环异步重校准，耗时数 ms）；给足时间后确认。
+    // 发 APPLY（PSoC 主循环异步重扫/重初始化）；轮询 busy 至真实完成而非盲等固定时间。
     uint8_t tx[7] = { psoc::FRAME_MAGIC, (uint8_t)psoc::Cmd::APPLY, 0, 0, 0, 0, 0 };
     uint8_t rx1[7] = {0};
     transfer(tx, rx1, 7);
-    sleep_ms(60);   // 等主循环执行 Cy_CapSense_Enable + 重扫
-    uint8_t tx2[7] = { psoc::FRAME_MAGIC, (uint8_t)psoc::Cmd::TOUCH, 0, 0, 0, 0, 0 };
-    uint8_t resp[7] = {0};
-    transfer(tx2, resp, 7);
-    return resp[0] == psoc::FRAME_MAGIC;
+    return _wait_op_done(800);   // 真实完成反馈(重初始化+首扫), 超时上限 800ms
+}
+
+bool PsocSpi::calibrate() {
+    if (!_ready) return false;
+    // CALIBRATE: PSoC 主循环执行 CalibrateAllWidgets(重算 IDAC, 全通道耗时) + 基线复位。
+    uint8_t tx[7] = { psoc::FRAME_MAGIC, (uint8_t)psoc::Cmd::CALIBRATE, 0, 0, 0, 0, 0 };
+    uint8_t rx1[7] = {0};
+    transfer(tx, rx1, 7);
+    return _wait_op_done(1500);  // 全通道 IDAC 校准更慢, 给足真实完成窗口
+}
+
+bool PsocSpi::baseline_reset() {
+    if (!_ready) return false;
+    // BASELINE_RESET: PSoC 主循环执行 InitializeAllBaselines。
+    uint8_t tx[7] = { psoc::FRAME_MAGIC, (uint8_t)psoc::Cmd::BASELINE_RESET, 0, 0, 0, 0, 0 };
+    uint8_t rx1[7] = {0};
+    transfer(tx, rx1, 7);
+    return _wait_op_done(500);
+}
+
+bool PsocSpi::auto_tune(uint8_t* out_result, uint16_t* out_div) {
+    if (!_ready) return false;
+    // 触发自适应: 逐档(最多 9 档)升分频重校准, 每档校准数百 ms → 给足 10s 真实完成窗口。
+    uint8_t tx[7] = { psoc::FRAME_MAGIC, (uint8_t)psoc::Cmd::AUTO_TUNE, 0, 0, 0, 0, 0 };
+    uint8_t rx1[7] = {0};
+    transfer(tx, rx1, 7);
+    if (!_wait_op_done(10000)) return false;   // busy 未在 10s 内清 = 超时
+    // 读结果: [magic, GET_AUTO_TUNE, result, 0, div24]。
+    uint8_t resp[7];
+    if (!_cmd_txn((uint8_t)psoc::Cmd::GET_AUTO_TUNE, 0, 0, 0, resp)) return false;
+    if (resp[1] != (uint8_t)psoc::Cmd::GET_AUTO_TUNE) return false;
+    if (out_result) *out_result = resp[2];
+    if (out_div) *out_div = (uint16_t)((uint32_t)resp[4] | ((uint32_t)resp[5] << 8));
+    return true;
 }
 
 bool PsocSpi::set_mode(uint8_t mode) {
@@ -260,6 +317,130 @@ bool PsocSpi::set_mode(uint8_t mode) {
     if (!_cmd_txn((uint8_t)psoc::Cmd::SET_MODE, mode, 0, 0, resp)) return false;
     // PSoC 回显 [magic, SET_MODE, applied_mode, ...]
     return resp[1] == (uint8_t)psoc::Cmd::SET_MODE;
+}
+
+// ---- JIT 算法 blob 下发 ----
+bool PsocSpi::algo_begin(uint16_t len) {
+    uint8_t resp[7];
+    if (!_cmd_txn((uint8_t)psoc::Cmd::ALGO_BEGIN, (uint8_t)(len & 0xFF), (uint8_t)((len >> 8) & 0xFF), 0, resp)) return false;
+    return resp[1] == (uint8_t)psoc::Cmd::ALGO_BEGIN;
+}
+
+bool PsocSpi::algo_page(uint8_t page, const uint8_t four[4]) {
+    // 帧 [magic,ALGO_PAGE,page,d0,d1,d2,d3]: b2=page, b3=four[0], val24=four[1..3]
+    uint8_t resp[7];
+    uint32_t v = (uint32_t)four[1] | ((uint32_t)four[2] << 8) | ((uint32_t)four[3] << 16);
+    if (!_cmd_txn((uint8_t)psoc::Cmd::ALGO_PAGE, page, four[0], v, resp)) return false;
+    return resp[1] == (uint8_t)psoc::Cmd::ALGO_PAGE && resp[2] == page;
+}
+
+bool PsocSpi::algo_end(uint16_t crc16, bool* out_ok, uint16_t* out_len) {
+    uint8_t resp[7];
+    if (!_cmd_txn((uint8_t)psoc::Cmd::ALGO_END, (uint8_t)(crc16 & 0xFF), (uint8_t)((crc16 >> 8) & 0xFF), 0, resp)) return false;
+    if (resp[1] != (uint8_t)psoc::Cmd::ALGO_END) return false;
+    if (out_ok) *out_ok = resp[2] != 0;
+    if (out_len) *out_len = (uint16_t)resp[4] | ((uint16_t)resp[5] << 8);
+    return true;
+}
+
+bool PsocSpi::algo_info(bool* out_valid, uint16_t* out_len) {
+    uint8_t resp[7];
+    if (!_cmd_txn((uint8_t)psoc::Cmd::ALGO_INFO, 0, 0, 0, resp)) return false;
+    if (resp[1] != (uint8_t)psoc::Cmd::ALGO_INFO) return false;
+    if (out_valid) *out_valid = resp[2] != 0;
+    if (out_len) *out_len = (uint16_t)resp[4] | ((uint16_t)resp[5] << 8);
+    return true;
+}
+
+bool PsocSpi::upload_algo(const uint8_t* data, uint16_t len, uint16_t crc16) {
+    if (!_ready || data == nullptr || len == 0 || len > 1024) return false;
+    if (!algo_begin(len)) return false;
+
+    const uint16_t pages = (uint16_t)((len + 3u) / 4u);   // 向上取整到 4 字节页
+    for (uint16_t p = 0; p < pages; ++p) {
+        uint8_t four[4] = {0, 0, 0, 0};
+        for (uint16_t b = 0; b < 4u; ++b) {
+            const uint32_t idx = (uint32_t)p * 4u + b;
+            if (idx < len) four[b] = data[idx];          // 末页不足 4 字节补 0
+        }
+        if (!algo_page((uint8_t)p, four)) return false;
+    }
+
+    bool end_ok = false;
+    uint16_t end_len = 0;
+    if (!algo_end(crc16, &end_ok, &end_len)) return false;
+
+    // PSoC commit 在其主循环执行(CRC16 校验+拷入槽); 轮询 ALGO_INFO 直到 valid 且 len 一致。
+    // 采样异常时 PSoC 主循环可能慢到 ~15Hz(≈66ms/圈), commit 需跨多圈才落地; 仅轮询 40ms 会
+    // 误判 "download failed"。放宽到 ~600ms(300×2ms)覆盖多个慢圈, 仍远短于用户可感知阻塞。
+    for (uint16_t i = 0; i < 300u; ++i) {
+        sleep_us(2000);
+        bool valid = false;
+        uint16_t vlen = 0;
+        if (algo_info(&valid, &vlen) && valid && vlen == len) return true;
+    }
+    return false;
+}
+
+bool PsocSpi::set_algo_rom(uint8_t ch, uint16_t rom) {
+    // 帧 [magic,ALGO_SET_ROM,ch,rom_lo,rom_hi,0,0]: b2=ch, b3=rom_lo, val24=rom_hi
+    uint8_t resp[7];
+    if (!_cmd_txn((uint8_t)psoc::Cmd::ALGO_SET_ROM, ch, (uint8_t)(rom & 0xFF), (uint32_t)(rom >> 8), resp)) return false;
+    return resp[1] == (uint8_t)psoc::Cmd::ALGO_SET_ROM && resp[2] == ch;
+}
+
+bool PsocSpi::get_algo_rom(uint8_t ch, uint16_t* out_rom) {
+    uint8_t resp[7];
+    if (!_cmd_txn((uint8_t)psoc::Cmd::ALGO_GET_ROM, ch, 0, 0, resp)) return false;
+    if (resp[1] != (uint8_t)psoc::Cmd::ALGO_GET_ROM || resp[2] != ch) return false;
+    if (out_rom) *out_rom = (uint16_t)resp[4] | ((uint16_t)resp[5] << 8);
+    return true;
+}
+
+bool PsocSpi::algo_get_trace(uint8_t ch, uint8_t idx, uint8_t* out_active, uint16_t* out_report) {
+    // 帧 [magic,ALGO_GET_TRACE,ch,idx,0,0,0] → 响应 [..,ch,out_active,report_lo,report_hi,0]
+    uint8_t resp[7];
+    if (!_cmd_txn((uint8_t)psoc::Cmd::ALGO_GET_TRACE, ch, idx, 0, resp)) return false;
+    if (resp[1] != (uint8_t)psoc::Cmd::ALGO_GET_TRACE || resp[2] != ch) return false;
+    if (out_active) *out_active = resp[3];
+    if (out_report) *out_report = (uint16_t)resp[4] | ((uint16_t)resp[5] << 8);
+    return true;
+}
+
+bool PsocSpi::algo_set_cfg(uint8_t idx, uint8_t val) {
+    // 帧 [magic,ALGO_SET_CFG,idx,val,0,0,0] → 响应回显 [..,idx,0,cfg[idx],0,0]
+    uint8_t resp[7];
+    if (!_cmd_txn((uint8_t)psoc::Cmd::ALGO_SET_CFG, idx, val, 0, resp)) return false;
+    return resp[1] == (uint8_t)psoc::Cmd::ALGO_SET_CFG && resp[2] == idx;
+}
+
+bool PsocSpi::algo_get_cfg(uint8_t idx, uint8_t* out_val) {
+    uint8_t resp[7];
+    if (!_cmd_txn((uint8_t)psoc::Cmd::ALGO_GET_CFG, idx, 0, 0, resp)) return false;
+    if (resp[1] != (uint8_t)psoc::Cmd::ALGO_GET_CFG || resp[2] != idx) return false;
+    if (out_val) *out_val = (uint8_t)resp[4];
+    return true;
+}
+
+bool PsocSpi::set_global(uint8_t gparam_id, uint32_t value) {
+    // 帧 [magic,SET_GLOBAL,gparam_id,0,val24]: b2=gparam_id, b3=0, val24=value
+    uint8_t resp[7];
+    if (!_cmd_txn((uint8_t)psoc::Cmd::SET_GLOBAL, gparam_id, 0, value, resp)) return false;
+    return resp[1] == (uint8_t)psoc::Cmd::SET_GLOBAL && resp[2] == gparam_id;
+}
+
+bool PsocSpi::get_global(uint8_t gparam_id, uint32_t* out_value) {
+    uint8_t resp[7];
+    if (!_cmd_txn((uint8_t)psoc::Cmd::GET_GLOBAL, gparam_id, 0, 0, resp)) return false;
+    if (resp[1] != (uint8_t)psoc::Cmd::GET_GLOBAL || resp[2] != gparam_id) return false;
+    if (out_value) *out_value = (uint32_t)resp[4] | ((uint32_t)resp[5] << 8) | ((uint32_t)resp[6] << 16);
+    return true;
+}
+
+bool PsocSpi::global_commit() {
+    uint8_t resp[7];
+    if (!_cmd_txn((uint8_t)psoc::Cmd::GLOBAL_COMMIT, 0, 0, 0, resp)) return false;
+    return resp[1] == (uint8_t)psoc::Cmd::GLOBAL_COMMIT;
 }
 
 bool PsocSpi::indicator_on() {

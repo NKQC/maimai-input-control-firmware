@@ -67,6 +67,8 @@ public:
     virtual bool config_write(const uint8_t* data, size_t length) = 0;
     virtual size_t config_read(uint8_t* buffer, size_t max_length) = 0;
     virtual size_t config_available() const = 0;
+    // 异步发送队列(vendor TX FIFO)当前剩余可写字节, 供发送方按余量决策(过载即弃/保留响应余量)。
+    virtual size_t config_write_available() const = 0;
     virtual void config_flush() = 0;
 
     // 获取实例名称
@@ -87,6 +89,7 @@ public:
     bool config_write(const uint8_t* data, size_t length) override;
     size_t config_read(uint8_t* buffer, size_t max_length) override;
     size_t config_available() const override;
+    size_t config_write_available() const override;
     void config_flush() override;
     std::string get_name() const override { return USB_DEVICE_NAME; }
 
