@@ -1,0 +1,13 @@
+# ★主线程栈必须放大到 16 MiB★
+#
+# MSVC 链接出来的 exe 默认只保留 1 MiB 主线程栈。Slint 的布局求值(layout info 收集 → 尺寸分配)
+# 是沿元素树递归的, 本工程设置页会一次性实例化 9 个子页(TabWidget 的行为), 且响应式改造后每页
+# 都套了 ScrollView(Flickable + 两条滚动条各自又是组件), 树的深度与广度都上了一个台阶 ——
+# 实测 9 页全启用时递归直接吃穿 1 MiB, 表现为进设置页立刻
+# "thread 'main' has overflowed its stack"; 而禁掉任意一页、或只留一页都不崩,
+# 正是"总量越过阈值"而非某一处绑定环的特征(绑定环会与页数无关地必崩)。
+#
+# 这里通过链接参数把主线程栈提到 16 MiB。之所以用链接参数而不是"把 UI 跑在自建大栈线程上":
+# winit/Slint 的事件循环在 Windows 上必须待在进程主线程, 不能挪走。
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "link-arg=/STACK:16777216"]

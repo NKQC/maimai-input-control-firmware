@@ -1,6 +1,7 @@
 #include "psoc.h"
 #include "../../config.h"
 #include "../../service/latency_stats.h"
+#include "../../hal/usb/hal_usb.h"
 #include <Arduino.h>
 #include <pico/stdlib.h>
 #include <hardware/sync.h>   // __dmb() / __sev() 跨核内存屏障
@@ -120,6 +121,16 @@ void Psoc::_spi_service() {
     // 4) 采样率统计: 每 ~500ms 读 PSoC scan_count 折算采样率/刷新周期。
     const uint32_t stats_now_us = time_us_32();
     if (stats_now_us - _stats_last_us >= 500000u) {
+        // ★XRES 启动宽限同样适用于"卡死"检测★: 复位后 PSoC 要重跑 initialize_capsense(数百 ms),
+        // 期间 scan_count 天然不推进。若此时不清零, 上一轮已攒到阈值的 _hang_intervals 会让兜底在
+        // PSoC 尚未启动完成时立刻再发一次 XRES → 反复复位 → 采样永远起不来(只能整机复位才恢复)。
+        // 同时清 primed: 跨复位的 scan_count 从 0 重新开始, 与旧值相减毫无意义。
+        if ((int32_t)(_reset_grace_until_ms - millis()) > 0) {
+            _hang_intervals = 0;
+            _stats_primed = false;
+            _stats_last_us = stats_now_us;
+            return;
+        }
         uint32_t sc = 0;
         if (ok && _spi.get_stats(&sc)) {
             if (_stats_primed) {
@@ -203,7 +214,13 @@ bool Psoc::_exec_cmd(SpiOp op, uint8_t ch, uint8_t pid, uint32_t val, uint32_t* 
             // val 打包 crc16<<16 | len; data 为 blob 指针(调用方持久缓冲)
             const uint16_t len = (uint16_t)(val & 0xFFFFu);
             const uint16_t crc = (uint16_t)((val >> 16) & 0xFFFFu);
-            return _spi.upload_algo(data, len, crc);
+            const bool ok = _spi.upload_algo(data, len, crc);
+            // 异步下发的真实结果只能在这里得知: 失败置标志由 core0 取走上报(SH_ALGO_FALLBACK detail=1),
+            // 忙标志同时释放, 允许下一次上传改写 blob。
+            if (!ok) _algo_dl.failed = 1u;
+            __dmb();
+            _algo_dl.busy = 0u;
+            return ok;
         }
         case SpiOp::GET_ALGO_INFO: {
             bool valid = false;
@@ -248,7 +265,22 @@ bool Psoc::_exec_cmd(SpiOp op, uint8_t ch, uint8_t pid, uint32_t val, uint32_t* 
             return _spi.global_commit();
         case SpiOp::AUTO_TUNE: {
             uint8_t result = 0; uint16_t div = 0;
-            const bool ok = _spi.auto_tune(&result, &div);
+            // ch 字段复用为目标通道(0xFF=全通道); pid 字段复用为灵敏度档位 pref(1..7)
+            // 阶段进度: 本核在 _spi.auto_tune 的阻塞等待中被回调, 经 seqlock 发布给 core0(推送上位机)。
+            _at_work.clear();
+            _at_work.req = _at_req;
+            _at_work.state = 1;
+            _at_work.ch = ch;
+            _publish_autotune();
+            const bool ok = _spi.auto_tune(ch, pid, &result, &div, &Psoc::_on_autotune_progress, this);
+            _at_work.state = 2;
+            _at_work.phase = 4;
+            _at_work.step = 0;
+            // 超时/链路失败按"失败"上报, 避免上位机永远等不到终态。
+            _at_work.result = (ok && result == 1u) ? 1u : 2u;
+            _at_work.div = (_at_work.result == 1u) ? div : 0u;
+            _at_work.cur_div = _at_work.div;
+            _publish_autotune();
             if (out) *out = (uint32_t)result | ((uint32_t)div << 8);
             return ok;
         }
@@ -271,6 +303,11 @@ bool Psoc::_submit(SpiOp op, uint8_t ch, uint8_t pid, uint32_t val, uint32_t* ou
     const uint32_t enq_start = time_us_32();
     while (((_cmd_head + 1u) % CMD_RING_SIZE) == _cmd_tail) {
         if (time_us_32() - enq_start > SPI_CMD_TIMEOUT_US) return false;
+        // ★保活 USB★: core1 执行重操作(如 CALIBRATE _wait_op_done ~1.5s)期间不消费命令环,
+        // 高频连发(如探针单轮 38 条 > 环深 32)会让 core0 卡在此入队自旋。与下方"等结果"环一致,
+        // 必须在此泵 tud_task 否则 TinyUSB 得不到服务 → 主机写超时拆端点掉线。
+        watchdog_update();
+        HAL_USB_Device::getInstance()->task();
         tight_loop_contents();
     }
 
@@ -298,6 +335,7 @@ bool Psoc::_submit(SpiOp op, uint8_t ch, uint8_t pid, uint32_t val, uint32_t* ou
     while (!c.done) {
         if (time_us_32() - start > eff_timeout) return false;   // 超时
         watchdog_update();   // 重操作阻塞等待可达~1.5s, 期间喂狗防 5s 看门狗误复位
+        HAL_USB_Device::getInstance()->task();
         tight_loop_contents();
     }
     __dmb();
@@ -344,28 +382,67 @@ bool Psoc::get_raw(uint8_t ch, uint16_t* out) {
     if (out) *out = (uint16_t)r;
     return ok;
 }
-// ★真实完成反馈★: 改为阻塞等待——core1 执行时在 _spi.* 内轮询 PSoC busy 至真实完成,
-// 本调用直到 PSoC 主循环把重操作做完(或超时)才返回, 使 host ACK = 真正完成而非"命令已收到"。
-// timeout_us 需大于对应 _spi 内 _wait_op_done 上限 + SPI 往返余量。
+// ★core0 非阻塞(修 USB 掉线)★: 保存流里会连发 参数×N + CALIBRATE, 若 core0 阻塞等真实完成
+// (~1.5s)会饿死 USB 服务 → 主机写超时 → "Missing config bulk OUT endpoint" 掉线。故这三类改为
+// 入队即返回(ACK 表示"已受理"); 重活仍由 core1 的 _spi.* 内 _wait_op_done 完成(只占用 core1,
+// 期间 touch 暂停但 core0/USB 正常)。完成后 raw 经遥测自然刷新, UI 无需阻塞等待。
 bool Psoc::apply_params() {
-    uint32_t done = 0;
-    return _submit(SpiOp::APPLY, 0, 0, 0, &done, nullptr, 1200000u);
+    return _submit(SpiOp::APPLY, 0, 0, 0, nullptr);
 }
 bool Psoc::calibrate() {
-    uint32_t done = 0;
-    return _submit(SpiOp::CALIBRATE, 0, 0, 0, &done, nullptr, 2000000u);
+    return _submit(SpiOp::CALIBRATE, 0, 0, 0, nullptr);
 }
 bool Psoc::baseline_reset() {
-    uint32_t done = 0;
-    return _submit(SpiOp::BASELINE_RESET, 0, 0, 0, &done, nullptr, 800000u);
+    return _submit(SpiOp::BASELINE_RESET, 0, 0, 0, nullptr);
 }
-// 频率自适应: 阻塞至 PSoC 逐档重校准完成(最多 ~10s)。out 打包 result(低8位) | div<<8。
-bool Psoc::auto_tune(uint8_t* out_result, uint16_t* out_div) {
+// 频率自适应: 阻塞至 PSoC 重校准完成。out 打包 result(低8位) | div<<8。
+// ch: 0..35=仅该通道, 0xFF=全通道逐通道各自校准(36 × 单通道 ≈ 11-23s) → 窗口 50s(> SPI 层 45s)。
+bool Psoc::auto_tune(uint8_t ch, uint8_t pref, uint8_t* out_result, uint16_t* out_div) {
     uint32_t packed = 0;
-    const bool ok = _submit(SpiOp::AUTO_TUNE, 0, 0, 0, &packed, nullptr, 12000000u);
+    const bool ok = _submit(SpiOp::AUTO_TUNE, ch, pref, 0, &packed, nullptr, 50000000u);
     if (out_result) *out_result = (uint8_t)(packed & 0xFFu);
     if (out_div) *out_div = (uint16_t)((packed >> 8) & 0xFFFFu);
     return ok;
+}
+// ★异步启动★: 入队即返回(同 calibrate/baseline_reset 的写类语义), core0 不再为 20-25s 长自适应干等。
+// 先自增 _at_req 再入队: core1 取到本条命令时回显该代号, core0 据此区分本轮进度与上一轮残留结果。
+bool Psoc::auto_tune_start(uint8_t ch, uint8_t pref) {
+    _at_req++;
+    __dmb();
+    return _submit(SpiOp::AUTO_TUNE, ch, pref, 0, nullptr);
+}
+
+// core1: 把工作副本发布为一致快照(多字段防撕裂, 同 _snapshot 的 seqlock 模式)。
+void Psoc::_publish_autotune() {
+    _at_seq++;            // 进入写临界区(奇)
+    __dmb();
+    _at_pub = _at_work;
+    __dmb();
+    _at_seq++;            // 离开写临界区(偶)
+}
+
+void Psoc::_on_autotune_progress(void* ctx, const psoc::AutoTuneProgress& p) {
+    Psoc* self = static_cast<Psoc*>(ctx);
+    if (self == nullptr) return;
+    self->_at_work.state = 1;
+    self->_at_work.phase = p.phase;
+    self->_at_work.step = p.step;
+    self->_at_work.cur_div = p.cur_div;
+    // 全通道模式下 PSoC 回显"当前正在处理的通道"→ 必须透传, 上位机才能显示 CHn/36 的逐通道进度。
+    self->_at_work.ch = p.ch;
+    self->_publish_autotune();
+}
+
+psoc::AutoTuneProgress Psoc::autotune_status() const {
+    uint32_t s1, s2;
+    do {
+        s1 = _at_seq;
+        __dmb();
+        _at_ro = _at_pub;
+        __dmb();
+        s2 = _at_seq;
+    } while ((s1 & 1u) || (s1 != s2));
+    return _at_ro;
 }
 bool Psoc::set_mode(uint8_t mode) {
     return _submit(SpiOp::SET_MODE, mode, 0, 0, nullptr);
@@ -381,10 +458,23 @@ bool Psoc::get_cp(uint8_t ch, uint32_t* out) {
 
 bool Psoc::upload_algo(const uint8_t* data, uint16_t len, uint16_t crc16) {
     if (data == nullptr || len == 0 || len > 1024) return false;
-    // val 打包 crc16<<16 | len; 阻塞(out 非空)等 core1 完成整段下发+PSoC commit 校验。
-    uint32_t done = 0;
+    // 上一次下发未完成时拒绝: blob 缓冲被 core1 持有, 此刻改写会让它下发出半新半旧的代码。
+    if (_algo_dl.busy != 0u) return false;
+    _algo_dl.busy = 1u;
+    __dmb();
+    // val 打包 crc16<<16 | len; 写类入队(out 为空)即返回, 重活全在 core1, core0 继续服务 USB。
     const uint32_t packed = ((uint32_t)crc16 << 16) | (uint32_t)len;
-    return _submit(SpiOp::UPLOAD_ALGO, 0, 0, packed, &done, data);
+    if (!_submit(SpiOp::UPLOAD_ALGO, 0, 0, packed, nullptr, data)) {
+        _algo_dl.busy = 0u;   // 入队都没成功: 立刻释放, 否则永久锁死上传通道
+        return false;
+    }
+    return true;
+}
+
+bool Psoc::algo_download_take_failure() {
+    if (_algo_dl.failed == 0u) return false;
+    _algo_dl.failed = 0u;
+    return true;
 }
 
 bool Psoc::get_algo_info(bool* out_valid, uint16_t* out_len) {
@@ -398,8 +488,10 @@ bool Psoc::get_algo_info(bool* out_valid, uint16_t* out_len) {
 }
 
 bool Psoc::set_algo_rom(uint8_t ch, uint16_t rom) {
-    uint32_t done = 0;
-    return _submit(SpiOp::SET_ALGO_ROM, ch, 0, rom, &done);   // 阻塞, 校验 PSoC 回显
+    // ★写类异步★: 一次算法下发要推 36 条 ROM, 逐条阻塞等 core1 回显会把 core0 按在 handler 里
+    // 数百 ms(且 core1 正忙于上一条 UPLOAD_ALGO 时每条都会撞上 100ms 超时假失败)。
+    // 入队即返回, core1 按 ring 顺序执行; 真值由 ALGO_GET_ROM 回读对账。
+    return _submit(SpiOp::SET_ALGO_ROM, ch, 0, rom, nullptr);
 }
 
 bool Psoc::get_algo_rom(uint8_t ch, uint16_t* out_rom) {
@@ -420,8 +512,8 @@ bool Psoc::algo_get_trace(uint8_t ch, uint8_t idx, uint8_t* out_active, uint16_t
 }
 
 bool Psoc::algo_set_cfg(uint8_t idx, uint8_t val) {
-    uint32_t done = 0;
-    return _submit(SpiOp::ALGO_SET_CFG, idx, 0, val, &done);   // idx 走 ch 字段, 阻塞校验回显
+    // 写类异步(同 set_algo_rom / set_global 的既有语义): idx 走 ch 字段, core1 按序执行。
+    return _submit(SpiOp::ALGO_SET_CFG, idx, 0, val, nullptr);
 }
 
 bool Psoc::algo_get_cfg(uint8_t idx, uint8_t* out_val) {
@@ -432,17 +524,18 @@ bool Psoc::algo_get_cfg(uint8_t idx, uint8_t* out_val) {
 }
 
 bool Psoc::set_global(uint8_t gparam_id, uint32_t value) {
-    uint32_t done = 0;
-    return _submit(SpiOp::SET_GLOBAL, gparam_id, 0, value, &done);   // gparam_id 走 ch 字段, 阻塞校验
+    // ★core0 非阻塞(修 USB 掉线)★: 保存改全局项时 _handle_global_set 会连续 set_global+global_commit,
+    // 若阻塞 core0(各~100ms)会饿死 USB → 主机写 SAVE_CONFIG 超时 → "Missing config bulk OUT endpoint"
+    // 掉线。改为入队即返回; 写影子(set_global)与完整重初始化(global_commit)由 core1 按 ring 顺序执行。
+    return _submit(SpiOp::SET_GLOBAL, gparam_id, 0, value, nullptr);   // gparam_id 走 ch 字段
 }
 
 bool Psoc::get_global(uint8_t gparam_id, uint32_t* out_value) {
-    return _submit(SpiOp::GET_GLOBAL, gparam_id, 0, 0, out_value);   // 读类, 阻塞
+    return _submit(SpiOp::GET_GLOBAL, gparam_id, 0, 0, out_value);   // 读类, 阻塞(按需, 不在保存热路径)
 }
 
 bool Psoc::global_commit() {
-    uint32_t done = 0;
-    return _submit(SpiOp::GLOBAL_COMMIT, 0, 0, 0, &done);   // 阻塞等 PSoC 完整重初始化触发确认
+    return _submit(SpiOp::GLOBAL_COMMIT, 0, 0, 0, nullptr);   // 非阻塞: core1 执行完整重初始化, 不阻塞 USB
 }
 
 void Psoc::reset_run() {

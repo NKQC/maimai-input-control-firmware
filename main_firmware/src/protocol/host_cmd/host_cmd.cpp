@@ -3,6 +3,7 @@
 #include "../../service/config_manager/config_manager.h"
 #include "../../service/psoc_updater/psoc_updater.h"
 #include "../../service/csd_config/csd_config.h"
+#include "../../service/self_heal/self_heal.h"
 #include "../psoc/psoc.h"
 #include "../../service/sensor_link/sensor_link.h"
 #include <cstring>
@@ -314,6 +315,24 @@ void HostCmdDispatcher::_handle_hello(const HostFrame& frame, uint8_t* resp_buf,
     append_u32(report.erase_first_nonzero_addr);
     append_u32(report.erase_first_nonzero_value);
     append_u32(report.erase_words_read);
+    // ★CSD 运行态标志(尾部追加, 向后兼容: 旧上位机按 report_length 解析会自然忽略)★
+    // bit0 = 上次"恢复默认"因 PSoC 采样异常(railed/停滞)拒绝固化基线 → 提示改用 PSoC 救砖。
+    resp.payload[resp.len++] = CsdConfig::getInstance()->baseline_untrusted() ? 0x01u : 0x00u;
+    // ★自持恢复事件计数(尾部追加, 旧上位机按 report_length 自然忽略)★: STREAM 推送是发射后不管的,
+    // 单靠它无法证明"一条都没漏"。这里给出累计/待发/被丢弃三个计数, 上位机可与自己收到的条数核对,
+    // 发现漏帧就明确提示, 而不是默认"没收到就等于没发生"。
+    {
+        SelfHeal* sh = SelfHeal::getInstance();
+        const uint16_t sh_total = sh->total();
+        const uint16_t sh_dropped = sh->dropped();
+        resp.payload[resp.len++] = static_cast<uint8_t>(sh_total);
+        resp.payload[resp.len++] = static_cast<uint8_t>(sh_total >> 8);
+        resp.payload[resp.len++] = static_cast<uint8_t>(sh_dropped);
+        resp.payload[resp.len++] = static_cast<uint8_t>(sh_dropped >> 8);
+        resp.payload[resp.len++] = sh->empty() ? 0x00u : 0x01u;
+    }
+    // CSD 真正运行模式由 RP2040 store 持有；追加在诊断尾部，旧上位机按 report_length 自然忽略。
+    resp.payload[resp.len++] = CsdConfig::getInstance()->mode();
     resp.payload[report_start + 1] = static_cast<uint8_t>(resp.len - report_start);
 
     *resp_len = HostCmdCodec::encode_frame(resp, resp_buf, 512);
@@ -806,7 +825,9 @@ static void _handle_reset_defaults(const HostFrame& frame, uint8_t* resp_buf, ui
     // 清 store 后 PSoC 启动 provisioning 跳过参数下发 → 用其生成的出厂默认(已验证 180Hz 正常),
     // 从而把被调崩(railed/降速)的 CSD 恢复到可用基线。
     ConfigManager::reset_to_defaults();
-    CsdConfig::getInstance()->clear();   // 清 CSD store(参数/全局无效) + 请求持久化
-    g_psoc_reboot_request = 1u;          // 重启 PSoC, 使其以出厂默认重新初始化 CSD
+    CsdConfig* csd = CsdConfig::getInstance();
+    csd->clear();              // 清 store → PSoC 重启后以出厂强制好全局(增益4/目标85)自动校准, 不再被坏全局污染
+    csd->request_recapture();  // 就绪后回读校准好的默认 → 切 SEMI 快速基线 → 持久化(正常半自动基线=默认)
+    g_psoc_reboot_request = 1u;          // 重启 PSoC, 使其以出厂默认重新初始化并自动校准 CSD
     *resp_len = HostCmdCodec::encode_ack(frame.seq, resp_buf, 512);
 }

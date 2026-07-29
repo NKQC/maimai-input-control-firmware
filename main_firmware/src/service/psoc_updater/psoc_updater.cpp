@@ -1,9 +1,13 @@
 #include "psoc_updater.h"
 
+#include <Arduino.h>
 #include <pico/stdlib.h>
+#include <hardware/watchdog.h>
 
 #include "../../protocol/psoc/psoc.h"
 #include "../../protocol/psoc/psoc_fw_image.h"
+#include "../../hal/usb/hal_usb.h"
+#include "../tx_scheduler/tx_scheduler.h"
 
 namespace {
 constexpr uint16_t FLAG_INDICATOR_APP = 1u << 0;
@@ -81,7 +85,7 @@ bool PsocUpdater::_fail(Psoc* psoc, PsocBringupStage stage) {
     return false;
 }
 
-bool PsocUpdater::run(Psoc* psoc) {
+bool PsocUpdater::run(Psoc* psoc, bool force_flash) {
     init();
     _report.last_stage = PsocBringupStage::SWD_READY;
     if (!psoc || !psoc->swd_ready()) {
@@ -89,7 +93,15 @@ bool PsocUpdater::run(Psoc* psoc) {
     }
 
     _report.last_stage = PsocBringupStage::INDICATOR_APP;
-    _report.indicator_app_ok = psoc->prepare_flash_indicator();
+    // ★运行期救砖不走 prepare_flash_indicator★: 它内部要发一条 SPI(indicator_on), 而运行期 PSoC SPI
+    // 由 core1 独占(PIO1), core0 再发就会撞车。白灯准备纯属指示, 故 force 路径只做 XRES 复位到已知态。
+    if (force_flash) {
+        psoc->reset_run();
+        sleep_ms(75);
+        _report.indicator_app_ok = false;
+    } else {
+        _report.indicator_app_ok = psoc->prepare_flash_indicator();
+    }
 
     _report.last_stage = PsocBringupStage::ACQUIRE;
     _capture_acquire(psoc);
@@ -119,8 +131,9 @@ bool PsocUpdater::run(Psoc* psoc) {
     // ★烧录版本/内容检查(省 PSoC flash 寿命)★：每次上电无条件擦写会快速耗尽 PSoC flash 擦写次数。
     // erase 前先只读 AHB 逐字比对当前 flash 与嵌入镜像; 一致则跳过 erase/program/verify, 直接运行。
     // 只读比对不消耗寿命; 内容不同(升级/损坏)时才擦写, 天然等价"版本检查"。
+    // ★救砖(force_flash)不走短路★: 目标是"无条件重刷"(内容一致但 RAM 态/扫描引擎已崩时也要恢复)。
     _report.last_stage = PsocBringupStage::VERIFY;
-    if (psoc->verify(PSOC_FW_IMAGE, PSOC_FW_IMAGE_LEN)) {
+    if (!force_flash && psoc->verify(PSOC_FW_IMAGE, PSOC_FW_IMAGE_LEN)) {
         _report.skipped_flash = true;
         _report.erase_ok = true;
         _report.program_ok = true;
@@ -193,7 +206,70 @@ bool PsocUpdater::run(Psoc* psoc) {
     return true;
 }
 
+// ---------------- 救砖: 强制重刷 + 重新应用 ----------------
+
+void PsocUpdater::rescue_request() {
+    _rescue_pending = true;
+    _rescue_phase = PsocRescuePhase::FLASHING;
+    _rescue_result = 0;
+}
+
+uint8_t PsocUpdater::rescue_state() const {
+    switch (_rescue_phase) {
+        case PsocRescuePhase::IDLE:    return 0u;
+        case PsocRescuePhase::DONE:
+        case PsocRescuePhase::FAILED:  return 2u;
+        default:                       return 1u;
+    }
+}
+
+// SWD 擦写/校验内层循环的保活: 喂狗 + 泵 USB(否则主机写超时拆 vendor 端点=掉线) + 推送阶段进度。
+// TxScheduler::tick 自带 200ms 节流, 故此处高频调用不会刷爆端点; 与主循环共用同一发送路径。
+void PsocUpdater::_keepalive() {
+    watchdog_update();
+    HAL_USB_Device::getInstance()->task();
+    TxScheduler::getInstance()->tick();
+}
+
+bool PsocUpdater::rescue_step(Psoc* psoc) {
+    if (!_rescue_pending || psoc == nullptr) return false;
+    _rescue_pending = false;
+
+    // ACK 已由 UsbComm 写入 TX FIFO: 先泵几轮把它送出, 再进入数秒的 SWD 擦写窗口。
+    for (uint8_t i = 0; i < 8u; i++) {
+        HAL_USB_Device::getInstance()->task();
+        TxScheduler::getInstance()->tick();
+        sleep_ms(1);
+    }
+
+    SwdProgrammer::set_keepalive(&PsocUpdater::_keepalive);
+    const bool ok = run(psoc, /*force_flash=*/true);   // 复用启动期完整流程(acquire→擦→写→校验→运行)
+    SwdProgrammer::set_keepalive(nullptr);             // 启动期与常规路径不再保活(避免意外重入)
+
+    if (!ok) {
+        _rescue_phase = PsocRescuePhase::FAILED;
+        _rescue_result = 2u;
+        return false;
+    }
+    // 重刷后 PSoC RAM 内的算法/CSD 参数全部丢失 → 交回主循环的 provisioning 重新下发(唯一入口)。
+    _rescue_phase = PsocRescuePhase::REAPPLY;
+    _rescue_deadline_ms = millis() + 8000u;   // 链路+下发正常只需数百 ms; 超时判失败并交回兜底
+    return true;
+}
+
+void PsocUpdater::rescue_note_reapplied() {
+    if (_rescue_phase != PsocRescuePhase::REAPPLY) return;
+    _rescue_phase = PsocRescuePhase::DONE;
+    _rescue_result = 1u;
+}
+
 void PsocUpdater::update() {
+    // 救砖"重新应用"超时兜底: 退出 REAPPLY 使 rescue_active() 转假, 失效兜底(XRES)重新生效。
+    if (_rescue_phase == PsocRescuePhase::REAPPLY &&
+        (int32_t)(millis() - _rescue_deadline_ms) >= 0) {
+        _rescue_phase = PsocRescuePhase::FAILED;
+        _rescue_result = 2u;
+    }
     Psoc* psoc = Psoc::getInstance();
     _report.link_ok = psoc->link_ok();
     _report.snapshot_valid = psoc->snapshot_valid();

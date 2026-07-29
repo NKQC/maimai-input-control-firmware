@@ -1,0 +1,149 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <!--
+    WIL + C++/WinRT 两个 nuget 包的位置。优先仓库内 vcam_source_cpp\packages(离线拷贝),
+    否则用参考工程已还原好的 %ProgramData%\vcamref\packages。
+    可用 /p:VCamPackagesDir=<路径>\ 覆盖, 不把任何机器绝对路径写成唯一方案。
+  -->
+  <PropertyGroup Label="Mai2VcamPackages">
+    <VCamPackagesDir Condition="'$(VCamPackagesDir)' == '' And Exists('$(MSBuildThisFileDirectory)packages')">$(MSBuildThisFileDirectory)packages\</VCamPackagesDir>
+    <VCamPackagesDir Condition="'$(VCamPackagesDir)' == ''">$(ProgramData)\vcamref\packages\</VCamPackagesDir>
+    <VCamCppWinRTDir>$(VCamPackagesDir)Microsoft.Windows.CppWinRT.3.0.260520.1\build\native\</VCamCppWinRTDir>
+    <VCamWilDir>$(VCamPackagesDir)Microsoft.Windows.ImplementationLibrary.1.0.260126.7\build\native\</VCamWilDir>
+  </PropertyGroup>
+  <Import Project="$(VCamCppWinRTDir)Microsoft.Windows.CppWinRT.props" Condition="Exists('$(VCamCppWinRTDir)Microsoft.Windows.CppWinRT.props')" />
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <VCProjectVersion>17.0</VCProjectVersion>
+    <Keyword>Win32Proj</Keyword>
+    <ProjectGuid>{6d1a7c4e-9b28-4f31-8c6d-1a5e3b70d942}</ProjectGuid>
+    <RootNamespace>mai2vcam_source</RootNamespace>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
+    <ConfigurationType>DynamicLibrary</ConfigurationType>
+    <UseDebugLibraries>true</UseDebugLibraries>
+    <PlatformToolset>v143</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
+    <ConfigurationType>DynamicLibrary</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>v143</PlatformToolset>
+    <WholeProgramOptimization>true</WholeProgramOptimization>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <ImportGroup Label="ExtensionSettings">
+  </ImportGroup>
+  <ImportGroup Label="Shared">
+  </ImportGroup>
+  <ImportGroup Label="PropertySheets">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <PropertyGroup Label="UserMacros" />
+  <!-- 产物路径固定, build.rs 直接按 x64\Release\mai2vcam_source.dll 取用。 -->
+  <PropertyGroup>
+    <TargetName>mai2vcam_source</TargetName>
+    <OutDir>$(MSBuildThisFileDirectory)x64\$(Configuration)\</OutDir>
+    <IntDir>$(MSBuildThisFileDirectory)x64\$(Configuration)\obj\</IntDir>
+  </PropertyGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <ClCompile>
+      <WarningLevel>Level3</WarningLevel>
+      <SDLCheck>true</SDLCheck>
+      <PreprocessorDefinitions>_DEBUG;_WINDOWS;_USRDLL;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <ConformanceMode>true</ConformanceMode>
+      <PrecompiledHeader>Use</PrecompiledHeader>
+      <PrecompiledHeaderFile>pch.h</PrecompiledHeaderFile>
+      <LanguageStandard>stdcpp20</LanguageStandard>
+      <RuntimeLibrary>MultiThreadedDebug</RuntimeLibrary>
+      <!-- 源码含中文注释, 不加 /utf-8 会按 CP936 解码导致注释吞行。 -->
+      <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
+    </ClCompile>
+    <Link>
+      <SubSystem>Windows</SubSystem>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+      <EnableUAC>false</EnableUAC>
+      <ModuleDefinitionFile>mai2vcam_source.def</ModuleDefinitionFile>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <ClCompile>
+      <WarningLevel>Level3</WarningLevel>
+      <FunctionLevelLinking>true</FunctionLevelLinking>
+      <IntrinsicFunctions>true</IntrinsicFunctions>
+      <SDLCheck>true</SDLCheck>
+      <PreprocessorDefinitions>NDEBUG;_WINDOWS;_USRDLL;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <ConformanceMode>true</ConformanceMode>
+      <PrecompiledHeader>Use</PrecompiledHeader>
+      <PrecompiledHeaderFile>pch.h</PrecompiledHeaderFile>
+      <LanguageStandard>stdcpp20</LanguageStandard>
+      <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
+      <!-- 源码含中文注释, 不加 /utf-8 会按 CP936 解码导致注释吞行。 -->
+      <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
+    </ClCompile>
+    <Link>
+      <SubSystem>Windows</SubSystem>
+      <EnableCOMDATFolding>true</EnableCOMDATFolding>
+      <OptimizeReferences>true</OptimizeReferences>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+      <EnableUAC>false</EnableUAC>
+      <ModuleDefinitionFile>mai2vcam_source.def</ModuleDefinitionFile>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <ClInclude Include="Activator.h" />
+    <ClInclude Include="EnumNames.h" />
+    <ClInclude Include="FrameReader.h" />
+    <ClInclude Include="framework.h" />
+    <ClInclude Include="MediaSource.h" />
+    <ClInclude Include="MediaStream.h" />
+    <ClInclude Include="MFTools.h" />
+    <ClInclude Include="pch.h" />
+    <ClInclude Include="resource.h" />
+    <ClInclude Include="Tools.h" />
+    <ClInclude Include="Undocumented.h" />
+    <ClInclude Include="WinTrace.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="Activator.cpp" />
+    <ClCompile Include="dllmain.cpp" />
+    <ClCompile Include="EnumNames.cpp" />
+    <ClCompile Include="FrameReader.cpp" />
+    <ClCompile Include="MediaSource.cpp" />
+    <ClCompile Include="MediaStream.cpp" />
+    <ClCompile Include="MFTools.cpp" />
+    <ClCompile Include="pch.cpp">
+      <PrecompiledHeader>Create</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="Tools.cpp" />
+    <ClCompile Include="WinTrace.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="packages.config" />
+    <None Include="mai2vcam_source.def" />
+  </ItemGroup>
+  <ItemGroup>
+    <ResourceCompile Include="mai2vcam_source.rc" />
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <ImportGroup Label="ExtensionTargets">
+    <Import Project="$(VCamWilDir)Microsoft.Windows.ImplementationLibrary.targets" Condition="Exists('$(VCamWilDir)Microsoft.Windows.ImplementationLibrary.targets')" />
+    <Import Project="$(VCamCppWinRTDir)Microsoft.Windows.CppWinRT.targets" Condition="Exists('$(VCamCppWinRTDir)Microsoft.Windows.CppWinRT.targets')" />
+  </ImportGroup>
+  <Target Name="EnsureVCamPackages" BeforeTargets="PrepareForBuild">
+    <Error Condition="!Exists('$(VCamWilDir)Microsoft.Windows.ImplementationLibrary.targets')" Text="缺少 WIL nuget 包: $(VCamWilDir) 不存在。用 /p:VCamPackagesDir=&lt;packages 目录&gt;\ 指定, 或把包还原到 $(MSBuildThisFileDirectory)packages\。" />
+    <Error Condition="!Exists('$(VCamCppWinRTDir)Microsoft.Windows.CppWinRT.props')" Text="缺少 C++/WinRT nuget 包: $(VCamCppWinRTDir) 不存在。用 /p:VCamPackagesDir=&lt;packages 目录&gt;\ 指定, 或把包还原到 $(MSBuildThisFileDirectory)packages\。" />
+  </Target>
+</Project>

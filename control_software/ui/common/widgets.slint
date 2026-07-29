@@ -1,0 +1,290 @@
+// ==========================================================================
+// 公共可复用组件 (跨页面共享, 不含任何页面业务逻辑)
+// ==========================================================================
+
+import { HorizontalBox, SpinBox, CheckBox, LineEdit } from "std-widgets.slint";
+import { ParamRow, AlgoSettingRow } from "types.slint";
+import { Theme } from "theme.slint";
+
+// ============================================================================
+// 通用可折叠区块
+// ============================================================================
+
+// 标题行(箭头 + 标题 + 右侧摘要) + 内容区(仅展开时实例化)。
+// 折叠态由使用方的 in-out property 提供并两向绑定 → 存到 AppWindow 中, 切页重建也不丢。
+// 交互沿用项目既有手写风格(Rectangle + TouchArea), 不引入第三方控件。
+export component CollapsibleSection inherits Rectangle {
+    in property <string> title;
+    // 折叠时显示在标题行右侧的一行摘要, 收起状态也能一眼看到关键值。
+    in property <string> summary;
+    in-out property <bool> expanded: false;
+
+    border-radius: Theme.radius;
+    border-width: 1px;
+    border-color: Theme.border;
+    background: Theme.panel;
+
+    VerticalLayout {
+        padding: Theme.gap;
+        spacing: Theme.gap;
+
+        Rectangle {
+            height: 24px;
+            HorizontalLayout {
+                spacing: Theme.gap;
+                Text {
+                    width: 14px;
+                    text: root.expanded ? "▼" : "▶";
+                    color: Theme.accent;
+                    font-size: Theme.fs-normal;
+                    vertical-alignment: center;
+                }
+                Text {
+                    text: root.title;
+                    color: Theme.text-title;
+                    font-weight: 700;
+                    font-size: Theme.fs-title;
+                    vertical-alignment: center;
+                }
+                Text {
+                    // 展开后摘要让位给内容, 避免同一信息两处并存。
+                    text: root.expanded ? "" : root.summary;
+                    color: Theme.text-sub;
+                    font-size: Theme.fs-normal;
+                    vertical-alignment: center;
+                    horizontal-alignment: right;
+                    horizontal-stretch: 1;
+                    overflow: elide;
+                }
+            }
+            TouchArea {
+                mouse-cursor: pointer;
+                clicked => { root.expanded = !root.expanded; }
+            }
+        }
+
+        // 内容区。Slint 不允许把 @children 放进条件元素(if), 故折叠用"高度归零 + clip 裁切"实现,
+        // 展开时高度取内容自身首选高度 ——效果等价于条件实例化, 且外层布局会随之伸缩。
+        Rectangle {
+            clip: true;
+            height: root.expanded ? body.preferred-height : 0px;
+            body := VerticalLayout {
+                padding: 0px;
+                spacing: Theme.gap;
+                @children
+            }
+        }
+    }
+}
+
+// 单通道参数编辑行。分辨率等需全通道一致的参数由 Rust 侧统一处理, 不再提供逐行"应用全部"。
+export component ParamEditorRow inherits HorizontalBox {
+    in property <ParamRow> entry;
+    // 未读取真值时不允许编辑；AUTO 时明确显示文本，避免自动计算值被误认为手动设置。
+    in property <bool> mode_known: false;
+    in property <bool> auto_mode: false;
+    callback edited(int, int);
+
+    padding: 0px;
+    spacing: Theme.gap;
+    height: Theme.row-height;
+
+    // 标签占剩余宽度并在过窄时省略, 保证 SpinBox 与按钮始终在 360px 参数区内不越界。
+    Text {
+        text: root.entry.label;
+        horizontal-stretch: 1;
+        overflow: elide;
+        wrap: no-wrap;
+        vertical-alignment: center;
+    }
+    if root.auto_mode || !root.mode_known: Text {
+        text: root.mode_known ? "AUTO" : @tr("读取中…");
+        color: root.mode_known ? Theme.accent : Theme.muted;
+        min-width: Theme.spin-width;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+    param_value := SpinBox {
+        visible: root.mode_known && !root.auto_mode;
+        horizontal-stretch: 0;
+        min-width: Theme.spin-width;
+        minimum: 0;
+        maximum: 65535;
+        value: root.entry.value;
+        edited(v) => { root.edited(root.entry.param_id, v); }
+    }
+}
+
+// 可调变量编辑行: 0..255(u8), 与 ParamEditorRow 分开(范围不同, 语义是共享算法 cfg 而非 CSD 参数)。
+export component AlgoSettingEditorRow inherits HorizontalBox {
+    in property <AlgoSettingRow> entry;
+    callback edited(int, int);
+
+    padding: 0px;
+    spacing: Theme.gap;
+    height: Theme.row-height;
+
+    Text {
+        text: root.entry.name + " (cfg[" + root.entry.idx + "], " + @tr("默认") + " " + root.entry.default_val + ")";
+        horizontal-stretch: 1;
+        overflow: elide;
+        wrap: no-wrap;
+        vertical-alignment: center;
+        color: Theme.text-strong;
+    }
+    SpinBox {
+        horizontal-stretch: 0;
+        min-width: Theme.spin-width;
+        minimum: 0;
+        maximum: 255;
+        value: root.entry.value;
+        edited(v) => { root.edited(root.entry.idx, v); }
+    }
+}
+
+// 主图里的一条折线。所有线共用同一套 viewbox 视图变换(缩放/平移永不错层), 数据坐标固定 1000x1000。
+//
+// ★为什么必须 fit: fill★: Path 的 `fit` 默认是 contain, 即"等比缩放 + 居中"(lyon FitStyle::Min)。
+// 等比缩放下, 只有 viewbox 宽高比恰好等于元素宽高比时才铺满; 一旦横向缩放时间窗(viewbox 变窄而
+// 高度不变), 宽高比立刻失配 → 内容按高度等比缩放后横向只占一小条, 左右对称留出空白带。
+// 这是无法用"给 x 乘绘图区宽高比"绕过的: 那个修正只在横纵缩放倍数相同(全览)时成立: 缩放后必然破功。
+// fill = FitStyle::Stretch(非等比拉伸), 任意宽高比的 viewbox 都被拉满元素矩形 → 缩放/平移到任何
+// 极端位置都铺满可视区, 且 x 值域可固定为 [0,1000], 缩放不必回 Rust 重算 path。
+export component PlotPath inherits Path {
+    in property <float> vx;
+    in property <float> vy;
+    in property <float> vw: 1000;
+    in property <float> vh: 1000;
+
+    x: 0;
+    y: 0;
+    width: 100%;
+    height: 100%;
+    fit: fill;
+    viewbox-x: root.vx;
+    viewbox-y: root.vy;
+    viewbox-width: root.vw;
+    viewbox-height: root.vh;
+}
+
+// 二值算法线的"归一化幅度 N"输入: 把 0/1 拉伸到 0..N, 否则它在共享右轴上就是贴底的一条直线。
+// ★为什么用 init 而不是把 text 绑到 value★: 上报折线模型每帧(30Hz)都可能整行替换, 若 text 绑定
+// 模型字段, 输入过程中会被回填反复重置(光标乱跳、输入被吞)。改成初始化取一次 + 回车提交。
+export component BinAmpEditor inherits HorizontalLayout {
+    in property <string> label: "×";
+    in property <float> value: 1;
+    callback changed(float);
+
+    spacing: 3px;
+    Text {
+        text: root.label;
+        color: Theme.accent;
+        font-size: Theme.fs-small;
+        vertical-alignment: center;
+    }
+    LineEdit {
+        width: 62px;
+        font-size: Theme.fs-normal;
+        input-type: decimal;
+        init => { self.text = Math.round(root.value * 1000) / 1000; }
+        accepted(t) => { root.changed(t.to-float()); }
+    }
+}
+
+// 右列"数据序列"里的一行: 同色线标 + 勾选 + (仅二值线才有的)归一化幅度 N。
+// ★为什么抽成组件★: "原生数据读取"组与"算法上报变量"组的行结构完全一致, 两处各写一遍必然
+// 越改越长歪; 抽出来后两组各自只是"往 VerticalLayout 里塞若干 SeriesRow", 项数变化由布局
+// 自动增行, 无处需要写死行数或行高之和。
+export component SeriesRow inherits HorizontalLayout {
+    in property <string> label;
+    // 线标颜色 = 主图里那条线的颜色: 看图时不必靠猜哪条线对应哪个变量。
+    in property <color> tint;
+    in property <bool> checked;
+    // 只有取值恒为 0/1 的二值线需要归一化幅度; 非二值线给了也无意义, 纯占宽度。
+    in property <bool> has_norm: false;
+    in property <float> norm: 1;
+    callback toggled(bool);
+    callback norm_changed(float);
+
+    spacing: 4px;
+    Text {
+        text: "—";
+        color: root.tint;
+        font-size: 15px;
+        width: 14px;
+        vertical-alignment: center;
+        horizontal-alignment: center;
+    }
+    CheckBox {
+        text: root.label;
+        checked: root.checked;
+        horizontal-stretch: 1;
+        toggled => { root.toggled(self.checked); }
+    }
+    if root.has_norm: BinAmpEditor {
+        value: root.norm;
+        changed(v) => { root.norm_changed(v); }
+    }
+}
+
+// 组合键捕获输入框: 转交焦点后在 0.5 秒无新按键时自动退出录制。
+export component KeyCaptureBox inherits Rectangle {
+    in property <string> display;
+    callback captured(string, bool, bool, bool, bool);  // text, ctrl, shift, alt, gui
+    property <bool> _recording: false;
+    property <duration> _capture_idle_timeout: 500ms;
+    forward-focus: fs;
+    height: 28px;
+    border-width: 1px;
+    border-radius: Theme.radius-small;
+    border-color: root._recording ? #4a90d9 : Theme.border-light;
+    background: root._recording ? #16222e : #262b31;
+
+    // 空闲焦点置于捕获域外，超时后既停止 key-pressed 冒泡也清除录制角标。
+    idle_focus := FocusScope { }
+    fs := FocusScope {
+        width: parent.width;
+        height: parent.height;
+        key-pressed(e) => {
+            root._recording = false;
+            root._recording = true;
+            root.captured(e.text, e.modifiers.control, e.modifiers.shift, e.modifiers.alt, e.modifiers.meta);
+            return accept;
+        }
+        TouchArea {
+            mouse-cursor: pointer;
+            // clicked 不会在 ScrollView 的滚动拖拽结束后触发，避免滚动误进录制态。
+            clicked => {
+                fs.focus();
+                root._recording = false;
+                root._recording = true;
+            }
+        }
+    }
+    key_idle := Timer {
+        interval: root._capture_idle_timeout;
+        running: root._recording;
+        triggered => {
+            root._recording = false;
+            idle_focus.focus();
+        }
+    }
+    // 始终显示当前组合键(捕获后立即更新, 不再被焦点占位符遮挡); 录制时右侧显示角标。
+    Text {
+        x: 8px;
+        width: parent.width - 74px;
+        vertical-alignment: center;
+        overflow: elide;
+        text: root.display;
+        color: root._recording ? Theme.accent : #d0d6dd;
+    }
+    Text {
+        x: parent.width - 64px;
+        width: 60px;
+        vertical-alignment: center;
+        horizontal-alignment: right;
+        font-size: Theme.fs-small;
+        text: root._recording ? @tr("⌨ 录制中") : "";
+        color: Theme.accent;
+    }
+}

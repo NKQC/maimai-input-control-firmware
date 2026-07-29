@@ -129,6 +129,8 @@ constexpr uint8_t REG_XPSR = 16;
 
 // ============================================================
 
+SwdProgrammer::KeepAliveFn SwdProgrammer::_keepalive = nullptr;
+
 SwdProgrammer::SwdProgrammer(uint8_t io_pin, uint8_t clk_pin, uint8_t rst_pin)
     : _io_pin(io_pin), _clk_pin(clk_pin), _rst_pin(rst_pin),
       _pio(nullptr), _sm(0), _offset(0), _ready(false), _last_idcode(0),
@@ -764,6 +766,7 @@ void SwdProgrammer::_scan_erased_flash() {
             _erase_first_nonzero_value = value;
         }
         ++_erase_words_read;
+        if ((_erase_words_read & 0x3FFu) == 0u) _keepalive_tick();   // 32K 字全片扫描: 定期保活
     }
     _erase_scan_complete = _erase_words_read == psoc::flash::SIZE / sizeof(uint32_t);
 }
@@ -884,6 +887,7 @@ bool SwdProgrammer::program_flash(const uint8_t* data, uint32_t len) {
             _last_fail_row = row;
             return false;
         }
+        if ((row & 0x07u) == 0u) _keepalive_tick();   // 每 8 行(2KB)保活: 喂狗 + 泵 USB + 推进度
     }
     return true;
 }
@@ -893,6 +897,7 @@ bool SwdProgrammer::verify_flash(const uint8_t* data, uint32_t len) {
         (len % 4) != 0) return false;
     // flash 直接映射到 CPU 地址空间自 0x00000000，按 4 字节读回比对
     for (uint32_t addr = 0; addr < len; addr += 4) {
+        if ((addr & 0xFFFu) == 0u) _keepalive_tick();   // 每 4KB 保活(全片校验数千次读)
         uint32_t expect = (uint32_t)data[addr] |
                           ((uint32_t)data[addr + 1] << 8) |
                           ((uint32_t)data[addr + 2] << 16) |

@@ -1,0 +1,686 @@
+import { Button, ComboBox, VerticalBox, HorizontalBox, GroupBox, CheckBox, SpinBox, ScrollView, TabWidget, Slider } from "std-widgets.slint";
+
+
+// ============================================================================
+// 触控全局调整页:CSD 处理模式 + 全局 CSD 硬件设置(从单通道精调/算法页集中迁入)
+// ============================================================================
+
+// 时钟树只读固定节点卡片: 灰底, 无编辑控件, 仅展示名称 + 值。
+export component ClockFixedNode inherits Rectangle {
+    in property <string> node_title;
+    in property <string> node_value;
+
+    width: 128px;
+    height: 54px;
+    border-radius: 6px;
+    background: #1c2228;
+    border-width: 1px;
+    border-color: #3a434c;
+
+    VerticalBox {
+        padding: 6px;
+        spacing: 2px;
+        alignment: center;
+        Text {
+            text: root.node_title;
+            font-size: 11px;
+            color: #8a949e;
+            horizontal-alignment: center;
+            wrap: word-wrap;
+        }
+        Text {
+            text: root.node_value;
+            font-size: 13px;
+            font-weight: 700;
+            color: #d8e0e8;
+            horizontal-alignment: center;
+            wrap: word-wrap;
+        }
+    }
+}
+
+// 水平连接箭头(→), 用于同一行节点之间。
+export component ClockArrowRight inherits Text {
+    text: "→";
+    color: #4a5560;
+    font-size: 18px;
+    vertical-alignment: center;
+    horizontal-alignment: center;
+    width: 22px;
+}
+
+// 垂直连接箭头(↓), 用于跨行连接。
+export component ClockArrowDown inherits Text {
+    text: "↓";
+    color: #4a5560;
+    font-size: 18px;
+    horizontal-alignment: center;
+    height: 20px;
+}
+
+export component GlobalTunePage inherits Rectangle {
+    in-out property <int> scan_mode: 0;
+    // 仅从设备诊断读到真实模式后显示下拉；未读到时不能用默认值冒充设备状态。
+    in property <bool> mode_known: false;
+    in property <int> g_inactive_sns: 1;   // 1=GND 2=High-Z 4=Shield
+    in property <int> g_idac_gain: 4;
+    in property <int> g_idac_sense_config: 0;   // 0=IDAC sourcing, 1=IDAC sinking
+    in property <int> g_auto_calibrate: 1;      // 1=自动校准, 0=固定IDAC(不自动校准)
+    in property <int> g_idac_min: 20;
+    in property <int> g_raw_target: 85;
+    in property <int> g_mfs_div_f1: 1;
+    in property <int> g_mfs_div_f2: 2;
+    // 以下两项始终显示 CH0 的当前值，编辑时统一写入全部 36 通道。
+    in property <int> csd_sns_clk_div: 0;
+    in property <int> csd_resolution: 0;
+    in property <int> csd_sns_clk_source: 0;
+    // snsClk 分频为【逐通道】参数, 时钟树显示全 36 通道的 min–max 范围(0=未知)。
+    in property <int> csd_sns_clk_div_min: 0;
+    in property <int> csd_sns_clk_div_max: 0;
+    // 异常采样标识(顶部醒目状态行) + 等级(0 正常 / 1 警告 / 2 异常)。
+    in property <string> sampling_advice: "";
+    in property <int> sampling_advice_level: 0;
+    callback psoc_rescue();                // PSoC 救砖: SWD 强制重刷 + 重新应用
+    // 救砖二次确认: 第一次点击置真(按钮变"确认救砖?"), 再点才真正执行, 切页/完成后复位。
+    in-out property <bool> rescue_confirm: false;
+    // 全通道频率自适应会改写全部 snsClk 分频且无法撤销，复用救砖的两段确认门控。
+    in-out property <bool> auto_tune_confirm: false;
+    // SettingsPage 切离本页时清理所有危险操作确认态。
+    in property <bool> page_active: false;
+    changed page_active => {
+        if (!root.page_active) {
+            root.rescue_confirm = false;
+            root.auto_tune_confirm = false;
+        }
+    }
+    // 设备实测探测周期(ms, 两位小数), 时钟树末端节点展示。
+    in property <float> scan_period_ms: 0;
+    // 设备实测探测周期(µs 原值), 用于与"期望周期"精确比较并显示差值。
+    in property <int> scan_period_us: 0;
+    // 由当前 CSD 参数(分辨率)解算的理论采集周期下限(µs); 0=参数超范围无法解算。
+    in property <int> expected_period_us: 0;
+    // 是否有未保存草稿(供撤销按钮与提示)。
+    in property <bool> config_dirty: false;
+    callback mode_changed(int);
+    callback capture_params();
+    callback algo_global_set(int, int);   // gparam_id, value
+    callback csd_param_set(int, int);     // param_id, value → set_param_all
+    callback csd_refresh();               // 重新请求 CH0 代表值
+    callback reboot_psoc();               // 脉冲 XRES 重启 PSoC
+    callback reset_defaults();            // 恢复设备默认配置
+    callback discard_draft();             // 撤销全部未保存草稿
+    callback auto_tune();                 // 频率自适应下探(逐档降频重校准至能压到目标%)
+    callback global_calibrate();          // 全通道 IDAC 校准(立即执行)
+    callback global_baseline_reset();      // 全通道基线复位(立即执行)
+    callback calib_pref_set(int);          // 校准频率偏好档位 1..7 → 写草稿(calib.pref)
+    in property <int> calib_pref: 4;       // 当前偏好档位(草稿优先回填)
+    // 阻塞类操作进行中(校准/基线/重启/自适应): 锁定触发按钮 + 显示运行中标识。
+    in property <bool> op_busy: false;
+    in property <string> op_label: "";
+    // 频率自适应结果文案(成功: 找到的分频; 失败: 超硬件能力)。
+    in property <string> auto_tune_status: "";
+
+    ScrollView {
+        // ★铺满并滚动★: 显式绑定 Rectangle 尺寸(TabWidget 给出可用高度), 内容超高时内部滚动,
+        // 而非把整页撑高挤出 SettingsPage 底部"保存到设备"栏(本页保存栏丢失的根因)。
+        x: 0; y: 0;
+        width: parent.width;
+        height: parent.height;
+        VerticalBox {
+            padding: 10px;
+            spacing: 10px;
+
+            Text { text: "触控全局调整"; color: #e0e6ee; font-size: 16px; }
+
+            GroupBox {
+                title: "状态与诊断";
+                VerticalBox {
+                    spacing: 4px;
+                    // ★异常采样标识★: railed 通道数 / 数据停滞 / 设备拒绝固化基线 → 直接给出下一步动作指引。
+                    Rectangle {
+                visible: root.sampling_advice != "";
+                height: advice_text.preferred-height + 12px;
+                border-radius: 4px;
+                background: root.sampling_advice_level == 0 ? #16301f
+                    : (root.sampling_advice_level == 2 ? #3a1c1c : #33290f);
+                border-width: 1px;
+                border-color: root.sampling_advice_level == 0 ? #2b8a3e
+                    : (root.sampling_advice_level == 2 ? #e05a5a : #f5a623);
+                advice_text := Text {
+                    x: 8px;
+                    width: parent.width - 16px;
+                    y: 6px;
+                    text: root.sampling_advice;
+                    color: root.sampling_advice_level == 0 ? #7fd89a
+                        : (root.sampling_advice_level == 2 ? #ff9a9a : #f5c46b);
+                    font-size: 12px;
+                    wrap: word-wrap;
+                }
+            }
+                }
+            }
+
+            GroupBox {
+                // 逐通道调完分频后无需切页: 在本页对全部 36 通道一次性校准/复位基线。
+                title: "立即执行的动作(不进草稿)";
+                VerticalBox {
+                    spacing: 6px;
+                    HorizontalBox {
+                        spacing: 8px;
+                        Button {
+                            text: root.op_busy ? ("⏳ " + root.op_label) : "全通道校准";
+                            enabled: !root.op_busy;
+                            clicked => { root.global_calibrate(); }
+                        }
+                        Button {
+                            text: root.op_busy ? ("⏳ " + root.op_label) : "全通道基线复位";
+                            enabled: !root.op_busy;
+                            clicked => { root.global_baseline_reset(); }
+                        }
+                        Rectangle { horizontal-stretch: 1; }
+                    }
+                    HorizontalBox {
+                        spacing: 8px;
+                        Button {
+                            text: root.op_busy ? ("⏳ " + root.op_label)
+                                : (root.auto_tune_confirm ? "⚠ 再点一次确认: 改写全部通道分频"
+                                                          : "全通道频率自适应(逐通道各自校准)");
+                            enabled: !root.op_busy;
+                            clicked => {
+                                if (root.auto_tune_confirm) {
+                                    root.auto_tune_confirm = false;
+                                    root.auto_tune();
+                                } else {
+                                    root.auto_tune_confirm = true;
+                                }
+                            }
+                        }
+                        Button {
+                            text: "取消";
+                            visible: root.auto_tune_confirm;
+                            clicked => { root.auto_tune_confirm = false; }
+                        }
+                        Text {
+                            text: root.auto_tune_status;
+                            color: #8fd6ff;
+                            vertical-alignment: center;
+                            horizontal-stretch: 1;
+                            wrap: word-wrap;
+                        }
+                    }
+                    Text {
+                        text: root.auto_tune_confirm
+                            ? "⚠ 确认后将逐通道改写 snsClk 分频并重校准，无法撤销。"
+                            : "全通道校准/基线复位立即执行；频率自适应会逐通道改写 snsClk 分频。";
+                        color: root.auto_tune_confirm ? #ff9a9a : #7f8c96;
+                        font-size: 10px;
+                        wrap: word-wrap;
+                    }
+                }
+            }
+
+            GroupBox {
+                title: "CSD 处理模式";
+                VerticalBox {
+                    spacing: 6px;
+                    HorizontalBox {
+                        spacing: 8px;
+                        Text { text: "CSD 模式:"; color: #b0b8c0; vertical-alignment: center; }
+                        if !root.mode_known: Text {
+                            text: "读取设备真实模式中…";
+                            color: #8b98a5;
+                            vertical-alignment: center;
+                        }
+                        ComboBox {
+                            visible: root.mode_known;
+                            model: ["自动校准", "半自动手动"];
+                            current-index: root.scan_mode;
+                            selected(_) => {
+                                root.scan_mode = self.current-index;
+                                root.mode_changed(self.current-index);
+                            }
+                        }
+                        Button {
+                            text: root.mode_known && root.scan_mode == 1 ? "捕获当前值→手动" : "捕获当前值(半自动模式可用)";
+                            enabled: root.mode_known && root.scan_mode == 1;
+                            clicked => { root.capture_params(); }
+                        }
+                    }
+                    Text {
+                        text: !root.mode_known ? "等待设备诊断上报真实 CSD 模式…"
+                            : (root.scan_mode == 1 ? "半自动手动:手动阈值/参数生效并可保存" : "自动校准: PSoC 已接管参数，手动值保持保存但当前失效");
+                        color: !root.mode_known ? #8b98a5 : (root.scan_mode == 1 ? #2b8a3e : #8fd6ff);
+                        wrap: word-wrap;
+                    }
+                }
+            }
+
+            GroupBox {
+                // ★去重★: 采样时钟分频/分辨率/时钟源/MFS 一律在下方"CSD 时钟树"里编辑(唯一入口),
+                // 本组只保留时钟树未覆盖的全局校准项, 避免两处重复导致的不同步。
+                title: "IDAC 与校准(编辑仅暂存, 保存后下发并重初始化)";
+                VerticalBox {
+                    spacing: 6px;
+                    HorizontalBox {
+                        spacing: 8px;
+                        Text { text: "全局校准项; 采样时钟/分辨率/MFS 见下方时钟树。"; color: #8fd6ff; horizontal-stretch: 1; vertical-alignment: center; }
+                        Button { text: "刷新 CH0 参数"; clicked => { root.csd_refresh(); } }
+                    }
+                    HorizontalBox {
+                        spacing: 8px;
+                        Text { text: "未激活传感器连接:"; color: #b0b8c0; vertical-alignment: center; }
+                        ComboBox {
+                            model: ["GND", "High-Z", "Shield"];
+                            current-index: root.g_inactive_sns == 4 ? 2 : (root.g_inactive_sns == 2 ? 1 : 0);
+                            selected(v) => {
+                                root.algo_global_set(1, self.current-index == 2 ? 4 : (self.current-index == 1 ? 2 : 1));
+                            }
+                        }
+                    }
+                    Text {
+                        visible: root.g_inactive_sns == 1;
+                        text: "⚠ GND 可能导致采样率下降或 railed。";
+                        color: #f5a623;
+                        font-size: 11px;
+                        wrap: word-wrap;
+                    }
+                    Text { text: "作用: 设置非激活电极接法。取值: GND/High-Z/Shield，保存后生效。"; color: #7f8c96; font-size: 10px; wrap: word-wrap; }
+                    HorizontalBox {
+                        spacing: 8px;
+                        Text { text: "IDAC 感应配置:"; color: #b0b8c0; vertical-alignment: center; }
+                        ComboBox {
+                            model: ["IDAC sourcing", "IDAC sinking"];
+                            current-index: root.g_idac_sense_config == 1 ? 1 : 0;
+                            selected(v) => { root.algo_global_set(7, self.current-index); }
+                        }
+                    }
+                    Text { text: "作用: 设置 IDAC 感应方向。取值: sourcing/sinking，保存后生效。"; color: #7f8c96; font-size: 10px; wrap: word-wrap; }
+                    HorizontalBox {
+                        spacing: 8px;
+                        CheckBox {
+                            text: "启用自动校准 (IDAC auto-calibration)";
+                            checked: root.g_auto_calibrate == 1;
+                            toggled => { root.algo_global_set(8, self.checked ? 1 : 0); }
+                        }
+                        Rectangle { horizontal-stretch: 1; }
+                    }
+                    Text { text: "作用: 设置 IDAC 自动校准开关。开关修改后保存生效。"; color: #7f8c96; font-size: 10px; wrap: word-wrap; }
+                    HorizontalBox {
+                        spacing: 8px;
+                        Text { text: "IDAC 增益档:"; color: #b0b8c0; vertical-alignment: center; }
+                        SpinBox { value: root.g_idac_gain; minimum: 0; maximum: 6; edited(v) => { root.algo_global_set(2, v); } }
+                        Text { text: "IDAC min:"; color: #b0b8c0; vertical-alignment: center; }
+                        SpinBox { value: root.g_idac_min; minimum: 0; maximum: 127; edited(v) => { root.algo_global_set(3, v); } }
+                        Text { text: "校准目标%:"; color: #b0b8c0; vertical-alignment: center; }
+                        SpinBox { value: root.g_raw_target; minimum: 1; maximum: 99; edited(v) => { root.algo_global_set(4, v); } }
+                    }
+                    Text { text: "作用: 设置 IDAC 参数。增益0–6、最小值0–127、目标1–99%，重新校准生效。"; color: #7f8c96; font-size: 10px; wrap: word-wrap; }
+                    HorizontalBox {
+                        spacing: 8px;
+                        Text { text: "校准频率偏好:"; color: #b0b8c0; vertical-alignment: center; }
+                        Slider {
+                            minimum: 1;
+                            maximum: 7;
+                            value: root.calib_pref;
+                            horizontal-stretch: 1;
+                            changed(v) => { root.calib_pref_set(Math.round(v)); }
+                        }
+                        Text {
+                            text: root.calib_pref + " 档 · " + (root.calib_pref == 1
+                                ? "最不灵敏(临界最高频)"
+                                : (root.calib_pref <= 3 ? "偏保守(靠近临界)"
+                                : (root.calib_pref == 4 ? "居中(默认)"
+                                : (root.calib_pref <= 6 ? "偏灵敏(明显低频)"
+                                : "最灵敏(过充近场)"))));
+                            color: #8fd6ff;
+                            vertical-alignment: center;
+                        }
+                    }
+                    Text { text: "作用: 设置频率自适应偏好档位 1–7，立即生效，保存后持久化。"; color: #7f8c96; font-size: 10px; wrap: word-wrap; }
+
+                }
+            }
+
+            GroupBox {
+                title: "采样时钟与周期诊断";
+                VerticalBox {
+                    spacing: 10px;
+
+                    // 第一行: 固定只读的振荡器/PLL/外设时钟链, 横向箭头连接。
+                    HorizontalBox {
+                        spacing: 0px;
+                        alignment: start;
+                        ClockFixedNode { node_title: "ECO 晶振"; node_value: "12 MHz"; }
+                        ClockArrowRight { }
+                        ClockFixedNode { node_title: "PLL / HFCLK"; node_value: "48 MHz"; }
+                        ClockArrowRight { }
+                        ClockFixedNode { node_title: "PERI / CSD"; node_value: "48 MHz"; }
+                        ClockArrowRight { }
+                        ClockFixedNode { node_title: "外设分频 DIV ÷1"; node_value: "48.00 MHz"; }
+                    }
+
+                    // 竖直箭头: 从外设分频落到下一行的 ModClk + MFS。
+                    HorizontalBox {
+                        spacing: 0px;
+                        alignment: start;
+                        Rectangle { width: 128px + 22px + 128px + 22px + 128px + 22px; }
+                        ClockArrowDown { }
+                    }
+
+                    // 第二行: ModClk(只读) + MFS F1/F2(可编辑, SpinBox 直接嵌节点卡内)。
+                    HorizontalBox {
+                        spacing: 0px;
+                        alignment: start;
+                        Rectangle { width: 128px + 22px + 128px + 22px + 128px + 22px - 128px - 22px; }
+                        ClockFixedNode { node_title: "ModClk ÷modCsdClk=1"; node_value: "48.00 MHz"; }
+                        ClockArrowRight { }
+                        Rectangle {
+                            // ★加宽以容纳两个 SpinBox★: 原 232px 内两 SpinBox 各仅得 ~107px < 其最小宽度,
+                            // HorizontalBox 撑破本卡片 → 下拉箭头溢出到框外(未包裹好)。按每个 ≈130px 取 300px。
+                            width: 300px;
+                            height: 92px;
+                            border-radius: 6px;
+                            background: #17222b;
+                            border-width: 1px;
+                            border-color: #2f6fa8;
+                            clip: true;   // 防御: 极端窄宽下也不外溢
+                            VerticalBox {
+                                padding: 6px;
+                                spacing: 2px;
+                                Text { text: "MFS DIV F1 / F2"; font-size: 11px; color: #8fd6ff; }
+                                HorizontalBox {
+                                    padding: 0px;
+                                    spacing: 6px;
+                                    SpinBox {
+                                        horizontal-stretch: 1;
+                                        min-width: 130px;
+                                        value: root.g_mfs_div_f1;
+                                        minimum: 0;
+                                        maximum: 65535;
+                                        edited(v) => { root.algo_global_set(5, v); }
+                                    }
+                                    SpinBox {
+                                        horizontal-stretch: 1;
+                                        min-width: 130px;
+                                        value: root.g_mfs_div_f2;
+                                        minimum: 0;
+                                        maximum: 65535;
+                                        edited(v) => { root.algo_global_set(6, v); }
+                                    }
+                                }
+                                // 多频抗噪: 启用后每传感器 3 个频点各扫一次(周期≈×3)。
+                                Text {
+                                    text: "多频抗噪 F0/F1/F2 (周期×频点数)";
+                                    font-size: 10px; color: #9fe0b0; horizontal-alignment: center; wrap: word-wrap;
+                                }
+                            }
+                        }
+                    }
+
+                    // 竖直箭头: 从 MFS 节点落到第三行的 SnsClk/Resolution。
+                    HorizontalBox {
+                        spacing: 0px;
+                        alignment: start;
+                        Rectangle { width: 128px + 22px + 128px; }
+                        ClockArrowDown { }
+                    }
+
+                    // 第三行: SnsClk DIV(只读, 逐通道参数→单通道页编辑) / Resolution / SnsClk Source(统一写全部 36 通道)。
+                    HorizontalBox {
+                        spacing: 0px;
+                        alignment: start;
+                        Rectangle { width: 128px + 22px; }
+                        Rectangle {
+                            width: 150px;
+                            height: 72px;
+                            border-radius: 6px;
+                            background: #17222b;
+                            border-width: 1px;
+                            border-color: #2f6fa8;
+                            VerticalBox {
+                                padding: 6px;
+                                spacing: 2px;
+                                Text { text: "SnsClk DIV (只读, 范围)"; font-size: 11px; color: #8fd6ff; }
+                                // ★去重: 唯一入口★ snsClk 分频是【逐通道】参数(各通道 Cp 22~138pF 差异极大,
+                                // 无法统一), 编辑入口只在单通道页"通道参数"里。逐通道自适应后各通道值不同,
+                                // 故此处显示全 36 通道的 min–max 范围(全部相同则退化为单值)。
+                                Text {
+                                    text: !root.mode_known ? "读取中…"
+                                        : (root.scan_mode == 0 ? "AUTO"
+                                        : (root.csd_sns_clk_div_max == 0
+                                            ? "÷—  (未读取)"
+                                            : (root.csd_sns_clk_div_min == root.csd_sns_clk_div_max
+                                                ? ("÷" + root.csd_sns_clk_div_min + "  (36 通道一致)")
+                                                : ("÷" + root.csd_sns_clk_div_min + " — ÷" + root.csd_sns_clk_div_max
+                                                   + "  (36 通道范围)"))));
+                                    font-size: 11px; color: #dfe6ec; horizontal-alignment: center;
+                                    wrap: word-wrap;
+                                }
+                                // 传感激励时钟 = ModClk(48MHz) / snsClkDiv。★只改激励频率, 不改扫描时长★
+                                // 分频越大 → 频率越低, 故范围两端与分频相反: min 分频 = 最高频。
+                                Text {
+                                    text: !root.mode_known ? "SnsClk = 读取中…"
+                                        : (root.scan_mode == 0 ? "SnsClk = AUTO"
+                                        : (root.csd_sns_clk_div_max == 0
+                                            ? "SnsClk = —"
+                                            : (root.csd_sns_clk_div_min == root.csd_sns_clk_div_max
+                                                ? ("SnsClk = " + (Math.round(48000 / root.csd_sns_clk_div_min) / 1000) + " MHz")
+                                                : ("SnsClk = " + (Math.round(48000 / root.csd_sns_clk_div_max) / 1000)
+                                                   + " — " + (Math.round(48000 / root.csd_sns_clk_div_min) / 1000) + " MHz"))));
+                                    font-size: 10px; color: #9fe0b0; horizontal-alignment: center;
+                                    wrap: word-wrap;
+                                }
+                            }
+                        }
+                        ClockArrowRight { }
+                        Rectangle {
+                            width: 150px;
+                            height: 72px;
+                            border-radius: 6px;
+                            background: #17222b;
+                            border-width: 1px;
+                            border-color: #2f6fa8;
+                            VerticalBox {
+                                padding: 6px;
+                                spacing: 2px;
+                                Text { text: "采样分辨率(位)"; font-size: 11px; color: #8fd6ff; }
+                                if root.mode_known && root.scan_mode == 0: Text {
+                                    text: "AUTO";
+                                    color: #8fd6ff;
+                                    horizontal-alignment: center;
+                                }
+                                if !root.mode_known: Text {
+                                    text: "读取中…";
+                                    color: #8b98a5;
+                                    horizontal-alignment: center;
+                                }
+                                if root.mode_known && root.scan_mode == 1: SpinBox {
+                                    value: root.csd_resolution;
+                                    minimum: 6;
+                                    maximum: 16;
+                                    edited(v) => { root.csd_param_set(7, v); }
+                                }
+                                // 子转换数 = 2^N; 单传感器换能时长 ≈ 2^N / 48MHz。★决定扫描时长的就是它★
+                                Text {
+                                    text: "2^N=" + Math.round(Math.pow(2, root.csd_resolution))
+                                        + " 换能≈" + (Math.round(Math.pow(2, root.csd_resolution) / 48)) + " µs";
+                                    font-size: 10px; color: #9fe0b0; horizontal-alignment: center;
+                                }
+                            }
+                        }
+                        ClockArrowRight { }
+                        Rectangle {
+                            width: 150px;
+                            height: 72px;
+                            border-radius: 6px;
+                            background: #17222b;
+                            border-width: 1px;
+                            border-color: #2f6fa8;
+                            VerticalBox {
+                                padding: 6px;
+                                spacing: 2px;
+                                Text { text: "时钟源(协议数值)"; font-size: 11px; color: #8fd6ff; }
+                                if root.mode_known && root.scan_mode == 0: Text {
+                                    text: "AUTO";
+                                    color: #8fd6ff;
+                                    horizontal-alignment: center;
+                                }
+                                if !root.mode_known: Text {
+                                    text: "读取中…";
+                                    color: #8b98a5;
+                                    horizontal-alignment: center;
+                                }
+                                if root.mode_known && root.scan_mode == 1: SpinBox {
+                                    value: root.csd_sns_clk_source;
+                                    minimum: 0;
+                                    maximum: 255;
+                                    edited(v) => { root.csd_param_set(10, v); }
+                                }
+                                // 非频率: 选择直连/PRS/SSC 展频方式(bit7=自动)。
+                                Text {
+                                    text: (root.csd_sns_clk_source >= 128 ? "自动+" : "")
+                                        + ((Math.mod(root.csd_sns_clk_source, 128) == 0) ? "直连"
+                                          : (Math.mod(root.csd_sns_clk_source, 128) <= 4 ? "SSC" : "PRS"));
+                                    font-size: 10px; color: #9fe0b0; horizontal-alignment: center;
+                                }
+                            }
+                        }
+                    }
+
+                    // 竖直箭头: 汇聚到末端"设备实测探测周期"节点。
+                    HorizontalBox {
+                        spacing: 0px;
+                        alignment: start;
+                        Rectangle { width: 128px + 22px + 75px; }
+                        ClockArrowDown { }
+                    }
+
+                    // 末端节点: 设备实测探测周期(唯一由固件遥测回填的真实值,非生成配置推算)。
+                    HorizontalBox {
+                        spacing: 0px;
+                        alignment: start;
+                        Rectangle { width: 128px + 22px; }
+                        Rectangle {
+                            width: 220px;
+                            height: 54px;
+                            border-radius: 6px;
+                            background: #16301f;
+                            border-width: 1px;
+                            border-color: #2b8a3e;
+                            VerticalBox {
+                                padding: 6px;
+                                spacing: 2px;
+                                alignment: center;
+                                Text { text: "设备实测探测周期"; font-size: 11px; color: #9fe0b0; horizontal-alignment: center; }
+                                Text {
+                                    text: (Math.round(root.scan_period_ms * 100) / 100) + " ms";
+                                    font-size: 15px;
+                                    font-weight: 700;
+                                    color: #d6ffd9;
+                                    horizontal-alignment: center;
+                                }
+                            }
+                        }
+                    }
+
+                    // 期望 vs 实际探测周期比较: 期望由当前分辨率参数解算(理论采集下限, 不含处理),
+                    // 实际为设备遥测实测值。差值/倍率用于区分"真实异常"与"设置期望异常"。
+                    HorizontalBox {
+                        spacing: 8px;
+                        alignment: start;
+                        Text {
+                            text: root.expected_period_us > 0
+                                ? ("期望(解算) " + (Math.round(root.expected_period_us / 10) / 100) + " ms"
+                                    + "  实际 " + (Math.round(root.scan_period_us / 10) / 100) + " ms"
+                                    + "  差值 " + (root.scan_period_us - root.expected_period_us) + " µs"
+                                    + (root.expected_period_us > 0
+                                        ? ("  倍率 ×" + (Math.round(root.scan_period_us * 10 / root.expected_period_us) / 10))
+                                        : ""))
+                                : ("实际 " + (Math.round(root.scan_period_us / 10) / 100) + " ms  (分辨率参数超范围, 期望无法解算)");
+                            color: (root.expected_period_us > 0 && root.scan_period_us > root.expected_period_us * 3)
+                                ? #f5a623 : #9fe0b0;
+                            vertical-alignment: center;
+                            wrap: word-wrap;
+                            horizontal-stretch: 1;
+                        }
+                    }
+
+                    Text {
+                        text: "显示当前分辨率的理论周期，用于对比实测周期。";
+                        color: #7f8c96;
+                        font-size: 11px;
+                        wrap: word-wrap;
+                    }
+                }
+            }
+            GroupBox {
+                title: "危险与恢复";
+                VerticalBox {
+                    spacing: 6px;
+                    HorizontalBox {
+                        spacing: 8px;
+                        Button {
+                            text: "撤销未保存改动";
+                            enabled: root.config_dirty;
+                            clicked => { root.discard_draft(); }
+                        }
+                        Button {
+                            text: "重启 PSoC";
+                            clicked => { root.reboot_psoc(); }
+                        }
+                        Button {
+                            text: "恢复默认值";
+                            clicked => { root.reset_defaults(); }
+                        }
+                        Rectangle { horizontal-stretch: 1; }
+                    }
+                    // ★最后手段: PSoC 救砖★ 两段式确认(先点变"确认救砖?", 再点才执行), 不引入新弹窗组件。
+                    HorizontalBox {
+                        spacing: 8px;
+                        Button {
+                            text: root.op_busy ? ("⏳ " + root.op_label)
+                                : (root.rescue_confirm ? "⚠ 再点一次确认: 立即重刷 PSoC"
+                                                       : "PSoC 救砖(重刷并重新应用)");
+                            enabled: !root.op_busy;
+                            clicked => {
+                                if (root.rescue_confirm) {
+                                    root.rescue_confirm = false;
+                                    root.psoc_rescue();
+                                } else {
+                                    root.rescue_confirm = true;
+                                }
+                            }
+                        }
+                        Button {
+                            text: "取消";
+                            visible: root.rescue_confirm;
+                            clicked => { root.rescue_confirm = false; }
+                        }
+                        Rectangle { horizontal-stretch: 1; }
+                    }
+                    Text {
+                        text: "⚠ 危险操作：重刷期间触控不可用，切勿断电。";
+                        color: #ff9a9a;
+                        font-size: 11px;
+                        wrap: word-wrap;
+                    }
+                    Text {
+                        text: root.config_dirty
+                            ? "● 有未保存草稿:在页面底部“保存到设备”生效, 或点“撤销未保存改动”放弃"
+                            : "✓ 已与设备同步";
+                        color: root.config_dirty ? #f5a623 : #2b8a3e;
+                        font-size: 12px;
+                        wrap: word-wrap;
+                    }
+                    Text {
+                        text: "异常时可撤销草稿；已保存可恢复默认并重启 PSoC。";
+                        color: #7f8c96;
+                        font-size: 11px;
+                        wrap: word-wrap;
+                    }
+                }
+            }
+            Rectangle { vertical-stretch: 1; }
+        }
+    }
+}

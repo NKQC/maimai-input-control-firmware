@@ -45,8 +45,13 @@ public:
     bool calibrate();
     bool baseline_reset();
     // 频率自适应下探: 触发后轮询 busy 至完成(逐档升分频重校准, 数秒), 再读结果。
-    // out_result: 0=进行中/未知 1=成功 2=失败(超硬件能力); out_div: 成功时找到的统一 snsClk 分频。
-    bool auto_tune(uint8_t* out_result, uint16_t* out_div);
+    // ch: 0..35=仅该通道下探(其余通道分频不动), 0xFF=全 36 通道统一(旧行为)。
+    // pref: 灵敏度档位 1..7(帧字节3), 越高=在临界频率基础上往低频多让分频(更灵敏)。
+    // out_result: 0=进行中/未知 1=成功 2=失败(超硬件能力); out_div: 最终写入的 snsClk 分频。
+    // on_progress != nullptr 时, 在阻塞等待中每 ~100ms 顺带读一次 GET_AUTO_TUNE 的阶段进度并回吐
+    // (不改 busy 判定与超时行为, 不提高 busy 轮询频率, 避免抢占 PSoC 的 SPI 带宽影响校准)。
+    bool auto_tune(uint8_t ch, uint8_t pref, uint8_t* out_result, uint16_t* out_div,
+                   psoc::AutoTuneProgressFn on_progress = nullptr, void* progress_ctx = nullptr);
     bool set_mode(uint8_t mode);                                   // 0=自动校准/标准完整处理，1=半自动手动
 
     // ---- JIT 算法 blob 下发（分页事务；仅启动/更新用，非延迟关键）----
@@ -90,7 +95,10 @@ private:
     static uint16_t _read_u16(const uint8_t* bytes);
     // 轮询 GET_STATS 的 busy 字节(resp[2])至 PSoC 主循环真正完成重操作(busy 1→0)或超时。
     // 用于 calibrate/apply/baseline_reset 的真实完成反馈, 替代原固定 sleep 盲等。返回 true=真实完成。
-    bool _wait_op_done(uint32_t timeout_ms);
+    // on_progress != nullptr 时额外每 PROGRESS_POLL_MS 读一次 AUTO_TUNE 进度回吐(busy 语义不变)。
+    bool _wait_op_done(uint32_t timeout_ms, psoc::AutoTuneProgressFn on_progress = nullptr,
+                       void* progress_ctx = nullptr);
+    static constexpr uint32_t PROGRESS_POLL_MS = 100;   // 进度读取降频周期(busy 轮询仍为 3ms)
 
     uint8_t _sck_pin;
     uint8_t _mosi_pin;
@@ -103,8 +111,14 @@ private:
     bool _ready;
     uint8_t _seq;
 
+    // 一份快照的完成期限: 超期即丢弃进度重新 BEGIN。快照跨多次 pump 续读且中途失败原地重试,
+    // 若某种应答流水失步让某页永远读不出来, 就会无限重试同一页 → 快照永不发布 → 上位机看到
+    // raw/baseline/diff 永久冻结(误判为"采样停了", 实测只能复位设备)。30Hz 遥测下正常几十 ms 完成。
+    static constexpr uint32_t SNAP_COMPLETE_TIMEOUT_US = 2000000;
+
     // 分块快照读取状态机（snapshot_pump 用）
     bool _snap_active = false;                     // 是否正在读一份快照
+    uint32_t _snap_start_us = 0;                   // 本份快照的起始时刻(完成期限用)
     uint16_t _snap_page = 0;                       // 下一个待请求的页号(1..PAGE_COUNT)
     uint8_t _snap_expected_seq = 0;                // 期望的流水应答序号
     uint16_t _snap_generation = 0;

@@ -4,6 +4,7 @@
 #include "../../protocol/host_cmd/host_cmd.h"   // HostCmdCrc16::crc16 (CCITT-FALSE)
 #include "../config_manager/config_crc.h"
 #include "../../flash_guard.h"
+#include "../../hal/usb/hal_usb.h"
 #include <cstring>
 #include "../usb_debug.h"
 
@@ -174,15 +175,19 @@ bool PsocAlgo::save() {
     std::memcpy(blob.cfg, _cfg, sizeof(blob.cfg));
     blob.crc32 = ConfigCRC::calculate_crc32((const uint8_t*)&blob, sizeof(blob) - sizeof(uint32_t));
 
-    // 双核安全 flash 写(同 csd_config/config_manager): 禁中断 + 暂停 core1, 保护 XIP 擦写窗口。
-    uint32_t _irq = save_and_disable_interrupts();
-    multicore_lockout_start_blocking();
-    File f = LittleFS.open(ALGO_BLOB_PATH, "w");
+    // LittleFS 擦写无法在 XIP 禁用期间安全分片；忙标记暂停所有定时 IN 推送，临界区前后各泵 USB。
+    // 这避免共享 64B vendor FIFO 在 flash 窗口累积；实际有效频率边界由 soak 的 out_stalled/rearm 计数验证。
     size_t n = 0;
-    if (f) {
-        n = f.write((const uint8_t*)&blob, sizeof(blob));
-        f.close();
-    }
+    {
+        FlashWriteGuard flash_guard;
+        HAL_USB_Device::getInstance()->task();
+        uint32_t _irq = save_and_disable_interrupts();
+        multicore_lockout_start_blocking();
+        File f = LittleFS.open(ALGO_BLOB_PATH, "w");
+        if (f) {
+            n = f.write((const uint8_t*)&blob, sizeof(blob));
+            f.close();
+        }
     // 同一安全窗口内顺带落盘算法 C 源(映射表), 复用已暂停的 core1 lockout。
     {
         uint8_t hdr[10];
@@ -200,7 +205,9 @@ bool PsocAlgo::save() {
         }
     }
     multicore_lockout_end_blocking();
-    restore_interrupts(_irq);
+        restore_interrupts(_irq);
+    }
+    HAL_USB_Device::getInstance()->task();
     g_usb_dbg.flash_write_count++;
     g_usb_dbg.loop_at_last_flash = g_usb_dbg.loop_count;
     return n == sizeof(blob);

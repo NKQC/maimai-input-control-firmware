@@ -27,6 +27,8 @@ volatile UsbDebugCounters g_usb_dbg = { 0xDB01u, (uint16_t)sizeof(UsbDebugCounte
 
 volatile uint8_t g_bootsel_request = 0u;
 volatile uint8_t g_psoc_reboot_request = 0u;
+// 由 FlashWriteGuard 引用计数维护；flash XIP 临界区内调度器不得继续生成 vendor IN 推送。
+volatile uint8_t g_usb_flash_busy = 0u;
 
 volatile uint32_t g_last_host_cmd_ms = 0u;
 

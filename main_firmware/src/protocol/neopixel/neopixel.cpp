@@ -22,8 +22,8 @@ static const struct pio_program neopixel_program = {
 
 const struct pio_program NeoPixel::neopixel_program_ = neopixel_program;
 
-NeoPixel::NeoPixel(HAL_PIO* pio_hal, uint16_t num_leds, NeoPixel_Type type)
-    : pio_hal_(pio_hal), num_leds_(num_leds), type_(type),
+NeoPixel::NeoPixel(HAL_PIO* pio_hal, uint8_t gpio_pin, uint16_t num_leds, NeoPixel_Type type)
+    : pio_hal_(pio_hal), gpio_pin_(gpio_pin), num_leds_(num_leds), type_(type),
       initialized_(false), pio_sm_(0), pio_offset_(0), brightness_(255),
       animation_running_(false), animation_step_(0) {
     
@@ -56,6 +56,10 @@ bool NeoPixel::init() {
         return false;
     }
     
+    // 本条链的数据脚交给 PIO 并置为输出（side-set 只能驱动已是输出方向的引脚）
+    pio_hal_->init_pin(gpio_pin_);
+    pio_hal_->sm_set_pindirs_out(pio_sm_, gpio_pin_, 1);
+
     // 配置PIO
     if (!configure_pio()) {
         pio_hal_->unclaim_sm(pio_sm_);
@@ -393,14 +397,20 @@ bool NeoPixel::configure_pio() {
     float clkdiv = clock_freq / target_freq;
     
     // 创建统一配置
+    // 本程序用 out 只是把位移进 scratch X（out x,1），波形完全由 side-set 产生，
+    // 故不设 out pins（out_count=0），只把 side-set 绑到本链数据脚。
     PIOStateMachineConfig config;
-    config.out_base = 0;  // GPIO引脚由PIO HAL管理
-    config.out_count = 1;
-    config.sideset_base = 0;  // GPIO引脚由PIO HAL管理
+    config.out_count = 0;
+    config.sideset_base = gpio_pin_;
     config.sideset_bit_count = 1;
     config.sideset_optional = false;
     config.sideset_pindirs = false;
     config.clkdiv = clkdiv;
+    // 24bit(RGB)/32bit(RGBW) 到阈值自动重装 OSR：show() 只需按像素 put 一个左对齐字，
+    // 无 autopull 时 out 会移出零位，灯链永远全灭。
+    config.out_shift_right = false;   // 左移 = MSB first
+    config.autopull = true;
+    config.pull_threshold = (type_ == NEOPIXEL_RGBW) ? 32 : 24;
     config.wrap_target = pio_offset_;
     config.wrap = pio_offset_ + neopixel_program_.length - 1;
     config.program_offset = pio_offset_;

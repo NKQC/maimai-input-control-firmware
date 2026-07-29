@@ -77,7 +77,9 @@ struct NeoPixel_Animation {
 
 class NeoPixel {
 public:
-    NeoPixel(HAL_PIO* pio_hal, uint16_t num_leds, NeoPixel_Type type = NEOPIXEL_RGB);
+    // gpio_pin: 本条灯链的数据引脚。必须显式传入——同一 PIO 实例上可挂多条链，
+    // HAL_PIO::init(pin) 只登记第一条的引脚，其余靠 init_pin()，故 side-set 引脚不能靠 HAL 推断。
+    NeoPixel(HAL_PIO* pio_hal, uint8_t gpio_pin, uint16_t num_leds, NeoPixel_Type type = NEOPIXEL_RGB);
     ~NeoPixel();
     
     // 初始化
@@ -135,6 +137,7 @@ public:
     
 private:
     HAL_PIO* pio_hal_;
+    uint8_t gpio_pin_;
     uint16_t num_leds_;
     NeoPixel_Type type_;
     bool initialized_;

@@ -1,0 +1,429 @@
+// ============================================================================
+// 主页 - 仪表盘(Phase 1 UI 现代化)
+// ============================================================================
+
+import { Button, ComboBox, VerticalBox, HorizontalBox, ScrollView } from "std-widgets.slint";
+import { CollapsibleSection, PlotPath } from "../common/widgets.slint";
+import { Theme } from "../common/theme.slint";
+
+export component DashboardPage inherits Rectangle {
+    in property <[string]> device_labels: [];
+    in-out property <int> selected_device: 0;
+    in property <string> conn_status: @tr("未连接");
+    in property <string> device_info_text: @tr("未获取到设备信息");
+    // 人可读摘要 + 原始诊断折叠态(真相源在 AppWindow, 切页不丢失)。
+    in property <string> device_summary_text: @tr("未获取到设备信息");
+    in-out property <bool> diag_expanded: false;
+    // 工作模式文案(Serial/HID/未知, 含草稿未保存提示), 由 main.rs::work_mode_text 回填。
+    in property <string> work_mode_text: @tr("未知");
+    in property <string> sensor_health: "";
+    in property <int> sensor_health_level: 0;
+    in property <int> sample_rate_hz: 0;
+    in property <string> curve_threshold_warning: "";
+    in property <float> scan_period_ms: 0;
+    in-out property <int> scan_mode: 0;
+    in property <int> latency_total_us: 0;
+    in property <int> latency_spi_us: 0;
+    in property <int> latency_proc_us: 0;
+    in property <int> latency_usb_us: 0;
+    in property <int> latency_sensor_us: 0;
+    in-out property <bool> measure_latency: false;
+    // 延迟历史折线(总延迟 us): SVG path(viewbox 1000x1000) + 量程 + 点数, 由 main.rs 回填。
+    in property <string> lat_path: "";
+    in property <float> lat_y_max: 1;
+    in property <float> lat_y_min: 0;
+    in property <int> lat_point_count: 0;
+    // 延迟图横向视图窗口(viewbox 0..1000): 滚轮缩放时间 + 拖拽/滚动条平移 + 双击复位。
+    property <float> view_lx: 0;
+    property <float> view_lw: 1000;
+
+    callback refresh();
+    callback connect_clicked();
+    callback disconnect_clicked();
+    callback reboot_device();
+    callback reboot_bootloader();
+    callback reboot_psoc();
+    callback mode_changed(int);
+    callback latency_measure_toggled(bool);
+
+    background: Theme.panel-deep;
+
+    ScrollView {
+        VerticalBox {
+            padding: 12px;
+            spacing: 12px;
+
+            HorizontalBox {
+                padding: 0px;
+                spacing: 12px;
+
+                Rectangle {
+                    border-radius: 8px;
+                    background: Theme.panel-alt;
+                    min-height: 190px;
+                    horizontal-stretch: 1;
+
+                    VerticalBox {
+                        padding: 12px;
+                        spacing: 8px;
+
+                        Text {
+                            text: @tr("设备连接");
+                            font-weight: 700;
+                            color: Theme.text-title;
+                        }
+
+                        HorizontalBox {
+                            padding: 0px;
+                            spacing: Theme.gap;
+                            ComboBox {
+                                model: root.device_labels;
+                                current-index <=> root.selected_device;
+                                horizontal-stretch: 1;
+                            }
+                            Button {
+                                text: @tr("刷新");
+                                clicked => { root.refresh(); }
+                            }
+                        }
+
+                        HorizontalBox {
+                            padding: 0px;
+                            spacing: Theme.gap;
+                            Button {
+                                text: @tr("连接");
+                                clicked => { root.connect_clicked(); }
+                            }
+                            Button {
+                                text: @tr("断开");
+                                clicked => { root.disconnect_clicked(); }
+                            }
+                        }
+
+                        HorizontalBox {
+                            padding: 0px;
+                            spacing: Theme.gap;
+                            Button {
+                                text: @tr("重启设备");
+                                clicked => { root.reboot_device(); }
+                            }
+                            Button {
+                                text: @tr("进烧录模式");
+                                clicked => { root.reboot_bootloader(); }
+                            }
+                            Button {
+                                text: @tr("重启PSoC");
+                                clicked => { root.reboot_psoc(); }
+                            }
+                        }
+
+                        Text {
+                            text: @tr("状态: ") + root.conn_status;
+                            color: Theme.text-sub;
+                            wrap: word-wrap;
+                        }
+                    }
+                }
+
+                Rectangle {
+                    border-radius: 8px;
+                    background: Theme.panel-alt;
+                    min-height: 190px;
+                    horizontal-stretch: 1;
+                    clip: true;
+
+                    VerticalBox {
+                        padding: 12px;
+                        spacing: 8px;
+
+                        Text {
+                            text: @tr("系统状态");
+                            font-weight: 700;
+                            color: Theme.text-title;
+                        }
+
+                        // 人可读摘要默认只显示这些: 固件版本/PSoC 版本/协议/通道数/能力位。
+                        // 已在 AppController::device_summary_text 里译成中文, 不再让用户读 0x 位图。
+                        Text {
+                            // 固定 min-width: 版本/通道数/能力名长度会随设备回填变化, 钉死后本卡片
+                            // 首选宽度恒定, 与左侧"设备连接"卡的分界不会因为回填而左右挪动。
+                            min-width: 260px;
+                            text: root.device_summary_text;
+                            color: Theme.text-sub;
+                            wrap: word-wrap;
+                            vertical-stretch: 1;
+                        }
+
+                        // 工作模式只读展示(唯一修改入口在设置 → 通信系统 Tab)。文案由 Rust 侧
+                        // 按草稿优先口径给出, 未回读到就是"未知", 不拿默认值冒充设备真值。
+                        Text {
+                            text: @tr("工作模式: ") + root.work_mode_text;
+                            color: Theme.text-sub;
+                            wrap: word-wrap;
+                        }
+
+                        // 原始 debug 诊断(bring-up 阶段/SWD/flash/verify)保留但默认折叠, 排障时展开。
+                        CollapsibleSection {
+                            title: @tr("原始诊断(debug)");
+                            summary: "bring-up / SWD / flash / verify 原始字段";
+                            expanded <=> root.diag_expanded;
+                            ScrollView {
+                                // ★必须用 min/max-height 而非 height★: 本 ScrollView 处在
+                                // CollapsibleSection 的 VerticalLayout 里, 布局会忽略子元素的显式
+                                // height 而按 preferred-height 拉伸 → 视口等于内容全高 = 永远没有可滚
+                                // 区间, 再被折叠区的 clip 裁掉下半截, 表现为"诊断只显示一半且滚不动"。
+                                // min/max 是布局会尊重的约束, 钉死视口后内容超出即可滚动。
+                                min-height: 150px;
+                                max-height: 150px;
+                                // ★viewport-height 必须显式给★: Flickable 只把【布局类】子元素的 min
+                                // 折进 viewport, 这里的子元素是裸 Text(绝对定位), viewport 恒等于视口
+                                // 150px → 可滚区间恒为 0, 于是"内容被裁掉下半截且滚不动"。
+                                // 依赖链 viewport-height ← Text.preferred-height ← Text.width ←
+                                // ScrollView.width 全程与滚动条无关(滚动条反馈只体现在 visible-width,
+                                // 本处一律不用), 故不会形成 all_channels 那种 cols 闭环。
+                                viewport-height: diag_text.preferred-height;
+                                diag_text := Text {
+                                    width: parent.width;
+                                    text: root.device_info_text;
+                                    color: #97a2ac;
+                                    font-size: Theme.fs-normal;
+                                    wrap: word-wrap;
+                                }
+                            }
+                        }
+                        // CSD 模式切换属于精细化设置(单通道精调页), 主页不再提供。
+                    }
+                }
+            }
+
+            HorizontalBox {
+                padding: 0px;
+                spacing: 12px;
+
+                Rectangle {
+                    border-radius: 8px;
+                    background: Theme.panel-alt;
+                    min-height: 130px;
+                    horizontal-stretch: 1;
+
+                    VerticalBox {
+                        padding: 12px;
+                        spacing: Theme.gap;
+
+                        Text {
+                            text: @tr("采样");
+                            font-weight: 700;
+                            color: Theme.text-title;
+                        }
+                        Text {
+                            // ★固定像素宽度★: 数值(181→1810 Hz)变化不再改变文本首选宽度, 从而不驱动本块
+                            // 首选宽度 → HorizontalBox 的 stretch 分配恒定 → 与相邻延迟块的间隙(分割)不抖。
+                            // (不能用 width:parent.width, 会与 stretch 块形成 width↔layoutinfo 绑定环。)
+                            // ★用固定 width 而非 min-width★: min-width 只抬下限, 文本一旦比它长,
+                            // 首选宽度仍随位数变化 → 驱动 HorizontalBox 重新分配 → 卡片边界左右抖。
+                            // 钉死 width + elide 后, 位数怎么变都不再影响布局。
+                            width: 150px;
+                            overflow: elide;
+                            text: root.sample_rate_hz + " Hz";
+                            font-size: 28px;
+                            horizontal-alignment: left;
+                            color: Theme.accent;
+                        }
+                        Text {
+                            width: 150px;
+                            overflow: elide;
+                            text: @tr("探测周期: ") + Math.round(root.scan_period_ms * 100) / 100 + " ms";
+                            horizontal-alignment: left;
+                            color: Theme.text-sub;
+                        }
+                        // 传感器/PSoC 健康总结(异常时给出大致原因)。level: 0正常/1警告/2错误。
+                        Text {
+                            text: root.sensor_health;
+                            wrap: word-wrap;
+                            font-size: Theme.fs-normal;
+                            color: root.sensor_health_level == 0 ? #4caf50
+                                : root.sensor_health_level == 2 ? #e05a5a
+                                : Theme.warn;
+                        }
+                    }
+                }
+
+                Rectangle {
+                    border-radius: 8px;
+                    background: Theme.panel-alt;
+                    min-height: 130px;
+                    horizontal-stretch: 2;
+
+                    VerticalBox {
+                        padding: 12px;
+                        spacing: Theme.gap;
+
+                        Text {
+                            text: @tr("延迟(Phase2 固件填值)");
+                            font-weight: 700;
+                            color: Theme.text-title;
+                        }
+
+                        // 固定高度的明细区允许按卡片宽度分成两列；所有动态数值文本仍用明确 width + elide，
+                        // 因此每帧位数变化不会重新分配父布局。外层有固定 height，子项读取 parent.width 不会形成布局环。
+                        Rectangle {
+                            height: 52px;
+                            Text {
+                                x: 0px;
+                                y: 14px;
+                                width: 200px;
+                                overflow: elide;
+                                text: @tr("总计 ") + root.latency_total_us + " us";
+                                font-size: 20px;
+                                horizontal-alignment: left;
+                                color: Theme.accent;
+                            }
+                            Rectangle {
+                                x: 212px;
+                                y: 0px;
+                                width: parent.width - 212px;
+                                height: 52px;
+                                Text {
+                                    x: 0px;
+                                    y: 0px;
+                                    width: parent.width / 2 - 4px;
+                                    height: 20px;
+                                    text: "SPI " + root.latency_spi_us + "us";
+                                    font-size: Theme.fs-normal;
+                                    color: Theme.text-sub;
+                                    overflow: elide;
+                                }
+                                Text {
+                                    x: parent.width / 2 + 4px;
+                                    y: 0px;
+                                    width: parent.width / 2 - 4px;
+                                    height: 20px;
+                                    text: @tr("RP处理 ") + root.latency_proc_us + "us";
+                                    font-size: Theme.fs-normal;
+                                    color: Theme.text-sub;
+                                    overflow: elide;
+                                }
+                                Text {
+                                    x: 0px;
+                                    y: 28px;
+                                    width: parent.width / 2 - 4px;
+                                    height: 20px;
+                                    text: "USB " + root.latency_usb_us + "us";
+                                    font-size: Theme.fs-normal;
+                                    color: Theme.text-sub;
+                                    overflow: elide;
+                                }
+                                Text {
+                                    x: parent.width / 2 + 4px;
+                                    y: 28px;
+                                    width: parent.width / 2 - 4px;
+                                    height: 20px;
+                                    text: @tr("传感器 ") + root.latency_sensor_us + "us";
+                                    font-size: Theme.fs-normal;
+                                    color: Theme.text-sub;
+                                    overflow: elide;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 总延迟历史折线图(独占整宽, 加高, 右锚定自动滚动)。
+            Rectangle {
+                border-radius: 8px;
+                background: Theme.panel-alt;
+                min-height: 220px;
+                // ★放大窗口不留空白的根因修法★ 盒布局把多余高度按 stretch 分配, 全为 0 时平均分给
+                // 每一块 —— 于是两张信息卡各自被撑高一截, 卡内文字下方空出大片背景。只有这张图值得
+                // 变高(纵向越高越能看清延迟抖动), 给它唯一的非零 stretch, 多余高度就全归它。
+                vertical-stretch: 1;
+
+                VerticalBox {
+                    padding: 12px;
+                    spacing: Theme.gap;
+
+                    Text {
+                        text: @tr("总延迟历史 (us)");
+                        font-weight: 700;
+                        color: Theme.text-title;
+                    }
+
+                    Rectangle {
+                        vertical-stretch: 1;
+                        min-height: 160px;
+                        background: #12181d;
+                        border-width: 1px;
+                        border-color: Theme.surface;
+                        clip: true;
+
+                        // 量程网格线: 顶(峰值) / 中(半程) / 底(0)。
+                        Rectangle {
+                            x: 0; y: 0; width: parent.width; height: 1px;
+                            background: #2a343c;
+                        }
+                        Rectangle {
+                            x: 0; y: parent.height / 2; width: parent.width; height: 1px;
+                            background: #222b32;
+                        }
+
+                        latplot := Rectangle {
+                            x: 2px; y: 2px;
+                            width: parent.width - 4px;
+                            height: parent.height - 4px;
+                            clip: true;
+                            // 不能用 aspect 修正：等比 contain 无法铺满任意矩形，PlotPath 的 fit: fill 才能稳定拉满。
+                            PlotPath {
+                                vx: 0;
+                                vy: 0;
+                                vw: 1000;
+                                vh: 1000;
+                                commands: root.lat_path;
+                                stroke: Theme.accent;
+                                stroke-width: 1.5px;
+                                visible: root.lat_point_count > 0;
+                            }
+                        }
+                        Text {
+                            x: 4px; y: 2px;
+                            text: Math.round(root.lat_y_max) + "us";
+                            color: Theme.text-dim;
+                            font-size: Theme.fs-small;
+                        }
+                        Text {
+                            x: 4px; y: parent.height / 2 - 6px;
+                            text: Math.round((root.lat_y_max + root.lat_y_min) / 2) + "us";
+                            color: #5f6a73;
+                            font-size: 9px;
+                        }
+                        Text {
+                            x: 4px; y: parent.height - 14px;
+                            text: Math.round(root.lat_y_min) + "us";
+                            color: #5f6a73;
+                            font-size: 9px;
+                        }
+                        Text {
+                            // 固定 108px 槽位 + 右对齐: 原来只留 90px 且宽度随内容自适应, 四位数
+                            // ("当前 1234us")会顶出绘图区右边被裁; 现在槽位够宽且位数变化不移动元素。
+                            x: parent.width - 112px; y: 2px;
+                            width: 108px;
+                            horizontal-alignment: right;
+                            text: @tr("当前 ") + root.latency_total_us + "us";
+                            color: Theme.accent;
+                            font-size: Theme.fs-small;
+                        }
+                        Text {
+                            text: root.lat_point_count == 0 ? @tr("无延迟数据(需固件填值)") : "";
+                            color: Theme.text-dim;
+                            font-size: Theme.fs-title;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                            visible: root.lat_point_count == 0;
+                        }
+                    }
+                }
+            }
+
+        }
+    }
+}

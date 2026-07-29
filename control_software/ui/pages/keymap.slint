@@ -1,0 +1,184 @@
+// ============================================================================
+// 触控键盘映射 / 物理键盘 占位页 (Phase 1)
+// ============================================================================
+
+import { VerticalBox, HorizontalBox, CheckBox, SpinBox, ScrollView, Button } from "std-widgets.slint";
+import { KeyCaptureBox } from "../common/widgets.slint";
+import { Theme } from "../common/theme.slint";
+
+export component KeyMapPage inherits Rectangle {
+    in property <bool> keyboard_map_en: false;
+    // 34 分区当前选择的键码下拉索引(由 main.rs 从 kbd_touch_keycode 换算), 共享键名表。
+    in property <[string]> zone_display: []; // 34 分区当前组合键显示
+    in property <[string]> zone_names: []; // 34 分区名 A1-E8
+    // 数值单位为毫秒：0..65535，与设备 kbd.zhdNN/kbd.zmhNN KV 完全一致。
+    in property <[int]> zone_hold_delay: [];
+    in property <[int]> zone_hold_max: [];
+
+    callback set_keyboard_map_en(bool);
+    callback zone_captured(int, string, bool, bool, bool, bool);  // zone, text, ctrl,shift,alt,gui
+    callback zone_cleared(int);
+    callback zone_hold_set(int, int, int);
+    callback refresh_kbd();
+
+    VerticalBox {
+        padding: 8px;
+        spacing: 8px;
+
+        HorizontalBox {
+            padding: 0px;
+            spacing: 8px;
+            Text {
+                text: @tr("触控分区触发时输出所选 HID 键。长按 X 毫秒后才触发：按住达到该时长才真正输出按键，中途松开则不输出；0=立即触发；最长按住 X 毫秒自动抬起：已输出的按键最长保持该时长后自动松开；0=不自动抬起。数值单位毫秒。");
+                color: Theme.text-sub;
+                wrap: word-wrap;
+                horizontal-stretch: 1;
+                vertical-alignment: center;
+            }
+            Button { text: @tr("刷新"); clicked => { root.refresh_kbd(); } }
+        }
+
+        CheckBox {
+            text: @tr("启用触控键盘映射");
+            checked: root.keyboard_map_en;
+            toggled => { root.set_keyboard_map_en(self.checked); }
+        }
+
+        ScrollView {
+            vertical-stretch: 1;
+            VerticalBox {
+                padding: 0px;
+                spacing: 4px;
+                for z in 34: VerticalBox {
+                    padding: 2px;
+                    spacing: 2px;
+                    HorizontalBox {
+                        spacing: Theme.gap;
+                        Text {
+                            text: root.zone_names[z];
+                            color: Theme.text-sub;
+                            vertical-alignment: center;
+                            min-width: 56px;
+                        }
+                        KeyCaptureBox {
+                            horizontal-stretch: 1;
+                            display: z < root.zone_display.length ? root.zone_display[z] : "";
+                            captured(t, c, s, a, g) => { root.zone_captured(z, t, c, s, a, g); }
+                        }
+                        Button {
+                            text: @tr("清除");
+                            clicked => { root.zone_cleared(z); }
+                        }
+                    }
+                    HorizontalBox {
+                        spacing: Theme.gap;
+                        Text { text: @tr("触发延时(ms)"); font-size: Theme.fs-small; vertical-alignment: center; }
+                        SpinBox {
+                            width: 112px;
+                            minimum: 0;
+                            maximum: 65535;
+                            value: z < root.zone_hold_delay.length ? root.zone_hold_delay[z] : 0;
+                            edited(v) => { root.zone_hold_set(z, v, z < root.zone_hold_max.length ? root.zone_hold_max[z] : 0); }
+                        }
+                        Text { text: @tr("自动抬起(ms)"); font-size: Theme.fs-small; vertical-alignment: center; }
+                        SpinBox {
+                            width: 112px;
+                            minimum: 0;
+                            maximum: 65535;
+                            value: z < root.zone_hold_max.length ? root.zone_hold_max[z] : 0;
+                            edited(v) => { root.zone_hold_set(z, z < root.zone_hold_delay.length ? root.zone_hold_delay[z] : 0, v); }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+export component PhysKbdPage inherits Rectangle {
+    in property <[bool]> phys_pressed: [];   // 12 键实时按下态
+    in property <[string]> phys_display: []; // 12 键当前组合键显示
+    // 数值单位为毫秒：0..65535，与设备 kbd.hdNN/kbd.mhNN KV 完全一致。
+    in property <[int]> phys_hold_delay: [];
+    in property <[int]> phys_hold_max: [];
+
+    callback phys_captured(int, string, bool, bool, bool, bool);  // idx, text, ctrl,shift,alt,gui
+    callback phys_cleared(int);
+    callback phys_hold_set(int, int, int);
+    callback refresh_kbd();
+
+    VerticalBox {
+        padding: 8px;
+        spacing: 8px;
+
+        HorizontalBox {
+            padding: 0px;
+            spacing: 8px;
+            Text {
+                text: @tr("为 GPIO1–12 物理键设置输出 HID 键。长按 X 毫秒后才触发：按住达到该时长才真正输出按键，中途松开则不输出；0=立即触发；最长按住 X 毫秒自动抬起：已输出的按键最长保持该时长后自动松开；0=不自动抬起。数值单位毫秒。");
+                color: Theme.text-sub;
+                wrap: word-wrap;
+                horizontal-stretch: 1;
+                vertical-alignment: center;
+            }
+            Button { text: @tr("刷新"); clicked => { root.refresh_kbd(); } }
+        }
+
+        ScrollView {
+            vertical-stretch: 1;
+            VerticalBox {
+                padding: 0px;
+                spacing: 5px;
+                for i in 12: VerticalBox {
+                    padding: 2px;
+                    spacing: 2px;
+                    HorizontalBox {
+                        spacing: Theme.gap;
+                        Rectangle {
+                            width: 18px;
+                            height: 18px;
+                            border-radius: 4px;
+                            border-width: 1px;
+                            border-color: Theme.border-light;
+                            background: (i < root.phys_pressed.length && root.phys_pressed[i]) ? Theme.ok : #262b31;
+                        }
+                        Text {
+                            text: @tr("键 ") + (i + 1) + " (GPIO" + (i + 1) + ")";
+                            color: #d0d6dd;
+                            vertical-alignment: center;
+                            min-width: 96px;
+                        }
+                        KeyCaptureBox {
+                            horizontal-stretch: 1;
+                            display: i < root.phys_display.length ? root.phys_display[i] : "";
+                            captured(t, c, s, a, g) => { root.phys_captured(i, t, c, s, a, g); }
+                        }
+                        Button {
+                            text: @tr("清除");
+                            clicked => { root.phys_cleared(i); }
+                        }
+                    }
+                    HorizontalBox {
+                        spacing: Theme.gap;
+                        Text { text: @tr("触发延时(ms)"); font-size: Theme.fs-small; vertical-alignment: center; }
+                        SpinBox {
+                            width: 112px;
+                            minimum: 0;
+                            maximum: 65535;
+                            value: i < root.phys_hold_delay.length ? root.phys_hold_delay[i] : 0;
+                            edited(v) => { root.phys_hold_set(i, v, i < root.phys_hold_max.length ? root.phys_hold_max[i] : 0); }
+                        }
+                        Text { text: @tr("自动抬起(ms)"); font-size: Theme.fs-small; vertical-alignment: center; }
+                        SpinBox {
+                            width: 112px;
+                            minimum: 0;
+                            maximum: 65535;
+                            value: i < root.phys_hold_max.length ? root.phys_hold_max[i] : 0;
+                            edited(v) => { root.phys_hold_set(i, i < root.phys_hold_delay.length ? root.phys_hold_delay[i] : 0, v); }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

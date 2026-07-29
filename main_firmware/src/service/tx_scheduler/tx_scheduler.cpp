@@ -1,4 +1,5 @@
 #include "tx_scheduler.h"
+#include "../usb_debug.h"
 #include <pico/stdlib.h>
 
 TxScheduler* TxScheduler::_instance = nullptr;
@@ -69,6 +70,9 @@ bool TxScheduler::active(uint8_t id) const {
 }
 
 void TxScheduler::tick() {
+    // XIP 擦写时 TinyUSB 与 flash 代码都无法可靠运行；暂停所有定时 IN 推送而非只停遥测，
+    // 防止 telemetry/AUTO_TUNE/RESCUE/SELF_HEAL 共同挤满同一个 64B vendor FIFO 导致 stall。
+    if (g_usb_flash_busy != 0u) return;
     const uint32_t now_us = time_us_32();
     for (uint8_t i = 0; i < MAX_TASKS; i++) {
         Task& t = _tasks[i];

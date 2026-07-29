@@ -1,0 +1,26 @@
+[package]
+name = "mai2vcam-source"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "mai2vcam_source"
+path = "src/lib.rs"
+# 媒体源必须由消费端进程(Frame Server / 游戏)加载, 只能是进程内 COM DLL。
+crate-type = ["cdylib"]
+
+[dependencies]
+windows = { version = "0.62.2", default-features = false, features = [
+    "Win32_Foundation",
+    "Win32_Media_KernelStreaming",
+    "Win32_Media_MediaFoundation",
+    "Win32_Security",
+    "Win32_System_Com",
+    # IMFMediaEventGenerator / IMFMediaSource 的 _Impl trait 依赖 PROPVARIANT, 需这两个 feature。
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_Registry",
+    "Win32_System_SystemInformation",
+] }

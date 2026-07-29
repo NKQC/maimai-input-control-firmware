@@ -16,6 +16,7 @@
 #endif
 
 #include "../../flash_guard.h"
+#include "../../hal/usb/hal_usb.h"
 #include "../usb_debug.h"
 
 // 常量定义
@@ -1280,18 +1281,22 @@ bool ConfigManager::save_config_task() {
     _save_requested = false;  // 清除保存请求信号
     log_debug("Starting config save process...");
     log_debug("Runtime map size: " + std::to_string(_runtime_map.size()));
-    // ★照抄 v3.1 双核安全 flash 写★：禁本核中断 + lockout core1(core1 已 multicore_lockout_victim_init)。
-    // 两核在 flash 擦写(XIP 禁用)期间都不取指/访问总线，flash 安全完成且 USB 快速恢复。
-    // 前提：main 已 multicore_launch_core1 且 core1 入口调用 multicore_lockout_victim_init()——
-    // 否则 multicore_lockout_start_blocking() 会永久死锁(这正是之前 wedge 的根因)。
+    // LittleFS 没有可安全让出 XIP 擦写的分片 API；改用忙标记暂停所有定时 IN 推送，
+    // 并在关中断前后各泵一次 USB。这样既不在擦写中执行 flash 代码，也不给 64B vendor FIFO 继续塞帧。
+    bool result;
 #ifdef PICO_PLATFORM
-    uint32_t _irq = save_and_disable_interrupts();
-    multicore_lockout_start_blocking();
-    bool result = config_save(&_runtime_map);
-    multicore_lockout_end_blocking();
-    restore_interrupts(_irq);
+    {
+        FlashWriteGuard flash_guard;
+        HAL_USB_Device::getInstance()->task();
+        uint32_t _irq = save_and_disable_interrupts();
+        multicore_lockout_start_blocking();
+        result = config_save(&_runtime_map);
+        multicore_lockout_end_blocking();
+        restore_interrupts(_irq);
+    }
+    HAL_USB_Device::getInstance()->task();
 #else
-    bool result = config_save(&_runtime_map);
+    result = config_save(&_runtime_map);
 #endif
     if (!result) {
         _error_count++;

@@ -25,7 +25,10 @@
  *   0x64 uint16_t rom           in   per-channel 16-bit ROM (host-downloaded,
  *                                    read-only for the blob; arbitrary use,
  *                                    e.g. per-channel fingerCap/Cp/threshold)
- *   0x66 uint8_t  reserved[26]  -    padding to 0x80 (128 bytes)
+ *   0x66 uint16_t report[4]     out  algorithm-reported debug values
+ *   0x6E uint16_t out_led       out  status LED request (0 = off); the engine
+ *                                    never derives LED state from out_active
+ *   0x70 uint8_t  reserved[16]  -    padding to 0x80 (128 bytes)
  ******************************************************************************/
 
 #if !defined(PSOC_ALGO_ABI_H)
@@ -54,7 +57,12 @@ typedef struct
     uint32_t out_active;      /* 0x60 out */
     uint16_t rom;             /* 0x64 in  per-channel 16-bit ROM (host-downloaded) */
     uint16_t report[4];       /* 0x66 out algorithm-reported debug values (host visualizes per-channel) */
-    uint8_t  reserved[18];    /* 0x6E -   pad to 0x80 */
+    /* 0x6E out: 白色状态 LED 请求(0=不点亮, 非 0=点亮)。从原 reserved 区首部划出, 既有字段偏移与
+     * 结构总长均未变 → 不写本字段的旧算法二进制照常运行, 且因恒为 0 而不会点灯(这正是"原生不点灯")。
+     * ★存在理由★: 此前固件把 out_active(触控判定)直接当作点灯信号写死, 于是任何算法只要判定触摸
+     * 就必然亮灯, "点不点灯"无法被算法表达。拆出独立输出后, 点灯完全由算法决定。 */
+    uint16_t out_led;         /* 0x6E out */
+    uint8_t  reserved[16];    /* 0x70 -   pad to 0x80 */
 } algo_io_t;
 
 /* Host-parsed naming metadata (expand to nothing; the upper computer greps the C source
@@ -82,7 +90,8 @@ _Static_assert(_ALGO_IO_OFFSETOF(state)        == 0x20u, "algo_io_t.state offset
 _Static_assert(_ALGO_IO_OFFSETOF(out_active)   == 0x60u, "algo_io_t.out_active offset");
 _Static_assert(_ALGO_IO_OFFSETOF(rom)          == 0x64u, "algo_io_t.rom offset");
 _Static_assert(_ALGO_IO_OFFSETOF(report)       == 0x66u, "algo_io_t.report offset");
-_Static_assert(_ALGO_IO_OFFSETOF(reserved)     == 0x6Eu, "algo_io_t.reserved offset");
+_Static_assert(_ALGO_IO_OFFSETOF(out_led)      == 0x6Eu, "algo_io_t.out_led offset");
+_Static_assert(_ALGO_IO_OFFSETOF(reserved)     == 0x70u, "algo_io_t.reserved offset");
 _Static_assert(sizeof(algo_io_t)               == 0x80u, "algo_io_t total size must be 128 bytes");
 #endif /* __GNUC__ || __clang__ */
 #undef _ALGO_IO_OFFSETOF

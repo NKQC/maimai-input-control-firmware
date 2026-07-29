@@ -1,0 +1,440 @@
+// ============================================================================
+// 绑区页 (#6f)
+// ============================================================================
+
+import { GroupBox, VerticalBox, HorizontalBox, SpinBox, ScrollView, Button } from "std-widgets.slint";
+import { ZoneCell } from "../common/types.slint";
+import { Theme } from "../common/theme.slint";
+
+// 真实 34 区路径画布。所有 Path 共用同一个 SCREEN_FRAME viewbox(见
+// touch_geometry::SCREEN_W/SCREEN_H, 1000x562.5, 16:9)绘制精确 DXF 几何
+// (含 bulge 圆弧); 命中检测改为独立的透明矩形层, 按各区包围盒(path_x/y/
+// path_width/path_height, 同一坐标系)定位, 避免局部 viewbox 造成的圆弧/
+// 缩放失真。画布容器按 16:9 letterbox, 不做非等比拉伸。
+component BindingCanvas inherits Rectangle {
+    in property <[ZoneCell]> zones: [];
+    in property <int> selected_zone: -1;
+    property <bool> binding_blink: false;
+
+    // 绘制视框 = 分区几何并集 bbox(main.rs 从 touch_geometry::content_bbox 回填, SCREEN 坐标系)。
+    // 用内容 bbox 而非整幅 16:9 SCREEN, 使圆形分区图缩放铺满画布元素, 去除四周留白。
+    in property <float> view_x: 0;
+    in property <float> view_y: 0;
+    in property <float> view_w: 1000;
+    in property <float> view_h: 562.5;
+
+    callback zone_selected(int);
+    callback zone_activated(int);
+    // 精确命中检测: 传入 SCREEN 坐标系的点, 返回分区 index(未命中 -1)。
+    // 由 main.rs 绑定到 touch_geometry::hit_test(point-in-polygon)。
+    pure callback zone_hit_test(float, float) -> int;
+
+    // 响应式: 画布随可用空间放大; 内部按内容 bbox 宽高比等比缩放铺满(居中)。
+    // ★min-width 从 360 降到 240★: 与右栏的 min-width 相加原为 746px, 在 720px 宽的窗口(左侧导航
+    // 还要占 104px)下必然横向溢出; 画布本身是等比 letterbox, 240px 宽仍能看清 34 个分区。
+    min-width: 240px;
+    min-height: 220px;
+    horizontal-stretch: 3;
+    background: Theme.panel-deep;
+    border-radius: 6px;
+    border-width: 1px;
+    border-color: #2a2f36;
+    clip: true;
+
+    Timer {
+        interval: 450ms;
+        running: true;
+        triggered => { root.binding_blink = !root.binding_blink; }
+    }
+
+    // 按内容 bbox 宽高比等比缩放并居中铺满可用区域; 图层/标签/命中均相对它定位。
+    letterbox := Rectangle {
+        width: Math.min(parent.width, parent.height * root.view_w / root.view_h);
+        height: self.width * root.view_h / root.view_w;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+
+    // 图形层: 34 个 Path 共用同一 viewbox(=内容 bbox), 每个只绘制自己的闭合区域, 保留 DXF 圆弧。
+    for cell in root.zones: Path {
+        x: 0;
+        y: 0;
+        width: parent.width;
+        height: parent.height;
+        viewbox-x: root.view_x;
+        viewbox-y: root.view_y;
+        viewbox-width: root.view_w;
+        viewbox-height: root.view_h;
+        commands: cell.path;
+        fill: cell.touched ? Theme.ok
+            : cell.binding_active ? (root.binding_blink ? #248eea : #174f86)
+            : cell.index == root.selected_zone ? #245b78 : #2b3038;
+        stroke: cell.index == root.selected_zone ? #7edbff
+            : cell.binding_active ? Theme.accent : #55606a;
+        stroke-width: cell.index == root.selected_zone ? 4px : 2px;
+    }
+
+    for cell in root.zones: Text {
+        x: parent.width * (cell.label_x - root.view_x) / root.view_w - 24px;
+        y: parent.height * (cell.label_y - root.view_y) / root.view_h - 14px;
+        width: 48px;
+        height: 13px;
+        text: cell.label;
+        color: Theme.text-title;
+        font-size: Theme.fs-small;
+        font-weight: 700;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+    for cell in root.zones: Text {
+        x: parent.width * (cell.label_x - root.view_x) / root.view_w - 29px;
+        y: parent.height * (cell.label_y - root.view_y) / root.view_h - 1px;
+        width: 58px;
+        height: 11px;
+        text: cell.binding_text;
+        color: cell.touched ? #d6ffd9 : cell.channel >= 0 ? #b9e6ff : #9aa3aa;
+        font-size: 7px;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    // 单一命中层: 覆盖整个 letterbox, 把点击像素换算回 SCREEN 坐标系(经 bbox 偏移+缩放),
+    // 交给精确 point-in-polygon(hit_test)判定, 消除旧 34 个重叠 bbox 的误选。
+    hit_area := TouchArea {
+        property <int> hit: -1;
+        mouse-cursor: pointer;
+        clicked => {
+            self.hit = root.zone_hit_test(root.view_x + self.mouse-x / self.width * root.view_w, root.view_y + self.mouse-y / self.height * root.view_h);
+            if (self.hit >= 0) { root.zone_selected(self.hit); }
+        }
+        double-clicked => {
+            self.hit = root.zone_hit_test(root.view_x + self.mouse-x / self.width * root.view_w, root.view_y + self.mouse-y / self.height * root.view_h);
+            if (self.hit >= 0) { root.zone_selected(self.hit); root.zone_activated(self.hit); }
+        }
+    }
+    }
+}
+
+component ZoneListRow inherits Rectangle {
+    in property <ZoneCell> entry;
+    in property <bool> selected;
+
+    callback clicked();
+    callback activated();
+    callback channel_set(int);   // 更改通道
+    callback listen();           // 侦听下一次触摸绑定
+    callback unbind();           // 移除分区绑定
+
+    height: 40px;
+    border-width: selected ? 2px : 1px;
+    border-color: selected ? #4fc3f7 : #33393f;
+    background: entry.touched ? #245f35 : selected ? #23303a : #1c2024;
+
+    HorizontalBox {
+        padding: 4px;
+        spacing: Theme.gap;
+
+        // 标签 + 状态点区域: 单击选中, 双击进入单通道精调。
+        TouchArea {
+            width: 92px;
+            mouse-cursor: pointer;
+            clicked => { root.clicked(); }
+            double-clicked => { root.clicked(); root.activated(); }
+            HorizontalBox {
+                padding: 0px;
+                spacing: Theme.gap;
+                Rectangle {
+                    width: 8px;
+                    height: 8px;
+                    border-radius: 4px;
+                    background: root.entry.touched ? Theme.ok : root.entry.binding_active ? Theme.info : #444444;
+                }
+                Text {
+                    text: root.entry.label;
+                    color: Theme.text-title;
+                    font-weight: 700;
+                    vertical-alignment: center;
+                }
+                Text {
+                    text: root.entry.binding_text;
+                    color: Theme.text-sub;
+                    font-size: Theme.fs-normal;
+                    vertical-alignment: center;
+                    overflow: elide;
+                    horizontal-stretch: 1;
+                }
+            }
+        }
+        Text {
+            text: root.entry.cp_text;
+            color: Theme.accent;
+            font-size: Theme.fs-small;
+            vertical-alignment: center;
+            min-width: 54px;
+        }
+        // 三操作: 更改通道(SpinBox) / 侦听绑定 / 移除
+        SpinBox {
+            width: 72px;
+            minimum: 0;
+            maximum: 35;
+            value: root.entry.channel >= 0 ? root.entry.channel : 0;
+            edited(v) => { root.channel_set(v); }
+        }
+        Button {
+            text: root.entry.binding_active ? @tr("侦听中") : @tr("侦听");
+            clicked => { root.listen(); }
+        }
+        Button {
+            text: @tr("移除");
+            enabled: root.entry.channel >= 0;
+            clicked => { root.unbind(); }
+        }
+    }
+}
+
+component ZoneList inherits Rectangle {
+    in property <[ZoneCell]> zones: [];
+    in property <int> selected_zone: -1;
+
+    callback zone_selected(int);
+    callback zone_activated(int);
+    callback zone_channel_set(int, int);
+    callback zone_listen(int);
+    callback zone_unbind(int);
+
+    background: transparent;
+
+    ScrollView {
+        VerticalBox {
+            padding: 0px;
+            spacing: 2px;
+
+            for cell in root.zones: ZoneListRow {
+                entry: cell;
+                selected: cell.index == root.selected_zone;
+                clicked => { root.zone_selected(cell.index); }
+                activated => { root.zone_activated(cell.index); }
+                channel_set(v) => { root.zone_channel_set(cell.index, v); }
+                listen => { root.zone_listen(cell.index); }
+                unbind => { root.zone_unbind(cell.index); }
+            }
+        }
+    }
+}
+
+component BindingDetail inherits GroupBox {
+    in property <int> selected_zone: -1;
+    in property <string> selected_zone_label: "";
+    in property <int> selected_channel: -1;
+
+    callback channel_set(int);
+    callback touch_start();
+    callback listen_cancel();
+    callback unbind();
+
+    title: root.selected_zone >= 0 ? @tr("区 ") + root.selected_zone_label + @tr(" 详情") : @tr("详情");
+
+    VerticalBox {
+        padding: 4px;
+        spacing: Theme.gap;
+
+        if root.selected_zone >= 0: VerticalBox {
+            padding: 0px;
+            spacing: Theme.gap;
+
+            Text {
+                text: root.selected_channel >= 0 ? (@tr("当前绑定: CH") + root.selected_channel) : @tr("当前绑定: 未绑定");
+                color: Theme.text-sub;
+            }
+
+            HorizontalBox {
+                padding: 0px;
+                spacing: 8px;
+                Text {
+                    text: @tr("通道:");
+                    vertical-alignment: center;
+                }
+                SpinBox {
+                    minimum: 0;
+                    maximum: 35;
+                    value: root.selected_channel >= 0 ? root.selected_channel : 0;
+                    edited(v) => { root.channel_set(v); }
+                }
+            }
+
+            HorizontalBox {
+                padding: 0px;
+                spacing: 8px;
+                Button {
+                    text: @tr("侦听绑定");
+                    clicked => { root.touch_start(); }
+                }
+                Button {
+                    text: @tr("取消侦听");
+                    clicked => { root.listen_cancel(); }
+                }
+                Button {
+                    text: @tr("清除");
+                    clicked => { root.unbind(); }
+                }
+            }
+            Text {
+                text: @tr("侦听绑定：触摸目标分区暂存通道，保存后生效。");
+                color: Theme.text-dim;
+                font-size: Theme.fs-normal;
+                wrap: word-wrap;
+            }
+        }
+
+        if root.selected_zone < 0: Text {
+            text: @tr("请在左侧图上或列表中选择一个分区");
+            color: #666666;
+            wrap: word-wrap;
+        }
+    }
+}
+
+export component BindingPage inherits Rectangle {
+    in property <[ZoneCell]> zones: [];
+    in property <string> bind_status: "";
+    in-out property <int> selected_zone: -1;
+    in property <string> selected_zone_label: "";
+    in property <int> selected_channel: -1;
+
+    callback bind_load();
+    callback zone_selected(int);
+    callback zone_activated(int);
+    callback zone_channel_set(int, int);
+    callback bind_touch_start(int);
+    callback bind_listen_cancel();
+    callback zone_unbind(int);
+    pure callback zone_hit_test(float, float) -> int;
+    // 交互式顺序绑定(等效 v3.0): 一键从 A1 起依次提示触摸每区, 捕获即自动推进。
+    callback interactive_bind();
+    callback interactive_bind_cancel();
+    in property <bool> interactive_active: false;
+    // 分区图绘制视框(内容 bbox, SCREEN 坐标系), 由 AppWindow 从 touch_geometry::content_bbox 回填。
+    in property <float> view_x: 0;
+    in property <float> view_y: 0;
+    in property <float> view_w: 1000;
+    in property <float> view_h: 562.5;
+    // 右栏子标签: 0=详情 1=列表(互相切换, 不再上下抢占空间)。
+    property <int> right_tab: 0;
+
+    VerticalBox {
+        padding: 8px;
+        spacing: Theme.gap;
+
+        // 顶部信息条: 精简单行, 不再占用大块高度, 把空间留给分区画布。
+        HorizontalBox {
+            padding: 0px;
+            spacing: 8px;
+            Button {
+                text: @tr("从设备加载");
+                clicked => { root.bind_load(); }
+            }
+            Button {
+                // 交互式顺序绑定: 点开始后按提示依次触摸各区(A1→E8), 每区捕获即自动跳下一区。
+                text: root.interactive_active ? @tr("终止交互式绑定") : @tr("交互式绑定");
+                clicked => {
+                    if (root.interactive_active) { root.interactive_bind_cancel(); }
+                    else { root.interactive_bind(); }
+                }
+            }
+            Text {
+                text: @tr("单击选择，双击进入精调；列表可改通道或绑定。");
+                vertical-alignment: center;
+                color: Theme.text-dim;
+                font-size: Theme.fs-normal;
+                horizontal-stretch: 1;
+                overflow: elide;
+            }
+            Text {
+                text: root.bind_status;
+                vertical-alignment: center;
+                color: #a05a00;
+                // 状态串长度不可控(交互式绑定会写进度), 不 elide 会把整条工具栏的 min-width 顶上去。
+                wrap: no-wrap;
+                overflow: elide;
+            }
+        }
+
+        // mai2serial 面板已迁至设置页「协议」标签(与 mai2light 并列), 此处不再重复展示。
+
+        HorizontalBox {
+            padding: 0px;
+            spacing: 10px;
+            vertical-stretch: 1;
+
+            // 分区画布占主要宽度(stretch 3), 详情/列表占右侧(stretch 2)。
+            BindingCanvas {
+                zones: root.zones;
+                selected_zone: root.selected_zone;
+                view_x: root.view_x;
+                view_y: root.view_y;
+                view_w: root.view_w;
+                view_h: root.view_h;
+                zone_selected(i) => { root.selected_zone = i; root.zone_selected(i); }
+                zone_activated(i) => { root.selected_zone = i; root.zone_activated(i); }
+                zone_hit_test(x, y) => { return root.zone_hit_test(x, y); }
+            }
+
+            // 右栏: 详情/列表 两个子标签互相切换, 各自占满高度, 不再上下挤占。
+            // ★固定 min-width★: 详情/列表两个 GroupBox 标题长短不同(首选宽度不同), 若不钉死,
+            // 切换子标签时右栏 min-width 跳变 → 与左侧画布的分界随之左右偏移。固定后切换不再抖。
+            VerticalBox {
+                padding: 0px;
+                spacing: Theme.gap;
+                horizontal-stretch: 2;
+                // 300px 仍大于"详情"/"列表"两个 GroupBox 各自的首选宽度 → 切子标签不抖(原意保留);
+                // 同时把总 min-width 压到 720px 窗口放得下。列表行更宽的部分由其自带 ScrollView 横滚。
+                min-width: 300px;
+
+                HorizontalBox {
+                    padding: 0px;
+                    spacing: Theme.gap;
+                    Rectangle {
+                        // min-width: 行尾 stretch 空白吸收余量, 视觉同固定宽, 文案变长也不裁字。
+                        min-width: 96px; height: 30px; border-radius: 4px;
+                        background: root.right_tab == 0 ? Theme.info : Theme.panel-alt;
+                        Text { text: @tr("详情"); color: Theme.text-title; horizontal-alignment: center; vertical-alignment: center; }
+                        TouchArea { clicked => { root.right_tab = 0; } }
+                    }
+                    Rectangle {
+                        min-width: 96px; height: 30px; border-radius: 4px;
+                        background: root.right_tab == 1 ? Theme.info : Theme.panel-alt;
+                        Text { text: @tr("列表"); color: Theme.text-title; horizontal-alignment: center; vertical-alignment: center; }
+                        TouchArea { clicked => { root.right_tab = 1; } }
+                    }
+                    Rectangle { horizontal-stretch: 1; }
+                }
+
+                if root.right_tab == 0: BindingDetail {
+                    vertical-stretch: 1;
+                    selected_zone: root.selected_zone;
+                    selected_zone_label: root.selected_zone_label;
+                    selected_channel: root.selected_channel;
+                    channel_set(v) => { root.zone_channel_set(root.selected_zone, v); }
+                    touch_start() => { root.bind_touch_start(root.selected_zone); }
+                    listen_cancel() => { root.bind_listen_cancel(); }
+                    unbind() => { root.zone_unbind(root.selected_zone); }
+                }
+
+                if root.right_tab == 1: GroupBox {
+                    // 标题精简(原长标题使该 GroupBox 首选宽度远大于"详情"页, 是切换偏移的主因之一)。
+                    title: @tr("全部绑定");
+                    vertical-stretch: 1;
+
+                    ZoneList {
+                        zones: root.zones;
+                        selected_zone: root.selected_zone;
+                        zone_selected(i) => { root.selected_zone = i; root.zone_selected(i); }
+                        zone_activated(i) => { root.selected_zone = i; root.zone_activated(i); }
+                        zone_channel_set(z, v) => { root.zone_channel_set(z, v); }
+                        zone_listen(z) => { root.bind_touch_start(z); }
+                        zone_unbind(z) => { root.zone_unbind(z); }
+                    }
+                }
+            }
+        }
+    }
+}

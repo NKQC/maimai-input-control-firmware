@@ -169,6 +169,7 @@ public:
     // 状态
     void set_serial_ok(bool ok);
     bool get_serial_ok() const;
+    Status get_status() const { return status_; }
 
     // 设置触发指定区域
     void manually_triggle_area(Mai2_TouchArea area);

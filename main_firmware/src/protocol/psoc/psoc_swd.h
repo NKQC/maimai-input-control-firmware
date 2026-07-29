@@ -111,6 +111,12 @@ public:
     bool program_flash(const uint8_t* data, uint32_t len);
     bool verify_flash(const uint8_t* data, uint32_t len);
 
+    // ★长操作保活钩子★: 逐行写/逐字校验的内层循环每若干次调用一次(由上层注入)。
+    // 启动期(setup, USB 未枚举/看门狗未启)不需要, 运行期"救砖"重刷必须靠它喂狗 + 泵 USB + 推进度,
+    // 否则数秒的擦写会触发 5s 看门狗复位并让主机拆掉 vendor 端点(掉线)。
+    using KeepAliveFn = void (*)();
+    static void set_keepalive(KeepAliveFn fn) { _keepalive = fn; }
+
     // flash 几何（集中定义于 psoc_types.h）
     static constexpr uint16_t ROW_SIZE = psoc::flash::ROW_SIZE;
     static constexpr uint16_t ROWS_PER_MACRO = psoc::flash::ROWS_PER_MACRO;
@@ -209,4 +215,8 @@ private:
     uint32_t _erase_first_nonzero_addr;
     uint32_t _erase_first_nonzero_value;
     uint32_t _erase_words_read;
+
+    // 长操作保活钩子(全类共享, 由 set_keepalive 注入; nullptr=不保活, 启动期即如此)。
+    static KeepAliveFn _keepalive;
+    static inline void _keepalive_tick() { if (_keepalive != nullptr) _keepalive(); }
 };

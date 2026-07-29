@@ -3,6 +3,7 @@
 #include "../../protocol/psoc/psoc.h"
 #include "../csd_config/csd_config.h"
 #include "../psoc_algo/psoc_algo.h"
+#include "../psoc_updater/psoc_updater.h"
 #include "../tx_scheduler/tx_scheduler.h"
 #include "../latency_stats.h"
 #include <pico/stdlib.h>
@@ -10,6 +11,19 @@
 
 // 遥测租约(ms): 上位机需在此时限内经任意命令帧续期(UsbComm renew_all), 否则任务自动停。
 static constexpr uint32_t TELEM_LEASE_MS = 3000;
+// 频率自适应进度推送: 5Hz 足够看清阶段变化又不占带宽; 租约须覆盖最坏总耗时+余量,
+// 因为长自适应期间上位机可能一条命令都不发(无 renew_all), 靠初始租约撑到完成。
+static constexpr uint32_t AUTOTUNE_INTERVAL_US = 200000;
+static constexpr uint32_t AUTOTUNE_LEASE_MS = 60000;
+// 自续租上限(帧数): 长自适应期间上位机可能一条命令都不发, 而任意主机帧都会 renew_all(3s) 覆盖本任务
+// 租约 → 靠本任务自续租撑过全程; 上限须【大于】RP2040 的自适应窗口(45s), 否则全通道逐通道自适应
+// (36 × 单通道 ≈ 11-23s, 最坏更长)会在终态帧发出前先把推送任务饿死 → 上位机只能等超时。
+// 350 帧 × 200ms = 70s > 45s, 异常情况下推送仍必然自灭。
+static constexpr uint16_t AUTOTUNE_MAX_TICKS = 350;
+// PSoC 救砖进度推送: 全片擦写+校验+重新下发数秒~十几秒, 同自适应用 5Hz + 长租约 + 帧数硬上限自灭。
+static constexpr uint32_t RESCUE_INTERVAL_US = 200000;
+static constexpr uint32_t RESCUE_LEASE_MS = 30000;
+static constexpr uint16_t RESCUE_MAX_TICKS = 300;   // 60s > 最坏总耗时, 异常时推送必然自灭
 
 volatile uint16_t g_lat_spi_us = 0;
 volatile uint16_t g_lat_proc_us = 0;
@@ -33,16 +47,22 @@ constexpr uint8_t kParamIds[] = {
     0x0B,  // IDAC_GAIN
 };
 constexpr uint8_t kParamCount = sizeof(kParamIds) / sizeof(kParamIds[0]);
+// Cp 哨兵(与 PSoC/上位机一致): 未测量 / 测量失败 / 读取失败。
+constexpr uint32_t CP_UNMEASURED_FF = 0x00FFFFFFu;
+// PARAM_GET_ALL 的"全通道单参数"变体标记(payload = 0xFF + param_id)。
+constexpr uint8_t kAllChannels = 0xFFu;
 }  // namespace
 
 SensorLink::SensorLink()
-    : _streaming(false),
+    : _lease_ms(TELEM_LEASE_MS),
       _mode(0),
       _rate_hz(30),
       _fields(TELEM_FIELD_RAW | TELEM_FIELD_BASELINE | TELEM_FIELD_DIFF | TELEM_FIELD_STATUS),
       _ch_mask(0),
       _last_emit_us(0),
-      _stream_seq(0) {
+      _stream_seq(0),
+      _at_req_ch(0xFF),
+      _at_ticks(0) {
     std::memset(_tx_buf, 0, sizeof(_tx_buf));
 }
 
@@ -67,7 +87,9 @@ void SensorLink::init() {
     dispatcher->register_handler(HostCmd::GLOBAL_GET, _handle_global_get);
     dispatcher->register_handler(HostCmd::GLOBAL_SET, _handle_global_set);
     dispatcher->register_handler(HostCmd::GLOBAL_GET_ALL, _handle_global_get_all);
+    dispatcher->register_handler(HostCmd::GLOBAL_COMMIT, _handle_global_commit);
     dispatcher->register_handler(HostCmd::AUTO_TUNE, _handle_auto_tune);
+    dispatcher->register_handler(HostCmd::PSOC_RESCUE, _handle_psoc_rescue);
     dispatcher->register_handler(HostCmd::ALGO_GET_INFO, _handle_algo_get_info);
     dispatcher->register_handler(HostCmd::ALGO_UPLOAD, _handle_algo_upload);
     dispatcher->register_handler(HostCmd::ALGO_APPLY, _handle_algo_apply);
@@ -83,9 +105,25 @@ void SensorLink::init() {
 }
 
 void SensorLink::stop() {
-    _streaming = false;
+    _stream.clear();
     Psoc::getInstance()->set_telemetry_active(false);
     TxScheduler::getInstance()->cancel(TX_TASK_TELEM);
+}
+
+void SensorLink::suspend() {
+    if (!_stream.active || _stream.suspended) return;
+    _stream.suspended = true;
+    Psoc::getInstance()->set_telemetry_active(false);   // 快照慢路暂停, 触控快路不受影响
+    TxScheduler::getInstance()->cancel(TX_TASK_TELEM);
+}
+
+void SensorLink::resume() {
+    if (!_stream.active || !_stream.suspended) return;
+    _stream.suspended = false;
+    Psoc::getInstance()->set_telemetry_active(true);
+    const uint32_t interval_us = 1000000UL / ((_rate_hz != 0u) ? _rate_hz : 1u);
+    TxScheduler::getInstance()->schedule(TX_TASK_TELEM, interval_us, _lease_ms,
+                                         &SensorLink::emit_telem_task);
 }
 
 void SensorLink::emit_telem_task() {
@@ -94,7 +132,7 @@ void SensorLink::emit_telem_task() {
 
 void SensorLink::tick() {
     // 周期由 TxScheduler 定时任务驱动; 本函数只负责"发送一帧"(不再自门控频率)。
-    if (!_streaming) return;
+    if (!_stream.emitting()) return;
 
     const uint32_t now_us = time_us_32();
 
@@ -176,10 +214,146 @@ void SensorLink::tick() {
         }
     }
     if (_mode == 1) {
-        _streaming = false;
-        Psoc::getInstance()->set_telemetry_active(false);
-        TxScheduler::getInstance()->cancel(TX_TASK_TELEM);
+        stop();   // 单次模式: 一帧即止(与主机显式 TELEM_STOP 同语义, 不自动恢复)
     }
+}
+
+void SensorLink::emit_autotune_task() {
+    getInstance()->autotune_tick();
+}
+
+// 频率自适应阶段进度推送: core1 在阻塞完成自适应的同时发布 phase/step/试探分频,
+// 本任务把它按 5Hz 组帧推给上位机, 使 20-25s 的长操作全程可见(而非上位机干等一个最终响应)。
+void SensorLink::autotune_tick() {
+    // 自续租: 本任务的存活由"设备侧操作未完成"决定, 不依赖上位机发命令(renew_all 会把租约压到 3s)。
+    // 有硬上限, 异常时必然自灭。
+    if (_at_ticks < AUTOTUNE_MAX_TICKS) {
+        _at_ticks++;
+        TxScheduler::getInstance()->renew(TX_TASK_AUTOTUNE, AUTOTUNE_LEASE_MS);
+    }
+    Psoc* psoc = Psoc::getInstance();
+    psoc::AutoTuneProgress st = psoc->autotune_status();
+    // core1 尚未取到本轮命令(队列排队中): 发布态仍是上一轮的结果 → 一律按"已受理/排队中"上报,
+    // 否则上一轮的 done 会让本轮进度流刚开始就自取消。
+    if (st.req != psoc->autotune_req()) {
+        st.clear();
+        st.state = 1;
+        st.ch = _at_req_ch;
+    }
+    const bool done = (st.state == 2u);
+    // 全通道终态必须回显请求哨兵 0xFF；进度帧才回显当前通道，不能让最后一次进度污染完成分支。
+    const uint8_t report_ch = (done && _at_req_ch == kAllChannels) ? kAllChannels : st.ch;
+
+    uint8_t* payload = _telem_frame.payload;
+    uint16_t length = 0;
+    payload[length++] = st.state;
+    payload[length++] = st.phase;
+    payload[length++] = st.step;
+    payload[length++] = static_cast<uint8_t>(st.cur_div);
+    payload[length++] = static_cast<uint8_t>(st.cur_div >> 8);
+    payload[length++] = report_ch;
+    payload[length++] = st.result;
+    payload[length++] = static_cast<uint8_t>(st.div);
+    payload[length++] = static_cast<uint8_t>(st.div >> 8);
+
+    _telem_frame.cmd = static_cast<uint8_t>(HostCmd::AUTO_TUNE_PROGRESS);
+    _telem_frame.flags = HOST_CMD_FLAG_STREAM;
+    _telem_frame.seq = _stream_seq++;
+    _telem_frame.len = length;
+
+    bool sent = false;
+    const uint16_t frame_length = HostCmdCodec::encode_frame(_telem_frame, _tx_buf, sizeof(_tx_buf));
+    if (frame_length > 0) {
+        HAL_USB_Device* usb = HAL_USB_Device::getInstance();
+        if (usb->config_write_available() > 0) {   // 背压保护: 满则跳过本帧, 不阻塞不排队
+            usb->config_write(_tx_buf, frame_length);
+            sent = true;
+        }
+    }
+
+    // 终态帧若被背压丢弃则不收尾, 下个周期重发: 否则上位机永远等不到完成帧(要靠 28s 超时兜)。
+    if (!done || !sent) return;
+    // 终态: 成功且找到分频 → 写穿 RP2040 真相源(供持久化与回读一致)。原同步 handler 里的这段
+    // 必须搬到此处, 因为受理时刻还没有结果。
+    if (st.result == 1u) {
+        CsdConfig* cfg = CsdConfig::getInstance();
+        if (_at_req_ch < SENSOR_LINK_CHANNELS && st.div != 0u) {
+            cfg->note_param(_at_req_ch, 0x08u, st.div);   // 0x08 = PARAM_SNS_CLK_DIV
+        } else if (_at_req_ch >= SENSOR_LINK_CHANNELS) {
+            // ★逐通道自适应★: 各通道分频互不相同(终态 st.div 已复用为"成功通道数"), 故逐通道
+            // 从 PSoC 回读真实 snsClk 写穿真相源, 否则重启后 download_to_psoc 会用旧值覆盖调好的结果。
+            for (uint8_t ch = 0; ch < SENSOR_LINK_CHANNELS; ch++) {
+                uint32_t v = 0;
+                if (Psoc::getInstance()->get_param(ch, 0x08u, &v) && v != 0u) {
+                    cfg->note_param(ch, 0x08u, v);
+                }
+            }
+        }
+        // 写穿后请求持久化: 否则调好的 snsClk 只活在 RAM, 重启后 download_to_psoc 用旧 blob 覆盖。
+        // 实际 flash 写由主循环安全窗口(main.cpp: has_pending_save)执行, 本函数不阻塞。
+        // 生效无需再 APPLY: PSoC 自适应内部已写 widgetContext 并 InitializeAllBaselines, 真相源写穿
+        // 只为持久化/回读一致; 多余 APPLY 会触发整片重初始化+重校准(额外重扫, 白掉一次基线)。
+        cfg->request_save();
+    }
+    TxScheduler::getInstance()->cancel(TX_TASK_AUTOTUNE);   // 最终帧已发出 → 自取消
+}
+
+void SensorLink::emit_rescue_task() {
+    getInstance()->rescue_tick();
+}
+
+// PSoC 救砖阶段进度推送: 与自适应同结构(自续租 + 终态自取消)。重刷期间主循环被 SWD 阻塞,
+// 本函数由 SwdProgrammer 的保活钩子经 TxScheduler::tick 调用, 故擦写全程仍有帧发出。
+void SensorLink::rescue_tick() {
+    if (_rescue_ticks < RESCUE_MAX_TICKS) {
+        _rescue_ticks++;
+        TxScheduler::getInstance()->renew(TX_TASK_RESCUE, RESCUE_LEASE_MS);
+    }
+    PsocUpdater* updater = PsocUpdater::getInstance();
+    const PsocBringupReport& rep = updater->report();
+    const uint8_t state = updater->rescue_state();
+
+    uint8_t* payload = _telem_frame.payload;
+    uint16_t length = 0;
+    payload[length++] = state;
+    payload[length++] = updater->rescue_phase();
+    payload[length++] = updater->rescue_result();
+    payload[length++] = static_cast<uint8_t>(rep.last_stage);
+    payload[length++] = static_cast<uint8_t>(rep.failure_stage);
+
+    _telem_frame.cmd = static_cast<uint8_t>(HostCmd::PSOC_RESCUE_PROGRESS);
+    _telem_frame.flags = HOST_CMD_FLAG_STREAM;
+    _telem_frame.seq = _stream_seq++;
+    _telem_frame.len = length;
+
+    bool sent = false;
+    const uint16_t frame_length = HostCmdCodec::encode_frame(_telem_frame, _tx_buf, sizeof(_tx_buf));
+    if (frame_length > 0) {
+        HAL_USB_Device* usb = HAL_USB_Device::getInstance();
+        if (usb->config_write_available() > 0) {   // 背压保护: 满则跳过本帧
+            usb->config_write(_tx_buf, frame_length);
+            sent = true;
+        }
+    }
+    // 终态帧被背压丢弃则下周期重发, 否则上位机等不到完成帧。
+    if (state == 2u && sent) TxScheduler::getInstance()->cancel(TX_TASK_RESCUE);
+}
+
+void SensorLink::_handle_psoc_rescue(const HostFrame& frame, uint8_t* response, uint16_t* response_length) {
+    // PSOC_RESCUE(0x08): 空 payload。★立即回 ACK("已受理")★ —— 全片擦写数秒, 在 handler 里同步做
+    // 会饿死 USB 导致掉线。仅置位请求, 由主循环 rescue_step 执行(其内部保活喂狗+泵 USB+推进度)。
+    PsocUpdater* updater = PsocUpdater::getInstance();
+    if (updater->rescue_active()) {
+        *response_length = HostCmdCodec::encode_nak(frame.seq, HostCmdError::DEVICE_BUSY,
+            "psoc rescue already running", response, 512);
+        return;
+    }
+    updater->rescue_request();
+    SensorLink* self = getInstance();
+    self->_rescue_ticks = 0;
+    TxScheduler::getInstance()->schedule(TX_TASK_RESCUE, RESCUE_INTERVAL_US, RESCUE_LEASE_MS,
+                                        &SensorLink::emit_rescue_task);
+    *response_length = HostCmdCodec::encode_ack(frame.seq, response, 512);
 }
 
 void SensorLink::_handle_telem_start(const HostFrame& frame, uint8_t* response, uint16_t* response_length) {
@@ -204,7 +378,8 @@ void SensorLink::_handle_telem_start(const HostFrame& frame, uint8_t* response, 
     if (self->_rate_hz < 1) self->_rate_hz = 1;
     if (self->_rate_hz > 1000) self->_rate_hz = 1000;
     self->_last_emit_us = 0;
-    self->_streaming = true;
+    self->_stream.active = true;
+    self->_stream.suspended = false;
     Psoc::getInstance()->set_telemetry_active(true);   // Phase C：开启全通道 raw 快照慢路
 
     // 注册/续期遥测定时任务(续期制): 周期=1e6/rate。可选 payload[12..13]=lease_ms(u16), 缺省 3s。
@@ -215,6 +390,7 @@ void SensorLink::_handle_telem_start(const HostFrame& frame, uint8_t* response, 
                            (static_cast<uint16_t>(frame.payload[13]) << 8);
         if (l != 0) lease_ms = l;
     }
+    self->_lease_ms = lease_ms;   // 记住协商值: 租约超时挂起后自动恢复要复用同一租约
     const uint32_t interval_us = 1000000UL / self->_rate_hz;
     TxScheduler::getInstance()->schedule(TX_TASK_TELEM, interval_us, lease_ms,
                                          &SensorLink::emit_telem_task);
@@ -222,9 +398,7 @@ void SensorLink::_handle_telem_start(const HostFrame& frame, uint8_t* response, 
 }
 
 void SensorLink::_handle_telem_stop(const HostFrame& frame, uint8_t* response, uint16_t* response_length) {
-    getInstance()->_streaming = false;
-    Psoc::getInstance()->set_telemetry_active(false);  // Phase C：关闭快照慢路，回落触控快路
-    TxScheduler::getInstance()->cancel(TX_TASK_TELEM);
+    getInstance()->stop();   // Phase C：关闭快照慢路，回落触控快路；显式停流不自动恢复
     *response_length = HostCmdCodec::encode_ack(frame.seq, response, 512);
 }
 
@@ -302,12 +476,23 @@ void SensorLink::_handle_param_get(const HostFrame& frame, uint8_t* response, ui
 
 void SensorLink::_handle_param_get_all(const HostFrame& frame, uint8_t* response, uint16_t* response_length) {
     // payload = channel(u8) → 响应 channel + count + [param_id + value(u32 LE)]×count
+    // payload = 0xFF + param_id(u8) → "全通道单参数"变体: 响应 0xFF + param_id + count + [ch + value(u32 LE)]×count
+    //   (36 通道单参数一次取回, 替代 36 条单发 PARAM_GET; 36×5+3=183B 仍在单帧内)
     if (frame.len < 1) {
         *response_length = HostCmdCodec::encode_nak(frame.seq, HostCmdError::INVALID_PARAM,
             "param_get_all payload too short", response, 512);
         return;
     }
     const uint8_t ch = frame.payload[0];
+    if (ch == kAllChannels) {
+        if (frame.len < 2) {
+            *response_length = HostCmdCodec::encode_nak(frame.seq, HostCmdError::INVALID_PARAM,
+                "param_get_all(all channels) needs param_id", response, 512);
+            return;
+        }
+        _emit_param_all_channels(frame, response, response_length);
+        return;
+    }
 
     HostFrame resp;
     resp.clear();
@@ -323,6 +508,36 @@ void SensorLink::_handle_param_get_all(const HostFrame& frame, uint8_t* response
         uint32_t value = 0;
         if (!Psoc::getInstance()->get_param(ch, kParamIds[i], &value)) continue;
         resp.payload[position++] = kParamIds[i];
+        resp.payload[position++] = static_cast<uint8_t>(value);
+        resp.payload[position++] = static_cast<uint8_t>(value >> 8);
+        resp.payload[position++] = static_cast<uint8_t>(value >> 16);
+        resp.payload[position++] = static_cast<uint8_t>(value >> 24);
+        count++;
+    }
+    resp.payload[count_position] = count;
+    resp.len = position;
+    *response_length = HostCmdCodec::encode_frame(resp, response, 512);
+}
+
+// "全通道单参数"批量回读: 响应 0xFF + param_id + count + [ch + value(u32 LE)]×count。
+// 读不到的通道直接跳过(不占 pair), 上位机按 count 解析。
+void SensorLink::_emit_param_all_channels(const HostFrame& frame, uint8_t* response, uint16_t* response_length) {
+    const uint8_t param_id = frame.payload[1];
+    HostFrame resp;
+    resp.clear();
+    resp.cmd = static_cast<uint8_t>(HostCmd::PARAM_GET_ALL);
+    resp.flags = HOST_CMD_FLAG_RESPONSE;
+    resp.seq = frame.seq;
+    uint16_t position = 0;
+    resp.payload[position++] = kAllChannels;
+    resp.payload[position++] = param_id;
+    const uint16_t count_position = position++;
+
+    uint8_t count = 0;
+    for (uint8_t ch = 0; ch < SENSOR_LINK_CHANNELS; ch++) {
+        uint32_t value = 0;
+        if (!Psoc::getInstance()->get_param(ch, param_id, &value)) continue;
+        resp.payload[position++] = ch;
         resp.payload[position++] = static_cast<uint8_t>(value);
         resp.payload[position++] = static_cast<uint8_t>(value >> 8);
         resp.payload[position++] = static_cast<uint8_t>(value >> 16);
@@ -356,30 +571,30 @@ void SensorLink::_handle_baseline_reset(const HostFrame& frame, uint8_t* respons
 }
 
 void SensorLink::_handle_auto_tune(const HostFrame& frame, uint8_t* response, uint16_t* response_length) {
-    // 空请求 → 频率自适应下探(阻塞至完成)。响应 [result(u8), div(u16 LE)]。
-    // result: 1=成功(div 为找到的统一 snsClk 分频, 已写回 PSoC widgetContext), 2=失败(超硬件能力)。
-    uint8_t result = 0; uint16_t div = 0;
-    if (!Psoc::getInstance()->auto_tune(&result, &div)) {
-        *response_length = HostCmdCodec::encode_nak(frame.seq, HostCmdError::SENSOR_ERROR,
-            "PSoC auto_tune failed/timeout", response, 512);
+    // payload = [ch(u8), pref(u8, 可选)]: ch 0..35=仅该通道下探, 0xFF=全 36 通道(旧行为);
+    // 缺省(空 payload)=全通道; pref=灵敏度档位 1..7(缺省/越界→4), 越高=落档时往低频多让分频。
+    // ★异步化★: 自适应最坏 20-25s, 端到端阻塞会让上位机干等且无从判断进度/异常。改为
+    // 入队即回 ACK("已受理"), 阶段进度与最终结果(含 result/div)经 AUTO_TUNE_PROGRESS(0x2E)
+    // 推送流上报, 完成帧发出后任务自取消。真相源写穿(note_param)随之搬到完成时刻。
+    const uint8_t req_ch = (frame.len >= 1) ? frame.payload[0] : 0xFFu;
+    uint8_t req_pref = (frame.len >= 2) ? frame.payload[1] : 4u;
+    if (req_pref < 1u || req_pref > 7u) req_pref = 4u;
+    if (req_ch >= 36u && req_ch != 0xFFu) {
+        *response_length = HostCmdCodec::encode_nak(frame.seq, HostCmdError::INVALID_PARAM,
+            "auto_tune channel out of range", response, 512);
         return;
     }
-    // 成功且找到分频 → 写穿 RP2040 真相源(全 36 通道统一 snsClk), 供持久化与回读一致。
-    if (result == 1u && div != 0u) {
-        for (uint8_t ch = 0; ch < 36u; ch++) {
-            CsdConfig::getInstance()->note_param(ch, 0x08u, div);   // 0x08 = PARAM_SNS_CLK_DIV
-        }
+    SensorLink* self = getInstance();
+    self->_at_req_ch = req_ch;
+    self->_at_ticks = 0;
+    if (!Psoc::getInstance()->auto_tune_start(req_ch, req_pref)) {
+        *response_length = HostCmdCodec::encode_nak(frame.seq, HostCmdError::SENSOR_ERROR,
+            "PSoC auto_tune enqueue failed", response, 512);
+        return;
     }
-    HostFrame resp;
-    resp.clear();
-    resp.cmd = static_cast<uint8_t>(HostCmd::AUTO_TUNE);
-    resp.flags = HOST_CMD_FLAG_RESPONSE;
-    resp.seq = frame.seq;
-    resp.payload[0] = result;
-    resp.payload[1] = static_cast<uint8_t>(div & 0xFF);
-    resp.payload[2] = static_cast<uint8_t>((div >> 8) & 0xFF);
-    resp.len = 3;
-    *response_length = HostCmdCodec::encode_frame(resp, response, 512);
+    TxScheduler::getInstance()->schedule(TX_TASK_AUTOTUNE, AUTOTUNE_INTERVAL_US, AUTOTUNE_LEASE_MS,
+                                         &SensorLink::emit_autotune_task);
+    *response_length = HostCmdCodec::encode_ack(frame.seq, response, 512);
 }
 
 void SensorLink::_handle_mode_set(const HostFrame& frame, uint8_t* response, uint16_t* response_length) {
@@ -399,8 +614,18 @@ void SensorLink::_handle_mode_set(const HostFrame& frame, uint8_t* response, uin
 }
 
 void SensorLink::_handle_csd_capture(const HostFrame& frame, uint8_t* response, uint16_t* response_length) {
-    // 从 PSoC 读取当前全部参数入 RP2040 store，作为半自动手动模式的起点/种子。
-    CsdConfig::getInstance()->capture_from_psoc(Psoc::getInstance());
+    // AUTO 的实时参数由 CapSense 自动计算，回读固化会覆盖用户保存的半自动手动参数。
+    CsdConfig* csd = CsdConfig::getInstance();
+    if (csd->mode() != CSD_MODE_SEMI) {
+        *response_length = HostCmdCodec::encode_nak(frame.seq, HostCmdError::CONFIG_ERROR,
+            "自动模式由 PSoC 接管，禁止捕获以保护手动参数", response, 512);
+        return;
+    }
+    if (!csd->capture_from_psoc(Psoc::getInstance())) {
+        *response_length = HostCmdCodec::encode_nak(frame.seq, HostCmdError::SENSOR_ERROR,
+            "PSoC 参数读取失败", response, 512);
+        return;
+    }
     *response_length = HostCmdCodec::encode_ack(frame.seq, response, 512);
 }
 
@@ -427,10 +652,11 @@ void SensorLink::_handle_cp_get(const HostFrame& frame, uint8_t* response, uint1
 
     const uint8_t ch = frame.payload[0];
     uint32_t cp_ff = 0;
+    // ★不再 NAK★: PSoC 未测量/测量失败本就以哨兵 0xFFFFFF 表达; 读取(SPI 忙/超时)失败时也回同一
+    // 哨兵的正常响应, 使上位机显示"未测量/测量失败"而不是刷 NAK 日志(实测 NAK 每秒 8~12 条刷屏)。
+    // NAK 只保留给非法通道(上面已处理)。
     if (!Psoc::getInstance()->get_cp(ch, &cp_ff)) {
-        *response_length = HostCmdCodec::encode_nak(frame.seq, HostCmdError::SENSOR_ERROR,
-            "PSoC cp_get failed", response, 512);
-        return;
+        cp_ff = CP_UNMEASURED_FF;
     }
 
     HostFrame resp;
@@ -523,7 +749,14 @@ void SensorLink::_handle_global_set(const HostFrame& frame, uint8_t* response, u
         return;
     }
     CsdConfig::getInstance()->note_global(gid, value);   // 写穿 RP2040 真相源
-    psoc->global_commit();   // 一次完整重初始化生效(合并, 防反复重校准漂移)
+    // ★不再逐项 commit★: 只写影子。由上位机在批量下发全部全局项后发一次 GLOBAL_COMMIT 统一重初始化,
+    // 避免"每项各触发一次完整 Init+Enable 重校准"的风暴(实测会拖垮 core0/USB → 掉线, 见 log.log)。
+    *response_length = HostCmdCodec::encode_ack(frame.seq, response, 512);
+}
+
+// 批量全局项下发完毕后, 单次触发 PSoC 完整重初始化(合并, 防反复重校准漂移/风暴)。
+void SensorLink::_handle_global_commit(const HostFrame& frame, uint8_t* response, uint16_t* response_length) {
+    Psoc::getInstance()->global_commit();
     *response_length = HostCmdCodec::encode_ack(frame.seq, response, 512);
 }
 
@@ -592,21 +825,35 @@ void SensorLink::_handle_algo_upload(const HostFrame& frame, uint8_t* response, 
             "algo_upload len invalid", response, 512);
         return;
     }
+    // ★必须先挡住"上一次下发还没做完"★: blob 缓冲被 core1 持有, 此刻 set_algo 改写它会让 PSoC
+    // 收到半新半旧的代码(=必然跑飞的算法)。下发已异步化, 故这里明确回 DEVICE_BUSY 让上位机重试。
+    if (Psoc::getInstance()->algo_download_busy()) {
+        *response_length = HostCmdCodec::encode_nak(frame.seq, HostCmdError::DEVICE_BUSY,
+            "algo download still in progress", response, 512);
+        return;
+    }
     PsocAlgo* store = PsocAlgo::getInstance();
     if (!store->set_algo(&frame.payload[4], len, crc16)) {   // 校验 crc16 一致才接受+持久化
         *response_length = HostCmdCodec::encode_nak(frame.seq, HostCmdError::INVALID_PARAM,
             "algo crc16 mismatch", response, 512);
         return;
     }
-    if (!store->download_to_psoc(Psoc::getInstance())) {     // 立即下发 PSoC + commit 校验
+    // 下发已受理(异步, 重活在 core1)。真实结果经 ALGO_GET_INFO 的 psoc_valid/len 回读对账,
+    // 失败则由主循环上报 SELF_HEAL_EVENT(SH_ALGO_FALLBACK, detail=1)。
+    if (!store->download_to_psoc(Psoc::getInstance())) {
         *response_length = HostCmdCodec::encode_nak(frame.seq, HostCmdError::SENSOR_ERROR,
-            "algo download to PSoC failed", response, 512);
+            "algo download enqueue failed", response, 512);
         return;
     }
     *response_length = HostCmdCodec::encode_ack(frame.seq, response, 512);
 }
 
 void SensorLink::_handle_algo_apply(const HostFrame& frame, uint8_t* response, uint16_t* response_length) {
+    if (Psoc::getInstance()->algo_download_busy()) {
+        *response_length = HostCmdCodec::encode_nak(frame.seq, HostCmdError::DEVICE_BUSY,
+            "algo download still in progress", response, 512);
+        return;
+    }
     if (PsocAlgo::getInstance()->download_to_psoc(Psoc::getInstance())) {
         *response_length = HostCmdCodec::encode_ack(frame.seq, response, 512);
     } else {
@@ -616,6 +863,12 @@ void SensorLink::_handle_algo_apply(const HostFrame& frame, uint8_t* response, u
 }
 
 void SensorLink::_handle_algo_reset_default(const HostFrame& frame, uint8_t* response, uint16_t* response_length) {
+    // 同 ALGO_UPLOAD: reset_default 会改写 blob, 下发在途时必须先挡住。
+    if (Psoc::getInstance()->algo_download_busy()) {
+        *response_length = HostCmdCodec::encode_nak(frame.seq, HostCmdError::DEVICE_BUSY,
+            "algo download still in progress", response, 512);
+        return;
+    }
     PsocAlgo* store = PsocAlgo::getInstance();
     store->reset_default();                          // 回退内嵌默认 + 请求持久化
     store->download_to_psoc(Psoc::getInstance());    // 立即下发默认(失败也回 ACK, 启动会重推)

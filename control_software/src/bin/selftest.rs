@@ -17,7 +17,8 @@ use mai2control_ui::app_state::{AppController, ConnState};
 use mai2control_ui::io;
 use mai2control_ui::proto::{
     BRINGUP_FLAG_CHECKSUM, BRINGUP_FLAG_LINK, BRINGUP_FLAG_SNAPSHOT,
-    EXPECTED_PSOC_S455_ID, RP_BUILD_ID_DIAGNOSTIC_V1, CfgValue,
+    EXPECTED_PSOC_S455_ID, RP_BUILD_ID_DIAGNOSTIC_V1, CfgValue, LedRegion,
+    LED_PREVIEW_ALL, LED_UNIT_COUNT,
 };
 use std::thread;
 use std::time::Duration;
@@ -31,11 +32,1005 @@ const CP_GET_TIMEOUT_MS: u64 = 1_000;
 const CP_REQUEST_INTERVAL_MS: u64 = 500;
 const CP_CHANNEL_COUNT: u8 = 36;
 const CP_FAILURE_VALUE: u32 = 0x00FF_FFFF;
+const LED_STATE_TIMEOUT_MS: u64 = 1_000;
+const LED_APPLY_TIMEOUT_MS: u64 = 1_000;
+const LED_PREVIEW_FALLBACK_MS: u64 = 3_300;
+
+fn _print_vcam_probe_hr<T>(step: &str, result: &windows::core::Result<T>) -> bool {
+    match result {
+        Ok(_) => {
+            println!("[VCAM] {}: 0x00000000", step);
+            true
+        }
+        Err(error) => {
+            println!("[VCAM] {}: 0x{:08X}", step, error.code().0 as u32);
+            false
+        }
+    }
+}
+
+/// 无论 Start 是否成功都回收会话相机，避免探测留下系统可见但不可用的残留项。
+fn _cleanup_vcam_probe_camera(
+    access_name: &str,
+    camera: &windows::Win32::Media::MediaFoundation::IMFVirtualCamera,
+) {
+    _print_vcam_probe_hr(
+        &format!("IMFVirtualCamera::Stop({})", access_name),
+        &unsafe { camera.Stop() },
+    );
+    _print_vcam_probe_hr(
+        &format!("IMFVirtualCamera::Remove({})", access_name),
+        &unsafe { camera.Remove() },
+    );
+    _print_vcam_probe_hr(
+        &format!("IMFVirtualCamera::Shutdown({})", access_name),
+        &unsafe { camera.Shutdown() },
+    );
+}
+
+fn _run_vcam_probe() {
+    use mai2control_ui::vcam::{
+        share::{FramePublisher, ShareNamespace},
+        FRAME_H, FRAME_W,
+    };
+    use windows::core::{GUID, Interface, IUnknown};
+    use windows::Win32::Media::KernelStreaming::IKsControl;
+    use windows::Win32::Media::MediaFoundation::{
+        MFCreateAttributes, MFCreateMediaType, MFCreateSourceReaderFromMediaSource,
+        MFCreateVirtualCamera, MFEnumDeviceSources, MFShutdown, MFStartup, IMFActivate,
+        IMFAttributes, IMFGetService, IMFMediaEventGenerator, IMFMediaSource, IMFMediaSourceEx,
+        IMFSourceReader, IMFSampleAllocatorControl, MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME,
+        MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE, MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID,
+        MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE, MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING,
+        MF_SOURCE_READER_FIRST_VIDEO_STREAM, MFMediaType_Video, MF_E_SHUTDOWN, MFVideoFormat_NV12,
+        MFVideoFormat_RGB32, MFVirtualCameraAccess_AllUsers, MFVirtualCameraAccess_CurrentUser,
+        MFVirtualCameraLifetime_Session, MFVirtualCameraType_SoftwareCameraSource,
+        MFSTARTUP_FULL, MF_VERSION,
+    };
+    use windows::Win32::System::Com::{
+        CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, CLSCTX_INPROC_SERVER,
+        COINIT_APARTMENTTHREADED, COINIT_MULTITHREADED,
+    };
+
+    fn _measure_vcam_frame(bytes: &[u8], subtype: GUID) -> Option<([f32; 3], f32)> {
+        const SAMPLE_STEP: usize = 8;
+        let x_start = FRAME_W / 2 - 80;
+        let x_end = FRAME_W / 2 + 80;
+        let y_start = FRAME_H / 2 - 60;
+        let y_end = FRAME_H / 2 + 60;
+        let (mut sums, mut non_black, mut samples) = ([0u64; 3], 0usize, 0usize);
+
+        if subtype == MFVideoFormat_RGB32 {
+            if bytes.len() < FRAME_W * FRAME_H * 4 {
+                return None;
+            }
+            for y in (y_start..y_end).step_by(SAMPLE_STEP) {
+                for x in (x_start..x_end).step_by(SAMPLE_STEP) {
+                    let offset = (y * FRAME_W + x) * 4;
+                    let pixel = [bytes[offset + 2], bytes[offset + 1], bytes[offset]];
+                    for channel in 0..3 {
+                        sums[channel] += pixel[channel] as u64;
+                    }
+                    non_black += usize::from(pixel.iter().any(|&value| value > 12));
+                    samples += 1;
+                }
+            }
+        } else if subtype == MFVideoFormat_NV12 {
+            if bytes.len() < FRAME_W * FRAME_H {
+                return None;
+            }
+            for y in (y_start..y_end).step_by(SAMPLE_STEP) {
+                for x in (x_start..x_end).step_by(SAMPLE_STEP) {
+                    let luma = bytes[y * FRAME_W + x];
+                    sums[0] += luma as u64;
+                    non_black += usize::from(luma > 24);
+                    samples += 1;
+                }
+            }
+        } else {
+            return None;
+        }
+
+        if samples == 0 {
+            return None;
+        }
+        Some((
+            [
+                sums[0] as f32 / samples as f32,
+                sums[1] as f32 / samples as f32,
+                sums[2] as f32 / samples as f32,
+            ],
+            non_black as f32 * 100.0 / samples as f32,
+        ))
+    }
+
+    fn _vcam_frame_matches(mean: [f32; 3], non_black_percent: f32, subtype: GUID, color: [u8; 3]) -> bool {
+        const COLOR_TOLERANCE: f32 = 20.0;
+        const MIN_NON_BLACK_PERCENT: f32 = 80.0;
+        if non_black_percent < MIN_NON_BLACK_PERCENT {
+            return false;
+        }
+        if subtype == MFVideoFormat_NV12 {
+            let expected_luma = 16.0
+                + 0.257 * color[0] as f32
+                + 0.504 * color[1] as f32
+                + 0.098 * color[2] as f32;
+            return (mean[0] - expected_luma).abs() <= COLOR_TOLERANCE;
+        }
+        subtype == MFVideoFormat_RGB32
+            && mean
+                .iter()
+                .zip(color)
+                .all(|(actual, expected)| (*actual - expected as f32).abs() <= COLOR_TOLERANCE)
+    }
+
+    fn _publish_and_verify_vcam_frame(
+        reader: &IMFSourceReader,
+        publisher: &mut FramePublisher,
+        subtype: GUID,
+        round_name: &str,
+        color: [u8; 3],
+    ) -> Result<(), String> {
+        let mut frame = vec![0u8; FRAME_W * FRAME_H * 3];
+        for pixel in frame.chunks_exact_mut(3) {
+            pixel.copy_from_slice(&color);
+        }
+        if let Err(error) = publisher.publish(&frame) {
+            println!("[VCAM] FramePublisher::publish({}): {}", round_name, error);
+            return Err(format!("{} 发布帧失败", round_name));
+        }
+
+        let start = std::time::Instant::now();
+        let mut frames = 0u32;
+        while start.elapsed() < Duration::from_secs(3) && frames < 60 {
+            let mut actual_stream = 0u32;
+            let mut stream_flags = 0u32;
+            let mut sample = None;
+            let read_result = unsafe {
+                reader.ReadSample(
+                    MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32,
+                    0,
+                    Some(&mut actual_stream),
+                    Some(&mut stream_flags),
+                    None,
+                    Some(&mut sample),
+                )
+            };
+            if let Err(error) = read_result {
+                println!("[VCAM] IMFSourceReader::ReadSample({}): 0x{:08X}", round_name, error.code().0 as u32);
+                return Err(format!("{} 读帧失败", round_name));
+            }
+            let Some(sample) = sample else {
+                thread::sleep(Duration::from_millis(10));
+                continue;
+            };
+            frames += 1;
+
+            let buffer_result = unsafe { sample.ConvertToContiguousBuffer() };
+            let buffer = match buffer_result {
+                Ok(buffer) => buffer,
+                Err(error) => {
+                    println!("[VCAM] IMFSample::ConvertToContiguousBuffer({}): 0x{:08X}", round_name, error.code().0 as u32);
+                    return Err(format!("{} 连续缓冲区失败", round_name));
+                }
+            };
+            let mut buffer_ptr = std::ptr::null_mut();
+            let mut buffer_len = 0u32;
+            let lock_result = unsafe { buffer.Lock(&mut buffer_ptr, None, Some(&mut buffer_len)) };
+            if let Err(error) = lock_result {
+                println!("[VCAM] IMFMediaBuffer::Lock({}): 0x{:08X}", round_name, error.code().0 as u32);
+                return Err(format!("{} 锁定缓冲区失败", round_name));
+            }
+            let measurement = if buffer_ptr.is_null() {
+                None
+            } else {
+                let bytes = unsafe { std::slice::from_raw_parts(buffer_ptr, buffer_len as usize) };
+                _measure_vcam_frame(bytes, subtype)
+            };
+            let unlock_result = unsafe { buffer.Unlock() };
+            if let Err(error) = unlock_result {
+                println!("[VCAM] IMFMediaBuffer::Unlock({}): 0x{:08X}", round_name, error.code().0 as u32);
+                return Err(format!("{} 解锁缓冲区失败", round_name));
+            }
+            let Some((mean, non_black_percent)) = measurement else {
+                return Err(format!("{} 输出格式或帧大小不支持", round_name));
+            };
+            if _vcam_frame_matches(mean, non_black_percent, subtype, color) {
+                if subtype == MFVideoFormat_NV12 {
+                    println!(
+                        "[VCAM] e2e {} hit frame={} mean=Y:{:.1} nonblack={:.1}%",
+                        round_name, frames, mean[0], non_black_percent
+                    );
+                } else {
+                    println!(
+                        "[VCAM] e2e {} hit frame={} mean=R:{:.1} G:{:.1} B:{:.1} nonblack={:.1}%",
+                        round_name, frames, mean[0], mean[1], mean[2], non_black_percent
+                    );
+                }
+                return Ok(());
+            }
+        }
+        Err(format!("{} 在 3 秒/60 帧内未命中目标颜色", round_name))
+    }
+
+    fn _run_current_user_vcam_e2e(vcam_name: &str) -> Result<(), String> {
+        let mut publisher = match FramePublisher::create() {
+            Ok(publisher) => publisher,
+            Err(error) => {
+                println!("[VCAM] FramePublisher::create: {}", error);
+                return Err("无法创建帧共享内存".to_string());
+            }
+        };
+        println!("[VCAM] FramePublisher namespace: {}", publisher.namespace().label());
+        if publisher.namespace() == ShareNamespace::Local {
+            println!("[VCAM] WARNING: Local 映射无法被 session 0 Frame Server 读取，端到端判定不可用");
+            return Err("FramePublisher 退回 Local 命名空间".to_string());
+        }
+
+        let mut enum_attributes: Option<IMFAttributes> = None;
+        let enum_attributes_result = unsafe { MFCreateAttributes(&mut enum_attributes, 1) };
+        if !_print_vcam_probe_hr("MFCreateAttributes(device enum)", &enum_attributes_result) {
+            return Err("无法创建设备枚举属性".to_string());
+        }
+        let Some(enum_attributes) = enum_attributes else {
+            return Err("设备枚举属性为空".to_string());
+        };
+        let source_type_result = unsafe {
+            enum_attributes.SetGUID(
+                &MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE,
+                &MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID,
+            )
+        };
+        if !_print_vcam_probe_hr("IMFAttributes::SetGUID(VIDCAP)", &source_type_result) {
+            return Err("无法设置视频捕获枚举条件".to_string());
+        }
+
+        let mut device_activates = std::ptr::null_mut();
+        let mut device_count = 0u32;
+        let enum_result = unsafe {
+            MFEnumDeviceSources(&enum_attributes, &mut device_activates, &mut device_count)
+        };
+        if !_print_vcam_probe_hr("MFEnumDeviceSources(VIDCAP)", &enum_result) {
+            return Err("枚举视频捕获设备失败".to_string());
+        }
+        // MFCreateVirtualCamera 将传入名称包装为 Windows Shell 可见的友好名；按枚举出的完整值精确匹配，
+        // 仍以本次唯一 MAI2_VCAM_NAME 为前缀，避免误取同 CLSID 的旧会话相机。
+        let expected_friendly_name = format!("{} (Windows 虚拟摄像头)", vcam_name);
+        let mut matching_activate = None;
+        if !device_activates.is_null() {
+            for index in 0..device_count as usize {
+                let candidate = unsafe { std::ptr::read(device_activates.add(index)) };
+                let Some(candidate) = candidate else {
+                    continue;
+                };
+                let name_len_result = unsafe {
+                    candidate.GetStringLength(&MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME)
+                };
+                let Ok(name_len) = name_len_result else {
+                    _print_vcam_probe_hr(
+                        "IMFActivate::GetStringLength(MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME)",
+                        &name_len_result,
+                    );
+                    continue;
+                };
+                let mut name_utf16 = vec![0u16; name_len as usize + 1];
+                let name_result = unsafe {
+                    candidate.GetString(
+                        &MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME,
+                        &mut name_utf16,
+                        None,
+                    )
+                };
+                if !_print_vcam_probe_hr(
+                    "IMFActivate::GetString(MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME)",
+                    &name_result,
+                ) {
+                    continue;
+                }
+                let name = String::from_utf16_lossy(&name_utf16[..name_len as usize]);
+                println!("[VCAM] MFEnumDeviceSources candidate[{}]: '{}'", index, name);
+                if name == expected_friendly_name {
+                    matching_activate = Some(candidate);
+                    break;
+                }
+            }
+            unsafe { CoTaskMemFree(Some(device_activates.cast())) };
+        }
+        println!(
+            "[VCAM] MFEnumDeviceSources: total={} {}",
+            device_count,
+            if matching_activate.is_some() { "matched" } else { "not matched" }
+        );
+        let Some(matching_activate) = matching_activate else {
+            return Err("未按友好名找到本次虚拟摄像头".to_string());
+        };
+
+        let source_result: windows::core::Result<IMFMediaSource> = unsafe {
+            matching_activate.ActivateObject()
+        };
+        if !_print_vcam_probe_hr(
+            "IMFActivate::ActivateObject(IMFMediaSource, enumerated camera)",
+            &source_result,
+        ) {
+            return Err("无法激活枚举到的虚拟摄像头".to_string());
+        }
+        let media_source = match source_result {
+            Ok(media_source) => media_source,
+            Err(_) => return Err("枚举相机媒体源为空".to_string()),
+        };
+
+        let mut reader_attributes: Option<IMFAttributes> = None;
+        let reader_attributes_result = unsafe { MFCreateAttributes(&mut reader_attributes, 1) };
+        let mut e2e_result = if !_print_vcam_probe_hr(
+            "MFCreateAttributes(source reader)",
+            &reader_attributes_result,
+        ) {
+            Err("无法创建 SourceReader 属性".to_string())
+        } else if let Some(reader_attributes) = reader_attributes {
+            let enable_processing_result = unsafe {
+                reader_attributes.SetUINT32(&MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, 1)
+            };
+            let video_processing = _print_vcam_probe_hr(
+                "IMFAttributes::SetUINT32(MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING)",
+                &enable_processing_result,
+            );
+            let reader_result = unsafe {
+                MFCreateSourceReaderFromMediaSource(&media_source, &reader_attributes)
+            };
+            if !_print_vcam_probe_hr("MFCreateSourceReaderFromMediaSource", &reader_result) {
+                Err("无法创建 SourceReader".to_string())
+            } else {
+                match reader_result {
+                    Ok(reader) => {
+                        if video_processing {
+                            let rgb_type_result = unsafe { MFCreateMediaType() };
+                            if _print_vcam_probe_hr("MFCreateMediaType(RGB32)", &rgb_type_result) {
+                                if let Ok(rgb_type) = rgb_type_result {
+                                    let major_type_result = unsafe {
+                                        rgb_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)
+                                    };
+                                    let subtype_result = unsafe {
+                                        rgb_type.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_RGB32)
+                                    };
+                                    if _print_vcam_probe_hr(
+                                        "IMFMediaType::SetGUID(MF_MT_MAJOR_TYPE=Video)",
+                                        &major_type_result,
+                                    ) && _print_vcam_probe_hr(
+                                        "IMFMediaType::SetGUID(MF_MT_SUBTYPE=RGB32)",
+                                        &subtype_result,
+                                    ) {
+                                        _print_vcam_probe_hr(
+                                            "IMFSourceReader::SetCurrentMediaType(RGB32)",
+                                            &unsafe {
+                                                reader.SetCurrentMediaType(
+                                                    MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32,
+                                                    None,
+                                                    &rgb_type,
+                                                )
+                                            },
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        let current_type_result = unsafe {
+                            reader.GetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32)
+                        };
+                        if !_print_vcam_probe_hr(
+                            "IMFSourceReader::GetCurrentMediaType",
+                            &current_type_result,
+                        ) {
+                            Err("无法取得 SourceReader 输出媒体类型".to_string())
+                        } else if let Ok(current_type) = current_type_result {
+                            let subtype_result = unsafe { current_type.GetGUID(&MF_MT_SUBTYPE) };
+                            if !_print_vcam_probe_hr(
+                                "IMFMediaType::GetGUID(MF_MT_SUBTYPE)",
+                                &subtype_result,
+                            ) {
+                                Err("无法取得 SourceReader 输出子类型".to_string())
+                            } else if let Ok(subtype) = subtype_result {
+                                println!("[VCAM] SourceReader output subtype: {:?}", subtype);
+                                if subtype != MFVideoFormat_RGB32 && subtype != MFVideoFormat_NV12 {
+                                    Err(format!("不支持的 SourceReader 输出格式 {:?}", subtype))
+                                } else if let Err(reason) = _publish_and_verify_vcam_frame(
+                                    &reader,
+                                    &mut publisher,
+                                    subtype,
+                                    "A",
+                                    [200, 40, 60],
+                                ) {
+                                    Err(reason)
+                                } else {
+                                    _publish_and_verify_vcam_frame(
+                                        &reader,
+                                        &mut publisher,
+                                        subtype,
+                                        "B",
+                                        [30, 180, 220],
+                                    )
+                                }
+                            } else {
+                                Err("SourceReader 输出子类型为空".to_string())
+                            }
+                        } else {
+                            Err("SourceReader 输出媒体类型为空".to_string())
+                        }
+                    }
+                    Err(_) => Err("SourceReader 为空".to_string()),
+                }
+            }
+        } else {
+            Err("SourceReader 属性为空".to_string())
+        };
+
+        let source_shutdown_result = unsafe { media_source.Shutdown() };
+        // SourceReader 释放时会连带关闭它所拥有的媒体源, 所以这里的 MF_E_SHUTDOWN 是预期结果,
+        // 只有其它错误码才说明媒体源真的没能正常收尾。
+        let already_shutdown = source_shutdown_result
+            .as_ref()
+            .err()
+            .is_some_and(|error| error.code() == MF_E_SHUTDOWN);
+        if !_print_vcam_probe_hr("IMFMediaSource::Shutdown(enumerated camera)", &source_shutdown_result)
+            && !already_shutdown
+            && e2e_result.is_ok()
+        {
+            e2e_result = Err("枚举相机媒体源 Shutdown 失败".to_string());
+        }
+        drop(media_source);
+        drop(matching_activate);
+        drop(publisher);
+        e2e_result
+    }
+
+    const VCAM_CLSID: GUID = GUID::from_u128(0xB7C5F1A2_3D64_4E8B_9A11_2F6C8D0E4A73);
+    // ★探针允许用唯一友好名★: MFCreateVirtualCamera 以入参为键复用已注册的虚拟相机, 沿用同名会
+    // 复用上一次(可能是失败态)的注册记录。设 MAI2_VCAM_NAME 环境变量即可用全新键跑一次干净验证。
+    let vcam_name_owned = std::env::var("MAI2_VCAM_NAME")
+        .unwrap_or_else(|_| "mai2control Virtual Camera".to_string());
+    let vcam_name: &str = vcam_name_owned.as_str();
+    const VCAM_CLSID_TEXT: &str = "{B7C5F1A2-3D64-4E8B-9A11-2F6C8D0E4A73}";
+
+    println!("[VCAM] probe begin");
+    // windows 0.62 的 CoInitializeEx 返回裸 HRESULT, 直接打印即可(S_FALSE=已初始化过, 非错误)。
+    let mut _com_init_count = 0u8;
+    let apartment = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+    println!("[VCAM] CoInitializeEx(COINIT_APARTMENTTHREADED): 0x{:08X}", apartment.0 as u32);
+    if apartment.is_ok() {
+        _com_init_count += 1;
+    }
+    let multithreaded = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+    println!("[VCAM] CoInitializeEx(COINIT_MULTITHREADED): 0x{:08X}", multithreaded.0 as u32);
+    if multithreaded.is_ok() {
+        _com_init_count += 1;
+    }
+
+    let mf_startup = unsafe { MFStartup(MF_VERSION, MFSTARTUP_FULL) };
+    let mf_started = _print_vcam_probe_hr("MFStartup(MF_VERSION, MFSTARTUP_FULL)", &mf_startup);
+
+    let unknown_result: windows::core::Result<IUnknown> = unsafe {
+        CoCreateInstance(&VCAM_CLSID, None, CLSCTX_INPROC_SERVER)
+    };
+    _print_vcam_probe_hr(
+        "CoCreateInstance(CLSID_mai2vcam_source, CLSCTX_INPROC_SERVER, IID_IUnknown)",
+        &unknown_result,
+    );
+    let unknown = unknown_result.ok();
+
+    if let Some(unknown) = unknown.as_ref() {
+        let activate_result = unknown.cast::<IMFActivate>();
+        _print_vcam_probe_hr("QueryInterface(IMFActivate)", &activate_result);
+        if let Some(activate) = activate_result.ok() {
+            let media_source_result: windows::core::Result<IMFMediaSource> =
+                unsafe { activate.ActivateObject() };
+            _print_vcam_probe_hr(
+                "IMFActivate::ActivateObject(IMFMediaSource)",
+                &media_source_result,
+            );
+
+            if let Ok(media_source) = media_source_result.as_ref() {
+                _print_vcam_probe_hr(
+                    "QueryInterface(IMFMediaSource)",
+                    &media_source.cast::<IMFMediaSource>(),
+                );
+                _print_vcam_probe_hr(
+                    "QueryInterface(IMFMediaSourceEx)",
+                    &media_source.cast::<IMFMediaSourceEx>(),
+                );
+                _print_vcam_probe_hr(
+                    "QueryInterface(IMFMediaEventGenerator)",
+                    &media_source.cast::<IMFMediaEventGenerator>(),
+                );
+                _print_vcam_probe_hr(
+                    "QueryInterface(IMFGetService)",
+                    &media_source.cast::<IMFGetService>(),
+                );
+                _print_vcam_probe_hr(
+                    "QueryInterface(IKsControl)",
+                    &media_source.cast::<IKsControl>(),
+                );
+                _print_vcam_probe_hr(
+                    "QueryInterface(IMFAttributes)",
+                    &media_source.cast::<IMFAttributes>(),
+                );
+                _print_vcam_probe_hr(
+                    "QueryInterface(IMFSampleAllocatorControl)",
+                    &media_source.cast::<IMFSampleAllocatorControl>(),
+                );
+                _print_vcam_probe_hr(
+                    "IMFMediaSource::CreatePresentationDescriptor",
+                    &unsafe { media_source.CreatePresentationDescriptor() },
+                );
+                _print_vcam_probe_hr(
+                    "IMFActivate::ShutdownObject",
+                    &unsafe { activate.ShutdownObject() },
+                );
+                _print_vcam_probe_hr(
+                    "IMFActivate::DetachObject",
+                    &unsafe { activate.DetachObject() },
+                );
+            } else {
+                for interface_name in [
+                    "IMFMediaSource",
+                    "IMFMediaSourceEx",
+                    "IMFMediaEventGenerator",
+                    "IMFGetService",
+                    "IKsControl",
+                    "IMFAttributes",
+                    "IMFSampleAllocatorControl",
+                ] {
+                    println!("[VCAM] QueryInterface({}): skipped (ActivateObject failed)", interface_name);
+                }
+                println!("[VCAM] IMFMediaSource::CreatePresentationDescriptor: skipped (ActivateObject failed)");
+                println!("[VCAM] IMFActivate::ShutdownObject: skipped (ActivateObject failed)");
+                println!("[VCAM] IMFActivate::DetachObject: skipped (ActivateObject failed)");
+            }
+        } else {
+            println!("[VCAM] IMFActivate::ActivateObject(IMFMediaSource): skipped (IMFActivate unavailable)");
+            for interface_name in [
+                "IMFMediaSource",
+                "IMFMediaSourceEx",
+                "IMFMediaEventGenerator",
+                "IMFGetService",
+                "IKsControl",
+                "IMFAttributes",
+                "IMFSampleAllocatorControl",
+            ] {
+                println!("[VCAM] QueryInterface({}): skipped (IMFActivate unavailable)", interface_name);
+            }
+            println!("[VCAM] IMFMediaSource::CreatePresentationDescriptor: skipped (IMFActivate unavailable)");
+            println!("[VCAM] IMFActivate::ShutdownObject: skipped (IMFActivate unavailable)");
+            println!("[VCAM] IMFActivate::DetachObject: skipped (IMFActivate unavailable)");
+        }
+    } else {
+        println!("[VCAM] QueryInterface(IMFActivate): skipped (CoCreateInstance failed)");
+        println!("[VCAM] IMFActivate::ActivateObject(IMFMediaSource): skipped (CoCreateInstance failed)");
+        for interface_name in [
+            "IMFMediaSource",
+            "IMFMediaSourceEx",
+            "IMFMediaEventGenerator",
+            "IMFGetService",
+            "IKsControl",
+            "IMFAttributes",
+            "IMFSampleAllocatorControl",
+        ] {
+            println!("[VCAM] QueryInterface({}): skipped (CoCreateInstance failed)", interface_name);
+        }
+        println!("[VCAM] IMFMediaSource::CreatePresentationDescriptor: skipped (CoCreateInstance failed)");
+        println!("[VCAM] IMFActivate::ShutdownObject: skipped (CoCreateInstance failed)");
+        println!("[VCAM] IMFActivate::DetachObject: skipped (CoCreateInstance failed)");
+    }
+    // COM 引用必须在 MFShutdown/CoUninitialize 前释放，否则 DLL 的析构会访问已卸载的套间。
+    drop(unknown);
+
+    // ★MAI2_VCAM_ONLY_CURRENT=1 时只测 CurrentUser★: 同一 sourceId 同时存在两台会互相干扰 ——
+    // AllUsers 那台 Start 失败后被 Remove(), 可能连带把该 CLSID 的虚拟相机注册一起删掉,
+    // 导致随后 CurrentUser 那台 Start 时帧服务器只看到"0 个流"。
+    let only_current = std::env::var("MAI2_VCAM_ONLY_CURRENT").is_ok();
+    let all_users_result = if only_current {
+        Err(windows::core::Error::from(windows::Win32::Foundation::E_ABORT))
+    } else {
+        unsafe {
+            MFCreateVirtualCamera(
+                MFVirtualCameraType_SoftwareCameraSource,
+                MFVirtualCameraLifetime_Session,
+                MFVirtualCameraAccess_AllUsers,
+                &windows::core::HSTRING::from(vcam_name),
+                &windows::core::HSTRING::from(VCAM_CLSID_TEXT),
+                None,
+            )
+        }
+    };
+    if only_current {
+        println!("[VCAM] MFCreateVirtualCamera(AllUsers): skipped (MAI2_VCAM_ONLY_CURRENT)");
+    } else {
+        _print_vcam_probe_hr("MFCreateVirtualCamera(AllUsers)", &all_users_result);
+    }
+    let current_user_result = unsafe {
+        MFCreateVirtualCamera(
+            MFVirtualCameraType_SoftwareCameraSource,
+            MFVirtualCameraLifetime_Session,
+            MFVirtualCameraAccess_CurrentUser,
+            &windows::core::HSTRING::from(vcam_name),
+            &windows::core::HSTRING::from(VCAM_CLSID_TEXT),
+            None,
+        )
+    };
+    _print_vcam_probe_hr("MFCreateVirtualCamera(CurrentUser)", &current_user_result);
+
+    // ★两种 access 都要各自 Start 一次★: CurrentUser Start 成功后才可用枚举路径验证真实画面。
+    let mut any_created = false;
+    let mut e2e_result = None;
+    for (access_name, camera) in [
+        ("AllUsers", all_users_result.ok()),
+        ("CurrentUser", current_user_result.ok()),
+    ] {
+        if let Some(camera) = camera {
+            any_created = true;
+            let start_result = unsafe { camera.Start(None) };
+            let started = _print_vcam_probe_hr(
+                &format!("IMFVirtualCamera::Start({})", access_name),
+                &start_result,
+            );
+            if access_name == "CurrentUser" {
+                e2e_result = Some(if started {
+                    _run_current_user_vcam_e2e(vcam_name)
+                } else {
+                    Err("CurrentUser 虚拟摄像头 Start 失败".to_string())
+                });
+            }
+            _cleanup_vcam_probe_camera(access_name, &camera);
+        } else {
+            println!("[VCAM] IMFVirtualCamera::Start({}): skipped (creation failed)", access_name);
+        }
+    }
+    if !any_created {
+        println!("[VCAM] IMFVirtualCamera::Start: skipped (both creation calls failed)");
+    }
+    match e2e_result {
+        Some(Ok(())) => println!("[VCAM] e2e: PASS"),
+        Some(Err(reason)) => println!("[VCAM] e2e: FAIL {}", reason),
+        None => println!("[VCAM] e2e: FAIL CurrentUser 虚拟摄像头未创建"),
+    }
+
+    if mf_started {
+        _print_vcam_probe_hr("MFShutdown", &unsafe { MFShutdown() });
+    } else {
+        println!("[VCAM] MFShutdown: skipped (MFStartup failed)");
+    }
+    while _com_init_count > 0 {
+        unsafe { CoUninitialize() };
+        _com_init_count -= 1;
+    }
+    println!("[VCAM] probe end");
+}
+
+#[derive(Clone, Copy, Default)]
+struct SoakDebugCounters {
+    vendor_tx_bytes: u32,
+    flash_write_count: u32,
+    rearm_count: u32,
+    out_stalled: u8,
+}
+
+fn read_soak_debug(ctrl: &AppController) -> Option<SoakDebugCounters> {
+    let bytes = match ctrl.read_debug_counters() {
+        Ok(bytes) if bytes.len() >= 44 => bytes,
+        Ok(bytes) => {
+            println!("[SOAK] DBG short response len={}", bytes.len());
+            return None;
+        }
+        Err(error) => {
+            println!("[SOAK] DBG read failed: {}", error);
+            return None;
+        }
+    };
+    let u32_at = |offset: usize| {
+        u32::from_le_bytes([bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3]])
+    };
+    Some(SoakDebugCounters {
+        vendor_tx_bytes: u32_at(24),
+        flash_write_count: u32_at(28),
+        rearm_count: u32_at(36),
+        out_stalled: bytes[41],
+    })
+}
+
+fn led_read_state(ctrl: &mut AppController, step: &str) -> bool {
+    let version = ctrl.led_version();
+    if let Err(error) = ctrl.led_request_state() {
+        println!("[LED] {} FAIL LED_GET send: {}", step, error);
+        return false;
+    }
+    let start = std::time::Instant::now();
+    while start.elapsed() < Duration::from_millis(LED_STATE_TIMEOUT_MS) {
+        ctrl.poll();
+        if ctrl.led_version() > version {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(16));
+    }
+    println!("[LED] {} FAIL LED_GET 96B snapshot timeout", step);
+    false
+}
+
+fn led_wait_receipt(ctrl: &mut AppController, step: &str, seq: u8, expect_accept: bool) -> bool {
+    let start = std::time::Instant::now();
+    while start.elapsed() < Duration::from_millis(LED_APPLY_TIMEOUT_MS) {
+        ctrl.poll();
+        if ctrl.led_apply_seq() != Some(seq) {
+            let status = ctrl.led_apply_status();
+            // 映射与预览共用回执槽位, 成功文案分别是"映射已生效"/"预览色已生效";
+            // 失败文案是"设备拒绝(NAK): ..." 或"未连接...", 故以"已生效"收尾判定受理。
+            let accepted = status.ends_with("已生效");
+            println!(
+                "[LED] {} device receipt: seq={} status='{}' error={:?}",
+                step,
+                seq,
+                status,
+                ctrl.last_error()
+            );
+            if accepted == expect_accept {
+                return true;
+            }
+            println!(
+                "[LED] {} FAIL expected device {} but got '{}'",
+                step,
+                if expect_accept { "ACK" } else { "NAK" },
+                status
+            );
+            return false;
+        }
+        thread::sleep(Duration::from_millis(16));
+    }
+    println!("[LED] {} FAIL receipt timeout for seq={}", step, seq);
+    false
+}
+
+fn led_regions_match(ctrl: &AppController, expected: &[LedRegion; LED_UNIT_COUNT], step: &str) -> bool {
+    let mut matches = true;
+    for (unit, expected_region) in expected.iter().enumerate() {
+        let actual = ctrl.led_region(unit);
+        if actual != *expected_region {
+            println!(
+                "[LED] {} FAIL unit={} expected=({},{},{}) actual=({},{},{})",
+                step,
+                unit,
+                expected_region.ch,
+                expected_region.start,
+                expected_region.count,
+                actual.ch,
+                actual.start,
+                actual.count
+            );
+            matches = false;
+        }
+    }
+    matches
+}
+
+/// 单个预览用例: 下发 → 等设备回执(ACK) → LED_GET 回读校验生效色。
+/// `unit = LED_PREVIEW_ALL` 时校验全部单元, 否则只校验该单元。
+/// 失败一律打印设备侧诊断(回执文案 + byte1 诊断位), 让"没变色"能定位到具体环节。
+fn led_preview_case(ctrl: &mut AppController, step: &str, unit: u8, rgb: [u8; 3]) -> bool {
+    let seq = match ctrl.led_preview(unit, rgb) {
+        Ok(seq) => seq,
+        Err(error) => {
+            println!("[LED] {} FAIL preview send: {}", step, error);
+            return false;
+        }
+    };
+    if !led_wait_receipt(ctrl, step, seq, true) {
+        println!(
+            "[LED] {} FAIL preview receipt: apply_status='{}' device_reason={:?}",
+            step,
+            ctrl.led_apply_status(),
+            ctrl.last_error()
+        );
+        return false;
+    }
+    if !led_read_state(ctrl, step) {
+        return false;
+    }
+    let targets: Vec<usize> = if unit == LED_PREVIEW_ALL {
+        (0..LED_UNIT_COUNT).collect()
+    } else {
+        vec![unit as usize]
+    };
+    let mismatch: Vec<usize> = targets
+        .iter()
+        .copied()
+        .filter(|target| ctrl.led_color(*target) != rgb)
+        .collect();
+    if mismatch.is_empty() {
+        println!(
+            "[LED] {} PASS preview RGB={:02X?} units={:?} preview_active={:?} refresh_ticks={:?}",
+            step, rgb, targets, ctrl.led_preview_active(), ctrl.led_refresh_ticks()
+        );
+        return true;
+    }
+    println!(
+        "[LED] {} FAIL preview RGB={:02X?} not effective on units={:?} (preview_active={:?} service_ready={:?} refresh_seen={:?} refresh_ticks={:?})",
+        step,
+        rgb,
+        mismatch,
+        ctrl.led_preview_active(),
+        ctrl.led_service_ready(),
+        ctrl.led_refresh_seen(),
+        ctrl.led_refresh_ticks()
+    );
+    false
+}
+
+fn run_led_test(ctrl: &mut AppController) -> bool {
+    println!("[LED] step 1/6: LED_GET and 96B snapshot contract...");
+    if !led_read_state(ctrl, "step 1") {
+        return false;
+    }
+    let unit_count = ctrl.led_unit_count();
+    let ws_counts = [ctrl.led_ws_count(0), ctrl.led_ws_count(1)];
+    if !ctrl.led_known() || unit_count != Some(LED_UNIT_COUNT as u8) {
+        println!(
+            "[LED] step 1 FAIL 96B contract: known={} unit_count={:?} expected={}",
+            ctrl.led_known(),
+            unit_count,
+            LED_UNIT_COUNT
+        );
+        return false;
+    }
+    let chain_ready = [
+        ctrl.led_chain_ready(0).unwrap_or(false),
+        ctrl.led_chain_ready(1).unwrap_or(false),
+    ];
+    let init_fault = ctrl.led_init_fault().unwrap_or(0);
+    println!(
+        "[LED] step 1 PASS 96B snapshot: status={:?} chain_ready={:?} init_fault={} units={} ws_count={:?}",
+        ctrl.led_status(),
+        chain_ready,
+        init_fault,
+        LED_UNIT_COUNT,
+        ws_counts
+    );
+    // 预览链路诊断(byte1): 预览没效果时据此区分"发丢了"/"服务没初始化"/"刷新没跑"。
+    println!(
+        "[LED] step 1 diag: resp_enabled={:?} preview_active={:?} service_ready={:?} refresh_seen={:?} refresh_ticks={:?}",
+        ctrl.led_resp_enabled(),
+        ctrl.led_preview_active(),
+        ctrl.led_service_ready(),
+        ctrl.led_refresh_seen(),
+        ctrl.led_refresh_ticks()
+    );
+    if ctrl.led_service_ready() == Some(false) {
+        println!("[LED] step 1 WARN device LED map service not initialized (init_fault={})", init_fault);
+    }
+    if ctrl.led_refresh_seen() == Some(false) {
+        println!("[LED] step 1 WARN device LED refresh never ran: preview colors cannot reach the chains");
+    }
+    if !chain_ready[0] && !chain_ready[1] {
+        println!("[LED] step 1 WARN both WS2812 chains are not ready (init_fault={})", init_fault);
+    }
+
+    let original: [LedRegion; LED_UNIT_COUNT] =
+        std::array::from_fn(|unit| ctrl.led_region(unit));
+    println!("[LED] step 2/6: captured original {}-unit mapping", LED_UNIT_COUNT);
+    let original_items: Vec<(u8, LedRegion)> = original
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(unit, region)| (unit as u8, region))
+        .collect();
+    let mut passed = true;
+
+    println!("[LED] step 3/6: valid mapping round-trip...");
+    match ctrl.led_send_regions_raw(&original_items) {
+        Ok(seq) => passed &= led_wait_receipt(ctrl, "step 3 valid mapping", seq, true),
+        Err(error) => {
+            println!("[LED] step 3 FAIL LED_SET_REGION send: {}", error);
+            passed = false;
+        }
+    }
+    passed &= led_read_state(ctrl, "step 3 readback");
+    if led_regions_match(ctrl, &original, "step 3 readback") {
+        println!("[LED] step 3 PASS field-by-field readback");
+    } else {
+        passed = false;
+    }
+
+    println!("[LED] step 4/6: device-side atomic rejection of invalid mappings...");
+    if let Some((chain, chain_len)) = ws_counts
+        .iter()
+        .copied()
+        .enumerate()
+        .find(|(_, count)| *count > 0)
+    {
+        let mut overlap = original_items.clone();
+        overlap[0].1 = LedRegion { ch: chain as u8, start: 0, count: 1 };
+        overlap[1].1 = LedRegion { ch: chain as u8, start: 0, count: 1 };
+        match ctrl.led_send_regions_raw(&overlap) {
+            Ok(seq) => passed &= led_wait_receipt(ctrl, "step 4 overlap", seq, false),
+            Err(error) => {
+                println!("[LED] step 4 overlap FAIL send: {}", error);
+                passed = false;
+            }
+        }
+
+        let mut out_of_bounds = original_items.clone();
+        out_of_bounds[0].1 = LedRegion {
+            ch: chain as u8,
+            start: chain_len,
+            count: 1,
+        };
+        match ctrl.led_send_regions_raw(&out_of_bounds) {
+            Ok(seq) => passed &= led_wait_receipt(ctrl, "step 4 out-of-bounds", seq, false),
+            Err(error) => {
+                println!("[LED] step 4 out-of-bounds FAIL send: {}", error);
+                passed = false;
+            }
+        }
+    } else {
+        println!("[LED] step 4 FAIL no non-empty WS chain in LED_GET snapshot");
+        passed = false;
+    }
+
+    println!("[LED] step 5/6: preview receipt, effective color and automatic fallback...");
+    let colors_before: [[u8; 3]; LED_UNIT_COUNT] =
+        std::array::from_fn(|unit| ctrl.led_color(unit));
+    // 先全体(0xFF)再单点(unit=0): 全体用例证明预览通路整体可用, 单点用例证明 unit 寻址
+    // 没串到别的单元。单点用例只校验被点名的单元 —— 其余单元此刻仍持有上一次全体预览色
+    // (预览超时未到), 拿协议色去比会得到假失败。
+    let all_ok = led_preview_case(ctrl, "step 5 all-units", LED_PREVIEW_ALL, [0x17, 0xA5, 0x3C]);
+    let unit0_ok = led_preview_case(ctrl, "step 5 unit0", 0, [0x3C, 0x17, 0xA5]);
+    println!(
+        "[LED] step 5 preview conclusion: all-units={} unit0={}",
+        if all_ok { "PASS" } else { "FAIL" },
+        if unit0_ok { "PASS" } else { "FAIL" }
+    );
+    passed &= all_ok && unit0_ok;
+    let fallback_start = std::time::Instant::now();
+    while fallback_start.elapsed() < Duration::from_millis(LED_PREVIEW_FALLBACK_MS) {
+        ctrl.poll();
+        thread::sleep(Duration::from_millis(16));
+    }
+    if !led_read_state(ctrl, "step 5 fallback readback") {
+        passed = false;
+    } else if (0..LED_UNIT_COUNT).all(|unit| ctrl.led_color(unit) == colors_before[unit]) {
+        println!(
+            "[LED] step 5 fallback PASS after ~3s (preview_active={:?})",
+            ctrl.led_preview_active()
+        );
+    } else {
+        println!(
+            "[LED] step 5 FAIL preview did not return to protocol colors (preview_active={:?})",
+            ctrl.led_preview_active()
+        );
+        passed = false;
+    }
+
+    println!("[LED] step 6/6: restore original mapping and confirm readback...");
+    match ctrl.led_send_regions_raw(&original_items) {
+        Ok(seq) => passed &= led_wait_receipt(ctrl, "step 6 restore", seq, true),
+        Err(error) => {
+            println!("[LED] step 6 FAIL restore send: {}", error);
+            passed = false;
+        }
+    }
+    passed &= led_read_state(ctrl, "step 6 restore readback");
+    if led_regions_match(ctrl, &original, "step 6 restore readback") {
+        println!("[LED] step 6 PASS original mapping restored");
+    } else {
+        passed = false;
+    }
+    passed
+}
 
 fn main() {
     env_logger::init();
 
     let args: Vec<String> = std::env::args().collect();
+    // 虚拟摄像头探测不依赖 WinUSB 固件，必须在设备枚举之前独立退出。
+    if args.iter().any(|a| a == "--vcam-probe") {
+        _run_vcam_probe();
+        return;
+    }
     let reboot_bootloader = args.iter().any(|a| a == "--reboot-bootloader");
     let reboot_bootloader_only = args.iter().any(|a| a == "--reboot-bootloader-only");
     let smoke_only = args.iter().any(|a| a == "--smoke");
@@ -45,6 +1040,7 @@ fn main() {
     let algo_test = args.iter().any(|a| a == "--algo");
     let global_test = args.iter().any(|a| a == "--global");
     let kbd_test = args.iter().any(|a| a == "--kbd");
+    let led_test = args.iter().any(|a| a == "--led");
     let soak = args.iter().any(|a| a == "--soak");
     let list_only = args.iter().any(|a| a == "--list-only");
     let debug_read = args.iter().any(|a| a == "--debug-read");
@@ -64,6 +1060,16 @@ fn main() {
         .and_then(|i| args.get(i + 1))
         .and_then(|s| s.parse().ok())
         .unwrap_or(30);
+    // --soak-rate/--soak-fields/--soak-seconds 仅影响 soak 压测；缺省保持各入口既有负载。
+    let soak_rate_hz: Option<u16> = args.iter().position(|a| a == "--soak-rate")
+        .and_then(|i| args.get(i + 1)).and_then(|s| s.parse().ok());
+    let soak_fields: Option<u8> = args.iter().position(|a| a == "--soak-fields")
+        .and_then(|i| args.get(i + 1)).and_then(|s| {
+            let value = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s);
+            u8::from_str_radix(value, if s.starts_with("0x") || s.starts_with("0X") { 16 } else { 10 }).ok()
+        });
+    let soak_seconds: u64 = args.iter().position(|a| a == "--soak-seconds")
+        .and_then(|i| args.get(i + 1)).and_then(|s| s.parse().ok()).unwrap_or(5);
 
     println!("[SELFTEST] mai2control WinUSB 无头自测程序启动");
 
@@ -199,6 +1205,12 @@ fn main() {
         thread::sleep(Duration::from_millis(350));
         println!("[SELFTEST] BOOTSEL REQUESTED");
         std::process::exit(0);
+    }
+
+    if led_test {
+        let passed = run_led_test(&mut ctrl);
+        println!("[LED] {}", if passed { "PASS" } else { "FAIL" });
+        std::process::exit(if passed { 0 } else { 1 });
     }
 
     // Diagnose is intentionally read-only and accepts legacy short DEVICE_INFO payloads.
@@ -427,14 +1439,45 @@ fn main() {
         settle(&mut ctrl, 300);
         let _ = ctrl.debug_global_now(0x04, target);
         settle(&mut ctrl, 500);
-        let _ = ctrl.auto_tune();
+        // --ch N: 只对该通道下探(逐通道分频); 缺省 0xFF = 全通道统一分频(旧行为)。
+        let tune_ch: u8 = args.iter().position(|a| a == "--ch")
+            .and_then(|i| args.get(i + 1)).and_then(|s| s.parse::<u8>().ok())
+            .filter(|c| *c < 36).unwrap_or(0xFF);
+        // --pref N(1..7): 校准频率偏好档位。只写草稿即生效(auto_tune 组帧时草稿优先读取),
+        // 缺省不设 → 沿用设备当前 calib.pref。档位越高=在临界频率上多让 2×(N-1) 个分频(越灵敏)。
+        if let Some(pref) = args.iter().position(|a| a == "--pref")
+            .and_then(|i| args.get(i + 1)).and_then(|s| s.parse::<u8>().ok())
+            .filter(|p| (1..=7).contains(p))
+        {
+            let _ = ctrl.set_config_number("calib.pref", pref as f64);
+            println!("[AUTOTUNE] 校准频率偏好档位 = {} (临界分频 + {})", pref, 2 * (pref - 1));
+        }
+        let _ = ctrl.auto_tune(tune_ch);
         let t0 = std::time::Instant::now();
-        while ctrl.auto_tune_result() == 0 && t0.elapsed() < Duration::from_millis(15000) {
-            ctrl.poll(); thread::sleep(Duration::from_millis(50));
+        // 轮询窗须大于固件预算(RP2040 _wait_op_done 45s / _submit 50s): 全通道已改为【逐通道各自校准】
+        // (36 × 单通道三步算法 ≈ 11-23s, 最坏更长) → 窗口取 60s。
+        // 固件以 5Hz 推送 AUTO_TUNE_PROGRESS(0x2E) 阶段进度(含当前通道号), 顺带打印以确认"过程可见"。
+        let mut last_progress_ver = ctrl.auto_tune_progress_version();
+        while ctrl.auto_tune_result() == 0 && t0.elapsed() < Duration::from_millis(60000) {
+            ctrl.poll();
+            if ctrl.auto_tune_progress_version() != last_progress_ver {
+                last_progress_ver = ctrl.auto_tune_progress_version();
+                let p = ctrl.auto_tune_progress();
+                println!("[AUTOTUNE] 进度 state={} phase={}({}) step={} ch={} 试探div={} @{}ms",
+                         p.state, p.phase, p.phase_text(), p.step, p.ch, p.cur_div, t0.elapsed().as_millis());
+            }
+            thread::sleep(Duration::from_millis(50));
         }
         let res = ctrl.auto_tune_result();
         let div = ctrl.auto_tune_div();
-        println!("[AUTOTUNE] 结果 result={} (1=成功 2=失败) 找到分频div={} 耗时~{}ms", res, div, t0.elapsed().as_millis());
+        // 全通道(0xFF)模式下 div 字段语义 = 成功通道数; 单通道模式下 = 该通道最终分频。
+        if tune_ch == 0xFF {
+            let (lo, hi) = ctrl.sns_clk_div_range();
+            println!("[AUTOTUNE] 结果 result={} (1=至少一个通道成功 2=全失败) 成功通道数={}/36 分频范围=÷{}..÷{} 耗时~{}ms",
+                     res, div.min(36), lo, hi, t0.elapsed().as_millis());
+        } else {
+            println!("[AUTOTUNE] 结果 result={} (1=成功 2=失败) 找到分频div={} 耗时~{}ms", res, div, t0.elapsed().as_millis());
+        }
         // 校验: 成功则全通道应离轨且有抖动。
         let _ = ctrl.start_telemetry(30, FIELD_RAW, u64::MAX);
         settle(&mut ctrl, 700);
@@ -523,12 +1566,16 @@ fn main() {
             None
         };
         println!("[SOAK] 开始综合压测: {} 次随机操作 (seed 起始)", iters);
-        let _ = ctrl.start_telemetry(30, FIELD_RAW, u64::MAX);
+        let _ = ctrl.start_telemetry(
+            soak_rate_hz.unwrap_or(30),
+            soak_fields.unwrap_or(FIELD_RAW),
+            u64::MAX,
+        );
         settle(&mut ctrl, 300);
         let mut fails = 0u32;
         for i in 0..iters {
             let op = rng() % 14;
-            let mut desc: String;
+            let desc: String;
             let mut budget = 2000u64;
             match op {
                 0 => { let _ = ctrl.debug_mode_now(1); desc = "mode=SEMI".into(); budget = 1500; }
@@ -668,6 +1715,221 @@ fn main() {
         std::process::exit(0);
     }
 
+    // 建立"半自动默认基线": 先让 PSoC 在 AUTO 下把阈值/snsClk/IDAC 自动算好, 显式捕获成手动基线,
+    // 切回 SEMI 并持久化, 最后重启核验 store 真的能把这套值下发回去。
+    // 用途: 手动参数被污染成 0 之后重建一套可用且安全的起点(0 阈值在 SEMI 下等于一直判定触摸)。
+    if args.iter().any(|a| a == "--semi-baseline") {
+        let settle = |ctrl: &mut AppController, ms: u64| {
+            let w = std::time::Instant::now();
+            while w.elapsed() < Duration::from_millis(ms) {
+                ctrl.poll();
+                thread::sleep(Duration::from_millis(10));
+            }
+        };
+        // 阈值取 PSoC 生成配置的出厂默认(cycfg_capsense.c: fingerTh=60 noiseTh=30 nNoiseTh=30
+        // hysteresis=7 onDebounce=3 lowBslnRst=30)。不从设备回读: AUTO 模式并不会重算这些阈值
+        // (生成配置里它们不是自动项), 阈值一旦被写成 0 就一直是 0, 回读只会把 0 再收一遍。
+        // 分辨率/snsClk/IDAC 保持设备现值不动 —— 那些是校准与自适应的结果, 不该被基线覆盖。
+        // ★阈值按实测噪声地板抬高★: 生成配置的 fingerTh=60 是给示例板的, 本面板基线复位后静止
+        // 残余 diff 仍有 50~99(通道间差异大), 60 的阈值会持续误判触摸 —— 而触控板同时是 HID 键盘,
+        // 误判会直接往前台窗口发按键(实测把本程序界面上的按钮点了)。故 fingerTh 取 150、噪声阈值取 60,
+        // 先保证"静止不误触发"这个安全底线; 真实手感留给用户在单通道精调里按 diff 峰值微调。
+        const BASE: [(u8, u32); 6] = [
+            (0x01, 150), // FINGER_TH
+            (0x02, 60),  // NOISE_TH
+            (0x03, 60),  // NEG_NOISE_TH
+            (0x04, 7),  // HYSTERESIS
+            (0x05, 3),  // ON_DEBOUNCE
+            (0x06, 30), // LOW_BSLN_RST
+        ];
+        println!("[BASE] 1) 切 SEMI(手动参数生效)...");
+        let _ = ctrl.debug_mode_now(1);
+        settle(&mut ctrl, 1200);
+        println!("[BASE] 2) 把出厂默认阈值写进全 36 通道...");
+        for ch in 0u8..36u8 {
+            for (pid, v) in BASE {
+                let _ = ctrl.debug_param_now(ch, pid, v);
+            }
+            settle(&mut ctrl, 40);
+        }
+        settle(&mut ctrl, 1500);
+        println!("[BASE] 3) 持久化到 flash...");
+        if let Err(e) = ctrl.save_config() {
+            println!("[BASE] FAIL save_config: {}", e);
+            std::process::exit(1);
+        }
+        settle(&mut ctrl, 3000);
+        println!("[BASE] 完成。请重启设备后用 --param-dump 核验 store 下发结果。");
+        std::process::exit(0);
+    }
+
+    // 全通道基线复位: 把 baseline 拉回当前 raw, 消掉漂移导致的常触发(diff 长期高于阈值)。
+    if args.iter().any(|a| a == "--baseline-reset") {
+        let _ = ctrl.baseline_reset(0xFFFFFFFF_FFFFFFFFu64);
+        let w = std::time::Instant::now();
+        while w.elapsed() < Duration::from_millis(3000) {
+            ctrl.poll();
+            thread::sleep(Duration::from_millis(10));
+        }
+        println!("[BSLN] 已请求全通道基线复位");
+        std::process::exit(0);
+    }
+
+    // 只切 CSD 模式(0=自动校准 1=半自动手动), 不动任何参数。用于验证"AUTO 只让手动设置失效、
+    // 切回 SEMI 后 RP2040 store 里的手动参数应当原样恢复"。
+    if let Some(i) = args.iter().position(|a| a == "--set-mode") {
+        let mode: u8 = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(1);
+        let _ = ctrl.debug_mode_now(mode);
+        let s = std::time::Instant::now();
+        while s.elapsed() < Duration::from_millis(1500) {
+            ctrl.poll();
+            thread::sleep(Duration::from_millis(10));
+        }
+        println!(
+            "[MODE] 已下发 CSD 模式 = {} ({})",
+            mode,
+            if mode == 0 { "自动校准" } else { "半自动手动" }
+        );
+        std::process::exit(0);
+    }
+
+    // 通道参数真值转储: 直接从设备回读指定通道(缺省全 36 通道)的全部已知参数, 用来判定
+    // "重启 UI 后参数显示 0" 到底是上位机没读到, 还是设备侧真的被清成了 0。
+    if args.iter().any(|a| a == "--param-dump") {
+        use mai2control_ui::proto::KNOWN_PARAM_IDS;
+        let only_ch: Option<u8> = args
+            .iter()
+            .position(|a| a == "--ch")
+            .and_then(|i| args.get(i + 1))
+            .and_then(|s| s.parse().ok());
+        let settle = |ctrl: &mut AppController, ms: u64| {
+            let w = std::time::Instant::now();
+            while w.elapsed() < Duration::from_millis(ms) {
+                ctrl.poll();
+                thread::sleep(Duration::from_millis(10));
+            }
+        };
+        // 用批量变体(一帧回 36 通道)逐参数拉, 比 36×N 条单发省一个数量级的往返。
+        for &pid in KNOWN_PARAM_IDS.iter() {
+            let _ = ctrl.request_param_all_channels(pid);
+            settle(&mut ctrl, 250);
+        }
+        settle(&mut ctrl, 800);
+        let header: Vec<String> = KNOWN_PARAM_IDS.iter().map(|p| format!("0x{:02X}", p)).collect();
+        println!("[PDUMP] ch  {}", header.join("     "));
+        for ch in 0u8..36u8 {
+            if let Some(only) = only_ch {
+                if ch != only {
+                    continue;
+                }
+            }
+            let vals: Vec<String> = KNOWN_PARAM_IDS
+                .iter()
+                .map(|&pid| match ctrl.param(ch, pid) {
+                    Some(v) => format!("{:>6}", v),
+                    None => "     -".to_string(),
+                })
+                .collect();
+            println!("[PDUMP] {:>2}  {}", ch, vals.join(" "));
+        }
+        std::process::exit(0);
+    }
+
+    // GND 降速机理判据: 对 inactive=GND/High-Z 各测 分辨率 8 与 12 的实测扫描周期。
+    // 转换时长 ∝ 2^res(subConv=2^res/div, 每子转换 div 个 ModClk, 乘积与 div 无关);
+    // 故若 GND 的多出开销随 res 一起缩小 → 慢在硬件转换等待(Cp 拖长建立);
+    // 若 res 8→12 周期几乎不变(开销恒定) → 慢在与转换无关的固定开销(引脚状态切换/setup)。
+    if args.iter().any(|a| a == "--gnd-scale-probe") {
+        use mai2control_ui::proto::FIELD_STATS;
+        const CLK_DIV: u8 = 0x08;
+        const CLK_RES: u8 = 0x07;
+        const G_INACTIVE: u8 = 0x01;
+        let settle = |ctrl: &mut AppController, ms: u64| {
+            let w = std::time::Instant::now();
+            while w.elapsed() < Duration::from_millis(ms) {
+                ctrl.poll();
+                thread::sleep(Duration::from_millis(10));
+            }
+        };
+        println!("[GNDP] 切半自动手动模式(SET_MODE=1)...");
+        let _ = ctrl.debug_mode_now(1);
+        settle(&mut ctrl, 400);
+        // ★不用设备上报的 scan_period_us 单次值★: 它是 1e6/整数sps(psoc.cpp:130), 5~7Hz 时量化
+        // 误差 ±25%。改为 15s 内多次独立窗口取均值(见下), 把量化误差摊平。
+        // (device_info().psoc_generation 不可用: 它只在连接时取一次, 运行中不刷新。)
+        // 矩阵: 控制点 + GND 下变分辨率(改子转换数与转换时长) + GND 下变分频(只改子转换数, 转换时长不变)。
+        let points: [(u32, u32, u32); 7] = [
+            (2, 12, 32),   // High-Z 基准
+            (2, 8, 32),
+            (1, 8, 32),    // GND
+            (1, 10, 32),
+            (1, 12, 32),
+            (1, 12, 8),    // 同 res 变 div: subConv ×4, 转换时长不变
+            (1, 12, 64),   // subConv ÷2
+        ];
+        let mut last_inactive = 0u32;
+        for &(inactive, res, div) in points.iter() {
+            if inactive != last_inactive {
+                let _ = ctrl.debug_global_now(G_INACTIVE, inactive);
+                settle(&mut ctrl, 300);
+                let _ = ctrl.global_commit();   // 必须 commit, 否则只写影子不生效
+                settle(&mut ctrl, 3000);
+                last_inactive = inactive;
+            }
+            for ch in 0..36u8 {
+                let _ = ctrl.debug_param_now(ch, CLK_DIV, div);
+                let _ = ctrl.debug_param_now(ch, CLK_RES, res);
+            }
+            settle(&mut ctrl, 800);
+            let _ = ctrl.start_telemetry(30, FIELD_STATS, u64::MAX);
+            settle(&mut ctrl, 1500);
+            // 设备每 500ms 用 scan_count 增量算一次 sps(整数量化)。取 15s 内多次独立窗口求均值,
+            // 把低速档 ±25% 的量化误差摊平到 <1%。
+            let mut samples: Vec<u32> = Vec::new();
+            let mut last = u32::MAX;
+            let w = std::time::Instant::now();
+            while w.elapsed() < Duration::from_millis(15000) {
+                ctrl.poll();
+                let s = ctrl.telem_samples_per_sec();
+                if s != last {
+                    last = s;
+                    if s > 0 { samples.push(s); }
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            let tag = if inactive == 1 { "GND" } else { "High-Z" };
+            let sub_conv = (1u32 << res) / div.max(1);
+            if samples.is_empty() {
+                println!("[GNDP] inactive={:<6} res={:>2} div={:>2} → 无有效 sps 采样", tag, res, div);
+            } else {
+                let mean: f64 = samples.iter().map(|&v| v as f64).sum::<f64>() / samples.len() as f64;
+                let cycle = 1e6 / mean;
+                println!(
+                    "[GNDP] inactive={:<6} res={:>2} div={:>2} subConv={:>4} → sps均值={:.2} 每轮={:.0}us 每通道={:.1}us (n={} 样本 min={} max={})",
+                    tag, res, div, sub_conv, mean, cycle, cycle / 36.0,
+                    samples.len(), samples.iter().min().unwrap(), samples.iter().max().unwrap()
+                );
+            }
+            let _ = ctrl.stop_telemetry();
+            settle(&mut ctrl, 300);
+        }
+        // 复位到常态: High-Z + res12 + div32 + 自动模式。
+        let _ = ctrl.debug_global_now(G_INACTIVE, 2);
+        settle(&mut ctrl, 300);
+        let _ = ctrl.global_commit();
+        settle(&mut ctrl, 2500);
+        for ch in 0..36u8 {
+            let _ = ctrl.debug_param_now(ch, CLK_RES, 12);
+            let _ = ctrl.debug_param_now(ch, CLK_DIV, 32);
+        }
+        settle(&mut ctrl, 500);
+        let _ = ctrl.calibrate(u64::MAX);
+        let _ = ctrl.debug_mode_now(0);
+        println!("[GNDP] 已复位 High-Z/res12/div32/自动模式");
+        println!("[GNDP] 判读: GND 多出的开销若随 res 8→12 一起变大=硬件转换等待; 若恒定=固定 setup 开销");
+        std::process::exit(0);
+    }
+
     // 时钟生效实验: 半自动模式下, 直接把全 36 通道 SNS_CLK_DIV 设成不同值 + APPLY,
     // 测每档的设备实测扫描周期(scan_period_us)。周期应随 div 近似线性变化; 若恒定=时钟未真正生效。
     if args.iter().any(|a| a == "--clk-probe") {
@@ -762,7 +2024,7 @@ fn main() {
             std::process::exit(1);
         };
         let silicon_device_mask = 0xFFFF_00FFu32; // programming spec: ignore revision byte
-        let identity_ok = info.fw_version == 0x0000_0401
+        let identity_ok = info.fw_version == env!("EXPECTED_RP_FW_VERSION").parse::<u32>().expect("valid generated RP2040 version")
             && diag.rp_build_id == RP_BUILD_ID_DIAGNOSTIC_V1
             && diag.embedded_psoc_version == env!("EXPECTED_PSOC_FW_VERSION").parse::<u32>().expect("valid generated PSoC version")
             && (diag.actual_silicon_id & silicon_device_mask)
@@ -984,6 +2246,60 @@ fn main() {
         std::process::exit(0);
     }
 
+    // --global-set ID VAL: 直接下发单个全局 CSD 项(诊断/救砖用, 绕过草稿)。可重复多组。
+    // 例: --global-set 8 1 (AUTO_CALIBRATE_EN=1) --global-set 2 4 (IDAC_GAIN_INIT=4)
+    if args.iter().any(|a| a == "--global-set") {
+        let mut i = 0usize;
+        while i < args.len() {
+            if args[i] == "--global-set" {
+                let id = args.get(i + 1).and_then(|s| s.parse::<u8>().ok());
+                let val = args.get(i + 2).and_then(|s| s.parse::<u32>().ok());
+                if let (Some(id), Some(val)) = (id, val) {
+                    let _ = ctrl.debug_global_now(id, val);
+                    println!("[GSET] 下发全局项 0x{:02X} = {}", id, val);
+                    let s = std::time::Instant::now();
+                    while s.elapsed() < Duration::from_millis(900) {
+                        ctrl.poll();
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                }
+                i += 3;
+            } else {
+                i += 1;
+            }
+        }
+        // ★必须 commit★: GLOBAL_SET 只写 PSoC RAM 影子, 不重初始化; 少了这一步"设了等于没设"
+        // (实测 inactive_sns 改 GND 后采样率不变, 就是漏了 commit 造成的假阴性)。
+        let _ = ctrl.global_commit();
+        let s = std::time::Instant::now();
+        while s.elapsed() < Duration::from_millis(2500) {
+            ctrl.poll();
+            thread::sleep(Duration::from_millis(10));
+        }
+        // 回读全部 8 项(含 0x07 IDAC_SENSE_CONFIG / 0x08 AUTO_CALIBRATE_EN, 旧 dump 只到 0x06)。
+        let _ = ctrl.global_get_all();
+        let s = std::time::Instant::now();
+        while s.elapsed() < Duration::from_millis(800) {
+            ctrl.poll();
+            thread::sleep(Duration::from_millis(10));
+        }
+        // 0x09 = GPARAM_BOOT_OVERRIDE(只读, PSoC 启动强制改写位掩码)。旧 PSoC 固件不认该 id 返回 0,
+        // 故它同时充当"PSoC 是否已跑上新镜像"的判据。
+        for id in 1u8..=8 {
+            println!("[GSET] 回读 0x{:02X} = {:?}", id, ctrl.global(id));
+        }
+        // 0x09 = GPARAM_BOOT_OVERRIDE(只读, PSoC 启动强制改写位掩码)。GET_ALL 只回 8 项, 必须单项读。
+        // 旧 PSoC 固件不认该 id(返回 0/NAK), 故它同时充当"PSoC 是否已跑上新镜像"的判据。
+        let _ = ctrl.global_get(9);
+        let s = std::time::Instant::now();
+        while s.elapsed() < Duration::from_millis(1200) {
+            ctrl.poll();
+            thread::sleep(Duration::from_millis(10));
+        }
+        println!("[GSET] 单项回读 0x09(BOOT_OVERRIDE) = {:?}", ctrl.global(9));
+        std::process::exit(0);
+    }
+
     if reset_config {
         println!("[SELFTEST] RESET_DEFAULTS 恢复配置...");
         if let Err(e) = ctrl.reset_defaults() {
@@ -1042,7 +2358,13 @@ fn main() {
     }
 
     if soak {
-        run_soak(&mut ctrl, soak_idle_s);
+        run_soak(
+            &mut ctrl,
+            soak_idle_s,
+            soak_rate_hz.unwrap_or(100),
+            soak_fields.unwrap_or(0x1F),
+            soak_seconds,
+        );
         // run_soak 内部在失败时已 exit(1)；到此即全通过。
         println!("[SELFTEST] ================ SOAK PASS ================");
         std::process::exit(0);
@@ -1495,8 +2817,74 @@ fn soak_pump(ctrl: &mut AppController, ms: u64, label: &str) {
     }
 }
 
+struct SoakPhaseStart {
+    telem_frames: u64,
+    telem_bytes: u64,
+    io: io::IoStats,
+    debug: Option<SoakDebugCounters>,
+    // 设备侧 SelfHeal 计数在 DEVICE_INFO 诊断里就是 u16，这里保持同宽度，避免无意义的类型放大。
+    self_heal: Option<(u16, u16)>,
+}
+
+fn read_self_heal(ctrl: &AppController) -> Option<(u16, u16)> {
+    ctrl.device_info()
+        .and_then(|info| info.diagnostics.as_ref())
+        .map(|diag| (diag.self_heal_total, diag.self_heal_dropped))
+}
+
+fn print_soak_summary(
+    ctrl: &AppController,
+    start: &SoakPhaseStart,
+    rate_hz: u16,
+    elapsed: Duration,
+    disconnects: u32,
+    end_debug: Option<SoakDebugCounters>,
+    end_self_heal: Option<(u16, u16)>,
+) {
+    let frames = ctrl.telem_frame_count().saturating_sub(start.telem_frames);
+    let wire_bytes = ctrl.telem_wire_bytes().saturating_sub(start.telem_bytes);
+    let end_io = ctrl.io_stats();
+    let elapsed_secs = elapsed.as_secs_f64();
+    let actual_rate = if elapsed_secs > 0.0 { frames as f64 / elapsed_secs } else { 0.0 };
+    println!(
+        "[SOAK] ===== 压测汇总: elapsed={:.3}s frames={} wire_bytes={} actual_rate={:.2}Hz expected_rate={}Hz delta={:+.2}Hz stall_recoveries={} disconnects={} queue_replaced={} =====",
+        elapsed_secs,
+        frames,
+        wire_bytes,
+        actual_rate,
+        rate_hz,
+        actual_rate - rate_hz as f64,
+        end_io.stall_recoveries.saturating_sub(start.io.stall_recoveries),
+        disconnects,
+        end_io.queue_dropped.saturating_sub(start.io.queue_dropped),
+    );
+    match (start.debug, end_debug) {
+        (Some(before), Some(after)) => println!(
+            "[SOAK] device delta: out_stalled={} rearm_count={} vendor_tx_bytes={} flash_write_count={}",
+            after.out_stalled.wrapping_sub(before.out_stalled),
+            after.rearm_count.wrapping_sub(before.rearm_count),
+            after.vendor_tx_bytes.wrapping_sub(before.vendor_tx_bytes),
+            after.flash_write_count.wrapping_sub(before.flash_write_count),
+        ),
+        _ => println!("[SOAK] device delta: unavailable (EP0 debug read unavailable)"),
+    }
+    match (start.self_heal, end_self_heal) {
+        (Some(before), Some(after)) => println!(
+            "[SOAK] SelfHeal delta: total={} dropped={}",
+            after.0.wrapping_sub(before.0), after.1.wrapping_sub(before.1)
+        ),
+        _ => println!("[SOAK] SelfHeal delta: unavailable (DEVICE_INFO diagnostics absent)"),
+    }
+}
+
 /// 无头 exerciser：逐个驱动 UI 全部功能后长时 idle，复现并回验稳定性。
-fn run_soak(ctrl: &mut AppController, idle_s: u64) {
+fn run_soak(
+    ctrl: &mut AppController,
+    idle_s: u64,
+    rate_hz: u16,
+    fields: u8,
+    telemetry_seconds: u64,
+) {
     println!("[SOAK] 开始无头 exerciser (模拟 UI 持久连接 + 16ms 轮询)");
 
     // A. 拉全部配置
@@ -1530,8 +2918,8 @@ fn run_soak(ctrl: &mut AppController, idle_s: u64) {
     soak_pump(ctrl, 300, "set_binding");
 
     // D. 遥测(全通道) + 等真实数据 + 全通道抽样
-    println!("[SOAK] D: start_telemetry(全通道 100Hz)");
-    let _ = ctrl.start_telemetry(100, 0x1F, 0xFFFF_FFFF_FFFF_FFFFu64);
+    println!("[SOAK] D: start_telemetry(全通道 {}Hz fields=0x{:02X})", rate_hz, fields);
+    let _ = ctrl.start_telemetry(rate_hz, fields, 0xFFFF_FFFF_FFFF_FFFFu64);
     let start = std::time::Instant::now();
     let mut got = false;
     while start.elapsed() < Duration::from_millis(2500) {
@@ -1574,9 +2962,66 @@ fn run_soak(ctrl: &mut AppController, idle_s: u64) {
         std::process::exit(1);
     }
 
-    // D2. 持续遥测 5s(采样时快慢路并发压测：观察 link 稳定 / 是否 stall)
-    println!("[SOAK] D2: 持续遥测 5s(并发压测)");
-    soak_pump(ctrl, 5000, "telemetry_run");
+    // D2 单独重新开流并从此处取基线，确保 --soak-seconds 是完整、唯一的计量窗口。
+    let _ = ctrl.stop_telemetry();
+    soak_pump(ctrl, 100, "telem_prime_stop");
+    println!("[SOAK] D2: 持续遥测 {}s + 周期 USB debug", telemetry_seconds);
+    let _ = ctrl.start_telemetry(rate_hz, fields, 0xFFFF_FFFF_FFFF_FFFFu64);
+    let phase_start = std::time::Instant::now();
+    let phase = SoakPhaseStart {
+        telem_frames: ctrl.telem_frame_count(),
+        telem_bytes: ctrl.telem_wire_bytes(),
+        io: ctrl.io_stats(),
+        debug: read_soak_debug(ctrl),
+        self_heal: read_self_heal(ctrl),
+    };
+    let mut last_debug_at = phase_start - Duration::from_secs(1);
+    let mut last_ping_at = phase_start;
+    let mut last_debug = phase.debug;
+    let mut last_self_heal = phase.self_heal;
+    while phase_start.elapsed() < Duration::from_secs(telemetry_seconds) {
+        ctrl.poll();
+        if let Some(current) = read_self_heal(ctrl) {
+            last_self_heal = Some(current);
+        }
+        if ctrl.state() == ConnState::Disconnected {
+            let elapsed = phase_start.elapsed();
+            println!("[SOAK] FAIL 连接断开 during telemetry_run: {:?}", ctrl.last_error());
+            println!("[SOAK] 压测中断于第 {} 秒", elapsed.as_secs());
+            print_soak_summary(ctrl, &phase, rate_hz, elapsed, 1, last_debug, last_self_heal);
+            std::process::exit(1);
+        }
+        if last_debug_at.elapsed() >= Duration::from_secs(1) {
+            last_debug_at = std::time::Instant::now();
+            // ★压测期间绝不能发 HELLO★: 固件 HELLO 处理的第一步是 SensorLink::stop()(停遥测流),
+            // 每秒刷新一次 DEVICE_INFO 等于每秒把自己要压测的遥测流关掉(实测 frames≈0)。
+            // SelfHeal 累计值改为压测结束后单独读一次, 期间只用 EP0 计数(不经 bulk、不影响流)。
+            if let Some(debug) = read_soak_debug(ctrl) {
+                last_debug = Some(debug);
+                println!(
+                    "[SOAK] DBG +{}s out_stalled={} rearm={} vendor_tx={} flash_writes={}",
+                    phase_start.elapsed().as_secs(), debug.out_stalled, debug.rearm_count,
+                    debug.vendor_tx_bytes, debug.flash_write_count
+                );
+            }
+        }
+        // ★必须周期续租★: 固件 TxScheduler 的遥测任务是租约制(约 3s 到期自停), 靠下行命令续期。
+        // PING 是唯一既能续租又不会停流的轻量命令(HELLO 会 SensorLink::stop())。
+        if last_ping_at.elapsed() >= Duration::from_millis(500) {
+            last_ping_at = std::time::Instant::now();
+            let _ = ctrl.ping();
+        }
+        thread::sleep(Duration::from_millis(16));
+    }
+    let elapsed = phase_start.elapsed();
+    let end_debug = read_soak_debug(ctrl).or(last_debug);
+    // 压测窗口结束后才刷新 DEVICE_INFO: HELLO 会停流, 只能放在计量之外。
+    let _ = ctrl.resend_hello();
+    soak_pump(ctrl, 200, "self_heal_refresh");
+    let end_self_heal = read_self_heal(ctrl).or(last_self_heal);
+    print_soak_summary(ctrl, &phase, rate_hz, elapsed, 0, end_debug, end_self_heal);
+    let _ = ctrl.stop_telemetry();
+    soak_pump(ctrl, 300, "stop_telem");
 
     // E. 半自动手动 + 捕获 + 调参 + 校准 + 回自动校准/标准完整处理
     println!("[SOAK] E: 半自动手动/捕获/调参/校准/自动校准标准完整处理");
@@ -1590,11 +3035,6 @@ fn run_soak(ctrl: &mut AppController, idle_s: u64) {
     soak_pump(ctrl, 600, "calibrate");
     let _ = ctrl.set_mode(0);
     soak_pump(ctrl, 200, "set_mode_auto");
-
-    // F. 停遥测
-    println!("[SOAK] F: stop_telemetry");
-    let _ = ctrl.stop_telemetry();
-    soak_pump(ctrl, 300, "stop_telem");
 
     // G. 长时 idle(复现 UI 空闲 stall)
     println!("[SOAK] G: idle {}s (复现空闲 stall)", idle_s);

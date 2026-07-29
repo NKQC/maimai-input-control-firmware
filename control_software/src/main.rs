@@ -1,4 +1,8 @@
 //! mai2control-ui 上位机主程序 (#6e~g 实现)
+// ★release 不带控制台窗口★: 日志已有自持可用的日志页 + logs/ 落盘, 那个类 cmd 的黑窗口
+// 只会挡在界面前面且无法选择复制。debug 构建保留控制台便于开发时直接看 stderr。
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 //!
 //! 职责:
 //! - 初始化 Slint UI 框架与应用状态控制器(AppController)
@@ -6,7 +10,7 @@
 //! - 周期性轮询 IO 事件与构建派生数据(配置行、绑区单元、曲线路径)
 //! - 响应配置、绑区、遥测、参数操作及重启/进烧录模式指令
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -14,9 +18,12 @@ use log::info;
 use anyhow::Result;
 
 use slint::Model;
-use mai2control_ui::app_state::{AppController, ConnState, zone_label};
+use mai2control_ui::app_state::{AppController, CompiledAlgo, ConnState, zone_label};
 use mai2control_ui::proto::{ConfigEntry, CfgValue, FIELD_RAW, FIELD_BASELINE, FIELD_DIFF, FIELD_STATUS, FIELD_STATS, FIELD_LATENCY, PARAM_FINGER_TH, PARAM_NOISE_TH, PARAM_RESOLUTION, PARAM_SNS_CLK_DIV, PARAM_SNS_CLK_SOURCE};
+use mai2control_ui::proto::{LED_CH_UNMAPPED, LED_PREVIEW_ALL, LED_UNIT_COUNT};
 use mai2control_ui::touch_geometry;
+use mai2control_ui::vcam::{self, VcamState, FRAME_W, FRAME_H};
+use mai2control_ui::vcam::{backend as vcam_backend, share::FramePublisher};
 
 slint::include_modules!();
 
@@ -26,7 +33,43 @@ const ALGO_V31_TEMPLATE: &str = include_str!(concat!(
     "/../psoc_firmware/algo/psoc_algo_default.c"
 ));
 
+/// 纯"白灯演示"算法模板: 触摸即点亮白灯(out_active), 展示 JIT 算法对 PSoC 硬件的绝对可控性。
+const ALGO_LED_DEMO_TEMPLATE: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../psoc_firmware/algo/psoc_algo_led_demo.c"
+));
+
 const CP_MEASURE_FAILED: u32 = 0x00FF_FFFF;
+
+/// 项目仓库地址(关于页展示 + 一键复制到剪贴板)。
+const REPO_URL: &str = "https://github.com/NKQC/project-mai2control.git";
+
+/// 全 36 通道掩码(36 位全 1): 全通道校准/基线复位用同一动作接口(ch_mask)一次覆盖所有通道。
+const ALL_CHANNELS_MASK: u64 = (1u64 << 36) - 1;
+
+/// 后台算法编译任务。
+/// ★为什么要有这东西★: 编译一次要顺序阻塞跑 gcc/objcopy/nm/objdump 四个子进程, 首次还要解压
+/// 18MB 内置工具链, 以前在 UI 线程里直接做 → 整个界面冻住数秒(点不动、不重绘)。现在只把 C 源
+/// 这类纯数据搬进 std::thread, 产物经 channel 回到 UI 线程(16ms tick 取回)再写入 AppController —— 
+/// `Rc<RefCell<AppController>>` 不是 Send, 绝不能进后台线程。
+struct AlgoCompileJob {
+    rx: std::sync::mpsc::Receiver<Result<CompiledAlgo>>,
+    /// 提交编译的源码: 产物回来后要连同它一起写入状态(留档/上传随附源)。
+    src: String,
+    /// 编译成功后是否续走上传(“编译并上传”一键流程)。
+    upload_after: bool,
+}
+
+/// 起一次后台编译。同一时刻只允许一个任务(由调用处的 algo_busy 守门)。
+fn spawn_algo_compile(slot: &Rc<RefCell<Option<AlgoCompileJob>>>, src: String, upload_after: bool) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let src_for_thread = src.clone();
+    std::thread::spawn(move || {
+        // 发送失败只可能是 UI 已退出, 此时无人关心结果, 忽略即可。
+        let _ = tx.send(AppController::compile_blob(&src_for_thread));
+    });
+    *slot.borrow_mut() = Some(AlgoCompileJob { rx, src, upload_after });
+}
 
 /// 生成与源码行数一致的行号列字符串("1\n2\n...\nN"), 供算法页行号 gutter。
 fn line_numbers_for(text: &str) -> String {
@@ -41,19 +84,47 @@ fn line_numbers_for(text: &str) -> String {
     s
 }
 
-struct CpPollState {
+/// PSoC 逐电极 BIST 测量窗口: MEASURE_CP 受理后需约 1.5s 才有结果, 期间 CP_GET 恒回"测量中(0)"。
+const CP_SWEEP_START_DELAY: Duration = Duration::from_millis(1500);
+/// 同一通道未出结果时的重试间隔。
+const CP_SWEEP_RETRY: Duration = Duration::from_millis(400);
+/// 同一通道最多请求次数: 到顶即跳过该通道, 绝不无限重试(NAK/无响应风暴的根因之一)。
+const CP_SWEEP_MAX_TRIES: u8 = 3;
+/// 整轮抓取硬超时: 到点即停, 不管还剩几个通道。
+const CP_SWEEP_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// 手动电容测量的一轮全通道抓取状态。
+/// ★没有任何自动/周期性 Cp 获取★: 仅用户点击"测量电容"时置 started_at, 之后每 tick 最多发 1 条
+/// CP_GET 顺序推进 0..35, 全部取完(或超时)即回到空闲; 单通道最多 CP_SWEEP_MAX_TRIES 次。
+struct CpSweep {
     started_at: Option<Instant>,
-    next_request_at: Option<Instant>,
-    measurement_start_channel_version: u64,
-    requested_channel_version: u64,
-    visible_channel: i32,
-    visible_after_version: u64,
-    waiting_for_response: bool,
+    next_at: Option<Instant>,
+    ch: u8,
+    tries: u8,
+    req_version: u64,
     status: String,
 }
 
+impl CpSweep {
+    /// 结束本轮抓取(完成/超时/失败/断连)并落最终文案。
+    fn _stop(&mut self, status: String) {
+        self.started_at = None;
+        self.next_at = None;
+        self.tries = 0;
+        self.status = status;
+    }
+    /// 推进到下一个通道(本通道已出结果或已放弃)。
+    fn _advance(&mut self) {
+        self.ch = self.ch.saturating_add(1);
+        self.tries = 0;
+        self.next_at = None;
+    }
+}
+
 fn main() -> Result<()> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    // 统一日志中枢: 全量记录进内存环形缓冲(供日志页) + 每次启动在 logs/ 下新建一份文件。
+    // 取代 env_logger —— 它只往 stderr 打, UI 里看不到 io/nusb 层的掉线与端点错误。
+    mai2control_ui::logging::init(true);
     info!("mai2control-ui starting");
 
     let ui = AppWindow::new().map_err(|e| anyhow::anyhow!("Failed to create UI: {}", e))?;
@@ -68,10 +139,149 @@ fn main() -> Result<()> {
     ui.run().map_err(|e| anyhow::anyhow!("UI run failed: {}", e))?;
 
     info!("mai2control-ui exiting");
+    mai2control_ui::logging::hub().flush();
     Ok(())
 }
 
+/// 二值算法线归一化幅度 N 的上下限。下限取 0.1(允许把 0/1 压到比邻居线更矮),
+/// 上限取 65535(右轴上的算法量纲可以是上万的计数, 要允许 N 跟得上)。
+const ALGO_BIN_AMP_MIN: f32 = 0.1;
+const ALGO_BIN_AMP_MAX: f32 = 65535.0;
+
+/// 归一化幅度的 config.cfg 键名: 0..3 = report[idx], 4 = 触发判定。
+fn algo_bin_amp_key(idx: usize) -> String {
+    use mai2control_ui::ui_config::keys as k;
+    if idx >= 4 {
+        k::ALGO_BIN_AMP_ACTIVE.to_string()
+    } else {
+        format!("{}{}", k::ALGO_BIN_AMP_PREFIX, idx)
+    }
+}
+
+/// 把当前界面偏好写回 config.cfg。由 16ms tick 调用: UiConfig::set_* 内部只在值真变了才落盘,
+/// 所以这里无脑对账即可, 不必给每个开关都挂一个回调(那样每加一项设置都得改多处)。
+fn persist_ui_settings(ui: &AppWindow, cfg: &mut mai2control_ui::ui_config::UiConfig) {
+    use mai2control_ui::ui_config::keys as k;
+    cfg.set_i32(k::LOG_FILTER, ui.get_log_filter());
+    cfg.set_bool(k::LOG_AUTO_SCROLL, ui.get_log_auto_scroll());
+    cfg.set_bool(k::LOG_FILE_ON, ui.get_log_file_on());
+    cfg.set_bool(k::VCAM_ENABLED, ui.get_vcam_enabled());
+    cfg.set_i32(k::VCAM_SUBMIT_SECS, ui.get_vcam_submit_secs());
+    cfg.set_i32(k::VCAM_DISPLAY_SECS, ui.get_vcam_display_secs());
+    cfg.set_bool(k::LATENCY_MEASURE, ui.get_measure_latency());
+    cfg.set_i32(k::CURRENT_VIEW, ui.get_current_view());
+    cfg.set_i32(k::SETTINGS_TAB, ui.get_settings_tab());
+    cfg.set_i32(k::SEL_CHANNEL, ui.get_sel_channel());
+}
+
+/// 重新枚举 HID 键盘并刷新设备树: 首行固定"所有键盘"(dev_index=0),
+/// 之后按分类插入组头, 组内设备 dev_index = 在 `list` 中的下标 + 1。
+/// `saved_path` 非空且仍在场 → 恢复该选择并生效; 否则回落"所有键盘"。返回设备个数。
+fn refresh_vcam_devices(
+    ui: &AppWindow,
+    list: &Rc<RefCell<Vec<vcam::keyboard::KeyboardDevice>>>,
+    saved_path: &str,
+) -> usize {
+    // list_keyboards 已按 分类→产品名→父实例→集合 排好序, 顺序扫一遍即可插两级组头。
+    let devices = vcam::keyboard::list_keyboards();
+    let mut rows: Vec<VcamKbdRow> = vec![VcamKbdRow {
+        is_group: false,
+        level: 0,
+        title: "所有键盘(不限定设备)".into(),
+        detail: "任何键盘输入都会进入扫码缓冲, 打字会污染数据".into(),
+        dev_index: 0,
+    }];
+    let mut cur_cat = String::new();
+    let mut cur_parent = String::new();
+    for (i, dev) in devices.iter().enumerate() {
+        if dev.category != cur_cat {
+            cur_cat = dev.category.clone();
+            cur_parent.clear();
+            let n = devices.iter().filter(|d| d.category == cur_cat).count();
+            rows.push(VcamKbdRow {
+                is_group: true,
+                level: 0,
+                title: cur_cat.clone().into(),
+                detail: format!("{} 项", n).into(),
+                dev_index: -1,
+            });
+        }
+        // 同一物理设备的集合个数: 1 个就折叠成一行(免去无意义的父层), 多个才展开子项。
+        let siblings = devices
+            .iter()
+            .filter(|d| d.parent_key == dev.parent_key)
+            .count();
+        if dev.parent_key != cur_parent {
+            cur_parent = dev.parent_key.clone();
+            if siblings > 1 {
+                let mut detail = dev.vendor.clone();
+                if !detail.is_empty() {
+                    detail.push_str("  ·  ");
+                }
+                detail.push_str(&format!("{} 个键盘集合", siblings));
+                rows.push(VcamKbdRow {
+                    is_group: true,
+                    level: 1,
+                    title: dev.product.clone().into(),
+                    detail: detail.into(),
+                    dev_index: -1,
+                });
+            }
+        }
+        let (title, detail) = if siblings > 1 {
+            (dev.label.clone(), dev.detail.clone())
+        } else {
+            // 折叠行: 主文案用产品名, 副文案补上厂商。
+            let mut d = dev.vendor.clone();
+            if !d.is_empty() && !dev.detail.is_empty() {
+                d.push_str("  ·  ");
+            }
+            d.push_str(&dev.detail);
+            (dev.product.clone(), d)
+        };
+        rows.push(VcamKbdRow {
+            is_group: false,
+            level: if siblings > 1 { 2 } else { 1 },
+            title: title.into(),
+            detail: detail.into(),
+            dev_index: i as i32 + 1,
+        });
+    }
+    ui.set_vcam_kbd_rows(slint::ModelRc::new(slint::VecModel::from(rows)));
+
+    let picked = devices
+        .iter()
+        .position(|d| d.path.eq_ignore_ascii_case(saved_path));
+    ui.set_vcam_device_index(picked.map(|i| i as i32 + 1).unwrap_or(0));
+    vcam::keyboard::set_target_device(picked.map(|i| devices[i].path.clone()));
+
+    let count = devices.len();
+    for d in &devices {
+        log::debug!(
+            "虚拟摄像头设备树: [{}] 产品={} 厂商={} 项={} ({}) parent={}",
+            d.category, d.product, d.vendor, d.label, d.detail, d.parent_key
+        );
+    }
+    log::info!(
+        "虚拟摄像头: 枚举到 {} 个 HID 键盘设备, 当前选择={}",
+        count,
+        picked
+            .map(|i| devices[i].label.clone())
+            .unwrap_or_else(|| "所有键盘".into())
+    );
+    *list.borrow_mut() = devices;
+    count
+}
+
 fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) -> slint::Timer {
+    let settings_counts = mai2control_ui::settings_io::group_counts(&controller.borrow());
+    ui.set_settings_io_config_count(settings_counts.config);
+    ui.set_settings_io_channel_params_count(settings_counts.channel_params);
+    ui.set_settings_io_globals_count(settings_counts.globals);
+    ui.set_settings_io_algo_count(settings_counts.algo);
+    ui.set_settings_io_keyboard_count(settings_counts.keyboard);
+    ui.set_settings_io_zones_count(settings_counts.zones);
+
     // 初始化设备列表，并回填/按需应用工具箱端口设置。
     let (auto_port_enabled, serial_com, light_com, port_status) = {
         let mut ctrl = controller.borrow_mut();
@@ -100,38 +310,69 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
         ui.set_port_status(status.into());
     }
 
+    // 虚拟扫码摄像头共享状态 + 初始 UI 值(与状态默认对齐: 提交阈值 2s, 显示 10s)。
+    let vcam = VcamState::new();
+    vcam.set_submit_timeout_ms(2000);
+    vcam.set_display_ms(10_000);
+    ui.set_vcam_submit_secs(2);
+    ui.set_vcam_display_secs(10);
+    ui.set_vcam_enabled(false);
+    // 映射可在关闭虚拟相机时保留；启动即创建能让日志明确记录当前命名空间，且关闭后
+    // Frame Server 重新拉起时仍有合法黑帧可读。Global 被拒绝时绝不静默退回 Local。
+    let frame_publisher = Rc::new(RefCell::new(match FramePublisher::create() {
+        Ok(publisher) => Some(publisher),
+        Err(error) => {
+            log::error!("虚拟摄像头: 共享内存创建失败: {}", error);
+            None
+        }
+    }));
+    let share_runtime_status = frame_publisher
+        .borrow()
+        .as_ref()
+        .map(|publisher| format!("未运行 · 共享内存命名空间 {}", publisher.namespace().label()))
+        .unwrap_or_else(|| "未运行 · 共享内存创建失败".to_string());
+    ui.set_vcam_runtime_status(share_runtime_status.into());
+    // 权限状态 + 一键提权重启: Windows 不能给已运行进程提权, 只能以管理员重开自身。
+    ui.set_is_elevated(mai2control_ui::elevation::is_elevated());
+    ui.set_elevation_text(mai2control_ui::elevation::limitation_text().into());
+    ui.on_restart_as_admin(move || {
+        // 先把界面偏好与日志落盘, 否则新实例读不到本次的改动、日志缓冲也会丢。
+        mai2control_ui::logging::hub().flush();
+        match mai2control_ui::elevation::relaunch_as_admin() {
+            Ok(()) => {
+                log::info!("已请求以管理员重启, 当前实例退出(避免两个实例抢 WinUSB 句柄)");
+                mai2control_ui::logging::hub().flush();
+                let _ = slint::quit_event_loop();
+            }
+            Err(e) => log::warn!("提权重启未执行: {}", e),
+        }
+    });
+
+    let install_status = vcam_backend::registration_status();
+    log::info!("虚拟摄像头: 系统注册状态: {}", install_status);
+    ui.set_vcam_install_status(install_status.into());
+    // COM 指针只在本 UI 线程的 Rc<RefCell> 中保存，绝不交给 Raw Input 线程。
+    let virtual_camera = Rc::new(RefCell::new(None::<vcam_backend::VirtualCamera>));
+    // 可选 HID 键盘列表(下拉索引 0 = 所有键盘, 之后按此 Vec 顺序对应)。
+    // 启动即按持久化的设备路径恢复选择: 设备不在场时回落到"所有键盘", 不静默失效。
+    let vcam_kbd_list: Rc<RefCell<Vec<vcam::keyboard::KeyboardDevice>>> =
+        Rc::new(RefCell::new(Vec::new()));
+    {
+        let saved = controller.borrow().vcam_kbd_device();
+        refresh_vcam_devices(ui, &vcam_kbd_list, &saved);
+    }
+
     let ui_weak = ui.as_weak();
-    let cp_poll = Rc::new(RefCell::new(CpPollState {
+    let cp_poll = Rc::new(RefCell::new(CpSweep {
         started_at: None,
-        next_request_at: None,
-        measurement_start_channel_version: 0,
-        requested_channel_version: 0,
-        visible_channel: -1,
-        visible_after_version: 0,
-        waiting_for_response: false,
-        status: "读取中…".to_string(),
+        next_at: None,
+        ch: 0,
+        tries: 0,
+        req_version: 0,
+        status: "未测量".to_string(),
     }));
 
-    // 延迟图绘图区宽高比(UI resize 回传), 供 build_lat_path 横向拉伸铺满。
-    let lat_aspect = Rc::new(std::cell::Cell::new(3.0f32));
-    {
-        let ui_la = ui_weak.clone();
-        let ctrl_la = controller.clone();
-        let la = lat_aspect.clone();
-        ui.on_lat_area_resized(move |a| {
-            la.set(if a > 0.01 { a } else { 3.0 });
-            if let Some(ui) = ui_la.upgrade() {
-                let series = ctrl_la.borrow().lat_total_series();
-                if !series.is_empty() {
-                    let (path, lo, hi) = build_lat_path(&series, la.get());
-                    ui.set_lat_path(path.into());
-                    ui.set_lat_y_max(hi);
-                    ui.set_lat_y_min(lo);
-                    ui.set_lat_point_count(series.len() as i32);
-                }
-            }
-        });
-    }
+    // 延迟图不再依赖绘图区宽高比：PlotPath 的 fit: fill 会把固定 1000×1000 数据坐标拉满。
 
     // 刷新按钮
     let ctrl_clone = controller.clone();
@@ -186,11 +427,48 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
         let _ = ctrl.reboot_psoc();
     });
 
-    // 频率自适应下探(阻塞类, 结果经 tick 回填 auto_tune_status)。
+    // 全通道频率自适应下探(0xFF=统一分频; 阻塞类, 结果经 tick 回填 auto_tune_status)。
     let ctrl_clone = controller.clone();
     ui.on_auto_tune(move || {
         let mut ctrl = ctrl_clone.borrow_mut();
-        let _ = ctrl.auto_tune();
+        let _ = ctrl.auto_tune(0xFF);
+    });
+
+    // PSoC 救砖: 经 SWD 强制重刷 PSoC 并重新下发算法/CSD(UI 已做两段式二次确认)。
+    let ctrl_clone = controller.clone();
+    ui.on_psoc_rescue(move || {
+        let mut ctrl = ctrl_clone.borrow_mut();
+        let _ = ctrl.psoc_rescue();
+    });
+
+    // 校准频率偏好滑条(1..7): 只写草稿(与其他设置同规范), 但下一次自适应即读草稿生效。
+    let ctrl_clone = controller.clone();
+    ui.on_calib_pref_set(move |v| {
+        let mut ctrl = ctrl_clone.borrow_mut();
+        let _ = ctrl.set_config_number("calib.pref", v.clamp(1, 7) as f64);
+    });
+
+    // 全通道校准 / 全通道基线复位(立即执行的动作, 不进草稿)。掩码 = 36 位全 1。
+    let ctrl_clone = controller.clone();
+    ui.on_global_calibrate(move || {
+        let mut ctrl = ctrl_clone.borrow_mut();
+        let _ = ctrl.calibrate(ALL_CHANNELS_MASK);
+    });
+
+    let ctrl_clone = controller.clone();
+    ui.on_global_baseline_reset(move || {
+        let mut ctrl = ctrl_clone.borrow_mut();
+        let _ = ctrl.baseline_reset(ALL_CHANNELS_MASK);
+    });
+
+    // 本通道频率自适应(只下探当前选中通道, 其余通道分频不动)。
+    let ctrl_clone = controller.clone();
+    let ui_at = ui_weak.clone();
+    ui.on_curve_auto_tune(move || {
+        let ui = ui_at.upgrade().unwrap();
+        let ch = ui.get_sel_channel().clamp(0, 35) as u8;
+        let mut ctrl = ctrl_clone.borrow_mut();
+        let _ = ctrl.auto_tune(ch);
     });
 
     // 配置页
@@ -210,6 +488,110 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
     ui.on_cfg_reset(move || {
         let mut ctrl = ctrl_clone.borrow_mut();
         let _ = ctrl.reset_defaults();
+    });
+
+    // 全通道页"批量应用": 勾选态与应用动作全部落在 AppController, UI 只转发事件。
+    // 应用走 set_param(草稿), 与手工编辑同路径, 由"保存到设备"统一下发。
+    let ctrl_clone = controller.clone();
+    ui.on_batch_toggle_channel(move |ch| {
+        if !(0..36).contains(&ch) {
+            return;
+        }
+        ctrl_clone.borrow_mut().batch_toggle_channel(ch as u8);
+    });
+
+    let ctrl_clone = controller.clone();
+    ui.on_batch_toggle_param(move |param_id| {
+        if !(0x01..=0x0B).contains(&param_id) {
+            return;
+        }
+        ctrl_clone.borrow_mut().batch_toggle_param(param_id as u8);
+    });
+
+    let ctrl_clone = controller.clone();
+    ui.on_batch_channels_all(move || {
+        ctrl_clone.borrow_mut().batch_channels_all();
+    });
+
+    let ctrl_clone = controller.clone();
+    ui.on_batch_channels_invert(move || {
+        ctrl_clone.borrow_mut().batch_channels_invert();
+    });
+
+    let ctrl_clone = controller.clone();
+    ui.on_batch_params_all(move || {
+        ctrl_clone.borrow_mut().batch_params_all();
+    });
+
+    let ctrl_clone = controller.clone();
+    ui.on_batch_params_invert(move || {
+        ctrl_clone.borrow_mut().batch_params_invert();
+    });
+
+    let ctrl_clone = controller.clone();
+    ui.on_batch_clear(move || {
+        ctrl_clone.borrow_mut().batch_clear();
+    });
+
+    let ctrl_clone = controller.clone();
+    ui.on_batch_apply(move |src| {
+        if !(0..36).contains(&src) {
+            return;
+        }
+        let _ = ctrl_clone.borrow_mut().batch_apply_from(src as u8);
+    });
+
+    // JSON 导出：范围先由 Slint 弹窗确认，再使用系统原生保存对话框，失败只写日志不阻塞 UI。
+    let ctrl_clone = controller.clone();
+    ui.on_settings_export(move |config, channel_params, globals, algo, keyboard, zones| {
+        let selected = mai2control_ui::settings_io::GroupSelection {
+            config, channel_params, globals, algo, keyboard, zones,
+        };
+        match mai2control_ui::settings_io::choose_settings_path(true) {
+            Ok(Some(path)) => match mai2control_ui::settings_io::export_settings(&ctrl_clone.borrow(), selected) {
+                Ok(text) => match std::fs::write(&path, text) {
+                    Ok(()) => log::info!("设置 JSON 已导出: {}", path.display()),
+                    Err(e) => log::warn!("设置 JSON 导出失败，无法写入 {}: {}", path.display(), e),
+                },
+                Err(e) => log::warn!("设置 JSON 导出失败: {}", e),
+            },
+            Ok(None) => log::info!("设置 JSON 导出已取消"),
+            Err(e) => log::warn!("无法打开设置 JSON 保存对话框: {}", e),
+        }
+    });
+
+    // JSON 导入：只写 UI 草稿并置脏，不下发、不写 flash、不回读；结果(覆盖/跳过/未保存态)写进日志页。
+    let ctrl_clone = controller.clone();
+    ui.on_settings_import(move |config, channel_params, globals, algo, keyboard, zones| {
+        let selected = mai2control_ui::settings_io::GroupSelection {
+            config, channel_params, globals, algo, keyboard, zones,
+        };
+        match mai2control_ui::settings_io::choose_settings_path(false) {
+            Ok(Some(path)) => match std::fs::read_to_string(&path) {
+                Ok(text) => {
+                    let mut ctrl = ctrl_clone.borrow_mut();
+                    match mai2control_ui::settings_io::import_settings(&mut ctrl, &text, selected) {
+                        Ok(summary) => {
+                            let report = summary.report_text();
+                            // 跳过项必须显眼: 走 Warn 等级, 默认过滤下也能看到, 不静默丢弃。
+                            if summary.skipped.is_empty() {
+                                ctrl.push_log(format!("{}（{}）", report, path.display()));
+                            } else {
+                                ctrl.push_log_warn(format!("{}（{}）", report, path.display()));
+                            }
+                            log::info!("设置 JSON 已导入: {}", path.display());
+                        }
+                        Err(e) => {
+                            ctrl.push_log_warn(format!("设置 JSON 导入失败, 草稿未改动: {}", e));
+                            log::warn!("设置 JSON 导入失败 {}: {}", path.display(), e);
+                        }
+                    }
+                }
+                Err(e) => log::warn!("设置 JSON 导入失败，无法读取 {}: {}", path.display(), e),
+            },
+            Ok(None) => log::info!("设置 JSON 导入已取消"),
+            Err(e) => log::warn!("无法打开设置 JSON 导入对话框: {}", e),
+        }
     });
 
     // 撤销全部未保存草稿(CSD 安全操作 / 配置页): 恢复到设备当前运行态。
@@ -273,17 +655,18 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
         // 恢复默认会清空设备侧算法 C 源 → 立即把内嵌默认源(去注释)回灌设备映射表,
         // 使"读取信息"能真正从设备取回去注释的默认 C 源(而非带注释的原始模板)。
         let _ = ctrl.send_algo_src(&AppController::strip_c_comments(ALGO_V31_TEMPLATE));
-        let _ = ctrl.algo_get_info();
         let _ = ctrl.algo_get_rom();
         let _ = ctrl.request_algo_src();
     });
 
     // 载入内置 v3.1 HDR 模板到编辑器(参考 + 真实可下发案例)。
     let ui_tpl = ui_weak.clone();
-    ui.on_algo_load_template(move || {
+    ui.on_algo_load_template(move |idx| {
+        // idx: 0 = v3.1 HDR 默认(完整触发算法), 1 = 纯白灯演示(触摸点亮白灯, 展示算法可控性)。
+        let tpl = if idx == 1 { ALGO_LED_DEMO_TEMPLATE } else { ALGO_V31_TEMPLATE };
         let ui = ui_tpl.upgrade().unwrap();
-        ui.set_algo_c_source(ALGO_V31_TEMPLATE.into());
-        ui.set_algo_line_numbers(line_numbers_for(ALGO_V31_TEMPLATE).into());
+        ui.set_algo_c_source(tpl.into());
+        ui.set_algo_line_numbers(line_numbers_for(tpl).into());
     });
 
     // 编辑器内容变化 → 刷新行号列。
@@ -306,11 +689,14 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
         let _ = ctrl.kbd_set_touchmap(zone as u8, kbd_choice_to_code(choice), modifier as u8);
     });
 
-    // 键盘捕获输入框: 按下组合键 → 主键+修饰位。纯修饰键(code==0)忽略, 等主键。
+    // 键盘捕获输入框: 按下组合键 → 主键+修饰位；未识别键码写入可见日志提示。
     let ctrl_clone = controller.clone();
     ui.on_kbd_capture_phys(move |idx, text, c, s, a, g| {
         let code = char_to_hid(text.as_str());
-        if code == 0 { return; }
+        if code == 0 {
+            ctrl_clone.borrow_mut().push_log("物理键盘映射: 该按键无法识别为 HID 键码".to_string());
+            return;
+        }
         let m = (c as u8) | ((s as u8) << 1) | ((a as u8) << 2) | ((g as u8) << 3);
         let mut ctrl = ctrl_clone.borrow_mut();
         let _ = ctrl.kbd_set_map(idx as u8, code, m);
@@ -318,7 +704,10 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
     let ctrl_clone = controller.clone();
     ui.on_kbd_capture_zone(move |zone, text, c, s, a, g| {
         let code = char_to_hid(text.as_str());
-        if code == 0 { return; }
+        if code == 0 {
+            ctrl_clone.borrow_mut().push_log("触控分区映射: 该按键无法识别为 HID 键码".to_string());
+            return;
+        }
         let m = (c as u8) | ((s as u8) << 1) | ((a as u8) << 2) | ((g as u8) << 3);
         let mut ctrl = ctrl_clone.borrow_mut();
         let _ = ctrl.kbd_set_touchmap(zone as u8, code, m);
@@ -335,10 +724,37 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
     });
 
     let ctrl_clone = controller.clone();
+    ui.on_kbd_set_hold_phys(move |idx, delay, max_hold| {
+        if !(0..12).contains(&idx) {
+            return;
+        }
+        let mut ctrl = ctrl_clone.borrow_mut();
+        let _ = ctrl.kbd_set_hold_phys(
+            idx as u8,
+            delay.clamp(0, u16::MAX as i32) as u16,
+            max_hold.clamp(0, u16::MAX as i32) as u16,
+        );
+    });
+
+    let ctrl_clone = controller.clone();
+    ui.on_kbd_set_hold_zone(move |zone, delay, max_hold| {
+        if !(0..34).contains(&zone) {
+            return;
+        }
+        let mut ctrl = ctrl_clone.borrow_mut();
+        let _ = ctrl.kbd_set_hold_zone(
+            zone as u8,
+            delay.clamp(0, u16::MAX as i32) as u16,
+            max_hold.clamp(0, u16::MAX as i32) as u16,
+        );
+    });
+
+    let ctrl_clone = controller.clone();
     ui.on_kbd_refresh(move || {
         let mut ctrl = ctrl_clone.borrow_mut();
         let _ = ctrl.kbd_request_map();
         let _ = ctrl.kbd_request_touchmap();
+        let _ = ctrl.kbd_request_hold();
         let _ = ctrl.kbd_request_state();
     });
 
@@ -354,36 +770,77 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
         ui.set_zone_view_h(vh);
     }
 
-    // 编译(不上传): 产出 ASM 并显示占用/进度; compile_only 在超容量时报错, 保证塞得下不截断。
-    let ctrl_clone = controller.clone();
+    // 算法编译一律丢后台线程(见 AlgoCompileJob/spawn_algo_compile): UI 线程只置 busy 并在
+    // 16ms tick 里取回产物写入 AppController, 编译期间界面照常重绘与响应点击。
+    let algo_busy = Rc::new(Cell::new(false));
+    let algo_job: Rc<RefCell<Option<AlgoCompileJob>>> = Rc::new(RefCell::new(None));
+
+    // 编译(不上传): 产出 ASM 并显示占用/进度; compile_blob 在超容量时报错, 保证塞得下不截断。
     let ui_algo = ui_weak.clone();
+    let algo_busy_compile = algo_busy.clone();
+    let algo_job_compile = algo_job.clone();
     ui.on_algo_compile(move |src| {
-        let ui = ui_algo.upgrade().unwrap();
-        let mut ctrl = ctrl_clone.borrow_mut();
-        let cap = AppController::algo_slot_capacity();
-        match ctrl.compile_only(&src) {
-            Ok(len) => {
-                ui.set_algo_asm_bytes(len as i32);
-                ui.set_algo_status(
-                    format!("编译成功: ASM {} / {} 字节 ({}%), 可上传", len, cap, (len * 100) / cap).into());
+        let Some(ui) = ui_algo.upgrade() else { return; };
+        if algo_busy_compile.get() {
+            if algo_job_compile.borrow().is_some() {
+                ui.set_algo_status("正在编译中，请等待完成".into());
+                return;
             }
-            Err(e) => {
-                ui.set_algo_asm_bytes(0);
-                ui.set_algo_status(format!("编译失败: {}", e).into());
-            }
+            // busy 与 job 槽必须同生同灭；仅 busy 悬挂说明上次任务已丢失，解锁后接受本次点击。
+            algo_busy_compile.set(false);
+            ui.set_algo_busy(false);
         }
+        algo_busy_compile.set(true);
+        ui.set_algo_busy(true);
+        ui.set_algo_phase("编译中…".into());
+        ui.set_algo_status("编译中…(后台工具链, 界面可继续操作)".into());
+        spawn_algo_compile(&algo_job_compile, src.to_string(), false);
     });
 
     // 上传最近一次成功编译的 ASM(强制先编译后上传, 避免上传未经容量校验的产物)。
     let ctrl_clone = controller.clone();
     let ui_algo = ui_weak.clone();
+    let algo_busy_upload = algo_busy.clone();
+    let algo_job_upload = algo_job.clone();
     ui.on_algo_upload(move || {
-        let ui = ui_algo.upgrade().unwrap();
+        let Some(ui) = ui_algo.upgrade() else { return; };
+        if algo_busy_upload.get() {
+            if algo_job_upload.borrow().is_some() {
+                ui.set_algo_status("正在编译中，请等待完成".into());
+                return;
+            }
+            // 同上：busy=true 而 job 槽为空只能是遗留状态，不能永久静默吞掉用户点击。
+            algo_busy_upload.set(false);
+            ui.set_algo_busy(false);
+        }
         let mut ctrl = ctrl_clone.borrow_mut();
         match ctrl.upload_compiled() {
-            Ok(()) => ui.set_algo_status(format!("上传成功: {} 字节已下发设备", ctrl.algo_compiled_len()).into()),
+            Ok(()) => ui.set_algo_status(ctrl.algo_upload_status().into()),
             Err(e) => ui.set_algo_status(format!("上传失败: {}", e).into()),
         }
+    });
+
+    // ★一键编译并上传★: 编译同样在后台线程; 成功后由 tick 直接续走 upload_compiled
+    // (上传本身走 mpsc 不阻塞), 失败即解锁并给出原因。
+    let ui_algo = ui_weak.clone();
+    let algo_busy_build = algo_busy.clone();
+    let algo_job_build = algo_job.clone();
+    ui.on_algo_build_upload(move |src| {
+        let Some(ui) = ui_algo.upgrade() else { return; };
+        if algo_busy_build.get() {
+            if algo_job_build.borrow().is_some() {
+                ui.set_algo_status("正在编译中，请等待完成".into());
+                return;
+            }
+            // busy 与 job 槽失步时，上次任务已不可回收；先恢复不忙状态再启动新任务。
+            algo_busy_build.set(false);
+            ui.set_algo_busy(false);
+        }
+        algo_busy_build.set(true);
+        ui.set_algo_busy(true);
+        ui.set_algo_phase("编译中…".into());
+        ui.set_algo_status("编译中…(后台工具链, 界面可继续操作)".into());
+        spawn_algo_compile(&algo_job_build, src.to_string(), true);
     });
 
     // 算法可调变量(cfg[8]) SpinBox 编辑 → 立即下发+持久化。
@@ -394,6 +851,25 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
         }
         let mut ctrl = ctrl_clone.borrow_mut();
         let _ = ctrl.set_algo_cfg(idx as u8, value as u8);
+    });
+
+    // 算法上报变量逐条显示开关(默认全显): 行模型常驻，勾选立即原地改对应行，
+    // 后续追踪刷新仍以该真相源为准，避免复选框被模型回填弹回。
+    let report_show = Rc::new(RefCell::new([true; 4usize]));
+    let algo_report_lines_model: Rc<slint::VecModel<AlgoReportLine>> =
+        Rc::new(slint::VecModel::from(Vec::new()));
+    ui.set_algo_report_lines(slint::ModelRc::from(algo_report_lines_model.clone()));
+    let rs_toggle = report_show.clone();
+    let report_model_toggle = algo_report_lines_model.clone();
+    ui.on_report_toggle(move |idx, on| {
+        if idx >= 0 && (idx as usize) < 4 {
+            let row = idx as usize;
+            rs_toggle.borrow_mut()[row] = on;
+            if let Some(mut line) = report_model_toggle.row_data(row) {
+                line.visible = on;
+                report_model_toggle.set_row_data(row, line);
+            }
+        }
     });
 
     let ctrl_clone = controller.clone();
@@ -412,6 +888,10 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
             return;
         }
         let mut ctrl = ctrl_clone.borrow_mut();
+        // AUTO 下这些值由 PSoC 接管；UI 已锁定，这里再守住异步旧事件。
+        if ctrl.mode_draft().or(ctrl.csd_mode()) != Some(1) {
+            return;
+        }
         let _ = ctrl.set_param_all(param_id as u8, value as u32);
     });
 
@@ -427,6 +907,65 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
     ui.on_bind_load(move || {
         let mut ctrl = ctrl_clone.borrow_mut();
         let _ = ctrl.request_config_all();
+    });
+
+    let ctrl_clone = controller.clone();
+    ui.on_mai2_set_send_en(move |enabled| {
+        let mut ctrl = ctrl_clone.borrow_mut();
+        let _ = ctrl.mai2_set_send_en(enabled);
+    });
+
+    let ctrl_clone = controller.clone();
+    ui.on_mai2_refresh(move || {
+        let mut ctrl = ctrl_clone.borrow_mut();
+        let _ = ctrl.mai2_request_state();
+    });
+
+    // ---------------- 协议页: mai2light 灯板协议 ----------------
+    let ctrl_clone = controller.clone();
+    ui.on_light_refresh(move || {
+        let mut ctrl = ctrl_clone.borrow_mut();
+        let _ = ctrl.led_request_state();
+    });
+
+    // 映射编辑只落 Rust 侧草稿; 下拉索引 0/1/2 ↔ 固件 ch 0xFF/0/1。
+    let ctrl_clone = controller.clone();
+    ui.on_light_map_set(move |unit, ch_choice, start, count| {
+        if !(0..11).contains(&unit) {
+            return;
+        }
+        let ch = if ch_choice <= 0 { LED_CH_UNMAPPED } else { (ch_choice - 1) as u8 };
+        ctrl_clone.borrow_mut().led_set_region(
+            unit as usize, ch, start.clamp(0, u16::MAX as i32) as u16, count.clamp(0, 255) as u8);
+    });
+
+    let ctrl_clone = controller.clone();
+    ui.on_light_map_apply(move || {
+        let _ = ctrl_clone.borrow_mut().led_apply_regions();
+    });
+
+    // unit < 0 → 全部单元(LED_PREVIEW_ALL)。
+    let ctrl_clone = controller.clone();
+    ui.on_light_preview(move |unit, r, g, b| {
+        let target = if unit < 0 || unit > 10 { LED_PREVIEW_ALL } else { unit as u8 };
+        let rgb = [r.clamp(0, 255) as u8, g.clamp(0, 255) as u8, b.clamp(0, 255) as u8];
+        let _ = ctrl_clone.borrow_mut().led_preview(target, rgb);
+    });
+
+    // 灯链长度/亮度是配置 KV, 复用既有草稿写入路径(随"保存到设备"落 flash), 不另造协议。
+    let ctrl_clone = controller.clone();
+    ui.on_light_ws_count_set(move |chain, value| {
+        let key = if chain == 0 { "led.ws_count0" } else { "led.ws_count1" };
+        let _ = ctrl_clone
+            .borrow_mut()
+            .set_config_number(key, value.clamp(1, 1000) as f64);
+    });
+
+    let ctrl_clone = controller.clone();
+    ui.on_light_brightness_set(move |value| {
+        let _ = ctrl_clone
+            .borrow_mut()
+            .set_config_number("led.ws_brightness", value.clamp(0, 255) as f64);
     });
 
     // 选中分区:回填分区名与当前绑定通道(-1=未映射),供详情面板 SpinBox 显示。
@@ -452,7 +991,8 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
         if channel != 0xFF {
             let ui = ui_zone_activated.upgrade().unwrap();
             ui.set_sel_channel(channel as i32);
-            ui.set_settings_tab(3);
+            // Tab 顺序: 0绑区 1协议 2触控通道 3触控全局 4单通道精调 …(协议页插到索引 1 后全部后移一位)
+            ui.set_settings_tab(4);
         }
     });
 
@@ -480,6 +1020,18 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
     // 取消侦听。
     let ctrl_clone = controller.clone();
     ui.on_bind_listen_cancel(move || {
+        let mut ctrl = ctrl_clone.borrow_mut();
+        ctrl.listen_cancel();
+    });
+
+    // 交互式顺序绑定(等效 v3.0): 开始 / 终止。
+    let ctrl_clone = controller.clone();
+    ui.on_interactive_bind(move || {
+        let mut ctrl = ctrl_clone.borrow_mut();
+        let _ = ctrl.interactive_bind_start();
+    });
+    let ctrl_clone = controller.clone();
+    ui.on_interactive_bind_cancel(move || {
         let mut ctrl = ctrl_clone.borrow_mut();
         ctrl.listen_cancel();
     });
@@ -513,12 +1065,12 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
         let _ = ctrl.stop_telemetry();
     });
 
-    // 从全通道状态卡进入精调：选中物理通道并切换到“单通道精调”子标签(索引 3)。
+    // 从全通道状态卡进入精调：选中物理通道并切换到“单通道精调”子标签(索引 4)。
     let ui_channel = ui_weak.clone();
     ui.on_channel_selected(move |channel| {
         let ui = ui_channel.upgrade().unwrap();
         ui.set_sel_channel(channel.clamp(0, 35));
-        ui.set_settings_tab(3);
+        ui.set_settings_tab(4);
     });
 
     let ctrl_clone = controller.clone();
@@ -545,6 +1097,9 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
         let ui = ui_th.upgrade().unwrap();
         let ch = ui.get_sel_channel() as u8;
         let mut ctrl = ctrl_clone.borrow_mut();
+        if ctrl.mode_draft().or(ctrl.csd_mode()) != Some(1) {
+            return;
+        }
         let _ = ctrl.set_param(ch, param_id as u8, value as u32);
     });
 
@@ -554,35 +1109,33 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
         let ui = ui_param.upgrade().unwrap();
         let ch = ui.get_sel_channel() as u8;
         let mut ctrl = ctrl_clone.borrow_mut();
+        if ctrl.mode_draft().or(ctrl.csd_mode()) != Some(1) {
+            return;
+        }
         let _ = ctrl.set_param(ch, param_id as u8, value as u32);
     });
 
     let ctrl_clone = controller.clone();
     let ui_measure = ui_weak.clone();
     let cp_poll_measure = cp_poll.clone();
+    // ★唯一的 Cp 获取入口★: 手动"测量电容" = 触发一次全电极 BIST 测量 + 一轮 36 通道顺序抓取。
+    // 除此之外任何路径(连接、切换通道、恢复默认、每 tick)都不再请求 Cp。
     ui.on_curve_measure_cp(move || {
         let ui = ui_measure.upgrade().unwrap();
-        let ch = ui.get_sel_channel().clamp(0, 35) as u8;
         let mut ctrl = ctrl_clone.borrow_mut();
         let mut state = cp_poll_measure.borrow_mut();
         match ctrl.measure_cp() {
             Ok(()) => {
                 let now = Instant::now();
                 state.started_at = Some(now);
-                state.next_request_at = Some(now + Duration::from_millis(500));
-                state.measurement_start_channel_version = ctrl.cp_channel_version(ch);
-                state.requested_channel_version = state.measurement_start_channel_version;
-                state.visible_channel = ch as i32;
-                state.visible_after_version = state.measurement_start_channel_version;
-                state.waiting_for_response = false;
+                state.next_at = Some(now + CP_SWEEP_START_DELAY);
+                state.ch = 0;
+                state.tries = 0;
+                state.req_version = 0;
                 state.status = "测量中…".to_string();
+                ctrl.push_log("测量电容: 已触发全电极 BIST, 将顺序回读 36 通道 Cp(仅本次)");
             }
-            Err(error) => {
-                state.started_at = None;
-                state.next_request_at = None;
-                state.waiting_for_response = false;
-                state.status = format!("测量失败: {}", error);
-            }
+            Err(error) => state._stop(format!("测量失败: {}", error)),
         }
         ui.set_cp_text(state.status.clone().into());
     });
@@ -631,10 +1184,341 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
     let ctrl_clone = controller.clone();
     let ui_ports = ui_weak.clone();
     ui.on_apply_ports(move || {
-        let status = { ctrl_clone.borrow_mut().apply_ports() };
+        // 用户点"立即应用" → force=true: 即使已是目标口也强制重启端口节点使其真正生效。
+        let status = { ctrl_clone.borrow_mut().apply_ports(true) };
         if let Some(ui) = ui_ports.upgrade() {
             ui.set_port_status(status.into());
         }
+    });
+
+    // ★已删除单通道精调主图的 plot_area_resized/宽高比机制★:
+    // 上一版靠"把曲线 x 拉伸到 [0,1000*aspect] + viewbox 宽同乘 aspect"来对抗 Path 的 contain
+    // (等比缩放+居中)。该修正只在横纵缩放倍数相同(全览)时成立: 一旦横向缩放时间窗(viewbox 变窄、
+    // 高度不变), viewbox 宽高比 != 元素宽高比, contain 退化为按高度缩放, 横向只占 view_w/1000 的
+    // 宽度 → 数据两侧又出现空白带。现在主图 PlotPath 改用 fit: fill(非等比拉伸), 任意宽高比的
+    // viewbox 都被拉满元素, 缩放/平移到任何极端位置都铺满可视区; 于是 path 的 x 固定为 [0,1000],
+    // Rust 侧不必知道绘图区形状, 拖分栏/改窗口也不再触发重算全部 path。
+
+    // ---------------- 界面偏好(config.cfg) ----------------
+    // 纯界面设置(日志等级/自动滚动/落盘开关/虚拟摄像头时长/延迟测量/当前页签与通道)重启即丢,
+    // 每次开程序都要重新点一遍。这里在启动目录的 config.cfg 里存取, 与"会改系统状态"的
+    // toolbox.cfg(固定 COM 号、扫码器设备)分开, 避免界面偏好牵连到系统级设置。
+    let ui_cfg = Rc::new(RefCell::new(mai2control_ui::ui_config::UiConfig::load()));
+    {
+        use mai2control_ui::ui_config::keys as k;
+        let cfg = ui_cfg.borrow();
+        ui.set_log_filter(cfg.get_i32(k::LOG_FILTER, 2).clamp(0, 3));
+        ui.set_log_auto_scroll(cfg.get_bool(k::LOG_AUTO_SCROLL, true));
+        ui.set_vcam_submit_secs(cfg.get_i32(k::VCAM_SUBMIT_SECS, 2).clamp(1, 10));
+        ui.set_vcam_display_secs(cfg.get_i32(k::VCAM_DISPLAY_SECS, 10).clamp(1, 60));
+        ui.set_measure_latency(cfg.get_bool(k::LATENCY_MEASURE, false));
+        ui.set_current_view(cfg.get_i32(k::CURRENT_VIEW, 0).clamp(0, 3));
+        // 上限 8: 共 9 个标签(0绑区 1协议 2触控通道 3触控全局 4精调 5触控键映 6物理键盘 7通信 8算法)。
+        ui.set_settings_tab(cfg.get_i32(k::SETTINGS_TAB, 0).clamp(0, 8));
+        ui.set_sel_channel(cfg.get_i32(k::SEL_CHANNEL, 0).clamp(0, 35));
+        // 日志落盘: 关掉过就保持关掉(logging::init 默认开)。
+        if !cfg.get_bool(k::LOG_FILE_ON, true) {
+            mai2control_ui::logging::hub().set_file_enabled(false);
+        }
+        // 恢复后的等级要同时作用于文件与控制台。
+        let lv = ui.get_log_filter().clamp(0, 3) as u8;
+        controller.borrow_mut().set_log_filter(lv);
+        mai2control_ui::logging::hub().set_level(lv);
+        // 虚拟摄像头的秒数直接进共享状态, 否则要等用户动一次 SpinBox 才生效。
+        vcam.set_submit_timeout_ms((ui.get_vcam_submit_secs().max(1) as u32) * 1000);
+        vcam.set_display_ms((ui.get_vcam_display_secs().max(1) as u32) * 1000);
+    }
+
+    // 二值算法线的归一化幅度 N(索引 0..3 = report[idx], 4 = 触发判定)。
+    // ★为什么需要★: 0/1 的布尔类上报与同一右轴上动辄上千的计数类上报共存时会被压成贴底的一条线,
+    // 把 0/1 拉伸到 0..N 才看得见。★为什么每条线各自一个 N★: 各条二值线要去"贴"的邻居量纲不同
+    // (有的邻居是几千的计数, 有的是几十的 permille), 共用一个 N 必然有一条不合适。
+    // ★纯 UI 量★: 只影响本机画图, 存 config.cfg, 绝不下发设备(设备侧算法语义不能被显示偏好污染)。
+    let report_norm = Rc::new(RefCell::new([1.0f32; 5]));
+    {
+        let cfg = ui_cfg.borrow();
+        let mut norm = report_norm.borrow_mut();
+        for idx in 0..5usize {
+            // 千分之一整数存储: config.cfg 只有 i32 存取, 而 N 需要小于 1 的档位。
+            norm[idx] = (cfg.get_i32(&algo_bin_amp_key(idx), 1000) as f32 / 1000.0)
+                .clamp(ALGO_BIN_AMP_MIN, ALGO_BIN_AMP_MAX);
+        }
+    }
+    let report_norm_cb = report_norm.clone();
+    let ui_cfg_norm = ui_cfg.clone();
+    let report_model_norm = algo_report_lines_model.clone();
+    let ui_weak_norm = ui_weak.clone();
+    ui.on_report_norm_set(move |idx, value| {
+        if idx < 0 || idx as usize >= 5 {
+            return;
+        }
+        let row = idx as usize;
+        let amp = if value.is_finite() { value.clamp(ALGO_BIN_AMP_MIN, ALGO_BIN_AMP_MAX) } else { 1.0 };
+        report_norm_cb.borrow_mut()[row] = amp;
+        ui_cfg_norm
+            .borrow_mut()
+            .set_i32(&algo_bin_amp_key(row), (amp * 1000.0).round() as i32);
+        // 立即回显钳制后的值(用户可能输了 0 或超界), 并原地改行, 不等下一次追踪刷新。
+        if row < 4 {
+            if let Some(mut line) = report_model_norm.row_data(row) {
+                line.norm_amp = amp;
+                report_model_norm.set_row_data(row, line);
+            }
+        } else if let Some(ui) = ui_weak_norm.upgrade() {
+            ui.set_active_norm_amp(amp);
+        }
+    });
+
+    // ---------------- 日志页 ----------------
+    // 过滤等级: 写入 app_state 作真相源, 并强制下一帧重建行模型(把 last_log_ver 打脏)。
+    ui.set_log_filter(controller.borrow().log_filter() as i32);
+    mai2control_ui::logging::hub().set_level(controller.borrow().log_filter());
+    ui.set_log_file_on(mai2control_ui::logging::hub().file_enabled());
+    ui.set_log_file_path(mai2control_ui::logging::hub().file_path_text().into());
+    let log_dirty = Rc::new(std::cell::Cell::new(true));
+
+    let ctrl_logf = controller.clone();
+    let log_dirty_f = log_dirty.clone();
+    ui.on_set_log_filter(move |lvl| {
+        let lv = lvl.clamp(0, 3) as u8;
+        ctrl_logf.borrow_mut().set_log_filter(lv);
+        // 落盘与控制台门槛都跟着走: 看什么等级就记什么等级, 不另设一套阈值。
+        mai2control_ui::logging::hub().set_level(lv);
+        log_dirty_f.set(true);
+    });
+
+    // 清空动作由状态层完成；脏标记确保下一次 tick 即回填零行视图。
+    let ctrl_clear = controller.clone();
+    let log_dirty_clear = log_dirty.clone();
+    ui.on_clear_log(move || {
+        ctrl_clear.borrow_mut().clear_log();
+        log_dirty_clear.set(true);
+    });
+
+    let ctrl_copy2 = controller.clone();
+    ui.on_copy_log_all(move || {
+        let filter = ctrl_copy2.borrow().log_filter();
+        let text = mai2control_ui::logging::hub()
+            .text_for_copy(filter, mai2control_ui::logging::VIEW_MAX);
+        let lines = text.lines().count();
+        match mai2control_ui::logging::copy_to_clipboard(&text) {
+            Ok(()) => log::info!("已复制当前视图 {} 行到剪贴板", lines),
+            Err(e) => log::warn!("复制失败: {}", e),
+        }
+    });
+
+    ui.on_open_log_dir(move || {
+        if let Err(e) = mai2control_ui::logging::open_logs_dir() {
+            log::warn!("{}", e);
+        }
+    });
+
+    // 关于页: 上位机版本与仓库地址都是编译期常量, 一次性回填(不进 16ms tick)。
+    ui.set_about_app_version(env!("CARGO_PKG_VERSION").into());
+    ui.set_about_repo_url(REPO_URL.into());
+    ui.on_copy_repo_url(move || match mai2control_ui::logging::copy_to_clipboard(REPO_URL) {
+        Ok(()) => log::info!("已复制仓库地址到剪贴板: {}", REPO_URL),
+        Err(e) => log::warn!("复制仓库地址失败: {}", e),
+    });
+
+    let ui_logfile = ui_weak.clone();
+    ui.on_set_log_file_enabled(move |on| {
+        let hub = mai2control_ui::logging::hub();
+        hub.set_file_enabled(on);
+        if let Some(ui) = ui_logfile.upgrade() {
+            ui.set_log_file_on(hub.file_enabled());
+            ui.set_log_file_path(hub.file_path_text().into());
+        }
+    });
+
+    // 虚拟摄像头: 开启前先核验机器级注册；共享映射和 COM 后端都在 UI 线程创建，
+    // 避免 Frame Server 与 Raw Input 线程之间错误共享 COM 指针。
+    let vcam_cb = vcam.clone();
+    let publisher_cb = frame_publisher.clone();
+    let camera_cb = virtual_camera.clone();
+    let ui_vcam = ui_weak.clone();
+    ui.on_set_vcam_enabled(move |on| {
+        let Some(ui) = ui_vcam.upgrade() else { return };
+        let namespace = if on && publisher_cb.borrow().is_none() {
+            match FramePublisher::create() {
+                Ok(publisher) => {
+                    let namespace = publisher.namespace();
+                    *publisher_cb.borrow_mut() = Some(publisher);
+                    Some(namespace)
+                }
+                Err(error) => {
+                    log::error!("虚拟摄像头: 无法启动帧发布: {}", error);
+                    vcam_cb.set_enabled(false);
+                    ui.set_vcam_enabled(false);
+                    ui.set_vcam_runtime_status("未运行 · 共享内存创建失败".into());
+                    return;
+                }
+            }
+        } else {
+            publisher_cb.borrow().as_ref().map(|publisher| publisher.namespace())
+        };
+        let Some(namespace) = namespace else { return };
+        if on {
+            match vcam_backend::is_registered() {
+                Ok(true) => {}
+                Ok(false) => {
+                    log::warn!("虚拟摄像头: 未注册媒体源 DLL；请先点击“安装(需管理员)”");
+                    vcam_cb.set_enabled(false);
+                    ui.set_vcam_enabled(false);
+                    ui.set_vcam_install_status(vcam_backend::registration_status().into());
+                    ui.set_vcam_runtime_status(
+                        format!("未运行 · 共享内存命名空间 {} · 需先安装", namespace.label()).into(),
+                    );
+                    return;
+                }
+                Err(error) => {
+                    log::error!("虚拟摄像头: 注册状态核验失败: {}", error);
+                    vcam_cb.set_enabled(false);
+                    ui.set_vcam_enabled(false);
+                    ui.set_vcam_runtime_status("未运行 · 注册状态核验失败".into());
+                    return;
+                }
+            }
+            if camera_cb.borrow().is_none() {
+                match vcam_backend::VirtualCamera::start() {
+                    Ok(camera) => *camera_cb.borrow_mut() = Some(camera),
+                    Err(error) => {
+                        log::error!("虚拟摄像头: Media Foundation 启动失败: {}", error);
+                        vcam_cb.set_enabled(false);
+                        ui.set_vcam_enabled(false);
+                        ui.set_vcam_runtime_status(
+                            format!("未运行 · 共享内存命名空间 {} · 启动失败", namespace.label()).into(),
+                        );
+                        return;
+                    }
+                }
+            }
+            let access = camera_cb.borrow().as_ref().map(|camera| camera.access_name()).unwrap_or("未知");
+            vcam_cb.set_enabled(true);
+            vcam::keyboard::start(vcam_cb.clone());
+            ui.set_vcam_runtime_status(
+                format!("运行中 ({}) · 共享内存命名空间 {}", access, namespace.label()).into(),
+            );
+        } else {
+            vcam_cb.set_enabled(false);
+            vcam::keyboard::stop();
+            if let Some(camera) = camera_cb.borrow_mut().take() {
+                camera.stop();
+            }
+            ui.set_vcam_runtime_status(
+                format!("未运行 · 共享内存命名空间 {}", namespace.label()).into(),
+            );
+        }
+    });
+    // ★安装/卸载必须离开 UI 线程★: 提权走 ShellExecute("runas"), UAC 弹窗期间调用会阻塞,
+    // 再加上要等 regsvr32 跑完才能核验注册表 —— 全都压在事件循环里就是标题栏那个"(未响应)"。
+    // 这里丢到工作线程, 结果用 invoke_from_event_loop 回投给 UI。
+    let ui_vcam_install = ui_weak.clone();
+    ui.on_install_vcam(move || {
+        if let Some(ui) = ui_vcam_install.upgrade() {
+            ui.set_vcam_install_status("安装中… 请在 UAC 弹窗上确认".into());
+        }
+        let ui_done = ui_vcam_install.clone();
+        std::thread::Builder::new()
+            .name("vcam-install".into())
+            .spawn(move || {
+                let status = match vcam_backend::install() {
+                    Ok(status) => {
+                        log::info!("虚拟摄像头: 安装核验通过: {}", status);
+                        status
+                    }
+                    Err(error) => {
+                        let status = format!("安装未确认: {}", error);
+                        log::warn!("虚拟摄像头: {}", status);
+                        status
+                    }
+                };
+                let _ = ui_done.upgrade_in_event_loop(move |ui| {
+                    ui.set_vcam_install_status(status.into());
+                });
+            })
+            .ok();
+    });
+    let ui_vcam_uninstall = ui_weak.clone();
+    let camera_uninstall = virtual_camera.clone();
+    let vcam_uninstall = vcam.clone();
+    ui.on_uninstall_vcam(move || {
+        let Some(ui) = ui_vcam_uninstall.upgrade() else { return };
+        vcam_uninstall.set_enabled(false);
+        vcam::keyboard::stop();
+        if let Some(camera) = camera_uninstall.borrow_mut().take() {
+            camera.stop();
+        }
+        ui.set_vcam_install_status("卸载中… 请在 UAC 弹窗上确认".into());
+        ui.set_vcam_enabled(false);
+        // 同安装: 提权 + 等命令结束不能压在事件循环里。
+        let ui_done = ui_vcam_uninstall.clone();
+        std::thread::Builder::new()
+            .name("vcam-uninstall".into())
+            .spawn(move || {
+                let status = match vcam_backend::uninstall() {
+                    Ok(status) => {
+                        log::info!("虚拟摄像头: 卸载核验通过: {}", status);
+                        status
+                    }
+                    Err(error) => {
+                        let status = format!("卸载未确认: {}", error);
+                        log::warn!("虚拟摄像头: {}", status);
+                        status
+                    }
+                };
+                let _ = ui_done.upgrade_in_event_loop(move |ui| {
+                    ui.set_vcam_install_status(status.into());
+                });
+            })
+            .ok();
+    });
+    let vcam_cb = vcam.clone();
+    ui.on_set_vcam_submit_secs(move |s| {
+        vcam_cb.set_submit_timeout_ms((s.max(1) as u32) * 1000);
+    });
+    let vcam_cb = vcam.clone();
+    ui.on_set_vcam_display_secs(move |s| {
+        vcam_cb.set_display_ms((s.max(1) as u32) * 1000);
+    });
+
+    // 输入源设备选择: index 0 = 所有键盘, 其余对应 vcam_kbd_list 里的设备。
+    // 选中即生效(捕获线程运行中也可切换), 并持久化到 toolbox.cfg。
+    let ctrl_clone = controller.clone();
+    let kbd_list_sel = vcam_kbd_list.clone();
+    let ui_kbd_sel = ui_weak.clone();
+    ui.on_set_vcam_device(move |index| {
+        let list = kbd_list_sel.borrow();
+        let picked = (index > 0)
+            .then(|| list.get((index - 1) as usize).map(|d: &vcam::keyboard::KeyboardDevice| d.path.clone()))
+            .flatten();
+        vcam::keyboard::set_target_device(picked.clone());
+        // 选中行高亮靠 dev_index 比较, 不重建整棵树。
+        if let Some(ui) = ui_kbd_sel.upgrade() {
+            ui.set_vcam_device_index(index);
+        }
+        let mut ctrl = ctrl_clone.borrow_mut();
+        ctrl.set_vcam_kbd_device(picked.clone().unwrap_or_default());
+        match picked {
+            Some(_) => ctrl.push_log(format!(
+                "虚拟摄像头: 输入源已限定为 {}",
+                list.get((index - 1) as usize).map(|d| d.label.clone()).unwrap_or_default()
+            )),
+            None => ctrl.push_log("虚拟摄像头: 输入源为所有键盘(未限定设备)".to_string()),
+        }
+    });
+
+    // 刷新设备列表(扫码器热插拔后用)。
+    let ui_kbd = ui_weak.clone();
+    let ctrl_clone = controller.clone();
+    let kbd_list_refresh = vcam_kbd_list.clone();
+    ui.on_refresh_vcam_devices(move || {
+        let ui = ui_kbd.upgrade().unwrap();
+        let saved = ctrl_clone.borrow().vcam_kbd_device();
+        let count = refresh_vcam_devices(&ui, &kbd_list_refresh, &saved);
+        ctrl_clone
+            .borrow_mut()
+            .push_log(format!("虚拟摄像头: 已刷新键盘设备列表, 共 {} 个", count));
     });
 
     // 延迟测量开关只控制 UI 显示，固件始终低成本采样。
@@ -653,16 +1537,19 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
     // Cp 缓存版本门控：无新遥测但有新 Cp 响应时也要刷新全通道卡片的 cp_text。
     let mut last_cp_version_all = u64::MAX;
     let mut last_param_version = 0u64;
+    let mut last_batch_sel_version = u64::MAX;
     let mut last_channel = -1i32;
     let mut last_curve_visibility = (false, false, false);
+    // 算法叠加脏标记: 它会改变主图 path, 与遥测版本一起做门控(绘图区尺寸已不再参与, 见 fit: fill)。
+    let mut algo_overlay_dirty = true;
     let mut reconnect_tick = 0u32;
     let mut was_connected = false;
-    // 全通道 Cp 轮询游标(0..35): 每隔几 tick 请求一个通道, 轮流刷新全部 36 通道的 Cp。
-    let mut cp_rr_channel = 0u8;
     // mode.work 保存后自动重启倒计时(tick): 给 SAVE_CONFIG 的 flash 写留出完成窗口再重启重枚举。
     let mut reboot_countdown: Option<u32> = None;
-    let mut last_log_seq = u64::MAX;
+    let mut last_log_ver = u64::MAX;
+    let ui_cfg_tick = ui_cfg.clone();
     let mut last_algo_version = u64::MAX;
+    let mut last_algo_upload_version = 0u64;
     let mut last_algo_src_version = u64::MAX;
     let mut last_algo_code_version = u64::MAX;
     // 默认算法的 C 源(已滤注释)是否已回灌到设备映射表: 设备默认算法出厂不带源,
@@ -672,7 +1559,13 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
     // 算法追踪(report[]/out_active)/可调变量(cfg[8]): 版本门控 + 轮询游标。
     let mut last_algo_trace_version = u64::MAX;
     let mut last_algo_cfg_version = u64::MAX;
-    let mut last_algo_source_for_schema = String::new();
+    // schema(ALGO_REPORT/ALGO_SETTING)版本门控: 源取自 AppController::algo_schema_source()
+    // (设备回读源优先), 与编辑器文本无关 —— 连接后自动按设备正在跑的算法填面板/轮询集合。
+    let mut last_algo_schema_version = u64::MAX;
+    // 自动载入编辑器的那份文本: 用于判断编辑器是否已被用户改过(改过就不再自动覆盖)。
+    // ★初值必须等于启动时预置进编辑器的那份模板★: 否则"编辑器 == 自动载入值"恒不成立,
+    // 会把开机预置的模板当成"用户的改动"而永不载入设备算法源 —— 表现为 JIT 算法从不自动同步显示。
+    let mut editor_autoload_mark = algo_default_src.to_string();
     // 已声明的 ALGO_REPORT idx 列表(从源码 schema 解析, 轮询游标按此列表轮转; 未声明则不轮询)。
     let mut algo_report_idxs: Vec<u8> = Vec::new();
     let mut algo_trace_rr = 0usize;
@@ -688,6 +1581,14 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
         Rc::new(slint::VecModel::from(vec![ChannelStatus::default(); 36]));
     ui.set_all_channels(slint::ModelRc::from(all_channels_model.clone()));
 
+    // 这三组可交互行模型在整个 UI 生命周期内保持同一实例；tick 只原地更新变化行。
+    let zones_model: Rc<slint::VecModel<ZoneCell>> =
+        Rc::new(slint::VecModel::from(build_zone_cells(&controller.borrow())));
+    ui.set_zones(slint::ModelRc::from(zones_model.clone()));
+    let curve_params_model: Rc<slint::VecModel<ParamRow>> =
+        Rc::new(slint::VecModel::from(build_param_rows(&controller.borrow().params_of(0))));
+    ui.set_curve_params(slint::ModelRc::from(curve_params_model.clone()));
+
     // 键盘键码下拉的共享键名表(一次性设置)。
     let kbd_choice_names: Vec<slint::SharedString> =
         kbd_key_choices().iter().map(|(n, _)| (*n).into()).collect();
@@ -700,11 +1601,67 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
     let mut last_kbd_state_version = u64::MAX;
     let mut last_kbd_map_version = u64::MAX;
     let mut last_kbd_touchmap_version = u64::MAX;
+    let mut last_kbd_hold_version = u64::MAX;
+    let mut last_mai2_version = u64::MAX;
+    let mut last_led_version = u64::MAX;
+    // 协议页驻留门控: 进页边沿请求一次, 离页停止轮询(见下方 protocol_visible)。
+    let mut last_protocol_visible = false;
 
+    let report_show_timer = report_show.clone();
+    // 后台编译任务槽与 busy 闸: tick 里取回产物后由本处解锁(见"后台编译产物回收")。
+    let algo_job_timer = algo_job.clone();
+    let algo_busy_timer = algo_busy.clone();
+    let algo_report_lines_model_timer = algo_report_lines_model.clone();
+    let report_norm_timer = report_norm.clone();
+    let vcam_timer = vcam.clone();
+    let publisher_timer = frame_publisher.clone();
+    let mut last_vcam_frame_version = 0u32;
     let timer = slint::Timer::default();
     timer.start(slint::TimerMode::Repeated, std::time::Duration::from_millis(16), move || {
         let ui = ui_weak.upgrade().unwrap();
         let mut ctrl = controller.borrow_mut();
+
+        // 虚拟摄像头: 推进时序状态机(显示到期转黑)，帧变化时先提交 RGB24 到命名
+        // 共享内存，再刷新 UI 预览。序号提交由 FramePublisher 保证在像素写完之后发生。
+        vcam_timer.tick();
+        let vframe_ver = vcam_timer.frame_version();
+        if vframe_ver != last_vcam_frame_version {
+            last_vcam_frame_version = vframe_ver;
+            let rgb = vcam_timer.frame_copy();
+            if let Some(publisher) = publisher_timer.borrow_mut().as_mut() {
+                if let Err(error) = publisher.publish(&rgb) {
+                    log::error!("虚拟摄像头: 帧共享发布失败: {}", error);
+                }
+            }
+            let mut buf = slint::SharedPixelBuffer::<slint::Rgb8Pixel>::new(FRAME_W as u32, FRAME_H as u32);
+            let dst = buf.make_mut_bytes();
+            if dst.len() == rgb.len() {
+                dst.copy_from_slice(&rgb);
+                ui.set_vcam_preview(slint::Image::from_rgb8(buf));
+            }
+            ui.set_vcam_last_data(vcam_timer.last_data().into());
+        }
+
+        // CSD 调试诊断: 推进"改全局后回读设备状态"的排程与窗口(日志写入见 app_state)。
+        ctrl.csd_diag_tick();
+
+        // 恢复默认设备端回填就绪: 全量重读(配置/当前通道+CH0 参数/全局/Cp) 刷新显示。
+        if ctrl.take_post_reset_refetch() {
+            let ch = ui.get_sel_channel().clamp(0, 35) as u8;
+            // Cp 不在此刷新: 电容获取一律由用户手动"测量电容"触发(自动测量会与重初始化抢链路)。
+            ctrl.push_log("恢复默认完成: 重读设备配置 / 全 36 通道参数 / 全局 刷新显示");
+            let _ = ctrl.request_config_all();
+            let _ = ctrl.request_params(ch);
+            let _ = ctrl.request_params(0);
+            // ★必须覆盖全 36 通道★: 只重读"当前通道 + CH0"会让其余 34 通道停在恢复默认前的
+            // 过期值(或空), 界面表现为"只留了一个通道的数据"。队列每 tick 发一条, 不加快轮询。
+            ctrl.schedule_param_refetch_all();
+            let _ = ctrl.global_get_all();
+            // 重取 DEVICE_INFO: 其报告尾部 csd_flags 携带"恢复默认是否获得可信基线", 驱动异常采样警示行。
+            let _ = ctrl.resend_hello();
+            // 时钟树的分频范围需要全 36 通道 snsClk(恢复默认后已全变): 一条批量取回, 非 36 条单发。
+            let _ = ctrl.request_param_all_channels(PARAM_SNS_CLK_DIV);
+        }
         ctrl.poll();
         // 侦听绑定: 捕获下一次触摸的物理通道并写入草稿(仅在侦听态时有动作)。
         let _ = ctrl.listen_tick();
@@ -727,23 +1684,149 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
         }
 
         ui.set_conn_status(ctrl.status_line().into());
+        // 主页默认看摘要(人可读), 原始 debug 诊断在折叠区里备查。
+        ui.set_device_summary_text(ctrl.device_summary_text().into());
         ui.set_device_info_text(ctrl.device_info_text().into());
+        // 主页工作模式(只读展示): 草稿优先与配置页同口径, 未回读到即"未知"。
+        ui.set_work_mode_text(work_mode_text(&ctrl).into());
+        // 关于页设备版本: 复用主页那份 DEVICE_INFO, 不新增协议请求。
+        ui.set_about_device_versions(
+            ctrl.device_version_lines()
+                .unwrap_or_else(|| "未连接 — 连接设备后显示主控 / PSoC 固件与协议版本".to_string())
+                .into(),
+        );
 
         // 阻塞类操作(校准/基线/重启/频率自适应)状态 → 驱动各页按钮锁定 + 运行中标识。
         ui.set_op_busy(ctrl.op_busy());
         ui.set_op_label(ctrl.op_label().into());
-        // 频率自适应结果文案(成功: 统一分频; 失败: 超硬件能力)。
-        let auto_tune_status = match ctrl.auto_tune_result() {
-            1 => format!("✔ 自适应成功: 全通道统一 snsClk 分频 = {}", ctrl.auto_tune_div()),
-            2 => "✖ 自适应失败: 已到硬件频率下限仍压不到目标%, 请降低校准目标% 或调整 IDAC".to_string(),
-            _ => String::new(),
+        // 频率自适应结果文案。全局页只显示全通道那次的结果; 单通道页显示所选通道自己的结果。
+        let auto_tune_status = if ctrl.auto_tune_ch() == 0xFF {
+            // ★逐通道模式★: 终态 div 字段是"成功通道数", 不是某个统一分频。
+            match ctrl.auto_tune_result() {
+                1 => {
+                    let ok = ctrl.auto_tune_div().min(36);
+                    let (lo, hi) = ctrl.sns_clk_div_range();
+                    if ok >= 36 {
+                        format!("✔ 逐通道自适应成功: 36/36 个通道各自落档, 分频范围 ÷{} – ÷{}", lo, hi)
+                    } else {
+                        format!("▲ 逐通道自适应完成: {}/36 成功, {} 个通道超出硬件能力(保持原分频); 分频范围 ÷{} – ÷{}",
+                                ok, 36 - ok, lo, hi)
+                    }
+                }
+                2 => "✖ 逐通道自适应失败: 无任何通道能压到目标%, 请降低校准目标% 或调整 IDAC".to_string(),
+                _ => String::new(),
+            }
+        } else {
+            String::new()
         };
         ui.set_auto_tune_status(auto_tune_status.into());
+        let sel_ch = ui.get_sel_channel().clamp(0, 35) as u8;
+        let curve_auto_tune_status = match ctrl.auto_tune_ch_result(sel_ch) {
+            1 => format!("✔ CH{} 自适应成功: snsClk 分频 = {}", sel_ch, ctrl.auto_tune_ch_div(sel_ch)),
+            2 => format!("✖ CH{} 自适应失败: 已到硬件频率下限仍压不到目标%, 请降低校准目标% 或调整 IDAC", sel_ch),
+            _ => String::new(),
+        };
+        ui.set_curve_auto_tune_status(curve_auto_tune_status.into());
 
-        // 连接/收发/错误 事件日志回填 UI 日志面板(仅在有新日志时刷新)。
-        if ctrl.log_seq() != last_log_seq {
-            last_log_seq = ctrl.log_seq();
-            ui.set_log_text(ctrl.log_text().into());
+        // 界面偏好对账落盘(值未变则不写盘)。放在 tick 里而不是给每个开关挂回调:
+        // Slint 侧有些开关(自动滚动、页签、通道)是直接改 in-out 属性的, 本来就没有回调可挂。
+        persist_ui_settings(&ui, &mut ui_cfg_tick.borrow_mut());
+
+        // 日志页: 版本号门控重建行模型。只取尾部 VIEW_MAX 条, 长日志下 UI 模型不随之膨胀
+        // (全量仍在 logs/ 文件里)。行号用全局序号, 过滤切换后仍能与文件对上。
+        {
+            let hub = mai2control_ui::logging::hub();
+            let ver = hub.version();
+            if ver != last_log_ver || log_dirty.get() {
+                last_log_ver = ver;
+                log_dirty.set(false);
+                let entries = hub.snapshot(ctrl.log_filter(), mai2control_ui::logging::VIEW_MAX);
+                let shown = entries.len();
+                // 日志正文与算法编辑器同款 gutter 分离：正文可无干扰拖选，行号保持固定左列。
+                let mut text = String::with_capacity(shown * 96);
+                for e in &entries {
+                    text.push_str(&e.text.replace('\n', " | "));
+                    text.push('\n');
+                }
+                ui.set_log_line_numbers(
+                    if shown == 0 { String::new() } else { line_numbers_for(&text) }.into(),
+                );
+                ui.set_log_text(text.into());
+                let dropped = hub.dropped();
+                ui.set_log_stats(
+                    format!(
+                        "视图 {} 行(上限 {}) · 内存保留 {} 条{}",
+                        shown,
+                        mai2control_ui::logging::VIEW_MAX,
+                        mai2control_ui::logging::RING_MAX,
+                        if dropped > 0 {
+                            format!(" · 已滚出内存 {} 条(仍在日志文件中)", dropped)
+                        } else {
+                            String::new()
+                        }
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // 后台编译产物回收: try_recv 不阻塞, 拿到结果才写状态(Rc<RefCell<AppController>> 只在本线程碰)。
+        // 成功且要求上传时当帧续走 upload_compiled(其内部走 mpsc, 不阻塞 UI)。
+        {
+            let finished = match algo_job_timer.borrow().as_ref() {
+                Some(job) => match job.rx.try_recv() {
+                    Ok(result) => Some(result),
+                    Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                    // 线程 panic 才会断连: 当作一次失败结束, 否则 busy 会永久卡住。
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        Some(Err(anyhow::anyhow!("编译线程异常退出")))
+                    }
+                },
+                None => None,
+            };
+            if let Some(result) = finished {
+                let job = algo_job_timer.borrow_mut().take();
+                let cap = AppController::algo_slot_capacity();
+                match (result, job) {
+                    (Ok(out), Some(job)) => {
+                        let len = ctrl.apply_compiled(&job.src, out);
+                        ui.set_algo_asm_bytes(len as i32);
+                        let pct = (len * 100) / cap;
+                        if job.upload_after {
+                            ui.set_algo_phase("上传中…".into());
+                            match ctrl.upload_compiled() {
+                                Ok(()) => ui.set_algo_status(format!(
+                                    "编译成功: ASM {} / {} 字节 ({}%); {}",
+                                    len, cap, pct, ctrl.algo_upload_status()).into()),
+                                Err(error) => {
+                                    ctrl.push_log_warn(format!("算法: 编译成功但上传失败: {}", error));
+                                    ui.set_algo_status(format!("编译成功但上传失败: {}", error).into());
+                                }
+                            }
+                        } else {
+                            ui.set_algo_status(format!(
+                                "编译成功: ASM {} / {} 字节 ({}%), 可上传", len, cap, pct).into());
+                        }
+                    }
+                    (Err(error), job) => {
+                        ui.set_algo_asm_bytes(0);
+                        ctrl.push_log_error(format!("算法: 编译失败: {}", error));
+                        let tail = if job.map(|j| j.upload_after).unwrap_or(false) { "(未上传)" } else { "" };
+                        ui.set_algo_status(format!("编译失败{}: {}", tail, error).into());
+                    }
+                    // 结果与任务槽必然同生同灭, 该分支不可达; 兜底解锁避免 busy 悬挂。
+                    (Ok(_), None) => {}
+                }
+                ui.set_algo_busy(false);
+                ui.set_algo_phase("".into());
+                algo_busy_timer.set(false);
+            }
+        }
+
+        // 上传状态只在对应 seq 的 ACK/NAK 或无回执超时时变化，避免"已发送"被误显示为成功。
+        if ctrl.algo_upload_version() != last_algo_upload_version {
+            last_algo_upload_version = ctrl.algo_upload_version();
+            ui.set_algo_status(ctrl.algo_upload_status().into());
         }
 
         // 算法信息回填(version 门控): 只更新信息文本; 编辑器由下方"设备映射表源"块统一载入。
@@ -765,16 +1848,29 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
         if ctrl.algo_device_src_version() != last_algo_src_version {
             last_algo_src_version = ctrl.algo_device_src_version();
             let dev_src = ctrl.algo_device_src().to_string();
+            // ★不覆盖用户正在编辑的文本★: 编辑器只在"空"或"内容仍是上次自动载入的那份"时才自动填。
+            // schema/面板已与编辑器解耦(走 algo_schema_source), 所以这里不填也不影响算法面板。
+            let editor_now = ui.get_algo_c_source().to_string();
+            let editor_untouched = editor_now.trim().is_empty() || editor_now == editor_autoload_mark;
             if !dev_src.trim().is_empty() {
-                ui.set_algo_c_source(dev_src.clone().into());
-                ui.set_algo_line_numbers(line_numbers_for(&dev_src).into());
-                ui.set_algo_status("已从设备映射表载入当前算法 C 源(可直接修改后重新编译上传)".into());
+                if editor_untouched {
+                    ui.set_algo_c_source(dev_src.clone().into());
+                    ui.set_algo_line_numbers(line_numbers_for(&dev_src).into());
+                    editor_autoload_mark = dev_src.clone();
+                    ui.set_algo_status("已从设备映射表载入当前算法 C 源(可直接修改后重新编译上传)".into());
+                } else {
+                    ui.set_algo_status(
+                        "已回读设备算法 C 源(算法面板按设备口径刷新); 编辑器保留你的改动未被覆盖".into());
+                }
             } else if ctrl.algo_info().map(|i| i.is_default).unwrap_or(false) {
                 // 默认算法设备侧无源 → 用内嵌默认源(★去注释★, 与"上传即保存去注释"语义一致)载入编辑器,
                 // 而非展示带注释的原始模板。同时把去注释源回灌设备映射表一次, 使之后"读取信息"真正从设备取回。
                 let default_src = AppController::strip_c_comments(ALGO_V31_TEMPLATE);
-                ui.set_algo_c_source(default_src.clone().into());
-                ui.set_algo_line_numbers(line_numbers_for(&default_src).into());
+                if editor_untouched {
+                    ui.set_algo_c_source(default_src.clone().into());
+                    ui.set_algo_line_numbers(line_numbers_for(&default_src).into());
+                    editor_autoload_mark = default_src.clone();
+                }
                 if !default_src_synced {
                     let _ = ctrl.send_algo_src(&default_src);
                     default_src_synced = true;
@@ -802,39 +1898,18 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
                 ).into());
             }
         }
-        // 算法追踪(report[]折线 + 触发判定追踪)回填(version 门控)。
+        // 算法追踪回填(version 门控)。★只管算法页自己的等间距窄带★: 单通道精调页的上报折线已
+        // 并入主图并与主曲线共享真实时间轴, 必须和主曲线在同一处、用同一时间窗口生成 → 打脏标记
+        // 交给下方"主图回填"统一处理, 避免两处各算一套窗口而错位。
         if ctrl.algo_trace_version() != last_algo_trace_version {
             last_algo_trace_version = ctrl.algo_trace_version();
-            let decls = ctrl.algo_report_decls();
             let active_series = ctrl.algo_trace_active_series();
-            let point_count = active_series.len() as i32;
-            let active_path = series_to_svg_path(&active_series, -0.2, 1.2, 1.0);
-            ui.set_algo_active_path(active_path.clone().into());
-            ui.set_algo_trace_point_count(point_count);
-            ui.set_active_path(active_path.into());
-            ui.set_active_point_count(point_count);
+            // 算法页 90px 窄带用方形 viewbox(x_scale=1.0)。
+            let algo_active_path = series_to_svg_path(&active_series, -0.2, 1.2, 1.0);
+            ui.set_algo_active_path(algo_active_path.into());
+            ui.set_algo_trace_point_count(active_series.len() as i32);
             ui.set_algo_sel_channel(ui.get_sel_channel());
-
-            let colors: [slint::Color; 4] = [
-                slint::Color::from_rgb_u8(0x33, 0xcc, 0x33),
-                slint::Color::from_rgb_u8(0x33, 0x99, 0xff),
-                slint::Color::from_rgb_u8(0xff, 0xaa, 0x00),
-                slint::Color::from_rgb_u8(0xff, 0x66, 0xcc),
-            ];
-            let mut lines = Vec::with_capacity(4);
-            for idx in 0u8..4u8 {
-                let decl = decls.iter().find(|d| d.idx == idx);
-                let series = ctrl.algo_trace_report_series(idx);
-                let path = if decl.is_some() { build_report_path(&series) } else { String::new() };
-                lines.push(AlgoReportLine {
-                    idx: idx as i32,
-                    name: decl.map(|d| d.name.clone()).unwrap_or_default().into(),
-                    path: path.into(),
-                    visible: decl.is_some() && !series.is_empty(),
-                    line_color: colors[idx as usize],
-                });
-            }
-            ui.set_algo_report_lines(slint::ModelRc::new(slint::VecModel::from(lines)));
+            algo_overlay_dirty = true;
         }
 
         // 算法可调变量(cfg[8])行回填(version 门控): schema 来自当前编辑器源码, 值来自设备缓存。
@@ -866,29 +1941,35 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
             if let Some(v) = ctrl.global(6) { ui.set_g_mfs_div_f2(v as i32); }
         }
 
+        // 校准频率偏好回填(草稿优先, 故滑条拖动后立即反映草稿值; 缺省 4)。
+        ui.set_calib_pref(match ctrl.config_get("calib.pref").map(|e| e.value) {
+            Some(CfgValue::U8(v)) => (v as i32).clamp(1, 7),
+            _ => 4,
+        });
+
         // 连接成功边沿主动拉取当前通道参数与 Cp，并开启全通道遥测；
         // 断线边沿清空 CpPollState，避免重连后展示旧设备/旧会话 Cp。
         let connected = ctrl.state() == ConnState::Connected;
+        // DEVICE_INFO 诊断携带的 mode 是唯一真值；未知时 UI 显示“读取中”，不再以默认 AUTO 冒充设备状态。
+        ui.set_mode_known(ctrl.csd_mode().is_some());
+        if let Some(mode) = ctrl.mode_draft().or(ctrl.csd_mode()) {
+            ui.set_scan_mode((mode != 0) as i32);
+        }
         if connected && !was_connected {
             let ch = ui.get_sel_channel().clamp(0, 35) as u8;
-            ctrl.push_log("已连接 → 自动请求配置、当前通道参数/Cp、CH0 全局采样参数 + 开启全通道遥测");
+            ctrl.push_log("已连接 → 自动请求配置、当前通道参数、CH0 全局采样参数 + 开启全通道遥测");
             {
+                // Cp 一律不自动获取: 连接边沿只清状态并显示"未测量", 等用户点"测量电容"。
                 let mut cp_state = cp_poll_timer.borrow_mut();
-                cp_state.started_at = None;
-                cp_state.next_request_at = None;
-                cp_state.measurement_start_channel_version = 0;
-                cp_state.requested_channel_version = 0;
-                cp_state.visible_channel = ch as i32;
-                cp_state.visible_after_version = ctrl.cp_channel_version(ch);
-                cp_state.waiting_for_response = false;
-                cp_state.status = "读取中…".to_string();
+                cp_state._stop("未测量".to_string());
                 ui.set_cp_text(cp_state.status.clone().into());
             }
             let _ = ctrl.request_config_all();
             let _ = ctrl.request_params(ch);
             // 全局页代表值固定取 CH0；即使精调当前停在其他通道也必须拉取。
             let _ = ctrl.request_params(0);
-            let _ = ctrl.request_cp(ch);
+            // 其余 34 个通道同样需要真值, 否则全通道页/批量应用读到的是空缓存。
+            ctrl.schedule_param_refetch_all();
             let _ = ctrl.algo_get_info();
             let _ = ctrl.algo_get_rom();
             let _ = ctrl.request_algo_src();
@@ -897,12 +1978,12 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
                 let _ = ctrl.request_algo_cfg(idx);
             }
             let _ = ctrl.global_get_all();
-            // 连接后自动测量一次全电极 Cp: 否则设备端 Cp 缓存为 0xFFFFFF, 全通道页会一直显示
-            // "测量失败"(实为从未测量)。测量为 BIST 逐电极, 完成后各页读同一 Cp 缓存显示真实电容。
-            let _ = ctrl.measure_cp();
             let _ = ctrl.kbd_request_map();
             let _ = ctrl.kbd_request_touchmap();
+            let _ = ctrl.kbd_request_hold();
             let _ = ctrl.kbd_request_state();
+            let _ = ctrl.mai2_request_state();
+            let _ = ctrl.led_request_state();
             // 遥测降到 30Hz: 100Hz 全 36 通道(~25KB/s)会把 vendor IN 打到 stall(进精调掉线根因)。
             // 30Hz 视觉仍流畅, 大幅降低 vendor IN 负载。
             let _ = ctrl.start_telemetry(
@@ -912,22 +1993,32 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
             );
         } else if !connected && was_connected {
             let mut cp_state = cp_poll_timer.borrow_mut();
-            cp_state.started_at = None;
-            cp_state.next_request_at = None;
-            cp_state.measurement_start_channel_version = 0;
-            cp_state.requested_channel_version = 0;
-            cp_state.visible_channel = -1;
-            cp_state.visible_after_version = 0;
-            cp_state.waiting_for_response = false;
-            cp_state.status = "未连接".to_string();
+            cp_state._stop("未连接".to_string());
             ui.set_cp_text(cp_state.status.clone().into());
         }
-        // 仅在真正进入已连接的“触控全局调整”页时拉取一次 CH0，避免 16ms tick 洪泛。
-        let global_tune_visible = connected && ui.get_current_view() == 1 && ui.get_settings_tab() == 2;
+        // 仅在真正进入已连接的“触控全局调整”页(索引 3)时拉取一次 CH0，避免 16ms tick 洪泛。
+        let global_tune_visible = connected && ui.get_current_view() == 1 && ui.get_settings_tab() == 3;
         if global_tune_visible && !last_global_tune_visible && was_connected {
             let _ = ctrl.request_params(0);
+            // 时钟树的 snsClk 范围需要全 36 通道的值: 走 PARAM_GET_ALL 的全通道单参数变体, 一帧取回。
+            let _ = ctrl.request_param_all_channels(PARAM_SNS_CLK_DIV);
         }
         last_global_tune_visible = global_tune_visible;
+
+        // 协议页(settings_tab == 1)驻留期的灯效采样刷新。
+        // ★不得每 16ms 发★: 本设备所有流量共用一对 bulk 端点, 64B vendor FIFO 被高频轮询打爆会掉线
+        // (遥测已因此降到 30Hz)。这里取每 12 tick ≈ 192ms(约 5Hz): 色块跟手够用, 负载可忽略。
+        // 面板折叠时不轮询 —— 折叠态看不到色块, 没有理由占用链路。
+        let protocol_visible = connected && ui.get_current_view() == 1 && ui.get_settings_tab() == 1;
+        if protocol_visible {
+            // 进页边沿总取一次(折叠态的摘要行也要有真值); 持续轮询只在展开时做。
+            if !last_protocol_visible
+                || (ui.get_light_panel_expanded() && reconnect_tick % 12 == 0)
+            {
+                let _ = ctrl.led_request_state();
+            }
+        }
+        last_protocol_visible = protocol_visible;
 
         if connected && reconnect_tick % 63 == 0 {
             let _ = ctrl.ping();
@@ -937,27 +2028,25 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
             let _ = ctrl.kbd_request_state();
         }
 
-        // 全通道 Cp 轮询: 每 ~80ms(每 5 tick)请求一个通道, 轮流覆盖 0..35。
-        // 使"触控通道调整"全通道卡片与"分区绑定"页的 Cp 不再永远停在"读取中"——
-        // 只请求当前可见通道会让其余 35 个通道的 Cp 缓存永远为空。
-        // 单通道手动测量进行中时暂停轮询, 避免与当前通道的版本门控互相干扰。
-        if connected && reconnect_tick % 5 == 0 && cp_poll_timer.borrow().started_at.is_none() {
-            let _ = ctrl.request_cp(cp_rr_channel);
-            cp_rr_channel = (cp_rr_channel + 1) % 36;
-        }
+        // ★已删除周期性 Cp 轮询★: 原"每 5 tick 轮询一个通道"与用户是否测量无关, 实测把 vendor 端点
+        // 打满并与校准/自适应抢链路(NAK 每秒 8~12 条 → endpoint stall → 掉线)。
+        // Cp 现在只由手动"测量电容"触发一轮抓取(见下方 CpSweep 推进块)。
 
         // 算法运行时追踪(report[]/out_active): 选中通道~30Hz(每 tick, 16ms)轮询已声明的
         // report idx(轮转覆盖多个 idx); 未声明任何 ALGO_REPORT 时不轮询(省事务)。
         if connected {
-            let src = ctrl.algo_source();
-            if src != last_algo_source_for_schema {
-                last_algo_source_for_schema = src.clone();
+            if ctrl.algo_schema_version() != last_algo_schema_version {
+                last_algo_schema_version = ctrl.algo_schema_version();
                 algo_report_idxs = ctrl.algo_report_decls().into_iter().map(|d| d.idx).collect();
                 algo_report_idxs.sort_unstable();
                 algo_report_idxs.dedup();
                 algo_trace_rr = 0;
             }
-            if !algo_report_idxs.is_empty() {
+            // 仅在单通道精调页(算法折线叠加所在)且声明了 report 时轮询,
+            // 否则(主页/其它页/无算法声明)不发, 从根源杜绝 algo_get_trace NAK 刷屏。
+            // 设备端无算法时的 NAK 退避由 app_state 内部处理(见 request_algo_trace)。
+            let algo_trace_page = ui.get_current_view() == 1 && ui.get_settings_tab() == 4;
+            if algo_trace_page && !algo_report_idxs.is_empty() {
                 let ch = ui.get_sel_channel().clamp(0, 35) as u8;
                 let idx = algo_report_idxs[algo_trace_rr % algo_report_idxs.len()];
                 let _ = ctrl.request_algo_trace(ch, idx);
@@ -992,7 +2081,16 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
             last_config_version = current_config_version;
             let entries = ctrl.config_entries();
             let rows = build_config_rows(&entries);
+            // 未归类行数: Slint 没有数组过滤/计数, 空组不渲染要靠这里给出行数。
+            ui.set_config_other_count(rows.iter().filter(|r| r.group == "其他").count() as i32);
             ui.set_config_rows(slint::ModelRc::new(slint::VecModel::from(rows)));
+            let settings_counts = mai2control_ui::settings_io::group_counts(&ctrl);
+            ui.set_settings_io_config_count(settings_counts.config);
+            ui.set_settings_io_channel_params_count(settings_counts.channel_params);
+            ui.set_settings_io_globals_count(settings_counts.globals);
+            ui.set_settings_io_algo_count(settings_counts.algo);
+            ui.set_settings_io_keyboard_count(settings_counts.keyboard);
+            ui.set_settings_io_zones_count(settings_counts.zones);
 
             if let Some(entry) = ctrl.config_get("comm.keyboard_map_en") {
                 if let CfgValue::Bool(v) = entry.value {
@@ -1001,14 +2099,22 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
             }
         }
 
+        // 34 分区固定: 原地比较后只写变化行，保留列表内通道输入、侦听与移除按钮的焦点状态。
         let zones = build_zone_cells(&ctrl);
-        ui.set_zones(slint::ModelRc::new(slint::VecModel::from(zones)));
+        for (row, zone) in zones.into_iter().enumerate() {
+            if zones_model.row_data(row).as_ref() != Some(&zone) {
+                zones_model.set_row_data(row, zone);
+            }
+        }
 
         let bind_status = match ctrl.bind_progress() {
-            Some((zone, status)) => format!("进行中: 区{} 状态={}", zone, status),
+            Some((zone, _status)) if ctrl.interactive_bind_active() =>
+                format!("交互式绑定: 请触摸 区{} ({}/34)", zone_label(zone as usize), zone + 1),
+            Some((zone, status)) => format!("侦听: 区{} 状态={}", zone_label(zone as usize), status),
             None => "就绪".to_string(),
         };
         ui.set_bind_status(bind_status.into());
+        ui.set_interactive_active(ctrl.interactive_bind_active());
 
         let current_channel = ui.get_sel_channel();
         let current_telem_version = ctrl.telem_version();
@@ -1017,93 +2123,82 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
         let curve_visibility = (ui.get_show_raw(), ui.get_show_bsln(), ui.get_show_diff());
         let curve_visibility_changed = curve_visibility != last_curve_visibility;
 
-        // 通道切换立即刷新参数和 Cp；每通道版本门控确保不会展示前一通道/旧请求的缓存。
-        {
-            let now = Instant::now();
-            let ch = current_channel.clamp(0, 35) as u8;
-            let mut cp_state = cp_poll_timer.borrow_mut();
-
-            if channel_changed {
-                cp_state.visible_channel = current_channel;
-                cp_state.visible_after_version = ctrl.cp_channel_version(ch);
-                cp_state.status = if connected { "读取中…" } else { "未连接" }.to_string();
-                if cp_state.started_at.is_some() {
-                    cp_state.measurement_start_channel_version = cp_state.visible_after_version;
-                    cp_state.waiting_for_response = false;
-                }
-                if connected {
-                    let _ = ctrl.request_params(ch);
-                    if let Err(error) = ctrl.request_cp(ch) {
-                        cp_state.status = format!("读取失败: {}", error);
-                    }
-                }
-            }
-
-            let was_measuring = cp_state.started_at.is_some();
-            if let Some(started_at) = cp_state.started_at {
-                if now.duration_since(started_at) >= Duration::from_secs(10) {
-                    cp_state.started_at = None;
-                    cp_state.next_request_at = None;
-                    cp_state.waiting_for_response = false;
-                    cp_state.visible_after_version = ctrl.cp_channel_version(ch);
-                    cp_state.status = "测量失败/超时".to_string();
-                } else if cp_state.next_request_at.is_some_and(|deadline| now >= deadline) {
-                    cp_state.requested_channel_version = ctrl.cp_channel_version(ch);
-                    match ctrl.request_cp(ch) {
-                        Ok(()) => {
-                            cp_state.waiting_for_response = true;
-                            cp_state.next_request_at = Some(now + Duration::from_millis(500));
-                        }
-                        Err(error) => {
-                            cp_state.started_at = None;
-                            cp_state.next_request_at = None;
-                            cp_state.waiting_for_response = false;
-                            cp_state.status = format!("测量失败: {}", error);
-                        }
-                    }
-                }
-
-                let response_version = ctrl.cp_channel_version(ch);
-                if cp_state.waiting_for_response
-                    && response_version > cp_state.requested_channel_version
-                    && response_version > cp_state.measurement_start_channel_version
-                {
-                    match ctrl.cp(ch) {
-                        Some(CP_MEASURE_FAILED) => {
-                            cp_state.started_at = None;
-                            cp_state.next_request_at = None;
-                            cp_state.waiting_for_response = false;
-                            cp_state.visible_after_version = response_version;
-                            cp_state.status = "测量失败".to_string();
-                        }
-                        Some(value) if value != 0 => {
-                            cp_state.started_at = None;
-                            cp_state.next_request_at = None;
-                            cp_state.waiting_for_response = false;
-                            cp_state.visible_after_version = response_version;
-                            cp_state.status = format!("{}（测量成功）", cp_display_text(Some(value)));
-                        }
-                        _ => {
-                            cp_state.status = "测量中…".to_string();
-                        }
-                    }
-                }
-            }
-
-            if !was_measuring
-                && cp_state.visible_channel == current_channel
-                && ctrl.cp_channel_version(ch) > cp_state.visible_after_version
-            {
-                cp_state.visible_after_version = ctrl.cp_channel_version(ch);
-                cp_state.status = cp_display_text(ctrl.cp(ch));
-            }
-            ui.set_cp_text(cp_state.status.clone().into());
+        // 通道切换立即刷新该通道参数(单条 PARAM_GET_ALL); Cp 不随通道切换请求。
+        if channel_changed && connected {
+            let _ = ctrl.request_params(current_channel.clamp(0, 35) as u8);
         }
 
-        if current_telem_version != last_telem_version || channel_changed || curve_visibility_changed {
+        // 手动电容测量的一轮抓取推进: 每 tick 最多一条 CP_GET, 顺序走 0..35。
+        // 单通道 CP_SWEEP_MAX_TRIES 次仍无结果即跳过(不无限重试), 整轮 CP_SWEEP_TIMEOUT 到点即停。
+        {
+            let mut cp_state = cp_poll_timer.borrow_mut();
+            if let Some(started_at) = cp_state.started_at {
+                let now = Instant::now();
+                if !connected {
+                    cp_state._stop("未连接".to_string());
+                } else if now.duration_since(started_at) >= CP_SWEEP_TIMEOUT {
+                    let done = cp_state.ch;
+                    cp_state._stop(format!("电容测量超时: 仅完成 {}/36 通道, 正在重启 PSoC 恢复扫描…", done));
+                    // 半途超时同样要恢复: BIST 已经改过 CSD 硬件, 不重启会留下 raw 满量程/采样率崩塌的坏状态。
+                    let _ = ctrl.reboot_psoc();
+                } else {
+                    // 本通道是否已"落定": 响应到达(版本推进)且不是"测量中(0)"。
+                    let ch = cp_state.ch;
+                    let responded = cp_state.tries > 0 && ctrl.cp_channel_version(ch) > cp_state.req_version;
+                    if responded && ctrl.cp(ch) != Some(0) {
+                        cp_state._advance();
+                    }
+                    let due = cp_state.next_at.map_or(true, |deadline| now >= deadline);
+                    if cp_state.ch >= 36 {
+                        let ok = (0..36u8)
+                            .filter(|&c| matches!(ctrl.cp(c), Some(v) if v != 0 && v != CP_MEASURE_FAILED))
+                            .count();
+                        cp_state._stop(format!("电容测量完成: {}/36 通道有效, 正在重启 PSoC 恢复扫描…", ok));
+                        // ★BIST 后必须重启 PSoC★: Cp 测量(BIST)会重配 CSD 硬件, 其自带的恢复路径
+                        // (Cy_CapSense_Enable/Initialize)实测不可靠——测完全通道 raw 卡 4095、采样率掉到 1-7Hz,
+                        // 只有 XRES 重启能复原(重启后立即回到 ~171Hz)。故测量收尾自动重启, 免得用户点一次就把
+                        // 扫描搞废还以为是"扫描引擎卡死"。
+                        let _ = ctrl.reboot_psoc();
+                        ctrl.push_log("测量电容: BIST 会重配 CSD 硬件, 已自动重启 PSoC 恢复扫描(约 1s)");
+                    } else if due && cp_state.tries >= CP_SWEEP_MAX_TRIES {
+                        cp_state._advance();   // 该通道取不到 → 跳过, 绝不无限重试
+                    } else if due {
+                        let ch = cp_state.ch;
+                        cp_state.req_version = ctrl.cp_channel_version(ch);
+                        match ctrl.request_cp(ch) {
+                            Ok(()) => {
+                                cp_state.tries += 1;
+                                cp_state.next_at = Some(now + CP_SWEEP_RETRY);
+                                cp_state.status = format!("测量中… (CH{}/36)", ch + 1);
+                            }
+                            Err(error) => cp_state._stop(format!("测量失败: {}", error)),
+                        }
+                    }
+                }
+            }
+            // 空闲时文案 = 当前通道 Cp 缓存(未测量则显示"未测量")。
+            let text = if cp_state.started_at.is_some() {
+                cp_state.status.clone()
+            } else if !connected {
+                "未连接".to_string()
+            } else {
+                cp_display_text(ctrl.cp(current_channel.clamp(0, 35) as u8))
+            };
+            ui.set_cp_text(text.into());
+        }
+
+        // 主图回填: 主曲线(左轴) + 算法叠加线(右轴)共享同一时间窗口, 必须在同一处生成。
+        // 门控里【不再】有绘图区尺寸: PlotPath 用 fit: fill 拉满, 拖分栏/改窗口只是元素几何变化,
+        // path 不必重算 —— 纯 UI 交互不该把 36 通道的采样重新投影一遍。
+        if current_telem_version != last_telem_version
+            || channel_changed
+            || curve_visibility_changed
+            || algo_overlay_dirty
+        {
             last_telem_version = current_telem_version;
             last_channel = current_channel;
             last_curve_visibility = curve_visibility;
+            algo_overlay_dirty = false;
             let curves = build_curve_paths(
                 &ctrl,
                 current_channel as u8,
@@ -1111,6 +2206,63 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
                 curve_visibility.1,
                 curve_visibility.2,
             );
+            // 横轴真实时间: 跨度(ms)给 UI 换算刻度/十字线读数, 绝对时刻只做一行文本展示
+            // (f32 存不住小时级的 ms 绝对值, 故 UI 侧一律用"相对最新样本"的偏移)。
+            ui.set_curve_t_span_ms(curves.t_span_ms());
+            ui.set_curve_t_end_text(dev_time_text(curves.t_last_us).into());
+
+            // 算法叠加线: 与主曲线同一时间窗口 + 独立右轴量程。
+            let overlay_on = ui.get_show_algo_overlay();
+            let show_active = ui.get_show_active();
+            let decls = ctrl.algo_report_decls();
+            let amps = *report_norm_timer.borrow();
+            let mut wanted = [false; 4];
+            for (idx, slot) in wanted.iter_mut().enumerate() {
+                *slot = overlay_on
+                    && decls.iter().any(|d| d.idx == idx as u8)
+                    && report_show_timer.borrow()[idx];
+            }
+            let overlay = build_algo_overlay(
+                &ctrl,
+                &wanted,
+                show_active,
+                &amps,
+                curves.t_first_us,
+                curves.t_last_us,
+                algo_report_idxs.len(),
+            );
+            ui.set_curve_r_min(overlay.r_min);
+            ui.set_curve_r_max(overlay.r_max);
+            ui.set_active_point_count(overlay.active_count);
+            ui.set_active_path(overlay.active_path.into());
+            ui.set_active_norm_amp(amps[4]);
+            let colors: [slint::Color; 4] = [
+                slint::Color::from_rgb_u8(0x33, 0xcc, 0x33),
+                slint::Color::from_rgb_u8(0x33, 0x99, 0xff),
+                slint::Color::from_rgb_u8(0xff, 0xaa, 0x00),
+                slint::Color::from_rgb_u8(0xff, 0x66, 0xcc),
+            ];
+            for idx in 0usize..4 {
+                let decl = decls.iter().find(|d| d.idx == idx as u8);
+                let line = AlgoReportLine {
+                    idx: idx as i32,
+                    name: decl.map(|d| d.name.clone()).unwrap_or_default().into(),
+                    path: overlay.report_paths[idx].clone().into(),
+                    // 声明 + 有数据 + 用户未取消勾选 → 才画在主图上。
+                    visible: wanted[idx] && overlay.report_has_data[idx],
+                    is_binary: overlay.report_binary[idx],
+                    norm_amp: amps[idx],
+                    line_color: colors[idx],
+                };
+                if algo_report_lines_model_timer.row_data(idx).as_ref() != Some(&line) {
+                    if idx < algo_report_lines_model_timer.row_count() {
+                        algo_report_lines_model_timer.set_row_data(idx, line);
+                    } else {
+                        algo_report_lines_model_timer.push(line);
+                    }
+                }
+            }
+
             let finger_th = ctrl.param(current_channel as u8, PARAM_FINGER_TH).unwrap_or(0) as f32;
             let noise_th = ctrl.param(current_channel as u8, PARAM_NOISE_TH).unwrap_or(0) as f32;
             let finger_th_y = curves.value_to_y(finger_th);
@@ -1148,11 +2300,48 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
             ui.set_curve_readout(readout.into());
         }
 
+        // 批量应用抽屉回填: 勾选态走自己的 version, 源通道参数值随 param_version/换通道刷新。
+        // 两者都并入既有 16ms tick 门控, 不新增定时器、不提高频率。
+        let current_batch_sel_version = ctrl.batch_sel_version();
+        if current_batch_sel_version != last_batch_sel_version
+            || current_param_version != last_param_version
+            || channel_changed
+        {
+            last_batch_sel_version = current_batch_sel_version;
+            ui.set_batch_ch_selected(slint::ModelRc::new(slint::VecModel::from(
+                ctrl.batch_ch_selected())));
+            ui.set_batch_param_selected(slint::ModelRc::new(slint::VecModel::from(
+                ctrl.batch_param_selected())));
+            let names: Vec<slint::SharedString> = (0x01u8..=0x0Bu8)
+                .map(|id| param_display_name(id).into())
+                .collect();
+            ui.set_batch_param_names(slint::ModelRc::new(slint::VecModel::from(names)));
+            // 源通道该参数无真值时显示"—", 明确区别于"值为 0"。
+            let values: Vec<slint::SharedString> = (0x01u8..=0x0Bu8)
+                .map(|id| match ctrl.param(current_channel as u8, id) {
+                    Some(v) => slint::SharedString::from(v.to_string()),
+                    None => slint::SharedString::from("—"),
+                })
+                .collect();
+            ui.set_batch_param_values(slint::ModelRc::new(slint::VecModel::from(values)));
+        }
+
         if current_param_version != last_param_version || channel_changed {
             last_param_version = current_param_version;
             let params = ctrl.params_of(current_channel as u8);
             let param_rows = build_param_rows(&params);
-            ui.set_curve_params(slint::ModelRc::new(slint::VecModel::from(param_rows)));
+            while curve_params_model.row_count() > param_rows.len() {
+                curve_params_model.remove(curve_params_model.row_count() - 1);
+            }
+            for (row, param) in param_rows.into_iter().enumerate() {
+                if row < curve_params_model.row_count() {
+                    if curve_params_model.row_data(row).as_ref() != Some(&param) {
+                        curve_params_model.set_row_data(row, param);
+                    }
+                } else {
+                    curve_params_model.push(param);
+                }
+            }
 
             if let Some(finger_th) = ctrl.param(current_channel as u8, PARAM_FINGER_TH) {
                 ui.set_finger_th_val(finger_th as i32);
@@ -1165,6 +2354,10 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
             if let Some(value) = ctrl.param(0, PARAM_SNS_CLK_DIV) {
                 ui.set_csd_sns_clk_div(value as i32);
             }
+            // ★时钟树 snsClk 改显示全 36 通道范围★: 逐通道自适应后各通道分频不同, CH0 单值不反映任何情况。
+            let (div_lo, div_hi) = ctrl.sns_clk_div_range();
+            ui.set_csd_sns_clk_div_min(div_lo as i32);
+            ui.set_csd_sns_clk_div_max(div_hi as i32);
             if let Some(value) = ctrl.param(0, PARAM_RESOLUTION) {
                 ui.set_csd_resolution(value as i32);
             }
@@ -1193,7 +2386,7 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
         if ctrl.lat_version() != last_lat_version {
             last_lat_version = ctrl.lat_version();
             let series = ctrl.lat_total_series();
-            let (path, lo, hi) = build_lat_path(&series, lat_aspect.get());
+            let (path, lo, hi) = build_lat_path(&series);
             ui.set_lat_path(path.into());
             ui.set_lat_y_max(hi);
             ui.set_lat_y_min(lo);
@@ -1229,6 +2422,95 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
                 (0..34u8).map(|z| kbd_display(ctrl.kbd_touch_keycode(z), ctrl.kbd_zone_mod(z)).into()).collect();
             ui.set_kbd_zone_display(slint::ModelRc::new(slint::VecModel::from(disp)));
         }
+        // 长按参数(version 门控): 只在设备侧真值更新时回填, 不覆盖正在编辑的 SpinBox。
+        if ctrl.kbd_hold_version() != last_kbd_hold_version {
+            last_kbd_hold_version = ctrl.kbd_hold_version();
+            let phys_delay: Vec<i32> = (0..12u8)
+                .map(|idx| ctrl.kbd_hold_phys(idx).0 as i32)
+                .collect();
+            let phys_max: Vec<i32> = (0..12u8)
+                .map(|idx| ctrl.kbd_hold_phys(idx).1 as i32)
+                .collect();
+            ui.set_kbd_phys_hold_delay(slint::ModelRc::new(slint::VecModel::from(phys_delay)));
+            ui.set_kbd_phys_hold_max(slint::ModelRc::new(slint::VecModel::from(phys_max)));
+            let zone_delay: Vec<i32> = (0..34u8)
+                .map(|zone| ctrl.kbd_hold_zone(zone).0 as i32)
+                .collect();
+            let zone_max: Vec<i32> = (0..34u8)
+                .map(|zone| ctrl.kbd_hold_zone(zone).1 as i32)
+                .collect();
+            ui.set_kbd_zone_hold_delay(slint::ModelRc::new(slint::VecModel::from(zone_delay)));
+            ui.set_kbd_zone_hold_max(slint::ModelRc::new(slint::VecModel::from(zone_max)));
+        }
+        // mai2serial 发送状态(version 门控): 未读取时显式未知，不能以 false/0 冒充设备真值。
+        if ctrl.mai2_version() != last_mai2_version {
+            last_mai2_version = ctrl.mai2_version();
+            let send_en = ctrl.mai2_send_en();
+            ui.set_mai2_send_en_known(send_en.is_some());
+            ui.set_mai2_send_en(send_en.unwrap_or(false));
+            let status = match ctrl.mai2_status() {
+                Some(0) => "停",
+                Some(1) => "就绪",
+                Some(2) => "运行",
+                _ => "未知",
+            };
+            ui.set_mai2_status(status.into());
+            let baud = ctrl
+                .mai2_baud()
+                .map(|value| format!("{} bps", value))
+                .unwrap_or_else(|| "未知".to_string());
+            ui.set_mai2_baud(baud.into());
+        }
+        // mai2light 灯效运行态(version 门控): 回读/草稿编辑/应用结果任一变化才重建 11 行。
+        if ctrl.led_version() != last_led_version {
+            last_led_version = ctrl.led_version();
+            ui.set_light_known(ctrl.led_known());
+            ui.set_light_status(match ctrl.led_status() {
+                Some(0) => "停",
+                Some(1) => "就绪",
+                Some(2) => "运行",
+                _ => "未知",
+            }.into());
+            // 两链就绪位与故障分档来自同一状态字高位: 未回读时一律 false/"", UI 显示"未知"而非绿灯。
+            ui.set_light_chain0_ready(ctrl.led_chain_ready(0).unwrap_or(false));
+            ui.set_light_chain1_ready(ctrl.led_chain_ready(1).unwrap_or(false));
+            ui.set_light_init_fault(match ctrl.led_init_fault() {
+                Some(1) => "PIO1 初始化失败",
+                Some(2) => "灯链0 建链失败(PIO 程序内存/状态机)",
+                Some(3) => "灯链1 建链失败(PIO 程序内存/状态机)",
+                _ => "",
+            }.into());
+            ui.set_light_resp_en(match ctrl.led_resp_enabled() {
+                Some(true) => "已使能",
+                Some(false) => "未使能",
+                None => "未知",
+            }.into());
+            let baud = if ctrl.led_baud_valid() {
+                format!("{} bps", ctrl.led_baud().unwrap_or_default())
+            } else {
+                "未知".to_string()
+            };
+            ui.set_light_baud(baud.into());
+            let rx_frames = if ctrl.led_rx_frames_valid() {
+                ctrl.led_rx_frames().to_string()
+            } else {
+                "未知".to_string()
+            };
+            ui.set_light_rx_frames(rx_frames.into());
+            let sum_errors = if ctrl.led_sum_errors_valid() {
+                ctrl.led_sum_errors().to_string()
+            } else {
+                "未知".to_string()
+            };
+            ui.set_light_sum_errors(sum_errors.into());
+            ui.set_light_units(slint::ModelRc::new(slint::VecModel::from(build_led_unit_rows(&ctrl))));
+            ui.set_light_conflict(ctrl.led_region_conflict().unwrap_or_default().into());
+            ui.set_light_apply_status(ctrl.led_apply_status().into());
+        }
+        // 灯链长度/亮度取配置 KV(草稿优先), 与 calib_pref 同口径每帧回填。
+        ui.set_light_ws_count0(cfg_u32_or(&ctrl, "led.ws_count0", 0).clamp(0, 1000) as i32);
+        ui.set_light_ws_count1(cfg_u32_or(&ctrl, "led.ws_count1", 0).clamp(0, 1000) as i32);
+        ui.set_light_brightness(cfg_u32_or(&ctrl, "led.ws_brightness", 0).clamp(0, 255) as i32);
 
         // 采样率/探测周期：每 tick 回填(与遥测帧到达节奏一致，STATS 字段随 TELEM_DATA 更新)。
         // 探测周期统一展示为两位小数 ms(设备实测值), 由 scan_period_us 换算。
@@ -1268,6 +2550,9 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
         // 传感器/PSoC 健康总结(异常原因)。
         ui.set_sensor_health(ctrl.sensor_health_summary().into());
         ui.set_sensor_health_level(ctrl.sensor_health_level());
+        // ★异常采样标识(全局调整页顶部状态行)★: railed 通道数 / 数据停滞 / 设备拒绝固化基线 + 动作指引。
+        ui.set_sampling_advice(ctrl.sampling_advice().into());
+        ui.set_sampling_advice_level(ctrl.sampling_advice_level());
 
         // 延迟数值始终回填(固件低成本采样,不受测量开关门控)。
         let spi = ctrl.telem_lat_spi_us() as i32;
@@ -1311,11 +2596,18 @@ fn expected_scan_period_us(ctrl: &AppController) -> i32 {
 fn build_config_rows(entries: &[ConfigEntry]) -> Vec<ConfigRow> {
     entries
         .iter()
-        // 通用配置页只展示 comm./mode./led. 等; bind.map* 有"分区绑定"页, kbd.* 有键盘页,
-        // 不在此重复展示(否则大量隐藏行 + 间距累积成大段空白)。
+        // ★渲染归属集中在这里★ 每个 KV 只允许出现在一个页面: 有专用编辑器的 key 一律在此滤掉,
+        // 其余按 parse_config_label 给出的 group 决定落在"通信系统"Tab 还是"协议"页的对应块。
+        // bind.map* → 分区绑定页; kbd.* → 键盘页; calib.* → 触控全局调整页的偏好滑条;
+        // led.map* → 协议页 11 单元映射可视化编辑器(裸 KV 是打包 u32, 暴露出来只会被误改);
+        // led.ws_count0/1 与 led.ws_brightness → 协议页 mai2light 块已有专用 SpinBox。
         .filter(|entry| {
             let k = entry.key.as_str();
-            !k.starts_with("bind.") && !k.starts_with("kbd.")
+            !k.starts_with("bind.")
+                && !k.starts_with("kbd.")
+                && !k.starts_with("calib.")
+                && !k.starts_with("led.map")
+                && !matches!(k, "led.ws_count0" | "led.ws_count1" | "led.ws_brightness")
         })
         .map(|entry| {
             let (mut kind, type_code, bool_val, num_val, min_val, max_val, has_range, mut enum_index, str_val) = match &entry.value {
@@ -1386,12 +2678,34 @@ fn build_config_rows(entries: &[ConfigEntry]) -> Vec<ConfigRow> {
 /// 返回 (分组中文名, 配置项中文名, 小字说明)。未收录的 key 回退到英文 key 的可读形式。
 fn parse_config_label(key: &str) -> (String, String, String) {
     let parts: Vec<&str> = key.split('.').collect();
-    let group = match parts.first().copied().unwrap_or("") {
-        "comm" => "通信",
-        "mode" => "模式",
-        "light" | "led" => "灯效",
-        "bind" => "绑区",
-        _ => "其他",
+    // ★group 就是渲染位置★ 各 Slint 端的 ConfigGroupSection 用 group_title 精确匹配取行,
+    // 所以归属按语义逐 key 指定, 而不是按 key 的一级前缀 —— comm./led. 前缀下同时混着
+    // "协议能力参数"(属协议页)与"键盘映射/状态指示灯"(属通信系统 Tab), 前缀分不开。
+    let group = match key {
+        // mai2serial: 串口本身 + 触控上报节流 + {E}RSET 善后行为 → 协议页 mai2serial 块
+        "comm.serial_baud"
+        | "comm.touch_delay_100us"
+        | "comm.sample_delay_ms"
+        | "comm.send_only_on_change"
+        | "comm.aggregation_delay_ms"
+        | "comm.extra_send"
+        | "comm.rate_limit_en"
+        | "comm.rate_limit_hz"
+        | "comm.serial_reset_calibrate"
+        | "comm.serial_reset_baseline" => "mai2serial 协议参数",
+        // mai2light: 灯板串口 + 节点号 + 灯珠总数 → 协议页 mai2light 块
+        "comm.light_baud" | "led.node_id" | "led.count" => "mai2light 协议参数",
+        // 触控 → 键盘映射: 虽在 comm. 前缀下, 语义与协议无关
+        "comm.keyboard_map_en" | "comm.keyboard_delay_100us" => "键盘映射",
+        // 板载状态指示灯(main.cpp 心跳灯消费), 与灯板协议无关
+        "led.enable" | "led.status_brightness" | "led.color_connected" | "led.color_flash_error"
+        | "led.color_link_error" | "led.color_healthy" => "状态指示灯",
+        "mode.work" => "工作模式",
+        // 未收录 key 的兜底: 按前缀落到通信系统 Tab 的"其他"组, 不会凭空消失。
+        _ => match parts.first().copied().unwrap_or("") {
+            "bind" => "绑区",
+            _ => "其他",
+        },
     }
     .to_string();
 
@@ -1404,6 +2718,8 @@ fn parse_config_label(key: &str) -> (String, String, String) {
         "comm.rate_limit_hz" => ("速率上限 (Hz)", "遥测上报帧率的上限"),
         "comm.keyboard_map_en" => ("启用触摸→键盘", "把触摸分区映射为键盘按键输出"),
         "comm.serial_baud" => ("触控串口波特率", "游戏触控串口 (COM) 的波特率"),
+        "comm.serial_reset_calibrate" => ("串口重启后自动 IDAC 校准", "收到 mai2serial 重启指令({E} RSET)后，自动执行一次全通道 IDAC 校准"),
+        "comm.serial_reset_baseline" => ("串口重启后自动基线复位", "收到 mai2serial 重启指令({E} RSET)后，自动执行一次全通道基线复位"),
         "comm.light_baud" => ("灯板串口波特率", "灯板通信串口的波特率"),
         "comm.touch_delay_100us" => ("触控延迟 (×100µs)", "触控串口上报延迟线, 0..100ms"),
         "comm.keyboard_delay_100us" => ("键盘延迟 (×100µs)", "触摸→键盘输出的附加延迟"),
@@ -1428,10 +2744,11 @@ fn parse_config_label(key: &str) -> (String, String, String) {
 }
 
 /// 把 Cp(fF) 缓存值换算成两位小数 pF 文本，语义与曲线页一致：
-/// None=读取中，Some(0)=测量中，Some(CP_MEASURE_FAILED)=测量失败，其余=正常测量值。
+/// None=本会话尚未测量(无任何自动获取)，Some(0)=测量中，Some(CP_MEASURE_FAILED)=未测量/测量失败，
+/// 其余=正常测量值。
 fn cp_display_text(cp: Option<u32>) -> String {
     match cp {
-        None => "读取中…".to_string(),
+        None => "未测量".to_string(),
         Some(0) => "测量中…".to_string(),
         Some(CP_MEASURE_FAILED) => "测量失败".to_string(),
         Some(value) => format!("{:.2} pF", value as f64 / 1000.0),
@@ -1482,6 +2799,8 @@ fn build_zone_cells(ctrl: &AppController) -> Vec<ZoneCell> {
     cells
 }
 
+/// 单通道精调主图一次回填的产物: 左轴(ADC 量纲)三条曲线 + 全量共享时间窗口。
+/// 算法叠加线(右轴)复用同一时间窗口, 见 `build_algo_overlay`。
 struct CurvePaths {
     raw_path: String,
     bsln_path: String,
@@ -1490,6 +2809,9 @@ struct CurvePaths {
     y_mid: f32,
     y_max: f32,
     point_count: i32,
+    /// 全量时间窗口(展开后的设备时间 us): 最旧样本→最新样本。UI 的横向缩放在其上取子区间。
+    t_first_us: u64,
+    t_last_us: u64,
 }
 
 impl CurvePaths {
@@ -1500,6 +2822,53 @@ impl CurvePaths {
         (1000.0 - (value - self.y_min) / (self.y_max - self.y_min) * 1000.0)
             .clamp(0.0, 1000.0)
     }
+    /// 全量时间跨度(ms), 供 UI 把 viewbox 横坐标换算成真实时刻。
+    fn t_span_ms(&self) -> f32 {
+        self.t_last_us.saturating_sub(self.t_first_us) as f32 / 1000.0
+    }
+}
+
+/// 采样间隔超过多少视为"时间缺口"(暂停/掉帧): 取标称周期的若干倍, 并给一个绝对下限,
+/// 免得采样率未知(sps=0)或抖动时误判。缺口两侧不连线, 见 `points_to_svg_path`。
+fn gap_threshold_us(sample_rate_hz: u32, period_mult: u32, floor_us: u64) -> u64 {
+    let nominal = if sample_rate_hz > 0 { 1_000_000 / sample_rate_hz as u64 } else { 33_333 };
+    (nominal * period_mult as u64).max(floor_us)
+}
+
+/// 把 (设备时间us, 值) 序列按时间窗口 [t0,t1] 与数值窗口 [v_min,v_max] 投影成 SVG path。
+///
+/// ★横坐标按时间而非序号★: 掉帧/暂停时等间距序号会把时间轴画错(同样的像素距离代表不同时长)。
+/// ★缺口断开★: 相邻两点间隔超过 gap_us 就用 `M` 重开子路径 —— 直线插值会伪造"这段时间数值在
+/// 线性变化"的假象, 停流几十秒后尤其误导。
+/// ★x 值域固定 [0,1000]★: 主图 PlotPath 用 fit: fill(非等比拉伸), viewbox 无论什么宽高比都被
+/// 拉满绘图区, 所以不需要按绘图区宽高比预拉伸 x —— 那套修正在横向缩放后必然失配并留出空白带。
+fn points_to_svg_path(
+    points: &[(u64, f32)],
+    t0: u64,
+    t1: u64,
+    v_min: f32,
+    v_max: f32,
+    gap_us: u64,
+) -> String {
+    if points.is_empty() {
+        return String::new();
+    }
+    let t_span = t1.saturating_sub(t0).max(1) as f32;
+    let v_range = (v_max - v_min).max(f32::EPSILON);
+    let mut path = String::new();
+    let mut prev_t: Option<u64> = None;
+    for &(t, v) in points {
+        let x = t.saturating_sub(t0) as f32 / t_span * 1000.0;
+        let y = (1000.0 - (v - v_min) / v_range * 1000.0).clamp(0.0, 1000.0);
+        let broken = prev_t.map_or(true, |p| t.saturating_sub(p) > gap_us);
+        if path.is_empty() {
+            path.push_str(&format!("M {} {}", x as i32, y as i32));
+        } else {
+            path.push_str(&format!(" {} {} {}", if broken { "M" } else { "L" }, x as i32, y as i32));
+        }
+        prev_t = Some(t);
+    }
+    path
 }
 
 fn build_curve_paths(
@@ -1509,17 +2878,23 @@ fn build_curve_paths(
     show_bsln: bool,
     show_diff: bool,
 ) -> CurvePaths {
-    let raw_series = if show_raw { ctrl.telem_series(ch, FIELD_RAW) } else { vec![] };
-    let bsln_series = if show_bsln { ctrl.telem_series(ch, FIELD_BASELINE) } else { vec![] };
-    let diff_series = if show_diff { ctrl.telem_series(ch, FIELD_DIFF) } else { vec![] };
-    let all_series = [&raw_series[..], &bsln_series[..], &diff_series[..]];
+    let raw_pts = if show_raw { ctrl.telem_points(ch, FIELD_RAW) } else { vec![] };
+    let bsln_pts = if show_bsln { ctrl.telem_points(ch, FIELD_BASELINE) } else { vec![] };
+    let diff_pts = if show_diff { ctrl.telem_points(ch, FIELD_DIFF) } else { vec![] };
+    let all_pts = [&raw_pts[..], &bsln_pts[..], &diff_pts[..]];
 
     let mut min = f32::INFINITY;
     let mut max = f32::NEG_INFINITY;
     let mut point_count = 0usize;
-    for series in all_series {
-        point_count = point_count.max(series.len());
-        for &value in series {
+    let mut t_first = u64::MAX;
+    let mut t_last = 0u64;
+    for points in all_pts {
+        point_count = point_count.max(points.len());
+        if let (Some(first), Some(last)) = (points.first(), points.last()) {
+            t_first = t_first.min(first.0);
+            t_last = t_last.max(last.0);
+        }
+        for &(_, value) in points {
             if value.is_finite() {
                 min = min.min(value);
                 max = max.max(value);
@@ -1527,7 +2902,7 @@ fn build_curve_paths(
         }
     }
 
-    if !min.is_finite() || !max.is_finite() {
+    if !min.is_finite() || !max.is_finite() || t_first > t_last {
         return CurvePaths {
             raw_path: String::new(),
             bsln_path: String::new(),
@@ -1536,6 +2911,8 @@ fn build_curve_paths(
             y_mid: 0.5,
             y_max: 1.0,
             point_count: 0,
+            t_first_us: 0,
+            t_last_us: 0,
         };
     }
 
@@ -1548,16 +2925,130 @@ fn build_curve_paths(
     let y_min = min - padding;
     let y_max = max + padding;
     let y_mid = (y_min + y_max) * 0.5;
+    // 遥测帧缺口: 超过 5 个标称周期(且至少 250ms)才算缺口, 容忍正常的帧间抖动。
+    let gap_us = gap_threshold_us(ctrl.telem_samples_per_sec(), 5, 250_000);
 
     CurvePaths {
-        raw_path: series_to_svg_path(&raw_series, y_min, y_max, 1.0),
-        bsln_path: series_to_svg_path(&bsln_series, y_min, y_max, 1.0),
-        diff_path: series_to_svg_path(&diff_series, y_min, y_max, 1.0),
+        raw_path: points_to_svg_path(&raw_pts, t_first, t_last, y_min, y_max, gap_us),
+        bsln_path: points_to_svg_path(&bsln_pts, t_first, t_last, y_min, y_max, gap_us),
+        diff_path: points_to_svg_path(&diff_pts, t_first, t_last, y_min, y_max, gap_us),
         y_min,
         y_mid,
         y_max,
         point_count: point_count as i32,
+        t_first_us: t_first,
+        t_last_us: t_last,
     }
+}
+
+/// 算法叠加线(4 条上报 + 触发判定)在主图上的一次回填产物。
+/// 走**独立右轴**: 算法量纲(计数/permille/布尔)与 ADC 量纲无关, 共用左轴会被压成一条平线。
+struct AlgoOverlay {
+    /// 右轴量程(已含二值线归一化后的幅度)。
+    r_min: f32,
+    r_max: f32,
+    report_paths: [String; 4],
+    /// 某条上报线是否为二值(取值只有 0/1) → UI 才为它显示"归一化幅度 N"输入。
+    report_binary: [bool; 4],
+    /// 某条上报线是否已有追踪数据(无数据的线不勾选也不算进右轴量程)。
+    report_has_data: [bool; 4],
+    active_path: String,
+    /// 触发判定的采样点数(供 UI 判断"有无追踪数据", 免得再取一遍序列)。
+    active_count: i32,
+}
+
+/// 判定二值序列: 非空且全部取值只有 0/1。0/1 在共享右轴上几乎不可见, 需要拉伸到 0..N。
+fn points_are_binary(points: &[(u64, f32)]) -> bool {
+    !points.is_empty() && points.iter().all(|&(_, v)| v == 0.0 || v == 1.0)
+}
+
+/// 二值线按幅度 N 拉伸(纯显示变换, 不下发设备); 非二值线原样返回。
+fn normalize_binary(points: &[(u64, f32)], amp: f32) -> Vec<(u64, f32)> {
+    points.iter().map(|&(t, v)| (t, v * amp)).collect()
+}
+
+/// 生成算法叠加线的 path 与右轴量程。`wanted` 决定哪些线参与右轴量程计算 ——
+/// 没画出来的线不该影响量程, 否则勾掉一条线后其余线的高度会莫名其妙地变。
+/// amps[0..3] 对应 report[idx], amps[4] 对应触发判定。
+fn build_algo_overlay(
+    ctrl: &AppController,
+    wanted: &[bool; 4],
+    show_active: bool,
+    amps: &[f32; 5],
+    t0: u64,
+    t1: u64,
+    poll_slots: usize,
+) -> AlgoOverlay {
+    // 算法追踪是主机轮询取回的: n 个 idx 轮转 → 单条线的采样间隔是遥测周期的 n 倍。
+    let gap_us = gap_threshold_us(
+        ctrl.telem_samples_per_sec(),
+        (poll_slots.max(1) * 6) as u32,
+        400_000,
+    );
+    let mut series: [Vec<(u64, f32)>; 4] = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+    let mut report_binary = [false; 4];
+    let mut report_has_data = [false; 4];
+    let mut r_min = f32::INFINITY;
+    let mut r_max = f32::NEG_INFINITY;
+    let track = |points: &[(u64, f32)]| -> (f32, f32) {
+        let mut lo = f32::INFINITY;
+        let mut hi = f32::NEG_INFINITY;
+        for &(_, v) in points {
+            if v.is_finite() {
+                lo = lo.min(v);
+                hi = hi.max(v);
+            }
+        }
+        (lo, hi)
+    };
+    for idx in 0..4usize {
+        let raw = ctrl.algo_trace_report_points(idx as u8);
+        report_has_data[idx] = !raw.is_empty();
+        report_binary[idx] = points_are_binary(&raw);
+        let norm = if report_binary[idx] { normalize_binary(&raw, amps[idx]) } else { raw };
+        if wanted[idx] && report_has_data[idx] {
+            let (lo, hi) = track(&norm);
+            r_min = r_min.min(lo);
+            r_max = r_max.max(hi);
+        }
+        series[idx] = norm;
+    }
+    let active_pts = normalize_binary(&ctrl.algo_trace_active_points(), amps[4]);
+    if show_active {
+        let (lo, hi) = track(&active_pts);
+        r_min = r_min.min(lo);
+        r_max = r_max.max(hi);
+    }
+    if !r_min.is_finite() || !r_max.is_finite() {
+        r_min = 0.0;
+        r_max = 1.0;
+    }
+    let span = r_max - r_min;
+    let padding = if span.abs() < f32::EPSILON { (r_max.abs() * 0.05).max(0.5) } else { span * 0.05 };
+    let r_min = r_min - padding;
+    let r_max = r_max + padding;
+    let mut report_paths = [String::new(), String::new(), String::new(), String::new()];
+    for idx in 0..4usize {
+        report_paths[idx] = points_to_svg_path(&series[idx], t0, t1, r_min, r_max, gap_us);
+    }
+    AlgoOverlay {
+        r_min,
+        r_max,
+        report_paths,
+        report_binary,
+        report_has_data,
+        active_path: points_to_svg_path(&active_pts, t0, t1, r_min, r_max, gap_us),
+        active_count: active_pts.len() as i32,
+    }
+}
+
+/// 设备端运行时刻(展开后)的人读文本: 供"最新样本的绝对时刻"这一行展示。
+/// UI 侧的刻度/读数一律用"相对最新样本"的 ms 偏移(f32 精度足够), 绝对时刻只在这里出现一次。
+fn dev_time_text(t_us: u64) -> String {
+    let total_ms = t_us / 1000;
+    let ms = total_ms % 1000;
+    let total_s = total_ms / 1000;
+    format!("{:02}:{:02}:{:02}.{:03}", total_s / 3600, (total_s / 60) % 60, total_s % 60, ms)
 }
 
 fn series_to_svg_path(series: &[f32], min: f32, max: f32, x_scale: f32) -> String {
@@ -1585,31 +3076,10 @@ fn series_to_svg_path(series: &[f32], min: f32, max: f32, x_scale: f32) -> Strin
     path
 }
 
-/// 算法上报变量折线: 按序列自身 min/max 自适应量程(带 5% 余量), 镜像 build_curve_paths 的
-/// 量程算法, 但只服务单条序列(算法上报变量语义各异, 不共享量程)。
-fn build_report_path(series: &[f32]) -> String {
-    if series.is_empty() {
-        return String::new();
-    }
-    let mut min = f32::INFINITY;
-    let mut max = f32::NEG_INFINITY;
-    for &v in series {
-        if v.is_finite() {
-            min = min.min(v);
-            max = max.max(v);
-        }
-    }
-    if !min.is_finite() || !max.is_finite() {
-        return String::new();
-    }
-    let span = max - min;
-    let padding = if span.abs() < f32::EPSILON { (min.abs() * 0.05).max(1.0) } else { span * 0.05 };
-    series_to_svg_path(series, min - padding, max + padding, 1.0)
-}
-
-/// 生成延迟历史折线 path + 自适应纵向量程 (lo, hi)。x 按绘图区宽高比拉伸铺满宽度。
+/// 生成延迟历史折线 path + 自适应纵向量程 (lo, hi)。x 固定映射到 [0,1000]，由 PlotPath 的 fit: fill 拉满绘图区。
+/// 不能用 aspect 修正：等比 contain 无法铺满任意矩形，宽高比变化后会重新产生空白带。
 /// 纵向量程按数据 min/max 自适应(带 10% 余量), 否则接近常数的延迟会被压成一条线。
-fn build_lat_path(series: &[f32], aspect: f32) -> (String, f32, f32) {
+fn build_lat_path(series: &[f32]) -> (String, f32, f32) {
     let dmin = series.iter().cloned().fold(f32::INFINITY, f32::min);
     let dmax = series.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
     let (lo, hi) = if dmin.is_finite() && dmax.is_finite() {
@@ -1618,8 +3088,7 @@ fn build_lat_path(series: &[f32], aspect: f32) -> (String, f32, f32) {
     } else {
         (0.0, 1.0)
     };
-    let x_scale = if aspect > 0.01 { aspect } else { 3.0 };
-    (series_to_svg_path(series, lo, hi, x_scale), lo, hi)
+    (series_to_svg_path(series, lo, hi, 1.0), lo, hi)
 }
 
 /// 右锚定滚动窗口折线: 最新点固定在右缘(x=1000),越旧越靠左,超出 window 的点丢弃。
@@ -1776,6 +3245,7 @@ fn build_channel_status(ctrl: &AppController) -> Vec<ChannelStatus> {
             grid_row: (ch / 6) as i32,
             binding_text: binding_text.into(),
             cp_text: cp_display_text(ctrl.cp(ch)).into(),
+            frozen: ctrl.channel_frozen(ch),
         });
     }
     out
@@ -1784,30 +3254,92 @@ fn build_channel_status(ctrl: &AppController) -> Vec<ChannelStatus> {
 fn build_param_rows(params: &[(u8, u32)]) -> Vec<ParamRow> {
     params
         .iter()
-        // 单通道精调只暴露【逐通道】参数(阈值/迟滞/消抖/低基线复位/模态 IDAC 0x01-0x06,0x09)。
-        // 全局/统一生效的硬件采样参数(分辨率 0x07、SnsClk 分频 0x08、时钟源 0x0A、IDAC 增幅 0x0B)
-        // 会一改改全部 36 通道, 只应在“触控全局调整”页编辑 —— 从单通道页移除, 避免意外全局改动。
-        .filter(|&&(param_id, _)| matches!(param_id, 0x01..=0x06 | 0x09))
-        .map(|&(param_id, value)| {
-            let label = match param_id {
-                0x01 => "手指阈值(PARAM_FINGER_TH)".to_string(),
-                0x02 => "噪声阈值(PARAM_NOISE_TH)".to_string(),
-                0x03 => "负阈值(PARAM_NEG_NOISE_TH)".to_string(),
-                0x04 => "迟滞(PARAM_HYSTERESIS)".to_string(),
-                0x05 => "按键消抖(PARAM_ON_DEBOUNCE)".to_string(),
-                0x06 => "低基线复位(PARAM_LOW_BSLN_RST)".to_string(),
-                0x07 => "分辨率(PARAM_RESOLUTION)".to_string(),
-                0x08 => "传感时钟分频(PARAM_SNS_CLK_DIV)".to_string(),
-                0x09 => "模态 IDAC(PARAM_IDAC_MOD)".to_string(),
-                0x0A => "时钟源(PARAM_SNS_CLK_SOURCE)".to_string(),
-                0x0B => "IDAC 增幅档(PARAM_IDAC_GAIN)".to_string(),
-                _ => format!("参数 0x{:02X}", param_id),
-            };
+        // 单通道精调展示全部由 CSD 模式接管的逐通道参数；AUTO 时 Slint 统一显示 AUTO 并锁定，
+        // SEMI 时恢复数值与编辑，避免自动实时值被误当作用户的手动设置。
+        .filter(|&&(param_id, _)| matches!(param_id, 0x01..=0x06 | 0x08..=0x0B))
+        .map(|&(param_id, value)| ParamRow {
+            param_id: param_id as i32,
+            label: param_display_name(param_id).into(),
+            value: value as i32,
+        })
+        .collect()
+}
 
-            ParamRow {
-                param_id: param_id as i32,
-                label: label.into(),
-                value: value as i32,
+/// per-channel 参数的中文显示名。单一真相源: 单通道精调的参数行与全通道页的批量应用面板
+/// 共用本函数, 避免两处各写一份 match 而出现名称漂移。
+fn param_display_name(param_id: u8) -> String {
+    match param_id {
+        0x01 => "手指阈值(PARAM_FINGER_TH)".to_string(),
+        0x02 => "噪声阈值(PARAM_NOISE_TH)".to_string(),
+        0x03 => "负阈值(PARAM_NEG_NOISE_TH)".to_string(),
+        0x04 => "迟滞(PARAM_HYSTERESIS)".to_string(),
+        0x05 => "按键消抖(PARAM_ON_DEBOUNCE)".to_string(),
+        0x06 => "低基线复位(PARAM_LOW_BSLN_RST)".to_string(),
+        0x07 => "分辨率(PARAM_RESOLUTION)".to_string(),
+        0x08 => "传感时钟分频(PARAM_SNS_CLK_DIV)".to_string(),
+        0x09 => "模态 IDAC(PARAM_IDAC_MOD)".to_string(),
+        0x0A => "时钟源(PARAM_SNS_CLK_SOURCE)".to_string(),
+        0x0B => "IDAC 增幅档(PARAM_IDAC_GAIN)".to_string(),
+        _ => format!("参数 0x{:02X}", param_id),
+    }
+}
+
+/// 主页"工作模式"一行文案。草稿优先(与通信系统 Tab 的 ComboBox 同源), 未回读到 mode.work
+/// 就显示"未知" —— 拿默认值 0 冒充设备真值会让人以为设备在 Serial 模式。
+/// 草稿与设备值不同时追加提示: 该项要整机重启重枚举才生效, 复用 draft_needs_reboot 判定。
+fn work_mode_text(ctrl: &AppController) -> String {
+    let base = match ctrl.work_mode() {
+        Some(0) => "Serial (mai2serial + mai2light 双 CDC)",
+        Some(1) => "HID (键盘 + 触摸屏)",
+        Some(_) => "未知(设备返回了未定义值)",
+        None => "未知",
+    };
+    if ctrl.draft_needs_reboot() {
+        format!("{}（未保存，保存后重启生效）", base)
+    } else {
+        base.to_string()
+    }
+}
+
+/// 读取数值型配置 KV(草稿优先, 由 config_get 保证); 未回读到则给默认值。
+/// 各数值变体统一折成 u32, 免得每个调用点再 match 一遍 CfgValue。
+fn cfg_u32_or(ctrl: &AppController, key: &str, default: u32) -> u32 {
+    match ctrl.config_get(key).map(|e| e.value) {
+        Some(CfgValue::U8(v)) => v as u32,
+        Some(CfgValue::I8(v)) => v.max(0) as u32,
+        Some(CfgValue::U16(v)) => v as u32,
+        Some(CfgValue::U32(v)) => v,
+        Some(CfgValue::F32(v)) => v.max(0.0) as u32,
+        Some(CfgValue::Bool(v)) => u32::from(v),
+        _ => default,
+    }
+}
+
+/// 虚拟 LED 单元语义标签: 0..7 为按键灯(经灯板协议缓冲提交), 8/9/10 为白灯直刷。
+fn led_unit_label(unit: usize) -> String {
+    match unit {
+        0..=7 => format!("{} 按键灯{}", unit, unit + 1),
+        8 => "8 Body 白灯".to_string(),
+        9 => "9 Ext 白灯".to_string(),
+        10 => "10 Side 白灯".to_string(),
+        _ => format!("{} ?", unit),
+    }
+}
+
+/// 协议页 11 个虚拟 LED 单元行: 采样色(LED_GET 回报的当前有效色)+ 映射(草稿优先)。
+fn build_led_unit_rows(ctrl: &AppController) -> Vec<LedUnitRow> {
+    (0..LED_UNIT_COUNT)
+        .map(|unit| {
+            let rgb = ctrl.led_color(unit);
+            let region = ctrl.led_region(unit);
+            LedUnitRow {
+                unit: unit as i32,
+                label: led_unit_label(unit).into(),
+                sample: slint::Color::from_rgb_u8(rgb[0], rgb[1], rgb[2]),
+                rgb_text: format!("R{} G{} B{}", rgb[0], rgb[1], rgb[2]).into(),
+                ch_choice: if region.ch > 1 { 0 } else { region.ch as i32 + 1 },
+                start: region.start as i32,
+                count: region.count as i32,
             }
         })
         .collect()

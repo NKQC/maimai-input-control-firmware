@@ -5,6 +5,11 @@
 
 pub mod app_state;
 pub mod comport;
+pub mod elevation;
 pub mod io;
+pub mod logging;
 pub mod proto;
+pub mod settings_io;
 pub mod touch_geometry;
+pub mod ui_config;
+pub mod vcam;

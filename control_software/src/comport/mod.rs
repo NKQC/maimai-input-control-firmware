@@ -194,20 +194,22 @@ mod windows_impl {
     use super::*;
     use std::os::raw::c_void;
 
-    use windows::core::{GUID, PCWSTR};
+    use windows::core::{GUID, PCWSTR, PWSTR};
     use windows::Win32::Devices::DeviceAndDriverInstallation::{
         SetupDiCallClassInstaller, SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInfo,
-        SetupDiGetClassDevsW, SetupDiGetDeviceInstanceIdW, SetupDiOpenDevRegKey,
-        SetupDiSetClassInstallParamsW, DICS_FLAG_CONFIGSPECIFIC, DICS_FLAG_GLOBAL, DICS_PROPCHANGE,
-        DIF_PROPERTYCHANGE, DIGCF_PRESENT, DIREG_DEV, HDEVINFO, SP_CLASSINSTALL_HEADER,
-        SP_DEVINFO_DATA, SP_PROPCHANGE_PARAMS,
+        SetupDiGetClassDevsW, SetupDiGetDeviceInstanceIdW, SetupDiGetDeviceRegistryPropertyW,
+        SetupDiOpenDevRegKey, SetupDiSetClassInstallParamsW, SetupDiSetDeviceRegistryPropertyW,
+        DICS_FLAG_CONFIGSPECIFIC, DICS_FLAG_GLOBAL, DICS_PROPCHANGE, DIF_PROPERTYCHANGE,
+        DIGCF_PRESENT, DIREG_DEV, HDEVINFO, SP_CLASSINSTALL_HEADER, SP_DEVINFO_DATA,
+        SP_PROPCHANGE_PARAMS, SPDRP_FRIENDLYNAME,
     };
-    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::Foundation::{CloseHandle, ERROR_NO_MORE_ITEMS};
     use windows::Win32::Security::{
         GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
     };
     use windows::Win32::System::Registry::{
-        RegCloseKey, RegQueryValueExW, RegSetValueExW, HKEY, KEY_READ, KEY_SET_VALUE, REG_SZ,
+        RegCloseKey, RegEnumValueW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW, HKEY,
+        HKEY_LOCAL_MACHINE, KEY_READ, KEY_SET_VALUE, REG_BINARY, REG_SZ,
     };
     use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
@@ -357,13 +359,16 @@ mod windows_impl {
             to_port: format!("COM{}", target_com),
             function: CdcFunction::Unknown,
         };
-        apply_one_action(&action)
+        apply_one_action(&action, true).map(|_| ())
     }
 
     /// 一键"自动设置端口"组合入口:识别本机 Serial/Light 接口 → 已是目标口则跳过 →
     /// 目标口被别的设备占用则标记冲突不改 → 否则改名。返回结构含中文文案,
     /// 供 UI `port_status` 直接展示。只读识别失败/未插入设备时 `device_found=false`。
-    pub fn auto_assign(serial_com: u16, light_com: u16) -> AutoAssignResult {
+    // force=true(用户点"立即应用"): 即使注册表 PortName 已等于目标, 也重写并重启端口节点强制驱动重读,
+    // 修"注册表已是目标但设备管理器/驱动仍是旧口(写了没重启从未生效)"→点应用无反应。
+    // force=false(启动自动): 已匹配则跳过, 避免每次开机都重启端口造成短暂断连churn。
+    pub fn auto_assign(serial_com: u16, light_com: u16, force: bool) -> AutoAssignResult {
         let ports = identify_ports();
         let elevated = is_elevated();
         let mut items = Vec::new();
@@ -384,10 +389,49 @@ mod windows_impl {
             let target_name = format!("COM{}", target_com);
 
             if port.port_name.eq_ignore_ascii_case(&target_name) {
-                items.push(AutoAssignItem {
+                let action = AssignmentAction {
+                    instance_id: port.instance_id.clone(),
+                    from_port: port.port_name.clone(),
+                    to_port: target_name.clone(),
                     function,
-                    message: format!("{}: 已是 {}, 无需更改", label, target_name),
-                });
+                };
+                if force {
+                    if !elevated {
+                        needs_admin = true;
+                        items.push(AutoAssignItem {
+                            function,
+                            message: format!(
+                                "{}: PortName 已是 {}, 但强制重启以核验 SERIALCOMM 需要管理员权限",
+                                label, target_name
+                            ),
+                        });
+                    } else {
+                        match apply_one_action(&action, true) {
+                            Ok(outcome) => {
+                                needs_replug = true;
+                                items.push(AutoAssignItem {
+                                    function,
+                                    message: format!("{}: 已强制重启，{}", label, outcome.message),
+                                });
+                            }
+                            Err(e) => items.push(AutoAssignItem {
+                                function,
+                                message: format!("{}: 强制核验 {} 失败: {}", label, target_name, e),
+                            }),
+                        }
+                    }
+                } else {
+                    match apply_one_action(&action, false) {
+                        Ok(outcome) => items.push(AutoAssignItem {
+                            function,
+                            message: format!("{}: 已是 {}，{}", label, target_name, outcome.message),
+                        }),
+                        Err(e) => items.push(AutoAssignItem {
+                            function,
+                            message: format!("{}: PortName 为 {}，但 SERIALCOMM 核验失败: {}", label, target_name, e),
+                        }),
+                    }
+                }
                 continue;
             }
 
@@ -414,12 +458,18 @@ mod windows_impl {
                 continue;
             }
 
-            match set_port_name(&port.instance_id, target_com) {
-                Ok(()) => {
+            let action = AssignmentAction {
+                instance_id: port.instance_id.clone(),
+                from_port: port.port_name.clone(),
+                to_port: target_name.clone(),
+                function,
+            };
+            match apply_one_action(&action, true) {
+                Ok(outcome) => {
                     needs_replug = true;
                     items.push(AutoAssignItem {
                         function,
-                        message: format!("{}: {} -> {} 已应用", label, port.port_name, target_name),
+                        message: format!("{}: {} -> {}，{}", label, port.port_name, target_name, outcome.message),
                     });
                 }
                 Err(e) => {
@@ -556,14 +606,16 @@ mod windows_impl {
         }
 
         for action in actions {
-            apply_one_action(action)?;
+            apply_one_action(action, true)?;
         }
         Ok(())
     }
 
-    fn apply_one_action(action: &AssignmentAction) -> Result<()> {
-        // 重新按实例 ID 定位设备,取得可写的 Device Parameters 键。
-        // 这里复用 identify 阶段的 GUID_DEVCLASS_PORTS 枚举,按 instance_id 匹配。
+    struct ApplyOutcome {
+        message: String,
+    }
+
+    fn apply_one_action(action: &AssignmentAction, rewrite_and_restart: bool) -> Result<ApplyOutcome> {
         let h_devinfo = unsafe {
             SetupDiGetClassDevsW(
                 Some(&GUID_DEVCLASS_PORTS as *const GUID),
@@ -574,16 +626,14 @@ mod windows_impl {
         }
         .map_err(|e| anyhow!("SetupDiGetClassDevsW failed: {}", e))?;
 
-        let result = (|| -> Result<()> {
+        let result = (|| -> Result<ApplyOutcome> {
             let mut index = 0u32;
             loop {
                 let mut devinfo_data = SP_DEVINFO_DATA {
                     cbSize: std::mem::size_of::<SP_DEVINFO_DATA>() as u32,
                     ..Default::default()
                 };
-                let enum_result =
-                    unsafe { SetupDiEnumDeviceInfo(h_devinfo, index, &mut devinfo_data) };
-                if enum_result.is_err() {
+                if unsafe { SetupDiEnumDeviceInfo(h_devinfo, index, &mut devinfo_data) }.is_err() {
                     break;
                 }
                 index += 1;
@@ -595,34 +645,37 @@ mod windows_impl {
                     continue;
                 }
 
-                // 命中目标设备,打开可写的 Device Parameters 键并写入 PortName。
-                let hkey = unsafe {
-                    SetupDiOpenDevRegKey(
-                        h_devinfo,
-                        &devinfo_data,
-                        DICS_FLAG_GLOBAL.0,
-                        0,
-                        DIREG_DEV,
-                        KEY_SET_VALUE.0,
-                    )
+                let former_port = read_port_name_now(h_devinfo, &devinfo_data)
+                    .filter(|port| !port.is_empty())
+                    .unwrap_or_else(|| action.from_port.clone());
+
+                if rewrite_and_restart {
+                    let hkey = unsafe {
+                        SetupDiOpenDevRegKey(
+                            h_devinfo,
+                            &devinfo_data,
+                            DICS_FLAG_GLOBAL.0,
+                            0,
+                            DIREG_DEV,
+                            KEY_SET_VALUE.0,
+                        )
+                    }
+                    .map_err(|e| anyhow!("打开设备注册表键失败: {}", e))?;
+                    let write_result = write_reg_sz(hkey, "PortName", &action.to_port);
+                    unsafe {
+                        let _ = RegCloseKey(hkey);
+                    }
+                    write_result?;
+                    restart_device_node(h_devinfo, &devinfo_data)?;
+                    std::thread::sleep(std::time::Duration::from_millis(1200));
                 }
-                .map_err(|e| anyhow!("打开设备注册表键失败: {}", e))?;
 
-                let write_result = write_reg_sz(hkey, "PortName", &action.to_port);
-
-                unsafe {
-                    let _ = RegCloseKey(hkey);
-                }
-
-                write_result?;
-
-                // ★关键: 写 PortName 后必须重启该设备节点★, 让串口驱动(usbser)重新读取 PortName 并
-                // 刷新 HKLM\HARDWARE\DEVICEMAP\SERIALCOMM 与设备管理器显示的 COM 号。仅写注册表而不重启,
-                // 设备管理器"详情"里的 Device Parameters 已是新值, 但显示的端口号(及 SERIALCOMM 活动映射)
-                // 不会更新——这正是"手动改(设备管理器内部会 DIF_PROPERTYCHANGE 重启设备)立即生效, 而本程序
-                // 只写注册表+重插仍不变"的根因。此处复刻设备管理器的属性变更重启序列使其立即生效。
-                restart_device_node(h_devinfo, &devinfo_data)?;
-                return Ok(());
+                return _finalize_assignment(
+                    h_devinfo,
+                    &mut devinfo_data,
+                    &former_port,
+                    &action.to_port,
+                );
             }
             Err(anyhow!(
                 "未找到实例 ID 对应的设备(可能已拔出): {}",
@@ -633,8 +686,361 @@ mod windows_impl {
         unsafe {
             let _ = SetupDiDestroyDeviceInfoList(h_devinfo);
         }
-
         result
+    }
+
+    /// 重新打开设备的 Device Parameters 键、读回**当前真实**的 PortName。
+    /// 用于写入+重启后核对驱动是否真的接受了该端口号(而不是信任自己刚写进去的值)。
+    fn read_port_name_now(
+        h_devinfo: HDEVINFO,
+        devinfo_data: &SP_DEVINFO_DATA,
+    ) -> Option<String> {
+        // SAFETY: h_devinfo/devinfo_data 在调用方枚举期间有效。
+        let hkey = unsafe {
+            SetupDiOpenDevRegKey(
+                h_devinfo,
+                devinfo_data,
+                DICS_FLAG_GLOBAL.0,
+                0,
+                DIREG_DEV,
+                KEY_READ.0,
+            )
+        }
+        .ok()?;
+        let value = read_reg_sz(hkey, "PortName");
+        unsafe {
+            let _ = RegCloseKey(hkey);
+        }
+        value
+    }
+
+    fn _finalize_assignment(
+        h_devinfo: HDEVINFO,
+        devinfo_data: &mut SP_DEVINFO_DATA,
+        former_port: &str,
+        target_port: &str,
+    ) -> Result<ApplyOutcome> {
+        let serialcomm_ports = _read_serialcomm_ports()?;
+        if !serialcomm_ports
+            .iter()
+            .any(|port| port.eq_ignore_ascii_case(target_port))
+        {
+            let port_name = read_port_name_now(h_devinfo, devinfo_data)
+                .unwrap_or_else(|| "无法回读".to_string());
+            let published = if serialcomm_ports.is_empty() {
+                "无".to_string()
+            } else {
+                serialcomm_ports.join(", ")
+            };
+            if !former_port.is_empty()
+                && serialcomm_ports
+                    .iter()
+                    .any(|port| port.eq_ignore_ascii_case(former_port))
+            {
+                return Err(anyhow!(
+                    "驱动未接受该端口号: SERIALCOMM 未出现 {}，且仍挂着旧号 {}；PortName 回读为 {}；当前驱动端口: {}",
+                    target_port,
+                    former_port,
+                    port_name,
+                    published
+                ));
+            }
+            return Err(anyhow!(
+                "SERIALCOMM 未出现 {}，无法确认端口已生效；PortName 回读为 {}；当前驱动端口: {}",
+                target_port,
+                port_name,
+                published
+            ));
+        }
+
+        let friendly_status = match _update_friendly_name(h_devinfo, devinfo_data, target_port) {
+            Ok(name) => format!("FriendlyName 已更新为 {}", name),
+            Err(error) => format!(
+                "端口已可用, 但设备管理器显示名可能仍是旧号(不影响使用): {}",
+                error
+            ),
+        };
+        let arbiter_status = match _update_com_name_arbiter(
+            target_port,
+            former_port,
+            &serialcomm_ports,
+        ) {
+            Ok(()) => format!("COM Name Arbiter 已登记 {}", target_port),
+            Err(error) => format!("COM Name Arbiter 登记警告: {}", error),
+        };
+
+        Ok(ApplyOutcome {
+            message: format!(
+                "端口已在 SERIALCOMM 生效；{}；{}",
+                friendly_status, arbiter_status
+            ),
+        })
+    }
+
+    fn _read_serialcomm_ports() -> Result<Vec<String>> {
+        let path: Vec<u16> = "HARDWARE\\DEVICEMAP\\SERIALCOMM"
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut hkey = HKEY::default();
+        let status = unsafe {
+            RegOpenKeyExW(
+                HKEY_LOCAL_MACHINE,
+                PCWSTR(path.as_ptr()),
+                None,
+                KEY_READ,
+                &mut hkey,
+            )
+        };
+        if status.is_err() {
+            return Err(anyhow!("打开 SERIALCOMM 失败: {:?}", status));
+        }
+
+        let result = (|| -> Result<Vec<String>> {
+            let mut ports = Vec::new();
+            let mut index = 0;
+            loop {
+                let mut value_name = [0u16; 256];
+                let mut value_name_len = value_name.len() as u32;
+                let mut value_data = [0u8; 512];
+                let mut value_data_len = value_data.len() as u32;
+                let mut value_type = 0u32;
+                let status = unsafe {
+                    RegEnumValueW(
+                        hkey,
+                        index,
+                        Some(PWSTR(value_name.as_mut_ptr())),
+                        &mut value_name_len,
+                        None,
+                        Some(&mut value_type),
+                        Some(value_data.as_mut_ptr()),
+                        Some(&mut value_data_len),
+                    )
+                };
+                if status == ERROR_NO_MORE_ITEMS {
+                    break;
+                }
+                if status.is_err() {
+                    return Err(anyhow!("枚举 SERIALCOMM 失败: {:?}", status));
+                }
+                index += 1;
+                if value_type != REG_SZ.0 {
+                    continue;
+                }
+                if let Some(port) = _decode_utf16le(&value_data[..value_data_len as usize]) {
+                    ports.push(port);
+                }
+            }
+            Ok(ports)
+        })();
+
+        unsafe {
+            let _ = RegCloseKey(hkey);
+        }
+        result
+    }
+
+    fn _update_friendly_name(
+        h_devinfo: HDEVINFO,
+        devinfo_data: &mut SP_DEVINFO_DATA,
+        target_port: &str,
+    ) -> Result<String> {
+        let original = _read_friendly_name(h_devinfo, devinfo_data)?;
+        let updated = _replace_friendly_port(&original, target_port);
+        let wide: Vec<u16> = updated
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let bytes: Vec<u8> = wide.iter().flat_map(|code| code.to_le_bytes()).collect();
+        unsafe {
+            SetupDiSetDeviceRegistryPropertyW(
+                h_devinfo,
+                devinfo_data,
+                SPDRP_FRIENDLYNAME,
+                Some(bytes.as_slice()),
+            )
+            .map_err(|error| anyhow!("写入 FriendlyName 失败: {}", error))?;
+        }
+        Ok(updated)
+    }
+
+    fn _read_friendly_name(h_devinfo: HDEVINFO, devinfo_data: &SP_DEVINFO_DATA) -> Result<String> {
+        let mut size = 0u32;
+        let mut value_type = 0u32;
+        unsafe {
+            let _ = SetupDiGetDeviceRegistryPropertyW(
+                h_devinfo,
+                devinfo_data,
+                SPDRP_FRIENDLYNAME,
+                Some(&mut value_type),
+                None,
+                Some(&mut size),
+            );
+        }
+        if size == 0 {
+            return Err(anyhow!("读取 FriendlyName 时未返回数据"));
+        }
+        let mut data = vec![0u8; size as usize];
+        unsafe {
+            SetupDiGetDeviceRegistryPropertyW(
+                h_devinfo,
+                devinfo_data,
+                SPDRP_FRIENDLYNAME,
+                Some(&mut value_type),
+                Some(data.as_mut_slice()),
+                Some(&mut size),
+            )
+            .map_err(|error| anyhow!("读取 FriendlyName 失败: {}", error))?;
+        }
+        _decode_utf16le(&data[..size as usize])
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| anyhow!("FriendlyName 为空或不是有效 UTF-16"))
+    }
+
+    fn _replace_friendly_port(original: &str, target_port: &str) -> String {
+        let trimmed = original.trim_end();
+        if let Some(before_close) = trimmed.strip_suffix(')') {
+            if let Some(open) = before_close.rfind('(') {
+                if _parse_com_number(&before_close[open + 1..]).is_some() {
+                    return format!("{}({})", &before_close[..open], target_port);
+                }
+            }
+        }
+        format!("{} ({})", trimmed, target_port)
+    }
+
+    fn _update_com_name_arbiter(
+        target_port: &str,
+        former_port: &str,
+        serialcomm_ports: &[String],
+    ) -> Result<()> {
+        let path: Vec<u16> = "SYSTEM\\CurrentControlSet\\Control\\COM Name Arbiter"
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut hkey = HKEY::default();
+        let status = unsafe {
+            RegOpenKeyExW(
+                HKEY_LOCAL_MACHINE,
+                PCWSTR(path.as_ptr()),
+                None,
+                KEY_READ | KEY_SET_VALUE,
+                &mut hkey,
+            )
+        };
+        if status.is_err() {
+            return Err(anyhow!("打开 COM Name Arbiter 失败: {:?}", status));
+        }
+
+        let result = (|| -> Result<()> {
+            let mut comdb = _read_reg_binary(hkey, "ComDB")?;
+            let target_number = _parse_com_number(target_port)
+                .ok_or_else(|| anyhow!("无效目标端口号: {}", target_port))?;
+            _set_comdb_bit(&mut comdb, target_number, true);
+            if let Some(former_number) = _parse_com_number(former_port) {
+                let former_is_active = serialcomm_ports
+                    .iter()
+                    .any(|port| port.eq_ignore_ascii_case(former_port));
+                if !former_is_active {
+                    _set_comdb_bit(&mut comdb, former_number, false);
+                }
+            }
+            let value_name: Vec<u16> = "ComDB"
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect();
+            let status = unsafe {
+                RegSetValueExW(
+                    hkey,
+                    PCWSTR(value_name.as_ptr()),
+                    None,
+                    REG_BINARY,
+                    Some(comdb.as_slice()),
+                )
+            };
+            if status.is_err() {
+                return Err(anyhow!("写入 ComDB 失败: {:?}", status));
+            }
+            Ok(())
+        })();
+
+        unsafe {
+            let _ = RegCloseKey(hkey);
+        }
+        result
+    }
+
+    fn _read_reg_binary(hkey: HKEY, value_name: &str) -> Result<Vec<u8>> {
+        let wide_name: Vec<u16> = value_name.encode_utf16().chain(std::iter::once(0)).collect();
+        let mut size = 0u32;
+        // windows 0.62 的绑定要求这里是 REG_VALUE_TYPE 而不是裸 u32。
+        let mut value_type = windows::Win32::System::Registry::REG_VALUE_TYPE(0);
+        let status = unsafe {
+            RegQueryValueExW(
+                hkey,
+                PCWSTR(wide_name.as_ptr()),
+                None,
+                Some(&mut value_type),
+                None,
+                Some(&mut size),
+            )
+        };
+        if status.is_err() || size == 0 {
+            return Err(anyhow!("读取 {} 大小失败: {:?}", value_name, status));
+        }
+        let mut value = vec![0u8; size as usize];
+        let status = unsafe {
+            RegQueryValueExW(
+                hkey,
+                PCWSTR(wide_name.as_ptr()),
+                None,
+                Some(&mut value_type),
+                Some(value.as_mut_ptr()),
+                Some(&mut size),
+            )
+        };
+        if status.is_err() {
+            return Err(anyhow!("读取 {} 失败: {:?}", value_name, status));
+        }
+        if value_type != REG_BINARY {
+            return Err(anyhow!("{} 不是 REG_BINARY", value_name));
+        }
+        value.truncate(size as usize);
+        Ok(value)
+    }
+
+    fn _set_comdb_bit(comdb: &mut Vec<u8>, port_number: u16, set: bool) {
+        if port_number == 0 {
+            return;
+        }
+        let bit_index = (port_number - 1) as usize;
+        let byte_index = bit_index / 8;
+        if comdb.len() <= byte_index {
+            comdb.resize(byte_index + 1, 0);
+        }
+        let bit = 1u8 << (bit_index % 8);
+        if set {
+            comdb[byte_index] |= bit;
+        } else {
+            comdb[byte_index] &= !bit;
+        }
+    }
+
+    fn _parse_com_number(port: &str) -> Option<u16> {
+        let upper = port.trim().to_ascii_uppercase();
+        upper.strip_prefix("COM")?.parse::<u16>().ok().filter(|number| *number > 0)
+    }
+
+    fn _decode_utf16le(bytes: &[u8]) -> Option<String> {
+        if bytes.len() % 2 != 0 {
+            return None;
+        }
+        let chars: Vec<u16> = bytes
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect();
+        let end = chars.iter().position(|code| *code == 0).unwrap_or(chars.len());
+        Some(String::from_utf16_lossy(&chars[..end]))
     }
 
     /// 重启指定设备节点(等价设备管理器"停用→启用"的属性变更), 使驱动重读 PortName 立即生效。

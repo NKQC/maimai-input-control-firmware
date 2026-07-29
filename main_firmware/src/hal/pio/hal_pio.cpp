@@ -54,14 +54,11 @@ void HAL_PIO0::deinit() {
 }
 
 bool HAL_PIO0::load_program(const pio_program_t* program, uint8_t* offset) {
-    if (!initialized_) return false;
-    
-    uint program_offset = pio_add_program(pio0, program);
-    if (program_offset == -1) {
+    if (!initialized_ || program == nullptr || offset == nullptr || !pio_can_add_program(pio0, program)) {
         return false;
     }
-    
-    *offset = program_offset;
+
+    *offset = (uint8_t)pio_add_program(pio0, program);
     return true;
 }
 
@@ -263,14 +260,14 @@ void HAL_PIO1::deinit() {
 }
 
 bool HAL_PIO1::load_program(const pio_program_t* program, uint8_t* offset) {
-    if (!initialized_) return false;
-    
-    uint program_offset = pio_add_program(pio1, program);
-    if (program_offset == -1) {
+    // pio_add_program 在指令内存放不下时是 hard_assert(直接死机), 不返回错误码;
+    // 故必须先 pio_can_add_program 预检 —— PIO1 同时挂 PSoC SPI(7 指令) 与两条 WS2812
+    // (各 4 指令), 第二条链加载失败必须能被优雅拒绝并上报, 而不是把整机拖挂。
+    if (!initialized_ || program == nullptr || offset == nullptr || !pio_can_add_program(pio1, program)) {
         return false;
     }
-    
-    *offset = program_offset;
+
+    *offset = (uint8_t)pio_add_program(pio1, program);
     return true;
 }
 

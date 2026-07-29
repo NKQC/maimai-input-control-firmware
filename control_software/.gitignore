@@ -1,1 +1,4 @@
 /target
+# MSBuild 中间/输出目录(媒体源 C++ 子项目)
+/vcam_source_cpp/x64/
+/vcam_source_cpp/packages/

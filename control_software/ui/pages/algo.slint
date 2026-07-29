@@ -1,0 +1,332 @@
+import { Button, ComboBox, VerticalBox, HorizontalBox, ScrollView, TextEdit } from "std-widgets.slint";
+import { AlgoReportLine, AlgoSettingRow } from "../common/types.slint";
+import { AlgoSettingEditorRow } from "../common/widgets.slint";
+
+
+// ============================================================================
+// 算法页:JIT 触控算法管理 + C→ASM 编译器 + 全局 CSD 设置
+// ============================================================================
+
+export component AlgoPage inherits Rectangle {
+    in property <string> algo_info_text: "算法信息未读取";
+    in-out property <string> algo_c_source;
+    in property <string> algo_line_numbers: "1";   // 行号列(由 main.rs 随源码行数回填)
+    in property <string> algo_status: "";
+    // 编译/上传同步执行时的阶段反馈；忙碌期间锁定一键操作以避免重入。
+    in property <bool> algo_busy: false;
+    in property <string> algo_phase: "";
+    in property <string> algo_asm: "";   // 编译产物反汇编(objdump -d .text)
+    in property <int> algo_asm_bytes: 0;      // 最近一次编译产物字节数(进度条用)
+    in property <int> algo_asm_capacity: 1024; // PSoC 可执行槽容量(字节)
+    property <int> editor_tab: 0;        // 0=C 源 1=反汇编 ASM(复用同一编辑面板)
+    // 右侧子标签: 0=原生(C源/反汇编) 1=算法上报(report[]折线+触发判定追踪) 2=可调变量(cfg[8])
+    property <int> content_tab: 0;
+    callback algo_refresh();
+    callback algo_reset_default();
+    callback algo_compile(string);       // 仅编译(算 ASM 大小/塞得下校验), 不上传(保留供内部/兼容)
+    callback algo_upload();              // 上传最近一次编译产物(保留供内部/兼容)
+    callback algo_build_upload(string);  // ★一键: 编译+校验+成功则上传★
+    callback algo_load_template(int);    // 载入内置算法模板到编辑器: 0=v3.1 HDR, 1=纯白灯演示
+    callback algo_source_edited(string); // 编辑时回传, main.rs 据此刷新行号
+
+    // 算法上报(report[]折线 + 触发判定追踪), 由 main.rs::build_algo_trace_view 回填。
+    in property <int> algo_sel_channel: 0;    // 当前追踪通道(与单通道精调页 sel_channel 一致, 只读展示)
+    in property <[AlgoReportLine]> algo_report_lines: [];
+    in property <string> algo_active_path: "";     // 触发判定(out_active)追踪折线
+    in property <int> algo_trace_point_count: 0;
+    // 可调变量(cfg[8]), 由 main.rs::build_algo_setting_rows 回填。
+    in property <[AlgoSettingRow]> algo_setting_rows: [];
+    callback algo_setting_edited(int, int);
+    callback report_toggle(int, bool);
+
+    // ★整页装进 ScrollView★ 本页(标题 + 两行标签栏 + 编辑区下限 140px + 编译栏 + 容量条)的
+    // min-height 约 420px, 与设置页底部 46px 保存栏在 520px 高窗口里贴得极近; TabWidget 的
+    // min 覆盖只保证保存栏留在视口内, 页内溢出仍会画到它上面。ScrollView 自身 min 只有 50px,
+    // 且 viewport-height = max(视口高, 子布局 min-height): 窗口矮时页内滚动, 窗口高时照常铺满。
+    ScrollView {
+        VerticalBox {
+            padding: 10px;
+            spacing: 8px;
+
+            Text { text: "JIT 触控算法"; color: #e0e6ee; font-size: 16px; }
+            HorizontalBox {
+                spacing: 8px;
+                Button { text: "读取信息"; clicked => { root.algo_refresh(); } }
+                Text { text: "模板:"; color: #b0b8c0; vertical-alignment: center; }
+                tpl_sel := ComboBox {
+                    model: ["v3.1 HDR 默认", "纯白灯演示(触摸点亮)"];
+                    current-index: 0;
+                }
+                Button { text: "加载模板"; clicked => { root.algo_load_template(tpl_sel.current-index); } }
+                Text { text: root.algo_info_text; color: #b0b8c0; wrap: word-wrap; horizontal-stretch: 1; vertical-alignment: center; }
+            }
+
+            // 右侧三子标签: 原生 / 算法上报 / 可调变量, 明确分界线与顶部工具栏分离。
+            HorizontalBox {
+                spacing: 6px;
+                Rectangle {
+                    // min-width 而非 width: 标签行末尾有 stretch 空白吸收多余宽度, 视觉与固定宽一致,
+                    // 但字体/文案变长时按钮会自己变宽而不是把字裁掉。
+                    min-width: 90px; height: 30px; border-radius: 4px;
+                    background: root.content_tab == 0 ? #2b7de9 : #23282e;
+                    Text { text: "原生"; color: #ffffff; horizontal-alignment: center; vertical-alignment: center; }
+                    TouchArea { clicked => { root.content_tab = 0; } }
+                }
+                Rectangle {
+                    min-width: 110px; height: 30px; border-radius: 4px;
+                    background: root.content_tab == 1 ? #2b7de9 : #23282e;
+                    Text { text: "算法上报"; color: #ffffff; horizontal-alignment: center; vertical-alignment: center; }
+                    TouchArea { clicked => { root.content_tab = 1; } }
+                }
+                Rectangle {
+                    min-width: 110px; height: 30px; border-radius: 4px;
+                    background: root.content_tab == 2 ? #2b7de9 : #23282e;
+                    Text { text: "可调变量"; color: #ffffff; horizontal-alignment: center; vertical-alignment: center; }
+                    TouchArea { clicked => { root.content_tab = 2; } }
+                }
+                Rectangle { horizontal-stretch: 1; }
+            }
+            Rectangle { height: 1px; background: #3a434c; }
+
+            if root.content_tab == 0: VerticalBox {
+                padding: 0px;
+                spacing: 8px;
+
+                // C 源 / 反汇编 子标签(复用下方同一编辑面板, 而非上下两块)。
+                HorizontalBox {
+                    spacing: 6px;
+                    Rectangle {
+                        min-width: 90px; height: 30px; border-radius: 4px;
+                        background: root.editor_tab == 0 ? #2b7de9 : #23282e;
+                        Text { text: "C 源"; color: #ffffff; horizontal-alignment: center; vertical-alignment: center; }
+                        TouchArea { clicked => { root.editor_tab = 0; } }
+                    }
+                    Rectangle {
+                        min-width: 120px; height: 30px; border-radius: 4px;
+                        background: root.editor_tab == 1 ? #2b7de9 : #23282e;
+                        Text { text: "反汇编 ASM"; color: #ffffff; horizontal-alignment: center; vertical-alignment: center; }
+                        TouchArea { clicked => { root.editor_tab = 1; } }
+                    }
+                    Rectangle { horizontal-stretch: 1; }
+                }
+                Text {
+                    text: root.editor_tab == 0
+                        ? "编辑触控算法源代码。"
+                        : "查看只读反汇编。";
+                    color: #b0b8c0; wrap: word-wrap;
+                }
+
+                // 编辑面板: C 源(行号 gutter + 可编辑) 与 ASM(只读) 共用此区域。
+                // ★★这里必须是固定 height, 不能用 min-height + vertical-stretch★★
+                // 本 Rectangle 内部的 TextEdit/Flickable 用 `parent.width/height` 绑自身尺寸。
+                // 一旦本 Rectangle 不再是固定高, 它的 layout info 就改为取子元素的 min, 于是
+                // TextEdit.min ← TextEdit.width ← parent.width ← 本 Rectangle 的 min ← TextEdit.min
+                // 形成闭环, Slint 布局求值无限递归 → 一进设置页就
+                // "thread 'main' has overflowed its stack"(TabWidget 实例化所有子页, 一页有环全崩;
+                // 实测二分定位到本页)。整页已装进 ScrollView, 固定高不会再撑破保存栏 —— 窗口矮时页内滚动。
+                Rectangle {
+                    height: 300px;
+                    background: #14181c;
+                    border-width: 1px;
+                    border-color: #3a3a3a;
+                    clip: true;
+
+                    // C 源: Flickable 内 gutter + TextInput 同步滚动, 行号与代码始终对齐。
+                    Flickable {
+                        visible: root.editor_tab == 0;
+                        HorizontalLayout {
+                            spacing: 6px;
+                            alignment: start;
+                            Rectangle {
+                                width: 48px;
+                                background: #1c2228;
+                                Text {
+                                    x: 0; y: 4px; width: parent.width - 8px;
+                                    text: root.algo_line_numbers;
+                                    color: #6b7680;
+                                    font-size: 13px;
+                                    font-family: "Consolas";
+                                    horizontal-alignment: right;
+                                }
+                            }
+                            TextInput {
+                                text <=> root.algo_c_source;
+                                single-line: false;
+                                wrap: no-wrap;
+                                color: #d8e0e8;
+                                font-size: 13px;
+                                font-family: "Consolas";
+                                edited => { root.algo_source_edited(self.text); }
+                            }
+                        }
+                    }
+                    // 反汇编: 只读 TextEdit(自带滚动条, 可查看全部指令)。
+                    TextEdit {
+                        visible: root.editor_tab == 1;
+                        width: parent.width;
+                        height: parent.height;
+                        read-only: true;
+                        text: root.algo_asm;
+                        font-size: 12px;
+                    }
+                }
+
+                // ★编译与上传合并为一个按钮★: 一次点击=编译+容量校验+(成功则)下发, 不再分两步。
+                HorizontalBox {
+                    spacing: 8px;
+                    Button {
+                        text: root.algo_busy ? root.algo_phase : "编译并上传";
+                        enabled: !root.algo_busy;
+                        clicked => { root.algo_build_upload(root.algo_c_source); }
+                    }
+                    Text {
+                        text: root.algo_busy ? root.algo_phase : root.algo_status;
+                        color: root.algo_busy ? #8fd6ff : #e0e6ee;
+                        wrap: word-wrap;
+                        horizontal-stretch: 1;
+                        vertical-alignment: center;
+                    }
+                }
+
+                // ASM 空间占用进度条: 占用 = 编译产物字节 / PSoC 槽容量。满槽=红, 富余=绿。
+                VerticalBox {
+                    padding: 0px;
+                    spacing: 3px;
+                    Text {
+                        text: "ASM：" + root.algo_asm_bytes + " / " + root.algo_asm_capacity + " 字节"
+                            + (root.algo_asm_capacity > 0
+                                ? ("  (" + Math.round(root.algo_asm_bytes * 100 / root.algo_asm_capacity) + "%)")
+                                : "")
+                            + (root.algo_asm_bytes > 0 ? "  可上传" : "  未编译");
+                        color: #b0b8c0;
+                        font-size: 11px;
+                    }
+                    Rectangle {
+                        height: 10px;
+                        // ★显式 min-width 是断环所必需★: 内层进度条宽度按 parent.width 取比例, 若本
+                        // Rectangle 不给 min-width, 它的 min 就去取子元素 min → 子 min ← 子 width ←
+                        // parent.width ← 本 Rectangle 的 min, 闭环 → 布局无限递归栈溢出。给常量下限后
+                        // 本 Rectangle 的 min 与子元素无关, 实际宽度仍由布局按 stretch 分配。
+                        min-width: 120px;
+                        border-radius: 5px;
+                        background: #23282e;
+                        clip: true;
+                        Rectangle {
+                            x: 0;
+                            width: root.algo_asm_capacity > 0
+                                ? (parent.width * Math.min(1.0, root.algo_asm_bytes / root.algo_asm_capacity))
+                                : 0px;
+                            height: parent.height;
+                            border-radius: 5px;
+                            background: (root.algo_asm_bytes * 10 > root.algo_asm_capacity * 9) ? #f5a623 : #2b8a3e;
+                        }
+                    }
+                }
+            }
+
+            if root.content_tab == 1: VerticalBox {
+                padding: 0px;
+                spacing: 8px;
+
+                Text {
+                    text: "追踪通道：CH" + root.algo_sel_channel + "。";
+                    color: #8fd6ff;
+                    font-size: 12px;
+                }
+
+                // 上报变量折线图: 静态 viewbox(main.rs 已归一化到 0..1000), 无交互缩放(信息量小, 从简)。
+                // ★同编辑面板: 必须固定 height★ 内部 report_plot 与 Path 都用 parent.width/height 绑尺寸,
+                // 一旦本 Rectangle 改成 min-height + stretch, 它的 min 就取子元素 min, 与子元素对
+                // parent.* 的依赖构成闭环 → 布局求值无限递归 → 进设置页栈溢出崩溃。整页已在 ScrollView
+                // 内, 固定高不会撑破保存栏。
+                Rectangle {
+                    height: 240px;
+                    background: #101418;
+                    border-width: 1px;
+                    border-color: #3a3a3a;
+                    clip: true;
+
+                    report_plot := Rectangle {
+                        x: 8px; y: 8px;
+                        width: parent.width - 16px;
+                        height: parent.height - 16px;
+                        background: #12181d;
+                        border-width: 1px;
+                        border-color: #29323a;
+
+                        for line in root.algo_report_lines: Path {
+                            x: 0; y: 0; width: parent.width; height: parent.height;
+                            viewbox-x: 0; viewbox-y: 0; viewbox-width: 1000; viewbox-height: 1000;
+                            commands: line.path;
+                            stroke: line.line_color;
+                            stroke-width: 2px;
+                            visible: line.visible && root.algo_trace_point_count > 0;
+                        }
+                    }
+                    Text {
+                        x: 12px; y: 4px;
+                        text: root.algo_trace_point_count > 0 ? "" : "暂无追踪数据";
+                        color: #77828c;
+                        font-size: 11px;
+                    }
+                }
+                // 图例: 逐个上报变量名称+色块。
+                HorizontalBox {
+                    spacing: 12px;
+                    for line in root.algo_report_lines: HorizontalBox {
+                        padding: 0px;
+                        spacing: 4px;
+                        visible: line.visible;
+                        Rectangle { width: 10px; height: 10px; background: line.line_color; }
+                        Text { text: line.name; color: #b0b8c0; font-size: 11px; vertical-alignment: center; }
+                    }
+                }
+
+                Text { text: "显示触发判定状态。"; color: #b0b8c0; font-size: 11px; }
+                // 0/1 阶梯线的窄带: 只需看出高低电平。★同上必须固定 height★(内部 Path 绑 parent.*,
+                // 用 min-height 会让本 Rectangle 的 min 取子 min 从而成环)。
+                Rectangle {
+                    height: 70px;
+                    background: #101418;
+                    border-width: 1px;
+                    border-color: #3a3a3a;
+                    clip: true;
+                    Path {
+                        x: 4px; y: 4px;
+                        width: parent.width - 8px; height: parent.height - 8px;
+                        viewbox-x: 0; viewbox-y: 0; viewbox-width: 1000; viewbox-height: 1000;
+                        commands: root.algo_active_path;
+                        stroke: #ff3399;
+                        stroke-width: 2px;
+                        visible: root.algo_trace_point_count > 0;
+                    }
+                }
+            }
+
+            if root.content_tab == 2: VerticalBox {
+                padding: 0px;
+                spacing: 6px;
+                Text {
+                    text: "可调变量：修改立即下发并持久化。";
+                    color: #b0b8c0;
+                    wrap: word-wrap;
+                }
+                if root.algo_setting_rows.length == 0: Text {
+                    text: "当前源码未声明任何 ALGO_SETTING(idx,\"name\",defval)。";
+                    color: #77828c;
+                }
+                ScrollView {
+                    vertical-stretch: 1;
+                    VerticalBox {
+                        padding: 0px;
+                        spacing: 2px;
+                        for row in root.algo_setting_rows: AlgoSettingEditorRow {
+                            entry: row;
+                            edited(idx, v) => { root.algo_setting_edited(idx, v); }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

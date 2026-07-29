@@ -11,15 +11,17 @@ import sys
 DXF_PATH = r"F:\maimaicontrol-V3.0\V4 Build\外边构造\touch_map_37inch_16x9.dxf"
 OUT_PATH = r"F:\mai2control\mai2control-v4\control_software\src\touch_geometry.rs"
 
-# 34 区几何候选映射 (index 0..33 -> REGION_NN), 与既定架构结论一致:
-# A=[R20,R22,R24,R26,R28,R30,R32,R34] B=[R03..R10] C=[R01,R02]
-# D=[R19,R21,R23,R25,R27,R29,R31,R33] E=[R18,R11,R12,R13,R14,R15,R16,R17]
+# 34 区名 -> DXF REGION_NN 映射。索引即绑定 index(0..33)。
+# 方位基准取自 ITO 触摸区域映射图: D1 正上方, 序号沿顺时针递增(A1 右上 22.5°, D3/E3 正右 90°,
+# D5 正下 180°, D7 正左 270°), C1 在右、C2 在左。
+# 旧表按逆时针(等价于绕水平轴上下镜像)取区, 于是 D1 落到正下、A1 落到右下 —— 序号整体上下翻转。
+# 此处把每个名字改指向"镜像后该方位对应的区号", 几何本身不动(区形状与 DXF 一致)。
 ZONE_TO_REGION = (
-    [20, 22, 24, 26, 28, 30, 32, 34]   # A1..A8 (idx 0..7)
-    + [3, 4, 5, 6, 7, 8, 9, 10]         # B1..B8 (idx 8..15)
-    + [1, 2]                           # C1..C2 (idx 16..17)
-    + [19, 21, 23, 25, 27, 29, 31, 33]  # D1..D8 (idx 18..25)
-    + [18, 11, 12, 13, 14, 15, 16, 17]  # E1..E8 (idx 26..33)
+    [26, 24, 22, 20, 34, 32, 30, 28]   # A1..A8 (idx 0..7)   A1 右上 22.5° 起顺时针
+    + [6, 5, 4, 3, 10, 9, 8, 7]         # B1..B8 (idx 8..15)  与 A 同方位序
+    + [1, 2]                           # C1..C2 (idx 16..17) C1 右 / C2 左, 不受上下镜像影响
+    + [27, 25, 23, 21, 19, 33, 31, 29]  # D1..D8 (idx 18..25) D1 正上 0° 起顺时针
+    + [14, 13, 12, 11, 18, 17, 16, 15]  # E1..E8 (idx 26..33) E1 正上 0° 起顺时针
 )
 assert len(ZONE_TO_REGION) == 34
 assert len(set(ZONE_TO_REGION)) == 34
@@ -322,6 +324,25 @@ def main():
     out.append(f"pub const SCREEN_H: f32 = {ui_h:.4f};")
     out.append("")
     out.append("/// 单个逻辑分区(0..33)的静态几何: SVG path(M/L/A/Z) + 局部包围盒 + 标签点,")
+    # content_bbox 必须由生成器一并输出: 它是 UI 的绘制视框来源, 早先手写在 touch_geometry.rs 里,
+    # 重新生成时会被整文件覆盖而丢失(编译报 "cannot find function content_bbox")。
+    out.append("/// 全部分区几何并集的紧包围盒 (min_x, min_y, width, height)。")
+    out.append("/// 触控为圆形布局, 在 16:9 视框里四周有大量留白; UI 用本 bbox 作绘制视框,")
+    out.append("/// 使分区图铺满画布而非缩在中间。命中检测仍在 SCREEN 坐标系。")
+    out.append("pub fn content_bbox() -> (f32, f32, f32, f32) {")
+    out.append("    let mut min_x = f32::INFINITY;")
+    out.append("    let mut min_y = f32::INFINITY;")
+    out.append("    let mut max_x = f32::NEG_INFINITY;")
+    out.append("    let mut max_y = f32::NEG_INFINITY;")
+    out.append("    for g in ZONE_GEOMETRY.iter() {")
+    out.append("        min_x = min_x.min(g.min_x);")
+    out.append("        min_y = min_y.min(g.min_y);")
+    out.append("        max_x = max_x.max(g.min_x + g.width);")
+    out.append("        max_y = max_y.max(g.min_y + g.height);")
+    out.append("    }")
+    out.append("    (min_x, min_y, max_x - min_x, max_y - min_y)")
+    out.append("}")
+    out.append("")
     out.append("/// 均在 [`SCREEN_W`]x[`SCREEN_H`] 坐标系下。")
     out.append("pub struct ZoneStaticGeometry {")
     out.append("    pub region_id: u8,")

@@ -1,0 +1,169 @@
+// ============================================================================
+// 日志页(第 4 功能区): 连接/调试日志, 与主页/设置/工具箱齐平, 取代原主页内嵌日志框
+// ============================================================================
+
+import { VerticalBox, HorizontalBox, CheckBox, ComboBox, ScrollView, Button } from "std-widgets.slint";
+import { Theme } from "../common/theme.slint";
+
+export component LogPage inherits Rectangle {
+    // 视图文本与独立行号列由 Rust 同步回填，结构复用算法编辑器的 gutter + TextInput。
+    in property <string> log_text: "";
+    in property <string> log_line_numbers: "";
+    in-out property <int> log_filter: 2;   // 0=错误 1=警告 2=信息(默认) 3=调试(含原始数据交互/诊断)
+    property <bool> _log_at_bottom: true;
+
+    in-out property <bool> log_auto_scroll: true;
+    in property <bool> log_file_on: true;
+    in property <string> log_file_path: "";
+    in property <string> log_stats: "";
+    callback set_log_filter(int);
+
+    callback clear_log();
+    callback copy_log_all();
+    callback open_log_dir();
+    callback set_log_file_enabled(bool);
+    background: Theme.panel-deep;
+
+    VerticalBox {
+        padding: 12px;
+        spacing: Theme.gap;
+
+        HorizontalBox {
+            padding: 0px;
+            spacing: 8px;
+            Text {
+                text: @tr("连接 / 调试日志");
+                font-weight: 700;
+                font-size: 15px;
+                color: Theme.text-title;
+                vertical-alignment: center;
+            }
+            Rectangle { horizontal-stretch: 1; }
+            CheckBox {
+                text: @tr("自动滚动");
+                checked: root.log_auto_scroll;
+                toggled => {
+                    root.log_auto_scroll = self.checked;
+                    if (self.checked) {
+                        root._log_at_bottom = true;
+                        lv.viewport-y = min(0px, lv.visible-height - lv.viewport-height);
+                    }
+                }
+            }
+            CheckBox {
+                text: @tr("落盘到 logs/");
+                checked: root.log_file_on;
+                toggled => { root.set_log_file_enabled(self.checked); }
+            }
+            Text {
+                text: @tr("过滤等级:");
+                color: Theme.text-sub;
+                font-size: Theme.fs-title;
+                vertical-alignment: center;
+            }
+            ComboBox {
+                model: [@tr("错误"), @tr("警告"), @tr("信息"), @tr("调试(原始交互/诊断)")];
+                current-index <=> root.log_filter;
+                selected(v) => { root.set_log_filter(self.current-index); }
+            }
+        }
+
+        Rectangle {
+            border-radius: 8px;
+            background: #1a1e23;
+            border-color: Theme.border;
+            border-width: 1px;
+            vertical-stretch: 1;
+
+            lv := ScrollView {
+                x: 1px;
+                y: 1px;
+                width: parent.width - 2px;
+                height: parent.height - 2px;
+
+                // 用户滚离底部后保留当前位置；只有本就在底部时，新日志才继续跟随。
+                changed viewport-y => {
+                    root._log_at_bottom = self.viewport-y <= min(0px, self.visible-height - self.viewport-height) + 1px;
+                }
+                changed viewport-height => {
+                    if (root.log_auto_scroll && root._log_at_bottom) {
+                        self.viewport-y = min(0px, self.visible-height - self.viewport-height);
+                    }
+                }
+
+                HorizontalLayout {
+                    spacing: Theme.gap;
+                    alignment: start;
+                    Rectangle {
+                        width: 48px;
+                        background: Theme.panel;
+                        Text {
+                            x: 0px;
+                            y: 4px;
+                            width: parent.width - 8px;
+                            text: root.log_line_numbers;
+                            color: #6b7680;
+                            font-size: Theme.fs-normal;
+                            font-family: "Consolas";
+                            horizontal-alignment: right;
+                        }
+                    }
+                    TextInput {
+                        text: root.log_text;
+                        read-only: true;
+                        single-line: false;
+                        wrap: no-wrap;
+                        font-family: "Consolas";
+                        font-size: Theme.fs-normal;
+                        color: #cfe8d4;
+                        selection-background-color: #2c4f6b;
+                        selection-foreground-color: Theme.text-title;
+                    }
+                }
+            }
+        }
+
+        HorizontalBox {
+            padding: 0px;
+            spacing: 8px;
+            Text {
+                text: root.log_stats;
+                color: Theme.text-dim;
+                font-size: Theme.fs-normal;
+                vertical-alignment: center;
+                overflow: elide;
+                horizontal-stretch: 1;
+            }
+            Text {
+                text: @tr("提示: 滚轮/滚动条浏览，直接拖选可复制(Ctrl+C)；“清空视图”只清界面，日志文件照常追加");
+                color: Theme.text-dim;
+                font-size: Theme.fs-normal;
+                vertical-alignment: center;
+                // 这句提示不加 elide 时, 它整串文字的宽度就是本栏 min-width(约 700px), 窄窗口下会把
+                // 右边三个按钮挤出可视区。提示是最不重要的元素, 让它先省略。
+                wrap: no-wrap;
+                overflow: elide;
+            }
+            Button {
+                // 只清内存视图: 磁盘 logs/ 里那份继续追加, 事后仍可取证(见 logging::LogHub::clear)。
+                text: @tr("清空视图");
+                clicked => { root.clear_log(); }
+            }
+            Button {
+                text: @tr("复制全部(当前视图)");
+                clicked => { root.copy_log_all(); }
+            }
+            Button {
+                text: @tr("打开日志目录");
+                clicked => { root.open_log_dir(); }
+            }
+        }
+
+        Text {
+            text: root.log_file_path == "" ? @tr("日志落盘已关闭") : @tr("当前日志文件: ") + root.log_file_path;
+            color: #5c6773;
+            font-size: Theme.fs-small;
+            overflow: elide;
+        }
+    }
+}

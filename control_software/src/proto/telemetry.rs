@@ -112,6 +112,12 @@ pub fn encode_param_get_all(channel: u8) -> Vec<u8> {
     vec![channel]
 }
 
+/// 编码 PARAM_GET_ALL 的"全通道单参数"变体请求载荷。
+/// payload = 0xFF + param_id(u8) → 一帧回全 36 通道的该参数值(替代 36 条单发 PARAM_GET)。
+pub fn encode_param_get_all_channels(param_id: u8) -> Vec<u8> {
+    vec![PARAM_ALL_CHANNELS, param_id]
+}
+
 /// 编码 CP_MEASURE 请求载荷（空）。
 pub fn encode_cp_measure() -> Vec<u8> {
     Vec::new()
@@ -146,6 +152,11 @@ pub fn encode_ch_mask(ch_mask: u64) -> Vec<u8> {
 #[derive(Debug, Clone)]
 pub struct ChannelSample {
     pub ch: u8,
+    /// 采样所属帧的设备端时间戳(us, 原样搬运 TelemFrame.ts_us)。
+    /// ★为什么每个样本都带★: 折线图的横轴必须是真实时间而不是等间距序号 —— 掉帧/暂停时
+    /// 等间距会把时间轴画错。32 位 us 约 71 分钟回绕, 回绕展开在 app_state 侧统一处理
+    /// (这里保持协议原值, 不做任何加工, 便于日志与协议排查对齐)。
+    pub t_us: u32,
     pub raw: Option<u16>,
     pub bsln: Option<u16>,
     pub diff: Option<i16>,
@@ -232,7 +243,8 @@ pub fn decode_telem_data(payload: &[u8]) -> Result<TelemFrame, String> {
         let ch = payload[pos];
         pos += 1;
 
-        let mut sample = ChannelSample { ch, raw: None, bsln: None, diff: None, status: None };
+        // 帧内所有通道同属一次扫描 → 共用帧级 ts_us 作为该样本的设备时间。
+        let mut sample = ChannelSample { ch, t_us: ts_us, raw: None, bsln: None, diff: None, status: None };
 
         // RAW (u16 LE)?
         if (fields & FIELD_RAW) != 0 {
@@ -306,6 +318,104 @@ pub fn decode_param_get(payload: &[u8]) -> Result<(u8, u8, u32), String> {
         | ((payload[5] as u32) << 24);
 
     Ok((ch, param_id, value))
+}
+
+/// AUTO_TUNE_PROGRESS(0x2E) 推送帧: 设备侧频率自适应的阶段性进度/终态。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AutoTuneProgress {
+    /// 0=空闲 1=进行中 2=完成
+    pub state: u8,
+    /// 0=已受理 1=粗定位 2=细搜临界 3=落档/回退 4=完成
+    pub phase: u8,
+    /// 当前阶段内步序(1 起, 设备侧上报饱和 31)
+    pub step: u8,
+    /// 进行中: 当前正在试探的 snsClk 分频
+    pub cur_div: u16,
+    /// 目标通道(0..35 单通道 / 0xFF 全通道)
+    pub ch: u8,
+    /// 0=进行中 1=成功 2=失败/超时
+    pub result: u8,
+    /// 完成时最终写入的分频(失败为 0)
+    pub final_div: u16,
+}
+
+impl AutoTuneProgress {
+    /// 阶段中文名(供 UI 的"处理中"文案)。
+    pub fn phase_text(&self) -> &'static str {
+        match self.phase {
+            1 => "粗定位",
+            2 => "细搜临界",
+            3 => "落档校验",
+            4 => "完成",
+            _ => "已受理",
+        }
+    }
+}
+
+/// 解码 AUTO_TUNE_PROGRESS 推送载荷。
+/// payload = state(u8) + phase(u8) + step(u8) + cur_div(u16 LE) + ch(u8) + result(u8) + final_div(u16 LE)
+pub fn decode_auto_tune_progress(payload: &[u8]) -> Result<AutoTuneProgress, String> {
+    if payload.len() < 9 {
+        return Err(format!(
+            "AUTO_TUNE_PROGRESS payload must be >= 9 bytes, got {}",
+            payload.len()
+        ));
+    }
+    Ok(AutoTuneProgress {
+        state: payload[0],
+        phase: payload[1],
+        step: payload[2],
+        cur_div: u16::from_le_bytes([payload[3], payload[4]]),
+        ch: payload[5],
+        result: payload[6],
+        final_div: u16::from_le_bytes([payload[7], payload[8]]),
+    })
+}
+
+/// PSOC_RESCUE_PROGRESS(0x09) 推送帧: 设备侧"PSoC 救砖"(强制重刷 + 重新应用)的阶段进度/终态。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PsocRescueProgress {
+    /// 0=空闲 1=进行中 2=完成
+    pub state: u8,
+    /// 0=空闲 1=SWD 重刷中 2=重新应用(重下发算法/CSD) 3=完成 4=失败
+    pub phase: u8,
+    /// 0=进行中 1=成功 2=失败
+    pub result: u8,
+    /// bring-up 阶段码(PsocBringupStage: 8=擦除 9=写入 10=校验和 12=校验 13=运行 14=完成)
+    pub stage: u8,
+    /// 失败阶段码(0=无)
+    pub fail_stage: u8,
+}
+
+impl PsocRescueProgress {
+    /// 阶段中文名(供 UI 的"处理中"文案)。
+    pub fn phase_text(&self) -> &'static str {
+        match self.phase {
+            1 => "SWD 重刷中",
+            2 => "重新应用算法/CSD",
+            3 => "完成",
+            4 => "失败",
+            _ => "已受理",
+        }
+    }
+}
+
+/// 解码 PSOC_RESCUE_PROGRESS 推送载荷。
+/// payload = state(u8) + phase(u8) + result(u8) + stage(u8) + fail_stage(u8)
+pub fn decode_psoc_rescue_progress(payload: &[u8]) -> Result<PsocRescueProgress, String> {
+    if payload.len() < 5 {
+        return Err(format!(
+            "PSOC_RESCUE_PROGRESS payload must be >= 5 bytes, got {}",
+            payload.len()
+        ));
+    }
+    Ok(PsocRescueProgress {
+        state: payload[0],
+        phase: payload[1],
+        result: payload[2],
+        stage: payload[3],
+        fail_stage: payload[4],
+    })
 }
 
 /// 解码 CP_GET 响应载荷。
@@ -596,4 +706,39 @@ mod tests {
         let result = decode_param_get(&payload);
         assert!(result.is_err());
     }
+}
+
+/// PARAM_GET_ALL 的"全通道单参数"标记(请求与响应的 payload[0])。
+pub const PARAM_ALL_CHANNELS: u8 = 0xFF;
+
+/// 解码 PARAM_GET_ALL 的"全通道单参数"响应载荷
+/// payload = 0xFF + param_id(u8) + count(u8) + [channel(u8) + value(u32 LE)]×count
+/// 返回 (param_id, Vec<(channel, value)>)
+pub fn decode_param_get_all_channels(payload: &[u8]) -> Result<(u8, Vec<(u8, u32)>), String> {
+    if payload.len() < 3 || payload[0] != PARAM_ALL_CHANNELS {
+        return Err("PARAM_GET_ALL(all channels) response malformed".to_string());
+    }
+    let param_id = payload[1];
+    let count = payload[2] as usize;
+    let mut values = Vec::with_capacity(count);
+    let mut pos = 3;
+    for _ in 0..count {
+        if pos + 5 > payload.len() {
+            return Err(format!(
+                "PARAM_GET_ALL(all channels) truncated: expected {} entries, got {}",
+                count,
+                values.len()
+            ));
+        }
+        let ch = payload[pos];
+        let value = u32::from_le_bytes([
+            payload[pos + 1],
+            payload[pos + 2],
+            payload[pos + 3],
+            payload[pos + 4],
+        ]);
+        pos += 5;
+        values.push((ch, value));
+    }
+    Ok((param_id, values))
 }

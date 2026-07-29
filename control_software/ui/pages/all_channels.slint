@@ -1,0 +1,353 @@
+// ============================================================================
+// 全通道实时状态页
+// ============================================================================
+
+import { Button, CheckBox, VerticalBox, HorizontalBox, ScrollView } from "std-widgets.slint";
+import { ChannelStatus } from "../common/types.slint";
+import { Theme } from "../common/theme.slint";
+
+component ChannelStatusCell inherits Rectangle {
+    in property <ChannelStatus> entry;
+    in property <bool> selected: false;
+    // 抽屉展开时本卡片变为"可勾选": 单击切换勾选而不是切换精调目标, 双击行为不变。
+    in property <bool> pick_mode: false;
+    in property <bool> picked: false;
+
+    callback activated(int);   // 双击 → 进入单通道精调
+    callback selected_click(int); // 单击 → 仅高亮选中
+    callback picked_click(int);   // 勾选模式下的单击 → 切换勾选
+
+    width: 124px;
+    height: 90px;
+    border-width: (root.selected || root.picked) ? 2px : 1px;
+    border-color: root.picked ? #ffd166 : (root.selected ? #4fc3f7 : touch.has-hover ? #6b8191 : Theme.border-light);
+    // 触摸、选择和 hover 都有区分明确的反馈; 勾选态再叠一层暖色边框与角标, 与"当前精调通道"区分。
+    background: root.picked ? #3a3320
+        : (root.selected ? #203b4a : touch.has-hover ? #242c33 : root.entry.active ? #245f35 : #1a1e22);
+    border-radius: 5px;
+
+    // 勾选角标: 只在勾选模式下出现, 避免平时多一块视觉噪声。
+    Rectangle {
+        visible: root.pick_mode;
+        x: root.width - 18px;
+        y: 4px;
+        width: 14px;
+        height: 14px;
+        border-radius: 3px;
+        border-width: 1px;
+        border-color: root.picked ? #ffd166 : #6b8191;
+        background: root.picked ? #ffd166 : transparent;
+        Text {
+            text: root.picked ? "✓" : "";
+            font-size: 10px;
+            color: #2a2418;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+    }
+
+    VerticalBox {
+        padding: 5px;
+        spacing: 1px;
+        HorizontalBox {
+            padding: 0px;
+            spacing: 4px;
+            Text {
+                text: root.entry.label;
+                font-weight: 700;
+                color: Theme.text-title;
+                min-width: 38px;
+            }
+            Text {
+                // 停滞优先提示: raw 长时间完全不变疑似异常, 明确标红, 不再让人猜是否真值。
+                text: root.entry.frozen ? @tr("⚠停滞") : (root.entry.active ? @tr("触摸") : @tr("空闲"));
+                font-size: Theme.fs-small;
+                color: root.entry.frozen ? #ff8c42 : (root.entry.active ? #d0ffd0 : #85929d);
+            }
+        }
+        Text {
+            text: "raw " + root.entry.raw + "  diff " + root.entry.diff;
+            font-size: Theme.fs-normal;
+            color: root.entry.frozen ? #ff8c42 : #c4ccd3;
+        }
+        Text {
+            text: @tr("逻辑区: ") + root.entry.binding_text;
+            font-size: Theme.fs-small;
+            color: root.entry.binding_text == "未绑定" ? #77828c : Theme.accent;
+        }
+        Text {
+            text: root.entry.cp_text;
+            font-size: Theme.fs-small;
+            color: Theme.accent;
+        }
+    }
+
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => {
+            if (root.pick_mode) {
+                root.picked_click(root.entry.index);
+            } else {
+                root.selected_click(root.entry.index);
+            }
+        }
+        double-clicked => { root.activated(root.entry.index); }
+    }
+}
+
+// 批量应用抽屉里的一行"参数复选框"。每个参数各自独立勾选, 只有勾上的才会被写到目标通道。
+component BatchParamRow inherits Rectangle {
+    in property <string> label;
+    in property <bool> checked: false;
+    in property <string> value_text: "";
+    callback toggled();
+
+    height: 26px;
+    HorizontalLayout {
+        spacing: 6px;
+        CheckBox {
+            width: 22px;
+            checked: root.checked;
+            toggled => { root.toggled(); }
+        }
+        Text {
+            text: root.label;
+            font-size: Theme.fs-small;
+            color: Theme.text-sub;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+            overflow: elide;
+        }
+        Text {
+            // 固定 width: 源通道值随遥测/草稿变化, min-width 挡不住位数变化驱动的重分配。
+            width: 56px;
+            text: root.value_text;
+            font-size: Theme.fs-small;
+            color: Theme.accent;
+            horizontal-alignment: right;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+    }
+}
+
+export component AllChannelsPage inherits Rectangle {
+    in property <[ChannelStatus]> channels: [];
+    in-out property <int> selected_channel: 0;
+    // ---- 批量应用抽屉 ----
+    // 勾选状态的真相源在 Rust(AppController::batch_*), 这里只展示与转发事件, 避免两份状态对不上。
+    in property <[bool]> batch_ch_selected: [];
+    in property <[bool]> batch_param_selected: [];
+    in property <[string]> batch_param_names: [];
+    in property <[string]> batch_param_values: [];
+    in-out property <bool> batch_drawer_open: false;
+    callback batch_toggle_channel(int);
+    callback batch_toggle_param(int);   // 传 param_id(0x01..0x0B)
+    callback batch_channels_all();
+    callback batch_channels_invert();
+    callback batch_params_all();
+    callback batch_params_invert();
+    callback batch_clear();
+    callback batch_apply(int);          // 源通道号
+    // 由 main.rs 每 tick 从 AppController::telem_samples_per_sec()/telem_scan_period_us() 回填
+    in property <int> sample_rate_hz: 0;
+    in property <string> curve_threshold_warning: "";
+    // 设备实测探测周期(ms, 两位小数), 由 telem_scan_period_us / 1000.0 换算回填。
+    in property <float> scan_period_ms: 0;
+
+    callback telem_start();
+    callback telem_stop();
+    callback channel_selected(int);
+
+    VerticalBox {
+        padding: 8px;
+        spacing: 8px;
+
+        HorizontalBox {
+            padding: 0px;
+            spacing: 8px;
+            Button {
+                text: @tr("开始实时");
+                clicked => { root.telem_start(); }
+            }
+            Button {
+                text: @tr("停止");
+                clicked => { root.telem_stop(); }
+            }
+            Text {
+                text: @tr("查看 36 通道实时状态；双击卡片进入精调。");
+                vertical-alignment: center;
+                color: #89949e;
+            }
+            Button {
+                text: root.batch_drawer_open ? @tr("收起批量应用 ▶") : @tr("◀ 批量应用参数");
+                clicked => { root.batch_drawer_open = !root.batch_drawer_open; }
+            }
+            Text {
+                // ★固定 min-width (与主页采样/延迟块同口径): 采样率与探测周期每帧刷新, 位数变化会改变
+                // 文本首选宽度, 进而驱动 HorizontalBox 重新分配, 左侧说明文字被来回推动。钉死宽度后不抖。
+                // 固定 width(不是 min-width): 采样率/探测周期每帧刷新, min-width 挡不住"文本比下限更长"
+                // 时首选宽度随位数变化, 那会持续驱动 HorizontalBox 重分配, 左侧说明文字来回被推。
+                width: 300px;
+                overflow: elide;
+                horizontal-alignment: right;
+                text: @tr("采样率") + root.sample_rate_hz + " Hz  " + @tr("探测周期 ") + Math.round(root.scan_period_ms * 100) / 100 + " ms";
+                vertical-alignment: center;
+                color: Theme.accent;
+            }
+        }
+
+        // 网格定位用循环索引自身(Math.mod/Math.floor)，不依赖 Rust 字段。
+        // 杜绝旧实现的"仅渲染 6 格斜向级联"故障。124px 宽 + 6px 间距 = 130px 列距。
+        // ★列数随可用宽度自适应★: 固定 6 列在窄窗口要 792px, 在 2560 宽窗口又只占左侧三分之一。
+        // ★viewport 必须显式指定★: Flickable 只会把【布局类】子元素的 min 折进 viewport, 这里的
+        // 子元素是绝对定位的裸 Rectangle, 于是 viewport 恒等于视口 → 原实现在窄窗口下是"直接裁掉
+        // 右边几列且滚不动"。按实际网格尺寸给出 viewport 后, 不够放时才真的能滚。
+        // 网格与抽屉并排。抽屉宽度是**常量**, 左侧可用宽度 = 本页宽度 - 抽屉宽度, 因此列数只依赖
+        // 一个与滚动条无关的量(见下方 cols 注释), 抽屉开合只是让这个常量在 0/300px 之间切换。
+        HorizontalLayout {
+            vertical-stretch: 1;
+            spacing: 0px;
+
+        grid_view := ScrollView {
+            horizontal-stretch: 1;
+            vertical-stretch: 1;
+            // ★★列数只能由外层容器宽度推导, 绝不能用 self.visible-width★★
+            // 曾经写成 `cols: Math.floor(self.visible-width / 130px)` + `viewport-width: ... cols`,
+            // 这是一个完整闭环: visible-width 取决于纵向滚动条是否出现 → 取决于 viewport-height →
+            // 取决于 rows → 取决于 cols → 取决于 visible-width。布局求值无限递归, 一进设置页就
+            // "thread 'main' has overflowed its stack"(TabWidget 会实例化所有子页, 一页有环全崩)。
+            // root.width 是本页整体宽度(由 TabWidget 的 content-width 决定), 与本 ScrollView 内部的
+            // 滚动条反馈无关, 因此用它算列数是安全的(减去 VerticalBox 的左右 padding 与滚动条宽度)。
+            // 抽屉占据的宽度必须从列数计算里扣掉, 否则展开后右侧几列会被抽屉盖住。
+            // drawer_w 是常量(不是抽屉的实际渲染宽度), 所以不会把抽屉尺寸反馈回列数。
+            property <length> drawer_w: root.batch_drawer_open ? 300px : 0px;
+            property <float> cols: Math.max(1, Math.floor((root.width - 30px - self.drawer_w) / 130px));
+            property <float> rows: Math.ceil(root.channels.length / self.cols);
+            viewport-width: self.cols * 130px;
+            viewport-height: self.rows * 100px;
+            Rectangle {
+                for cell[idx] in root.channels: ChannelStatusCell {
+                    entry: cell;
+                    selected: cell.index == root.selected_channel;
+                    pick_mode: root.batch_drawer_open;
+                    picked: cell.index < root.batch_ch_selected.length
+                        ? root.batch_ch_selected[cell.index] : false;
+                    x: Math.mod(idx, grid_view.cols) * 130px;
+                    y: Math.floor(idx / grid_view.cols) * 100px;
+                    selected_click(ch) => { root.selected_channel = ch; }
+                    picked_click(ch) => { root.batch_toggle_channel(ch); }
+                    activated(ch) => { root.channel_selected(ch); }
+                }
+            }
+        }
+
+        // 批量应用抽屉: 固定 300px 宽。
+        // ★必须用 `if` 条件实例化, 不能用 visible★: Slint 的 visible=false 只是不绘制, 元素照样
+        // 参与布局求值 —— 收起时即使把 width 置 0, 内部 VerticalBox 累加出来的 min-height 仍会
+        // 一路上传到 TabWidget(它会实例化全部 9 个子页), 把整个设置页撑高, 表现为"底部保存栏被顶出
+        // 窗口"以及"分区绑定页的 letterbox 按被撑大的 parent.height 算尺寸导致底部被裁"。
+        // `if` 收起时根本不实例化, 对外部布局零影响。
+        // ★内容必须再套一层 ScrollView★: 抽屉内容的 min-height 有三四百 px, 直接摆进去会在窄/矮
+        // 窗口下继续撑高父布局; ScrollView 的 min 是常量, 内容超出即自身滚动, 不向上传播。
+        // 本 Rectangle 有固定 width, 内部子元素才可以绑 parent.width —— 反过来(尺寸由内容反推)
+        // 就会形成本工程修过多次的布局环。
+        if root.batch_drawer_open : Rectangle {
+            width: 300px;
+            border-radius: 6px;
+            background: #1c2126;
+            border-width: 1px;
+            border-color: Theme.border-light;
+            clip: true;
+
+            ScrollView {
+            VerticalBox {
+                padding: 8px;
+                spacing: 6px;
+
+                Text {
+                    text: @tr("单通道参数批量应用");
+                    font-weight: 700;
+                    color: Theme.text-title;
+                }
+                Text {
+                    text: @tr("以下把“源通道”的选定参数复制到选定通道。只影响勾选的通道与勾选的参数，其余一律不动；改动进草稿，需点“保存到设备”才下发。");
+                    font-size: Theme.fs-small;
+                    color: Theme.text-sub;
+                    wrap: word-wrap;
+                }
+
+                Text {
+                    text: @tr("源通道: CH") + root.selected_channel + @tr("（在网格中双击卡片可换源通道）");
+                    font-size: Theme.fs-small;
+                    color: Theme.accent;
+                    wrap: word-wrap;
+                }
+
+                Text {
+                    text: @tr("目标通道选择");
+                    font-size: Theme.fs-small;
+                    color: Theme.text-title;
+                }
+                HorizontalBox {
+                    padding: 0px;
+                    spacing: 6px;
+                    Button {
+                        text: @tr("全选");
+                        clicked => { root.batch_channels_all(); }
+                    }
+                    Button {
+                        text: @tr("反选");
+                        clicked => { root.batch_channels_invert(); }
+                    }
+                    Button {
+                        text: @tr("清空");
+                        clicked => { root.batch_clear(); }
+                    }
+                }
+
+                Text {
+                    text: @tr("参数选择（勾选项才会被写入）");
+                    font-size: Theme.fs-small;
+                    color: Theme.text-title;
+                }
+                HorizontalBox {
+                    padding: 0px;
+                    spacing: 6px;
+                    Button {
+                        text: @tr("全选");
+                        clicked => { root.batch_params_all(); }
+                    }
+                    Button {
+                        text: @tr("反选");
+                        clicked => { root.batch_params_invert(); }
+                    }
+                }
+
+                // 参数行按自然高度排布(11 行 × 26px), 整列的滚动由抽屉外层那个 ScrollView 承担。
+                // 这里不再套第二层 ScrollView: 嵌套 Flickable 会抢滚动事件, 且内层 min 仍要占位。
+                VerticalLayout {
+                        padding: 0px;
+                        spacing: 1px;
+                        for name[i] in root.batch_param_names: BatchParamRow {
+                            label: name;
+                            checked: i < root.batch_param_selected.length
+                                ? root.batch_param_selected[i] : false;
+                            value_text: i < root.batch_param_values.length
+                                ? root.batch_param_values[i] : "";
+                            // 行下标 i 对应 param_id = i + 1(0x01..0x0B), 与 Rust 侧掩码位序一致。
+                            toggled => { root.batch_toggle_param(i + 1); }
+                        }
+                }
+
+                Button {
+                    text: @tr("应用到已选通道");
+                    primary: true;
+                    clicked => { root.batch_apply(root.selected_channel); }
+                }
+            }
+            }
+        }
+        }
+    }
+}

@@ -1,0 +1,44 @@
+// ==========================================================================
+// 全局视觉常量 (只收敛全文多处复用的字面量, 一次性用值仍写在原处)
+// 取值与拆分前完全一致, 仅换成命名引用, 不改任何呈现。
+// ==========================================================================
+
+export global Theme {
+    // ---- 文本 ----
+    out property <color> text: #e0e6ec;
+    out property <color> text-sub: #b0b8c0;
+    out property <color> text-dim: #7f8c96;
+    out property <color> text-strong: #d8e0e8;
+    out property <color> text-title: #ffffff;
+    out property <color> muted: #8b98a5;
+
+    // ---- 强调色 / 状态色 ----
+    out property <color> accent: #8fd6ff;
+    out property <color> accent-soft: #7fd0ff;
+    out property <color> ok: #2b8a3e;
+    out property <color> ok-text: #9fe0b0;
+    out property <color> info: #2b7de9;
+    out property <color> warn: #f5a623;
+    out property <color> err: #d9480f;
+
+    // ---- 面板 / 描边 ----
+    out property <color> panel: #1c2228;
+    out property <color> panel-alt: #23282e;
+    out property <color> panel-deep: #15181c;
+    out property <color> surface: #29323a;
+    out property <color> border: #2b3238;
+    out property <color> border-light: #3a434c;
+    out property <color> arrow: #4a5560;
+
+    // ---- 尺寸 ----
+    out property <length> fs-small: 10px;
+    out property <length> fs-normal: 11px;
+    out property <length> fs-title: 12px;
+    out property <length> gap: 6px;
+    out property <length> radius: 6px;
+    out property <length> radius-small: 4px;
+    // 参数/变量编辑行的行高与数值框宽度(两处编辑行共用)
+    out property <length> row-height: 34px;
+    // Fluent SpinBox needs room for a five-digit value plus its stacked arrow affordance; 112px keeps both inside the field border.
+    out property <length> spin-width: 112px;
+}

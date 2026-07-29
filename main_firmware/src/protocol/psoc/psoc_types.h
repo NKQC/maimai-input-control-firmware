@@ -93,6 +93,28 @@ struct SensorSample {
     }
 };
 
+// ---------------- 频率自适应(AUTO_TUNE)阶段性进度 ----------------
+// 长自适应(最坏 ~20s)期间 PSoC 逐步更新 phase/step/试探分频, RP2040 core1 在阻塞等待中降频轮询
+// GET_AUTO_TUNE 取回并经 seqlock 发布, core0 再由 TxScheduler 推送给上位机(避免上位机干等)。
+// 单一结构同时用于 SPI 层进度回调与门面发布态, 不再散装多个平行变量。
+struct AutoTuneProgress {
+    uint32_t req = 0;        // 请求代号(core0 每次启动自增, core1 回显): 用于区分本轮与上一轮的 done
+    uint8_t  state = 0;      // 0=空闲 1=进行中 2=完成
+    uint8_t  phase = 0;      // 0=已受理 1=粗定位 2=细搜临界 3=落档/回退 4=完成
+    uint8_t  step = 0;       // 当前阶段内步序(1 起)
+    uint8_t  ch = 0xFF;      // 目标通道(0..35 单通道 / 0xFF 全通道)
+    uint8_t  result = 0;     // 0=进行中 1=成功 2=失败/超时
+    uint16_t cur_div = 0;    // 进行中: 当前试探的 snsClk 分频
+    uint16_t div = 0;        // 完成时: 最终写入的分频(失败为 0)
+
+    void clear() {
+        req = 0; state = 0; phase = 0; step = 0; ch = 0xFF; result = 0; cur_div = 0; div = 0;
+    }
+};
+
+// SPI 层在阻塞等待中回吐进度用的回调(ctx 由调用方透传, 避免 SPI 层反向依赖门面类型)。
+using AutoTuneProgressFn = void (*)(void* ctx, const AutoTuneProgress& progress);
+
 struct SensorSnapshot {
     uint16_t generation = 0;
     bool valid = false;

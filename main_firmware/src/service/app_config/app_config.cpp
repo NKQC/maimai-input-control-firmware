@@ -7,7 +7,7 @@ void app_config_register_schema() {
     // This function is called during ConfigManager::initialize() to populate defaults
     
     ConfigManager::register_init_function([](config_map_t& config_map) {
-        // ===== comm.* (9 keys) =====
+        // ===== comm.* (13 keys) =====
         config_map["comm.sample_delay_ms"]       = ConfigValue(uint8_t(0), uint8_t(0), uint8_t(100));
         config_map["comm.send_only_on_change"]   = ConfigValue(false);
         config_map["comm.aggregation_delay_ms"]  = ConfigValue(uint8_t(0), uint8_t(0), uint8_t(100));
@@ -17,11 +17,19 @@ void app_config_register_schema() {
         config_map["comm.keyboard_map_en"]       = ConfigValue(false);
         config_map["comm.serial_baud"]           = ConfigValue(uint32_t(115200));
         config_map["comm.light_baud"]            = ConfigValue(uint32_t(115200));
+        config_map["comm.serial_reset_calibrate"] = ConfigValue(false);
+        config_map["comm.serial_reset_baseline"]  = ConfigValue(true);
         // 触控串口/键盘输出延迟线: 100us 时间片, 0..1000 片 = 0..100ms, UI 可设。
         // 触控延迟仅作用于串口上报; 触控->键盘映射走原始触控, 不加键盘延迟。
         config_map["comm.touch_delay_100us"]     = ConfigValue(uint16_t(0), uint16_t(0), uint16_t(1000));
         config_map["comm.keyboard_delay_100us"]  = ConfigValue(uint16_t(0), uint16_t(0), uint16_t(1000));
         
+        // ===== calib.* (1 key) 校准偏好 =====
+        // calib.pref: 频率自适应的"灵敏度档位" 1..7(默认 4=居中)。随 AUTO_TUNE 请求下发,
+        // 档位越高 → PSoC 在"校准刚好通过的临界最高频率"基础上往低频多让 2 个 snsClk 分频/档,
+        // 充电更充分产生近场探测效应(更灵敏); 档位 1 = 临界频率本身(最不灵敏, 余量最小)。
+        config_map["calib.pref"]                 = ConfigValue(uint8_t(4), uint8_t(1), uint8_t(7));
+
         // ===== mode.work (1 key) =====
         config_map["mode.work"]                  = ConfigValue(uint8_t(0), uint8_t(0), uint8_t(1));
 
@@ -60,6 +68,25 @@ void app_config_register_schema() {
             snprintf(key_buf, sizeof(key_buf), "kbd.zm%02d", i);
             config_map[key_buf] = ConfigValue(uint8_t(0), uint8_t(0), uint8_t(15));
         }
+
+        // ===== 每键长按参数(毫秒, 0=禁用) =====
+        // kbd.hdNN/kbd.mhNN: 物理键 GPIO1-12; kbd.zhdNN/kbd.zmhNN: 触控分区。
+        // hd/zhd = 按下需持续该时长才真正输出 HID(0=立即输出, 原行为);
+        // mh/zmh = 已输出后最长保持该时长即自动 release(0=不自动抬起), 抬起后需松开才能再触发。
+        for (int i = 0; i < 12; i++) {
+            char key_buf[16];
+            snprintf(key_buf, sizeof(key_buf), "kbd.hd%02d", i);
+            config_map[key_buf] = ConfigValue(uint16_t(0), uint16_t(0), uint16_t(65535));
+            snprintf(key_buf, sizeof(key_buf), "kbd.mh%02d", i);
+            config_map[key_buf] = ConfigValue(uint16_t(0), uint16_t(0), uint16_t(65535));
+        }
+        for (int i = 0; i < 34; i++) {
+            char key_buf[16];
+            snprintf(key_buf, sizeof(key_buf), "kbd.zhd%02d", i);
+            config_map[key_buf] = ConfigValue(uint16_t(0), uint16_t(0), uint16_t(65535));
+            snprintf(key_buf, sizeof(key_buf), "kbd.zmh%02d", i);
+            config_map[key_buf] = ConfigValue(uint16_t(0), uint16_t(0), uint16_t(65535));
+        }
         
         // ===== led.* (8 keys) =====
         config_map["led.enable"]                 = ConfigValue(true);
@@ -73,6 +100,23 @@ void app_config_register_schema() {
         config_map["led.color_flash_error"]      = ConfigValue(uint8_t(1), uint8_t(0), uint8_t(7));
         config_map["led.color_link_error"]       = ConfigValue(uint8_t(4), uint8_t(0), uint8_t(7));
         config_map["led.color_healthy"]          = ConfigValue(uint8_t(2), uint8_t(0), uint8_t(7));
+
+        // ===== WS2812 灯链 (3 + 11 keys) =====
+        // 两路物理链: 通道 0=GPIO13, 通道 1=GPIO14。默认 64 珠/链 = 常见 8 键×8 珠布线,
+        // 且 60Hz 下单链 64 珠推流 ≈1.9ms, core0 负担可接受。
+        config_map["led.ws_count0"]              = ConfigValue(uint16_t(64), uint16_t(1), uint16_t(1000));
+        config_map["led.ws_count1"]              = ConfigValue(uint16_t(64), uint16_t(1), uint16_t(1000));
+        // WS2812 亮度独立于板载状态灯亮度(led.status_brightness 已被 main.cpp 心跳灯占用),
+        // 否则调灯链亮度会连带改状态灯。
+        config_map["led.ws_brightness"]          = ConfigValue(uint8_t(128), uint8_t(0), uint8_t(255));
+        // led.map00..map10: 虚拟 LED 单元(0..7 按键灯, 8/9/10 = Body/Ext/Side)→ 物理段。
+        // 打包 u32: bit31..28=channel(0/1, 0xF=未映射), bit27..12=start, bit11..0=count。
+        // 结构性约束(越界/段重叠)无法用标量 range 表达, 由 LED_SET_REGION 整批校验; 默认全未映射。
+        for (int i = 0; i < 11; i++) {
+            char key_buf[16];
+            snprintf(key_buf, sizeof(key_buf), "led.map%02d", i);
+            config_map[key_buf] = ConfigValue(uint32_t(0xF0000000u));
+        }
         
         // ===== bind.map00..bind.map33 (34 keys) =====
         for (int i = 0; i < 34; i++) {

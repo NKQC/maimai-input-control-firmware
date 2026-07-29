@@ -1,0 +1,911 @@
+import { Button, VerticalBox, HorizontalBox, CheckBox, SpinBox, ScrollView } from "std-widgets.slint";
+import { ParamRow, AlgoReportLine, AlgoSettingRow } from "../common/types.slint";
+import { CollapsibleSection, ParamEditorRow, AlgoSettingEditorRow, PlotPath, SeriesRow } from "../common/widgets.slint";
+
+
+// ============================================================================
+// 曲线页 (#6g-2)
+// ============================================================================
+
+export component CurvesPage inherits Rectangle {
+    // 选中通道(0..35),main.rs 每 tick 读取判断是否变化以决定是否
+    // request_params/重建曲线。
+    in-out property <int> sel_channel: 0;
+    in-out property <bool> show_raw: false;
+    in-out property <bool> show_bsln: false;
+    in-out property <bool> show_diff: true;
+    // CSD 处理模式：0=自动校准/标准完整处理, 1=半自动手动。半自动下手动阈值/参数才持久生效。
+    in-out property <int> scan_mode: 0;
+    // 仅诊断报告明确上报模式后才开放参数编辑，杜绝未连接时默认显示为自动模式。
+    in property <bool> mode_known: false;
+
+    // 由 main.rs::build_curve_paths 回填的 SVG path 命令串,viewbox 1000x1000
+    in property <string> diff_path: "";
+    in property <string> raw_path: "";
+    in property <string> bsln_path: "";
+    // 所有勾选序列共享的纵轴尺度，由 main.rs 计算后回填。
+    in property <float> curve_y_min: 0;
+    in property <float> curve_y_mid: 0;
+    in property <float> curve_y_max: 0;
+    in property <int> curve_point_count: 0;
+
+    // 阈值线在共享纵轴尺度的 viewbox 坐标(0..1000)，由 main.rs 换算回填
+    in property <float> finger_th_y: 500;
+    in property <float> noise_th_y: 500;
+    // 阈值当前值(退化方案:SpinBox 直接编辑,视觉线只读展示)
+    in property <int> finger_th_val: 0;
+    in property <int> noise_th_val: 0;
+
+    in property <[ParamRow]> params: [];
+    in property <string> cp_text: "未测量";
+    // 当前通道最新数值读数(raw/diff/baseline + 阈值), 由 main.rs 每 tick 回填。
+    in property <string> curve_readout: "";
+    // 阈值可判定区域警告(main.rs 计算): 当 2^分辨率-基线 < 手指阈值 时非空 → 该通道永不触发。空=正常。
+    in property <string> threshold_warning: "";
+
+    // 算法触发判定追踪(out_active, 0/1 阶梯线), 由 main.rs 回填。
+    // ★已并入主图★: 与算法上报线一起走右侧 Y 轴 —— 它本来就是 0/1 二值, 归一化到右轴后叠加在
+    // 主曲线上, 能直接看出"触发发生在波形的哪个位置", 比原来独立窄带靠眼睛横向对位可靠得多。
+    in property <string> active_path: "";
+    in property <int> active_point_count: 0;
+    in-out property <bool> show_active: true;
+    // 触发判定线的归一化幅度 N(二值线专用, 见 AlgoReportLine.norm_amp)。
+    in property <float> active_norm_amp: 1;
+
+    // 横轴真实时间: 全量样本的时间跨度(ms, 由设备端时间戳算出)与最新样本的绝对时刻文本。
+    // ★为什么 UI 只拿"跨度"★: 绝对时刻是小时量级的 ms 数, f32 存不住 ms 精度; 刻度与十字线读数
+    // 一律用"相对最新样本"的偏移(0 = 现在, 负值 = 过去), 绝对时刻只在信息行显示一次。
+    in property <float> curve_t_span_ms: 0;
+    in property <string> curve_t_end_text: "";
+    // 右侧 Y 轴量程(算法量纲): 算法上报/触发判定专用, 与左轴 ADC 量纲无关。
+    in property <float> curve_r_min: 0;
+    in property <float> curve_r_max: 1;
+
+    // ★算法可选叠加(合并自原独立"算法"页的上报折线/可调变量)★: 勾选后在本页追加显示
+    // 算法 report[] 折线 + 图例 + cfg[8] 可调变量行(与选中通道一致)。默认关闭, 不干扰精调。
+    in-out property <bool> show_algo_overlay: false;
+    in property <[AlgoReportLine]> algo_report_lines: [];
+    in property <int> algo_trace_point_count: 0;
+    in property <[AlgoSettingRow]> algo_setting_rows: [];
+    // 右列两个折叠区块的展开态, 放在 AppWindow 上双向绑定, 切页重建也不丢(同 CollapsibleSection 约定)。
+    in-out property <bool> params_expanded: true;
+    in-out property <bool> algo_cfg_expanded: false;
+    // "数据序列"折叠区(原生数据读取 + 算法上报变量)的展开态。★默认展开★: 勾哪条线是看图前
+    // 第一件要做的事, 收起会让人以为没有这个入口。
+    in-out property <bool> series_expanded: true;
+    callback algo_setting_edited(int, int);
+    callback report_toggle(int, bool);   // 勾选/取消某条上报变量在主图的叠加
+
+    callback telem_start();
+    callback telem_stop();
+    callback calibrate();
+    callback baseline_reset();
+    // ★已删除 plot_area_resized★: PlotPath 改用 fit: fill(非等比拉伸)后, 曲线铺满与绘图区宽高比
+    // 完全无关, Rust 侧不再需要知道宽高比, 拖分栏/改窗口也不必重算 path。
+    // 二值算法线的归一化幅度 N: idx 0..3 = 上报线, 4 = 触发判定。
+    callback report_norm_set(int, float);
+    // 阻塞类操作进行中: 锁定校准/基线按钮 + 显示运行标识。
+    in property <bool> op_busy: false;
+    in property <string> op_label: "";
+    callback measure_cp();
+    // 本通道频率自适应(只下探当前选中通道的 snsClk 分频, 其余通道不动)。
+    callback auto_tune_channel();
+    in property <string> auto_tune_status: "";
+    // 退化方案:阈值通过 SpinBox 直接编辑值,回调 (param_id, value)
+    callback threshold_set(int, int);
+    callback param_edited(int, int);
+    // CSD 模式切换(0=自动校准/标准完整处理,1=半自动手动) + 捕获当前参数作为手动起点
+    callback mode_changed(int);
+    callback capture_params();
+
+    // 当前采样率(Hz), 供把横向可见窗口(样本数)换算成真实时间跨度显示。
+    in property <int> sample_rate_hz: 0;
+    in property <string> curve_threshold_warning: "";
+
+    // 折线图视图变换(viewbox 坐标系 0..1000): 横=时间窗口, 纵=数值范围。
+    // 滚轮缩放时间(横, 锚定右缘=现在), Shift+滚轮缩放纵轴, 拖拽平移, 双击复位。全览默认 0/1000。
+    property <float> view_x: 0;
+    property <float> view_w: 1000;
+    // 当前横向可见时间跨度(ms) = 全量跨度 × 可见比例。时间来自设备端时间戳, 不再用"样本数/采样率"
+    // 估算 —— 掉帧或暂停时估算值会与真实时间严重不符。
+    property <float> visible_ms: root.curve_t_span_ms * root.view_w / 1000;
+    property <float> view_y: 0;
+    property <float> view_h: 1000;
+    property <float> drag_start_vx: 0;
+    property <float> drag_start_vy: 0;
+    // 主体左右分栏比例；默认接近原右侧 360px 配置区的观感。
+    in-out property <float> split_ratio: 0.72;
+    property <float> split_drag_start_ratio: 0.72;
+    // 可见范围回算的数值: 左轴 = ADC 量纲, 右轴 = 算法量纲。纵向缩放(view_y/view_h)对两轴同时生效,
+    // 因为两轴共用同一套 viewbox y 坐标(0..1000), 只是各自映射到不同的物理量纲。
+    property <float> vis_top: root.curve_y_max - root.view_y / 1000 * (root.curve_y_max - root.curve_y_min);
+    property <float> vis_bot: root.curve_y_max - (root.view_y + root.view_h) / 1000 * (root.curve_y_max - root.curve_y_min);
+    property <float> vis_top_r: root.curve_r_max - root.view_y / 1000 * (root.curve_r_max - root.curve_r_min);
+    property <float> vis_bot_r: root.curve_r_max - (root.view_y + root.view_h) / 1000 * (root.curve_r_max - root.curve_r_min);
+    // 可见时间窗口(ms, 相对最新样本, 0=现在, 负=过去)。逻辑分析仪式刻度与十字线读数都由此算。
+    property <float> vis_t_lo: (root.view_x / 1000 - 1) * root.curve_t_span_ms;
+    property <float> vis_t_hi: ((root.view_x + root.view_w) / 1000 - 1) * root.curve_t_span_ms;
+    // 十字线: 鼠标在绘图区内的归一化位置(0..1)。声明式取自绘图区 TouchArea 的 has-hover/mouse-x/y,
+    // 不走回调 —— 十字线是纯显示, 不该产生任何事件处理与 Rust 侧重算。
+    property <bool> cursor_on: pta.has-hover;
+    property <float> cursor_fx: Math.clamp(pta.mouse-x / pta.width, 0, 1);
+    property <float> cursor_fy: Math.clamp(pta.mouse-y / pta.height, 0, 1);
+    // 光标处的读数: 时间(ms, 相对最新样本) + 左轴(ADC) + 右轴(算法量纲)。
+    property <float> cursor_t_ms: root.vis_t_lo + (root.vis_t_hi - root.vis_t_lo) * root.cursor_fx;
+    property <float> cursor_v_left: root.vis_top - (root.vis_top - root.vis_bot) * root.cursor_fy;
+    property <float> cursor_v_right: root.vis_top_r - (root.vis_top_r - root.vis_bot_r) * root.cursor_fy;
+    // 时间刻度数量随绘图区宽度自适应(每 ~120px 一个刻度), 缩放后标签不会挤成一团。
+    property <int> tick_count: Math.clamp(Math.round(plot.width / 120px), 3, 9);
+    // 右轴是否可见: 没有任何算法线时不占右侧空间, 也不显示"算法量纲"标注。
+    // 触发判定现在始终绘制(无数据时画基线), 所以只要勾了它右轴就得给出量纲参照。
+    property <bool> raxis_on: root.show_active
+        || (root.show_algo_overlay && root.algo_trace_point_count > 0);
+    // 触发判定无追踪数据时的基线位置(viewbox y): 右轴 0 值所在高度。0/1 阶梯线的"未触发"就是 0,
+    // 画一条 0 基线比整条消失更符合逻辑分析仪的直觉("这条道存在, 只是一直没抬起来")。
+    property <float> active_base_y: Math.clamp(
+        (1 - (0 - root.curve_r_min) / Math.max(root.curve_r_max - root.curve_r_min, 0.000001)) * 1000,
+        0, 1000);
+    function reset-view() {
+        root.view_x = 0; root.view_w = 1000; root.view_y = 0; root.view_h = 1000;
+    }
+
+    VerticalBox {
+        padding: 8px;
+        spacing: 8px;
+
+        HorizontalBox {
+            padding: 0px;
+            spacing: 8px;
+
+            Text {
+                text: "通道:";
+                vertical-alignment: center;
+            }
+            SpinBox {
+                minimum: 0;
+                maximum: 35;
+                value: root.sel_channel;
+                edited(v) => { root.sel_channel = v; }
+            }
+            Button {
+                text: "开始";
+                clicked => { root.telem_start(); }
+            }
+            Button {
+                text: "停止";
+                clicked => { root.telem_stop(); }
+            }
+            // ★序列勾选(RAW/BASELINE/DIFF/触发判定)已全部移到右列"数据序列"区★: 顶部每多一行控件
+            // 就少一行波形, 竖向空间优先给时间轴; 顶部只留通道选择、采样/校准操作与这个总开关。
+            CheckBox {
+                text: "叠加算法上报折线(右轴)";
+                checked: root.show_algo_overlay;
+                toggled => { root.show_algo_overlay = self.checked; }
+            }
+            Rectangle { horizontal-stretch: 1; }
+        }
+
+        // 第二行工具栏：校准/测量类操作。拆两行避免窄窗口右侧按钮被截断。
+        HorizontalBox {
+            padding: 0px;
+            spacing: 8px;
+
+            Button {
+                // 自动模式由中间件自动校准, 手动"校准"无意义 → 锁定; 切半自动手动模式后可用。
+                // 运行中(op_busy)锁定并显示运行标识, 完成后自动解锁。
+                text: root.op_busy ? ("⏳ " + root.op_label) : (root.scan_mode == 1 ? "校准" : "校准(自动模式锁定)");
+                enabled: root.scan_mode == 1 && !root.op_busy;
+                clicked => { root.calibrate(); }
+            }
+            Button {
+                text: "基线复位";
+                enabled: !root.op_busy;
+                clicked => { root.baseline_reset(); }
+            }
+            Button {
+                text: "测量全部电极电容";
+                clicked => { root.measure_cp(); }
+            }
+            // 逐通道频率自适应: 各通道 Cp 跨度极大(22pF~138pF), 只对本通道逐档降频重校准。
+            Button {
+                text: root.op_busy ? ("⏳ " + root.op_label) : ("本通道频率自适应 (CH" + root.sel_channel + ")");
+                enabled: !root.op_busy;
+                clicked => { root.auto_tune_channel(); }
+            }
+            Text {
+                text: root.cp_text;
+                vertical-alignment: center;
+                color: #8fd6ff;
+                horizontal-stretch: 1;
+                // 窄窗口下先让这行读数让位(省略号), 而不是把左边四个按钮挤出可视区:
+                // 无 elide 的单行 Text 会把整串文字宽度当成 min-width。
+                wrap: no-wrap;
+                overflow: elide;
+            }
+        }
+
+        // ★已删除顶部"手指阈值/噪声阈值"两个 SpinBox★: 与右列"通道参数"里的 PARAM_FINGER_TH(0x01)/
+        // PARAM_NOISE_TH(0x02) 是同一份值的两个入口, 两处并存必然出现"改了一处另一处没跟上"的错觉。
+        // 唯一真相源保留在通道参数区(它还带 AUTO 锁定语义); 下面这行读数里仍显示两个阈值的当前值。
+
+        // 当前通道最新数值读数(raw/diff/baseline + 量程 + 阈值, 阈值取自通道参数, 由 main.rs 回填)。
+        Text {
+            text: root.curve_readout;
+            color: #cfe6ff;
+            font-size: 12px;
+            wrap: word-wrap;
+        }
+
+        // ★已删除顶部"上报变量"勾选行★: 与 RAW/BASELINE/DIFF/触发判定 合并到右列"数据序列"折叠区,
+        // 按"原生数据读取 / 算法上报变量"分两组竖排(见 right_col)。顶部只保留总开关。
+
+        // 主体左右结构(手动绝对布局: HorizontalBox 在本嵌套下不尊重 min-width 会把参数区挤没,
+        // 改为容器 Rectangle + 绝对 x/width；分隔条只更新比例, 保持两侧绝对定位)。
+        body := Rectangle {
+            vertical-stretch: 1;
+            // 240px 是"绘图区(上下各留 62px 刻度边距)+ 右列一个折叠区块"仍可辨认的真实下限。
+            // 原 300px 会连同上面两行工具栏把本页 min-height 顶到 ~430px 以上, 在 520px 高的窗口里
+            // 直接把设置页底部保存栏挤出视口(盒布局不会压过 min, 只会溢出)。
+            min-height: 240px;
+
+        Rectangle {
+            x: 0;
+            y: 0;
+            width: parent.width * root.split_ratio - 12px;
+            // 独立窄带已取消(算法上报与触发判定都并入主图), 整块高度全归时间轴。
+            height: parent.height;
+            clip: true;
+            background: #101418;
+            border-width: 1px;
+            border-color: #3a3a3a;
+
+            // 绘图区刻意留出左、右、下边距: 左 ADC 纵轴刻度, 右 算法量纲纵轴刻度 + 纵向滚动条,
+            // 下 时间刻度与十字线时间读数。路径不会遮挡标签。
+            plot := Rectangle {
+                x: 62px;
+                y: 12px;
+                width: parent.width - 62px - 72px;
+                height: parent.height - 62px;
+                background: #12181d;
+                border-width: 1px;
+                border-color: #29323a;
+                // ★不再上报宽高比★: PlotPath 用 fit: fill 非等比拉伸, 曲线铺满与绘图区形状无关,
+                // 窗口/分栏怎么变都不会失配, 也省掉了每次 resize 触发 Rust 重算全部 path。
+            }
+
+
+            // 五条横向网格线，所有曲线与阈值使用同一共享尺度。
+            Rectangle { x: plot.x; y: plot.y; width: plot.width; height: 1px; background: #33404a; }
+            Rectangle { x: plot.x; y: plot.y + plot.height * 0.25; width: plot.width; height: 1px; background: #29323a; }
+            Rectangle { x: plot.x; y: plot.y + plot.height * 0.5; width: plot.width; height: 1px; background: #3b4650; }
+            Rectangle { x: plot.x; y: plot.y + plot.height * 0.75; width: plot.width; height: 1px; background: #29323a; }
+            Rectangle { x: plot.x; y: plot.y + plot.height - 1px; width: plot.width; height: 1px; background: #33404a; }
+
+            // 曲线裁剪区 = plot 大小; 三条 Path 用 viewbox 视图变换实现缩放/平移, 超出被裁剪。
+            clipbox := Rectangle {
+                x: plot.x;
+                y: plot.y;
+                width: plot.width;
+                height: plot.height;
+                clip: true;
+
+                PlotPath {
+                    vx: root.view_x; vy: root.view_y; vw: root.view_w; vh: root.view_h;
+                    commands: root.bsln_path;
+                    stroke: #ffaa00;
+                    stroke-width: 2px;
+                    visible: root.show_bsln && root.curve_point_count > 0;
+                }
+                PlotPath {
+                    vx: root.view_x; vy: root.view_y; vw: root.view_w; vh: root.view_h;
+                    commands: root.raw_path;
+                    stroke: #3399ff;
+                    stroke-width: 2px;
+                    visible: root.show_raw && root.curve_point_count > 0;
+                }
+                PlotPath {
+                    vx: root.view_x; vy: root.view_y; vw: root.view_w; vh: root.view_h;
+                    commands: root.diff_path;
+                    stroke: #33cc33;
+                    stroke-width: 2px;
+                    visible: root.show_diff && root.curve_point_count > 0;
+                }
+
+                // ★阈值线画进主图 clipbox, 用与曲线【完全相同】的 viewbox 视图变换★
+                // 这样无论 Path 是拉伸还是 contain 缩放, 阈值线都与 raw/diff 曲线同步缩放/平移, 永不错层。
+                // (旧实现用 plot 像素坐标线性映射 ff, 与曲线的 viewbox 变换不一致)→ 缩放时层级/位置漂移。
+                PlotPath {
+                    vx: root.view_x; vy: root.view_y; vw: root.view_w; vh: root.view_h;
+                    commands: "M 0 \{root.finger_th_y} L 1000 \{root.finger_th_y}";
+                    stroke: #ff4444;
+                    stroke-width: 1px;
+                    visible: root.curve_point_count > 0;
+                }
+                PlotPath {
+                    vx: root.view_x; vy: root.view_y; vw: root.view_w; vh: root.view_h;
+                    commands: "M 0 \{root.noise_th_y} L 1000 \{root.noise_th_y}";
+                    stroke: #ffee44;
+                    stroke-width: 1px;
+                    visible: root.curve_point_count > 0;
+                }
+
+                // ★算法上报折线并入主图★: 现在每个遥测样本都带设备端时间戳, 算法追踪点也按"最近一帧
+                // 设备时间"落到同一条时间轴上(见 main.rs TracePoint 注释), 所以可以叠加了 —— 不必再靠
+                // 两张图横向对位去猜"算法在波形的哪一点触发"。纵向走右轴量程(算法量纲 ≠ ADC 量纲)。
+                for line in root.algo_report_lines: PlotPath {
+                    vx: root.view_x; vy: root.view_y; vw: root.view_w; vh: root.view_h;
+                    commands: line.path;
+                    stroke: line.line_color;
+                    stroke-width: 2px;
+                    visible: root.show_algo_overlay && line.visible;
+                }
+                // 触发判定(0/1 二值)同样走右轴, 归一化幅度由 active_norm_amp 控制。
+                // ★声明顺序=层级★: Slint 同父元素内后声明者画在上。触发判定放在 raw/bsln/diff、
+                // 阈值线、算法上报线【全部之后】, 因为它是"结论"线 —— 判断"这一刻到底算不算按下"时
+                // 它绝不能被任何一条参考线盖住。
+                // ★为什么无数据也要画★: 勾了却整条消失, 看图的人无法区分"没触发"和"这条道没接上";
+                // 追踪数据要靠主机轮询取回, 未声明 ALGO_REPORT 时压根不轮询 → 永远没有点。
+                // 无点时退化成右轴 0 值基线(active_base_y), 表达"通道在, 只是一直没抬起来"。
+                PlotPath {
+                    vx: root.view_x; vy: root.view_y; vw: root.view_w; vh: root.view_h;
+                    commands: root.active_point_count > 0
+                        ? root.active_path
+                        : "M 0 \{root.active_base_y} L 1000 \{root.active_base_y}";
+                    stroke: #ff3399;
+                    stroke-width: 2px;
+                    visible: root.show_active;
+                }
+
+                // 十字线(逻辑分析仪式): 竖线追到 X 轴, 横线追到左右两轴; 鼠标离开即隐藏。
+                // 纯 UI 交互, 不触发 Rust 侧重算任何 path。
+                Rectangle {
+                    x: parent.width * root.cursor_fx;
+                    y: 0;
+                    width: 1px;
+                    height: parent.height;
+                    background: #7fd0ff;
+                    opacity: 0.75;
+                    visible: root.cursor_on && root.curve_point_count > 0;
+                }
+                Rectangle {
+                    x: 0;
+                    y: parent.height * root.cursor_fy;
+                    width: parent.width;
+                    height: 1px;
+                    background: #7fd0ff;
+                    opacity: 0.75;
+                    visible: root.cursor_on && root.curve_point_count > 0;
+                }
+
+                // 交互: 滚轮缩放时间(横), Shift+滚轮缩放纵轴, 拖拽平移, 双击复位; hover 供十字线。
+                pta := TouchArea {
+                    mouse-cursor: crosshair;
+                    pointer-event(e) => {
+                        if (e.kind == PointerEventKind.down) {
+                            root.drag_start_vx = root.view_x;
+                            root.drag_start_vy = root.view_y;
+                        }
+                    }
+                    moved => {
+                        if (self.pressed) {
+                            root.view_x = Math.clamp(
+                                root.drag_start_vx - (self.mouse-x - self.pressed-x) / self.width * root.view_w,
+                                0, 1000 - root.view_w);
+                            root.view_y = Math.clamp(
+                                root.drag_start_vy - (self.mouse-y - self.pressed-y) / self.height * root.view_h,
+                                0, 1000 - root.view_h);
+                        }
+                    }
+                    scroll-event(e) => {
+                        if (e.modifiers.shift) {
+                            // 纵轴缩放(围绕当前窗口中心)。上滚放大(窗口变窄)。
+                            root.view_y = Math.clamp(
+                                root.view_y + root.view_h * (1 - (e.delta-y > 0 ? 0.85 : 1.1765)) / 2,
+                                0, 1000 - root.view_h * (e.delta-y > 0 ? 0.85 : 1.1765));
+                            root.view_h = Math.clamp(root.view_h * (e.delta-y > 0 ? 0.85 : 1.1765), 40, 1000);
+                        } else {
+                            // 横轴(时间)缩放: ★硬锚定右缘=现在(x=1000)★, 缩放只改"显示多长的近端时间窗口"。
+                            // 视图恒为 [1000-view_w, 1000], 始终贴在最新数据右缘, 杜绝露出右侧无数据(始终无效)区。
+                            root.view_w = Math.clamp(root.view_w * (e.delta-y > 0 ? 0.85 : 1.1765), 40, 1000);
+                            root.view_x = 1000 - root.view_w;
+                        }
+                        return accept;
+                    }
+                    double-clicked => { root.reset-view(); }
+                }
+            }
+
+            // 横向滚动条(时间): 缩放后显示当前窗口在全量中的位置, 可点击/拖动平移。
+            htrack := Rectangle {
+                x: plot.x;
+                y: plot.y + plot.height + 3px;
+                width: plot.width;
+                height: 6px;
+                background: #1a2129;
+                border-radius: 3px;
+                visible: root.view_w < 999;
+                Rectangle {
+                    x: parent.width * (root.view_x / 1000);
+                    width: Math.max(parent.width * (root.view_w / 1000), 10px);
+                    height: parent.height;
+                    border-radius: 3px;
+                    background: hta.pressed ? #6a7580 : #4a5560;
+                }
+                hta := TouchArea {
+                    moved => { if (self.pressed) {
+                        root.view_x = Math.clamp((self.mouse-x / htrack.width) * 1000 - root.view_w / 2, 0, 1000 - root.view_w);
+                    } }
+                    clicked => {
+                        root.view_x = Math.clamp((self.mouse-x / htrack.width) * 1000 - root.view_w / 2, 0, 1000 - root.view_w);
+                    }
+                }
+            }
+            // 纵向滚动条(数值): 缩放后显示当前纵轴窗口位置, 可点击/拖动。
+            vtrack := Rectangle {
+                x: plot.x + plot.width + 3px;
+                y: plot.y;
+                width: 6px;
+                height: plot.height;
+                background: #1a2129;
+                border-radius: 3px;
+                visible: root.view_h < 999;
+                Rectangle {
+                    y: parent.height * (root.view_y / 1000);
+                    height: Math.max(parent.height * (root.view_h / 1000), 10px);
+                    width: parent.width;
+                    border-radius: 3px;
+                    background: vta.pressed ? #6a7580 : #4a5560;
+                }
+                vta := TouchArea {
+                    moved => { if (self.pressed) {
+                        root.view_y = Math.clamp((self.mouse-y / vtrack.height) * 1000 - root.view_h / 2, 0, 1000 - root.view_h);
+                    } }
+                    clicked => {
+                        root.view_y = Math.clamp((self.mouse-y / vtrack.height) * 1000 - root.view_h / 2, 0, 1000 - root.view_h);
+                    }
+                }
+            }
+
+            // 阈值线本体已画进 clipbox(见上, 与曲线共享 viewbox 变换); 此处仅保留贴线的数值标注。
+            // 阈值线数值标注 贴线右端, 用与线相同的 ff 投影定位, 缩放时随线移动。
+            Text {
+                property <float> ff: (root.finger_th_y - root.view_y) / root.view_h;
+                x: plot.x + plot.width - 96px;
+                y: plot.y + plot.height * ff - 14px;
+                text: "手指阈值 " + root.finger_th_val;
+                color: #ff8888;
+                font-size: 10px;
+                horizontal-alignment: right;
+                width: 92px;
+                visible: root.curve_point_count > 0 && ff >= 0 && ff <= 1;
+            }
+            Text {
+                property <float> nf: (root.noise_th_y - root.view_y) / root.view_h;
+                x: plot.x + plot.width - 96px;
+                y: plot.y + plot.height * nf + 2px;
+                text: "噪声阈值 " + root.noise_th_val;
+                color: #ffee88;
+                font-size: 10px;
+                horizontal-alignment: right;
+                width: 92px;
+                visible: root.curve_point_count > 0 && nf >= 0 && nf <= 1;
+            }
+
+            // 左纵轴刻度(ADC 量纲: raw/bsln/diff 与阈值线共用)。
+            Text {
+                x: 4px;
+                y: plot.y - 7px;
+                width: 54px;
+                height: 16px;
+                text: Math.round(root.vis_top);
+                color: #aeb9c2;
+                font-size: 10px;
+                horizontal-alignment: right;
+            }
+            Text {
+                x: 4px;
+                y: plot.y + plot.height * 0.5 - 7px;
+                width: 54px;
+                height: 16px;
+                text: Math.round((root.vis_top + root.vis_bot) / 2);
+                color: #aeb9c2;
+                font-size: 10px;
+                horizontal-alignment: right;
+            }
+            Text {
+                x: 4px;
+                y: plot.y + plot.height - 12px;
+                width: 54px;
+                height: 16px;
+                text: Math.round(root.vis_bot);
+                color: #aeb9c2;
+                font-size: 10px;
+                horizontal-alignment: right;
+            }
+
+            // ★右纵轴刻度(算法量纲)★: 算法上报/触发判定的量程与 ADC 完全无关(有的是 permille,
+            // 有的是布尔), 共用左轴会被压成一条线 → 独立右轴。仅在有算法线显示时出现(root.raxis_on)。
+            Text {
+                x: plot.x + plot.width + 12px;
+                y: plot.y - 7px;
+                width: 58px;
+                height: 16px;
+                text: Math.round(root.vis_top_r * 100) / 100;
+                color: #b98fd6;
+                font-size: 10px;
+                visible: root.raxis_on;
+            }
+            Text {
+                x: plot.x + plot.width + 12px;
+                y: plot.y + plot.height * 0.5 - 7px;
+                width: 58px;
+                height: 16px;
+                text: Math.round((root.vis_top_r + root.vis_bot_r) / 2 * 100) / 100;
+                color: #b98fd6;
+                font-size: 10px;
+                visible: root.raxis_on;
+            }
+            Text {
+                x: plot.x + plot.width + 12px;
+                y: plot.y + plot.height - 12px;
+                width: 58px;
+                height: 16px;
+                text: Math.round(root.vis_bot_r * 100) / 100;
+                color: #b98fd6;
+                font-size: 10px;
+                visible: root.raxis_on;
+            }
+            Text {
+                x: plot.x + plot.width + 12px;
+                y: plot.y + plot.height + 14px;
+                width: 58px;
+                text: "算法量纲";
+                color: #8a72a0;
+                font-size: 9px;
+                visible: root.raxis_on;
+            }
+
+            // ★X 轴真实时间刻度(逻辑分析仪风格)★: 刻度值 = 相对最新样本的 ms 偏移(0=现在, 负=过去),
+            // 由设备端时间戳算出而非样本序号 —— 掉帧/暂停时序号与真实时间不成比例。
+            // 刻度数量随宽度自适应(见 tick_count), 缩放时标签不会挤在一起。
+            for i in root.tick_count: Rectangle {
+                property <float> f: root.tick_count > 1 ? i / (root.tick_count - 1) : 0;
+                x: plot.x + plot.width * f;
+                y: plot.y;
+                width: 1px;
+                height: plot.height;
+                background: #232c34;
+                visible: root.curve_point_count > 0;
+            }
+            for i in root.tick_count: Text {
+                property <float> f: root.tick_count > 1 ? i / (root.tick_count - 1) : 0;
+                property <float> tv: root.vis_t_lo + (root.vis_t_hi - root.vis_t_lo) * f;
+                x: plot.x + plot.width * f - 44px;
+                y: plot.y + plot.height + 12px;
+                width: 88px;
+                text: (root.visible_ms < 200
+                        ? Math.round(tv * 100) / 100
+                        : (root.visible_ms < 2000 ? Math.round(tv * 10) / 10 : Math.round(tv))) + " ms";
+                color: #7f8c96;
+                font-size: 9px;
+                horizontal-alignment: center;
+                visible: root.curve_point_count > 0;
+            }
+
+            // 十字线读数: X 轴时间 + 左轴值 + 右轴值。鼠标离开绘图区即全部隐藏。
+            Rectangle {
+                x: Math.clamp(plot.x + plot.width * root.cursor_fx - 46px, 0px, parent.width - 92px);
+                // 与时间刻度标签同一行(后画=盖在标签之上), 这是逻辑分析仪的惯例位置。
+                y: plot.y + plot.height + 11px;
+                width: 92px;
+                height: 15px;
+                background: #17222c;
+                border-radius: 3px;
+                visible: root.cursor_on && root.curve_point_count > 0;
+                Text {
+                    width: parent.width;
+                    height: parent.height;
+                    text: (Math.round(root.cursor_t_ms * 100) / 100) + " ms";
+                    color: #7fd0ff;
+                    font-size: 10px;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+            Text {
+                x: 4px;
+                y: plot.y + plot.height * root.cursor_fy - 7px;
+                width: 54px;
+                height: 14px;
+                text: Math.round(root.cursor_v_left);
+                color: #7fd0ff;
+                font-size: 10px;
+                horizontal-alignment: right;
+                visible: root.cursor_on && root.curve_point_count > 0;
+            }
+            Text {
+                x: plot.x + plot.width + 12px;
+                y: plot.y + plot.height * root.cursor_fy - 7px;
+                width: 58px;
+                height: 14px;
+                text: Math.round(root.cursor_v_right * 100) / 100;
+                color: #7fd0ff;
+                font-size: 10px;
+                visible: root.cursor_on && root.curve_point_count > 0 && root.raxis_on;
+            }
+
+            // 信息行: 可见时间窗 / 全量跨度 / 最新样本的设备时刻 / 缩放倍数 / 操作提示。
+            Text {
+                x: plot.x;
+                y: parent.height - 15px;
+                width: plot.width;
+                text: "时间窗 " + (Math.round(root.visible_ms * 10) / 10) + " ms"
+                    + "  全量 " + (Math.round(root.curve_t_span_ms) / 1000) + " s"
+                    + "  最新样本设备时刻 " + root.curve_t_end_text
+                    + "  " + (Math.round(10000 / root.view_w) / 10) + "×"
+                    + "  (滚轮=时间窗 Shift+滚轮=纵轴 拖拽=平移 双击=复位)";
+                color: #7f8c96;
+                font-size: 10px;
+                horizontal-alignment: center;
+            }
+            Text {
+                x: plot.x;
+                y: plot.y + plot.height * 0.5 - 10px;
+                width: plot.width;
+                height: 20px;
+                text: "等待遥测数据";
+                color: #7f8c96;
+                font-size: 14px;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+                visible: root.curve_point_count == 0;
+            }
+        }
+
+        // ★原"算法上报"与"触发判定"两条独立窄带已删除★: 它们都已并入主图(算法线走右轴), 既省下
+        // 两条 40px 的竖向空间给时间轴, 也免去了在两张图之间靠眼睛横向对位。
+
+        // 分隔条只占原先 12px 间隙；拖拽时夹紧比例，避免任一分区被收至不可用。
+        divider := Rectangle {
+            x: parent.width * root.split_ratio - 10px;
+            y: 0;
+            width: 10px;
+            height: parent.height;
+            background: splitter.pressed ? #8fd6ff : (splitter.has-hover ? #3a4149 : #2a2f37);
+
+            Rectangle {
+                x: 4px;
+                width: 2px;
+                height: parent.height;
+                background: splitter.pressed ? #8fd6ff : #3a4149;
+            }
+            splitter := TouchArea {
+                x: 0;
+                y: 0;
+                width: parent.width;
+                height: parent.height;
+                mouse-cursor: ew-resize;
+                pointer-event(e) => {
+                    if (e.kind == PointerEventKind.down) {
+                        root.split_drag_start_ratio = root.split_ratio;
+                    }
+                }
+                moved => {
+                    if (self.pressed) {
+                        root.split_ratio = Math.max(0.2, Math.min(0.8,
+                            root.split_drag_start_ratio + (self.mouse-x - self.pressed-x) / body.width));
+                    }
+                }
+                double-clicked => { root.split_ratio = 0.72; }
+            }
+        }
+
+        // 右侧: 通道参数 + 算法可调变量区(绝对定位，宽度随分栏比例变化)。
+        right_col := Rectangle {
+            x: parent.width * root.split_ratio;
+            y: 0;
+            width: parent.width * (1 - root.split_ratio);
+            height: parent.height;
+            // 三个区块同时展开且窗口极矮时(每块下限 60px + 42px 标题行), 竖排总高会略超本列高度。
+            // 裁掉溢出的部分, 保证它绝不会画到设置页底部的保存栏上面去。
+            clip: true;
+            // 右列 = 三个可折叠区块(见 right_col 的高度分配注释): "通道参数" 与 "算法可调变量(cfg)"。
+            // ★为什么折叠★: cfg 那几行 SpinBox 原来挤在页面顶部, 每行都在压缩时间轴的高度; 移到这里
+            // 并可折叠后, 不看参数时整列可以全收起来, 竖向空间全给波形。
+            // ★为什么内容高度要显式算★: CollapsibleSection 的内容区高度取 @children 的 preferred-height,
+            // 而 ScrollView 自身没有有意义的 preferred-height。这里按"可用高度 / 展开的区块数"分配,
+            // 于是每个展开的区块都能撑满并各自滚动(可伸缩 + 可滚动)。
+            // ★★绝对不能让 ScrollView 的 min/max-height 依赖本列(父)的实际高度★★
+            // 曾经这里写成 `min/max-height: pane_share`, 而 pane_share 由 parent.height 推出 ——
+            // 子元素的 min-height 会向上决定父布局的 min, 父高度又回头喂给 pane_share, 于是布局
+            // 求值无限递归: 一进设置页就 "thread 'main' has overflowed its stack" 崩溃(9 个 Tab 全崩,
+            // 因为 TabWidget 会实例化所有子页, 任何一页有环都会拖崩整页)。
+            // 现在改成**常量**上下限: 窄窗口时各区块内部滚动, 宽窗口时区块保持这个高度上限,
+            // 多余的竖向空间由本列底部留白吸收 —— 宁可留白, 也不能要一个会崩的布局。
+            ScrollView {
+                x: 0;
+                y: 0;
+                width: parent.width;
+                // 警告框占据列底的 96px，并留出 4px 间距；滚动视口不与它重叠。
+                height: root.threshold_warning != "" ? parent.height - 104px : parent.height;
+
+                VerticalLayout {
+                    padding: 0px;
+                    spacing: 4px;
+                    alignment: start;
+
+                // ★数据序列 = 本页唯一的"画什么"入口★: RAW/BASELINE/DIFF/触发判定 与上报变量的
+                // 勾选原先分散在页面顶部的两行里, 每多一行控件就少一行波形; 全部收进右列后顶部只剩
+                // 操作按钮, 竖向空间归时间轴。
+                // ★为什么分两组 + 分割线★: 上组是设备原生直出量(左轴 ADC 量纲, 换算法也不变),
+                // 下组是算法产出量(右轴算法量纲, 换个算法这几行的含义全变)。量纲与可信度都不同,
+                // 混作一列会让人把算法中间量误当成硬件读数。
+                // ★两组都不写死行数★: 组内就是往 VerticalBox 里塞 SeriesRow, 增删项由布局自动增行。
+                CollapsibleSection {
+                    title: "数据序列";
+                    summary: ((root.show_raw ? 1 : 0) + (root.show_bsln ? 1 : 0)
+                            + (root.show_diff ? 1 : 0) + (root.show_active ? 1 : 0))
+                        + " 原生"
+                        + (root.show_algo_overlay ? " · 算法叠加开" : " · 算法叠加关");
+                    expanded <=> root.series_expanded;
+
+                    VerticalBox {
+                            padding: 0px;
+                            spacing: 2px;
+
+                            Text {
+                                text: "原生数据读取 (设备直出量 · 左轴 ADC 量纲)";
+                                color: #8fd6ff;
+                                font-size: 10px;
+                            }
+                            SeriesRow {
+                                label: "RAW";
+                                tint: #3399ff;
+                                checked: root.show_raw;
+                                toggled(on) => { root.show_raw = on; }
+                            }
+                            SeriesRow {
+                                label: "BASELINE";
+                                tint: #ffaa00;
+                                checked: root.show_bsln;
+                                toggled(on) => { root.show_bsln = on; }
+                            }
+                            SeriesRow {
+                                label: "DIFF";
+                                tint: #33cc33;
+                                checked: root.show_diff;
+                                toggled(on) => { root.show_diff = on; }
+                            }
+                            // 触发判定虽然画在右轴(它是 0/1, 与 ADC 量纲无关), 但取自设备算法的原生
+                            // 输出 out_active, 属于"读设备", 故归原生组; N 用于把 0/1 拉到看得见的高度。
+                            SeriesRow {
+                                label: "触发判定";
+                                tint: #ff3399;
+                                checked: root.show_active;
+                                has_norm: true;
+                                norm: root.active_norm_amp;
+                                toggled(on) => { root.show_active = on; }
+                                norm_changed(v) => { root.report_norm_set(4, v); }
+                            }
+
+                            // 两组分割线。
+                            Rectangle {
+                                height: 1px;
+                                background: #3a4149;
+                            }
+
+                            Text {
+                                text: "算法上报变量 (算法产出量 · 右轴算法量纲)";
+                                color: #b98fd6;
+                                font-size: 10px;
+                            }
+                            Text {
+                                // 总开关关着时这几行勾了也不会画, 明说一句, 免得以为勾选失灵。
+                                text: "需先打开顶部\"叠加算法上报折线(右轴)\"";
+                                color: #8a8f96;
+                                font-size: 10px;
+                                wrap: word-wrap;
+                                visible: !root.show_algo_overlay;
+                            }
+                            for line in root.algo_report_lines: Rectangle {
+                                // 未声明 ALGO_REPORT 的 idx 在算法里根本不存在, 整行收起(高度归零)
+                                // 而不是摆一个空标签的勾选框 —— 沿用 CollapsibleSection 的收起手法。
+                                height: line.name != "" ? srow.preferred-height : 0px;
+                                clip: true;
+                                srow := SeriesRow {
+                                    width: parent.width;
+                                    label: "report[" + line.idx + "] " + line.name;
+                                    tint: line.line_color;
+                                    checked: line.visible;
+                                    has_norm: line.is_binary;
+                                    norm: line.norm_amp;
+                                    toggled(on) => { root.report_toggle(line.idx, on); }
+                                    norm_changed(v) => { root.report_norm_set(line.idx, v); }
+                                }
+                            }
+                            Text {
+                                text: "当前算法未声明 ALGO_REPORT, 无上报变量";
+                                color: #8a8f96;
+                                font-size: 10px;
+                                visible: root.algo_report_lines.length == 0;
+                            }
+                        }
+                }
+
+                CollapsibleSection {
+                    title: "通道参数";
+                    summary: root.params.length + " 项";
+                    expanded <=> root.params_expanded;
+
+                    // 本通道自适应结果(成功分频/失败原因), 与上方"本通道频率自适应"按钮配套。
+                    Text {
+                        text: root.auto_tune_status;
+                        color: #8fd6ff;
+                        font-size: 10px;
+                        wrap: word-wrap;
+                        visible: root.auto_tune_status != "";
+                    }
+                    VerticalBox {
+                            padding: 0px;
+                            spacing: 4px;
+                            for row in root.params: ParamEditorRow {
+                                entry: row;
+                                mode_known: root.mode_known;
+                                auto_mode: root.mode_known && root.scan_mode == 0;
+                                edited(pid, v) => { root.param_edited(pid, v); }
+                            }
+                        }
+                }
+
+                CollapsibleSection {
+                    title: "算法可调变量(cfg)";
+                    summary: root.algo_setting_rows.length > 0
+                        ? root.algo_setting_rows.length + " 项 · 改即下发"
+                        : "无声明";
+                    expanded <=> root.algo_cfg_expanded;
+
+                    Text {
+                        text: root.algo_setting_rows.length > 0
+                            ? "修改立即下发并持久化(与设备上运行的算法共享 cfg[8])。"
+                            : "当前算法未声明 ALGO_SETTING, 无可调变量。";
+                        color: #b0b8c0;
+                        font-size: 10px;
+                        wrap: word-wrap;
+                    }
+                    VerticalBox {
+                            padding: 0px;
+                            spacing: 2px;
+                            for row in root.algo_setting_rows: AlgoSettingEditorRow {
+                                entry: row;
+                                edited(idx, v) => { root.algo_setting_edited(idx, v); }
+                            }
+                        }
+                }
+                }
+            }
+
+            // 阈值可判定区域警告(图4 位置): 2^分辨率-基线 < 手指阈值 → 该通道永不触发, 红框警示 + 建议。
+            Rectangle {
+                x: 0;
+                y: parent.height - 100px;
+                width: parent.width;
+                height: 96px;
+                visible: root.threshold_warning != "";
+                border-radius: 6px;
+                border-width: 2px;
+                border-color: #e0403a;
+                background: #2a1416;
+                Text {
+                    x: 8px; y: 6px;
+                    width: parent.width - 16px; height: parent.height - 12px;
+                    text: root.threshold_warning;
+                    color: #ff6b64;
+                    font-size: 11px;
+                    wrap: word-wrap;
+                    vertical-alignment: center;
+                }
+            }
+        }
+        }
+    }
+}

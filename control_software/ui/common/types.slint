@@ -1,0 +1,139 @@
+// ==========================================================================
+// 公共数据结构 (Rust 侧 build_* 回填的展平行模型)
+// ★本文件只放 export struct★: Rust 侧生成的类型名与字段一一对应, 改名即破坏 main.rs。
+// ==========================================================================
+
+// 一条配置行的展平数据,由 main.rs::build_config_rows 从 ConfigEntry 转换而来。
+// kind: 0=Bool(CheckBox) 1=Number(SpinBox) 2=Enum(ComboBox,当前仅 mode.work)
+//       3=String(LineEdit) 4=LedColor(专用颜色 ComboBox)
+// type_code 沿用 proto::config::ConfigValueType 编码(Bool=0..String=6),
+// 用于 main.rs 回调里按原类型重建 CfgValue。
+export struct ConfigRow {
+    key: string,
+    label: string,
+    desc: string,
+    group: string,
+    kind: int,
+    type_code: int,
+    bool_val: bool,
+    num_val: float,
+    min_val: float,
+    max_val: float,
+    has_range: bool,
+    enum_index: int,
+    str_val: string,
+    // 数字型配置的十六进制口径: hex_val=当前值(如 "0x1E"), range_hex=取值范围(如 "0x00–0xFF (0–255)")。
+    // 仅整数型(U8/U16/U32/I8)非空; 浮点/布尔/枚举/字符串为空串。
+    hex_val: string,
+    range_hex: string,
+}
+
+// 一个绑区槽位的展平数据,由 main.rs::build_zone_cells 从
+// AppController::binding_channel_of()/telem_latest() 转换而来。34 个
+// (index 0..33)。ring: 分组标签("A".."E"),沿用既有分组约定。
+// channel: 绑定的物理通道索引(0..35),-1=未映射。
+// touched: 绑定通道当前是否被触摸(status bit0),驱动几何图实时高亮。
+// cx/cy: 该分区圆心在画布 0..1000 归一化坐标系下的位置,由 main.rs 按
+// maimai 圆形分区几何(A/D 外环,B/E 内环,C 中心)预先算好回填,UI 侧
+// 只管按比例绘制,不在 Slint 里做三角函数计算(更稳)。
+export struct ZoneCell {
+    index: int,
+    label: string,
+    ring: string,
+    channel: int,
+    binding_text: string,
+    cp_text: string,
+    touched: bool,
+    binding_active: bool,
+    path: string,
+    path_x: float,
+    path_y: float,
+    path_width: float,
+    path_height: float,
+    label_x: float,
+    label_y: float,
+}
+
+// 一条参数行的展平数据,由 main.rs::build_param_rows 从
+// AppController::param(ch, pid) 转换而来。
+export struct ParamRow {
+    param_id: int,
+    label: string,
+    value: int,
+}
+
+// 单通道实时状态，由 main.rs 每 tick 从 AppController::telem_latest(ch) 构建(36 个)。
+// grid_col/grid_row 和 binding_text 均在 Rust 侧计算，Slint 仅消费明确数据。
+export struct ChannelStatus {
+    index: int,
+    label: string,
+    active: bool,
+    raw: int,
+    diff: int,
+    grid_col: int,
+    grid_row: int,
+    binding_text: string,
+    cp_text: string,
+    // 数据停滞标记: raw 长时间逐帧完全不变(设备仍在出帧) → 疑似该通道扫描/测量卡死或链路停滞
+    // 非真实恒定读数。UI 明确标红提示, 杜绝"是真值还是卡住"的忙猜。
+    frozen: bool,
+}
+
+// 算法上报变量折线(main.rs::build_algo_trace_view 回填): idx 对应 io->report[idx](0..3),
+// name 来自源码 ALGO_REPORT(idx,"name") 声明; 未声明的 idx 该行 visible=false。
+// ★定义前置★: CurvesPage(算法可选叠加)与 AlgoPage 都用到, 须在两者之前声明(Slint 先声明后使用)。
+export struct AlgoReportLine {
+    idx: int,
+    name: string,
+    path: string,
+    visible: bool,
+    // 该线取值只有 0/1(布尔类上报) → 才给它显示"归一化幅度 N"输入框。
+    is_binary: bool,
+    // 二值线的归一化幅度 N: 0/1 被拉伸到 0..N 才能在共享右轴上看见。纯显示量, 不下发设备。
+    norm_amp: float,
+    line_color: color,
+}
+
+// 算法可调变量行(main.rs::build_algo_setting_rows 回填): idx 对应 io->cfg[idx](0..7),
+// name/default_val 来自源码 ALGO_SETTING(idx,"name",defval) 声明, value 为当前 cfg[idx]。
+// 虚拟摄像头输入源设备树的一行: 组头(分类)或设备项。
+// 日志页一行。no=全局行号(跨过滤稳定, 便于指位与去重), level: 0错误 1警告 2信息 3调试。
+export struct LogRow {
+    no: int,
+    level: int,
+    text: string,
+}
+
+export struct VcamKbdRow {
+    // true=组头(不可选), false=可选设备项。
+    is_group: bool,
+    // 缩进层级: 0=分类, 1=物理设备, 2=该设备下的 HID 集合。
+    level: int,
+    // 组头=分类名; 设备项=设备描述(SetupAPI 友好名)。
+    title: string,
+    // 组头=该类设备个数说明; 设备项=厂商 · VID/PID · 父设备。
+    detail: string,
+    // -1=组头; 0="所有键盘"; >=1 对应第 (dev_index-1) 个枚举设备。
+    dev_index: int,
+}
+
+export struct AlgoSettingRow {
+    idx: int,
+    name: string,
+    default_val: int,
+    value: int,
+}
+
+// 一个虚拟 LED 单元的展平数据(main.rs::build_led_unit_rows 从 AppController 转换)。
+// unit: 0..10; 0..7=按键灯 8=Body 9=Ext 10=Side。
+// sample: LED_GET 回报的当前有效颜色(预览生效时即预览色), 直接给色块上色。
+// ch_choice: 下拉索引 0=未映射 1=通道0 2=通道1(与固件 ch=0xFF/0/1 一一对应)。
+export struct LedUnitRow {
+    unit: int,
+    label: string,
+    sample: color,
+    rgb_text: string,
+    ch_choice: int,
+    start: int,
+    count: int,
+}

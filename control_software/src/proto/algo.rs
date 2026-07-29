@@ -58,6 +58,11 @@ pub fn encode_global_get_all(seq: u8) -> Frame {
     Frame::new(HostCmd::GlobalGetAll as u8, 0, seq, vec![])
 }
 
+/// 批量全局项下发后, 单次触发 PSoC 完整重初始化(替代逐项 commit, 防重初始化风暴)。
+pub fn encode_global_commit(seq: u8) -> Frame {
+    Frame::new(HostCmd::GlobalCommit as u8, 0, seq, vec![])
+}
+
 /// 响应 [gparam_id, value(u32 LE)]
 pub fn decode_global_get(payload: &[u8]) -> Option<(u8, u32)> {
     if payload.len() < 5 {

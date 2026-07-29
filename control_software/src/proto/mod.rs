@@ -20,11 +20,18 @@
 
 pub mod algo;
 pub mod config;
+pub mod led;
 pub mod telemetry;
 
 use std::convert::TryFrom;
+pub use led::{
+    LedRegion, LedState, LED_CH_UNMAPPED, LED_PREVIEW_ALL, LED_UNIT_COUNT,
+    decode_led_get, encode_led_get, encode_led_preview, encode_led_set_region, validate_led_regions,
+};
 pub use config::{CfgValue, ConfigEntry, ConfigValueType, decode_entries, decode_entry, encode_entry, encode_entries};
 pub use telemetry::{
+    AutoTuneProgress, decode_auto_tune_progress,
+    PsocRescueProgress, decode_psoc_rescue_progress,
     ChannelSample, FIELD_RAW, FIELD_BASELINE, FIELD_DIFF, FIELD_STATUS, FIELD_STATS, FIELD_LATENCY,
     KNOWN_PARAM_IDS, PARAM_FINGER_TH, PARAM_NOISE_TH, PARAM_NEG_NOISE_TH,
     PARAM_HYSTERESIS, PARAM_ON_DEBOUNCE, PARAM_LOW_BSLN_RST, PARAM_RESOLUTION,
@@ -32,6 +39,8 @@ pub use telemetry::{
     encode_telem_start, encode_param_get, encode_param_set, encode_cp_measure, encode_cp_get,
     encode_param_get_all, encode_ch_mask, decode_telem_data, decode_param_get, decode_param_get_all,
     decode_cp_get,
+    // PARAM_GET_ALL 的"全通道单参数"批量变体(替代 36 条单发)
+    PARAM_ALL_CHANNELS, encode_param_get_all_channels, decode_param_get_all_channels,
 };
 
 // ============================================================================
@@ -70,6 +79,10 @@ pub enum HostCmd {
     RebootBootloader = 0x05,
     RebootPsoc = 0x06,
     DebugCrashBootsel = 0x07,
+    /// PSoC 救砖: 空 payload → 立即 ACK("已受理"), 设备经 SWD 强制重刷 + 重新下发算法/CSD。
+    PsocRescue = 0x08,
+    /// 设备主动推送(flags=STREAM): 救砖阶段进度/终态, 见 `decode_psoc_rescue_progress`。
+    PsocRescueProgressPush = 0x09,
     SaveConfig = 0x0E,
     ResetDefaults = 0x0F,
 
@@ -94,6 +107,13 @@ pub enum HostCmd {
     GlobalSet = 0x2A,
     GlobalGetAll = 0x2B,
     AutoTune = 0x2C,
+    GlobalCommit = 0x2D,
+    /// 设备主动推送(flags=STREAM): 频率自适应阶段进度/终态, 见 `decode_auto_tune_progress`。
+    AutoTuneProgressPush = 0x2E,
+    /// 设备主动推送(flags=STREAM): 固件自持恢复事件(复位 PSoC / 回退算法 / 清空 CSD store /
+    /// 重新下发 / PSoC 启动强制改写配置)。这些动作会让设备实际状态偏离 UI 以为的状态, 必须落日志。
+    /// payload = [code(u8), detail(u32 LE), seq(u16 LE), total(u16 LE)]
+    SelfHealEventPush = 0x2F,
 
     // Telemetry stream domain 0x30-0x3F
     TelemStart = 0x30,
@@ -133,6 +153,14 @@ pub enum HostCmd {
     KbdSetMap = 0x72,
     KbdGetTouchmap = 0x73,
     KbdSetTouchmap = 0x74,
+    /// 长按参数回读: 空 payload → 12 物理键 + 34 分区各自的 (delay_ms, max_hold_ms)。
+    KbdGetHold = 0x75,
+    /// 长按参数下发: n×[kind, idx, delay_ms(u16 LE), max_hold_ms(u16 LE)]。
+    KbdSetHold = 0x76,
+    /// mai2 串口(游戏触控上报)运行态回读: [send_en, status, baud(u32 LE)]。
+    Mai2GetState = 0x78,
+    /// mai2 串口发送使能: [en]。
+    Mai2SetSendEn = 0x79,
 
     // Response codes 0x7E-0x7F
     Ack = 0x7E,
@@ -152,6 +180,8 @@ impl TryFrom<u8> for HostCmd {
             0x05 => Ok(RebootBootloader),
             0x06 => Ok(RebootPsoc),
             0x07 => Ok(DebugCrashBootsel),
+            0x08 => Ok(PsocRescue),
+            0x09 => Ok(PsocRescueProgressPush),
             0x0E => Ok(SaveConfig),
             0x0F => Ok(ResetDefaults),
             0x10 => Ok(CfgGet),
@@ -172,6 +202,9 @@ impl TryFrom<u8> for HostCmd {
             0x2A => Ok(GlobalSet),
             0x2B => Ok(GlobalGetAll),
             0x2C => Ok(AutoTune),
+            0x2D => Ok(GlobalCommit),
+            0x2E => Ok(AutoTuneProgressPush),
+            0x2F => Ok(SelfHealEventPush),
             0x30 => Ok(TelemStart),
             0x31 => Ok(TelemStop),
             0x32 => Ok(TelemData),
@@ -201,6 +234,10 @@ impl TryFrom<u8> for HostCmd {
             0x72 => Ok(KbdSetMap),
             0x73 => Ok(KbdGetTouchmap),
             0x74 => Ok(KbdSetTouchmap),
+            0x75 => Ok(KbdGetHold),
+            0x76 => Ok(KbdSetHold),
+            0x78 => Ok(Mai2GetState),
+            0x79 => Ok(Mai2SetSendEn),
             0x7E => Ok(Ack),
             0x7F => Ok(Nak),
             _ => Err(HostCmdError::Unknown),
@@ -577,7 +614,21 @@ pub struct PsocBringupDiagnostics {
     pub checksum_srom: u32,
     pub checksum_value: u32,
     pub erase_failure: Option<EraseFailureDiagnostics>,
+    /// CSD 运行态标志(报告尾部追加, 旧固件为 0): bit0 = 上次"恢复默认"因 PSoC 采样异常
+    /// (raw 满量程 railed / 数据停滞)拒绝固化基线 → 应改用"PSoC 救砖"。
+    pub csd_flags: u8,
+    /// 固件累计登记的自持恢复事件数(与实际收到的 SELF_HEAL_EVENT 条数核对可发现漏帧)。
+    pub self_heal_total: u16,
+    /// 因队列满被丢弃的事件数(>0 说明有事件永远看不到了)。
+    pub self_heal_dropped: u16,
+    /// 是否还有事件待发(主机不在线时会一直排队)。
+    pub self_heal_pending: bool,
+    /// RP2040 store 持有的真实 CSD 模式(报告尾部追加；旧固件缺失时按 AUTO=0 处理)。
+    pub csd_mode: u8,
 }
+
+/// `PsocBringupDiagnostics::csd_flags` 位: 恢复默认未获得可信基线。
+pub const CSD_FLAG_BASELINE_UNTRUSTED: u8 = 0x01;
 
 impl PsocBringupDiagnostics {
     pub fn has(&self, flag: u16) -> bool {
@@ -708,6 +759,23 @@ impl DeviceInfo {
                 checksum_srom: read_u32_le(payload, 76)?,
                 checksum_value: read_u32_le(payload, 80)?,
                 erase_failure,
+                // 报告尾部追加字段: 声明长度不足(旧固件)时按 0 处理, 保持向后兼容。
+                csd_flags: if report_length >= 110 { payload[124] } else { 0 },
+                // 自持恢复事件计数(再往后 5 字节): 累计 / 被丢弃 / 是否还有待发。
+                // 供上位机与"自己实际收到的条数"核对, 漏帧要能被发现而不是当作没发生。
+                self_heal_total: if report_length >= 115 {
+                    u16::from_le_bytes([payload[125], payload[126]])
+                } else {
+                    0
+                },
+                self_heal_dropped: if report_length >= 115 {
+                    u16::from_le_bytes([payload[127], payload[128]])
+                } else {
+                    0
+                },
+                self_heal_pending: report_length >= 115 && payload[129] != 0,
+                // CSD 模式紧跟自持恢复计数；旧固件报告长度不足时保持 AUTO 默认值。
+                csd_mode: if report_length >= 116 { payload[130] } else { 0 },
             })
         } else {
             None
@@ -768,10 +836,133 @@ impl DeviceInfo {
                 payload.extend_from_slice(&erase.first_nonzero_addr.to_le_bytes());
                 payload.extend_from_slice(&erase.first_nonzero_value.to_le_bytes());
                 payload.extend_from_slice(&erase.words_read.to_le_bytes());
+                payload.push(report.csd_flags);   // 尾部 CSD 标志(仅在完整报告后存在)
+                payload.extend_from_slice(&report.self_heal_total.to_le_bytes());
+                payload.extend_from_slice(&report.self_heal_dropped.to_le_bytes());
+                payload.push(u8::from(report.self_heal_pending));
+                payload.push(report.csd_mode);      // 诊断尾部真实 CSD 模式
             }
         }
         payload
     }
+}
+
+// ============================================================================
+// 键盘长按参数 (KBD_GET_HOLD 0x75 / KBD_SET_HOLD 0x76)
+// ============================================================================
+
+/// 物理键数量(GPIO1-12)。
+pub const KBD_HOLD_PHYS_COUNT: usize = 12;
+/// 触控分区数量(A1..E8)。
+pub const KBD_HOLD_ZONE_COUNT: usize = 34;
+/// KBD_SET_HOLD 的 kind 字段: 物理键。
+pub const KBD_HOLD_KIND_PHYS: u8 = 0;
+/// KBD_SET_HOLD 的 kind 字段: 触控分区。
+pub const KBD_HOLD_KIND_ZONE: u8 = 1;
+
+/// 单个按键/分区的长按参数。
+///
+/// - `delay_ms`: 按住达到该时长才真正输出键(0 = 立即输出)。
+/// - `max_hold_ms`: 输出后最长保持该时长即自动抬起(0 = 不自动抬起)。
+///
+/// 12 物理键与 34 分区各自独立。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HoldParam {
+    pub delay_ms: u16,
+    pub max_hold_ms: u16,
+}
+
+/// KBD_SET_HOLD 的单条下发项。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KbdHoldItem {
+    /// `KBD_HOLD_KIND_PHYS` 或 `KBD_HOLD_KIND_ZONE`。
+    pub kind: u8,
+    pub idx: u8,
+    pub hold: HoldParam,
+}
+
+/// KBD_GET_HOLD 响应解出的完整长按参数表。
+#[derive(Debug, Clone, Default)]
+pub struct KbdHoldTable {
+    pub phys: Vec<HoldParam>,
+    pub zone: Vec<HoldParam>,
+}
+
+/// 编码 KBD_SET_HOLD 请求载荷。
+/// payload = n×[kind(u8), idx(u8), delay_ms(u16 LE), max_hold_ms(u16 LE)]
+pub fn encode_kbd_set_hold(items: &[KbdHoldItem]) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(items.len() * 6);
+    for item in items {
+        payload.push(item.kind);
+        payload.push(item.idx);
+        payload.extend_from_slice(&item.hold.delay_ms.to_le_bytes());
+        payload.extend_from_slice(&item.hold.max_hold_ms.to_le_bytes());
+    }
+    payload
+}
+
+/// 解码 KBD_GET_HOLD 响应载荷。
+/// payload = phys_count(u8) + zone_count(u8) + phys_count×4B + zone_count×4B
+/// 长度不足一律返回错误(不 panic, 不用默认值糊过去)。
+pub fn decode_kbd_get_hold(payload: &[u8]) -> Result<KbdHoldTable, String> {
+    if payload.len() < 2 {
+        return Err(format!("KBD_GET_HOLD 响应过短: {} 字节 (需 >= 2)", payload.len()));
+    }
+    let phys_count = payload[0] as usize;
+    let zone_count = payload[1] as usize;
+    let need = 2 + (phys_count + zone_count) * 4;
+    if payload.len() < need {
+        return Err(format!(
+            "KBD_GET_HOLD 响应截断: 声明 {} 物理键 + {} 分区需 {} 字节, 实收 {} 字节",
+            phys_count, zone_count, need, payload.len()
+        ));
+    }
+    let read_at = |pos: usize| HoldParam {
+        delay_ms: u16::from_le_bytes([payload[pos], payload[pos + 1]]),
+        max_hold_ms: u16::from_le_bytes([payload[pos + 2], payload[pos + 3]]),
+    };
+    let mut table = KbdHoldTable {
+        phys: Vec::with_capacity(phys_count),
+        zone: Vec::with_capacity(zone_count),
+    };
+    for i in 0..phys_count {
+        table.phys.push(read_at(2 + i * 4));
+    }
+    let zone_base = 2 + phys_count * 4;
+    for i in 0..zone_count {
+        table.zone.push(read_at(zone_base + i * 4));
+    }
+    Ok(table)
+}
+
+// ============================================================================
+// mai2 串口运行态 (MAI2_GET_STATE 0x78 / MAI2_SET_SEND_EN 0x79)
+// ============================================================================
+
+/// mai2 串口(游戏触控上报)运行态。`status`: 0=停 1=就绪 2=运行。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Mai2State {
+    pub send_en: bool,
+    pub status: u8,
+    pub baud: u32,
+}
+
+/// 编码 MAI2_SET_SEND_EN 请求载荷: [en(u8)]。
+pub fn encode_mai2_set_send_en(en: bool) -> Vec<u8> {
+    vec![u8::from(en)]
+}
+
+/// 解码 MAI2_GET_STATE 响应载荷。
+/// payload = send_en(u8) + status(u8) + baud(u32 LE)
+pub fn decode_mai2_get_state(payload: &[u8]) -> Result<Mai2State, String> {
+    if payload.len() < 6 {
+        return Err(format!("MAI2_GET_STATE 响应过短: {} 字节 (需 >= 6)", payload.len()));
+    }
+    Ok(Mai2State {
+        send_en: payload[0] != 0,
+        status: payload[1],
+        baud: u32::from_le_bytes([payload[2], payload[3], payload[4], payload[5]]),
+    })
 }
 
 // ============================================================================

@@ -20,15 +20,33 @@ public:
     static SensorLink* getInstance();
 
     void init();
-    // 发送一帧遥测(若 _streaming)。周期由 TxScheduler 定时任务驱动, 本函数不再自门控频率。
+    // 发送一帧遥测(仅当流处于 emitting 态)。周期由 TxScheduler 定时任务驱动, 本函数不再自门控频率。
     void tick();
 
     // TxScheduler 定时任务入口(无参函数指针): 转发到 getInstance()->tick()。
     static void emit_telem_task();
 
-    // 停止遥测流(清 _streaming + 关快照慢路)。新主机会话(HELLO)时调用,
-    // 使遗留遥测流不再淹没 vendor 端点、DEVICE_INFO 可正常送达。
+    // 发送一帧频率自适应阶段进度(AUTO_TUNE_PROGRESS)。周期由 TxScheduler 驱动;
+    // 检测到设备侧终态即发最终帧、写穿真相源并自取消任务。
+    void autotune_tick();
+    static void emit_autotune_task();
+
+    // 发送一帧 PSoC 救砖阶段进度(PSOC_RESCUE_PROGRESS)。与自适应同机制(TxScheduler 驱动 + 终态自取消);
+    // 长擦写窗口内由 SWD 保活钩子调 TxScheduler::tick 顺带泵出, 故全程可见。
+    void rescue_tick();
+    static void emit_rescue_task();
+
+    // 停止遥测流(清流状态 + 关快照慢路)。新主机会话(HELLO)与 TELEM_STOP 时调用,
+    // 使遗留遥测流不再淹没 vendor 端点、DEVICE_INFO 可正常送达。之后不会自动恢复。
     void stop();
+
+    // ★主机租约超时用★: 只挂起, 保留 rate/fields/ch_mask/lease 参数。
+    // 停流的理由是"上位机疑似丢失", 但 core0 也可能只是被长设备操作(JIT 下发/校准/flash 落地)
+    // 按在 UsbComm::update() 之外几秒 —— 那种情况下上位机其实一直在, 用 stop() 会把遥测永久停掉
+    // 且没有任何恢复路径(实测: 算法更新后 raw/baseline 永久冻结, 只能复位设备)。
+    void suspend();
+    // 主机命令重新到达后由主循环调用: 若处于挂起态则用原参数续推(无挂起则空转)。
+    void resume();
 
 private:
     SensorLink();
@@ -37,7 +55,16 @@ private:
 
     static SensorLink* _instance;
 
-    bool _streaming;
+    // 遥测流状态。active 与 suspended 必须成对判定(挂起态要保留参数并禁止发送), 故合为一个
+    // 结构体而非两个散装 bool, 避免任一处只更新其中一个导致"半挂起"。
+    struct StreamState {
+        bool active;      // 已被主机 TELEM_START 启用
+        bool suspended;   // 因主机租约超时暂时停发, 主机回来即自动续推
+        void clear() { active = false; suspended = false; }
+        bool emitting() const { return active && !suspended; }
+    };
+    StreamState _stream { false, false };
+    uint32_t _lease_ms;   // TELEM_START 协商的租约(自动恢复时复用同一值)
     uint8_t _mode;
     uint16_t _rate_hz;
     uint8_t _fields;
@@ -45,7 +72,11 @@ private:
     uint32_t _last_emit_us;
     uint8_t _stream_seq;
     uint8_t _tx_buf[512];
+    // 组帧缓冲: 遥测与自适应进度共用(两者都只在 core0 的 TxScheduler::tick 里顺序发送, 不会重入)。
     HostFrame _telem_frame;
+    uint8_t _at_req_ch;      // 本轮自适应目标通道(0..35 / 0xFF), 供进度帧回显与写穿真相源
+    uint16_t _at_ticks;      // 本轮已发进度帧数: 用于自续租的硬上限(防设备侧异常导致推送永不停)
+    uint16_t _rescue_ticks = 0;   // 救砖进度帧数(同上, 自续租硬上限)
 
     static inline bool _channel_selected(uint64_t channel_mask, uint8_t channel) {
         return ((channel_mask >> channel) & 1ULL) != 0;
@@ -59,6 +90,8 @@ private:
     static void _handle_param_set(const HostFrame& frame, uint8_t* response, uint16_t* response_length);
     static void _handle_param_get(const HostFrame& frame, uint8_t* response, uint16_t* response_length);
     static void _handle_param_get_all(const HostFrame& frame, uint8_t* response, uint16_t* response_length);
+    // PARAM_GET_ALL 的"全通道单参数"变体(payload = 0xFF + param_id): 一帧回全 36 通道该参数值。
+    static void _emit_param_all_channels(const HostFrame& frame, uint8_t* response, uint16_t* response_length);
     static void _handle_calibrate(const HostFrame& frame, uint8_t* response, uint16_t* response_length);
     static void _handle_baseline_reset(const HostFrame& frame, uint8_t* response, uint16_t* response_length);
     static void _handle_mode_set(const HostFrame& frame, uint8_t* response, uint16_t* response_length);
@@ -70,7 +103,9 @@ private:
     static void _handle_global_get(const HostFrame& frame, uint8_t* response, uint16_t* response_length);
     static void _handle_global_set(const HostFrame& frame, uint8_t* response, uint16_t* response_length);
     static void _handle_global_get_all(const HostFrame& frame, uint8_t* response, uint16_t* response_length);
+    static void _handle_global_commit(const HostFrame& frame, uint8_t* response, uint16_t* response_length);
     static void _handle_auto_tune(const HostFrame& frame, uint8_t* response, uint16_t* response_length);
+    static void _handle_psoc_rescue(const HostFrame& frame, uint8_t* response, uint16_t* response_length);
 
     // JIT 算法引擎：查询/上传/应用/恢复默认(转发 PsocAlgo store + PSoC SPI ALGO_* 下发)
     static void _handle_algo_get_info(const HostFrame& frame, uint8_t* response, uint16_t* response_length);

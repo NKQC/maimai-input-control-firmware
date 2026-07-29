@@ -25,6 +25,10 @@ struct UsbDebugCounters {
 
 extern volatile UsbDebugCounters g_usb_dbg;
 
+// Flash 写期间置位：LittleFS 的 XIP 擦写无法安全切片让出，TxScheduler 据此暂停遥测/进度等
+// 可丢弃推送，避免在 USB 不能运行的窗口继续向 64B vendor IN FIFO 累积数据而触发 stall。
+extern volatile uint8_t g_usb_flash_busy;
+
 // 经 EP0 控制请求(bRequest=0x52)置位的 BOOTSEL 请求：因 EP0 在 bulk vendor 死后仍存活，
 // 可在 vendor 卡死时仍软件触发进烧录模式，免去物理 BOOTSEL。loop() 检测到后 reset_usb_boot。
 extern volatile uint8_t g_bootsel_request;

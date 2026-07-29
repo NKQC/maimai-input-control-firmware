@@ -15,12 +15,15 @@
  */
 
 enum TxTaskId : uint8_t {
-    TX_TASK_TELEM = 1,   // 遥测数据流
+    TX_TASK_TELEM = 1,      // 遥测数据流
+    TX_TASK_AUTOTUNE = 2,   // 频率自适应阶段性进度(完成帧后自取消)
+    TX_TASK_RESCUE = 3,     // PSoC 救砖(强制重刷)阶段性进度(完成帧后自取消)
+    TX_TASK_SELFHEAL = 4,   // 自持恢复事件上报(队列空后自取消)
 };
 
 class TxScheduler {
 public:
-    static constexpr uint8_t MAX_TASKS = 4;
+    static constexpr uint8_t MAX_TASKS = 5;
     using EmitFn = void (*)();
 
     static TxScheduler* getInstance();

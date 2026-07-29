@@ -1,0 +1,52 @@
+﻿**********************
+Windows PowerShell transcript start
+Start time: 20260727015415
+Username: ITX-HUHUZHU\asdfg
+RunAs User: ITX-HUHUZHU\asdfg
+Configuration Name: 
+Machine: ITX-HUHUZHU (Microsoft Windows NT 10.0.26200.0)
+Host Application: C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe -ExecutionPolicy Bypass -NoProfile -File .\build.ps1
+Process ID: 26668
+PSVersion: 5.1.26100.8875
+PSEdition: Desktop
+PSCompatibleVersions: 1.0, 2.0, 3.0, 4.0, 5.0, 5.1.26100.8875
+BuildVersion: 10.0.26100.8875
+CLRVersion: 4.0.30319.42000
+WSManStackVersion: 3.0
+PSRemotingProtocolVersion: 2.3
+SerializationVersion: 1.1.0.1
+**********************
+Workflow round: 20260726T175415190Z-3d70bb46
+Workflow log: F:\mai2control\mai2control-v4\main_firmware\.workflow-logs\workflow-20260726T175415190Z-3d70bb46.log
+Workflow mode: Build
+Safety: UF2 writes require one removable RPI-RP2 volume and INFO_UF2.TXT; no fixed drive letter is used.
+
+=== Build PSoC firmware ===
+cwd: F:\mai2control\mai2control-v4\psoc_firmware\CY8C4147AZI-SensorCore
+exe: C:\Users\asdfg\ModusToolbox\tools_3.6\modus-shell\bin\make.exe
+args: build -j8
+
+
+=== Embed PSoC HEX (0x00000417) ===
+cwd: F:\mai2control\mai2control-v4\main_firmware
+exe: C:\Users\asdfg\.platformio\penv\Scripts\python.exe
+args: F:\mai2control\mai2control-v4\main_firmware\tools\psoc_hex_to_c.py F:\mai2control\mai2control-v4\psoc_firmware\CY8C4147AZI-SensorCore\build\last_config\mtb-example-psoc4-capsense-smartsense-buttons-slider.hex F:\mai2control\mai2control-v4\main_firmware\src\protocol\psoc\psoc_fw_image.h 0x00000417
+
+
+=== Build RP2040 firmware ===
+cwd: F:\mai2control\mai2control-v4\main_firmware
+exe: C:\Users\asdfg\.platformio\penv\Scripts\platformio.exe
+args: run -e pico
+
+RP2040 UF2 identity: SHA256=C97AA5E17CA025E16332E8637BBC8AF0A599F919DAAC697163DF5BE7AAA69DBC size=1029120 mtime_utc=2026-07-26T17:54:28.7234275Z
+
+=== Build Rust UI and selftest ===
+cwd: F:\mai2control\mai2control-v4\control_software
+exe: C:\Users\asdfg\.cargo\bin\cargo.exe
+args: build --locked --bins
+
+BUILD PASS: PSoC HEX embedded, RP2040 UF2 built, WinUSB selftest compiled.
+**********************
+Windows PowerShell transcript end
+End time: 20260727015437
+**********************

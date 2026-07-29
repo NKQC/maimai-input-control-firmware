@@ -41,6 +41,13 @@ enum class HostCmd : uint8_t {
     REBOOT_BOOTLOADER = 0x05,
     REBOOT_PSOC     = 0x06,  // 脉冲 XRES 重启 PSoC 使"需重启生效"的改动生效
     DEBUG_CRASH_BOOTSEL = 0x07,  // 运行时武装/解除"崩溃→进BOOTSEL"(自持debug); payload[0]: 1=武装 0=解除
+    // ★PSoC 救砖★: 空 payload → 立即 ACK("已受理"), 主循环随后经 SWD 强制全片擦写内嵌镜像 + 校验 +
+    // 复位运行, 再由 provisioning 重新下发算法 + CSD。阶段进度经 PSOC_RESCUE_PROGRESS(0x09) 推送。
+    PSOC_RESCUE     = 0x08,
+    // ★设备主动推送(flags=STREAM)★: 救砖受理后 5Hz 上报, 完成帧发出即自取消任务。
+    // payload = [state(u8: 0空闲/1进行中/2完成), phase(u8: 0空闲/1重刷中/2重新应用/3完成/4失败),
+    //            result(u8: 0进行中/1成功/2失败), stage(u8 PsocBringupStage), fail_stage(u8)]
+    PSOC_RESCUE_PROGRESS = 0x09,
     SAVE_CONFIG     = 0x0E,
     RESET_DEFAULTS  = 0x0F,
     
@@ -64,7 +71,20 @@ enum class HostCmd : uint8_t {
     GLOBAL_GET      = 0x29,  // payload=gparam_id(u8) → 响应 [gparam_id, value(u32 LE)]
     GLOBAL_SET      = 0x2A,  // payload=[gparam_id(u8), value(u32 LE)] 写全局CSD配置+APPLY → ACK
     GLOBAL_GET_ALL  = 0x2B,  // 空 → 响应 [count(u8), (gparam_id, value u32 LE)×count]
-    AUTO_TUNE       = 0x2C,  // 空 → 频率自适应下探; 响应 [result(u8: 0进行中/1成功/2失败), div(u16 LE)]
+    AUTO_TUNE       = 0x2C,  // [ch(u8): 0..35 单通道 / 0xFF 全通道, pref(u8 可选): 灵敏度档位 1..7(缺省4)]
+                             // → 异步触发频率自适应下探; 立即回 ACK(仅表示"已受理", 非完成),
+                             // 阶段进度与最终结果经 AUTO_TUNE_PROGRESS(0x2E) 推送流上报。
+    GLOBAL_COMMIT   = 0x2D,  // 空 → 批量下发全局项后【单次】触发 PSoC 完整重初始化(替代逐项 commit, 防重初始化风暴)
+    // ★设备主动推送(flags=STREAM)★: AUTO_TUNE 受理后 5Hz 上报阶段进度, 完成帧发出即自取消任务。
+    // payload = [state(u8: 0空闲/1进行中/2完成), phase(u8: 0受理/1粗定位/2细搜临界/3落档回退/4完成),
+    //            step(u8 阶段内步序), cur_div(u16 LE 当前试探分频), ch(u8),
+    //            result(u8: 0进行中/1成功/2失败), final_div(u16 LE)]
+    AUTO_TUNE_PROGRESS = 0x2E,
+    // ★设备主动推送(flags=STREAM)★: 固件"自己救自己"的动作(复位 PSoC/回退算法/清空 CSD store/
+    // 重新下发/PSoC 启动强制改写配置)会让设备实际状态偏离上位机以为的状态, 必须上报, 否则界面是幻觉。
+    // payload = [code(u8 见 SelfHealCode), detail(u32 LE), seq(u16 LE), total(u16 LE)]
+    SELF_HEAL_EVENT = 0x2F,
+
     
     // 遥测流域 0x30-0x3F
     TELEM_START     = 0x30,
@@ -98,12 +118,20 @@ enum class HostCmd : uint8_t {
     ALGO_SET_CFG       = 0x6A,  // payload=[idx(u8),val(u8)] 设共享 cfg[idx]+持久化+下发 → ACK
     ALGO_GET_CFG       = 0x6B,  // payload=[idx(u8)] → 响应 [idx,cfg(u8)]
 
-    // 物理键盘 / 触控键盘映射域 0x70-0x7D
+    // 物理键盘 / 触控键盘映射域 + mai2 串口状态 0x70-0x7D
     KBD_GET_STATE    = 0x70,  // 空 → [phys_state(u16 LE)] 物理键 GPIO1-12 实时按下位
     KBD_GET_MAP      = 0x71,  // 空 → [count(u8)=12, keycode(u8)×12] 物理键 HID 键码表
     KBD_SET_MAP      = 0x72,  // [idx(u8),keycode(u8)]×n 设物理键 HID 键码 → ACK
     KBD_GET_TOUCHMAP = 0x73,  // 空 → [en(u8), count(u8)=34, keycode(u8)×34] 触控→键盘映射表
     KBD_SET_TOUCHMAP = 0x74,  // [zone(u8),keycode(u8)]×n 设触控→键盘键码 → ACK
+    // 每键长按参数: delay_ms=按住够久才真正输出(0=立即); maxhold_ms=输出后最长保持即自动抬起(0=不抬)。
+    KBD_GET_HOLD     = 0x75,  // 空 → [phys_count(u8)=12, zone_count(u8)=34,
+                              //       12×(delay u16 LE, maxhold u16 LE), 34×(delay u16 LE, maxhold u16 LE)]
+    KBD_SET_HOLD     = 0x76,  // [kind(u8: 0=物理键/1=分区), idx(u8), delay(u16 LE), maxhold(u16 LE)]×n → ACK
+
+    // mai2 触控串口状态域
+    MAI2_GET_STATE   = 0x78,  // 空 → [send_en(u8), status(u8: 0=STOPPED/1=READY/2=RUNNING), baud(u32 LE)]
+    MAI2_SET_SEND_EN = 0x79,  // [en(u8)] 覆盖"是否发送触控帧"(游戏 {A}/{L} 之外的手动开关) → ACK
 
     // 应答 0x7E-0x7F
     ACK             = 0x7E,

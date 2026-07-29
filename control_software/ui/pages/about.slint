@@ -1,0 +1,119 @@
+// ============================================================================
+// 关于页(左栏底部入口, current_view == 4)
+// 纯展示 + 一次剪贴板写入, 不产生任何设备流量: 版本来自主页那份 DEVICE_INFO。
+// ============================================================================
+
+import { Button, VerticalBox, HorizontalBox, ScrollView } from "std-widgets.slint";
+import { Theme } from "../common/theme.slint";
+
+export component AboutPage inherits Rectangle {
+    // 上位机版本(CARGO_PKG_VERSION)与仓库地址: 编译期常量, main.rs 一次性回填。
+    in property <string> app_version: "";
+    in property <string> repo_url: "";
+    // 设备侧版本三行(主控固件 / PSoC 固件 / 协议版本); 未连接时为提示文案。
+    in property <string> device_versions: "";
+    callback copy_repo_url();
+
+    background: Theme.panel-deep;
+
+    ScrollView {
+        VerticalBox {
+            padding: 16px;
+            spacing: 12px;
+
+            // ---- 标题 + 署名 ----
+            Rectangle {
+                border-radius: 8px;
+                background: Theme.panel-alt;
+
+                VerticalBox {
+                    padding: 16px;
+                    spacing: 8px;
+
+                    Text {
+                        text: "mai2control v4";
+                        font-size: 26px;
+                        font-weight: 700;
+                        color: Theme.text-title;
+                    }
+                    Text {
+                        text: "design by huhuzhu";
+                        font-size: 18px;
+                        font-weight: 700;
+                        color: Theme.accent;
+                    }
+                    Text {
+                        text: @tr("mai2 control v4");
+                        font-size: Theme.fs-title;
+                        color: Theme.text-sub;
+                        wrap: word-wrap;
+                    }
+                }
+            }
+
+            // ---- 仓库地址(可复制) ----
+            Rectangle {
+                border-radius: 8px;
+                background: Theme.panel-alt;
+
+                VerticalBox {
+                    padding: 16px;
+                    spacing: 8px;
+
+                    Text {
+                        text: @tr("项目仓库");
+                        font-weight: 700;
+                        color: Theme.text-title;
+                    }
+                    HorizontalBox {
+                        padding: 0px;
+                        spacing: Theme.gap;
+                        Text {
+                            text: root.repo_url;
+                            color: Theme.accent;
+                            font-size: Theme.fs-title;
+                            vertical-alignment: center;
+                            horizontal-stretch: 1;
+                            // 窄窗口下先让位再省略: 无 elide 的单行文本会把整串宽度当 min-width。
+                            wrap: no-wrap;
+                            overflow: elide;
+                        }
+                        Button {
+                            text: @tr("复制仓库地址");
+                            clicked => { root.copy_repo_url(); }
+                        }
+                    }
+                }
+            }
+
+            // ---- 版本信息 ----
+            Rectangle {
+                border-radius: 8px;
+                background: Theme.panel-alt;
+
+                VerticalBox {
+                    padding: 16px;
+                    spacing: 8px;
+
+                    Text {
+                        text: @tr("版本信息");
+                        font-weight: 700;
+                        color: Theme.text-title;
+                    }
+                    Text {
+                        text: @tr("UI: v") + root.app_version;
+                        color: Theme.text-sub;
+                        wrap: word-wrap;
+                    }
+                    Text {
+                        text: root.device_versions;
+                        color: Theme.text-sub;
+                        wrap: word-wrap;
+                    }
+                }
+            }
+
+            Rectangle { vertical-stretch: 1; }
+        }
+    }
+}

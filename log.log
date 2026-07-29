@@ -1,379 +1,930 @@
-
-    =========================== USB Port2 ===========================
-
-Connection Status        : 0x01 (Device is connected)
-Port Chain               : 2-10-4-2
-Properties               : 0x00
- IsUserConnectable       : no
- PortIsDebugCapable      : no
- PortHasMultiCompanions  : no
- PortConnectorIsTypeC    : no
-ConnectionIndex          : 0x02 (Port 2)
-
-      ========================== Summary =========================
-Vendor ID                : 0x2E8A (Raspberry Pi (Trading) Limited)
-Product ID               : 0x000A
-Manufacturer String      : "Mai Control"
-Product String           : "Mai Control Device"
-Serial                   : "01934"
-USB Version              : 2.1 (but 12 Mbit/s FullSpeed only)
-Port maximum Speed       : High-Speed
-Device maximum Speed     : Full-Speed
-Device Connection Speed  : Full-Speed
-Self powered             : no
-Demanded Current         : 100 mA
-Used Endpoints           : 9
-
-      ======================== USB Device ========================
-
-        +++++++++++++++++ Device Information ++++++++++++++++++
-Device Description       : USB Composite Device
-BusReported Device Desc  : Mai Control Device
-Device Path              : \\?\USB#VID_2E8A&PID_000A#01934#{a5dcbf10-6530-11d2-901f-00c04fb951ed} (GUID_DEVINTERFACE_USB_DEVICE)
-Kernel Name              : \Device\USBPDO-14
-Device ID                : USB\VID_2E8A&PID_000A\01934
-Hardware IDs             : USB\VID_2E8A&PID_000A&REV_0401 USB\VID_2E8A&PID_000A
-Driver KeyName           : {36fc9e60-c465-11cf-8056-444553540000}\0024 (GUID_DEVCLASS_USB)
-Driver                   : \SystemRoot\System32\drivers\usbccgp.sys (Version: 10.0.26100.8737  Date: 2026-07-15  Company: Microsoft Corporation)
-Driver Inf               : C:\WINDOWS\inf\usb.inf
-Legacy BusType           : PNPBus
-Class                    : USB
-Class GUID               : {36fc9e60-c465-11cf-8056-444553540000} (GUID_DEVCLASS_USB)
-Service                  : usbccgp
-Enumerator               : USB
-Location Info            : Port_#0002.Hub_#0007
-Address                  : 2
-Location IDs             : PCIROOT(0)#PCI(0201)#PCI(0000)#PCI(0C00)#PCI(0000)#USBROOT(0)#USB(10)#USB(4)#USB(2), ACPI(_SB_)#ACPI(PCI0)#ACPI(GPP7)#ACPI(UP00)#ACPI(DP60)#ACPI(XH00)#ACPI(RHUB)#ACPI(POTC)#ACPI(PRT4)#USB(2)
-Container ID             : {954e2414-4a95-5143-9cc0-f571f1ce0060}
-Manufacturer Info        : (标准 USB 主控制器)
-Capabilities             : 0x94 (Removable, UniqueID, SurpriseRemovalOK)
-Status                   : 0x0180600A (DN_DRIVER_LOADED, DN_STARTED, DN_DISABLEABLE, DN_REMOVABLE, DN_NT_ENUMERATOR, DN_NT_DRIVER)
-First Install Date       : 2026-07-17 02:44:40
-Last Arrival Date        : 2026-07-18 00:59:16
-EnhancedPowerMgmtEnabled : 0
-Power State              : D0 (supported: D0, D1, D2, D3, wake from D0, wake from D1, wake from D2)
-
-        ---------------- Connection Information ---------------
-Connection Index         : 0x02 (Port 2)
-Connection Status        : 0x01 (DeviceConnected)
-Current Config Value     : 0x01 (Configuration 1)
-Device Address           : 0x13 (19)
-Is Hub                   : 0x00 (no)
-Device Bus Speed         : 0x01 (Full-Speed)
-Number of open Pipes     : 0x08 (8 pipes to data endpoints)
-Pipe[0]                  : EndpointID=1  Direction=OUT  ScheduleOffset=0  Type=Bulk       wMaxPacketSize=0x40    bInterval=0  
-Pipe[1]                  : EndpointID=1  Direction=IN   ScheduleOffset=0  Type=Bulk       wMaxPacketSize=0x40    bInterval=0  
-Pipe[2]                  : EndpointID=2  Direction=IN   ScheduleOffset=0  Type=Interrupt  wMaxPacketSize=0x08    bInterval=16  -> 196 Bits/ms = 24500 Bytes/s
-Pipe[3]                  : EndpointID=4  Direction=IN   ScheduleOffset=0  Type=Interrupt  wMaxPacketSize=0x08    bInterval=16  -> 196 Bits/ms = 24500 Bytes/s
-Pipe[4]                  : EndpointID=3  Direction=OUT  ScheduleOffset=0  Type=Bulk       wMaxPacketSize=0x40    bInterval=0  
-Pipe[5]                  : EndpointID=3  Direction=IN   ScheduleOffset=0  Type=Bulk       wMaxPacketSize=0x40    bInterval=0  
-Pipe[6]                  : EndpointID=5  Direction=OUT  ScheduleOffset=0  Type=Bulk       wMaxPacketSize=0x40    bInterval=0  
-Pipe[7]                  : EndpointID=5  Direction=IN   ScheduleOffset=0  Type=Bulk       wMaxPacketSize=0x40    bInterval=0  
-
-        --------------- Connection Information V2 -------------
-Connection Index         : 0x02 (2)
-Length                   : 0x10 (16 bytes)
-SupportedUsbProtocols    : 0x03
- Usb110                  : 1 (yes, port supports USB 1.1)
- Usb200                  : 1 (yes, port supports USB 2.0)
- Usb300                  : 0 (no, port not supports USB 3.0)
- ReservedMBZ             : 0x00
-Flags                    : 0x00
- DevIsOpAtSsOrHigher     : 0 (Device is not operating at SuperSpeed or higher)
- DevIsSsCapOrHigher      : 0 (Device is not SuperSpeed capable or higher)
- DevIsOpAtSsPlusOrHigher : 0 (Device is not operating at SuperSpeedPlus or higher)
- DevIsSsPlusCapOrHigher  : 0 (Device is not SuperSpeedPlus capable or higher)
- ReservedMBZ             : 0x00
-
-    ---------------------- Device Descriptor ----------------------
-bLength                  : 0x12 (18 bytes)
-bDescriptorType          : 0x01 (Device Descriptor)
-bcdUSB                   : 0x210 (USB Version 2.1)
-bDeviceClass             : 0xEF (Miscellaneous)
-bDeviceSubClass          : 0x02
-bDeviceProtocol          : 0x01 (IAD - Interface Association Descriptor)
-bMaxPacketSize0          : 0x40 (64 bytes)
-idVendor                 : 0x2E8A (Raspberry Pi (Trading) Limited)
-idProduct                : 0x000A
-bcdDevice                : 0x0401
-iManufacturer            : 0x01 (String Descriptor 1)
- Language 0x0409         : "Mai Control"
-iProduct                 : 0x02 (String Descriptor 2)
- Language 0x0409         : "Mai Control Device"
-iSerialNumber            : 0x03 (String Descriptor 3)
- Language 0x0409         : "01934"
-bNumConfigurations       : 0x01 (1 Configuration)
-
-    ------------------ Configuration Descriptor -------------------
-bLength                  : 0x09 (9 bytes)
-bDescriptorType          : 0x02 (Configuration Descriptor)
-wTotalLength             : 0x00A4 (164 bytes)
-bNumInterfaces           : 0x05 (5 Interfaces)
-bConfigurationValue      : 0x01 (Configuration 1)
-iConfiguration           : 0x00 (No String Descriptor)
-bmAttributes             : 0xA0
- D7: Reserved, set 1     : 0x01
- D6: Self Powered        : 0x00 (no)
- D5: Remote Wakeup       : 0x01 (yes)
- D4..0: Reserved, set 0  : 0x00
-MaxPower                 : 0x32 (100 mA)
-
-        ---------------- Interface Descriptor -----------------
-bLength                  : 0x09 (9 bytes)
-bDescriptorType          : 0x04 (Interface Descriptor)
-bInterfaceNumber         : 0x00 (Interface 0)
-bAlternateSetting        : 0x00
-bNumEndpoints            : 0x02 (2 Endpoints)
-bInterfaceClass          : 0xFF (Vendor Specific)
-bInterfaceSubClass       : 0x00
-bInterfaceProtocol       : 0x00
-iInterface               : 0x04 (String Descriptor 4)
- Language 0x0409         : "mai2 config"
-
-        ----------------- Endpoint Descriptor -----------------
-bLength                  : 0x07 (7 bytes)
-bDescriptorType          : 0x05 (Endpoint Descriptor)
-bEndpointAddress         : 0x01 (Direction=OUT EndpointID=1)
-bmAttributes             : 0x02 (TransferType=Bulk)
-wMaxPacketSize           : 0x0040 (64 bytes)
-bInterval                : 0x00 (ignored)
-
-        ----------------- Endpoint Descriptor -----------------
-bLength                  : 0x07 (7 bytes)
-bDescriptorType          : 0x05 (Endpoint Descriptor)
-bEndpointAddress         : 0x81 (Direction=IN EndpointID=1)
-bmAttributes             : 0x02 (TransferType=Bulk)
-wMaxPacketSize           : 0x0040 (64 bytes)
-bInterval                : 0x00 (ignored)
-
-        ------------------- IAD Descriptor --------------------
-bLength                  : 0x08 (8 bytes)
-bDescriptorType          : 0x0B (Interface Association Descriptor)
-bFirstInterface          : 0x01 (Interface 1)
-bInterfaceCount          : 0x02 (2 Interfaces)
-bFunctionClass           : 0x02 (Communications and CDC Control)
-bFunctionSubClass        : 0x02
-bFunctionProtocol        : 0x00
-iFunction                : 0x00 (No String Descriptor)
-
-        ---------------- Interface Descriptor -----------------
-bLength                  : 0x09 (9 bytes)
-bDescriptorType          : 0x04 (Interface Descriptor)
-bInterfaceNumber         : 0x01 (Interface 1)
-bAlternateSetting        : 0x00
-bNumEndpoints            : 0x01 (1 Endpoint)
-bInterfaceClass          : 0x02 (Communications and CDC Control)
-bInterfaceSubClass       : 0x02 (Abstract Control Model)
-bInterfaceProtocol       : 0x00 (No class specific protocol required)
-iInterface               : 0x05 (String Descriptor 5)
- Language 0x0409         : "mai2 serial"
-
-        -------------- CDC Interface Descriptor ---------------
-bFunctionLength          : 0x05 (5 bytes)
-bDescriptorType          : 0x24 (Interface)
-bDescriptorSubType       : 0x00 (Header Functional Descriptor)
-bcdCDC                   : 0x120 (CDC Version 1.20)
-
-        -------------- CDC Interface Descriptor ---------------
-bFunctionLength          : 0x05 (5 bytes)
-bDescriptorType          : 0x24 (Interface)
-bDescriptorSubType       : 0x01 (Call Management Functional Descriptor)
-bmCapabilities           : 0x00
- D7..2                   : 0x00 (Reserved)
- D1                      : 0x00 (sends/receives call management information only over the Communication Class interface)
- D0                      : 0x00 (does not handle call management itself)
-bDataInterface           : 0x02
-
-        -------------- CDC Interface Descriptor ---------------
-bFunctionLength          : 0x04 (4 bytes)
-bDescriptorType          : 0x24 (Interface)
-bDescriptorSubType       : 0x02 (Abstract Control Management Functional Descriptor)
-bmCapabilities           : 0x06
- D7..4                   : 0x00 (Reserved)
- D3                      : 0x00 (not supports the notification Network_Connection)
- D2                      : 0x01 (supports the request Send_Break)
- D1                      : 0x01 (supports the request combination of Set_Line_Coding, Set_Control_Line_State, Get_Line_Coding, and the notification Serial_State)
- D0                      : 0x00 (not supports the request combination of Set_Comm_Feature, Clear_Comm_Feature, and Get_Comm_Feature)
-
-        -------------- CDC Interface Descriptor ---------------
-bFunctionLength          : 0x05 (5 bytes)
-bDescriptorType          : 0x24 (Interface)
-bDescriptorSubType       : 0x06 (Union Functional Descriptor)
-bControlInterface        : 0x01
-bSubordinateInterface[0] : 0x02
-
-        ----------------- Endpoint Descriptor -----------------
-bLength                  : 0x07 (7 bytes)
-bDescriptorType          : 0x05 (Endpoint Descriptor)
-bEndpointAddress         : 0x82 (Direction=IN EndpointID=2)
-bmAttributes             : 0x03 (TransferType=Interrupt)
-wMaxPacketSize           : 0x0008 (8 bytes)
-bInterval                : 0x10 (16 ms)
-
-        ---------------- Interface Descriptor -----------------
-bLength                  : 0x09 (9 bytes)
-bDescriptorType          : 0x04 (Interface Descriptor)
-bInterfaceNumber         : 0x02 (Interface 2)
-bAlternateSetting        : 0x00
-bNumEndpoints            : 0x02 (2 Endpoints)
-bInterfaceClass          : 0x0A (CDC-Data)
-bInterfaceSubClass       : 0x00
-bInterfaceProtocol       : 0x00
-iInterface               : 0x00 (No String Descriptor)
-
-        ----------------- Endpoint Descriptor -----------------
-bLength                  : 0x07 (7 bytes)
-bDescriptorType          : 0x05 (Endpoint Descriptor)
-bEndpointAddress         : 0x03 (Direction=OUT EndpointID=3)
-bmAttributes             : 0x02 (TransferType=Bulk)
-wMaxPacketSize           : 0x0040 (64 bytes)
-bInterval                : 0x00 (ignored)
-
-        ----------------- Endpoint Descriptor -----------------
-bLength                  : 0x07 (7 bytes)
-bDescriptorType          : 0x05 (Endpoint Descriptor)
-bEndpointAddress         : 0x83 (Direction=IN EndpointID=3)
-bmAttributes             : 0x02 (TransferType=Bulk)
-wMaxPacketSize           : 0x0040 (64 bytes)
-bInterval                : 0x00 (ignored)
-
-        ------------------- IAD Descriptor --------------------
-bLength                  : 0x08 (8 bytes)
-bDescriptorType          : 0x0B (Interface Association Descriptor)
-bFirstInterface          : 0x03 (Interface 3)
-bInterfaceCount          : 0x02 (2 Interfaces)
-bFunctionClass           : 0x02 (Communications and CDC Control)
-bFunctionSubClass        : 0x02
-bFunctionProtocol        : 0x00
-iFunction                : 0x00 (No String Descriptor)
-
-        ---------------- Interface Descriptor -----------------
-bLength                  : 0x09 (9 bytes)
-bDescriptorType          : 0x04 (Interface Descriptor)
-bInterfaceNumber         : 0x03 (Interface 3)
-bAlternateSetting        : 0x00
-bNumEndpoints            : 0x01 (1 Endpoint)
-bInterfaceClass          : 0x02 (Communications and CDC Control)
-bInterfaceSubClass       : 0x02 (Abstract Control Model)
-bInterfaceProtocol       : 0x00 (No class specific protocol required)
-iInterface               : 0x06 (String Descriptor 6)
- Language 0x0409         : "mai2 light"
-
-        -------------- CDC Interface Descriptor ---------------
-bFunctionLength          : 0x05 (5 bytes)
-bDescriptorType          : 0x24 (Interface)
-bDescriptorSubType       : 0x00 (Header Functional Descriptor)
-bcdCDC                   : 0x120 (CDC Version 1.20)
-
-        -------------- CDC Interface Descriptor ---------------
-bFunctionLength          : 0x05 (5 bytes)
-bDescriptorType          : 0x24 (Interface)
-bDescriptorSubType       : 0x01 (Call Management Functional Descriptor)
-bmCapabilities           : 0x00
- D7..2                   : 0x00 (Reserved)
- D1                      : 0x00 (sends/receives call management information only over the Communication Class interface)
- D0                      : 0x00 (does not handle call management itself)
-bDataInterface           : 0x04
-
-        -------------- CDC Interface Descriptor ---------------
-bFunctionLength          : 0x04 (4 bytes)
-bDescriptorType          : 0x24 (Interface)
-bDescriptorSubType       : 0x02 (Abstract Control Management Functional Descriptor)
-bmCapabilities           : 0x06
- D7..4                   : 0x00 (Reserved)
- D3                      : 0x00 (not supports the notification Network_Connection)
- D2                      : 0x01 (supports the request Send_Break)
- D1                      : 0x01 (supports the request combination of Set_Line_Coding, Set_Control_Line_State, Get_Line_Coding, and the notification Serial_State)
- D0                      : 0x00 (not supports the request combination of Set_Comm_Feature, Clear_Comm_Feature, and Get_Comm_Feature)
-
-        -------------- CDC Interface Descriptor ---------------
-bFunctionLength          : 0x05 (5 bytes)
-bDescriptorType          : 0x24 (Interface)
-bDescriptorSubType       : 0x06 (Union Functional Descriptor)
-bControlInterface        : 0x03
-bSubordinateInterface[0] : 0x04
-
-        ----------------- Endpoint Descriptor -----------------
-bLength                  : 0x07 (7 bytes)
-bDescriptorType          : 0x05 (Endpoint Descriptor)
-bEndpointAddress         : 0x84 (Direction=IN EndpointID=4)
-bmAttributes             : 0x03 (TransferType=Interrupt)
-wMaxPacketSize           : 0x0008 (8 bytes)
-bInterval                : 0x10 (16 ms)
-
-        ---------------- Interface Descriptor -----------------
-bLength                  : 0x09 (9 bytes)
-bDescriptorType          : 0x04 (Interface Descriptor)
-bInterfaceNumber         : 0x04 (Interface 4)
-bAlternateSetting        : 0x00
-bNumEndpoints            : 0x02 (2 Endpoints)
-bInterfaceClass          : 0x0A (CDC-Data)
-bInterfaceSubClass       : 0x00
-bInterfaceProtocol       : 0x00
-iInterface               : 0x00 (No String Descriptor)
-
-        ----------------- Endpoint Descriptor -----------------
-bLength                  : 0x07 (7 bytes)
-bDescriptorType          : 0x05 (Endpoint Descriptor)
-bEndpointAddress         : 0x05 (Direction=OUT EndpointID=5)
-bmAttributes             : 0x02 (TransferType=Bulk)
-wMaxPacketSize           : 0x0040 (64 bytes)
-bInterval                : 0x00 (ignored)
-
-        ----------------- Endpoint Descriptor -----------------
-bLength                  : 0x07 (7 bytes)
-bDescriptorType          : 0x05 (Endpoint Descriptor)
-bEndpointAddress         : 0x85 (Direction=IN EndpointID=5)
-bmAttributes             : 0x02 (TransferType=Bulk)
-wMaxPacketSize           : 0x0040 (64 bytes)
-bInterval                : 0x00 (ignored)
-
-    ----------------- Device Qualifier Descriptor -----------------
-Error                    : request skipped because low-speed device
-
-      ---------- Binary Object Store (BOS) Descriptor -----------
-bLength                  : 0x05 (5 bytes)
-bDescriptorType          : 0x0F (Binary Object Store)
-wTotalLength             : 0x0021 (33 bytes)
-bNumDeviceCaps           : 0x01
-
-        ----------- Platform Capabilities Descriptor -----------
-bLength                  : 0x1C (28 bytes)
-bDescriptorType          : 0x10 (Device Capability Descriptor)
-bDevCapabilityType       : 0x05 (Platform Capabilities)
-bReserved                : 0x00
-PlatformCapabilityUUID   : D8DD60DF-4589-4CC7-9CD2-659D9E648A9F (GUID_USB_MSOS20_PLATFORM_CAPABILITY_ID)
-dwWindowsVersion         : 0x06030000 (Windows V6.3 and higher)
-wMSOSDescSetTotalLength  : 0x00B2 (178 Bytes)
-bMS_VendorCode           : 0x01 (1)
-bAltEnumCode             : 0x00 (0)
-
-      -------------------- String Descriptors -------------------
-             ------ String Descriptor 0 ------
-bLength                  : 0x04 (4 bytes)
-bDescriptorType          : 0x03 (String Descriptor)
-Language ID[0]           : 0x0409 (English - United States)
-             ------ String Descriptor 1 ------
-bLength                  : 0x18 (24 bytes)
-bDescriptorType          : 0x03 (String Descriptor)
-Language 0x0409          : "Mai Control"
-             ------ String Descriptor 2 ------
-bLength                  : 0x26 (38 bytes)
-bDescriptorType          : 0x03 (String Descriptor)
-Language 0x0409          : "Mai Control Device"
-             ------ String Descriptor 3 ------
-bLength                  : 0x0C (12 bytes)
-bDescriptorType          : 0x03 (String Descriptor)
-Language 0x0409          : "01934"
-             ------ String Descriptor 4 ------
-bLength                  : 0x18 (24 bytes)
-bDescriptorType          : 0x03 (String Descriptor)
-Language 0x0409          : "mai2 config"
-             ------ String Descriptor 5 ------
-bLength                  : 0x18 (24 bytes)
-bDescriptorType          : 0x03 (String Descriptor)
-Language 0x0409          : "mai2 serial"
-             ------ String Descriptor 6 ------
-bLength                  : 0x16 (22 bytes)
-bDescriptorType          : 0x03 (String Descriptor)
-Language 0x0409          : "mai2 light"
+[2026-07-25T19:56:15Z INFO  mai2control_ui] mai2control-ui starting
+[2026-07-25T19:56:15Z INFO  mai2control_ui::io] Enumerated 1 mai2 config WinUSB device(s)
+[2026-07-25T19:56:15Z INFO  mai2control_ui::app_state] 连接设备[0]: 启动 IO + 发 HELLO
+[2026-07-25T19:56:15Z INFO  mai2control_ui::io] WinUSB IO thread started
+[2026-07-25T19:56:15Z INFO  mai2control_ui::app_state] 工具箱端口应用: 触控串口(mai2serial): 已是 COM3, 无需更改
+    灯效串口(mai2light): 已是 COM21, 无需更改
+[2026-07-25T19:56:15Z INFO  mai2control_ui::app_state] IO 线程已连接, 等待 DEVICE_INFO...
+[2026-07-25T19:56:15Z INFO  mai2control_ui::app_state] 已连接: 收到 DEVICE_INFO
+[2026-07-25T19:56:15Z INFO  mai2control_ui::app_state] 已连接 → 自动请求配置、当前通道参数/Cp、CH0 全局采样参数 + 开启全通道遥测
+[2026-07-25T19:56:16Z INFO  mai2control_ui::app_state] 遥测数据开始流入 (首帧 TELEM_DATA)
+[2026-07-25T19:56:25Z INFO  mai2control_ui::app_state] 保存: 已下发 1 项草稿改动并请求写入 flash
+[2026-07-25T19:56:28Z INFO  mai2control_ui::app_state] 下发 1 项全局设置(合并为一次 PSoC 重初始化): 自动校准(AUTO_CALIBRATE_EN)=0
+[2026-07-25T19:56:28Z INFO  mai2control_ui::app_state] 保存: 已下发 1 项草稿改动并请求写入 flash
+[2026-07-25T19:56:31Z INFO  mai2control_ui::app_state] CSD 操作冷却结束(保存后重校准/重初始化), 可继续下一步操作。
+[2026-07-25T19:56:36Z INFO  mai2control_ui::app_state] ▶ 阻塞操作开始: 校准中 (seq=52), 等待固件真正完成回执...
+[2026-07-25T19:56:36Z INFO  mai2control_ui::app_state] ✔ 阻塞操作完成: 校准中 (耗时约 32ms)
+[2026-07-25T19:56:36Z WARN  mai2control_ui::app_state] 收到 NAK(seq=53): PSoC cp_get failed
+[2026-07-25T19:56:36Z WARN  mai2control_ui::app_state] 收到 NAK(seq=54): PSoC cp_get failed
+[2026-07-25T19:56:36Z WARN  mai2control_ui::app_state] 收到 NAK(seq=55): PSoC cp_get failed
+[2026-07-25T19:56:36Z WARN  mai2control_ui::app_state] 收到 NAK(seq=57): PSoC cp_get failed
+[2026-07-25T19:56:36Z WARN  mai2control_ui::app_state] 收到 NAK(seq=58): PSoC cp_get failed
+[2026-07-25T19:56:36Z WARN  mai2control_ui::app_state] 收到 NAK(seq=59): PSoC cp_get failed
+[2026-07-25T19:56:36Z WARN  mai2control_ui::app_state] 收到 NAK(seq=60): PSoC cp_get failed
+[2026-07-25T19:56:37Z WARN  mai2control_ui::app_state] 收到 NAK(seq=62): PSoC cp_get failed
+[2026-07-25T19:56:37Z WARN  mai2control_ui::app_state] 收到 NAK(seq=63): PSoC cp_get failed
+[2026-07-25T19:56:37Z WARN  mai2control_ui::app_state] 收到 NAK(seq=65): PSoC cp_get failed
+[2026-07-25T19:56:37Z WARN  mai2control_ui::app_state] 收到 NAK(seq=66): PSoC cp_get failed
+[2026-07-25T19:56:38Z INFO  mai2control_ui::app_state] CSD 操作冷却结束(校准), 可继续下一步操作。
+[2026-07-25T19:56:44Z INFO  mai2control_ui::app_state] ▶ 阻塞操作开始: 频率自适应中 (seq=175), 等待固件真正完成回执...
+[2026-07-25T19:56:44Z WARN  mai2control_ui::app_state] 收到 NAK(seq=176): PSoC cp_get failed
+[2026-07-25T19:56:44Z WARN  mai2control_ui::app_state] 收到 NAK(seq=177): PSoC cp_get failed
+[2026-07-25T19:56:44Z WARN  mai2control_ui::app_state] 收到 NAK(seq=178): PSoC cp_get failed
+[2026-07-25T19:56:44Z WARN  mai2control_ui::app_state] 收到 NAK(seq=180): PSoC cp_get failed
+[2026-07-25T19:56:45Z WARN  mai2control_ui::app_state] 收到 NAK(seq=181): PSoC cp_get failed
+[2026-07-25T19:56:45Z WARN  mai2control_ui::app_state] 收到 NAK(seq=183): PSoC cp_get failed
+[2026-07-25T19:56:45Z WARN  mai2control_ui::app_state] 收到 NAK(seq=184): PSoC cp_get failed
+[2026-07-25T19:56:45Z WARN  mai2control_ui::app_state] 收到 NAK(seq=186): PSoC cp_get failed
+[2026-07-25T19:56:45Z WARN  mai2control_ui::app_state] 收到 NAK(seq=187): PSoC cp_get failed
+[2026-07-25T19:56:45Z INFO  mai2control_ui::app_state] … 全通道 频率自适应中: 已受理 已等待 1s, 仍未收到固件完成回执
+[2026-07-25T19:56:45Z WARN  mai2control_ui::app_state] 收到 NAK(seq=188): PSoC cp_get failed
+[2026-07-25T19:56:45Z WARN  mai2control_ui::app_state] 收到 NAK(seq=189): PSoC cp_get failed
+[2026-07-25T19:56:45Z WARN  mai2control_ui::app_state] 收到 NAK(seq=191): PSoC cp_get failed
+[2026-07-25T19:56:45Z WARN  mai2control_ui::app_state] 收到 NAK(seq=192): PSoC cp_get failed
+[2026-07-25T19:56:45Z WARN  mai2control_ui::app_state] 收到 NAK(seq=193): PSoC cp_get failed
+[2026-07-25T19:56:46Z WARN  mai2control_ui::app_state] 收到 NAK(seq=194): PSoC cp_get failed
+[2026-07-25T19:56:46Z WARN  mai2control_ui::app_state] 收到 NAK(seq=196): PSoC cp_get failed
+[2026-07-25T19:56:46Z WARN  mai2control_ui::app_state] 收到 NAK(seq=197): PSoC cp_get failed
+[2026-07-25T19:56:46Z WARN  mai2control_ui::app_state] 收到 NAK(seq=198): PSoC cp_get failed
+[2026-07-25T19:56:46Z WARN  mai2control_ui::app_state] 收到 NAK(seq=200): PSoC cp_get failed
+[2026-07-25T19:56:46Z INFO  mai2control_ui::app_state] CSD 操作冷却结束(频率自适应), 可继续下一步操作。
+[2026-07-25T19:56:46Z WARN  mai2control_ui::app_state] 收到 NAK(seq=202): PSoC cp_get failed
+[2026-07-25T19:56:46Z INFO  mai2control_ui::app_state] … 全通道 频率自适应中: 已受理 已等待 2s, 仍未收到固件完成回执
+[2026-07-25T19:56:46Z WARN  mai2control_ui::app_state] 收到 NAK(seq=203): PSoC cp_get failed
+[2026-07-25T19:56:46Z WARN  mai2control_ui::app_state] 收到 NAK(seq=204): PSoC cp_get failed
+[2026-07-25T19:56:46Z WARN  mai2control_ui::app_state] 收到 NAK(seq=205): PSoC cp_get failed
+[2026-07-25T19:56:46Z WARN  mai2control_ui::app_state] 收到 NAK(seq=207): PSoC cp_get failed
+[2026-07-25T19:56:47Z WARN  mai2control_ui::app_state] 收到 NAK(seq=208): PSoC cp_get failed
+[2026-07-25T19:56:47Z WARN  mai2control_ui::app_state] 收到 NAK(seq=209): PSoC cp_get failed
+[2026-07-25T19:56:47Z WARN  mai2control_ui::app_state] 收到 NAK(seq=210): PSoC cp_get failed
+[2026-07-25T19:56:47Z WARN  mai2control_ui::app_state] 收到 NAK(seq=212): PSoC cp_get failed
+[2026-07-25T19:56:47Z WARN  mai2control_ui::app_state] 收到 NAK(seq=213): PSoC cp_get failed
+[2026-07-25T19:56:47Z WARN  mai2control_ui::app_state] 收到 NAK(seq=214): PSoC cp_get failed
+[2026-07-25T19:56:47Z INFO  mai2control_ui::app_state] … 全通道 频率自适应中: 已受理 已等待 3s, 仍未收到固件完成回执
+[2026-07-25T19:56:47Z WARN  mai2control_ui::app_state] 收到 NAK(seq=216): PSoC cp_get failed
+[2026-07-25T19:56:47Z WARN  mai2control_ui::app_state] 收到 NAK(seq=218): PSoC cp_get failed
+[2026-07-25T19:56:47Z WARN  mai2control_ui::app_state] 收到 NAK(seq=219): PSoC cp_get failed
+[2026-07-25T19:56:47Z WARN  mai2control_ui::app_state] 收到 NAK(seq=220): PSoC cp_get failed
+[2026-07-25T19:56:48Z WARN  mai2control_ui::app_state] 收到 NAK(seq=221): PSoC cp_get failed
+[2026-07-25T19:56:48Z WARN  mai2control_ui::app_state] 收到 NAK(seq=223): PSoC cp_get failed
+[2026-07-25T19:56:48Z WARN  mai2control_ui::app_state] 收到 NAK(seq=224): PSoC cp_get failed
+[2026-07-25T19:56:48Z WARN  mai2control_ui::app_state] 收到 NAK(seq=225): PSoC cp_get failed
+[2026-07-25T19:56:48Z WARN  mai2control_ui::app_state] 收到 NAK(seq=226): PSoC cp_get failed
+[2026-07-25T19:56:48Z WARN  mai2control_ui::app_state] 收到 NAK(seq=228): PSoC cp_get failed
+[2026-07-25T19:56:48Z INFO  mai2control_ui::app_state] … 全通道 频率自适应中: 已受理 已等待 4s, 仍未收到固件完成回执
+[2026-07-25T19:56:48Z WARN  mai2control_ui::app_state] 收到 NAK(seq=229): PSoC cp_get failed
+[2026-07-25T19:56:48Z WARN  mai2control_ui::app_state] 收到 NAK(seq=230): PSoC cp_get failed
+[2026-07-25T19:56:48Z WARN  mai2control_ui::app_state] 收到 NAK(seq=231): PSoC cp_get failed
+[2026-07-25T19:56:48Z WARN  mai2control_ui::app_state] 收到 NAK(seq=234): PSoC cp_get failed
+[2026-07-25T19:56:49Z WARN  mai2control_ui::app_state] 收到 NAK(seq=235): PSoC cp_get failed
+[2026-07-25T19:56:49Z WARN  mai2control_ui::app_state] 收到 NAK(seq=236): PSoC cp_get failed
+[2026-07-25T19:56:49Z WARN  mai2control_ui::app_state] 收到 NAK(seq=237): PSoC cp_get failed
+[2026-07-25T19:56:49Z WARN  mai2control_ui::app_state] 收到 NAK(seq=239): PSoC cp_get failed
+[2026-07-25T19:56:49Z WARN  mai2control_ui::app_state] 收到 NAK(seq=240): PSoC cp_get failed
+[2026-07-25T19:56:49Z WARN  mai2control_ui::app_state] 收到 NAK(seq=241): PSoC cp_get failed
+[2026-07-25T19:56:49Z INFO  mai2control_ui::app_state] … 全通道 频率自适应中: 已受理 已等待 5s, 仍未收到固件完成回执
+[2026-07-25T19:56:49Z WARN  mai2control_ui::app_state] 收到 NAK(seq=242): PSoC cp_get failed
+[2026-07-25T19:56:49Z WARN  mai2control_ui::app_state] 收到 NAK(seq=244): PSoC cp_get failed
+[2026-07-25T19:56:49Z WARN  mai2control_ui::app_state] 收到 NAK(seq=245): PSoC cp_get failed
+[2026-07-25T19:56:49Z WARN  mai2control_ui::app_state] 收到 NAK(seq=246): PSoC cp_get failed
+[2026-07-25T19:56:50Z WARN  mai2control_ui::app_state] 收到 NAK(seq=247): PSoC cp_get failed
+[2026-07-25T19:56:50Z WARN  mai2control_ui::app_state] 收到 NAK(seq=249): PSoC cp_get failed
+[2026-07-25T19:56:50Z WARN  mai2control_ui::app_state] 收到 NAK(seq=251): PSoC cp_get failed
+[2026-07-25T19:56:50Z WARN  mai2control_ui::app_state] 收到 NAK(seq=252): PSoC cp_get failed
+[2026-07-25T19:56:50Z WARN  mai2control_ui::app_state] 收到 NAK(seq=253): PSoC cp_get failed
+[2026-07-25T19:56:50Z WARN  mai2control_ui::app_state] 收到 NAK(seq=255): PSoC cp_get failed
+[2026-07-25T19:56:50Z WARN  mai2control_ui::app_state] 收到 NAK(seq=0): PSoC cp_get failed
+[2026-07-25T19:56:50Z INFO  mai2control_ui::app_state] … 全通道 频率自适应中: 已受理 已等待 6s, 仍未收到固件完成回执
+[2026-07-25T19:56:50Z WARN  mai2control_ui::app_state] 收到 NAK(seq=1): PSoC cp_get failed
+[2026-07-25T19:56:50Z WARN  mai2control_ui::app_state] 收到 NAK(seq=2): PSoC cp_get failed
+[2026-07-25T19:56:50Z WARN  mai2control_ui::app_state] 收到 NAK(seq=4): PSoC cp_get failed
+[2026-07-25T19:56:51Z WARN  mai2control_ui::app_state] 收到 NAK(seq=5): PSoC cp_get failed
+[2026-07-25T19:56:51Z WARN  mai2control_ui::app_state] 收到 NAK(seq=6): PSoC cp_get failed
+[2026-07-25T19:56:51Z WARN  mai2control_ui::app_state] 收到 NAK(seq=7): PSoC cp_get failed
+[2026-07-25T19:56:51Z WARN  mai2control_ui::app_state] 收到 NAK(seq=9): PSoC cp_get failed
+[2026-07-25T19:56:51Z WARN  mai2control_ui::app_state] 收到 NAK(seq=11): PSoC cp_get failed
+[2026-07-25T19:56:51Z WARN  mai2control_ui::app_state] 收到 NAK(seq=12): PSoC cp_get failed
+[2026-07-25T19:56:51Z WARN  mai2control_ui::app_state] 收到 NAK(seq=13): PSoC cp_get failed
+[2026-07-25T19:56:51Z INFO  mai2control_ui::app_state] … 全通道 频率自适应中: 已受理 已等待 7s, 仍未收到固件完成回执
+[2026-07-25T19:56:51Z WARN  mai2control_ui::app_state] 收到 NAK(seq=15): PSoC cp_get failed
+[2026-07-25T19:56:51Z WARN  mai2control_ui::app_state] 收到 NAK(seq=16): PSoC cp_get failed
+[2026-07-25T19:56:51Z WARN  mai2control_ui::app_state] 收到 NAK(seq=17): PSoC cp_get failed
+[2026-07-25T19:56:52Z WARN  mai2control_ui::app_state] 收到 NAK(seq=18): PSoC cp_get failed
+[2026-07-25T19:56:52Z WARN  mai2control_ui::app_state] 收到 NAK(seq=20): PSoC cp_get failed
+[2026-07-25T19:56:52Z WARN  mai2control_ui::app_state] 收到 NAK(seq=21): PSoC cp_get failed
+[2026-07-25T19:56:52Z WARN  mai2control_ui::app_state] 收到 NAK(seq=22): PSoC cp_get failed
+[2026-07-25T19:56:52Z WARN  mai2control_ui::app_state] 收到 NAK(seq=23): PSoC cp_get failed
+[2026-07-25T19:56:52Z WARN  mai2control_ui::app_state] 收到 NAK(seq=25): PSoC cp_get failed
+[2026-07-25T19:56:52Z WARN  mai2control_ui::app_state] 收到 NAK(seq=26): PSoC cp_get failed
+[2026-07-25T19:56:52Z INFO  mai2control_ui::app_state] … 全通道 频率自适应中: 已受理 已等待 8s, 仍未收到固件完成回执
+[2026-07-25T19:56:52Z WARN  mai2control_ui::app_state] 收到 NAK(seq=28): PSoC cp_get failed
+[2026-07-25T19:56:52Z WARN  mai2control_ui::app_state] 收到 NAK(seq=29): PSoC cp_get failed
+[2026-07-25T19:56:52Z WARN  mai2control_ui::app_state] 收到 NAK(seq=31): PSoC cp_get failed
+[2026-07-25T19:56:53Z WARN  mai2control_ui::app_state] 收到 NAK(seq=32): PSoC cp_get failed
+[2026-07-25T19:56:53Z WARN  mai2control_ui::app_state] 收到 NAK(seq=33): PSoC cp_get failed
+[2026-07-25T19:56:53Z WARN  mai2control_ui::app_state] 收到 NAK(seq=34): PSoC cp_get failed
+[2026-07-25T19:56:53Z WARN  mai2control_ui::app_state] 收到 NAK(seq=36): PSoC cp_get failed
+[2026-07-25T19:56:53Z WARN  mai2control_ui::app_state] 收到 NAK(seq=37): PSoC cp_get failed
+[2026-07-25T19:56:53Z WARN  mai2control_ui::app_state] 收到 NAK(seq=38): PSoC cp_get failed
+[2026-07-25T19:56:53Z WARN  mai2control_ui::app_state] 收到 NAK(seq=39): PSoC cp_get failed
+[2026-07-25T19:56:53Z WARN  mai2control_ui::app_state] 收到 NAK(seq=41): PSoC cp_get failed
+[2026-07-25T19:56:53Z INFO  mai2control_ui::app_state] … 全通道 频率自适应中: 已受理 已等待 9s, 仍未收到固件完成回执
+[2026-07-25T19:56:53Z WARN  mai2control_ui::app_state] 收到 NAK(seq=42): PSoC cp_get failed
+[2026-07-25T19:56:53Z WARN  mai2control_ui::app_state] 收到 NAK(seq=44): PSoC cp_get failed
+[2026-07-25T19:56:54Z WARN  mai2control_ui::app_state] 收到 NAK(seq=45): PSoC cp_get failed
+[2026-07-25T19:56:54Z WARN  mai2control_ui::app_state] 收到 NAK(seq=47): PSoC cp_get failed
+[2026-07-25T19:56:54Z WARN  mai2control_ui::app_state] 收到 NAK(seq=48): PSoC cp_get failed
+[2026-07-25T19:56:54Z WARN  mai2control_ui::app_state] 收到 NAK(seq=49): PSoC cp_get failed
+[2026-07-25T19:56:54Z WARN  mai2control_ui::app_state] 收到 NAK(seq=50): PSoC cp_get failed
+[2026-07-25T19:56:54Z WARN  mai2control_ui::app_state] 收到 NAK(seq=52): PSoC cp_get failed
+[2026-07-25T19:56:54Z WARN  mai2control_ui::app_state] 收到 NAK(seq=53): PSoC cp_get failed
+[2026-07-25T19:56:54Z WARN  mai2control_ui::app_state] 收到 NAK(seq=54): PSoC cp_get failed
+[2026-07-25T19:56:54Z INFO  mai2control_ui::app_state] … 全通道 频率自适应中: 已受理 已等待 10s, 仍未收到固件完成回执
+[2026-07-25T19:56:54Z WARN  mai2control_ui::app_state] 收到 NAK(seq=55): PSoC cp_get failed
+[2026-07-25T19:56:54Z WARN  mai2control_ui::app_state] 收到 NAK(seq=57): PSoC cp_get failed
+[2026-07-25T19:56:55Z WARN  mai2control_ui::app_state] 收到 NAK(seq=58): PSoC cp_get failed
+[2026-07-25T19:56:55Z WARN  mai2control_ui::app_state] 收到 NAK(seq=59): PSoC cp_get failed
+[2026-07-25T19:56:55Z WARN  mai2control_ui::app_state] 收到 NAK(seq=61): PSoC cp_get failed
+[2026-07-25T19:56:55Z WARN  mai2control_ui::app_state] 收到 NAK(seq=63): PSoC cp_get failed
+[2026-07-25T19:56:55Z WARN  mai2control_ui::app_state] 收到 NAK(seq=64): PSoC cp_get failed
+[2026-07-25T19:56:55Z WARN  mai2control_ui::app_state] 收到 NAK(seq=65): PSoC cp_get failed
+[2026-07-25T19:56:55Z WARN  mai2control_ui::app_state] 收到 NAK(seq=66): PSoC cp_get failed
+[2026-07-25T19:56:55Z WARN  mai2control_ui::app_state] 收到 NAK(seq=68): PSoC cp_get failed
+[2026-07-25T19:56:55Z INFO  mai2control_ui::app_state] … 全通道 频率自适应中: 已受理 已等待 11s, 仍未收到固件完成回执
+[2026-07-25T19:56:55Z WARN  mai2control_ui::app_state] 收到 NAK(seq=69): PSoC cp_get failed
+[2026-07-25T19:56:55Z WARN  mai2control_ui::app_state] 收到 NAK(seq=70): PSoC cp_get failed
+[2026-07-25T19:56:56Z WARN  mai2control_ui::app_state] 收到 NAK(seq=71): PSoC cp_get failed
+[2026-07-25T19:56:56Z INFO  mai2control_ui::app_state] 频率自适应失败: 超出硬件能力, 目标% 无法达到
+[2026-07-25T19:56:56Z INFO  mai2control_ui::app_state] ✔ 阻塞操作完成: 全通道 频率自适应中: 已受理 (耗时约 0ms)
+[2026-07-25T19:57:11Z INFO  mai2control_ui::app_state] 保存: 已下发 3 项草稿改动并请求写入 flash
+[2026-07-25T19:57:12Z WARN  mai2control_ui::app_state] 收到 NAK(seq=73): param value out of legal range (guarded)
+[2026-07-25T19:57:12Z WARN  mai2control_ui::app_state] 收到 NAK(seq=75): param value out of legal range (guarded)
+[2026-07-25T19:57:12Z WARN  mai2control_ui::app_state] 收到 NAK(seq=77): param value out of legal range (guarded)
+[2026-07-25T19:57:12Z WARN  mai2control_ui::app_state] 收到 NAK(seq=79): param value out of legal range (guarded)
+[2026-07-25T19:57:12Z WARN  mai2control_ui::app_state] 收到 NAK(seq=81): param value out of legal range (guarded)
+[2026-07-25T19:57:12Z WARN  mai2control_ui::app_state] 收到 NAK(seq=83): param value out of legal range (guarded)
+[2026-07-25T19:57:12Z WARN  mai2control_ui::app_state] 收到 NAK(seq=85): param value out of legal range (guarded)
+[2026-07-25T19:57:12Z WARN  mai2control_ui::app_state] 收到 NAK(seq=87): param value out of legal range (guarded)
+[2026-07-25T19:57:12Z WARN  mai2control_ui::app_state] 收到 NAK(seq=89): param value out of legal range (guarded)
+[2026-07-25T19:57:12Z WARN  mai2control_ui::app_state] 收到 NAK(seq=91): param value out of legal range (guarded)
+[2026-07-25T19:57:12Z WARN  mai2control_ui::app_state] 收到 NAK(seq=93): param value out of legal range (guarded)
+[2026-07-25T19:57:12Z WARN  mai2control_ui::app_state] 收到 NAK(seq=95): param value out of legal range (guarded)
+[2026-07-25T19:57:12Z WARN  mai2control_ui::app_state] 收到 NAK(seq=97): param value out of legal range (guarded)
+[2026-07-25T19:57:12Z WARN  mai2control_ui::app_state] 收到 NAK(seq=99): param value out of legal range (guarded)
+[2026-07-25T19:57:12Z WARN  mai2control_ui::app_state] 收到 NAK(seq=101): param value out of legal range (guarded)
+[2026-07-25T19:57:12Z WARN  mai2control_ui::app_state] 收到 NAK(seq=103): param value out of legal range (guarded)
+[2026-07-25T19:57:12Z WARN  mai2control_ui::app_state] 收到 NAK(seq=105): param value out of legal range (guarded)
+[2026-07-25T19:57:12Z WARN  mai2control_ui::app_state] 收到 NAK(seq=107): param value out of legal range (guarded)
+[2026-07-25T19:57:12Z WARN  mai2control_ui::app_state] 收到 NAK(seq=109): param value out of legal range (guarded)
+[2026-07-25T19:57:12Z WARN  mai2control_ui::app_state] 收到 NAK(seq=111): param value out of legal range (guarded)
+[2026-07-25T19:57:12Z WARN  mai2control_ui::app_state] 收到 NAK(seq=113): param value out of legal range (guarded)
+[2026-07-25T19:57:12Z WARN  mai2control_ui::app_state] 收到 NAK(seq=115): param value out of legal range (guarded)
+[2026-07-25T19:57:12Z WARN  mai2control_ui::app_state] 收到 NAK(seq=117): param value out of legal range (guarded)
+[2026-07-25T19:57:12Z WARN  mai2control_ui::app_state] 收到 NAK(seq=119): param value out of legal range (guarded)
+[2026-07-25T19:57:12Z WARN  mai2control_ui::app_state] 收到 NAK(seq=121): param value out of legal range (guarded)
+[2026-07-25T19:57:12Z WARN  mai2control_ui::app_state] 收到 NAK(seq=123): param value out of legal range (guarded)
+[2026-07-25T19:57:12Z WARN  mai2control_ui::app_state] 收到 NAK(seq=125): param value out of legal range (guarded)
+[2026-07-25T19:57:12Z WARN  mai2control_ui::app_state] 收到 NAK(seq=127): param value out of legal range (guarded)
+[2026-07-25T19:57:12Z WARN  mai2control_ui::app_state] 收到 NAK(seq=129): param value out of legal range (guarded)
+[2026-07-25T19:57:12Z WARN  mai2control_ui::app_state] 收到 NAK(seq=131): param value out of legal range (guarded)
+[2026-07-25T19:57:12Z WARN  mai2control_ui::app_state] 收到 NAK(seq=133): param value out of legal range (guarded)
+[2026-07-25T19:57:12Z WARN  mai2control_ui::app_state] 收到 NAK(seq=135): param value out of legal range (guarded)
+[2026-07-25T19:57:12Z WARN  mai2control_ui::app_state] 收到 NAK(seq=137): param value out of legal range (guarded)
+[2026-07-25T19:57:12Z WARN  mai2control_ui::app_state] 收到 NAK(seq=139): param value out of legal range (guarded)
+[2026-07-25T19:57:12Z WARN  mai2control_ui::app_state] 收到 NAK(seq=141): param value out of legal range (guarded)
+[2026-07-25T19:57:12Z WARN  mai2control_ui::app_state] 收到 NAK(seq=143): param value out of legal range (guarded)
+[2026-07-25T19:57:12Z WARN  mai2control_ui::app_state] 收到 NAK(seq=147): PSoC cp_get failed
+[2026-07-25T19:57:12Z WARN  mai2control_ui::app_state] 收到 NAK(seq=149): PSoC cp_get failed
+[2026-07-25T19:57:12Z WARN  mai2control_ui::app_state] 收到 NAK(seq=150): PSoC cp_get failed
+[2026-07-25T19:57:12Z WARN  mai2control_ui::app_state] 收到 NAK(seq=151): PSoC cp_get failed
+[2026-07-25T19:57:12Z WARN  mai2control_ui::app_state] 收到 NAK(seq=153): PSoC cp_get failed
+[2026-07-25T19:57:12Z WARN  mai2control_ui::app_state] 收到 NAK(seq=154): PSoC cp_get failed
+[2026-07-25T19:57:12Z WARN  mai2control_ui::app_state] 收到 NAK(seq=155): PSoC cp_get failed
+[2026-07-25T19:57:12Z WARN  mai2control_ui::app_state] 收到 NAK(seq=156): PSoC cp_get failed
+[2026-07-25T19:57:13Z WARN  mai2control_ui::app_state] 收到 NAK(seq=158): PSoC cp_get failed
+[2026-07-25T19:57:13Z WARN  mai2control_ui::app_state] 收到 NAK(seq=159): PSoC cp_get failed
+[2026-07-25T19:57:13Z WARN  mai2control_ui::app_state] 收到 NAK(seq=160): PSoC cp_get failed
+[2026-07-25T19:57:13Z WARN  mai2control_ui::app_state] 收到 NAK(seq=161): PSoC cp_get failed
+[2026-07-25T19:57:13Z WARN  mai2control_ui::app_state] 收到 NAK(seq=163): PSoC cp_get failed
+[2026-07-25T19:57:14Z INFO  mai2control_ui::app_state] CSD 操作冷却结束(保存后重校准/重初始化), 可继续下一步操作。
+[2026-07-25T19:57:17Z WARN  mai2control_ui::app_state] 收到 NAK(seq=249): PSoC cp_get failed
+[2026-07-25T19:57:17Z WARN  mai2control_ui::app_state] 收到 NAK(seq=250): PSoC cp_get failed
+[2026-07-25T19:57:17Z WARN  mai2control_ui::app_state] 收到 NAK(seq=251): PSoC cp_get failed
+[2026-07-25T19:57:17Z WARN  mai2control_ui::app_state] 收到 NAK(seq=254): PSoC cp_get failed
+[2026-07-25T19:57:17Z WARN  mai2control_ui::app_state] 收到 NAK(seq=255): PSoC cp_get failed
+[2026-07-25T19:57:17Z WARN  mai2control_ui::app_state] 收到 NAK(seq=0): PSoC cp_get failed
+[2026-07-25T19:57:18Z WARN  mai2control_ui::app_state] 收到 NAK(seq=1): PSoC cp_get failed
+[2026-07-25T19:57:18Z WARN  mai2control_ui::app_state] 收到 NAK(seq=3): PSoC cp_get failed
+[2026-07-25T19:57:18Z WARN  mai2control_ui::app_state] 收到 NAK(seq=4): PSoC cp_get failed
+[2026-07-25T19:57:18Z WARN  mai2control_ui::app_state] 收到 NAK(seq=5): PSoC cp_get failed
+[2026-07-25T19:57:18Z WARN  mai2control_ui::app_state] 收到 NAK(seq=6): PSoC cp_get failed
+[2026-07-25T19:57:18Z WARN  mai2control_ui::app_state] 收到 NAK(seq=8): PSoC cp_get failed
+[2026-07-25T19:57:18Z WARN  mai2control_ui::app_state] 收到 NAK(seq=9): PSoC cp_get failed
+[2026-07-25T19:57:19Z INFO  mai2control_ui::app_state] ▶ 阻塞操作开始: PSoC 重启中 (seq=25), 等待固件真正完成回执...
+[2026-07-25T19:57:19Z INFO  mai2control_ui::app_state] ✔ 阻塞操作完成: PSoC 重启中 (耗时约 32ms)
+[2026-07-25T19:57:19Z WARN  mai2control_ui::app_state] 收到 NAK(seq=26): PSoC cp_get failed
+[2026-07-25T19:57:20Z WARN  mai2control_ui::app_state] 收到 NAK(seq=27): PSoC cp_get failed
+[2026-07-25T19:57:20Z WARN  mai2control_ui::app_state] 收到 NAK(seq=28): PSoC cp_get failed
+[2026-07-25T19:57:20Z WARN  mai2control_ui::app_state] 收到 NAK(seq=30): PSoC cp_get failed
+[2026-07-25T19:57:20Z WARN  mai2control_ui::app_state] 收到 NAK(seq=32): PSoC cp_get failed
+[2026-07-25T19:57:20Z WARN  mai2control_ui::app_state] 收到 NAK(seq=33): PSoC cp_get failed
+[2026-07-25T19:57:20Z WARN  mai2control_ui::app_state] 收到 NAK(seq=34): PSoC cp_get failed
+[2026-07-25T19:57:20Z WARN  mai2control_ui::app_state] 收到 NAK(seq=36): PSoC cp_get failed
+[2026-07-25T19:57:20Z WARN  mai2control_ui::app_state] 收到 NAK(seq=37): PSoC cp_get failed
+[2026-07-25T19:57:20Z WARN  mai2control_ui::app_state] 收到 NAK(seq=38): PSoC cp_get failed
+[2026-07-25T19:57:20Z WARN  mai2control_ui::app_state] 收到 NAK(seq=39): PSoC cp_get failed
+[2026-07-25T19:57:21Z WARN  mai2control_ui::app_state] 收到 NAK(seq=41): PSoC cp_get failed
+[2026-07-25T19:57:21Z WARN  mai2control_ui::app_state] 收到 NAK(seq=42): PSoC cp_get failed
+[2026-07-25T19:57:29Z INFO  mai2control_ui::app_state] 保存: 已下发 1 项草稿改动并请求写入 flash
+[2026-07-25T19:57:29Z WARN  mai2control_ui::app_state] 收到 NAK(seq=198): PSoC cp_get failed
+[2026-07-25T19:57:29Z WARN  mai2control_ui::app_state] 收到 NAK(seq=199): PSoC cp_get failed
+[2026-07-25T19:57:29Z WARN  mai2control_ui::app_state] 收到 NAK(seq=201): PSoC cp_get failed
+[2026-07-25T19:57:29Z WARN  mai2control_ui::app_state] 收到 NAK(seq=202): PSoC cp_get failed
+[2026-07-25T19:57:29Z WARN  mai2control_ui::app_state] 收到 NAK(seq=204): PSoC cp_get failed
+[2026-07-25T19:57:29Z WARN  mai2control_ui::app_state] 收到 NAK(seq=205): PSoC cp_get failed
+[2026-07-25T19:57:29Z WARN  mai2control_ui::app_state] 收到 NAK(seq=207): PSoC cp_get failed
+[2026-07-25T19:57:30Z WARN  mai2control_ui::app_state] 收到 NAK(seq=208): PSoC cp_get failed
+[2026-07-25T19:57:30Z WARN  mai2control_ui::app_state] 收到 NAK(seq=209): PSoC cp_get failed
+[2026-07-25T19:57:30Z WARN  mai2control_ui::app_state] 收到 NAK(seq=210): PSoC cp_get failed
+[2026-07-25T19:57:30Z WARN  mai2control_ui::app_state] 收到 NAK(seq=212): PSoC cp_get failed
+[2026-07-25T19:57:30Z WARN  mai2control_ui::app_state] 收到 NAK(seq=213): PSoC cp_get failed
+[2026-07-25T19:57:31Z INFO  mai2control_ui::app_state] CSD 操作冷却结束(保存后重校准/重初始化), 可继续下一步操作。
+[2026-07-25T19:57:36Z INFO  mai2control_ui::app_state] 保存: 已下发 1 项草稿改动并请求写入 flash
+[2026-07-25T19:57:36Z WARN  mai2control_ui::app_state] 收到 NAK(seq=97): PSoC cp_get failed
+[2026-07-25T19:57:36Z WARN  mai2control_ui::app_state] 收到 NAK(seq=98): PSoC cp_get failed
+[2026-07-25T19:57:36Z WARN  mai2control_ui::app_state] 收到 NAK(seq=100): PSoC cp_get failed
+[2026-07-25T19:57:36Z WARN  mai2control_ui::app_state] 收到 NAK(seq=101): PSoC cp_get failed
+[2026-07-25T19:57:36Z WARN  mai2control_ui::app_state] 收到 NAK(seq=102): PSoC cp_get failed
+[2026-07-25T19:57:36Z WARN  mai2control_ui::app_state] 收到 NAK(seq=103): PSoC cp_get failed
+[2026-07-25T19:57:37Z WARN  mai2control_ui::app_state] 收到 NAK(seq=105): PSoC cp_get failed
+[2026-07-25T19:57:37Z WARN  mai2control_ui::app_state] 收到 NAK(seq=107): PSoC cp_get failed
+[2026-07-25T19:57:37Z WARN  mai2control_ui::app_state] 收到 NAK(seq=108): PSoC cp_get failed
+[2026-07-25T19:57:37Z WARN  mai2control_ui::app_state] 收到 NAK(seq=109): PSoC cp_get failed
+[2026-07-25T19:57:38Z INFO  mai2control_ui::app_state] CSD 操作冷却结束(保存后重校准/重初始化), 可继续下一步操作。
+[2026-07-25T19:57:42Z INFO  mai2control_ui::app_state] 下发 1 项全局设置(合并为一次 PSoC 重初始化): MFS分频F2(MFS_DIV_F2)=0
+[2026-07-25T19:57:42Z INFO  mai2control_ui::app_state] 保存: 已下发 1 项草稿改动并请求写入 flash
+[2026-07-25T19:57:45Z INFO  mai2control_ui::app_state] CSD 操作冷却结束(保存后重校准/重初始化), 可继续下一步操作。
+[2026-07-25T19:57:48Z INFO  mai2control_ui::app_state] 下发 2 项全局设置(合并为一次 PSoC 重初始化): MFS分频F1(MFS_DIV_F1)=2, MFS分频F2(MFS_DIV_F2)=1
+[2026-07-25T19:57:48Z INFO  mai2control_ui::app_state] 保存: 已下发 2 项草稿改动并请求写入 flash
+[2026-07-25T19:57:51Z INFO  mai2control_ui::app_state] CSD 操作冷却结束(保存后重校准/重初始化), 可继续下一步操作。
+[2026-07-25T19:57:55Z INFO  mai2control_ui::app_state] 下发 2 项全局设置(合并为一次 PSoC 重初始化): IDAC增益档(IDAC_GAIN_INIT)=6, 自动校准(AUTO_CALIBRATE_EN)=1
+[2026-07-25T19:57:55Z INFO  mai2control_ui::app_state] 保存: 已下发 2 项草稿改动并请求写入 flash
+[2026-07-25T19:57:58Z INFO  mai2control_ui::app_state] CSD 操作冷却结束(保存后重校准/重初始化), 可继续下一步操作。
+[2026-07-25T19:58:07Z INFO  mai2control_ui::app_state] ▶ 阻塞操作开始: 基线复位中 (seq=98), 等待固件真正完成回执...
+[2026-07-25T19:58:07Z INFO  mai2control_ui::app_state] ✔ 阻塞操作完成: 基线复位中 (耗时约 16ms)
+[2026-07-25T19:58:09Z INFO  mai2control_ui::app_state] CSD 操作冷却结束(基线复位), 可继续下一步操作。
+[2026-07-25T19:58:21Z INFO  mai2control_ui::app_state] 保存: 已下发 2 项草稿改动并请求写入 flash
+[2026-07-25T19:58:21Z WARN  mai2control_ui::app_state] 收到 NAK(seq=93): PSoC cp_get failed
+[2026-07-25T19:58:21Z WARN  mai2control_ui::app_state] 收到 NAK(seq=94): PSoC cp_get failed
+[2026-07-25T19:58:21Z WARN  mai2control_ui::app_state] 收到 NAK(seq=96): PSoC cp_get failed
+[2026-07-25T19:58:21Z WARN  mai2control_ui::app_state] 收到 NAK(seq=98): PSoC cp_get failed
+[2026-07-25T19:58:22Z WARN  mai2control_ui::app_state] 收到 NAK(seq=99): PSoC cp_get failed
+[2026-07-25T19:58:22Z WARN  mai2control_ui::app_state] 收到 NAK(seq=100): PSoC cp_get failed
+[2026-07-25T19:58:22Z WARN  mai2control_ui::app_state] 收到 NAK(seq=101): PSoC cp_get failed
+[2026-07-25T19:58:22Z WARN  mai2control_ui::app_state] 收到 NAK(seq=103): PSoC cp_get failed
+[2026-07-25T19:58:22Z WARN  mai2control_ui::app_state] 收到 NAK(seq=104): PSoC cp_get failed
+[2026-07-25T19:58:22Z WARN  mai2control_ui::app_state] 收到 NAK(seq=105): PSoC cp_get failed
+[2026-07-25T19:58:22Z WARN  mai2control_ui::app_state] 收到 NAK(seq=106): PSoC cp_get failed
+[2026-07-25T19:58:22Z WARN  mai2control_ui::app_state] 收到 NAK(seq=108): PSoC cp_get failed
+[2026-07-25T19:58:22Z WARN  mai2control_ui::app_state] 收到 NAK(seq=109): PSoC cp_get failed
+[2026-07-25T19:58:24Z INFO  mai2control_ui::app_state] CSD 操作冷却结束(保存后重校准/重初始化), 可继续下一步操作。
+[2026-07-25T19:58:27Z INFO  mai2control_ui::app_state] ▶ 阻塞操作开始: 校准中 (seq=196), 等待固件真正完成回执...
+[2026-07-25T19:58:27Z INFO  mai2control_ui::app_state] ✔ 阻塞操作完成: 校准中 (耗时约 32ms)
+[2026-07-25T19:58:27Z WARN  mai2control_ui::app_state] 收到 NAK(seq=197): PSoC cp_get failed
+[2026-07-25T19:58:27Z WARN  mai2control_ui::app_state] 收到 NAK(seq=199): PSoC cp_get failed
+[2026-07-25T19:58:27Z WARN  mai2control_ui::app_state] 收到 NAK(seq=200): PSoC cp_get failed
+[2026-07-25T19:58:27Z WARN  mai2control_ui::app_state] 收到 NAK(seq=202): PSoC cp_get failed
+[2026-07-25T19:58:28Z WARN  mai2control_ui::app_state] 收到 NAK(seq=203): PSoC cp_get failed
+[2026-07-25T19:58:28Z WARN  mai2control_ui::app_state] 收到 NAK(seq=205): PSoC cp_get failed
+[2026-07-25T19:58:28Z WARN  mai2control_ui::app_state] 收到 NAK(seq=206): PSoC cp_get failed
+[2026-07-25T19:58:28Z WARN  mai2control_ui::app_state] 收到 NAK(seq=207): PSoC cp_get failed
+[2026-07-25T19:58:28Z WARN  mai2control_ui::app_state] 收到 NAK(seq=208): PSoC cp_get failed
+[2026-07-25T19:58:28Z WARN  mai2control_ui::app_state] 收到 NAK(seq=210): PSoC cp_get failed
+[2026-07-25T19:58:28Z WARN  mai2control_ui::app_state] 收到 NAK(seq=211): PSoC cp_get failed
+[2026-07-25T19:58:29Z INFO  mai2control_ui::app_state] CSD 操作冷却结束(校准), 可继续下一步操作。
+[2026-07-25T19:58:30Z INFO  mai2control_ui::app_state] ▶ 阻塞操作开始: 基线复位中 (seq=240), 等待固件真正完成回执...
+[2026-07-25T19:58:30Z INFO  mai2control_ui::app_state] ✔ 阻塞操作完成: 基线复位中 (耗时约 32ms)
+[2026-07-25T19:58:30Z WARN  mai2control_ui::app_state] 收到 NAK(seq=241): PSoC cp_get failed
+[2026-07-25T19:58:31Z INFO  mai2control_ui::app_state] CSD 操作冷却结束(基线复位), 可继续下一步操作。
+[2026-07-25T19:58:33Z INFO  mai2control_ui::app_state] ▶ 阻塞操作开始: CH7 频率自适应中 (seq=26), 等待固件真正完成回执...
+[2026-07-25T19:58:33Z WARN  mai2control_ui::app_state] 收到 NAK(seq=27): PSoC cp_get failed
+[2026-07-25T19:58:33Z WARN  mai2control_ui::app_state] 收到 NAK(seq=28): PSoC cp_get failed
+[2026-07-25T19:58:33Z WARN  mai2control_ui::app_state] 收到 NAK(seq=30): PSoC cp_get failed
+[2026-07-25T19:58:33Z WARN  mai2control_ui::app_state] 收到 NAK(seq=32): PSoC cp_get failed
+[2026-07-25T19:58:33Z WARN  mai2control_ui::app_state] 收到 NAK(seq=33): PSoC cp_get failed
+[2026-07-25T19:58:34Z WARN  mai2control_ui::app_state] 收到 NAK(seq=34): PSoC cp_get failed
+[2026-07-25T19:58:34Z WARN  mai2control_ui::app_state] 收到 NAK(seq=36): PSoC cp_get failed
+[2026-07-25T19:58:34Z WARN  mai2control_ui::app_state] 收到 NAK(seq=37): PSoC cp_get failed
+[2026-07-25T19:58:34Z WARN  mai2control_ui::app_state] 收到 NAK(seq=38): PSoC cp_get failed
+[2026-07-25T19:58:34Z WARN  mai2control_ui::app_state] 收到 NAK(seq=39): PSoC cp_get failed
+[2026-07-25T19:58:34Z WARN  mai2control_ui::app_state] 收到 NAK(seq=41): PSoC cp_get failed
+[2026-07-25T19:58:34Z INFO  mai2control_ui::app_state] … CH7 频率自适应中: 粗定位 (第1步, 试 ÷8) 已等待 1s, 仍未收到固件完成回执
+[2026-07-25T19:58:34Z WARN  mai2control_ui::app_state] 收到 NAK(seq=42): PSoC cp_get failed
+[2026-07-25T19:58:34Z WARN  mai2control_ui::app_state] 收到 NAK(seq=43): PSoC cp_get failed
+[2026-07-25T19:58:34Z WARN  mai2control_ui::app_state] 收到 NAK(seq=44): PSoC cp_get failed
+[2026-07-25T19:58:34Z WARN  mai2control_ui::app_state] 收到 NAK(seq=46): PSoC cp_get failed
+[2026-07-25T19:58:35Z WARN  mai2control_ui::app_state] 收到 NAK(seq=47): PSoC cp_get failed
+[2026-07-25T19:58:35Z WARN  mai2control_ui::app_state] 收到 NAK(seq=49): PSoC cp_get failed
+[2026-07-25T19:58:35Z WARN  mai2control_ui::app_state] 收到 NAK(seq=50): PSoC cp_get failed
+[2026-07-25T19:58:35Z INFO  mai2control_ui::app_state] CSD 操作冷却结束(频率自适应), 可继续下一步操作。
+[2026-07-25T19:58:35Z WARN  mai2control_ui::app_state] 收到 NAK(seq=52): PSoC cp_get failed
+[2026-07-25T19:58:35Z WARN  mai2control_ui::app_state] 收到 NAK(seq=53): PSoC cp_get failed
+[2026-07-25T19:58:35Z WARN  mai2control_ui::app_state] 收到 NAK(seq=54): PSoC cp_get failed
+[2026-07-25T19:58:35Z INFO  mai2control_ui::app_state] … CH7 频率自适应中: 粗定位 (第1步, 试 ÷8) 已等待 2s, 仍未收到固件完成回执
+[2026-07-25T19:58:35Z WARN  mai2control_ui::app_state] 收到 NAK(seq=55): PSoC cp_get failed
+[2026-07-25T19:58:35Z WARN  mai2control_ui::app_state] 收到 NAK(seq=57): PSoC cp_get failed
+[2026-07-25T19:58:35Z WARN  mai2control_ui::app_state] 收到 NAK(seq=58): PSoC cp_get failed
+[2026-07-25T19:58:35Z WARN  mai2control_ui::app_state] 收到 NAK(seq=59): PSoC cp_get failed
+[2026-07-25T19:58:36Z WARN  mai2control_ui::app_state] 收到 NAK(seq=60): PSoC cp_get failed
+[2026-07-25T19:58:36Z WARN  mai2control_ui::app_state] 收到 NAK(seq=62): PSoC cp_get failed
+[2026-07-25T19:58:36Z WARN  mai2control_ui::app_state] 收到 NAK(seq=63): PSoC cp_get failed
+[2026-07-25T19:58:36Z WARN  mai2control_ui::app_state] 收到 NAK(seq=64): PSoC cp_get failed
+[2026-07-25T19:58:36Z WARN  mai2control_ui::app_state] 收到 NAK(seq=66): PSoC cp_get failed
+[2026-07-25T19:58:36Z WARN  mai2control_ui::app_state] 收到 NAK(seq=68): PSoC cp_get failed
+[2026-07-25T19:58:36Z INFO  mai2control_ui::app_state] … CH7 频率自适应中: 粗定位 (第1步, 试 ÷8) 已等待 3s, 仍未收到固件完成回执
+[2026-07-25T19:58:36Z WARN  mai2control_ui::app_state] 收到 NAK(seq=69): PSoC cp_get failed
+[2026-07-25T19:58:36Z WARN  mai2control_ui::app_state] 收到 NAK(seq=70): PSoC cp_get failed
+[2026-07-25T19:58:36Z WARN  mai2control_ui::app_state] 收到 NAK(seq=71): PSoC cp_get failed
+[2026-07-25T19:58:36Z WARN  mai2control_ui::app_state] 收到 NAK(seq=73): PSoC cp_get failed
+[2026-07-25T19:58:37Z WARN  mai2control_ui::app_state] 收到 NAK(seq=74): PSoC cp_get failed
+[2026-07-25T19:58:37Z WARN  mai2control_ui::app_state] 收到 NAK(seq=75): PSoC cp_get failed
+[2026-07-25T19:58:37Z WARN  mai2control_ui::app_state] 收到 NAK(seq=76): PSoC cp_get failed
+[2026-07-25T19:58:37Z WARN  mai2control_ui::app_state] 收到 NAK(seq=78): PSoC cp_get failed
+[2026-07-25T19:58:37Z WARN  mai2control_ui::app_state] 收到 NAK(seq=79): PSoC cp_get failed
+[2026-07-25T19:58:37Z WARN  mai2control_ui::app_state] 收到 NAK(seq=80): PSoC cp_get failed
+[2026-07-25T19:58:37Z INFO  mai2control_ui::app_state] … CH7 频率自适应中: 粗定位 (第1步, 试 ÷8) 已等待 4s, 仍未收到固件完成回执
+[2026-07-25T19:58:37Z WARN  mai2control_ui::app_state] 收到 NAK(seq=82): PSoC cp_get failed
+[2026-07-25T19:58:37Z WARN  mai2control_ui::app_state] 收到 NAK(seq=84): PSoC cp_get failed
+[2026-07-25T19:58:37Z WARN  mai2control_ui::app_state] 收到 NAK(seq=85): PSoC cp_get failed
+[2026-07-25T19:58:37Z WARN  mai2control_ui::app_state] 收到 NAK(seq=86): PSoC cp_get failed
+[2026-07-25T19:58:38Z WARN  mai2control_ui::app_state] 收到 NAK(seq=87): PSoC cp_get failed
+[2026-07-25T19:58:38Z WARN  mai2control_ui::app_state] 收到 NAK(seq=89): PSoC cp_get failed
+[2026-07-25T19:58:38Z WARN  mai2control_ui::app_state] 收到 NAK(seq=90): PSoC cp_get failed
+[2026-07-25T19:58:38Z INFO  mai2control_ui::app_state] CH7 频率自适应失败: 超出硬件能力, 目标% 无法达到
+[2026-07-25T19:58:38Z INFO  mai2control_ui::app_state] ✔ 阻塞操作完成: CH7 频率自适应中: 粗定位 (第1步, 试 ÷8) (耗时约 0ms)
+[2026-07-25T19:58:50Z INFO  mai2control_ui::app_state] 保存: 已下发 1 项草稿改动并请求写入 flash
+[2026-07-25T19:58:50Z WARN  mai2control_ui::app_state] 收到 NAK(seq=71): PSoC cp_get failed
+[2026-07-25T19:58:51Z WARN  mai2control_ui::app_state] 收到 NAK(seq=72): PSoC cp_get failed
+[2026-07-25T19:58:51Z WARN  mai2control_ui::app_state] 收到 NAK(seq=74): PSoC cp_get failed
+[2026-07-25T19:58:51Z WARN  mai2control_ui::app_state] 收到 NAK(seq=75): PSoC cp_get failed
+[2026-07-25T19:58:51Z WARN  mai2control_ui::app_state] 收到 NAK(seq=76): PSoC cp_get failed
+[2026-07-25T19:58:51Z WARN  mai2control_ui::app_state] 收到 NAK(seq=77): PSoC cp_get failed
+[2026-07-25T19:58:51Z WARN  mai2control_ui::app_state] 收到 NAK(seq=79): PSoC cp_get failed
+[2026-07-25T19:58:51Z WARN  mai2control_ui::app_state] 收到 NAK(seq=80): PSoC cp_get failed
+[2026-07-25T19:58:51Z WARN  mai2control_ui::app_state] 收到 NAK(seq=81): PSoC cp_get failed
+[2026-07-25T19:58:51Z WARN  mai2control_ui::app_state] 收到 NAK(seq=83): PSoC cp_get failed
+[2026-07-25T19:58:51Z WARN  mai2control_ui::app_state] 收到 NAK(seq=85): PSoC cp_get failed
+[2026-07-25T19:58:52Z WARN  mai2control_ui::app_state] 收到 NAK(seq=86): PSoC cp_get failed
+[2026-07-25T19:58:53Z INFO  mai2control_ui::app_state] CSD 操作冷却结束(保存后重校准/重初始化), 可继续下一步操作。
+[2026-07-25T19:59:01Z INFO  mai2control_ui::app_state] ▶ 阻塞操作开始: CH7 频率自适应中 (seq=252), 等待固件真正完成回执...
+[2026-07-25T19:59:01Z WARN  mai2control_ui::app_state] 收到 NAK(seq=253): PSoC cp_get failed
+[2026-07-25T19:59:01Z WARN  mai2control_ui::app_state] 收到 NAK(seq=0): PSoC cp_get failed
+[2026-07-25T19:59:01Z WARN  mai2control_ui::app_state] 收到 NAK(seq=1): PSoC cp_get failed
+[2026-07-25T19:59:01Z WARN  mai2control_ui::app_state] 收到 NAK(seq=2): PSoC cp_get failed
+[2026-07-25T19:59:02Z WARN  mai2control_ui::app_state] 收到 NAK(seq=3): PSoC cp_get failed
+[2026-07-25T19:59:02Z WARN  mai2control_ui::app_state] 收到 NAK(seq=5): PSoC cp_get failed
+[2026-07-25T19:59:02Z WARN  mai2control_ui::app_state] 收到 NAK(seq=6): PSoC cp_get failed
+[2026-07-25T19:59:02Z WARN  mai2control_ui::app_state] 收到 NAK(seq=7): PSoC cp_get failed
+[2026-07-25T19:59:02Z WARN  mai2control_ui::app_state] 收到 NAK(seq=8): PSoC cp_get failed
+[2026-07-25T19:59:02Z WARN  mai2control_ui::app_state] 收到 NAK(seq=10): PSoC cp_get failed
+[2026-07-25T19:59:02Z WARN  mai2control_ui::app_state] 收到 NAK(seq=11): PSoC cp_get failed
+[2026-07-25T19:59:02Z INFO  mai2control_ui::app_state] … CH7 频率自适应中: 粗定位 (第1步, 试 ÷8) 已等待 1s, 仍未收到固件完成回执
+[2026-07-25T19:59:02Z WARN  mai2control_ui::app_state] 收到 NAK(seq=12): PSoC cp_get failed
+[2026-07-25T19:59:02Z WARN  mai2control_ui::app_state] 收到 NAK(seq=13): PSoC cp_get failed
+[2026-07-25T19:59:02Z WARN  mai2control_ui::app_state] 收到 NAK(seq=15): PSoC cp_get failed
+[2026-07-25T19:59:03Z WARN  mai2control_ui::app_state] 收到 NAK(seq=17): PSoC cp_get failed
+[2026-07-25T19:59:03Z WARN  mai2control_ui::app_state] 收到 NAK(seq=18): PSoC cp_get failed
+[2026-07-25T19:59:03Z WARN  mai2control_ui::app_state] 收到 NAK(seq=19): PSoC cp_get failed
+[2026-07-25T19:59:03Z WARN  mai2control_ui::app_state] 收到 NAK(seq=21): PSoC cp_get failed
+[2026-07-25T19:59:03Z INFO  mai2control_ui::app_state] CSD 操作冷却结束(频率自适应), 可继续下一步操作。
+[2026-07-25T19:59:03Z WARN  mai2control_ui::app_state] 收到 NAK(seq=22): PSoC cp_get failed
+[2026-07-25T19:59:03Z WARN  mai2control_ui::app_state] 收到 NAK(seq=23): PSoC cp_get failed
+[2026-07-25T19:59:03Z WARN  mai2control_ui::app_state] 收到 NAK(seq=24): PSoC cp_get failed
+[2026-07-25T19:59:03Z INFO  mai2control_ui::app_state] … CH7 频率自适应中: 粗定位 (第1步, 试 ÷8) 已等待 2s, 仍未收到固件完成回执
+[2026-07-25T19:59:03Z WARN  mai2control_ui::app_state] 收到 NAK(seq=26): PSoC cp_get failed
+[2026-07-25T19:59:03Z WARN  mai2control_ui::app_state] 收到 NAK(seq=27): PSoC cp_get failed
+[2026-07-25T19:59:03Z WARN  mai2control_ui::app_state] 收到 NAK(seq=28): PSoC cp_get failed
+[2026-07-25T19:59:04Z WARN  mai2control_ui::app_state] 收到 NAK(seq=29): PSoC cp_get failed
+[2026-07-25T19:59:04Z WARN  mai2control_ui::app_state] 收到 NAK(seq=31): PSoC cp_get failed
+[2026-07-25T19:59:04Z WARN  mai2control_ui::app_state] 收到 NAK(seq=32): PSoC cp_get failed
+[2026-07-25T19:59:04Z WARN  mai2control_ui::app_state] 收到 NAK(seq=34): PSoC cp_get failed
+[2026-07-25T19:59:04Z WARN  mai2control_ui::app_state] 收到 NAK(seq=35): PSoC cp_get failed
+[2026-07-25T19:59:04Z WARN  mai2control_ui::app_state] 收到 NAK(seq=37): PSoC cp_get failed
+[2026-07-25T19:59:04Z WARN  mai2control_ui::app_state] 收到 NAK(seq=38): PSoC cp_get failed
+[2026-07-25T19:59:04Z INFO  mai2control_ui::app_state] … CH7 频率自适应中: 粗定位 (第1步, 试 ÷8) 已等待 3s, 仍未收到固件完成回执
+[2026-07-25T19:59:04Z WARN  mai2control_ui::app_state] 收到 NAK(seq=39): PSoC cp_get failed
+[2026-07-25T19:59:04Z WARN  mai2control_ui::app_state] 收到 NAK(seq=40): PSoC cp_get failed
+[2026-07-25T19:59:04Z WARN  mai2control_ui::app_state] 收到 NAK(seq=42): PSoC cp_get failed
+[2026-07-25T19:59:05Z WARN  mai2control_ui::app_state] 收到 NAK(seq=43): PSoC cp_get failed
+[2026-07-25T19:59:05Z WARN  mai2control_ui::app_state] 收到 NAK(seq=44): PSoC cp_get failed
+[2026-07-25T19:59:05Z WARN  mai2control_ui::app_state] 收到 NAK(seq=45): PSoC cp_get failed
+[2026-07-25T19:59:05Z WARN  mai2control_ui::app_state] 收到 NAK(seq=47): PSoC cp_get failed
+[2026-07-25T19:59:05Z WARN  mai2control_ui::app_state] 收到 NAK(seq=48): PSoC cp_get failed
+[2026-07-25T19:59:05Z WARN  mai2control_ui::app_state] 收到 NAK(seq=50): PSoC cp_get failed
+[2026-07-25T19:59:05Z WARN  mai2control_ui::app_state] 收到 NAK(seq=51): PSoC cp_get failed
+[2026-07-25T19:59:05Z INFO  mai2control_ui::app_state] … CH7 频率自适应中: 粗定位 (第1步, 试 ÷8) 已等待 4s, 仍未收到固件完成回执
+[2026-07-25T19:59:05Z WARN  mai2control_ui::app_state] 收到 NAK(seq=53): PSoC cp_get failed
+[2026-07-25T19:59:05Z WARN  mai2control_ui::app_state] 收到 NAK(seq=54): PSoC cp_get failed
+[2026-07-25T19:59:05Z WARN  mai2control_ui::app_state] 收到 NAK(seq=55): PSoC cp_get failed
+[2026-07-25T19:59:06Z WARN  mai2control_ui::app_state] 收到 NAK(seq=56): PSoC cp_get failed
+[2026-07-25T19:59:06Z WARN  mai2control_ui::app_state] 收到 NAK(seq=58): PSoC cp_get failed
+[2026-07-25T19:59:06Z WARN  mai2control_ui::app_state] 收到 NAK(seq=59): PSoC cp_get failed
+[2026-07-25T19:59:06Z INFO  mai2control_ui::app_state] CH7 频率自适应失败: 超出硬件能力, 目标% 无法达到
+[2026-07-25T19:59:06Z INFO  mai2control_ui::app_state] ✔ 阻塞操作完成: CH7 频率自适应中: 粗定位 (第1步, 试 ÷8) (耗时约 0ms)
+[2026-07-25T19:59:17Z INFO  mai2control_ui::vcam::keyboard] 虚拟摄像头: 键盘捕获已启动
+[2026-07-25T19:59:19Z INFO  mai2control_ui::vcam::keyboard] 虚拟摄像头: 键盘捕获已停止
+[2026-07-25T19:59:20Z INFO  mai2control_ui::vcam::keyboard] 虚拟摄像头: 键盘捕获已启动
+[2026-07-25T19:59:25Z INFO  mai2control_ui::vcam::keyboard] 虚拟摄像头: 键盘捕获已停止
+[2026-07-25T19:59:30Z WARN  mai2control_ui::io] WinUSB read error: endpoint stalled (kind=ConnectionReset)，自恢复尝试 #1/8
+[2026-07-25T19:59:30Z ERROR mai2control_ui::io] IN 端点恢复失败: Missing config bulk IN endpoint 0x81
+[2026-07-25T19:59:30Z ERROR mai2control_ui::app_state] IO 错误: Missing config bulk IN endpoint 0x81
+[2026-07-25T19:59:30Z ERROR mai2control_ui::app_state] 设备断开 (last_error=Some("Missing config bulk IN endpoint 0x81"))
+[2026-07-25T19:59:30Z INFO  mai2control_ui::io] Enumerated 0 mai2 config WinUSB device(s)
+[2026-07-25T19:59:32Z INFO  mai2control_ui::io] Enumerated 0 mai2 config WinUSB device(s)
+[2026-07-25T19:59:34Z INFO  mai2control_ui::io] Enumerated 0 mai2 config WinUSB device(s)
+[2026-07-25T19:59:36Z INFO  mai2control_ui::io] Enumerated 0 mai2 config WinUSB device(s)
+[2026-07-25T19:59:38Z INFO  mai2control_ui::io] Enumerated 0 mai2 config WinUSB device(s)
+[2026-07-25T19:59:40Z INFO  mai2control_ui::io] Enumerated 0 mai2 config WinUSB device(s)
+[2026-07-25T19:59:42Z INFO  mai2control_ui::io] Enumerated 0 mai2 config WinUSB device(s)
+[2026-07-25T19:59:44Z INFO  mai2control_ui::io] Enumerated 0 mai2 config WinUSB device(s)
+[2026-07-25T19:59:46Z INFO  mai2control_ui::io] Enumerated 1 mai2 config WinUSB device(s)
+[2026-07-25T19:59:46Z INFO  mai2control_ui::app_state] 连接设备[0]: 启动 IO + 发 HELLO
+[2026-07-25T19:59:46Z INFO  mai2control_ui::io] WinUSB IO thread started
+[2026-07-25T19:59:47Z INFO  mai2control_ui::app_state] IO 线程已连接, 等待 DEVICE_INFO...
+[2026-07-25T19:59:47Z INFO  mai2control_ui::app_state] 已连接: 收到 DEVICE_INFO
+[2026-07-25T19:59:47Z INFO  mai2control_ui::app_state] 已连接: 收到 DEVICE_INFO
+[2026-07-25T19:59:47Z INFO  mai2control_ui::app_state] 已连接 → 自动请求配置、当前通道参数/Cp、CH0 全局采样参数 + 开启全通道遥测
+[2026-07-25T19:59:47Z WARN  mai2control_ui::app_state] 收到 NAK(seq=190): PSoC cp_get failed
+[2026-07-25T19:59:47Z WARN  mai2control_ui::app_state] 收到 NAK(seq=204): PSoC cp_measure failed
+[2026-07-25T19:59:47Z WARN  mai2control_ui::app_state] 收到 NAK(seq=209): PSoC cp_get failed
+[2026-07-25T19:59:51Z INFO  mai2control_ui::app_state] ▶ 阻塞操作开始: PSoC 重启中 (seq=18), 等待固件真正完成回执...
+[2026-07-25T19:59:51Z INFO  mai2control_ui::app_state] ✔ 阻塞操作完成: PSoC 重启中 (耗时约 32ms)
+[2026-07-25T19:59:51Z WARN  mai2control_ui::app_state] 收到 NAK(seq=19): PSoC cp_get failed
+[2026-07-25T19:59:51Z WARN  mai2control_ui::app_state] 收到 NAK(seq=20): PSoC cp_get failed
+[2026-07-25T19:59:51Z WARN  mai2control_ui::app_state] 收到 NAK(seq=22): PSoC cp_get failed
+[2026-07-25T19:59:51Z WARN  mai2control_ui::app_state] 收到 NAK(seq=23): PSoC cp_get failed
+[2026-07-25T19:59:51Z WARN  mai2control_ui::app_state] 收到 NAK(seq=24): PSoC cp_get failed
+[2026-07-25T19:59:51Z WARN  mai2control_ui::app_state] 收到 NAK(seq=25): PSoC cp_get failed
+[2026-07-25T19:59:52Z WARN  mai2control_ui::app_state] 收到 NAK(seq=27): PSoC cp_get failed
+[2026-07-25T19:59:52Z WARN  mai2control_ui::app_state] 收到 NAK(seq=29): PSoC cp_get failed
+[2026-07-25T19:59:52Z WARN  mai2control_ui::app_state] 收到 NAK(seq=30): PSoC cp_get failed
+[2026-07-25T19:59:52Z WARN  mai2control_ui::app_state] 收到 NAK(seq=31): PSoC cp_get failed
+[2026-07-25T19:59:52Z WARN  mai2control_ui::app_state] 收到 NAK(seq=33): PSoC cp_get failed
+[2026-07-25T19:59:52Z WARN  mai2control_ui::app_state] 收到 NAK(seq=34): PSoC cp_get failed
+[2026-07-25T19:59:52Z WARN  mai2control_ui::app_state] 收到 NAK(seq=35): PSoC cp_get failed
+[2026-07-25T19:59:52Z WARN  mai2control_ui::app_state] 收到 NAK(seq=36): PSoC cp_get failed
+[2026-07-25T19:59:52Z WARN  mai2control_ui::app_state] 收到 NAK(seq=38): PSoC cp_get failed
+[2026-07-25T19:59:59Z INFO  mai2control_ui::app_state] ▶ 阻塞操作开始: 校准中 (seq=135), 等待固件真正完成回执...
+[2026-07-25T19:59:59Z INFO  mai2control_ui::app_state] ✔ 阻塞操作完成: 校准中 (耗时约 16ms)
+[2026-07-25T19:59:59Z WARN  mai2control_ui::app_state] 收到 NAK(seq=136): PSoC cp_get failed
+[2026-07-25T19:59:59Z WARN  mai2control_ui::app_state] 收到 NAK(seq=137): PSoC cp_get failed
+[2026-07-25T19:59:59Z WARN  mai2control_ui::app_state] 收到 NAK(seq=138): PSoC cp_get failed
+[2026-07-25T19:59:59Z WARN  mai2control_ui::app_state] 收到 NAK(seq=140): PSoC cp_get failed
+[2026-07-25T19:59:59Z WARN  mai2control_ui::app_state] 收到 NAK(seq=141): PSoC cp_get failed
+[2026-07-25T20:00:00Z WARN  mai2control_ui::app_state] 收到 NAK(seq=142): PSoC cp_get failed
+[2026-07-25T20:00:00Z WARN  mai2control_ui::app_state] 收到 NAK(seq=143): PSoC cp_get failed
+[2026-07-25T20:00:00Z WARN  mai2control_ui::app_state] 收到 NAK(seq=145): PSoC cp_get failed
+[2026-07-25T20:00:00Z WARN  mai2control_ui::app_state] 收到 NAK(seq=147): PSoC cp_get failed
+[2026-07-25T20:00:00Z WARN  mai2control_ui::app_state] 收到 NAK(seq=148): PSoC cp_get failed
+[2026-07-25T20:00:00Z WARN  mai2control_ui::app_state] 收到 NAK(seq=149): PSoC cp_get failed
+[2026-07-25T20:00:01Z INFO  mai2control_ui::app_state] CSD 操作冷却结束(校准), 可继续下一步操作。
+[2026-07-25T20:00:07Z INFO  mai2control_ui::app_state] 下发 1 项全局设置(合并为一次 PSoC 重初始化): 校准目标%(RAW_TARGET)=25
+[2026-07-25T20:00:07Z INFO  mai2control_ui::app_state] 保存: 已下发 1 项草稿改动并请求写入 flash
+[2026-07-25T20:00:09Z INFO  mai2control_ui::app_state] CSD 操作冷却结束(保存后重校准/重初始化), 可继续下一步操作。
+[2026-07-25T20:00:14Z INFO  mai2control_ui::app_state] 下发 1 项全局设置(合并为一次 PSoC 重初始化): 自动校准(AUTO_CALIBRATE_EN)=0
+[2026-07-25T20:00:14Z INFO  mai2control_ui::app_state] 保存: 已下发 1 项草稿改动并请求写入 flash
+[2026-07-25T20:00:17Z INFO  mai2control_ui::app_state] CSD 操作冷却结束(保存后重校准/重初始化), 可继续下一步操作。
+[2026-07-25T20:00:29Z INFO  mai2control_ui::app_state] 下发 1 项全局设置(合并为一次 PSoC 重初始化): IDAC增益档(IDAC_GAIN_INIT)=3
+[2026-07-25T20:00:29Z INFO  mai2control_ui::app_state] 保存: 已下发 1 项草稿改动并请求写入 flash
+[2026-07-25T20:00:32Z INFO  mai2control_ui::app_state] CSD 操作冷却结束(保存后重校准/重初始化), 可继续下一步操作。
+[2026-07-25T20:00:37Z INFO  mai2control_ui::app_state] 下发 1 项全局设置(合并为一次 PSoC 重初始化): IDAC方向(IDAC_SENSE_CONFIG)=1
+[2026-07-25T20:00:37Z INFO  mai2control_ui::app_state] 保存: 已下发 1 项草稿改动并请求写入 flash
+[2026-07-25T20:00:40Z INFO  mai2control_ui::app_state] CSD 操作冷却结束(保存后重校准/重初始化), 可继续下一步操作。
+[2026-07-25T20:00:50Z INFO  mai2control_ui::app_state] 下发 2 项全局设置(合并为一次 PSoC 重初始化): IDAC增益档(IDAC_GAIN_INIT)=4, IDAC方向(IDAC_SENSE_CONFIG)=1
+[2026-07-25T20:00:50Z INFO  mai2control_ui::app_state] 保存: 已下发 2 项草稿改动并请求写入 flash
+[2026-07-25T20:00:53Z INFO  mai2control_ui::app_state] CSD 操作冷却结束(保存后重校准/重初始化), 可继续下一步操作。
+[2026-07-25T20:01:01Z INFO  mai2control_ui::app_state] 保存: 已下发 1 项草稿改动并请求写入 flash
+[2026-07-25T20:01:01Z WARN  mai2control_ui::app_state] 收到 NAK(seq=154): PSoC cp_get failed
+[2026-07-25T20:01:01Z WARN  mai2control_ui::app_state] 收到 NAK(seq=154): PSoC cp_get failed
+[2026-07-25T20:01:01Z WARN  mai2control_ui::app_state] 收到 NAK(seq=155): PSoC cp_get failed
+[2026-07-25T20:01:01Z WARN  mai2control_ui::app_state] 收到 NAK(seq=156): PSoC cp_get failed
+[2026-07-25T20:01:01Z WARN  mai2control_ui::app_state] 收到 NAK(seq=157): PSoC cp_get failed
+[2026-07-25T20:01:01Z WARN  mai2control_ui::app_state] 收到 NAK(seq=159): PSoC cp_get failed
+[2026-07-25T20:01:02Z WARN  mai2control_ui::app_state] 收到 NAK(seq=160): PSoC cp_get failed
+[2026-07-25T20:01:02Z WARN  mai2control_ui::app_state] 收到 NAK(seq=161): PSoC cp_get failed
+[2026-07-25T20:01:02Z WARN  mai2control_ui::app_state] 收到 NAK(seq=162): PSoC cp_get failed
+[2026-07-25T20:01:02Z WARN  mai2control_ui::app_state] 收到 NAK(seq=164): PSoC cp_get failed
+[2026-07-25T20:01:02Z WARN  mai2control_ui::app_state] 收到 NAK(seq=165): PSoC cp_get failed
+[2026-07-25T20:01:02Z WARN  mai2control_ui::app_state] 收到 NAK(seq=166): PSoC cp_get failed
+[2026-07-25T20:01:02Z WARN  mai2control_ui::app_state] 收到 NAK(seq=167): PSoC cp_get failed
+[2026-07-25T20:01:02Z WARN  mai2control_ui::app_state] 收到 NAK(seq=169): PSoC cp_get failed
+[2026-07-25T20:01:02Z WARN  mai2control_ui::app_state] 收到 NAK(seq=171): PSoC cp_get failed
+[2026-07-25T20:01:03Z INFO  mai2control_ui::app_state] CSD 操作冷却结束(保存后重校准/重初始化), 可继续下一步操作。
+[2026-07-25T20:01:06Z WARN  mai2control_ui::app_state] 收到 NAK(seq=254): PSoC cp_get failed
+[2026-07-25T20:01:06Z WARN  mai2control_ui::app_state] 收到 NAK(seq=255): PSoC cp_get failed
+[2026-07-25T20:01:06Z WARN  mai2control_ui::app_state] 收到 NAK(seq=0): PSoC cp_get failed
+[2026-07-25T20:01:06Z WARN  mai2control_ui::app_state] 收到 NAK(seq=2): PSoC cp_get failed
+[2026-07-25T20:01:06Z WARN  mai2control_ui::app_state] 收到 NAK(seq=4): PSoC cp_get failed
+[2026-07-25T20:01:06Z WARN  mai2control_ui::app_state] 收到 NAK(seq=5): PSoC cp_get failed
+[2026-07-25T20:01:07Z WARN  mai2control_ui::app_state] 收到 NAK(seq=6): PSoC cp_get failed
+[2026-07-25T20:01:07Z WARN  mai2control_ui::app_state] 收到 NAK(seq=7): PSoC cp_get failed
+[2026-07-25T20:01:07Z WARN  mai2control_ui::app_state] 收到 NAK(seq=9): PSoC cp_get failed
+[2026-07-25T20:01:07Z WARN  mai2control_ui::app_state] 收到 NAK(seq=10): PSoC cp_get failed
+[2026-07-25T20:01:07Z WARN  mai2control_ui::app_state] 收到 NAK(seq=11): PSoC cp_get failed
+[2026-07-25T20:01:07Z WARN  mai2control_ui::app_state] 收到 NAK(seq=12): PSoC cp_get failed
+[2026-07-25T20:01:07Z WARN  mai2control_ui::app_state] 收到 NAK(seq=14): PSoC cp_get failed
+[2026-07-25T20:01:07Z WARN  mai2control_ui::app_state] 收到 NAK(seq=15): PSoC cp_get failed
+[2026-07-25T20:01:07Z INFO  mai2control_ui::app_state] ▶ 阻塞操作开始: PSoC 重启中 (seq=21), 等待固件真正完成回执...
+[2026-07-25T20:01:07Z INFO  mai2control_ui::app_state] ✔ 阻塞操作完成: PSoC 重启中 (耗时约 32ms)
+[2026-07-25T20:01:08Z WARN  mai2control_ui::app_state] 收到 NAK(seq=22): PSoC cp_get failed
+[2026-07-25T20:01:08Z WARN  mai2control_ui::app_state] 收到 NAK(seq=23): PSoC cp_get failed
+[2026-07-25T20:01:08Z WARN  mai2control_ui::app_state] 收到 NAK(seq=24): PSoC cp_get failed
+[2026-07-25T20:01:08Z WARN  mai2control_ui::app_state] 收到 NAK(seq=26): PSoC cp_get failed
+[2026-07-25T20:01:08Z WARN  mai2control_ui::app_state] 收到 NAK(seq=27): PSoC cp_get failed
+[2026-07-25T20:01:08Z WARN  mai2control_ui::app_state] 收到 NAK(seq=28): PSoC cp_get failed
+[2026-07-25T20:01:08Z WARN  mai2control_ui::app_state] 收到 NAK(seq=29): PSoC cp_get failed
+[2026-07-25T20:01:08Z WARN  mai2control_ui::app_state] 收到 NAK(seq=31): PSoC cp_get failed
+[2026-07-25T20:01:08Z WARN  mai2control_ui::app_state] 收到 NAK(seq=32): PSoC cp_get failed
+[2026-07-25T20:01:08Z WARN  mai2control_ui::app_state] 收到 NAK(seq=33): PSoC cp_get failed
+[2026-07-25T20:01:08Z WARN  mai2control_ui::app_state] 收到 NAK(seq=34): PSoC cp_get failed
+[2026-07-25T20:01:09Z WARN  mai2control_ui::app_state] 收到 NAK(seq=37): PSoC cp_get failed
+[2026-07-25T20:01:09Z WARN  mai2control_ui::app_state] 收到 NAK(seq=38): PSoC cp_get failed
+[2026-07-25T20:01:09Z WARN  mai2control_ui::app_state] 收到 NAK(seq=39): PSoC cp_get failed
+[2026-07-25T20:01:21Z INFO  mai2control_ui::app_state] 下发 2 项全局设置(合并为一次 PSoC 重初始化): 非激活连接(INACTIVE_SNS)=2, IDAC方向(IDAC_SENSE_CONFIG)=0
+[2026-07-25T20:01:21Z INFO  mai2control_ui::app_state] 保存: 已下发 3 项草稿改动并请求写入 flash
+[2026-07-25T20:01:22Z WARN  mai2control_ui::app_state] 收到 NAK(seq=13): PSoC cp_get failed
+[2026-07-25T20:01:22Z WARN  mai2control_ui::app_state] 收到 NAK(seq=14): PSoC cp_get failed
+[2026-07-25T20:01:22Z WARN  mai2control_ui::app_state] 收到 NAK(seq=15): PSoC cp_get failed
+[2026-07-25T20:01:22Z WARN  mai2control_ui::app_state] 收到 NAK(seq=16): PSoC cp_get failed
+[2026-07-25T20:01:24Z INFO  mai2control_ui::app_state] CSD 操作冷却结束(保存后重校准/重初始化), 可继续下一步操作。
+[2026-07-25T20:01:37Z INFO  mai2control_ui::app_state] ▶ 阻塞操作开始: 基线复位中 (seq=248), 等待固件真正完成回执...
+[2026-07-25T20:01:38Z INFO  mai2control_ui::app_state] … 基线复位中 已等待 1s, 仍未收到固件完成回执
+[2026-07-25T20:01:39Z WARN  mai2control_ui::io] WinUSB write error: endpoint stalled (kind=ConnectionReset)，自恢复重建 #1/6
+[2026-07-25T20:01:39Z ERROR nusb::platform::windows_winusb::device] submit failed: 设备不识别此命令。 (os error 22)
+[2026-07-25T20:01:39Z WARN  mai2control_ui::io] WinUSB write error: device disconnected (kind=ConnectionAborted)，自恢复重建 #2/6
+[2026-07-25T20:01:39Z ERROR nusb::platform::windows_winusb::device] submit failed: 设备不识别此命令。 (os error 22)
+[2026-07-25T20:01:39Z WARN  mai2control_ui::io] WinUSB write error: device disconnected (kind=ConnectionAborted)，自恢复重建 #3/6
+[2026-07-25T20:01:39Z ERROR nusb::platform::windows_winusb::device] submit failed: 设备不识别此命令。 (os error 22)
+[2026-07-25T20:01:39Z WARN  mai2control_ui::io] WinUSB write error: device disconnected (kind=ConnectionAborted)，自恢复重建 #4/6
+[2026-07-25T20:01:39Z ERROR nusb::platform::windows_winusb::device] submit failed: 设备不识别此命令。 (os error 22)
+[2026-07-25T20:01:39Z WARN  mai2control_ui::io] WinUSB write error: device disconnected (kind=ConnectionAborted)，自恢复重建 #5/6
+[2026-07-25T20:01:39Z ERROR nusb::platform::windows_winusb::device] submit failed: 设备不识别此命令。 (os error 22)
+[2026-07-25T20:01:39Z WARN  mai2control_ui::io] WinUSB write error: device disconnected (kind=ConnectionAborted)，自恢复重建 #6/6
+[2026-07-25T20:01:39Z ERROR nusb::platform::windows_winusb::device] submit failed: 设备不识别此命令。 (os error 22)
+[2026-07-25T20:01:39Z WARN  mai2control_ui::io] WinUSB write error: device disconnected (kind=ConnectionAborted)，自恢复重建 #7/6
+[2026-07-25T20:01:39Z ERROR mai2control_ui::io] WinUSB write 连续 7 次端点错误，判定断开
+[2026-07-25T20:01:39Z ERROR mai2control_ui::app_state] IO 错误: write failed
+[2026-07-25T20:01:39Z ERROR mai2control_ui::app_state] 设备断开 (last_error=Some("write failed"))
+[2026-07-25T20:01:39Z INFO  mai2control_ui::app_state] CSD 操作冷却结束(基线复位), 可继续下一步操作。
+[2026-07-25T20:01:40Z INFO  mai2control_ui::app_state] … 基线复位中 已等待 2s, 仍未收到固件完成回执
+[2026-07-25T20:01:40Z INFO  mai2control_ui::io] Enumerated 0 mai2 config WinUSB device(s)
+[2026-07-25T20:01:41Z INFO  mai2control_ui::app_state] … 基线复位中 已等待 3s, 仍未收到固件完成回执
+[2026-07-25T20:01:42Z INFO  mai2control_ui::app_state] … 基线复位中 已等待 4s, 仍未收到固件完成回执
+[2026-07-25T20:01:42Z INFO  mai2control_ui::io] Enumerated 1 mai2 config WinUSB device(s)
+[2026-07-25T20:01:42Z INFO  mai2control_ui::app_state] 连接设备[0]: 启动 IO + 发 HELLO
+[2026-07-25T20:01:42Z INFO  mai2control_ui::io] WinUSB IO thread started
+[2026-07-25T20:01:42Z INFO  mai2control_ui::app_state] IO 线程已连接, 等待 DEVICE_INFO...
+[2026-07-25T20:01:42Z INFO  mai2control_ui::app_state] 已连接: 收到 DEVICE_INFO
+[2026-07-25T20:01:42Z INFO  mai2control_ui::app_state] 已连接: 收到 DEVICE_INFO
+[2026-07-25T20:01:42Z INFO  mai2control_ui::app_state] 已连接 → 自动请求配置、当前通道参数/Cp、CH0 全局采样参数 + 开启全通道遥测
+[2026-07-25T20:01:42Z WARN  mai2control_ui::app_state] 收到 NAK(seq=20): PSoC cp_get failed
+[2026-07-25T20:01:42Z WARN  mai2control_ui::app_state] 收到 NAK(seq=34): PSoC cp_measure failed
+[2026-07-25T20:01:43Z WARN  mai2control_ui::app_state] 收到 NAK(seq=39): PSoC cp_get failed
+[2026-07-25T20:01:43Z WARN  mai2control_ui::app_state] 收到 NAK(seq=41): PSoC cp_get failed
+[2026-07-25T20:01:43Z WARN  mai2control_ui::app_state] 收到 NAK(seq=42): PSoC cp_get failed
+[2026-07-25T20:01:43Z WARN  mai2control_ui::app_state] 收到 NAK(seq=44): PSoC cp_get failed
+[2026-07-25T20:01:43Z WARN  mai2control_ui::app_state] 收到 NAK(seq=45): PSoC cp_get failed
+[2026-07-25T20:01:43Z WARN  mai2control_ui::app_state] 收到 NAK(seq=47): PSoC cp_get failed
+[2026-07-25T20:01:43Z INFO  mai2control_ui::app_state] … 基线复位中 已等待 5s, 仍未收到固件完成回执
+[2026-07-25T20:01:43Z WARN  mai2control_ui::app_state] 收到 NAK(seq=48): PSoC cp_get failed
+[2026-07-25T20:01:43Z WARN  mai2control_ui::app_state] 收到 NAK(seq=49): PSoC cp_get failed
+[2026-07-25T20:01:43Z WARN  mai2control_ui::app_state] 收到 NAK(seq=50): PSoC cp_get failed
+[2026-07-25T20:01:43Z WARN  mai2control_ui::app_state] 收到 NAK(seq=52): PSoC cp_get failed
+[2026-07-25T20:01:43Z WARN  mai2control_ui::app_state] 收到 NAK(seq=53): PSoC cp_get failed
+[2026-07-25T20:01:43Z WARN  mai2control_ui::app_state] 收到 NAK(seq=54): PSoC cp_get failed
+[2026-07-25T20:01:44Z WARN  mai2control_ui::app_state] 收到 NAK(seq=55): PSoC cp_get failed
+[2026-07-25T20:01:44Z WARN  mai2control_ui::app_state] 收到 NAK(seq=57): PSoC cp_get failed
+[2026-07-25T20:01:44Z WARN  mai2control_ui::app_state] 收到 NAK(seq=58): PSoC cp_get failed
+[2026-07-25T20:01:44Z WARN  mai2control_ui::app_state] 收到 NAK(seq=60): PSoC cp_get failed
+[2026-07-25T20:01:44Z WARN  mai2control_ui::app_state] 收到 NAK(seq=61): PSoC cp_get failed
+[2026-07-25T20:01:44Z WARN  mai2control_ui::app_state] 收到 NAK(seq=63): PSoC cp_get failed
+[2026-07-25T20:01:44Z INFO  mai2control_ui::app_state] … 基线复位中 已等待 6s, 仍未收到固件完成回执
+[2026-07-25T20:01:44Z WARN  mai2control_ui::app_state] 收到 NAK(seq=64): PSoC cp_get failed
+[2026-07-25T20:01:44Z WARN  mai2control_ui::app_state] 收到 NAK(seq=65): PSoC cp_get failed
+[2026-07-25T20:01:44Z WARN  mai2control_ui::app_state] 收到 NAK(seq=66): PSoC cp_get failed
+[2026-07-25T20:01:44Z WARN  mai2control_ui::app_state] 收到 NAK(seq=68): PSoC cp_get failed
+[2026-07-25T20:01:44Z WARN  mai2control_ui::app_state] 收到 NAK(seq=69): PSoC cp_get failed
+[2026-07-25T20:01:45Z WARN  mai2control_ui::app_state] 收到 NAK(seq=70): PSoC cp_get failed
+[2026-07-25T20:01:45Z WARN  mai2control_ui::app_state] 收到 NAK(seq=71): PSoC cp_get failed
+[2026-07-25T20:01:45Z WARN  mai2control_ui::app_state] 收到 NAK(seq=73): PSoC cp_get failed
+[2026-07-25T20:01:45Z WARN  mai2control_ui::app_state] 收到 NAK(seq=74): PSoC cp_get failed
+[2026-07-25T20:01:45Z WARN  mai2control_ui::app_state] 收到 NAK(seq=75): PSoC cp_get failed
+[2026-07-25T20:01:45Z WARN  mai2control_ui::app_state] 收到 NAK(seq=77): PSoC cp_get failed
+[2026-07-25T20:01:45Z WARN  mai2control_ui::app_state] 收到 NAK(seq=79): PSoC cp_get failed
+[2026-07-25T20:01:45Z INFO  mai2control_ui::app_state] … 基线复位中 已等待 7s, 仍未收到固件完成回执
+[2026-07-25T20:01:45Z WARN  mai2control_ui::app_state] 收到 NAK(seq=80): PSoC cp_get failed
+[2026-07-25T20:01:45Z WARN  mai2control_ui::app_state] 收到 NAK(seq=81): PSoC cp_get failed
+[2026-07-25T20:01:45Z WARN  mai2control_ui::app_state] 收到 NAK(seq=82): PSoC cp_get failed
+[2026-07-25T20:01:45Z WARN  mai2control_ui::app_state] 收到 NAK(seq=84): PSoC cp_get failed
+[2026-07-25T20:01:46Z WARN  mai2control_ui::app_state] 收到 NAK(seq=85): PSoC cp_get failed
+[2026-07-25T20:01:46Z WARN  mai2control_ui::app_state] 收到 NAK(seq=86): PSoC cp_get failed
+[2026-07-25T20:01:46Z WARN  mai2control_ui::app_state] 收到 NAK(seq=87): PSoC cp_get failed
+[2026-07-25T20:01:46Z WARN  mai2control_ui::app_state] 收到 NAK(seq=89): PSoC cp_get failed
+[2026-07-25T20:01:46Z WARN  mai2control_ui::app_state] 收到 NAK(seq=90): PSoC cp_get failed
+[2026-07-25T20:01:46Z WARN  mai2control_ui::app_state] 收到 NAK(seq=91): PSoC cp_get failed
+[2026-07-25T20:01:46Z WARN  mai2control_ui::app_state] 收到 NAK(seq=93): PSoC cp_get failed
+[2026-07-25T20:01:46Z WARN  mai2control_ui::app_state] 收到 NAK(seq=95): PSoC cp_get failed
+[2026-07-25T20:01:46Z WARN  mai2control_ui::app_state] 收到 NAK(seq=96): PSoC cp_get failed
+[2026-07-25T20:01:46Z INFO  mai2control_ui::app_state] … 基线复位中 已等待 8s, 仍未收到固件完成回执
+[2026-07-25T20:01:46Z WARN  mai2control_ui::app_state] 收到 NAK(seq=97): PSoC cp_get failed
+[2026-07-25T20:01:46Z WARN  mai2control_ui::app_state] 收到 NAK(seq=98): PSoC cp_get failed
+[2026-07-25T20:01:46Z WARN  mai2control_ui::app_state] 收到 NAK(seq=100): PSoC cp_get failed
+[2026-07-25T20:01:46Z WARN  mai2control_ui::app_state] 收到 NAK(seq=101): PSoC cp_get failed
+[2026-07-25T20:01:47Z WARN  mai2control_ui::app_state] 收到 NAK(seq=102): PSoC cp_get failed
+[2026-07-25T20:01:47Z WARN  mai2control_ui::app_state] 收到 NAK(seq=103): PSoC cp_get failed
+[2026-07-25T20:01:47Z WARN  mai2control_ui::app_state] 收到 NAK(seq=105): PSoC cp_get failed
+[2026-07-25T20:01:47Z WARN  mai2control_ui::app_state] 收到 NAK(seq=106): PSoC cp_get failed
+[2026-07-25T20:01:47Z WARN  mai2control_ui::app_state] 收到 NAK(seq=107): PSoC cp_get failed
+[2026-07-25T20:01:47Z WARN  mai2control_ui::app_state] 收到 NAK(seq=108): PSoC cp_get failed
+[2026-07-25T20:01:47Z WARN  mai2control_ui::app_state] 收到 NAK(seq=111): PSoC cp_get failed
+[2026-07-25T20:01:47Z WARN  mai2control_ui::app_state] 收到 NAK(seq=112): PSoC cp_get failed
+[2026-07-25T20:01:47Z INFO  mai2control_ui::app_state] … 基线复位中 已等待 9s, 仍未收到固件完成回执
+[2026-07-25T20:01:47Z WARN  mai2control_ui::app_state] 收到 NAK(seq=113): PSoC cp_get failed
+[2026-07-25T20:01:47Z WARN  mai2control_ui::app_state] 收到 NAK(seq=114): PSoC cp_get failed
+[2026-07-25T20:01:47Z WARN  mai2control_ui::app_state] 收到 NAK(seq=116): PSoC cp_get failed
+[2026-07-25T20:01:48Z WARN  mai2control_ui::app_state] 收到 NAK(seq=117): PSoC cp_get failed
+[2026-07-25T20:01:48Z WARN  mai2control_ui::app_state] 收到 NAK(seq=118): PSoC cp_get failed
+[2026-07-25T20:01:48Z WARN  mai2control_ui::app_state] 收到 NAK(seq=119): PSoC cp_get failed
+[2026-07-25T20:01:48Z WARN  mai2control_ui::app_state] 收到 NAK(seq=121): PSoC cp_get failed
+[2026-07-25T20:01:48Z WARN  mai2control_ui::app_state] 收到 NAK(seq=122): PSoC cp_get failed
+[2026-07-25T20:01:48Z WARN  mai2control_ui::app_state] 收到 NAK(seq=123): PSoC cp_get failed
+[2026-07-25T20:01:48Z WARN  mai2control_ui::app_state] 收到 NAK(seq=124): PSoC cp_get failed
+[2026-07-25T20:01:48Z WARN  mai2control_ui::app_state] 收到 NAK(seq=126): PSoC cp_get failed
+[2026-07-25T20:01:48Z WARN  mai2control_ui::app_state] 收到 NAK(seq=128): PSoC cp_get failed
+[2026-07-25T20:01:48Z WARN  mai2control_ui::app_state] 收到 NAK(seq=129): PSoC cp_get failed
+[2026-07-25T20:01:48Z INFO  mai2control_ui::app_state] … 基线复位中 已等待 10s, 仍未收到固件完成回执
+[2026-07-25T20:01:48Z WARN  mai2control_ui::app_state] 收到 NAK(seq=130): PSoC cp_get failed
+[2026-07-25T20:01:48Z WARN  mai2control_ui::app_state] 收到 NAK(seq=132): PSoC cp_get failed
+[2026-07-25T20:01:49Z WARN  mai2control_ui::app_state] 收到 NAK(seq=133): PSoC cp_get failed
+[2026-07-25T20:01:49Z WARN  mai2control_ui::app_state] 收到 NAK(seq=134): PSoC cp_get failed
+[2026-07-25T20:01:49Z WARN  mai2control_ui::app_state] 收到 NAK(seq=135): PSoC cp_get failed
+[2026-07-25T20:01:49Z WARN  mai2control_ui::app_state] 收到 NAK(seq=137): PSoC cp_get failed
+[2026-07-25T20:01:49Z WARN  mai2control_ui::app_state] 收到 NAK(seq=138): PSoC cp_get failed
+[2026-07-25T20:01:49Z WARN  mai2control_ui::app_state] 收到 NAK(seq=139): PSoC cp_get failed
+[2026-07-25T20:01:49Z WARN  mai2control_ui::app_state] 收到 NAK(seq=140): PSoC cp_get failed
+[2026-07-25T20:01:49Z WARN  mai2control_ui::app_state] 收到 NAK(seq=142): PSoC cp_get failed
+[2026-07-25T20:01:49Z WARN  mai2control_ui::app_state] 收到 NAK(seq=144): PSoC cp_get failed
+[2026-07-25T20:01:49Z WARN  mai2control_ui::app_state] 收到 NAK(seq=145): PSoC cp_get failed
+[2026-07-25T20:01:49Z INFO  mai2control_ui::app_state] … 基线复位中 已等待 11s, 仍未收到固件完成回执
+[2026-07-25T20:01:49Z WARN  mai2control_ui::app_state] 收到 NAK(seq=146): PSoC cp_get failed
+[2026-07-25T20:01:50Z WARN  mai2control_ui::app_state] 收到 NAK(seq=148): PSoC cp_get failed
+[2026-07-25T20:01:50Z WARN  mai2control_ui::app_state] 收到 NAK(seq=149): PSoC cp_get failed
+[2026-07-25T20:01:50Z WARN  mai2control_ui::app_state] 收到 NAK(seq=150): PSoC cp_get failed
+[2026-07-25T20:01:50Z WARN  mai2control_ui::app_state] 收到 NAK(seq=151): PSoC cp_get failed
+[2026-07-25T20:01:50Z WARN  mai2control_ui::app_state] 收到 NAK(seq=153): PSoC cp_get failed
+[2026-07-25T20:01:50Z WARN  mai2control_ui::app_state] 收到 NAK(seq=154): PSoC cp_get failed
+[2026-07-25T20:01:50Z WARN  mai2control_ui::app_state] 收到 NAK(seq=155): PSoC cp_get failed
+[2026-07-25T20:01:50Z WARN  mai2control_ui::app_state] 收到 NAK(seq=156): PSoC cp_get failed
+[2026-07-25T20:01:50Z WARN  mai2control_ui::app_state] 收到 NAK(seq=158): PSoC cp_get failed
+[2026-07-25T20:01:50Z WARN  mai2control_ui::app_state] 收到 NAK(seq=159): PSoC cp_get failed
+[2026-07-25T20:01:50Z WARN  mai2control_ui::app_state] 收到 NAK(seq=161): PSoC cp_get failed
+[2026-07-25T20:01:50Z WARN  mai2control_ui::app_state] 收到 NAK(seq=162): PSoC cp_get failed
+[2026-07-25T20:01:50Z INFO  mai2control_ui::app_state] … 基线复位中 已等待 12s, 仍未收到固件完成回执
+[2026-07-25T20:01:51Z WARN  mai2control_ui::app_state] 收到 NAK(seq=164): PSoC cp_get failed
+[2026-07-25T20:01:51Z WARN  mai2control_ui::app_state] 收到 NAK(seq=165): PSoC cp_get failed
+[2026-07-25T20:01:51Z WARN  mai2control_ui::app_state] 收到 NAK(seq=166): PSoC cp_get failed
+[2026-07-25T20:01:51Z WARN  mai2control_ui::app_state] 收到 NAK(seq=167): PSoC cp_get failed
+[2026-07-25T20:01:51Z WARN  mai2control_ui::app_state] 收到 NAK(seq=169): PSoC cp_get failed
+[2026-07-25T20:01:51Z WARN  mai2control_ui::app_state] 收到 NAK(seq=170): PSoC cp_get failed
+[2026-07-25T20:01:51Z WARN  mai2control_ui::app_state] 收到 NAK(seq=171): PSoC cp_get failed
+[2026-07-25T20:01:51Z WARN  mai2control_ui::app_state] 收到 NAK(seq=172): PSoC cp_get failed
+[2026-07-25T20:01:51Z WARN  mai2control_ui::app_state] 收到 NAK(seq=174): PSoC cp_get failed
+[2026-07-25T20:01:51Z WARN  mai2control_ui::app_state] 收到 NAK(seq=175): PSoC cp_get failed
+[2026-07-25T20:01:51Z WARN  mai2control_ui::app_state] 收到 NAK(seq=177): PSoC cp_get failed
+[2026-07-25T20:01:51Z WARN  mai2control_ui::app_state] 收到 NAK(seq=178): PSoC cp_get failed
+[2026-07-25T20:01:52Z INFO  mai2control_ui::app_state] … 基线复位中 已等待 13s, 仍未收到固件完成回执
+[2026-07-25T20:01:52Z WARN  mai2control_ui::app_state] 收到 NAK(seq=180): PSoC cp_get failed
+[2026-07-25T20:01:52Z WARN  mai2control_ui::app_state] 收到 NAK(seq=181): PSoC cp_get failed
+[2026-07-25T20:01:52Z WARN  mai2control_ui::app_state] 收到 NAK(seq=182): PSoC cp_get failed
+[2026-07-25T20:01:52Z WARN  mai2control_ui::app_state] 收到 NAK(seq=183): PSoC cp_get failed
+[2026-07-25T20:01:52Z WARN  mai2control_ui::app_state] 收到 NAK(seq=185): PSoC cp_get failed
+[2026-07-25T20:01:52Z WARN  mai2control_ui::app_state] 收到 NAK(seq=186): PSoC cp_get failed
+[2026-07-25T20:01:52Z WARN  mai2control_ui::app_state] 收到 NAK(seq=187): PSoC cp_get failed
+[2026-07-25T20:01:52Z WARN  mai2control_ui::app_state] 收到 NAK(seq=188): PSoC cp_get failed
+[2026-07-25T20:01:52Z WARN  mai2control_ui::app_state] 收到 NAK(seq=190): PSoC cp_get failed
+[2026-07-25T20:01:52Z WARN  mai2control_ui::app_state] 收到 NAK(seq=191): PSoC cp_get failed
+[2026-07-25T20:01:52Z WARN  mai2control_ui::app_state] 收到 NAK(seq=192): PSoC cp_get failed
+[2026-07-25T20:01:53Z WARN  mai2control_ui::app_state] 收到 NAK(seq=194): PSoC cp_get failed
+[2026-07-25T20:01:53Z INFO  mai2control_ui::app_state] … 基线复位中 已等待 14s, 仍未收到固件完成回执
+[2026-07-25T20:01:53Z WARN  mai2control_ui::app_state] 收到 NAK(seq=196): PSoC cp_get failed
+[2026-07-25T20:01:53Z WARN  mai2control_ui::app_state] 收到 NAK(seq=197): PSoC cp_get failed
+[2026-07-25T20:01:53Z WARN  mai2control_ui::app_state] 收到 NAK(seq=198): PSoC cp_get failed
+[2026-07-25T20:01:53Z WARN  mai2control_ui::app_state] 收到 NAK(seq=199): PSoC cp_get failed
+[2026-07-25T20:01:53Z WARN  mai2control_ui::app_state] 收到 NAK(seq=201): PSoC cp_get failed
+[2026-07-25T20:01:53Z WARN  mai2control_ui::app_state] 收到 NAK(seq=202): PSoC cp_get failed
+[2026-07-25T20:01:53Z WARN  mai2control_ui::app_state] 收到 NAK(seq=203): PSoC cp_get failed
+[2026-07-25T20:01:53Z WARN  mai2control_ui::app_state] 收到 NAK(seq=204): PSoC cp_get failed
+[2026-07-25T20:01:53Z WARN  mai2control_ui::app_state] 收到 NAK(seq=206): PSoC cp_get failed
+[2026-07-25T20:01:53Z WARN  mai2control_ui::app_state] 收到 NAK(seq=207): PSoC cp_get failed
+[2026-07-25T20:01:53Z WARN  mai2control_ui::app_state] 收到 NAK(seq=208): PSoC cp_get failed
+[2026-07-25T20:01:54Z WARN  mai2control_ui::app_state] 收到 NAK(seq=209): PSoC cp_get failed
+[2026-07-25T20:01:54Z WARN  mai2control_ui::app_state] 收到 NAK(seq=212): PSoC cp_get failed
+[2026-07-25T20:01:54Z INFO  mai2control_ui::app_state] … 基线复位中 已等待 15s, 仍未收到固件完成回执
+[2026-07-25T20:01:54Z WARN  mai2control_ui::app_state] 收到 NAK(seq=213): PSoC cp_get failed
+[2026-07-25T20:01:54Z WARN  mai2control_ui::app_state] 收到 NAK(seq=214): PSoC cp_get failed
+[2026-07-25T20:01:54Z WARN  mai2control_ui::app_state] 收到 NAK(seq=215): PSoC cp_get failed
+[2026-07-25T20:01:54Z WARN  mai2control_ui::app_state] 收到 NAK(seq=217): PSoC cp_get failed
+[2026-07-25T20:01:54Z WARN  mai2control_ui::app_state] 收到 NAK(seq=218): PSoC cp_get failed
+[2026-07-25T20:01:54Z WARN  mai2control_ui::app_state] 收到 NAK(seq=219): PSoC cp_get failed
+[2026-07-25T20:01:54Z WARN  mai2control_ui::app_state] 收到 NAK(seq=220): PSoC cp_get failed
+[2026-07-25T20:01:54Z WARN  mai2control_ui::app_state] 收到 NAK(seq=222): PSoC cp_get failed
+[2026-07-25T20:01:54Z WARN  mai2control_ui::app_state] 收到 NAK(seq=223): PSoC cp_get failed
+[2026-07-25T20:01:55Z WARN  mai2control_ui::app_state] 收到 NAK(seq=224): PSoC cp_get failed
+[2026-07-25T20:01:55Z WARN  mai2control_ui::app_state] 收到 NAK(seq=225): PSoC cp_get failed
+[2026-07-25T20:01:55Z WARN  mai2control_ui::app_state] 收到 NAK(seq=228): PSoC cp_get failed
+[2026-07-25T20:01:55Z INFO  mai2control_ui::app_state] … 基线复位中 已等待 16s, 仍未收到固件完成回执
+[2026-07-25T20:01:55Z WARN  mai2control_ui::app_state] 收到 NAK(seq=229): PSoC cp_get failed
+[2026-07-25T20:01:55Z WARN  mai2control_ui::app_state] 收到 NAK(seq=230): PSoC cp_get failed
+[2026-07-25T20:01:55Z WARN  mai2control_ui::app_state] 收到 NAK(seq=231): PSoC cp_get failed
+[2026-07-25T20:01:55Z INFO  mai2control_ui::app_state] ▶ 阻塞操作开始: PSoC 重启中 (seq=234), 等待固件真正完成回执...
+[2026-07-25T20:01:55Z WARN  mai2control_ui::app_state] 收到 NAK(seq=233): PSoC cp_get failed
+[2026-07-25T20:01:55Z INFO  mai2control_ui::app_state] ✔ 阻塞操作完成: PSoC 重启中 (耗时约 16ms)
+[2026-07-25T20:01:55Z WARN  mai2control_ui::app_state] 收到 NAK(seq=235): PSoC cp_get failed
+[2026-07-25T20:01:55Z WARN  mai2control_ui::app_state] 收到 NAK(seq=236): PSoC cp_get failed
+[2026-07-25T20:01:55Z WARN  mai2control_ui::app_state] 收到 NAK(seq=237): PSoC cp_get failed
+[2026-07-25T20:01:55Z WARN  mai2control_ui::app_state] 收到 NAK(seq=239): PSoC cp_get failed
+[2026-07-25T20:01:55Z WARN  mai2control_ui::app_state] 收到 NAK(seq=240): PSoC cp_get failed
+[2026-07-25T20:01:56Z WARN  mai2control_ui::app_state] 收到 NAK(seq=241): PSoC cp_get failed
+[2026-07-25T20:01:56Z WARN  mai2control_ui::app_state] 收到 NAK(seq=242): PSoC cp_get failed
+[2026-07-25T20:01:56Z WARN  mai2control_ui::app_state] 收到 NAK(seq=244): PSoC cp_get failed
+[2026-07-25T20:01:56Z WARN  mai2control_ui::app_state] 收到 NAK(seq=246): PSoC cp_get failed
+[2026-07-25T20:01:56Z WARN  mai2control_ui::app_state] 收到 NAK(seq=247): PSoC cp_get failed
+[2026-07-25T20:01:56Z WARN  mai2control_ui::app_state] 收到 NAK(seq=248): PSoC cp_get failed
+[2026-07-25T20:01:56Z WARN  mai2control_ui::app_state] 收到 NAK(seq=250): PSoC cp_get failed
+[2026-07-25T20:01:56Z WARN  mai2control_ui::app_state] 收到 NAK(seq=251): PSoC cp_get failed
+[2026-07-25T20:01:56Z WARN  mai2control_ui::app_state] 收到 NAK(seq=252): PSoC cp_get failed
+[2026-07-25T20:01:56Z WARN  mai2control_ui::app_state] 收到 NAK(seq=253): PSoC cp_get failed
+[2026-07-25T20:01:56Z WARN  mai2control_ui::app_state] 收到 NAK(seq=255): PSoC cp_get failed
+[2026-07-25T20:01:57Z WARN  mai2control_ui::app_state] 收到 NAK(seq=0): PSoC cp_get failed
+[2026-07-25T20:01:57Z WARN  mai2control_ui::app_state] 收到 NAK(seq=1): PSoC cp_get failed
+[2026-07-25T20:01:57Z WARN  mai2control_ui::app_state] 收到 NAK(seq=2): PSoC cp_get failed
+[2026-07-25T20:01:57Z WARN  mai2control_ui::app_state] 收到 NAK(seq=4): PSoC cp_get failed
+[2026-07-25T20:01:57Z WARN  mai2control_ui::app_state] 收到 NAK(seq=6): PSoC cp_get failed
+[2026-07-25T20:01:57Z WARN  mai2control_ui::app_state] 收到 NAK(seq=7): PSoC cp_get failed
+[2026-07-25T20:01:57Z WARN  mai2control_ui::app_state] 收到 NAK(seq=8): PSoC cp_get failed
+[2026-07-25T20:01:57Z WARN  mai2control_ui::app_state] 收到 NAK(seq=10): PSoC cp_get failed
+[2026-07-25T20:01:57Z WARN  mai2control_ui::app_state] 收到 NAK(seq=11): PSoC cp_get failed
+[2026-07-25T20:01:57Z WARN  mai2control_ui::app_state] 收到 NAK(seq=12): PSoC cp_get failed
+[2026-07-25T20:01:57Z WARN  mai2control_ui::app_state] 收到 NAK(seq=13): PSoC cp_get failed
+[2026-07-25T20:01:58Z WARN  mai2control_ui::app_state] 收到 NAK(seq=15): PSoC cp_get failed
+[2026-07-25T20:01:58Z WARN  mai2control_ui::app_state] 收到 NAK(seq=16): PSoC cp_get failed
+[2026-07-25T20:01:58Z WARN  mai2control_ui::app_state] 收到 NAK(seq=17): PSoC cp_get failed
+[2026-07-25T20:01:58Z WARN  mai2control_ui::app_state] 收到 NAK(seq=18): PSoC cp_get failed
+[2026-07-25T20:01:58Z WARN  mai2control_ui::app_state] 收到 NAK(seq=20): PSoC cp_get failed
+[2026-07-25T20:01:58Z WARN  mai2control_ui::app_state] 收到 NAK(seq=21): PSoC cp_get failed
+[2026-07-25T20:01:58Z WARN  mai2control_ui::app_state] 收到 NAK(seq=23): PSoC cp_get failed
+[2026-07-25T20:01:58Z WARN  mai2control_ui::app_state] 收到 NAK(seq=24): PSoC cp_get failed
+[2026-07-25T20:01:58Z WARN  mai2control_ui::app_state] 收到 NAK(seq=26): PSoC cp_get failed
+[2026-07-25T20:01:58Z WARN  mai2control_ui::app_state] 收到 NAK(seq=27): PSoC cp_get failed
+[2026-07-25T20:01:58Z WARN  mai2control_ui::app_state] 收到 NAK(seq=28): PSoC cp_get failed
+[2026-07-25T20:01:58Z WARN  mai2control_ui::app_state] 收到 NAK(seq=29): PSoC cp_get failed
+[2026-07-25T20:01:59Z WARN  mai2control_ui::app_state] 收到 NAK(seq=31): PSoC cp_get failed
+[2026-07-25T20:01:59Z WARN  mai2control_ui::app_state] 收到 NAK(seq=32): PSoC cp_get failed
+[2026-07-25T20:01:59Z WARN  mai2control_ui::app_state] 收到 NAK(seq=33): PSoC cp_get failed
+[2026-07-25T20:01:59Z WARN  mai2control_ui::app_state] 收到 NAK(seq=34): PSoC cp_get failed
+[2026-07-25T20:01:59Z WARN  mai2control_ui::app_state] 收到 NAK(seq=36): PSoC cp_get failed
+[2026-07-25T20:01:59Z WARN  mai2control_ui::app_state] 收到 NAK(seq=37): PSoC cp_get failed
+[2026-07-25T20:01:59Z WARN  mai2control_ui::app_state] 收到 NAK(seq=38): PSoC cp_get failed
+[2026-07-25T20:01:59Z WARN  mai2control_ui::app_state] 收到 NAK(seq=40): PSoC cp_get failed
+[2026-07-25T20:01:59Z WARN  mai2control_ui::app_state] 收到 NAK(seq=42): PSoC cp_get failed
+[2026-07-25T20:01:59Z WARN  mai2control_ui::app_state] 收到 NAK(seq=43): PSoC cp_get failed
+[2026-07-25T20:01:59Z WARN  mai2control_ui::app_state] 收到 NAK(seq=44): PSoC cp_get failed
+[2026-07-25T20:02:00Z WARN  mai2control_ui::app_state] 收到 NAK(seq=45): PSoC cp_get failed
+[2026-07-25T20:02:00Z WARN  mai2control_ui::app_state] 收到 NAK(seq=47): PSoC cp_get failed
+[2026-07-25T20:02:00Z WARN  mai2control_ui::app_state] 收到 NAK(seq=48): PSoC cp_get failed
+[2026-07-25T20:02:00Z WARN  mai2control_ui::app_state] 收到 NAK(seq=49): PSoC cp_get failed
+[2026-07-25T20:02:00Z WARN  mai2control_ui::app_state] 收到 NAK(seq=50): PSoC cp_get failed
+[2026-07-25T20:02:00Z WARN  mai2control_ui::app_state] 收到 NAK(seq=52): PSoC cp_get failed
+[2026-07-25T20:02:00Z WARN  mai2control_ui::app_state] 收到 NAK(seq=53): PSoC cp_get failed
+[2026-07-25T20:02:00Z WARN  mai2control_ui::app_state] 收到 NAK(seq=54): PSoC cp_get failed
+[2026-07-25T20:02:00Z WARN  mai2control_ui::app_state] 收到 NAK(seq=56): PSoC cp_get failed
+[2026-07-25T20:02:00Z WARN  mai2control_ui::app_state] 收到 NAK(seq=58): PSoC cp_get failed
+[2026-07-25T20:02:00Z WARN  mai2control_ui::app_state] 收到 NAK(seq=59): PSoC cp_get failed
+[2026-07-25T20:02:01Z WARN  mai2control_ui::app_state] 收到 NAK(seq=60): PSoC cp_get failed
+[2026-07-25T20:02:01Z WARN  mai2control_ui::app_state] 收到 NAK(seq=61): PSoC cp_get failed
+[2026-07-25T20:02:01Z WARN  mai2control_ui::app_state] 收到 NAK(seq=63): PSoC cp_get failed
+[2026-07-25T20:02:01Z WARN  mai2control_ui::app_state] 收到 NAK(seq=64): PSoC cp_get failed
+[2026-07-25T20:02:01Z WARN  mai2control_ui::app_state] 收到 NAK(seq=65): PSoC cp_get failed
+[2026-07-25T20:02:01Z WARN  mai2control_ui::app_state] 收到 NAK(seq=66): PSoC cp_get failed
+[2026-07-25T20:02:01Z WARN  mai2control_ui::app_state] 收到 NAK(seq=68): PSoC cp_get failed
+[2026-07-25T20:02:01Z WARN  mai2control_ui::app_state] 收到 NAK(seq=69): PSoC cp_get failed
+[2026-07-25T20:02:01Z WARN  mai2control_ui::app_state] 收到 NAK(seq=70): PSoC cp_get failed
+[2026-07-25T20:02:02Z WARN  mai2control_ui::app_state] 收到 NAK(seq=71): PSoC cp_get failed
+[2026-07-25T20:02:02Z WARN  mai2control_ui::app_state] 收到 NAK(seq=74): PSoC cp_get failed
+[2026-07-25T20:02:02Z WARN  mai2control_ui::app_state] 收到 NAK(seq=75): PSoC cp_get failed
+[2026-07-25T20:02:02Z WARN  mai2control_ui::app_state] 收到 NAK(seq=76): PSoC cp_get failed
+[2026-07-25T20:02:02Z WARN  mai2control_ui::app_state] 收到 NAK(seq=77): PSoC cp_get failed
+[2026-07-25T20:02:02Z WARN  mai2control_ui::app_state] 收到 NAK(seq=79): PSoC cp_get failed
+[2026-07-25T20:02:02Z WARN  mai2control_ui::app_state] 收到 NAK(seq=80): PSoC cp_get failed
+[2026-07-25T20:02:02Z WARN  mai2control_ui::app_state] 收到 NAK(seq=81): PSoC cp_get failed
+[2026-07-25T20:02:02Z WARN  mai2control_ui::app_state] 收到 NAK(seq=82): PSoC cp_get failed
+[2026-07-25T20:02:02Z WARN  mai2control_ui::app_state] 收到 NAK(seq=84): PSoC cp_get failed
+[2026-07-25T20:02:03Z WARN  mai2control_ui::app_state] 收到 NAK(seq=85): PSoC cp_get failed
+[2026-07-25T20:02:03Z WARN  mai2control_ui::app_state] 收到 NAK(seq=86): PSoC cp_get failed
+[2026-07-25T20:02:03Z WARN  mai2control_ui::app_state] 收到 NAK(seq=87): PSoC cp_get failed
+[2026-07-25T20:02:03Z WARN  mai2control_ui::app_state] 收到 NAK(seq=90): PSoC cp_get failed
+[2026-07-25T20:02:03Z WARN  mai2control_ui::app_state] 收到 NAK(seq=91): PSoC cp_get failed
+[2026-07-25T20:02:03Z WARN  mai2control_ui::app_state] 收到 NAK(seq=92): PSoC cp_get failed
+[2026-07-25T20:02:03Z WARN  mai2control_ui::app_state] 收到 NAK(seq=93): PSoC cp_get failed
+[2026-07-25T20:02:03Z WARN  mai2control_ui::app_state] 收到 NAK(seq=95): PSoC cp_get failed
+[2026-07-25T20:02:03Z WARN  mai2control_ui::app_state] 收到 NAK(seq=96): PSoC cp_get failed
+[2026-07-25T20:02:03Z WARN  mai2control_ui::app_state] 收到 NAK(seq=97): PSoC cp_get failed
+[2026-07-25T20:02:03Z WARN  mai2control_ui::app_state] 收到 NAK(seq=98): PSoC cp_get failed
+[2026-07-25T20:02:03Z WARN  mai2control_ui::app_state] 收到 NAK(seq=100): PSoC cp_get failed
+[2026-07-25T20:02:04Z WARN  mai2control_ui::app_state] 收到 NAK(seq=101): PSoC cp_get failed
+[2026-07-25T20:02:04Z WARN  mai2control_ui::app_state] 收到 NAK(seq=102): PSoC cp_get failed
+[2026-07-25T20:02:04Z WARN  mai2control_ui::app_state] 收到 NAK(seq=103): PSoC cp_get failed
+[2026-07-25T20:02:04Z WARN  mai2control_ui::app_state] 收到 NAK(seq=105): PSoC cp_get failed
+[2026-07-25T20:02:04Z WARN  mai2control_ui::app_state] 收到 NAK(seq=107): PSoC cp_get failed
+[2026-07-25T20:02:04Z WARN  mai2control_ui::app_state] 收到 NAK(seq=108): PSoC cp_get failed
+[2026-07-25T20:02:04Z WARN  mai2control_ui::app_state] 收到 NAK(seq=109): PSoC cp_get failed
+[2026-07-25T20:02:04Z WARN  mai2control_ui::app_state] 收到 NAK(seq=111): PSoC cp_get failed
+[2026-07-25T20:02:04Z WARN  mai2control_ui::app_state] 收到 NAK(seq=112): PSoC cp_get failed
+[2026-07-25T20:02:04Z WARN  mai2control_ui::app_state] 收到 NAK(seq=113): PSoC cp_get failed
+[2026-07-25T20:02:05Z WARN  mai2control_ui::app_state] 收到 NAK(seq=114): PSoC cp_get failed
+[2026-07-25T20:02:05Z WARN  mai2control_ui::app_state] 收到 NAK(seq=116): PSoC cp_get failed
+[2026-07-25T20:02:05Z WARN  mai2control_ui::app_state] 收到 NAK(seq=117): PSoC cp_get failed
+[2026-07-25T20:02:05Z WARN  mai2control_ui::app_state] 收到 NAK(seq=118): PSoC cp_get failed
+[2026-07-25T20:02:05Z WARN  mai2control_ui::app_state] 收到 NAK(seq=119): PSoC cp_get failed
+[2026-07-25T20:02:05Z WARN  mai2control_ui::app_state] 收到 NAK(seq=121): PSoC cp_get failed
+[2026-07-25T20:02:05Z WARN  mai2control_ui::app_state] 收到 NAK(seq=122): PSoC cp_get failed
+[2026-07-25T20:02:05Z WARN  mai2control_ui::app_state] 收到 NAK(seq=124): PSoC cp_get failed
+[2026-07-25T20:02:05Z WARN  mai2control_ui::app_state] 收到 NAK(seq=125): PSoC cp_get failed
+[2026-07-25T20:02:05Z WARN  mai2control_ui::app_state] 收到 NAK(seq=127): PSoC cp_get failed
+[2026-07-25T20:02:05Z WARN  mai2control_ui::app_state] 收到 NAK(seq=128): PSoC cp_get failed
+[2026-07-25T20:02:05Z WARN  mai2control_ui::app_state] 收到 NAK(seq=129): PSoC cp_get failed
+[2026-07-25T20:02:06Z WARN  mai2control_ui::app_state] 收到 NAK(seq=130): PSoC cp_get failed
+[2026-07-25T20:02:06Z WARN  mai2control_ui::app_state] 收到 NAK(seq=132): PSoC cp_get failed
+[2026-07-25T20:02:06Z WARN  mai2control_ui::app_state] 收到 NAK(seq=133): PSoC cp_get failed
+[2026-07-25T20:02:06Z WARN  mai2control_ui::app_state] 收到 NAK(seq=134): PSoC cp_get failed
+[2026-07-25T20:02:06Z WARN  mai2control_ui::app_state] 收到 NAK(seq=135): PSoC cp_get failed
+[2026-07-25T20:02:06Z WARN  mai2control_ui::app_state] 收到 NAK(seq=137): PSoC cp_get failed
+[2026-07-25T20:02:06Z WARN  mai2control_ui::app_state] 收到 NAK(seq=138): PSoC cp_get failed
+[2026-07-25T20:02:06Z WARN  mai2control_ui::app_state] 收到 NAK(seq=140): PSoC cp_get failed
+[2026-07-25T20:02:06Z WARN  mai2control_ui::app_state] 收到 NAK(seq=141): PSoC cp_get failed
+[2026-07-25T20:02:06Z WARN  mai2control_ui::app_state] 收到 NAK(seq=143): PSoC cp_get failed
+[2026-07-25T20:02:07Z WARN  mai2control_ui::app_state] 收到 NAK(seq=144): PSoC cp_get failed
+[2026-07-25T20:02:07Z WARN  mai2control_ui::app_state] 收到 NAK(seq=145): PSoC cp_get failed
+[2026-07-25T20:02:07Z WARN  mai2control_ui::app_state] 收到 NAK(seq=146): PSoC cp_get failed
+[2026-07-25T20:02:07Z WARN  mai2control_ui::app_state] 收到 NAK(seq=148): PSoC cp_get failed
+[2026-07-25T20:02:07Z WARN  mai2control_ui::app_state] 收到 NAK(seq=149): PSoC cp_get failed
+[2026-07-25T20:02:07Z WARN  mai2control_ui::app_state] 收到 NAK(seq=150): PSoC cp_get failed
+[2026-07-25T20:02:07Z WARN  mai2control_ui::app_state] 收到 NAK(seq=151): PSoC cp_get failed
+[2026-07-25T20:02:07Z WARN  mai2control_ui::app_state] 收到 NAK(seq=153): PSoC cp_get failed
+[2026-07-25T20:02:08Z WARN  mai2control_ui::app_state] 收到 NAK(seq=154): PSoC cp_get failed
+[2026-07-25T20:02:08Z WARN  mai2control_ui::app_state] 收到 NAK(seq=155): PSoC cp_get failed
+[2026-07-25T20:02:08Z WARN  mai2control_ui::app_state] 收到 NAK(seq=157): PSoC cp_get failed
+[2026-07-25T20:02:08Z WARN  mai2control_ui::app_state] 收到 NAK(seq=159): PSoC cp_get failed
+[2026-07-25T20:02:08Z WARN  mai2control_ui::app_state] 收到 NAK(seq=160): PSoC cp_get failed
+[2026-07-25T20:02:08Z WARN  mai2control_ui::app_state] 收到 NAK(seq=161): PSoC cp_get failed
+[2026-07-25T20:02:08Z WARN  mai2control_ui::app_state] 收到 NAK(seq=162): PSoC cp_get failed
+[2026-07-25T20:02:08Z WARN  mai2control_ui::app_state] 收到 NAK(seq=164): PSoC cp_get failed
+[2026-07-25T20:02:08Z WARN  mai2control_ui::app_state] 收到 NAK(seq=165): PSoC cp_get failed
+[2026-07-25T20:02:09Z WARN  mai2control_ui::app_state] 收到 NAK(seq=166): PSoC cp_get failed
+[2026-07-25T20:02:09Z WARN  mai2control_ui::app_state] 收到 NAK(seq=167): PSoC cp_get failed
+[2026-07-25T20:02:09Z WARN  mai2control_ui::app_state] 收到 NAK(seq=169): PSoC cp_get failed
+[2026-07-25T20:02:09Z WARN  mai2control_ui::app_state] 收到 NAK(seq=170): PSoC cp_get failed
+[2026-07-25T20:02:09Z WARN  mai2control_ui::app_state] 收到 NAK(seq=171): PSoC cp_get failed
+[2026-07-25T20:02:09Z WARN  mai2control_ui::app_state] 收到 NAK(seq=173): PSoC cp_get failed
+[2026-07-25T20:02:09Z WARN  mai2control_ui::app_state] 收到 NAK(seq=175): PSoC cp_get failed
+[2026-07-25T20:02:09Z WARN  mai2control_ui::app_state] 收到 NAK(seq=176): PSoC cp_get failed
+[2026-07-25T20:02:10Z WARN  mai2control_ui::app_state] 收到 NAK(seq=177): PSoC cp_get failed
+[2026-07-25T20:02:10Z WARN  mai2control_ui::app_state] 收到 NAK(seq=178): PSoC cp_get failed
+[2026-07-25T20:02:10Z WARN  mai2control_ui::app_state] 收到 NAK(seq=180): PSoC cp_get failed
+[2026-07-25T20:02:10Z WARN  mai2control_ui::app_state] 收到 NAK(seq=181): PSoC cp_get failed
+[2026-07-25T20:02:10Z WARN  mai2control_ui::app_state] 收到 NAK(seq=182): PSoC cp_get failed
+[2026-07-25T20:02:10Z WARN  mai2control_ui::app_state] 收到 NAK(seq=183): PSoC cp_get failed
+[2026-07-25T20:02:10Z WARN  mai2control_ui::app_state] 收到 NAK(seq=185): PSoC cp_get failed
+[2026-07-25T20:02:10Z WARN  mai2control_ui::app_state] 收到 NAK(seq=186): PSoC cp_get failed
+[2026-07-25T20:02:11Z WARN  mai2control_ui::app_state] 收到 NAK(seq=187): PSoC cp_get failed
+[2026-07-25T20:02:11Z WARN  mai2control_ui::app_state] 收到 NAK(seq=188): PSoC cp_get failed
+[2026-07-25T20:02:11Z WARN  mai2control_ui::app_state] 收到 NAK(seq=191): PSoC cp_get failed
+[2026-07-25T20:02:11Z WARN  mai2control_ui::app_state] 收到 NAK(seq=192): PSoC cp_get failed
+[2026-07-25T20:02:11Z WARN  mai2control_ui::app_state] 收到 NAK(seq=193): PSoC cp_get failed
+[2026-07-25T20:02:11Z WARN  mai2control_ui::app_state] 收到 NAK(seq=194): PSoC cp_get failed
+[2026-07-25T20:02:11Z WARN  mai2control_ui::app_state] 收到 NAK(seq=196): PSoC cp_get failed
+[2026-07-25T20:02:11Z WARN  mai2control_ui::app_state] 收到 NAK(seq=197): PSoC cp_get failed
+[2026-07-25T20:02:12Z WARN  mai2control_ui::app_state] 收到 NAK(seq=198): PSoC cp_get failed
+[2026-07-25T20:02:12Z WARN  mai2control_ui::app_state] 收到 NAK(seq=199): PSoC cp_get failed
+[2026-07-25T20:02:12Z WARN  mai2control_ui::app_state] 收到 NAK(seq=201): PSoC cp_get failed
+[2026-07-25T20:02:12Z WARN  mai2control_ui::app_state] 收到 NAK(seq=202): PSoC cp_get failed
+[2026-07-25T20:02:12Z WARN  mai2control_ui::app_state] 收到 NAK(seq=203): PSoC cp_get failed
+[2026-07-25T20:02:12Z WARN  mai2control_ui::app_state] 收到 NAK(seq=204): PSoC cp_get failed
+[2026-07-25T20:02:12Z WARN  mai2control_ui::app_state] 收到 NAK(seq=206): PSoC cp_get failed
+[2026-07-25T20:02:12Z WARN  mai2control_ui::app_state] 收到 NAK(seq=208): PSoC cp_get failed
+[2026-07-25T20:02:13Z WARN  mai2control_ui::app_state] 收到 NAK(seq=209): PSoC cp_get failed
+[2026-07-25T20:02:13Z WARN  mai2control_ui::app_state] 收到 NAK(seq=210): PSoC cp_get failed
+[2026-07-25T20:02:13Z WARN  mai2control_ui::app_state] 收到 NAK(seq=212): PSoC cp_get failed
+[2026-07-25T20:02:13Z WARN  mai2control_ui::app_state] 收到 NAK(seq=213): PSoC cp_get failed
+[2026-07-25T20:02:13Z WARN  mai2control_ui::app_state] 收到 NAK(seq=214): PSoC cp_get failed
+[2026-07-25T20:02:13Z WARN  mai2control_ui::app_state] 收到 NAK(seq=215): PSoC cp_get failed

@@ -4,7 +4,7 @@
 
 class Psoc;
 
-static constexpr uint32_t RP_FIRMWARE_VERSION = 0x00000401u;
+static constexpr uint32_t RP_FIRMWARE_VERSION = 0x00000402u;
 static constexpr uint32_t RP_BUILD_ID = 0x4D324401u;  // "M2D" diagnostic image v1
 static constexpr uint8_t PSOC_BRINGUP_REPORT_VERSION = 1u;
 
@@ -82,14 +82,40 @@ struct PsocBringupReport {
     bool flash_ok() const { return acquired && silicon_id_ok && erase_ok && program_ok && verify_ok; }
 };
 
+// ★救砖(PSOC_RESCUE)状态★: 主机命令受理后由主循环执行强制重刷 + 重新应用, 经推送流上报。
+// state: 0=空闲 1=进行中 2=完成; stage 复用 PsocBringupStage(擦除/写入/校验/运行…),
+// REAPPLY 借用 COMPLETE 前的语义由 phase 字段区分(见 rescue_phase)。
+enum class PsocRescuePhase : uint8_t {
+    IDLE = 0,
+    FLASHING = 1,    // SWD 强制重刷中(acquire/erase/program/verify)
+    REAPPLY = 2,     // 已复位运行, 等主循环 provisioning 重新下发算法 + CSD
+    DONE = 3,
+    FAILED = 4,
+};
+
 class PsocUpdater {
 public:
     static PsocUpdater* getInstance();
 
     bool init();
-    bool run(Psoc* psoc);
+    // force_flash=true: 跳过"内容一致则免烧"的省寿命短路, 无条件擦写+校验(救砖用)。
+    bool run(Psoc* psoc, bool force_flash = false);
     void update();
     const PsocBringupReport& report() const { return _report; }
+
+    // ---------- 救砖(强制重刷 + 重新应用) ----------
+    void rescue_request();                       // host handler 调用: 置位后立即返回(不阻塞 core0)
+    bool rescue_active() const {                 // 进行中(重刷或等重新应用): 期间禁止兜底 XRES
+        return _rescue_pending || _rescue_phase == PsocRescuePhase::FLASHING ||
+               _rescue_phase == PsocRescuePhase::REAPPLY;
+    }
+    // 主循环每轮调用: 有待处理请求则执行强制重刷(内部保活喂狗/泵 USB/推进度)。
+    // 返回 true = 本轮刚完成重刷, 调用方需清 provisioned 使算法/CSD 重新下发。
+    bool rescue_step(Psoc* psoc);
+    void rescue_note_reapplied();                // provisioning 重新下发完成 → 终态
+    uint8_t rescue_state() const;                // 0=空闲 1=进行中 2=完成
+    uint8_t rescue_phase() const { return static_cast<uint8_t>(_rescue_phase); }
+    uint8_t rescue_result() const { return _rescue_result; }   // 0=进行中 1=成功 2=失败
 
 private:
     PsocUpdater();
@@ -98,7 +124,14 @@ private:
 
     bool _fail(Psoc* psoc, PsocBringupStage stage);
     void _capture_acquire(Psoc* psoc);
+    static void _keepalive();                    // 长擦写期间: 喂狗 + 泵 USB + 推送进度
 
     PsocBringupReport _report;
+    bool _rescue_pending = false;
+    PsocRescuePhase _rescue_phase = PsocRescuePhase::IDLE;
+    uint8_t _rescue_result = 0;
+    // 重新应用阶段的兜底截止时刻: 链路始终不回来时必须退出 REAPPLY, 否则 rescue_active() 恒真会
+    // 永久屏蔽 needs_reset 兜底复位(失效兜底被关掉比救砖失败更危险)。
+    uint32_t _rescue_deadline_ms = 0;
     static PsocUpdater* _instance;
 };

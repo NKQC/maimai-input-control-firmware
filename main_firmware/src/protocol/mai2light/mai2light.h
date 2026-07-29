@@ -2,264 +2,177 @@
 
 #include "../../hal/uart/hal_uart.h"
 #include <stdint.h>
-#include <vector>
-#include <functional>
-#include <cstring>
 
 /**
- * 协议层 - Mai2Light LED控制器
- * 基于UART通信的LED控制协议
- * 支持11个LED的颜色控制和EEPROM配置
+ * 协议层 - Mai2Light: 模拟官方 maimai DX LED 板 837-15070-04 (BD15070_4)
+ *
+ * 帧(请求): E0 dst src length command payload... sum
+ * 帧(应答): E0 dst src length status command report payload... sum
+ *   - 请求 length = command 起到 sum 之前的字节数; 应答 length = 3 + payload 字节数(status/command/report 各 1)
+ *   - sum = 转义前, dst 起到 sum 之前逐字节相加取低 8 位
+ *   - 转义: 原始字节为 0xE0/0xD0 时发 0xD0 + (原值-1); 收端遇 0xD0 则下一字节 +1 还原
+ *
+ * 虚拟 LED 单元共 11 个: 0..7 = 按键灯(写缓冲, 需 0x3C 提交); 8/9/10 = Body/Ext/Side 白灯(0x39 立即生效)。
+ * 本类只维护"灯板应该输出什么颜色", 实际推到 WS2812 由 LedMapService 完成(职责分离)。
  */
 
-// Mai2Light协议常量
-#define MAI2LIGHT_NUM_LEDS          11      // LED数量
-#define MAI2LIGHT_SYNC_BYTE         0xE0    // 同步字节
-#define MAI2LIGHT_MARKER_BYTE       0xD0    // 标记字节
-#define MAI2LIGHT_MAX_PACKET_SIZE   64      // 最大数据包大小
-#define MAI2LIGHT_DEFAULT_BAUD_RATE 115200  // 默认波特率
+#define MAI2LIGHT_NUM_LEDS          11      // 虚拟 LED 单元数
+#define MAI2LIGHT_BUTTON_LEDS       8       // 其中按键灯数量(0..7)
+#define MAI2LIGHT_SYNC_BYTE         0xE0
+#define MAI2LIGHT_ESCAPE_BYTE       0xD0
+#define MAI2LIGHT_MAX_PACKET_SIZE   48      // 去转义后的请求体上限(官方最长命令 payload 远小于此)
+#define MAI2LIGHT_MAX_ACK_SIZE      24      // 应答体上限(最长为 GetBoardInfo: 6 + 10)
+#define MAI2LIGHT_DEFAULT_BAUD_RATE 115200
+#define MAI2LIGHT_EEPROM_SIZE       8       // 官方板只有 8 字节模拟 EEPROM
 
-// Mai2Light命令定义
+// 命令码(与官方板一致, 不可自行发明)
 enum class Mai2Light_Command : uint8_t {
-    SET_LED_GS_8BIT         = 0x01,     // 设置单个LED 8位灰度
-    SET_LED_GS_8BIT_MULTI   = 0x02,     // 设置多个LED 8位灰度
-    SET_LED_RGB             = 0x03,     // 设置单个LED RGB
-    SET_LED_RGB_MULTI       = 0x04,     // 设置多个LED RGB
-    SET_ALL_LEDS            = 0x05,     // 设置所有LED
-    SET_BRIGHTNESS          = 0x06,     // 设置亮度
-    SET_FADE_TIME           = 0x07,     // 设置渐变时间
-    GET_LED_STATUS          = 0x10,     // 获取LED状态
-    GET_BOARD_INFO          = 0x11,     // 获取板卡信息
-    GET_PROTOCOL_VERSION    = 0x12,     // 获取协议版本
-    SET_EEPROM              = 0x20,     // 设置EEPROM
-    GET_EEPROM              = 0x21,     // 获取EEPROM
-    SAVE_TO_EEPROM          = 0x22,     // 保存到EEPROM
-    LOAD_FROM_EEPROM        = 0x23,     // 从EEPROM加载
-    GET_HELP                = 0x2F,     // 获取帮助信息
-    RESET_BOARD             = 0x30,     // 重置板卡
-    ENTER_BOOTLOADER        = 0x31,     // 进入引导程序
-    UNKNOWN                 = 0xFF      // 未知命令
+    SET_LED_GS_8BIT             = 0x31,
+    SET_LED_GS_8BIT_MULTI       = 0x32,
+    SET_LED_GS_8BIT_MULTI_FADE  = 0x33,
+    SET_LED_FET                 = 0x39,
+    SET_LED_GS_UPDATE           = 0x3C,
+    SET_EEPROM                  = 0x7B,
+    GET_EEPROM                  = 0x7C,
+    SET_ENABLE_RESPONSE         = 0x7D,
+    SET_DISABLE_RESPONSE        = 0x7E,
+    GET_BOARD_INFO              = 0xF0,
+    GET_BOARD_STATUS            = 0xF1,
+    GET_FIRM_SUM                = 0xF2,
+    GET_PROTOCOL_VERSION        = 0xF3,
 };
 
-// 应答状态定义
-enum class Mai2Light_AckStatus : uint8_t {
-    OK                      = 0x00,     // 成功
-    SUM_ERROR              = 0x01,     // 校验和错误
-    INVALID_COMMAND        = 0x02,     // 无效命令
-    INVALID_PARAMETER      = 0x03,     // 无效参数
-    EEPROM_ERROR           = 0x04,     // EEPROM错误
-    HARDWARE_ERROR         = 0x05      // 硬件错误
-};
+// 应答 status / report(官方定义, 正常一律 0x01)
+#define MAI2LIGHT_ACK_STATUS_OK         0x01
+#define MAI2LIGHT_ACK_STATUS_SUM_ERROR  0x02
+#define MAI2LIGHT_ACK_REPORT_OK         0x01
+#define MAI2LIGHT_ACK_REPORT_NONE       0x00
 
-// 应答报告定义
-enum class Mai2Light_AckReport : uint8_t {
-    OK                      = 0x00,     // 正常
-    WARNING                = 0x01,     // 警告
-    ERROR                  = 0x02      // 错误
-};
-
-// RGB颜色结构
 struct Mai2Light_RGB {
-    uint8_t r;              // 红色分量 (0-255)
-    uint8_t g;              // 绿色分量 (0-255)
-    uint8_t b;              // 蓝色分量 (0-255)
-    
+    uint8_t r;
+    uint8_t g;
+    uint8_t b;
+
     Mai2Light_RGB() : r(0), g(0), b(0) {}
     Mai2Light_RGB(uint8_t red, uint8_t green, uint8_t blue) : r(red), g(green), b(blue) {}
-    
-    // 从HSV转换
-    static Mai2Light_RGB from_hsv(uint16_t hue, uint8_t saturation, uint8_t value);
-    
-    // 颜色混合
-    Mai2Light_RGB blend(const Mai2Light_RGB& other, uint8_t ratio) const;
+    inline void clear() { r = 0; g = 0; b = 0; }
 };
 
-// LED状态结构
+// 单元状态(brightness/enabled 保留给上层缓存比较, 协议本身不区分)
 struct Mai2Light_LEDStatus {
-    Mai2Light_RGB color;    // 当前颜色
-    uint8_t brightness;     // 亮度 (0-255)
-    bool enabled;           // 是否启用
-    
+    Mai2Light_RGB color;
+    uint8_t brightness;
+    bool enabled;
+
     Mai2Light_LEDStatus() : brightness(255), enabled(true) {}
 };
 
-// 板卡信息结构
-struct Mai2Light_BoardInfo {
-    uint16_t board_id;      // 板卡ID
-    uint8_t hardware_version; // 硬件版本
-    uint8_t firmware_version; // 固件版本
-    uint16_t led_count;     // LED数量
-    uint32_t serial_number; // 序列号
-    
-    Mai2Light_BoardInfo() : board_id(0), hardware_version(0), firmware_version(0), 
-                           led_count(MAI2LIGHT_NUM_LEDS), serial_number(0) {}
-};
-
-// 请求数据包结构
-struct Mai2Light_PacketReq {
-    uint8_t sync;           // 同步字节 (0xE0)
-    uint8_t node_id;        // 节点ID
-    uint8_t length;         // 数据长度
-    Mai2Light_Command command; // 命令
-    uint8_t data[32];       // 数据
-    uint8_t checksum;       // 校验和
-    
-    Mai2Light_PacketReq() : sync(MAI2LIGHT_SYNC_BYTE), node_id(0), length(0), 
-                           command(Mai2Light_Command::UNKNOWN), checksum(0) {
-        memset(data, 0, sizeof(data));
-    }
-};
-
-// 应答数据包结构
-struct Mai2Light_PacketAck {
-    uint8_t sync;           // 同步字节 (0xE0)
-    uint8_t node_id;        // 节点ID
-    uint8_t length;         // 数据长度
-    Mai2Light_Command command; // 命令
-    Mai2Light_AckStatus status; // 状态
-    Mai2Light_AckReport report; // 报告
-    uint8_t data[32];       // 数据
-    uint8_t checksum;       // 校验和
-    
-    Mai2Light_PacketAck() : sync(MAI2LIGHT_SYNC_BYTE), node_id(0), length(0), 
-                           command(Mai2Light_Command::UNKNOWN), 
-                           status(Mai2Light_AckStatus::OK), 
-                           report(Mai2Light_AckReport::OK), checksum(0) {
-        memset(data, 0, sizeof(data));
-    }
-};
-
-// 配置结构
 struct Mai2Light_Config {
-    uint32_t baud_rate;     // 波特率
-    uint8_t node_id;        // 节点ID
-    uint8_t global_brightness; // 全局亮度 (0-255)
-    uint16_t fade_time_ms;  // 渐变时间 (毫秒)
-    bool auto_save;         // 自动保存到EEPROM
-    bool enable_fade;       // 启用渐变效果
-    
-    Mai2Light_Config() {
-        baud_rate = MAI2LIGHT_DEFAULT_BAUD_RATE;
-        node_id = 0;
-        global_brightness = 255;
-        fade_time_ms = 100;
-        auto_save = false;
-        enable_fade = true;
-    }
+    uint32_t baud_rate;
+    uint8_t node_id;
+
+    Mai2Light_Config() : baud_rate(MAI2LIGHT_DEFAULT_BAUD_RATE), node_id(0) {}
 };
 
-// 回调函数类型定义
-typedef std::function<void(Mai2Light_Command command, const uint8_t* data, uint8_t length)> Mai2Light_CommandCallback;
+// 链路统计(上位机据此判断"游戏是否真在刷灯"以及线路质量)
+struct Mai2Light_Stats {
+    uint32_t rx_frames;     // 校验通过的帧数
+    uint32_t sum_errors;    // 校验和错误数
+    uint32_t unknown_cmds;  // 未知命令数
+
+    inline void clear() { rx_frames = 0; sum_errors = 0; unknown_cmds = 0; }
+};
 
 class Mai2Light {
 public:
+    // 与 Mai2Serial 同一状态机范式: init→READY, 首个合法帧→RUNNING, 长时间无帧→READY, deinit→STOPPED
+    enum class Status : uint8_t {
+        STOPPED = 0,
+        READY = 1,
+        RUNNING = 2
+    };
+
     Mai2Light(HAL_UART* uart_hal, uint8_t node_id = 0);
     ~Mai2Light();
-    
-    // 初始化和释放
+
     bool init();
     void deinit();
-    bool is_ready() const;
-    
-    // 配置管理
+    inline bool is_ready() const { return _status != Status::STOPPED; }
+
     bool set_config(const Mai2Light_Config& config);
-    bool get_config(Mai2Light_Config& config);
-    
-    // LED控制
-    bool set_led_color(uint8_t led_index, const Mai2Light_RGB& color);          // 设置单个LED颜色
-    bool set_led_color(uint8_t led_index, uint8_t r, uint8_t g, uint8_t b);     // 设置单个LED颜色
-    bool set_led_brightness(uint8_t led_index, uint8_t brightness);             // 设置单个LED亮度
-    bool set_all_leds(const Mai2Light_RGB& color);                             // 设置所有LED颜色
-    
-    // 全局控制
-    bool set_global_brightness(uint8_t brightness);                            // 设置全局亮度
-    bool set_fade_time(uint16_t fade_time_ms);                                 // 设置渐变时间
-    bool clear_all_leds();                                                     // 清除所有LED
-    
-    // 状态查询
-    bool get_led_status(uint8_t led_index, Mai2Light_LEDStatus& status);       // 获取LED状态
-    bool get_all_led_status(Mai2Light_LEDStatus status_array[MAI2LIGHT_NUM_LEDS]); // 获取所有LED状态
-    const Mai2Light_LEDStatus* get_led_status_array() const;                   // 获取LED状态数组指针
-    bool get_board_info(Mai2Light_BoardInfo& info);                           // 获取板卡信息
-    uint8_t get_protocol_version();                                            // 获取协议版本
-    
-    // EEPROM操作
-    bool save_to_eeprom();                                                     // 保存当前状态到EEPROM
-    bool load_from_eeprom();                                                   // 从EEPROM加载状态
-    bool set_eeprom_data(uint16_t address, const uint8_t* data, uint8_t length); // 设置EEPROM数据
-    bool get_eeprom_data(uint16_t address, uint8_t* data, uint8_t length);     // 获取EEPROM数据
-    
-    // 系统控制
-    bool reset_board();                                                        // 重置板卡
-    bool enter_bootloader();                                                   // 进入引导程序
-    
-    // 回调设置
-    void set_command_callback(Mai2Light_CommandCallback callback);
-    
-    // 任务处理
+    bool get_config(Mai2Light_Config& config) const;
+
+    // 非阻塞: 收帧 + 应答 + 渐变按时间片推进
     void task();
-    
+
+    const Mai2Light_LEDStatus* get_led_status_array() const { return _led; }
+    Status get_status() const { return _status; }
+    bool response_enabled() const { return _flags.resp_enabled; }
+    const Mai2Light_Stats& get_stats() const { return _stats; }
+
 private:
-    HAL_UART* uart_hal_;
-    bool initialized_;
-    
-    // 配置和状态
-    Mai2Light_Config config_;
-    Mai2Light_LEDStatus led_status_[MAI2LIGHT_NUM_LEDS];
-    Mai2Light_BoardInfo board_info_;
-    
-    // 接收缓冲区
-    uint8_t rx_buffer_[MAI2LIGHT_MAX_PACKET_SIZE];
-    uint8_t rx_buffer_pos_;
-    
-    // 回调函数
-    Mai2Light_CommandCallback command_callback_;
-    
-    // 虚拟EEPROM存储
-    static const uint16_t EEPROM_SIZE = 256;  // EEPROM大小
-    uint8_t virtual_eeprom_[EEPROM_SIZE];     // 虚拟EEPROM数据
-    
-    // 内部方法
-    bool send_packet(const Mai2Light_PacketReq& packet);
-    bool send_command(Mai2Light_Command command, const uint8_t* data = nullptr, uint8_t data_length = 0);
-    
-    // 数据包处理
-    void process_received_data();
-    void process_packet(const Mai2Light_PacketReq& packet);
-    bool parse_packet(const uint8_t* buffer, uint8_t length, Mai2Light_PacketReq& packet);
-    
-    // 校验和计算
-    uint8_t calculate_checksum(const uint8_t* data, uint8_t length);
-    bool verify_checksum(const uint8_t* data, uint8_t length, uint8_t expected_checksum);
-    
-    // 命令处理
-    void handle_set_led_command(const Mai2Light_PacketReq& packet);
-    void handle_get_status_command(const Mai2Light_PacketReq& packet);
-    void handle_eeprom_command(const Mai2Light_PacketReq& packet);
-    void handle_system_command(const Mai2Light_PacketReq& packet);
-    
-    // 应答发送
-    void send_ack(Mai2Light_Command command, Mai2Light_AckStatus status, 
-                  Mai2Light_AckReport report = Mai2Light_AckReport::OK, 
-                  const uint8_t* data = nullptr, uint8_t data_length = 0);
-    
-    // 日志输出
-    void log_debug(const std::string& message);
-    void log_error(const std::string& message);
-    
-    // 字符串指令解析
-    void process_string_commands(const uint8_t* buffer, size_t length);
-    void parse_string_command(const std::string& command_str);
-    bool send_string_response(const std::string& response);
-    
-    // 渐变效果
-    void update_fade_effects();
-    bool is_fading_;
-    uint32_t fade_start_time_;
-    Mai2Light_RGB fade_start_colors_[MAI2LIGHT_NUM_LEDS];
-    Mai2Light_RGB fade_target_colors_[MAI2LIGHT_NUM_LEDS];
-    
-    // 字符串指令缓冲区
-    char string_cmd_buffer_[64];
-    uint8_t string_cmd_pos_;
+    Mai2Light(const Mai2Light&) = delete;
+    Mai2Light& operator=(const Mai2Light&) = delete;
+
+    // 成套开关归并, 避免散装 bool
+    struct Flags {
+        bool resp_enabled;  // 0x7D/0x7E 切换的"是否回应答"
+        bool rx_active;     // 已见 sync, 正在收帧
+        bool rx_escape;     // 上一字节是 0xD0
+        inline void clear() { resp_enabled = true; rx_active = false; rx_escape = false; }
+    };
+
+    // 渐变(0x33 设参数, 0x3C 触发开始, task 内按时间推进)
+    struct Fade {
+        uint32_t start_ms;
+        uint32_t end_ms;
+        Mai2Light_RGB from;
+        Mai2Light_RGB to;
+        uint8_t first;
+        uint8_t last;
+        bool armed;    // 收到 0x33, 等 0x3C
+        bool running;
+        inline void clear() {
+            start_ms = 0; end_ms = 0; from.clear(); to.clear();
+            first = 0; last = 0; armed = false; running = false;
+        }
+    };
+
+    inline void _feed(uint8_t byte);
+    void _dispatch();
+    void _cmd_set_single();
+    void _cmd_set_multi(bool fade);
+    void _cmd_set_fet();
+    void _cmd_commit();
+    void _fade_step(uint32_t now_ms);
+
+    // payload 首字节地址与长度(请求体 = dst,src,len,cmd,payload...)
+    inline const uint8_t* _req_payload() const { return &_rx[4]; }
+    inline uint8_t _req_payload_len() const { return (_rx[2] > 0u) ? (uint8_t)(_rx[2] - 1u) : 0u; }
+    inline uint8_t* _ack_payload() { return &_ack[6]; }
+    inline void _stage_unit(uint8_t index, const Mai2Light_RGB& color);
+    inline void _set_unit(uint8_t index, const Mai2Light_RGB& color);
+    void _ack_send(uint8_t payload_len, uint8_t status = MAI2LIGHT_ACK_STATUS_OK,
+                   uint8_t report = MAI2LIGHT_ACK_REPORT_OK);
+    inline void _write_escaped(uint8_t value, uint8_t* out, uint8_t* out_len) const;
+
+    HAL_UART* _uart;
+    Status _status;
+    Mai2Light_Config _config;
+    Flags _flags;
+    Mai2Light_Stats _stats;
+
+    Mai2Light_LEDStatus _led[MAI2LIGHT_NUM_LEDS];   // 已提交(对外输出)色
+    Mai2Light_RGB _stage[MAI2LIGHT_NUM_LEDS];       // 缓冲色, 0x3C 提交
+    uint16_t _stage_mask;                           // 缓冲脏位, 避免提交时覆盖 0x39 的即时白灯
+    Mai2Light_RGB _multi_color;                     // 上一次 0x32 设定色 = 渐变起始色
+    Fade _fade;
+
+    uint8_t _eeprom[MAI2LIGHT_EEPROM_SIZE];
+
+    uint8_t _rx[MAI2LIGHT_MAX_PACKET_SIZE];  // 去转义后的请求体(不含 sync / sum)
+    uint8_t _rx_len;
+    uint8_t _rx_sum;                         // 增量累加校验和
+    uint8_t _ack[MAI2LIGHT_MAX_ACK_SIZE];    // 应答体(不含 sync / sum)
+    uint32_t _last_frame_ms;                 // 最近一次合法帧时刻, 用于 RUNNING→READY 回落
 };

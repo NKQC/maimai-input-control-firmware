@@ -1,0 +1,710 @@
+import { Button, VerticalBox, HorizontalBox, CheckBox, TabWidget } from "std-widgets.slint";
+import { ConfigRow, ZoneCell, ParamRow, ChannelStatus, AlgoReportLine, AlgoSettingRow, LedUnitRow } from "../common/types.slint";
+import { AlgoPage } from "./algo.slint";
+import { AllChannelsPage } from "./all_channels.slint";
+import { BindingPage } from "./binding.slint";
+import { ConfigPage } from "./config.slint";
+import { CurvesPage } from "./curves.slint";
+import { GlobalTunePage } from "./global_tune.slint";
+import { KeyMapPage, PhysKbdPage } from "./keymap.slint";
+import { ProtocolPage } from "./protocol.slint";
+
+
+// ============================================================================
+// 设置页容器:子标签,原样挂载现有页面组件 + 算法页
+// ============================================================================
+
+export component SettingsPage inherits Rectangle {
+    // 显式绑定 TabWidget current-index，供通道卡点击后切到“单通道精调”。
+    in-out property <int> settings_tab: 0;
+    in property <[ConfigRow]> config_rows: [];
+    // 未归类("其他"组)行数: 为 0 时通信系统 Tab 不渲染该组, 避免空标题框。
+    in property <int> config_other_count: 0;
+    in property <bool> config_dirty: false;
+    in property <int> config_dirty_count: 0;
+    in property <bool> mode_change_needs_reboot: false;
+    callback cfg_set_bool(string, bool);
+    callback cfg_set_number(string, float);
+    callback cfg_set_number_hex(string, string);
+    callback cfg_set_enum(string, int);
+    callback cfg_set_string(string, string);
+    callback cfg_load();
+    callback cfg_save();
+    callback cfg_reset();
+    // 设置文件导入/导出由 Rust 侧选择文件并实际读写；此处仅收集覆盖范围。
+    callback settings_export(bool, bool, bool, bool, bool, bool);
+    callback settings_import(bool, bool, bool, bool, bool, bool);
+    in property <int> settings_io_config_count: 0;
+    in property <int> settings_io_channel_params_count: 396;
+    in property <int> settings_io_globals_count: 8;
+    in property <int> settings_io_algo_count: 10;
+    in property <int> settings_io_keyboard_count: 46;
+    in property <int> settings_io_zones_count: 34;
+    property <bool> settings_io_dialog: false;
+    property <int> settings_io_action: 0; // 1=导出 2=导入
+    property <bool> settings_io_config: true;
+    property <bool> settings_io_channel_params: true;
+    property <bool> settings_io_globals: true;
+    property <bool> settings_io_algo: true;
+    property <bool> settings_io_keyboard: true;
+    property <bool> settings_io_zones: true;
+    callback reboot_psoc();
+    callback discard_draft();
+    callback auto_tune();                 // 频率自适应下探(透传给 GlobalTunePage → AppWindow)
+    callback global_calibrate();          // 全通道校准(透传给 GlobalTunePage → AppWindow)
+    callback global_baseline_reset();     // 全通道基线复位(透传)
+    callback calib_pref_set(int);         // 校准频率偏好档位(透传)
+    in property <int> calib_pref: 4;
+    // 阻塞类操作状态(透传): 供各页锁定按钮/显示运行标识。
+    in property <bool> op_busy: false;
+    in property <string> op_label: "";
+    in property <string> auto_tune_status: "";
+
+    in property <[ZoneCell]> zones: [];
+    in property <string> bind_status: "";
+    in-out property <int> selected_zone: -1;
+    in property <string> selected_zone_label: "";
+    in property <int> selected_channel: -1;
+    in property <float> zone_view_x: 0;
+    in property <float> zone_view_y: 0;
+    in property <float> zone_view_w: 1000;
+    in property <float> zone_view_h: 562.5;
+    callback bind_load();
+    callback zone_selected(int);
+    callback zone_activated(int);
+    callback zone_channel_set(int, int);
+    callback bind_touch_start(int);
+    callback bind_listen_cancel();
+    callback zone_unbind(int);
+    pure callback zone_hit_test(float, float) -> int;
+    callback interactive_bind();
+    callback interactive_bind_cancel();
+    in property <bool> interactive_active: false;
+    in property <bool> mai2_send_en_known: false;
+    in property <bool> mai2_send_en: false;
+    in property <string> mai2_status: "未知";
+    in property <string> mai2_baud: "未知";
+    // mai2serial 区块折叠态: 透传到 ProtocolPage, 真相源在 AppWindow。
+    in-out property <bool> mai2_panel_expanded: false;
+    callback mai2_set_send_en(bool);
+    callback mai2_refresh();
+
+    // mai2light 灯板协议(协议页, 透传给 ProtocolPage)。
+    in property <bool> light_known: false;
+    in property <bool> light_chain0_ready: false;
+    in property <bool> light_chain1_ready: false;
+    in property <string> light_init_fault: "";
+    in property <string> light_status: "未知";
+    in property <string> light_resp_en: "未知";
+    in property <string> light_baud: "未知";
+    in property <string> light_rx_frames: "未知";
+    in property <string> light_sum_errors: "未知";
+    in property <[LedUnitRow]> light_units: [];
+    in property <string> light_conflict: "";
+    in property <string> light_apply_status: "";
+    in property <int> light_ws_count0: 0;
+    in property <int> light_ws_count1: 0;
+    in property <int> light_brightness: 0;
+    in-out property <bool> light_panel_expanded: false;
+    callback light_refresh();
+    callback light_map_set(int, int, int, int);
+    callback light_map_apply();
+    callback light_preview(int, int, int, int);
+    callback light_ws_count_set(int, int);
+    callback light_brightness_set(int);
+
+    in-out property <int> sel_channel: 0;
+    in-out property <bool> show_raw: false;
+    in-out property <bool> show_bsln: false;
+    in-out property <bool> show_diff: true;
+    in-out property <int> scan_mode: 0;
+    in property <bool> mode_known: false;
+    in property <string> diff_path: "";
+    in property <string> raw_path: "";
+    in property <string> bsln_path: "";
+    in property <float> curve_y_min: 0;
+    in property <float> curve_y_mid: 0;
+    in property <float> curve_y_max: 0;
+    in property <int> curve_point_count: 0;
+    in property <float> finger_th_y: 500;
+    in property <float> noise_th_y: 500;
+    in property <int> finger_th_val: 0;
+    in property <int> noise_th_val: 0;
+    in property <[ParamRow]> curve_params: [];
+    in property <string> cp_text: "未测量";
+    in property <string> curve_readout: "";
+    in property <string> active_path: "";
+    in property <int> active_point_count: 0;
+    in-out property <bool> show_active: true;
+    // 算法上报叠加总开关: main.rs 每 tick 读它决定右轴量程是否计入算法线。
+    in-out property <bool> show_algo_overlay: false;
+    in property <float> active_norm_amp: 1;
+    // 主图时间轴(真实设备时间)与右侧算法量纲纵轴。
+    in property <float> curve_t_span_ms: 0;
+    in property <string> curve_t_end_text: "";
+    in property <float> curve_r_min: 0;
+    in property <float> curve_r_max: 1;
+    // 右列两个折叠区块的展开态(存在 AppWindow, 切页不丢)。
+    in-out property <bool> curve_params_expanded: true;
+    in-out property <bool> curve_algo_cfg_expanded: false;
+    in-out property <bool> curve_series_expanded: true;
+    callback telem_start();
+    callback telem_stop();
+    callback curve_calibrate();
+    callback curve_baseline_reset();
+    callback curve_measure_cp();
+    callback report_norm_set(int, float);
+    callback threshold_set(int, int);
+    callback curve_param_edited(int, int);
+    callback curve_mode_changed(int);
+    callback curve_capture_params();
+    callback curve_auto_tune();                    // 本通道频率自适应(透传给 CurvesPage → AppWindow)
+    in property <string> curve_auto_tune_status: "";
+
+    in property <[ChannelStatus]> all_channels: [];
+    in property <int> sample_rate_hz: 0;
+    in property <string> curve_threshold_warning: "";
+    // 全通道页"批量应用"抽屉: 勾选状态与参数名/源值由 main.rs 回填, 真相源在 AppController。
+    in property <[bool]> batch_ch_selected: [];
+    in property <[bool]> batch_param_selected: [];
+    in property <[string]> batch_param_names: [];
+    in property <[string]> batch_param_values: [];
+    callback batch_toggle_channel(int);
+    callback batch_toggle_param(int);
+    callback batch_channels_all();
+    callback batch_channels_invert();
+    callback batch_params_all();
+    callback batch_params_invert();
+    callback batch_clear();
+    callback batch_apply(int);
+    in property <float> scan_period_ms: 0;
+    in property <int> scan_period_us: 0;
+    in property <int> scan_period_expected_us: 0;
+
+    in property <bool> keyboard_map_en: false;
+    callback set_keyboard_map_en(bool);
+    callback channel_selected(int);
+
+    // 键盘页(物理键盘 + 触控键盘映射)
+    in property <[bool]> kbd_phys_pressed: [];
+    in property <[int]> kbd_phys_choice: [];
+    in property <[int]> kbd_phys_mod: [];
+    in property <[int]> kbd_zone_choice: [];
+    in property <[int]> kbd_zone_mod: [];
+    in property <[string]> kbd_zone_names: [];
+    in property <[string]> kbd_key_choices: [];
+    in property <[string]> kbd_phys_display: [];
+    in property <[string]> kbd_zone_display: [];
+    in property <[int]> kbd_phys_hold_delay: [];
+    in property <[int]> kbd_phys_hold_max: [];
+    in property <[int]> kbd_zone_hold_delay: [];
+    in property <[int]> kbd_zone_hold_max: [];
+    callback kbd_set_phys(int, int, int);
+    callback kbd_set_zone(int, int, int);
+    callback kbd_set_hold_phys(int, int, int);
+    callback kbd_set_hold_zone(int, int, int);
+    callback kbd_capture_phys(int, string, bool, bool, bool, bool);
+    callback kbd_capture_zone(int, string, bool, bool, bool, bool);
+    callback kbd_clear_phys(int);
+    callback kbd_clear_zone(int);
+    callback kbd_refresh();
+
+    // 算法页
+    in property <string> algo_info_text: "算法信息未读取";
+    in-out property <string> algo_c_source;
+    in property <string> algo_line_numbers: "1";
+    in property <string> algo_status: "";
+    // 编译/上传同步执行时的阶段反馈；忙碌期间锁定一键操作以避免重入。
+    in property <bool> algo_busy: false;
+    in property <string> algo_phase: "";
+    in property <string> algo_asm: "";
+    in property <int> algo_asm_bytes: 0;
+    in property <int> algo_asm_capacity: 1024;
+    // 算法上报(report[]折线+触发判定追踪) + 可调变量(cfg[8])
+    in property <int> algo_sel_channel: 0;
+    in property <[AlgoReportLine]> algo_report_lines: [];
+    in property <string> algo_active_path: "";
+    in property <int> algo_trace_point_count: 0;
+    in property <[AlgoSettingRow]> algo_setting_rows: [];
+    callback algo_setting_edited(int, int);
+    callback report_toggle(int, bool);
+    // 全局 CSD(现由"触控全局调整"页使用)
+    in property <int> g_inactive_sns: 1;
+    in property <int> g_idac_gain: 4;
+    in property <int> g_idac_sense_config: 0;   // 0=IDAC sourcing, 1=IDAC sinking
+    in property <int> g_auto_calibrate: 1;      // 1=自动校准, 0=固定IDAC(不自动校准)
+    in property <int> g_idac_min: 20;
+    in property <int> g_raw_target: 85;
+    in property <int> g_mfs_div_f1: 1;
+    in property <int> g_mfs_div_f2: 2;
+    in property <int> csd_sns_clk_div: 0;
+    // 全 36 通道 snsClk 分频范围(透传给 GlobalTunePage 的时钟树; 0=未知)。
+    in property <int> csd_sns_clk_div_min: 0;
+    in property <int> csd_sns_clk_div_max: 0;
+    in property <int> csd_resolution: 0;
+    in property <int> csd_sns_clk_source: 0;
+    // 异常采样标识(透传): 文案 + 等级(0 正常 / 1 警告 / 2 异常)。
+    in property <string> sampling_advice: "";
+    in property <int> sampling_advice_level: 0;
+    callback psoc_rescue();               // PSoC 救砖(透传给 GlobalTunePage → AppWindow)
+    callback algo_refresh();
+    callback algo_reset_default();
+    callback algo_compile(string);
+    callback algo_upload();
+    callback algo_build_upload(string);
+    callback algo_load_template(int);
+    callback algo_source_edited(string);
+    callback algo_global_set(int, int);
+    callback csd_param_set(int, int);
+    callback csd_refresh();
+
+    VerticalBox {
+        padding: 0px;
+        spacing: 0px;
+
+        TabWidget {
+            vertical-stretch: 1;
+            // ★保存栏永不丢失的根因修法★ TabWidgetImpl 默认 min-height = 各子页 min-height 最大值
+            // + 标签栏高, min-width = max(子页 min-width, 标签栏首选宽 ≈760px)。而 Slint 的盒布局在
+            // "min 之和 > 可用尺寸"时不会压过 min, 直接溢出并把最后一个子元素(=下面的保存栏)推出视口。
+            // 这里显式覆盖 min-width/min-height, 把"够不够放得下"的决定权交还给各子页自身的滚动:
+            // 子页内容都已放进 ScrollView(其 min 恒 50px), 窄窗口时页内滚动而非撑破容器;
+            // 标签栏本身内置 Flickable, 变窄后可横向拖动, 不会有标签变得不可达。
+            // ★不要在 TabWidget 上覆盖 min-width/min-height★: 它是内建组件, lower_tabwidget
+            // 会把它降级成 TabWidgetImpl, 后者的 min-* 由 content-min-* 反推; 外部再覆盖 min-*
+            // 就与内部计算互相引用 → 布局求值无限递归 → 进设置页直接栈溢出崩溃(实测 9 个 Tab 全崩)。
+            // 保存栏永不丢失改由 SettingsPage 根层的绝对定位保证(见下), 不靠约束 TabWidget。
+            clip: true;
+            current-index <=> root.settings_tab;
+        Tab {
+            title: "分区绑定";
+
+            BindingPage {
+                zones: root.zones;
+                bind_status: root.bind_status;
+                selected_zone: root.selected_zone;
+                selected_zone_label: root.selected_zone_label;
+                selected_channel: root.selected_channel;
+                view_x: root.zone_view_x;
+                view_y: root.zone_view_y;
+                view_w: root.zone_view_w;
+                view_h: root.zone_view_h;
+                bind_load() => { root.bind_load(); }
+                interactive_bind() => { root.interactive_bind(); }
+                interactive_bind_cancel() => { root.interactive_bind_cancel(); }
+                interactive_active: root.interactive_active;
+                zone_selected(i) => { root.selected_zone = i; root.zone_selected(i); }
+                zone_activated(i) => { root.selected_zone = i; root.zone_activated(i); }
+                zone_channel_set(z, v) => { root.zone_channel_set(z, v); }
+                bind_touch_start(z) => { root.bind_touch_start(z); }
+                bind_listen_cancel() => { root.bind_listen_cancel(); }
+                zone_unbind(z) => { root.zone_unbind(z); }
+                zone_hit_test(x, y) => { return root.zone_hit_test(x, y); }
+            }
+        }
+
+        // ★Tab 顺序 = 隐含契约★  settings_tab 的索引判断散在 app.slint 与 main.rs 两侧
+        // (跳转到精调=4 / 全局调整=3 / 算法追踪轮询=4 / 协议页驻留轮询=1), 调整顺序必须同步全部索引。
+        // 现顺序: 0分区绑定 1协议 2触控通道调整 3触控全局调整 4单通道精调 5触控键盘映射 6物理键盘 7通信系统 8算法。
+        Tab {
+            title: "协议";
+
+            ProtocolPage {
+                // 协议能力参数与通信系统 Tab 共用同一份 config_rows 与草稿写入回调。
+                config_rows: root.config_rows;
+                cfg_set_bool(k, v) => { root.cfg_set_bool(k, v); }
+                cfg_set_number(k, v) => { root.cfg_set_number(k, v); }
+                cfg_set_number_hex(k, v) => { root.cfg_set_number_hex(k, v); }
+                cfg_set_enum(k, v) => { root.cfg_set_enum(k, v); }
+                cfg_set_string(k, v) => { root.cfg_set_string(k, v); }
+                mai2_send_en_known: root.mai2_send_en_known;
+                mai2_send_en: root.mai2_send_en;
+                mai2_status: root.mai2_status;
+                mai2_baud: root.mai2_baud;
+                mai2_panel_expanded <=> root.mai2_panel_expanded;
+                mai2_set_send_en(enabled) => { root.mai2_set_send_en(enabled); }
+                mai2_refresh() => { root.mai2_refresh(); }
+                light_known: root.light_known;
+                light_chain0_ready: root.light_chain0_ready;
+                light_chain1_ready: root.light_chain1_ready;
+                light_init_fault: root.light_init_fault;
+                light_status: root.light_status;
+                light_resp_en: root.light_resp_en;
+                light_baud: root.light_baud;
+                light_rx_frames: root.light_rx_frames;
+                light_sum_errors: root.light_sum_errors;
+                light_units: root.light_units;
+                light_conflict: root.light_conflict;
+                light_apply_status: root.light_apply_status;
+                light_ws_count0: root.light_ws_count0;
+                light_ws_count1: root.light_ws_count1;
+                light_brightness: root.light_brightness;
+                light_panel_expanded <=> root.light_panel_expanded;
+                light_refresh() => { root.light_refresh(); }
+                light_map_set(u, c, s, n) => { root.light_map_set(u, c, s, n); }
+                light_map_apply() => { root.light_map_apply(); }
+                light_preview(u, r, g, b) => { root.light_preview(u, r, g, b); }
+                light_ws_count_set(chain, v) => { root.light_ws_count_set(chain, v); }
+                light_brightness_set(v) => { root.light_brightness_set(v); }
+            }
+        }
+
+        Tab {
+            title: "触控通道调整";
+
+            AllChannelsPage {
+                channels: root.all_channels;
+                selected_channel: root.sel_channel;
+                sample_rate_hz: root.sample_rate_hz;
+                scan_period_ms: root.scan_period_ms;
+                batch_ch_selected: root.batch_ch_selected;
+                batch_param_selected: root.batch_param_selected;
+                batch_param_names: root.batch_param_names;
+                batch_param_values: root.batch_param_values;
+                batch_toggle_channel(ch) => { root.batch_toggle_channel(ch); }
+                batch_toggle_param(id) => { root.batch_toggle_param(id); }
+                batch_channels_all() => { root.batch_channels_all(); }
+                batch_channels_invert() => { root.batch_channels_invert(); }
+                batch_params_all() => { root.batch_params_all(); }
+                batch_params_invert() => { root.batch_params_invert(); }
+                batch_clear() => { root.batch_clear(); }
+                batch_apply(src) => { root.batch_apply(src); }
+                telem_start() => { root.telem_start(); }
+                telem_stop() => { root.telem_stop(); }
+                channel_selected(ch) => {
+                    root.sel_channel = ch;
+                    // Tab 顺序: 0绑区 1协议 2触控通道调整 3触控全局调整 4单通道精调 → 双击跳 4。
+                    root.settings_tab = 4;
+                    root.channel_selected(ch);
+                }
+            }
+        }
+
+        Tab {
+            title: "触控全局调整";
+
+            global_tune := GlobalTunePage {
+                // 触控全局调整 = 索引 3(协议页插入到索引 1 后整体后移一位)。
+                page_active: root.settings_tab == 3;
+                scan_mode <=> root.scan_mode;
+                mode_known: root.mode_known;
+                g_inactive_sns: root.g_inactive_sns;
+                g_idac_gain: root.g_idac_gain;
+                g_idac_sense_config: root.g_idac_sense_config;
+                g_auto_calibrate: root.g_auto_calibrate;
+                g_idac_min: root.g_idac_min;
+                g_raw_target: root.g_raw_target;
+                g_mfs_div_f1: root.g_mfs_div_f1;
+                g_mfs_div_f2: root.g_mfs_div_f2;
+                csd_sns_clk_div: root.csd_sns_clk_div;
+                csd_sns_clk_div_min: root.csd_sns_clk_div_min;
+                csd_sns_clk_div_max: root.csd_sns_clk_div_max;
+                csd_resolution: root.csd_resolution;
+                csd_sns_clk_source: root.csd_sns_clk_source;
+                sampling_advice: root.sampling_advice;
+                sampling_advice_level: root.sampling_advice_level;
+                psoc_rescue() => { root.psoc_rescue(); }
+                scan_period_ms: root.scan_period_ms;
+                scan_period_us: root.scan_period_us;
+                expected_period_us: root.scan_period_expected_us;
+                config_dirty: root.config_dirty;
+                mode_changed(m) => { root.curve_mode_changed(m); }
+                capture_params() => { root.curve_capture_params(); }
+                algo_global_set(id, v) => { root.algo_global_set(id, v); }
+                csd_param_set(id, v) => { root.csd_param_set(id, v); }
+                csd_refresh() => { root.csd_refresh(); }
+                reboot_psoc() => { root.reboot_psoc(); }
+                reset_defaults() => { root.cfg_reset(); }
+                discard_draft() => { root.discard_draft(); }
+                op_busy: root.op_busy;
+                op_label: root.op_label;
+                auto_tune_status: root.auto_tune_status;
+                auto_tune() => { root.auto_tune(); }
+                global_calibrate() => { root.global_calibrate(); }
+                global_baseline_reset() => { root.global_baseline_reset(); }
+                calib_pref: root.calib_pref;
+                calib_pref_set(v) => { root.calib_pref_set(v); }
+            }
+        }
+
+        Tab {
+            title: "单通道精调";
+
+            CurvesPage {
+                sel_channel <=> root.sel_channel;
+                show_raw <=> root.show_raw;
+                show_bsln <=> root.show_bsln;
+                show_diff <=> root.show_diff;
+                scan_mode <=> root.scan_mode;
+                mode_known: root.mode_known;
+                diff_path: root.diff_path;
+                raw_path: root.raw_path;
+                bsln_path: root.bsln_path;
+                curve_y_min: root.curve_y_min;
+                curve_y_mid: root.curve_y_mid;
+                curve_y_max: root.curve_y_max;
+                curve_point_count: root.curve_point_count;
+                finger_th_y: root.finger_th_y;
+                noise_th_y: root.noise_th_y;
+                finger_th_val: root.finger_th_val;
+                noise_th_val: root.noise_th_val;
+                params: root.curve_params;
+                cp_text: root.cp_text;
+                curve_readout: root.curve_readout;
+                active_path: root.active_path;
+                active_point_count: root.active_point_count;
+                show_active <=> root.show_active;
+                show_algo_overlay <=> root.show_algo_overlay;
+                active_norm_amp: root.active_norm_amp;
+                curve_t_span_ms: root.curve_t_span_ms;
+                curve_t_end_text: root.curve_t_end_text;
+                curve_r_min: root.curve_r_min;
+                curve_r_max: root.curve_r_max;
+                params_expanded <=> root.curve_params_expanded;
+                algo_cfg_expanded <=> root.curve_algo_cfg_expanded;
+                series_expanded <=> root.curve_series_expanded;
+                sample_rate_hz: root.sample_rate_hz;
+                threshold_warning: root.curve_threshold_warning;
+                telem_start() => { root.telem_start(); }
+                telem_stop() => { root.telem_stop(); }
+                calibrate() => { root.curve_calibrate(); }
+                baseline_reset() => { root.curve_baseline_reset(); }
+                measure_cp() => { root.curve_measure_cp(); }
+                auto_tune_channel() => { root.curve_auto_tune(); }
+                auto_tune_status: root.curve_auto_tune_status;
+                threshold_set(pid, v) => { root.threshold_set(pid, v); }
+                param_edited(pid, v) => { root.curve_param_edited(pid, v); }
+                mode_changed(m) => { root.curve_mode_changed(m); }
+                capture_params() => { root.curve_capture_params(); }
+                report_norm_set(idx, v) => { root.report_norm_set(idx, v); }
+                op_busy: root.op_busy;
+                op_label: root.op_label;
+                algo_report_lines: root.algo_report_lines;
+                algo_trace_point_count: root.algo_trace_point_count;
+                algo_setting_rows: root.algo_setting_rows;
+                algo_setting_edited(idx, v) => { root.algo_setting_edited(idx, v); }
+                report_toggle(idx, on) => { root.report_toggle(idx, on); }
+            }
+        }
+
+        Tab {
+            title: "触控键盘映射";
+
+            KeyMapPage {
+                keyboard_map_en: root.keyboard_map_en;
+                zone_display: root.kbd_zone_display;
+                zone_names: root.kbd_zone_names;
+                zone_hold_delay: root.kbd_zone_hold_delay;
+                zone_hold_max: root.kbd_zone_hold_max;
+                set_keyboard_map_en(v) => { root.set_keyboard_map_en(v); }
+                zone_captured(z, t, c, s, a, g) => { root.kbd_capture_zone(z, t, c, s, a, g); }
+                zone_cleared(z) => { root.kbd_clear_zone(z); }
+                zone_hold_set(z, delay, max_hold) => { root.kbd_set_hold_zone(z, delay, max_hold); }
+                refresh_kbd() => { root.kbd_refresh(); }
+            }
+        }
+
+        Tab {
+            title: "物理键盘";
+
+            PhysKbdPage {
+                phys_pressed: root.kbd_phys_pressed;
+                phys_display: root.kbd_phys_display;
+                phys_hold_delay: root.kbd_phys_hold_delay;
+                phys_hold_max: root.kbd_phys_hold_max;
+                phys_captured(i, t, c, s, a, g) => { root.kbd_capture_phys(i, t, c, s, a, g); }
+                phys_cleared(i) => { root.kbd_clear_phys(i); }
+                phys_hold_set(i, delay, max_hold) => { root.kbd_set_hold_phys(i, delay, max_hold); }
+                refresh_kbd() => { root.kbd_refresh(); }
+            }
+        }
+
+        Tab {
+            title: "通信系统";
+
+            ConfigPage {
+                rows: root.config_rows;
+                other_count: root.config_other_count;
+                config_dirty: root.config_dirty;
+                cfg_set_bool(k, v) => { root.cfg_set_bool(k, v); }
+                cfg_set_number(k, v) => { root.cfg_set_number(k, v); }
+                cfg_set_number_hex(k, v) => { root.cfg_set_number_hex(k, v); }
+                cfg_set_enum(k, v) => { root.cfg_set_enum(k, v); }
+                cfg_set_string(k, v) => { root.cfg_set_string(k, v); }
+                cfg_load() => { root.cfg_load(); }
+                cfg_save() => { root.cfg_save(); }
+                cfg_reset() => { root.cfg_reset(); }
+            }
+        }
+
+        Tab {
+            title: "算法";
+
+            AlgoPage {
+                algo_info_text: root.algo_info_text;
+                algo_c_source <=> root.algo_c_source;
+                algo_line_numbers: root.algo_line_numbers;
+                algo_status: root.algo_status;
+                algo_busy: root.algo_busy;
+                algo_phase: root.algo_phase;
+                algo_asm: root.algo_asm;
+                algo_asm_bytes: root.algo_asm_bytes;
+                algo_asm_capacity: root.algo_asm_capacity;
+                algo_sel_channel: root.algo_sel_channel;
+                algo_report_lines: root.algo_report_lines;
+                algo_active_path: root.algo_active_path;
+                algo_trace_point_count: root.algo_trace_point_count;
+                algo_setting_rows: root.algo_setting_rows;
+                algo_refresh() => { root.algo_refresh(); }
+                algo_reset_default() => { root.algo_reset_default(); }
+                algo_compile(s) => { root.algo_compile(s); }
+                algo_upload() => { root.algo_upload(); }
+                algo_build_upload(s) => { root.algo_build_upload(s); }
+                algo_load_template(i) => { root.algo_load_template(i); }
+                algo_source_edited(s) => { root.algo_source_edited(s); }
+                algo_setting_edited(idx, v) => { root.algo_setting_edited(idx, v); }
+            }
+        }
+
+        }
+
+        // 全局保存栏(设置页左下角常驻): 无改动锁定并提示, 有改动提示项数, 保存后即时反馈。
+        // ★固定 46px 是刻意的★: min==max 的项在盒布局里既不被拉伸也不被压缩, 配合上面 TabWidget
+        // 的 min 覆盖, 任何窗口尺寸下这一栏都保有完整 46px 且位于可视区内(严禁再套 ScrollView)。
+        HorizontalBox {
+            height: 46px;
+            padding-left: 12px;
+            padding-right: 12px;
+            spacing: 10px;
+            Button {
+                text: "保存到设备";
+                enabled: root.config_dirty;
+                clicked => { root.cfg_save(); }
+            }
+            // 设置文件始终可操作：导出可离线保存当前缓存，导入的连接校验由 Rust 给出明确原因。
+            Button {
+                text: "导出 JSON";
+                clicked => {
+                    root.settings_io_action = 1;
+                    root.settings_io_config = true; root.settings_io_channel_params = true;
+                    root.settings_io_globals = true; root.settings_io_algo = true;
+                    root.settings_io_keyboard = true; root.settings_io_zones = true;
+                    root.settings_io_dialog = true;
+                }
+            }
+            Button {
+                text: "导入 JSON";
+                clicked => {
+                    root.settings_io_action = 2;
+                    root.settings_io_config = true; root.settings_io_channel_params = true;
+                    root.settings_io_globals = true; root.settings_io_algo = true;
+                    root.settings_io_keyboard = true; root.settings_io_zones = true;
+                    root.settings_io_dialog = true;
+                }
+            }
+            Text {
+                text: root.mode_change_needs_reboot
+                    ? (root.config_dirty_count + " 项未保存 — 含 Serial/HID 模式切换, 保存后将自动重启设备生效")
+                    : (root.config_dirty
+                        ? (root.config_dirty_count + " 项改动未保存 — 点击保存写入设备 flash")
+                        : "无改动 (已与设备 flash 同步)");
+                color: root.mode_change_needs_reboot ? #f5a623
+                    : (root.config_dirty ? #f5a623 : #2b8a3e);
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+                // 无 elide 的单行 Text 会把整句话的宽度当作 min-width(见 Slint text_layout_info),
+                // 那会让本栏 min-width 涨到 800px 以上, 反过来把三个按钮挤出窄窗口。让文字先让位。
+                wrap: no-wrap;
+                overflow: elide;
+            }
+        }
+    }
+
+    // 覆盖范围弹窗放在 SettingsPage 根层，避免 TabWidget/滚动容器裁剪，且与当前深色主题一致。
+    Rectangle {
+        visible: root.settings_io_dialog;
+        x: 0; y: 0;
+        width: root.width; height: root.height;
+        // 弹窗子项的最小尺寸会回推 SettingsPage，弹窗尺寸不能依赖父尺寸以免形成布局环。
+        clip: true;
+        background: #000000a8;
+        Rectangle {
+            width: 560px;
+            height: 418px;
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            background: #1a1e23;
+            border-color: #2b3238;
+            border-width: 1px;
+            border-radius: 7px;
+            VerticalBox {
+                padding: 16px;
+                spacing: 10px;
+                Text {
+                    text: root.settings_io_action == 1 ? "导出设备设置 JSON" : "导入设备设置 JSON";
+                    color: #e0e6ec;
+                    font-size: 16px;
+                    font-weight: 700;
+                }
+                Text {
+                    text: "导入只写界面草稿，不会向设备发送任何命令；确认无误后点“保存到设备”才生效，点“撤销未保存改动”可回到导入前的设备值。覆盖与跳过明细见日志页。";
+                    color: #9aa6b2;
+                    font-size: 11px;
+                    wrap: word-wrap;
+                }
+                CheckBox {
+                    text: "配置缓存（" + root.settings_io_config_count + " 项）：通信、模式、灯效等全部键值";
+                    checked: root.settings_io_config;
+                    toggled => { root.settings_io_config = self.checked; }
+                }
+                CheckBox {
+                    text: "通道参数（" + root.settings_io_channel_params_count + " 项）：36 通道 × 全部已知 CapSense 参数";
+                    checked: root.settings_io_channel_params;
+                    toggled => { root.settings_io_channel_params = self.checked; }
+                }
+                CheckBox {
+                    text: "全局 CSD（" + root.settings_io_globals_count + " 项）：gparam 1–8 与 CSD 处理模式";
+                    checked: root.settings_io_globals;
+                    toggled => { root.settings_io_globals = self.checked; }
+                }
+                CheckBox {
+                    text: "算法（" + root.settings_io_algo_count + " 项）：设备 C 源、机器码与 cfg[0..7]";
+                    checked: root.settings_io_algo;
+                    toggled => { root.settings_io_algo = self.checked; }
+                }
+                CheckBox {
+                    text: "键盘映射（" + root.settings_io_keyboard_count + " 项）：12 物理键与 34 触控分区";
+                    checked: root.settings_io_keyboard;
+                    toggled => { root.settings_io_keyboard = self.checked; }
+                }
+                CheckBox {
+                    text: "分区绑定（" + root.settings_io_zones_count + " 项）：34 个逻辑区到物理通道的绑定";
+                    checked: root.settings_io_zones;
+                    toggled => { root.settings_io_zones = self.checked; }
+                }
+                Rectangle { vertical-stretch: 1; }
+                HorizontalBox {
+                    spacing: 8px;
+                    Rectangle { horizontal-stretch: 1; }
+                    Button {
+                        text: "取消";
+                        clicked => { root.settings_io_dialog = false; }
+                    }
+                    Button {
+                        text: "确定";
+                        clicked => {
+                            root.settings_io_dialog = false;
+                            if (root.settings_io_action == 1) {
+                                root.settings_export(root.settings_io_config, root.settings_io_channel_params,
+                                    root.settings_io_globals, root.settings_io_algo, root.settings_io_keyboard, root.settings_io_zones);
+                            } else {
+                                root.settings_import(root.settings_io_config, root.settings_io_channel_params,
+                                    root.settings_io_globals, root.settings_io_algo, root.settings_io_keyboard, root.settings_io_zones);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

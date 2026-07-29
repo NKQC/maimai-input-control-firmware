@@ -1,0 +1,243 @@
+// ============================================================================
+// 配置页 (#6e-2)
+// ============================================================================
+
+import { GroupBox, VerticalBox, HorizontalBox, CheckBox, SpinBox, ComboBox, LineEdit, ScrollView, Button } from "std-widgets.slint";
+import { ConfigRow } from "../common/types.slint";
+import { Theme } from "../common/theme.slint";
+
+// 注:属性名不能叫 `row`,该名字与 GridLayout 子元素自动注入的 row/col
+// 附加属性冲突(编译报 "Cannot override property 'row'")。用 `entry` 代替。
+component ConfigRowItem inherits Rectangle {
+    in property <ConfigRow> entry;
+
+    callback set_bool(string, bool);
+    callback set_number(string, float);
+    callback set_number_hex(string, string);   // 数字配置以十六进制串下发, 由 Rust 侧解析+夹取范围
+    callback set_enum(string, int);
+    callback set_string(string, string);
+
+    vertical-stretch: 0;
+    clip: true;
+
+    HorizontalBox {
+        padding-left: 2px;
+        padding-right: 2px;
+        padding-top: 3px;
+        padding-bottom: 3px;
+        spacing: 10px;
+
+        // 左侧: 中文名 + 小字说明(控制内容) + 取值范围(hex 口径)。
+        VerticalLayout {
+            min-width: 210px;
+            horizontal-stretch: 0;
+            spacing: 1px;
+            Text {
+                text: root.entry.label;
+                vertical-alignment: center;
+                color: Theme.text;
+            }
+            Text {
+                text: root.entry.desc;
+                font-size: Theme.fs-small;
+                color: Theme.text-dim;
+                visible: root.entry.desc != "";
+                overflow: elide;
+            }
+            // 取值范围(十六进制, 附十进制)。仅数字整数型有 range_hex。
+            Text {
+                text: root.entry.range_hex;
+                font-size: Theme.fs-small;
+                color: #6f7a84;
+                visible: root.entry.range_hex != "";
+                overflow: elide;
+            }
+        }
+
+        if root.entry.kind == 0: CheckBox {
+            checked: root.entry.bool_val;
+            toggled => {
+                root.set_bool(root.entry.key, self.checked);
+            }
+        }
+
+        // 通信系统配置一律十进制 SpinBox(hex 口径仅用于需寄存器处理的 CSD 内容, 见触控全局调整页)。
+        if root.entry.kind == 1: SpinBox {
+            horizontal-stretch: 1;
+            minimum: Math.round(root.entry.min_val);
+            maximum: Math.round(root.entry.max_val);
+            value: Math.round(root.entry.num_val);
+            edited(v) => {
+                root.set_number(root.entry.key, v);
+            }
+        }
+
+        if root.entry.kind == 2: ComboBox {
+            horizontal-stretch: 1;
+            model: [@tr("Serial(游戏串口)"), @tr("HID(触摸屏+键盘)")];
+            current-index: root.entry.enum_index;
+            selected(_) => {
+                root.set_enum(root.entry.key, self.current-index);
+            }
+        }
+
+        // 固件 schema 以 U8 提供 LED 颜色，未携带 enum options；仅这四个
+        // led.color_* 键使用专用 kind=4，仍经 set_number 保持原有 U8 写入路径。
+        if root.entry.kind == 4: ComboBox {
+            horizontal-stretch: 1;
+            model: [@tr("熄灭"), @tr("红"), @tr("绿"), @tr("黄"), @tr("蓝"), @tr("紫"), @tr("青"), @tr("白")];
+            current-index: root.entry.enum_index;
+            selected(_) => {
+                root.set_number(root.entry.key, self.current-index);
+            }
+        }
+
+        if root.entry.kind == 3: LineEdit {
+            horizontal-stretch: 1;
+            text: root.entry.str_val;
+            edited(v) => {
+                root.set_string(root.entry.key, v);
+            }
+        }
+    }
+}
+
+// 展示 `rows` 中 group == group_title 的条目。过滤在 for 循环体内按条件
+// 渲染(Slint 不支持数组推导式 filter 语法),故传入完整 rows,由每个
+// section 各自筛选自己关心的组。
+// 导出给协议页复用: 搬过去的协议参数用同一套 ConfigRow → 控件映射与同一套 cfg_set_* 草稿写入,
+// 不在协议页重造一遍 SpinBox/CheckBox 与专用属性。
+export component ConfigGroupSection inherits GroupBox {
+    in property <string> group_title;
+    in property <[ConfigRow]> rows;
+
+    callback set_bool(string, bool);
+    callback set_number(string, float);
+    callback set_number_hex(string, string);
+    callback set_enum(string, int);
+    callback set_string(string, string);
+
+    title: root.group_title;
+
+    VerticalBox {
+        padding: 0px;
+        // spacing 设 0: 不属于本组的行 height=0, 若有 spacing 会累积成大段空白(旧 bug 根因)。
+        // 行间距改由 ConfigRowItem 自身上下 padding + 分隔线提供。
+        spacing: 0px;
+
+        for row in root.rows: ConfigRowItem {
+            entry: row;
+            // Slint 的 `for` 不支持直接接 `if` 元素, 故按行是否属于当前组控制显隐与占位高度。
+            visible: row.group == root.group_title;
+            // 数字整数行多一行 hex 取值范围, 高度略增避免范围文字被裁。
+            height: row.group == root.group_title ? (row.range_hex != "" ? 60px : 48px) : 0px;
+            set_bool(key, v) => { root.set_bool(key, v); }
+            set_number(key, v) => { root.set_number(key, v); }
+            set_number_hex(key, v) => { root.set_number_hex(key, v); }
+            set_enum(key, v) => { root.set_enum(key, v); }
+            set_string(key, v) => { root.set_string(key, v); }
+        }
+    }
+}
+
+export component ConfigPage inherits Rectangle {
+    in property <[ConfigRow]> rows;
+    in property <bool> config_dirty: false;
+    // group == "其他" 的行数(未收录 key 的兜底组), 由 main.rs 与 rows 同步回填。
+    in property <int> other_count: 0;
+
+    callback cfg_set_bool(string, bool);
+    callback cfg_set_number(string, float);
+    callback cfg_set_number_hex(string, string);
+    callback cfg_set_enum(string, int);
+    callback cfg_set_string(string, string);
+    callback cfg_load();
+    callback cfg_save();
+    callback cfg_reset();
+
+    VerticalBox {
+        padding: 8px;
+        spacing: 8px;
+
+        HorizontalBox {
+            padding: 0px;
+            spacing: 8px;
+
+            Button {
+                text: @tr("加载");
+                clicked => { root.cfg_load(); }
+            }
+            Button {
+                text: @tr("保存到设备");
+                clicked => { root.cfg_save(); }
+            }
+            Button {
+                text: @tr("恢复默认");
+                clicked => { root.cfg_reset(); }
+            }
+            Text {
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+                wrap: no-wrap;
+                overflow: elide;
+                text: root.config_dirty
+                    ? @tr("● 有草稿未保存(编辑仅暂存, 点击“保存到设备”后才下发并生效)")
+                    : @tr("✓ 已与设备同步");
+                color: root.config_dirty ? Theme.warn : Theme.ok;
+                font-size: Theme.fs-title;
+            }
+        }
+
+        ScrollView {
+            VerticalBox {
+                padding: 0px;
+                spacing: 8px;
+
+                // ★组标题 = 渲染归属★ mai2serial/mai2light 的协议参数已归到"协议"页的同名组,
+                // 本页只挂剩下的四组, 标题与内容一一对应(不再有名为"通信"却空着的组)。
+                ConfigGroupSection {
+                    group_title: "工作模式";
+                    rows: root.rows;
+                    set_bool(k, v) => { root.cfg_set_bool(k, v); }
+                    set_number(k, v) => { root.cfg_set_number(k, v); }
+                    set_number_hex(k, v) => { root.cfg_set_number_hex(k, v); }
+                    set_enum(k, v) => { root.cfg_set_enum(k, v); }
+                    set_string(k, v) => { root.cfg_set_string(k, v); }
+                }
+
+                ConfigGroupSection {
+                    group_title: "键盘映射";
+                    rows: root.rows;
+                    set_bool(k, v) => { root.cfg_set_bool(k, v); }
+                    set_number(k, v) => { root.cfg_set_number(k, v); }
+                    set_number_hex(k, v) => { root.cfg_set_number_hex(k, v); }
+                    set_enum(k, v) => { root.cfg_set_enum(k, v); }
+                    set_string(k, v) => { root.cfg_set_string(k, v); }
+                }
+
+                ConfigGroupSection {
+                    group_title: "状态指示灯";
+                    rows: root.rows;
+                    set_bool(k, v) => { root.cfg_set_bool(k, v); }
+                    set_number(k, v) => { root.cfg_set_number(k, v); }
+                    set_number_hex(k, v) => { root.cfg_set_number_hex(k, v); }
+                    set_enum(k, v) => { root.cfg_set_enum(k, v); }
+                    set_string(k, v) => { root.cfg_set_string(k, v); }
+                }
+
+                // 未收录 key 的兜底组: 固件新增 KV 时不会静默消失, 会出现在这里。
+                // 用 `if` 而非 visible: 组为空时整块从树上移除, 不会留下一个有标题没内容的空框
+                // (visible:false 仍占布局位)。行数由 Rust 侧统计, Slint 无数组过滤/计数能力。
+                if root.other_count > 0: ConfigGroupSection {
+                    group_title: "其他";
+                    rows: root.rows;
+                    set_bool(k, v) => { root.cfg_set_bool(k, v); }
+                    set_number(k, v) => { root.cfg_set_number(k, v); }
+                    set_number_hex(k, v) => { root.cfg_set_number_hex(k, v); }
+                    set_enum(k, v) => { root.cfg_set_enum(k, v); }
+                    set_string(k, v) => { root.cfg_set_string(k, v); }
+                }
+            }
+        }
+    }
+}

@@ -22,7 +22,7 @@
 
 #define FW_VERSION_MAJOR                 (0u)
 #define FW_VERSION_MINOR                 (4u)
-#define FW_VERSION_PATCH                 (18u)
+#define FW_VERSION_PATCH                 (26u)
 #define FW_VERSION                       (((uint32_t)FW_VERSION_MAJOR << 16u) | \
                                           ((uint32_t)FW_VERSION_MINOR << 8u) | \
                                           FW_VERSION_PATCH)
@@ -52,8 +52,22 @@
 #define SENSOR_CMD_GLOBAL_COMMIT         (0x3Au)  // 全部全局项设完后触发【一次】完整重初始化(合并,防反复重校准漂移)
 #define SENSOR_CMD_CALIBRATE             (0x3Bu)  // 真正的 IDAC 重校准(CalibrateAllWidgets)+基线复位, 主循环执行
 #define SENSOR_CMD_BASELINE_RESET        (0x3Cu)  // 仅重置全部通道基线(InitializeAllBaselines), 主循环执行
-#define SENSOR_CMD_AUTO_TUNE             (0x3Du)  // 频率自适应: 从高频起逐档升 snsClk 分频, 直到校准能压到目标%(或超上限失败), 主循环执行
-#define SENSOR_CMD_GET_AUTO_TUNE         (0x3Eu)  // 读自适应结果; 响应 [magic,GET_AUTO_TUNE,result(0进行中/1成功/2失败),0,div24]
+// 频率自适应(三步): ①粗表升分频定位首个可校准档 ②从该档 -1 起逐 1 升频重校准找"临界分频"
+// (最后一个仍能校准成功的最小分频=最高频率=最不灵敏) ③按偏好档位往低频让 2*(pref-1) 个分频落档
+// (分频越大=频率越低=充电越充分→过充产生近场探测效应→越灵敏), 失败则朝临界方向逐 1 回退。
+// 帧字节2=通道号: 0..35=仅该通道自适应(只改该 widget 的 snsClk), 0xFF=全 36 通道【逐通道各自校准】
+// (外层遍历 36 个通道, 每通道独立跑完整三步算法得到各自的分频; 面板 Cp 22~138pF 无法共用统一分频)。
+// 帧字节3=偏好档位 pref(1..7, 非法值退化为 4): 1=临界最高频(最不灵敏), 7=最低频(最灵敏)。
+#define SENSOR_CMD_AUTO_TUNE             (0x3Du)
+// 读自适应结果/进度; 响应 [magic,GET_AUTO_TUNE,result(0进行中/1成功/2失败),ch,div_lo,div_hi,progress]。
+// ★resp[6]=progress 字节(原 val24 最高字节恒 0, 现复用为阶段进度, 旧 RP2040 只读 resp[4..5] 故向后兼容)★:
+//   bit0-2 = phase: 0=空闲/已受理 1=粗定位 2=细搜临界 3=落档/回退 4=完成
+//   bit3-7 = step : 当前阶段内步序(从 1 起递增, 上限饱和 31)
+// ★resp[4..5]=div 的语义随 result 变化★:
+//   result==0(进行中) → 当前正在试探的 snsClk 分频(供上位机显示"正在试 ÷N");
+//   result!=0(已完成) → 最终写入 widgetContext 的分频(成功)或 0(失败)。
+#define SENSOR_CMD_GET_AUTO_TUNE         (0x3Eu)
+#define AUTO_TUNE_CH_ALL                 (0xFFu)  // AUTO_TUNE 通道号哨兵: 全通道
 // 全局参数 id
 #define GPARAM_INACTIVE_SNS              (0x01u)  // 未激活传感器连接: 1=GND 2=High-Z 4=Shield
 #define GPARAM_IDAC_GAIN_INIT            (0x02u)  // csdIdacGainInitIndex(IDAC 增益档索引)
@@ -63,6 +77,11 @@
 #define GPARAM_MFS_DIV_F2                (0x06u)  // csdMfsDividerOffsetF2(多频通道2分频偏移)
 #define GPARAM_IDAC_SENSE_CONFIG         (0x07u)  // csdChargeTransfer: 0=IDAC sourcing, 1=IDAC sinking (运行时可设)
 #define GPARAM_AUTO_CALIBRATE_EN         (0x08u)  // 运行时是否自动校准: 0=固定IDAC(不自动校准), 1=Init/Apply 自动校准
+// 只读: 启动时固件对生成配置做过哪些强制改写(位掩码)。上位机据此把"设备被固件改过"如实告知用户,
+// 杜绝"UI 显示用户设定值、设备实际另一个值"的静默不同步。
+//   bit0 = IDAC 增益档被抬到下限(生成配置默认 0 会全片 railed, 必须抬)
+//   bit1 = 校准目标% 非法(0 或 >=100)被改成 85
+#define GPARAM_BOOT_OVERRIDE             (0x09u)
 // 注: IDAC 自动校准/补偿IDAC/自动增益 在 CapSense v5 是编译期宏(非 common_config 运行时字段),
 //     无法运行时切换; 若需固定IDAC(不自动校准)换稳定灵敏度, 运行时路径=手动设 IDAC_MOD 且不触发校准。
 // CapSense 参数 id（与上位机 proto PARAM_* 对齐）
@@ -105,6 +124,8 @@ static uint8_t spi_tx_frame[SENSOR_FRAME_SIZE];
 static volatile uint8_t touch_frame[SENSOR_FRAME_SIZE];
 /* APPLY 指令置位，主循环执行重校准（不能在 ISR 里做耗时重扫描）。 */
 static volatile bool apply_pending = false;
+/* 硬件参数改变后仅记录对应通道，避免 APPLY 为未修改通道重校准造成状态漂移。 */
+static volatile uint64_t idac_dirty_mask = 0u;
 /* MEASURE_CP 指令置位，主循环执行逐电极 BIST 电容测量(不能在 ISR 里做耗时测量)。 */
 static volatile bool measure_cp_pending = false;
 /* SET_GLOBAL 置位：全局 CSD 配置(inactive_sns/IDAC/MFS)改动需完整 Init+Enable 重初始化才能
@@ -121,14 +142,35 @@ static volatile bool baseline_reset_pending = false;
 static volatile bool auto_tune_pending = false;
 /* 自适应结果: 0=未执行/进行中, 1=成功(auto_tune_div 为找到的分频), 2=失败(超硬件上限仍压不到目标)。 */
 static volatile uint8_t auto_tune_result = 0u;
-/* 自适应成功时找到的统一 snsClk 分频(已写回全部 widgetContext)。 */
+/* 自适应成功时找到的 snsClk 分频(已写回目标 widgetContext)。
+ * ★全通道(0xFF)模式的完成态语义★: 各通道分频互不相同, 单一分频无意义, 故完成时本字段 = 成功通道数
+ * (0..36); 真正的逐通道分频由 RP2040 完成后经 GET_PARAM(0x08) 逐通道回读写穿真相源。 */
 static volatile uint16_t auto_tune_div = 0u;
+/* 本次自适应的目标通道: 0..35=单通道, AUTO_TUNE_CH_ALL=全通道。GET_AUTO_TUNE 回显该字节。 */
+static volatile uint8_t auto_tune_ch = AUTO_TUNE_CH_ALL;
+/* 本次自适应的灵敏度偏好档位(1..7, 默认 4=居中): 落档时在临界分频上加 2*(pref-1)(往低频=更灵敏)。 */
+static volatile uint8_t auto_tune_pref = 4u;
+/* ★阶段性进度★: 长自适应(最坏 ~20s)期间由主循环逐步更新, 经 GET_AUTO_TUNE 的 progress 字节上报,
+ * 使 RP2040/上位机在过程中就能看到"到哪一步了", 而非只能干等最终结果。
+ * phase: 0=空闲/已受理 1=粗定位 2=细搜临界 3=落档/回退 4=完成; step: 该阶段内步序(1 起, 上报饱和 31)。
+ * SPI 是独立中断且优先级(2)高于 CapSense(3), 故校准阻塞期间 ISR 仍能应答这两个量。 */
+static volatile uint8_t auto_tune_phase = 0u;
+static volatile uint8_t auto_tune_step = 0u;
+#define AUTO_TUNE_PHASE_IDLE             (0u)
+#define AUTO_TUNE_PHASE_COARSE           (1u)
+#define AUTO_TUNE_PHASE_FINE             (2u)
+#define AUTO_TUNE_PHASE_SETTLE           (3u)
+#define AUTO_TUNE_PHASE_DONE             (4u)
+#define AUTO_TUNE_STEP_MAX_REPORT        (31u)
+/* 细搜(1 步进上探临界)最大步数: 粗表最大相邻间隔为 48→64 的 16, 取 15 步即可覆盖整个区间;
+ * 同时限制全通道模式下额外校准次数(单次全通道校准 ~200-270ms), 保证总耗时留在 RP2040 的 10s 窗内。 */
+#define AUTO_TUNE_FINE_STEPS_MAX         (15u)
 /* ★处理中锁定/真实完成反馈★：ISR 收到 APPLY/CALIBRATE/BASELINE_RESET/GLOBAL_COMMIT 即置 1,
  * 主循环把对应重操作真正做完后清 0。经 GET_STATS 响应 byte[2] 上报, 供 RP2040 轮询至真实完成
  * (替代原固定 sleep 盲等), 上位机据此显示"处理中"并在真正完成后解锁/刷新, 而非命令一到就误判完成。 */
 static volatile uint8_t g_op_busy = 0u;
-/* 任一通道当前激活(算法 out_active / base_active 聚合)。驱动白 LED: 运行时激活亮、空闲灭。
- * 使新人写的算法只要令某通道判定为触发, 白灯即亮, 直观可视化算法作用(需求: 算法点亮白LED示例)。 */
+/* 任一通道的 JIT 算法【显式请求点灯】(io->out_led != 0)。白 LED 的唯一运行时来源。
+ * 固件不再从触控判定(out_active)推导灯态 —— 没有算法、或算法不写 out_led 时白灯恒灭。 */
 static volatile bool g_any_active = false;
 /* 全局"是否自动校准"运行时开关(GPARAM_AUTO_CALIBRATE_EN, 默认开)。开=Init/Apply 走 Enable 自动校准 IDAC;
  * 关=只 Initialize+基线复位, 用固定 IDAC(配置/手动值)换取稳定灵敏度范围(修某些通道自动校准发散 railed)。
@@ -176,6 +218,9 @@ static volatile uint32_t g_ms_tick = 0u;
  * 故 init 前把它拷到 RAM 并把 cy_capsense_context.ptrCommonConfig 指向此副本；
  * 之后 SET_GLOBAL 改此副本、APPLY 重初始化时中间件从 ptrCommonConfig 重算内部预计算而生效。 */
 static cy_stc_capsense_common_config_t g_common_cfg_ram;
+/* 启动时固件强制改写过哪些生成配置项(位掩码, 经 GPARAM_BOOT_OVERRIDE 只读上报)。
+ * 有值即说明"设备实际配置 != 用户/生成配置给的值", 上位机必须据此告警, 不许静默不同步。 */
+static uint8_t g_boot_override = 0u;
 
 static void spi_slave_task(void);
 static void spi_isr(void);
@@ -218,6 +263,80 @@ static uint16_t algo_crc16(const uint8_t *data, uint16_t len)
     return crc;
 }
 
+/* ★用户手动 IDAC 增益档锁定★: 中间件的校准(Cy_CapSense_CalibrateAllWidgets/CalibrateWidget,
+ * 见 cy_capsense_csd_v2.c 校准入口)与 Cy_CapSense_Enable 一进来就把 widgetContext[ch].idacGainIndex
+ * 无条件拉回全局起点档 csdIdacGainInitIndex, 于是用户经 PARAM_IDAC_GAIN 设的增幅被静默改回 ——
+ * 上位机显示与设备实际不符。故记录"用户显式设过的通道 + 其值", 在所有会重置增益档的动作之后恢复。
+ * 语义: 显式 PARAM_IDAC_GAIN 即锁定该通道; 修改全局 GPARAM_IDAC_GAIN_INIT 视为用户改了起点档 →
+ * 清空全部锁定(以全局值为准)。GET_PARAM 恒读 widgetContext 实际生效值。 */
+typedef struct
+{
+    uint64_t mask;                        /* bit ch = 该通道增益档被用户锁定 */
+    uint8_t  gain[SENSOR_CHANNEL_COUNT];  /* 锁定通道的用户增益档(0..6) */
+} idac_gain_lock_t;
+static volatile idac_gain_lock_t g_idac_lock;
+
+static inline void _idac_lock_clear(void)
+{
+    uint32_t i;
+    g_idac_lock.mask = 0u;
+    for (i = 0u; i < SENSOR_CHANNEL_COUNT; i++) { g_idac_lock.gain[i] = 0u; }
+}
+
+/* 把锁定通道的增益档写回 widgetContext; 返回是否有值被改回(需 re-init 才真正下到硬件)。 */
+static inline bool _idac_lock_restore(void)
+{
+    uint32_t w;
+    bool changed = false;
+    if (g_idac_lock.mask == 0u) { return false; }
+    for (w = 0u; w < SENSOR_CHANNEL_COUNT; w++)
+    {
+        if ((g_idac_lock.mask & ((uint64_t)1u << w)) != 0u)
+        {
+            cy_stc_capsense_widget_context_t * wc = &cy_capsense_tuner.widgetContext[w];
+            if (wc->idacGainIndex != g_idac_lock.gain[w])
+            {
+                wc->idacGainIndex = g_idac_lock.gain[w];
+                changed = true;
+            }
+        }
+    }
+    return changed;
+}
+
+/* ★逐通道校准必须在"该通道自己的增益档"下进行★
+ * cy_capsense_csd_v2.c:1713 的 CalibrateWidget 一进来就 idacGainIndex = csdIdacGainInitIndex(全局
+ * 起点档), auto-gain 之后只会往低档走 —— 于是"用户给该通道设的 PARAM_IDAC_GAIN"在校准过程中被
+ * 全局档顶替: 解出的 idacMod 属于全局档, 事后 _idac_lock_restore 又把档改回用户值, 二者不自洽
+ * (频率自适应尤其明显: 每一档试探的通过/失败判定都用的全局档, 找到的分频对不上该通道的档)。
+ * 故 per-channel 校准统一走本助手: 锁定通道把全局起点档临时替换为该通道的锁定档, 校准后还原,
+ * 使中间件的强制复位正好落在该通道自己的档上(语义 = 该通道的起点档)。未锁定通道零行为变化。 */
+static inline bool _calibrate_widget_locked(uint32_t ch)
+{
+    bool ok;
+    uint8_t saved_init = g_common_cfg_ram.csdIdacGainInitIndex;
+    const bool locked = (ch < SENSOR_CHANNEL_COUNT) &&
+                        ((g_idac_lock.mask & ((uint64_t)1u << ch)) != 0u);
+    if (locked) { g_common_cfg_ram.csdIdacGainInitIndex = g_idac_lock.gain[ch]; }
+    ok = (CY_CAPSENSE_STATUS_SUCCESS == Cy_CapSense_CalibrateWidget(ch, &cy_capsense_context));
+    /* 只在字段仍是我们写进去的临时值时还原: 校准期间 SPI ISR 若受理了 GPARAM_IDAC_GAIN_INIT,
+     * 盲目还原会把用户刚设的新全局起点档冲掉。 */
+    if (locked && (g_common_cfg_ram.csdIdacGainInitIndex == g_idac_lock.gain[ch]))
+    {
+        g_common_cfg_ram.csdIdacGainInitIndex = saved_init;
+    }
+    return ok;
+}
+
+/* 校准/Enable 之后调用: 恢复锁定档并用既有的"从 widgetContext 重配硬件"路径使其真正生效
+ * (Cy_CapSense_Initialize 不重算增益, 故不会再被冲回)。无锁定通道时零开销。 */
+static inline void _idac_lock_reapply(void)
+{
+    if (!_idac_lock_restore()) { return; }
+    (void)Cy_CapSense_Initialize(&cy_capsense_context);
+    Cy_CapSense_InitializeAllBaselines(&cy_capsense_context);
+}
+
 /* 建立全局配置 RAM 影子并重定向 ptrCommonConfig。必须在 Cy_CapSense_Init 前调用。 */
 static void initialize_common_cfg_shadow(void)
 {
@@ -230,10 +349,19 @@ static void initialize_common_cfg_shadow(void)
      * 运行时仍可经 GLOBAL_SET(IDAC_GAIN_INIT) / PARAM_SET(IDAC_GAIN) 覆盖。 */
     if (g_common_cfg_ram.csdIdacGainInitIndex < 4u) {
         g_common_cfg_ram.csdIdacGainInitIndex = 4u;
+        g_boot_override |= 0x01u;
     }
-    if (g_common_cfg_ram.csdRawTarget < 60u || g_common_cfg_ram.csdRawTarget > 90u) {
-        g_common_cfg_ram.csdRawTarget = 85u;   /* 校准目标 85%: 留触摸下摆空间且不易饱和 */
+    /* ★只拦真正非法值★: 运行时 cmd_set_global 放行 1..99, 这里原先却夹到 [60,90], 于是用户设的
+     * 50 每次启动被静默改成 85 —— 上位机显示 50、设备实际 85, 长期不同步。现在与运行时同口径,
+     * 只有 0 / >=100(会让自动校准发散→railed)才回退默认。被改写时置位经 GPARAM_BOOT_OVERRIDE 上报。 */
+    if ((g_common_cfg_ram.csdRawTarget == 0u) || (g_common_cfg_ram.csdRawTarget >= 100u)) {
+        g_common_cfg_ram.csdRawTarget = 85u;
+        g_boot_override |= 0x02u;
     }
+    /* ★不再强制改写 csdInactiveSnsConnection★: GND 会让 35 个非激活电极接地, 每通道多出约 4.3ms
+     * 固定硬件建立开销(实测 172.5µs → 4386µs/通道, 扫描率 169Hz → 6~7Hz), 但它同时降低抖动与
+     * 近场效应。该取舍归用户, 固件不得静默替用户决定 —— 原先在此把 GND 改成 High-Z, 导致用户选的
+     * GND 每次重启无声失效, 且 UI 无从知情。真值一律由上位机回读 GLOBAL_GET 呈现。 */
 
     cy_capsense_context.ptrCommonConfig = &g_common_cfg_ram;
 }
@@ -244,7 +372,9 @@ static void cmd_set_global(uint8_t gparam_id, uint32_t value)
     switch (gparam_id)
     {
         case GPARAM_INACTIVE_SNS:
-            /* 仅接受合法连接模式: 1=GND 2=High-Z 4=Shield，防非法值致扫描异常。 */
+            /* GND 会把未激活电极接地，显著增加被测电极对地寄生电容，转换建立时间随之拉长；
+             * 36 段面板的扫描周期可从约 6ms 暴涨到 142–200ms，且更易 raw railed。仍允许用户显式选择，
+             * 但面板默认应使用 High-Z(2)。 */
             if ((value == 1u) || (value == 2u) || (value == 4u))
             {
                 g_common_cfg_ram.csdInactiveSnsConnection = (uint8_t)value;
@@ -253,14 +383,24 @@ static void cmd_set_global(uint8_t gparam_id, uint32_t value)
         /* 防护: IDAC 增益档 0..7; IDAC min 0..127(7位); 校准目标 1..99%(0/≥100 会让自动校准发散→railed)。 */
         /* IDAC 增益档合法索引 0..6(idacGainTable 共 CY_CAPSENSE_IDAC_GAIN_NUMBER=7 项), 索引7越界会读
          * 到表外 gainReg → 写非法 IDAC → 扫描挂死/看门狗复位(崩溃)。夹到 <=6。 */
-        case GPARAM_IDAC_GAIN_INIT: if (value <= 6u)   { g_common_cfg_ram.csdIdacGainInitIndex = (uint8_t)value; } break;
+        /* 改起点档 = 用户重新给定全局增益基准 → 清空全部手动锁定, 以全局值为准。 */
+        case GPARAM_IDAC_GAIN_INIT: if (value <= 6u)   { g_common_cfg_ram.csdIdacGainInitIndex = (uint8_t)value; _idac_lock_clear(); } break;
         case GPARAM_IDAC_MIN:       if (value <= 127u) { g_common_cfg_ram.csdIdacMin           = (uint8_t)value; } break;
         case GPARAM_RAW_TARGET:     if ((value >= 1u) && (value <= 99u)) { g_common_cfg_ram.csdRawTarget = (uint8_t)value; } break;
         case GPARAM_MFS_DIV_F1:     g_common_cfg_ram.csdMfsDividerOffsetF1   = (uint8_t)value; break;
         case GPARAM_MFS_DIV_F2:     g_common_cfg_ram.csdMfsDividerOffsetF2   = (uint8_t)value; break;
         /* IDAC 感应配置(sourcing/sinking): 运行时可设的充电方向, 影响灵敏度极性/范围。 */
         case GPARAM_IDAC_SENSE_CONFIG: g_common_cfg_ram.csdChargeTransfer = (value != 0u) ? (uint8_t)CY_CAPSENSE_IDAC_SINKING : (uint8_t)CY_CAPSENSE_IDAC_SOURCING; break;
-        case GPARAM_AUTO_CALIBRATE_EN: g_auto_calibrate = (value != 0u); break;
+        /* ★由关转开必须立刻做一次真实校准★: 原生 CapSense 的"IDAC 自动校准"语义是
+         * Enable/Init 时按 csdRawTarget 解出各通道 IDAC。此前本项只改标志, 要等下一次 APPLY 才
+         * 生效, 且半自动手动模式下只补校"脏通道" —— 用户勾选后没有任何参数变更时 dirty 为空,
+         * 表现为"勾了不拉基线、IDAC 根本没运行"。故 0→1 沿置 calibrate_pending, 由主循环执行
+         * CalibrateAllWidgets + InitializeAllBaselines(等价于原生 Enable 的自动校准结果)。
+         * 只在上升沿触发: 重复写 1 不该反复打断扫描。 */
+        case GPARAM_AUTO_CALIBRATE_EN:
+            if ((value != 0u) && !g_auto_calibrate) { calibrate_pending = true; }
+            g_auto_calibrate = (value != 0u);
+            break;
         default: break;
     }
     /* 仅改影子, 不在此重初始化。全部全局项设完后由 GLOBAL_COMMIT 触发一次完整重初始化,
@@ -279,6 +419,7 @@ static uint32_t cmd_get_global(uint8_t gparam_id)
         case GPARAM_MFS_DIV_F2:     return g_common_cfg_ram.csdMfsDividerOffsetF2;
         case GPARAM_IDAC_SENSE_CONFIG: return (g_common_cfg_ram.csdChargeTransfer == (uint8_t)CY_CAPSENSE_IDAC_SINKING) ? 1u : 0u;
         case GPARAM_AUTO_CALIBRATE_EN: return g_auto_calibrate ? 1u : 0u;
+        case GPARAM_BOOT_OVERRIDE:  return g_boot_override;
         default: return 0u;
     }
 }
@@ -390,6 +531,10 @@ static uint32_t algo_engine_run_channel(uint32_t ch, uint32_t base_active)
     /* cfg[8] 全通道共享的可设置变量(上位机 ALGO_SET_CFG 下发)。 */
     for (uint32_t k = 0u; k < 8u; k++) { io->cfg[k] = g_algo_cfg[k]; }
 
+    /* 每轮先清点灯请求, 由算法重新声明: 否则换成不写 out_led 的算法后, 上一个算法(如 LED 演示)
+     * 留下的 1 会让白灯永久亮着 —— 那又变成了"用户改不掉的灯"。 */
+    io->out_led = 0u;
+
     algo_fn(io);
     return io->out_active;
 }
@@ -401,20 +546,40 @@ static void update_touch_frame(void)
     uint32_t ch;
     uint32_t st;
     bool use_algo = algo_valid;
+    /* 点灯请求只来自算法显式写入的 out_led; 与触控判定(out_active)彻底解耦。 */
+    bool algo_led = false;
 
     for (ch = 0u; ch < SENSOR_CHANNEL_COUNT; ch++)
     {
         uint32_t base_active = Cy_CapSense_IsWidgetActive((uint32_t)ch, &cy_capsense_context);
-        uint32_t active = use_algo ? algo_engine_run_channel(ch, base_active) : base_active;
+        uint32_t active;
 
-        if (0u != active)
+        if (use_algo)
+        {
+            active = algo_engine_run_channel(ch, base_active);
+            /* 只认算法自己写的 out_led; 算法不写 → 恒 0 → 不点灯。 */
+            if (g_algo_io[ch].out_led != 0u) { algo_led = true; }
+        }
+        else
+        {
+            active = base_active;
+            /* 未加载 JIT 时 trace 仍需反映实测触控态，不能留下上次算法的陈旧结果。 */
+            g_algo_io[ch].out_active = (uint16_t)base_active;
+            /* 无算法即无点灯请求: 原生 CapSense 触控不得点灯(否则又变成固件写死的触控反馈)。 */
+            g_algo_io[ch].out_led = 0u;
+        }
+
+        if (active != 0u)
         {
             mask[ch >> 3u] |= (uint8_t)(1u << (ch & 7u));
         }
     }
 
-    /* 聚合"任一通道激活"供白 LED 运行时指示(算法可视化)。 */
-    g_any_active = (bool)((mask[0] | mask[1] | mask[2] | mask[3] | mask[4]) != 0u);
+    /* ★白 LED 只由算法显式请求(out_led)驱动★: 此前这里写的是 `use_algo && algo_active`,
+     * 即把触控判定结果当成点灯信号写死 —— 任何算法(含默认 v3.1 HDR)只要判定触摸就必然亮灯,
+     * 用户换算法也改不掉。现在改为汇总算法写出的 out_led: 不写该字段的算法一律不点灯。
+     * 触控帧输出不受影响, 协议语义不变。 */
+    g_any_active = use_algo && algo_led;
 
     st = Cy_SysLib_EnterCriticalSection();
     touch_frame[0] = SENSOR_FRAME_MAGIC;
@@ -478,8 +643,17 @@ static bool cmd_set_param(uint8_t ch, uint8_t param_id, uint32_t value)
         case PARAM_SNS_CLK_DIV:   wc->snsClk       = (uint16_t)value; break;
         case PARAM_IDAC_MOD:      wc->idacMod[0]   = (uint8_t)value;  break;
         case PARAM_SNS_CLK_SOURCE:wc->snsClkSource = (uint8_t)value;  break;
-        case PARAM_IDAC_GAIN:     wc->idacGainIndex= (uint8_t)value;  break;
+        /* 用户显式设增幅 → 锁定该通道, 后续任何校准/Enable 冲回后都会被恢复成此值。 */
+        case PARAM_IDAC_GAIN:     wc->idacGainIndex= (uint8_t)value;
+                                  g_idac_lock.gain[ch] = (uint8_t)value;
+                                  g_idac_lock.mask |= ((uint64_t)1u << ch);
+                                  break;
         default: return false;
+    }
+    if ((param_id == PARAM_SNS_CLK_DIV) || (param_id == PARAM_RESOLUTION) ||
+        (param_id == PARAM_IDAC_GAIN))
+    {
+        idac_dirty_mask |= ((uint64_t)1u << ch);
     }
     return true;
 }
@@ -503,6 +677,24 @@ static uint32_t cmd_get_param(uint8_t ch, uint8_t param_id)
         case PARAM_IDAC_GAIN:     return wc->idacGainIndex;
         default: return 0u;
     }
+}
+
+static inline void _recalibrate_dirty_channels(void)
+{
+#if (defined(CY_CAPSENSE_CSD_CALIBRATION_EN) && (CY_CAPSENSE_ENABLE == CY_CAPSENSE_CSD_CALIBRATION_EN))
+    uint32_t w;
+
+    for (w = 0u; w < SENSOR_CHANNEL_COUNT; w++)
+    {
+        if ((idac_dirty_mask & ((uint64_t)1u << w)) != 0u)
+        {
+            (void)_calibrate_widget_locked(w);   /* 锁定通道按其自身增益档校准 */
+        }
+    }
+    /* 校准把增益档拉回全局起点档, 此处把用户锁定值写回; 调用方随后的 Initialize 使其下到硬件。 */
+    (void)_idac_lock_restore();
+#endif
+    idac_dirty_mask = 0u;
 }
 
 // 装载指令响应帧（直接填 TX FIFO；ISR 上下文，与 spi_load_touch 同）。
@@ -837,16 +1029,26 @@ static void spi_slave_task(void)
             break;
 
         case SENSOR_CMD_AUTO_TUNE:
-            // 频率自适应下探(耗时: 逐档升分频重校准); 仅置标志由主循环执行, 结果经 GET_AUTO_TUNE 读。
+            // 频率自适应下探(耗时: 粗定位+细搜+落档重校准); 仅置标志由主循环执行, 结果经 GET_AUTO_TUNE 读。
+            // rx[2]=目标通道(0..35 单通道 / 0xFF 全通道); 非法值退化为全通道。
+            // rx[3]=灵敏度偏好档位(1..7); 非法/缺省(0)退化为 4(居中)。
+            auto_tune_ch      = (rx[2] < SENSOR_CHANNEL_COUNT) ? rx[2] : AUTO_TUNE_CH_ALL;
+            auto_tune_pref    = ((rx[3] >= 1u) && (rx[3] <= 7u)) ? rx[3] : 4u;
             auto_tune_pending = true;
             auto_tune_result  = 0u;   // 进行中
+            auto_tune_phase   = AUTO_TUNE_PHASE_IDLE;   // 已受理, 主循环下一轮开始推进阶段
+            auto_tune_step    = 0u;
+            auto_tune_div     = 0u;
             g_op_busy = 1u;           // 处理中锁定(host 轮询 busy 至真实完成)
-            spi_load_cmd_response(SENSOR_CMD_AUTO_TUNE, 0u, 0u, 0u);
+            spi_load_cmd_response(SENSOR_CMD_AUTO_TUNE, auto_tune_ch, 0u, 0u);
             break;
 
         case SENSOR_CMD_GET_AUTO_TUNE:
-            // 读自适应结果: [result(0进行中/1成功/2失败), 0, div24]。
-            spi_load_cmd_response(SENSOR_CMD_GET_AUTO_TUNE, auto_tune_result, 0u, auto_tune_div);
+            // 读结果/进度: [result, ch, div_lo, div_hi, progress]; progress = phase | (step << 3)。
+            spi_load_cmd_response(SENSOR_CMD_GET_AUTO_TUNE, auto_tune_result, auto_tune_ch,
+                                  (uint32_t)auto_tune_div |
+                                  (((uint32_t)(auto_tune_phase & 0x07u) |
+                                    ((uint32_t)(auto_tune_step & 0x1Fu) << 3u)) << 16u));
             break;
 
         case SENSOR_CMD_SET_MODE:
@@ -899,6 +1101,89 @@ static void spi_slave_task(void)
     }
 }
 
+/* 自适应原子动作：把 snsClk 分频写进目标 widget 并就地校准一次, 返回该分频下 IDAC 能否把 raw
+ * 校到目标容差内。粗定位/细搜/落档/回退四处复用, 避免复制粘贴。
+ * ★恒为单通道判定★: 全通道模式也由外层逐通道调用本函数(不再有"写全部 widget 同一分频"的路径)。
+ * ★IDAC 档口径★: 经 _calibrate_widget_locked 校准, 故"该分频能否压到目标%"是在该通道自己的
+ * 增益档(用户设过 PARAM_IDAC_GAIN 时)下判定的, 而不是全局起点档。 */
+static inline bool auto_tune_try_div(uint8_t target_ch, uint16_t div)
+{
+    if (target_ch >= SENSOR_CHANNEL_COUNT) return false;
+    cy_capsense_tuner.widgetContext[target_ch].snsClk = div;
+    return _calibrate_widget_locked((uint32_t)target_ch);
+}
+
+/* 自适应"打点 + 试探"：先把阶段/步序/当前试探分频发布(SPI ISR 经 GET_AUTO_TUNE 上报, 长过程可见),
+ * 再执行一次试探校准。粗定位/细搜/落档/回退四处共用, 避免每处复制打点代码。 */
+static inline bool auto_tune_probe(uint8_t target_ch, uint16_t div, uint8_t phase, uint32_t step)
+{
+    auto_tune_phase = phase;
+    auto_tune_step  = (step > AUTO_TUNE_STEP_MAX_REPORT) ? (uint8_t)AUTO_TUNE_STEP_MAX_REPORT : (uint8_t)step;
+    auto_tune_div   = div;   /* 进行中语义: div 字段 = 当前试探值(完成时被最终分频覆盖) */
+    return auto_tune_try_div(target_ch, div);
+}
+
+/* 单通道完整三步自适应: ①粗表定位 ②1 步进上探临界 ③按 pref 落档(失败逐 1 回退)。
+ * 成功时 *out_div = 最终写入该 widget 的分频。全通道模式由外层逐通道复用本函数, 使每个通道各自
+ * 落在其自身临界频率上(面板 Cp 22~138pF, 单一统一分频必然被最高 Cp 的通道拖垮)。 */
+static bool auto_tune_run_ch(uint8_t target_ch, uint8_t pref, uint16_t* out_div)
+{
+    static const uint16_t k_autotune_divs[] = { 8u, 12u, 16u, 20u, 24u, 32u, 40u, 48u, 64u };
+    const uint32_t div_count = sizeof(k_autotune_divs) / sizeof(k_autotune_divs[0]);
+    uint16_t saved_div = cy_capsense_tuner.widgetContext[target_ch].snsClk;
+    uint16_t div_edge = 0u;   /* 临界分频(最高频率, 校准刚好通过) */
+    uint16_t div_target;
+    uint32_t di;
+    uint32_t step;
+
+    /* ① 粗定位: 粗表升序(升分频=降频)扫描, 首个校准成功的档位必然 >= 真实临界值。 */
+    for (di = 0u; di < div_count; di++)
+    {
+        if (auto_tune_probe(target_ch, k_autotune_divs[di], AUTO_TUNE_PHASE_COARSE, di + 1u))
+        {
+            div_edge = k_autotune_divs[di];
+            break;
+        }
+    }
+    if (div_edge == 0u)
+    {
+        /* 粗定位全失败时必须恢复原分频并尝试校准，否则最后试探值会残留为坏状态。 */
+        cy_capsense_tuner.widgetContext[target_ch].snsClk = saved_div;
+        (void)_calibrate_widget_locked(target_ch);
+        return false;
+    }
+
+    /* ② 1 步进上探临界: 从 div_edge-1 起逐 1 降分频(升频)重校准, 成功即继续;
+     *    首次失败即停, 最后一个成功值就是临界分频。 */
+    for (step = 0u; step < AUTO_TUNE_FINE_STEPS_MAX; step++)
+    {
+        if (div_edge <= 1u) break;
+        if (!auto_tune_probe(target_ch, (uint16_t)(div_edge - 1u),
+                             AUTO_TUNE_PHASE_FINE, step + 1u)) break;
+        div_edge = (uint16_t)(div_edge - 1u);
+    }
+
+    /* ③ 按偏好落档: 每档往低频让 2 个分频(充电更充分→过充近场效应→更灵敏)。 */
+    div_target = (uint16_t)(div_edge + 2u * (uint16_t)(pref - 1u));
+    if (div_target > 255u) div_target = 255u;   /* PSoC snsClk 合法范围 1..255 */
+    step = 1u;
+    while (!auto_tune_probe(target_ch, div_target, AUTO_TUNE_PHASE_SETTLE, step))
+    {
+        step++;
+        /* 落档失败(该低频下 IDAC 反而压不住): 朝临界方向逐 1 回退重试;
+         * 退到临界仍失败则在临界档重校准一次(已知可用)并采用它。 */
+        if (div_target <= div_edge)
+        {
+            (void)auto_tune_probe(target_ch, div_edge, AUTO_TUNE_PHASE_SETTLE, step);
+            div_target = div_edge;
+            break;
+        }
+        div_target = (uint16_t)(div_target - 1u);
+    }
+    if (out_div != NULL) *out_div = div_target;
+    return true;
+}
+
 int main(void)
 {
     cy_rslt_t result = cybsp_init();
@@ -922,6 +1207,9 @@ int main(void)
     auto_tune_pending = false;
     auto_tune_result = 0u;
     auto_tune_div = 0u;
+    auto_tune_ch = AUTO_TUNE_CH_ALL;
+    auto_tune_phase = AUTO_TUNE_PHASE_IDLE;
+    auto_tune_step = 0u;
     g_any_active = false;
     published_snapshot_index = 0u;
     published_snapshot_valid = false;
@@ -942,8 +1230,8 @@ int main(void)
     initialize_capsense();
     spi_slave_init();
     // hardware.txt: P1.6 -> LED -> R -> GND，因此高电平明确为点亮。
-    // 白灯启动即点亮作为 bring-up 指示; 进入主循环后交由 g_any_active 驱动:
-    // 运行空闲熄灭、任一通道激活(算法 out_active/base_active)点亮 → 兼作算法可视化。
+    // 白灯启动即点亮作为 bring-up 指示；800ms 后仅由已加载 JIT 算法的判定结果驱动，
+    // 原始 CapSense 触控不会触发白灯，避免把非 JIT 模式误呈现为算法已触发。
     Cy_GPIO_Write(STATUS_LED_PORT, STATUS_LED_NUM, STATUS_LED_ON_STATE);
     /* ★可见启动指示(修"重启白灯不亮")★: 白灯在启动后保持点亮 800ms 再交给 g_any_active 驱动,
      * 使每次上电/XRES 重启都有肉眼可见的白灯闪亮(否则仅亮几微秒无法察觉, 用户误判"重启无效")。 */
@@ -975,7 +1263,7 @@ int main(void)
                 }
             }
             update_touch_frame();       /* 刷新实时触控帧（快路数据源） */
-            /* 白 LED: 启动 800ms 内常亮(可见重启指示), 之后运行时任一通道激活则亮、空闲灭。 */
+            /* 白 LED: 启动 800ms 内常亮(可见启动指示)；之后只有算法显式写 out_led 才亮。 */
             Cy_GPIO_Write(STATUS_LED_PORT, STATUS_LED_NUM,
                           (g_any_active || (g_ms_tick < led_boot_until_ms))
                               ? STATUS_LED_ON_STATE : STATUS_LED_OFF_STATE);
@@ -1019,16 +1307,9 @@ int main(void)
                             cp_value[w] = (v >= 0xFFFFFFu) ? 0xFFFFFEu : v;
                         }
                     }
-                    /* BIST 改写 CSD HW，按当前模式恢复自动校准/标准完整处理或半自动手动配置。 */
-                    if (scan_mode == SCAN_MODE_AUTO)
-                    {
-                        (void)Cy_CapSense_Enable(&cy_capsense_context);
-                    }
-                    else
-                    {
-                        (void)Cy_CapSense_Initialize(&cy_capsense_context);
-                        Cy_CapSense_InitializeAllBaselines(&cy_capsense_context);
-                    }
+                    /* 测量是只读动作，不得触发全局重校准；仅从现有 widgetContext 恢复硬件和基线。 */
+                    (void)Cy_CapSense_Initialize(&cy_capsense_context);
+                    Cy_CapSense_InitializeAllBaselines(&cy_capsense_context);
 #endif
                     interrupt_state = Cy_SysLib_EnterCriticalSection();
                     measure_cp_active = false;
@@ -1069,13 +1350,16 @@ int main(void)
                  * 掉到 ~15Hz(疑似 DeInit 未复位时钟分频, 再 Init 残留慢时钟); 仅 Init→Enable 同样重算
                  * 全局预计算且保持满速。 */
                 (void)Cy_CapSense_Init(&cy_capsense_context);
-                /* 自动校准开→Enable(重算 IDAC); 关→仅 Initialize+基线(固定 IDAC, 稳定灵敏度范围)。 */
-                if (g_auto_calibrate) {
-                    (void)Cy_CapSense_Enable(&cy_capsense_context);
-                } else {
-                    (void)Cy_CapSense_Initialize(&cy_capsense_context);
-                    Cy_CapSense_InitializeAllBaselines(&cy_capsense_context);
-                }
+                /* Init 会按 ptrCommonConfig 重铺 widgetContext 增益档 → 先把用户锁定值写回,
+                 * 再由紧随其后的 Initialize 一并下到硬件(不额外触发校准)。 */
+                (void)_idac_lock_restore();
+                /* ★配置更新只重算内部预计算, 不再自动校准/频率下探(转一圈)★:
+                 * 恒走轻量 Initialize+基线路径, 沿用现有(上次手动校准的)IDAC。
+                 * Enable 的自动校准(SmartSense 可含频率自适应)耗时长会阻塞→掉 USB, 且用户要求
+                 * "频率自适应探测只能手动触发"。故校准/频率下探仅由显式 CALIBRATE / AUTO_TUNE 命令触发,
+                 * 配置改动(inactive_sns/IDAC/MFS)本身即时生效但不重扫校准。 */
+                (void)Cy_CapSense_Initialize(&cy_capsense_context);
+                Cy_CapSense_InitializeAllBaselines(&cy_capsense_context);
             }
 
             /* APPLY 指令：在主循环(非 ISR)重新初始化扫描硬件使硬件参数(分辨率/时钟/IDAC)生效。 */
@@ -1086,11 +1370,18 @@ int main(void)
                 {
                     /* 自动校准开：重新启用 CapSense(含 IDAC 自动校准)，后续继续标准完整处理。 */
                     (void)Cy_CapSense_Enable(&cy_capsense_context);
+                    idac_dirty_mask = 0u;
+                    _idac_lock_reapply();   /* Enable 的自动校准会把增益档冲回起点档 */
                 }
                 else
                 {
-                    /* 半自动手动 或 关闭自动校准：从 widgetContext 重配硬件(snsClk/resolution/idac)
-                     * 并重置基线，用固定 IDAC(不重算校准)，保留手动阈值与手动硬件参数。 */
+                    /* 硬件参数变化会使旧 IDAC 不再适用，只在用户允许自动校准时修复被改通道；
+                     * 关闭自动校准表示用户要求固定 IDAC，脏位保留到其重新允许校准。 */
+                    if (g_auto_calibrate)
+                    {
+                        _recalibrate_dirty_channels();
+                    }
+                    /* 从 widgetContext 重配硬件并重置基线，保留手动阈值与手动硬件参数。 */
                     (void)Cy_CapSense_Initialize(&cy_capsense_context);
                     Cy_CapSense_InitializeAllBaselines(&cy_capsense_context);
                 }
@@ -1107,6 +1398,12 @@ int main(void)
 #else
                 (void)Cy_CapSense_Enable(&cy_capsense_context);
 #endif
+                /* 校准无条件把增益档拉回起点档 → 恢复用户锁定档并重配硬件(不再校准), 否则
+                 * "手动设的增幅一点校准就没了"。 */
+                if (_idac_lock_restore())
+                {
+                    (void)Cy_CapSense_Initialize(&cy_capsense_context);
+                }
                 Cy_CapSense_InitializeAllBaselines(&cy_capsense_context);
             }
 
@@ -1117,37 +1414,56 @@ int main(void)
                 Cy_CapSense_InitializeAllBaselines(&cy_capsense_context);
             }
 
-            /* AUTO_TUNE：频率自适应下探。高 Cp 面板在高频(小分频)下传感器来不及建立→IDAC 无论如何
-             * 都压不到目标%→CalibrateAllWidgets 返回非 SUCCESS。此处从高频起逐档升分频(降频),
+            /* AUTO_TUNE：频率自适应下探。高 Cp 电极在高频(小分频)下传感器来不及建立→IDAC 无论如何
+             * 都压不到目标%→CalibrateWidget 返回非 SUCCESS。此处从高频起逐档升分频(降频),
              * 每档重校准, 用中间件校准返回状态判定该频率下 IDAC 能否满足目标; 首个成功的分频即为
-             * "满足当前 IDAC 设置的最高频率(最快扫描)", 写回全部 widgetContext 并记录; 全部档位都失败
-             * = 超硬件能力 → 返回失败。运行时可调, 结果经 GET_AUTO_TUNE 上报。 */
+             * "满足当前 IDAC 设置的最高频率(最快扫描)", 写回该 widgetContext 并记录; 全部档位都失败
+             * = 超该通道硬件能力 → 该通道失败。运行时可调, 结果经 GET_AUTO_TUNE 上报。 */
+            /* 通道 Cp 跨度极大(22pF~138pF), 单一统一分频无法兼顾 → 两种模式都按【单通道】判定:
+             *   auto_tune_ch = 0..35: 只改该 widget 的 snsClk(其余通道不动), CalibrateWidget 判定;
+             *   auto_tune_ch = 0xFF : 逐通道各自校准——外层遍历 36 通道, 每通道独立跑完整三步算法,
+             *                         各得其自身分频; 不再要求"全通道共用同一分频且全部通过"。 */
             if (auto_tune_pending)
             {
-                static const uint16_t k_autotune_divs[] = { 8u, 12u, 16u, 20u, 24u, 32u, 40u, 48u, 64u };
-                const uint32_t div_count = sizeof(k_autotune_divs) / sizeof(k_autotune_divs[0]);
-                uint32_t di;
+                const uint8_t target_ch = auto_tune_ch;
+                const uint8_t pref = auto_tune_pref;
+                uint16_t final_div = 0u;
                 bool tuned = false;
                 auto_tune_pending = false;
-                for (di = 0u; di < div_count; di++)
+
+                if (target_ch < SENSOR_CHANNEL_COUNT)
                 {
-                    uint16_t d = k_autotune_divs[di];
+                    tuned = auto_tune_run_ch(target_ch, pref, &final_div);
+                }
+                else
+                {
+                    /* 逐通道各自校准: 单通道失败不拖垮全场, 只影响该通道(其分频保持上一次的值)。
+                     * 进度期间 auto_tune_ch 回显"当前正在处理的通道", 供上位机显示 CHn/36。 */
+                    uint32_t ok_count = 0u;
                     uint32_t w;
                     for (w = 0u; w < SENSOR_CHANNEL_COUNT; w++)
                     {
-                        cy_capsense_tuner.widgetContext[w].snsClk = d;
+                        uint16_t ch_div = 0u;
+                        auto_tune_ch = (uint8_t)w;
+                        if (auto_tune_run_ch((uint8_t)w, pref, &ch_div)) ok_count++;
                     }
-                    /* 该分频下重校准; SUCCESS = 全部 widget 的 IDAC 均能把 raw 校到目标容差内。 */
-                    if (CY_CAPSENSE_STATUS_SUCCESS ==
-                        Cy_CapSense_CalibrateAllWidgets(&cy_capsense_context))
-                    {
-                        auto_tune_div = d;   /* 已写回 widgetContext, 供上位机回读/持久化 */
-                        tuned = true;
-                        break;
-                    }
+                    auto_tune_ch = AUTO_TUNE_CH_ALL;      /* 终态回显请求语义(全通道) */
+                    final_div = (uint16_t)ok_count;       /* 完成态: div 字段 = 成功通道数 */
+                    tuned = (ok_count > 0u);
                 }
+
+                /* 自适应内部逐档 CalibrateWidget 同样会把增益档冲回起点档: 搜索过程按中间件口径
+                 * 进行(不干扰判定), 终态再把用户锁定档恢复并重配硬件。 */
+                if (_idac_lock_restore())
+                {
+                    (void)Cy_CapSense_Initialize(&cy_capsense_context);
+                }
+                /* 基线复位只在最终分频确定后做一次。 */
                 Cy_CapSense_InitializeAllBaselines(&cy_capsense_context);
-                auto_tune_result = tuned ? 1u : 2u;   /* 1=成功 2=失败(超硬件能力) */
+                auto_tune_div = tuned ? final_div : 0u;   /* 失败: div 无效(否则残留最后一次试探值) */
+                auto_tune_phase = AUTO_TUNE_PHASE_DONE;
+                auto_tune_step  = 0u;
+                auto_tune_result = tuned ? 1u : 2u;       /* 1=成功(至少一个通道) 2=全部失败 */
             }
 
             /* ★处理中锁定解除★：本轮已把入队的重操作全部做完(且未被 ISR 追加新的)→ 清 busy。

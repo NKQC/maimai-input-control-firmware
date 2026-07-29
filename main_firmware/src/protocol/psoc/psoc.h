@@ -47,8 +47,15 @@ public:
     bool get_cp(uint8_t ch, uint32_t* out);     // 读指定通道 Cp：测量中=0，成功=fF，失败/未测量=0xFFFFFF
 
     // ---------- JIT 算法引擎：下发/查询(core0→信箱→core1 独占 SPI) ----------
-    // data 必须在调用期间保持有效(调用方持久缓冲); 阻塞至下发+PSoC commit 校验完成。
+    // data 必须持续有效直到下发完成(调用方持久缓冲, 见 PsocAlgo::_blob)。
+    // ★异步入队(修 USB 掉线 + 遥测永久冻结)★: core1 单次下发 = 256 页 SPI 事务 + PSoC commit 轮询
+    // (最坏 ~700ms), 远超命令信箱默认 100ms 等待窗。原先按"读类"阻塞 core0 会 (1) 必然超时误报
+    // "download failed", (2) 让 core0 在 host_cmd handler 里滞留近 1s 不跑 UsbComm::update() →
+    // 主机租约与 TxScheduler 租约一并过期 → 遥测被停且无恢复路径。改为入队即返回。
     bool upload_algo(const uint8_t* data, uint16_t len, uint16_t crc16);
+    bool algo_download_busy() const { return _algo_dl.busy != 0u; }
+    // core0: 取走并清除"最近一次下发未通过 PSoC commit 校验"标志(用于一次性上报, 不重复刷屏)。
+    bool algo_download_take_failure();
     bool get_algo_info(bool* out_valid, uint16_t* out_len);   // 读 PSoC 端算法 valid/len
     bool set_algo_rom(uint8_t ch, uint16_t rom);              // 设每通道 16 位只读 ROM
     bool get_algo_rom(uint8_t ch, uint16_t* out_rom);         // 读每通道 16 位 ROM
@@ -66,8 +73,17 @@ public:
     bool apply_params();
     bool calibrate();               // 真正的 IDAC 重校准 + 基线复位
     bool baseline_reset();          // 仅重置全部通道基线
-    // 频率自适应下探(阻塞至完成, 最多~10s): out_result 0进行中/1成功/2失败, out_div 找到的统一分频。
-    bool auto_tune(uint8_t* out_result, uint16_t* out_div);
+    // 频率自适应下探(阻塞至完成, 最多~10s): ch 0..35=单通道 / 0xFF=全通道;
+    // pref 灵敏度档位 1..7(越高越灵敏, 落档时往低频多让分频);
+    // out_result 0进行中/1成功/2失败, out_div 最终写入的分频。
+    bool auto_tune(uint8_t ch, uint8_t pref, uint8_t* out_result, uint16_t* out_div);
+    // ★异步启动(推荐)★: 入队即返回, core0 不阻塞; 阶段进度经 autotune_status() 读, 由服务层推送上位机。
+    // core1 仍在 _exec_cmd 内一次跑完整个自适应(不拆成跨周期状态机), 否则 _spi_service 的 scan_count
+    // 卡死兜底会在 PSoC 长校准期间误判并对其硬复位。
+    bool auto_tune_start(uint8_t ch, uint8_t pref);
+    // 本轮请求代号(core0 侧自增): 与 autotune_status().req 不等 ⇒ core1 尚未开始本轮(结果字段仍属上一轮)。
+    uint32_t autotune_req() const { return _at_req; }
+    psoc::AutoTuneProgress autotune_status() const;   // seqlock 一致读(core1 发布)
     bool set_mode(uint8_t mode);   // 0=自动校准/标准完整处理，1=半自动手动
     const psoc::SensorSnapshot& snapshot() const;   // seqlock 拷贝到 _snapshot_ro 后返回引用
     bool snapshot_valid() const { return _snapshot.valid; }        // bool 原子, 直读
@@ -169,14 +185,33 @@ private:
     uint32_t _link_fail_run = 0;                // 连续 read_touch 失败周期数
     volatile uint32_t _reset_grace_until_ms = 0; // XRES 复位后 PSoC 启动宽限截止(core0 写, core1 读)
     uint32_t _hang_intervals = 0;               // 连续 scan_count 不推进的统计间隔数
+    // 频率自适应阶段进度: core1 唯一写者(经 _at_seq seqlock 发布多字段一致副本), core0 只读。
+    // _at_req 反向: core0 唯一写者(启动时自增), core1 只读回显, 使 core0 能区分"上一轮的 done"。
+    volatile uint32_t _at_req = 0;
+    volatile uint32_t _at_seq = 0;                        // 自适应发布序列(奇=写入中)
+    psoc::AutoTuneProgress _at_pub;                       // 发布副本(core1 写, core0 seqlock 读)
+    psoc::AutoTuneProgress _at_work;                      // core1 工作副本
+    mutable psoc::AutoTuneProgress _at_ro;                // core0 读出的一致副本
+    void _publish_autotune();                             // core1: _at_work → _at_pub(seqlock)
+    static void _on_autotune_progress(void* ctx, const psoc::AutoTuneProgress& p);   // SPI 层回调
     volatile uint32_t _snap_seq = 0;        // 快照发布序列(奇=写入中)
     psoc::SensorSnapshot _snap_work;             // core1 快照流水工作缓冲
     mutable psoc::SensorSnapshot _snapshot_ro;   // core0 seqlock 读出的一致副本
 
+    // 算法下发状态(core0 发起, core1 执行)。"忙"与"失败"必须成对判定, 故合为一个结构体而非散装 bool。
+    struct AlgoDownloadState {
+        volatile uint8_t busy;      // 1 = core1 仍在执行 UPLOAD_ALGO(期间拒绝新的上传, 防 blob 被改写)
+        volatile uint8_t failed;    // 1 = 最近一次下发未通过 PSoC commit 校验, 待 core0 上报后清零
+        void clear() { busy = 0u; failed = 0u; }
+    };
+    AlgoDownloadState _algo_dl { 0u, 0u };
+
     // 命令 SPSC 环形队列(core0 生产, core1 消费, 单拷贝, 无锁):
     //   写类指令(set_param/set_mode/apply) 入队即返回(异步), core0 不再每条阻塞 ~1ms;
     //   读类指令(get_param/get_raw) 入队后按 FIFO 阻塞等本条 done, 顺序与前序写一致。
-    static constexpr uint32_t CMD_RING_SIZE = 32;        // 队列深度
+    // 深度 64: 一次完整算法下发 = 1×UPLOAD_ALGO + 36×SET_ALGO_ROM + 8×SET_CFG = 45 条,
+    // 必须能一次性全部入队, 否则 core0 仍会卡在入队自旋里(等于没异步)。
+    static constexpr uint32_t CMD_RING_SIZE = 64;        // 队列深度
     static constexpr uint32_t CMD_DRAIN_PER_CYCLE = 4;   // core1 每周期最多消费条数(限制周期抖动)
     struct SpiCmd {
         SpiOp          op = SpiOp::NONE;

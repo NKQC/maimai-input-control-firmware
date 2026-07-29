@@ -245,7 +245,7 @@ bool PsocSpi::get_cp(uint8_t ch, uint32_t* out_cp) {
 // 轮询 GET_STATS.busy(resp[2]) 至 PSoC 主循环真正完成重操作。两阶段避免竞态:
 // 阶段1 等 busy 置起(确认命令已被 PSoC ISR 接收, 最多 40ms; 若操作极快已完成则超时后进阶段2);
 // 阶段2 等 busy 落下(真实完成, 最多 timeout_ms)。返回 true=真实完成, false=超时。
-bool PsocSpi::_wait_op_done(uint32_t timeout_ms) {
+bool PsocSpi::_wait_op_done(uint32_t timeout_ms, psoc::AutoTuneProgressFn on_progress, void* progress_ctx) {
     uint8_t resp[7];
     // 阶段1: 等 busy=1
     absolute_time_t d1 = make_timeout_time_ms(40);
@@ -259,12 +259,30 @@ bool PsocSpi::_wait_op_done(uint32_t timeout_ms) {
     }
     // 阶段2: 等 busy=0
     absolute_time_t d2 = make_timeout_time_ms(timeout_ms);
+    absolute_time_t next_progress = make_timeout_time_ms(PROGRESS_POLL_MS);
     for (;;) {
         if (_cmd_txn((uint8_t)psoc::Cmd::GET_STATS, 0, 0, 0, resp) &&
             resp[1] == (uint8_t)psoc::Cmd::GET_STATS && resp[2] == 0u) {
             return true;   // 处理中锁定解除 = 真实完成
         }
         if (time_reached(d2)) return false;
+        // ★阶段性进度★: 长操作(自适应最坏 ~20s)期间降频(PROGRESS_POLL_MS)读一次进度回吐调用方,
+        // 使上位机能持续看到"到哪一步了"; busy 判定与超时窗完全不受影响。
+        if (on_progress != nullptr && time_reached(next_progress)) {
+            next_progress = make_timeout_time_ms(PROGRESS_POLL_MS);
+            uint8_t pr[7];
+            if (_cmd_txn((uint8_t)psoc::Cmd::GET_AUTO_TUNE, 0, 0, 0, pr) &&
+                pr[1] == (uint8_t)psoc::Cmd::GET_AUTO_TUNE) {
+                psoc::AutoTuneProgress p;
+                p.state = 1;
+                p.result = pr[2];
+                p.ch = pr[3];
+                p.cur_div = (uint16_t)((uint16_t)pr[4] | ((uint16_t)pr[5] << 8));
+                p.phase = (uint8_t)(pr[6] & 0x07u);
+                p.step = (uint8_t)((pr[6] >> 3) & 0x1Fu);
+                on_progress(progress_ctx, p);
+            }
+        }
         sleep_ms(3);
     }
 }
@@ -296,14 +314,19 @@ bool PsocSpi::baseline_reset() {
     return _wait_op_done(500);
 }
 
-bool PsocSpi::auto_tune(uint8_t* out_result, uint16_t* out_div) {
+bool PsocSpi::auto_tune(uint8_t ch, uint8_t pref, uint8_t* out_result, uint16_t* out_div,
+                        psoc::AutoTuneProgressFn on_progress, void* progress_ctx) {
     if (!_ready) return false;
-    // 触发自适应: 逐档(最多 9 档)升分频重校准, 每档校准数百 ms → 给足 10s 真实完成窗口。
-    uint8_t tx[7] = { psoc::FRAME_MAGIC, (uint8_t)psoc::Cmd::AUTO_TUNE, 0, 0, 0, 0, 0 };
+    // 触发自适应: 粗表定位 + 1 步进上探临界 + 按 pref 落档, 每次校准数百 ms → 10s 真实完成窗口。
+    // 字节2 = 目标通道(0..35 单通道 / 0xFF 全通道); 字节3 = 灵敏度档位 1..7(非法值 PSoC 侧退化为 4)。
+    uint8_t tx[7] = { psoc::FRAME_MAGIC, (uint8_t)psoc::Cmd::AUTO_TUNE, ch, pref, 0, 0, 0 };
     uint8_t rx1[7] = {0};
     transfer(tx, rx1, 7);
-    if (!_wait_op_done(10000)) return false;   // busy 未在 10s 内清 = 超时
-    // 读结果: [magic, GET_AUTO_TUNE, result, 0, div24]。
+    // 单通道三步算法最坏约 24(粗定位+细搜, 二者互斥性使其不叠满) + 13(落档回退) 次单 widget 校准
+    // ≈ 300-650ms。★全通道(0xFF)已改为逐通道各自校准★: 36 × 单通道 ≈ 11-23s(最坏更长) →
+    // 窗口放宽到 45s, 且必须小于上位机卡死阈值(csd_diag_tick 3200 tick ≈ 51s), 否则上位机会先误报。
+    if (!_wait_op_done(45000, on_progress, progress_ctx)) return false;   // busy 未在窗口内清 = 超时
+    // 读结果: [magic, GET_AUTO_TUNE, result, ch, div_lo, div_hi, progress]; 完成时 div 为最终分频。
     uint8_t resp[7];
     if (!_cmd_txn((uint8_t)psoc::Cmd::GET_AUTO_TUNE, 0, 0, 0, resp)) return false;
     if (resp[1] != (uint8_t)psoc::Cmd::GET_AUTO_TUNE) return false;
@@ -468,6 +491,13 @@ bool PsocSpi::snapshot_pump(uint8_t max_pages, psoc::SensorSnapshot* out) {
     // 好处：全程单一锁存→数据一致；每份快照仅 1 个 BEGIN→故障点极少，杜绝多块 re-BEGIN 偶发失败。
     uint8_t expected_seq;
 
+    // ★卡死兜底(修"采样永久冻结")★：原地重试是无上限的，一旦某页因应答流水失步永远读不出来，
+    // 这份快照就永不完成 → 发布态一直是旧值 → 上位机看到全通道 raw/baseline/diff 冻结。
+    // 超过完成期限即丢弃已读进度，改为重新 BEGIN 一份干净快照，使遥测必然能自行恢复。
+    if (_snap_active && (time_us_32() - _snap_start_us) > SNAP_COMPLETE_TIMEOUT_US) {
+        _snap_active = false;
+    }
+
     if (!_snap_active) {
         // 新快照：BEGIN 锁存 + 请求 page0 取回 INFO(generation/valid/count)。
         psoc::Frame begin = _make_request(psoc::Cmd::SNAPSHOT_BEGIN);
@@ -489,6 +519,7 @@ bool PsocSpi::snapshot_pump(uint8_t max_pages, psoc::SensorSnapshot* out) {
         _snap_valid = info.payload[2] != 0;
         _snap_page = 0;
         _snap_active = true;
+        _snap_start_us = time_us_32();
         expected_seq = req0.seq;   // req0 已令 PSoC 装载 page[0]
     } else {
         // 续读：不 BEGIN。prime 请求当前页令 PSoC 装载它；prime 的响应是触控残帧，丢弃不校验。

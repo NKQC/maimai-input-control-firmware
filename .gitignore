@@ -41,3 +41,5 @@
 *.dwo
 SensorFirmware/PSoC4000SSensorFirmware/mtb_shared/recipe-make-cat2/release-v2.5.0
 .cache
+
+.kiro/

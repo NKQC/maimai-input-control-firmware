@@ -20,6 +20,8 @@
 #include "service/psoc_updater/psoc_updater.h"
 #include "service/csd_config/csd_config.h"
 #include "service/psoc_algo/psoc_algo.h"
+#include "service/self_heal/self_heal.h"
+#include "service/tx_scheduler/tx_scheduler.h"
 #include "service/keyboard/keyboard.h"
 #include "service/tx_scheduler/tx_scheduler.h"
 #include "service/usb_debug.h"
@@ -126,6 +128,8 @@ void setup() {
     if (work_mode == UsbWorkMode::WORK_SERIAL) {
         GameIoService::getInstance()->init(work_mode);
     }
+    // mai2 串口状态命令与工作模式无关(HID 模式如实回 STOPPED), 故无条件注册。
+    GameIoService::getInstance()->register_host_cmds();
 
     // ★启动 core1★：必须在任何 flash 写(loop 的 save_config_task)之前完成，
     // 使 multicore_lockout_start_blocking() 有已注册的 victim 可暂停，而非永久死锁。
@@ -168,23 +172,54 @@ void loop() {
     PsocUpdater* updater = PsocUpdater::getInstance();
     updater->update();
 
+    // provisioning 状态(算法 + CSD 是否已下发到当前这颗运行中的 PSoC)。救砖与失效兜底都要清它，
+    // 故在此提前声明(其语义与去抖逻辑见下方 provisioning 段)。
+    static bool provisioned = false;
+    static uint32_t link_down_since_ms = 0;
+    // 主机主动重启后的事件抑制窗(见下方 g_psoc_reboot_request 分支): 窗内不把链路丢失型复位
+    // 上报为"固件自行救自己", 否则上位机会看到自己发起的重启被描述成设备异常。
+    static uint32_t host_reboot_quiet_until_ms = 0u;
+
+    // ★PSoC 救砖(PSOC_RESCUE)★：命令已回 ACK，重活在此(主循环安全窗口)执行——经 SWD 强制全片
+    // 擦写内嵌镜像+校验+复位运行。擦写数秒期间由 SwdProgrammer 的保活钩子喂狗/泵 USB/推送进度。
+    // 完成后清 provisioned，交由下方既有 provisioning 重新下发算法 + CSD(即"重新应用")。
+    if (updater->rescue_step(psoc)) {
+        provisioned = false;
+        psoc->clear_reset_request();   // 重刷期间 core1 必然判过链路丢失，清掉避免刚恢复就被 XRES
+        SelfHeal::getInstance()->note(SH_PSOC_RESCUED, 0u);
+    }
+
     // ★失效兜底★：core1 检测到 PSoC 崩溃/掉线(reason=1)或主循环卡死(reason=2, 疑似坏算法)后，
     // core0 在此脉冲 XRES 硬复位 PSoC。算法/CSD 参数在 PSoC RAM，复位即丢失，故 provisioned 归零
     // 令链路恢复后重新下发。reason=2(卡死)且当前为自定义算法 → 判定该算法致命，回退内嵌默认防复位环。
-    const uint8_t reset_reason = psoc->needs_reset();
+    // 救砖进行中不介入: 此时 PSoC 被 halt 在 SWD 会话里, XRES 会打断擦写。
+    const uint8_t reset_reason = updater->rescue_active() ? 0u : psoc->needs_reset();
     if (reset_reason != 0u) {
         if (reset_reason == 2u && !PsocAlgo::getInstance()->is_default()) {
             PsocAlgo::getInstance()->reset_default();
+            // 用户算法被判定致命并回退 —— 这是最容易让人误判"我的算法还在跑"的一步, 必须上报。
+            SelfHeal::getInstance()->note(SH_ALGO_FALLBACK, 0u);
         }
         psoc->reset_run();
         psoc->clear_reset_request();
+        // 卡死型(reason=2)永远上报; 链路丢失型(reason=1)在主机主动重启的抑制窗内跳过, 免得把
+        // "上位机自己发起的重启"报成"固件自行复位"。
+        if (reset_reason == 2u) {
+            SelfHeal::getInstance()->note(SH_PSOC_RESET_HANG, reset_reason);
+        } else if (millis() >= host_reboot_quiet_until_ms) {
+            SelfHeal::getInstance()->note(SH_PSOC_RESET_LINK, reset_reason);
+        }
     }
 
     // ★主机请求重启 PSoC★(REBOOT_PSOC=0x06): 脉冲 XRES 复位 PSoC 进运行态, 使"需重启生效"的
     // 改动(如全局 CSD 重初始化)真正生效。复位后链路短暂丢失→下方 provisioned 逻辑自动重新下发算法/CSD。
+    // ★主机主动重启不算"固件自行救自己"★: 它必然带来一次链路丢失, core1 随后会把它当成 PSoC 掉线
+    // 再报一次复位事件, 上位机就会看到"固件已自行 XRES 复位"这种误导文案。故在此开一个短抑制窗,
+    // 窗内的链路丢失型复位事件不上报(重启本身由上位机发起, 它自己知道)。
     if (g_psoc_reboot_request) {
         g_psoc_reboot_request = 0u;
         psoc->reset_run();
+        host_reboot_quiet_until_ms = millis() + 3000u;
     }
 
     // ★无状态 PSoC 启动/复位后下发★：SPI 链路(重新)就绪后一次性把 RP2040 持有的算法与 CSD 配置
@@ -194,8 +229,6 @@ void loop() {
     // 使 link_ok 瞬时 false。若一有 false 就清 provisioned 会触发"重下发→重初始化→又瞬断"的
     // provision 死循环(表现为状态灯白/绿反复闪 + 周期性重扫扰动 Cp/时序)。仅当链路【持续】断开
     // 超过阈值(真正 PSoC 复位)才判为未就绪重新下发, 忽略重初始化期间的瞬时抖动。
-    static bool provisioned = false;
-    static uint32_t link_down_since_ms = 0;
     const bool link_now = psoc->link_ok();
     if (link_now) {
         link_down_since_ms = 0;
@@ -204,19 +237,82 @@ void loop() {
     }
     if (!provisioned && link_now) {
         PsocAlgo::getInstance()->download_to_psoc(psoc);
-        CsdConfig::getInstance()->download_to_psoc(psoc);
+        CsdConfig* csd = CsdConfig::getInstance();
+        csd->download_to_psoc(psoc);
         provisioned = true;
+        // ★恢复默认→良好半自动基线★: RESET_DEFAULTS 后 store 已清空, PSoC 此刻带出厂强制好全局
+        // (增益4/目标85%) 且 Enable 已自动校准好 IDAC(raw≈目标, 未 railed)。回读这些校准好的值作默认,
+        // 切 SEMI 快速模式并立即重下发生效 → 得到"正常半自动基线"作为默认; RP2040 持有, PSoC 无状态。
+        // ★可信度校验(修"恢复默认救不回来")★: 若 PSoC 此刻本身就异常(raw 满量程 railed / 完全不抖动
+        // = 扫描停滞), 无条件回读就会把坏状态固化成新默认, 越点越回不去(实机已复现)。故先抽检采样,
+        // 不可信则【不固化】: 保持 store 空(AUTO + invalid)让 PSoC 跑自己的出厂默认链, 并置标志
+        // 经 DEVICE_INFO 上报, 由上位机提示改用"PSoC 救砖"。
+        if (csd->has_pending_recapture()) {
+            if (csd->mode() != CSD_MODE_SEMI) {
+                // AUTO 的实时参数由 CapSense 自动计算；即使采样可信也绝不能回读固化，
+                // 否则会覆盖用户原先保存的手动阈值/snsClk，切回 SEMI 时无法恢复。
+            } else if (csd->sampling_trustworthy(psoc) && csd->capture_from_psoc(psoc)) {
+                csd->download_to_psoc(psoc);       // set_mode(SEMI)+参数+APPLY: 手动参数即时生效
+                csd->request_save();               // 持久化, 成为下次开机默认
+            } else {
+                csd->clear();                      // 空 store(含 request_save): 真正回到出厂默认链
+                csd->download_to_psoc(psoc);       // set_mode(AUTO): PSoC 走标准完整处理 + 自动校准
+                csd->note_baseline_untrusted(true);
+                // 整个 CSD store 被清空并落盘 —— 用户所有逐通道调参就此消失, 不上报等于骗人。
+                SelfHeal::getInstance()->note(SH_STORE_CLEARED, 0u);
+            }
+            csd->clear_recapture();
+        }
+        // 救砖的"重新应用"以此为完成点: 算法 + CSD 已重新下发到刚刷好的 PSoC。
+        updater->rescue_note_reapplied();
+        // 该标志只记录当前运行态的不可信采样；PSoC 重启/救砖重新应用后必须再次实测，
+        // 已恢复才清除，避免无条件隐藏仍存在的硬件或扫描异常。
+        if (csd->baseline_untrusted() && csd->sampling_trustworthy(psoc)) {
+            csd->note_baseline_untrusted(false);
+            SelfHeal::getInstance()->note(SH_BASELINE_TRUST_RESTORED, 0u);
+        }
+        // 重新下发完成 → 上位机据此重新回读设备真值(PSoC 的 CSD 配置活在 RAM, 复位后必然换了一套)。
+        SelfHeal::getInstance()->note(SH_REPROVISIONED, csd->mode());
+        // PSoC 启动时若强制改写过生成配置(IDAC 增益档抬到下限 / 非法校准目标% 回退 85), 一并上报,
+        // 使"设备实际值 != 下发值"永远有据可查, 不再是静默不同步。
+        {
+            // PSoC 侧 GPARAM_BOOT_OVERRIDE(0x09): 只读位掩码, 见 psoc_firmware main.c。
+            constexpr uint8_t GPARAM_ID_BOOT_OVERRIDE = 0x09u;
+            uint32_t override_bits = 0u;
+            if (psoc->get_global(GPARAM_ID_BOOT_OVERRIDE, &override_bits) && override_bits != 0u) {
+                SelfHeal::getInstance()->note(SH_PSOC_BOOT_OVERRIDE, override_bits);
+            }
+        }
     }
     // 持续断开 >400ms 视为真复位 → 清 provisioned, 链路恢复后重下发(算法/CSD 在 PSoC RAM, 复位丢失)。
     if (!link_now && link_down_since_ms != 0u && (millis() - link_down_since_ms) > 400u) {
         provisioned = false;
     }
 
+    // ★自持恢复事件必达兜底★: note() 只在事件发生那一刻拉起推送任务, 若当时上位机没连(或租约过期
+    // 自取消), 队列里的事件就再也没人推 → 用户永远看不到"设备被固件改过"。故只要队列非空且任务不在,
+    // 就重新拉起(有上位机时 10Hz 排空, 无上位机时靠租约自灭, 不常驻)。
+    if (!SelfHeal::getInstance()->empty() && !TxScheduler::getInstance()->active(TX_TASK_SELFHEAL)) {
+        SelfHeal::getInstance()->note_rearm();
+    }
+
     UsbComm::getInstance()->update();
 
-    // ★主机租约★：ping 续期。超时未续期即认定上位机丢失,主动停遥测(自洽:绿灯亦据此判连接)。
+    // ★主机租约★：ping 续期。超时未续期即认定上位机丢失,暂停遥测(自洽:绿灯亦据此判连接)。
+    // ★只挂起、不永久停★: core0 可能只是被长设备操作(JIT 算法下发/校准/flash 落地)按在
+    // UsbComm::update() 之外几秒 —— 上位机其实一直在, 但租约照样过期。旧实现在这里调 stop(),
+    // 把 _streaming 清掉且没有任何恢复路径 → 上位机不会再发 TELEM_START → 全通道 raw/baseline/diff
+    // 永久冻结, 只能复位设备。改为挂起, 主机命令一到即用原参数自动续推。
     if ((millis() - g_last_host_cmd_ms) > HOST_LEASE_TIMEOUT_MS) {
-        SensorLink::getInstance()->stop();
+        SensorLink::getInstance()->suspend();
+    } else {
+        SensorLink::getInstance()->resume();
+    }
+
+    // ★算法下发结果上报★: 下发已异步化(core1 执行), 失败只有 core1 知道。在此取走标志上报,
+    // 使"算法没真正装上"永远有据可查, 而不是让用户以为自定义算法正在跑。
+    if (psoc->algo_download_take_failure()) {
+        SelfHeal::getInstance()->note(SH_ALGO_FALLBACK, 1u);
     }
 
     // ★大吞吐统一走定时任务队列★: 遥测等周期发送由 TxScheduler 按各自频率+租约驱动(续期制),
@@ -232,12 +328,18 @@ void loop() {
     // ★flash 落地安全窗口★：命令 handler 只置保存信号，实际 flash 写在此(命令已处理完、ACK 已发)执行。
     // flash 写内部已用 disable_interrupts()+multicore_lockout(暂停 core1)保护 XIP 擦写窗口，
     // 两核都不访问总线→写后 USB 自动恢复，无需重新枚举(照抄 v3.1，不再 reconnect)。
+    // ★每轮最多落一份★: 单份 LittleFS 写要禁中断 + 停 XIP + lockout core1 数十~上百 ms, 期间
+    // TinyUSB 的 USB 中断完全得不到服务。一次"保存到设备"会同时置起 config/csd/algo 三个信号,
+    // 三份背靠背写 = 数百 ms 连续 USB 黑洞, 主机侧待处理的 OUT 传输会被 Windows 直接 abort
+    // (实测 kind=ConnectionAborted → 拆端点 → 判断开)。分轮落地, 每份之间必有一次完整 USB 服务轮。
     {
-        if (ConfigManager::has_pending_save()) { ConfigManager::save_config_task(); }
-        CsdConfig* csd_cfg = CsdConfig::getInstance();
-        if (csd_cfg->has_pending_save()) { csd_cfg->save(); }
-        PsocAlgo* algo_store = PsocAlgo::getInstance();
-        if (algo_store->has_pending_save()) { algo_store->save(); }
+        if (ConfigManager::has_pending_save()) {
+            ConfigManager::save_config_task();
+        } else if (CsdConfig::getInstance()->has_pending_save()) {
+            CsdConfig::getInstance()->save();
+        } else if (PsocAlgo::getInstance()->has_pending_save()) {
+            PsocAlgo::getInstance()->save();
+        }
     }
 
     // ★vendor OUT 自愈★：每轮检查 config vendor OUT 是否仍处 arm 态，若因 flash 扰动等
