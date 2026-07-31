@@ -39,14 +39,14 @@ void NvStore::enable_lockout() {
     _nv_lockout_ready = true;
 }
 
-uint32_t NvStore::_region_offset(Region region, uint8_t slot) {
+uint32_t NvStore::_region_offset(Region region) {
 #ifdef PICO_PLATFORM
     const uint32_t fs_base = (uint32_t)(&_FS_start) - XIP_BASE;
-    // 排布仍是 [KV A][KV B][CSD A][CSD B][BIN A][BIN B][SRC A][SRC B], 但每区步长各自不同,
-    // 由 nv_layout 的累计表给出 —— 绝无硬编码绝对 flash 地址。
-    return fs_base + nv_layout::region_offset((uint32_t)region, slot);
+    // 排布是 [KV][CSD][ALGO_BIN][ALGO_SRC], 每区一份、步长各自不同, 由 nv_layout 的累计表给出
+    // —— 绝无硬编码绝对 flash 地址。
+    return fs_base + nv_layout::region_offset((uint32_t)region);
 #else
-    (void)region; (void)slot;
+    (void)region;
     return 0u;
 #endif
 }
@@ -157,22 +157,26 @@ bool NvStore::_unpack(Region region, const uint8_t* payload, uint32_t len) {
     return true;
 }
 
-bool NvStore::_read_slot(Region region, uint8_t slot, uint32_t* out_seq) {
+bool NvStore::_read_region(Region region, uint32_t* out_write_count) {
 #ifdef PICO_PLATFORM
     if (!_space_ok()) return false;
-    const uint8_t* base = (const uint8_t*)(XIP_BASE + _region_offset(region, slot));
+    const uint8_t* base = (const uint8_t*)(XIP_BASE + _region_offset(region));
     Header h;
     memcpy(&h, base, sizeof(h));
-    if (h.magic != MAGIC || h.version != VERSION) return false;
+    if (h.magic != MAGIC) return false;
+    if (h.version < VERSION_MIN_READ || h.version > VERSION) return false;
+    // ★region 自述必须对上★: 单份化让各区偏移整体前移, 新位置可能压在旧布局里别的区的数据上,
+    // 那些数据的 magic/version/CRC 全都合法, 只有自述字段能拦住"把 KV 的字节摊进 CSD"。
+    if (h.region != (uint32_t)region) return false;
     if (h.len > nv_layout::payload_cap((uint32_t)region)) return false;
     const uint8_t* payload = base + sizeof(Header);
     // 读走 XIP 直接 memcpy + CRC, 零擦写 ⇒ 不可能出现"只读回一半"(旧 LittleFS 路径的老毛病)。
     if (_crc32(payload, h.len) != h.crc) return false;
     if (!_unpack(region, payload, h.len)) return false;
-    *out_seq = h.seq;
+    if (out_write_count != nullptr) *out_write_count = h.write_count;
     return true;
 #else
-    (void)region; (void)slot; (void)out_seq;
+    (void)region; (void)out_write_count;
     return false;
 #endif
 }
@@ -193,68 +197,78 @@ static void __not_in_flash_func(_nv_program)(uint32_t offset, const uint8_t* buf
 }
 #endif
 
-bool NvStore::_write_slot(Region region, uint8_t slot, uint32_t seq) {
-#ifdef PICO_PLATFORM
-    if (!_space_ok()) return false;
+bool NvStore::_begin_commit(Region region) {
     const uint32_t idx = (uint32_t)region;
-    const uint32_t region_bytes = nv_layout::region_bytes(idx);
-    const uint32_t base_off = _region_offset(region, slot);
     const uint32_t len = _payload_len(region);
     if (len > nv_layout::payload_cap(idx)) return false;
     // 负载为 0 是合法的(例如清空算法 C 源), 仍要写一份"空但有效"的头。
+    // ★头与 CRC 一次算定、整片复用★: 若每扇区各算一次, 中途负载被改动就会写出一份
+    // "头与内容各说各话"的镜像 —— 那种镜像 CRC 校验能过, 内容却是拼接的两代, 最难查。
+    // 现在负载中途变化只会让最终回读校验失败(脏标记仍在, 下轮重写), 不可能留下假有效的镜像。
+    memset(&_commit_hdr, 0, sizeof(_commit_hdr));
+    _commit_hdr.magic = MAGIC;
+    _commit_hdr.version = VERSION;
+    _commit_hdr.region = idx;
+    _commit_hdr.len = len;
+    _commit_hdr.crc = _payload_crc(region, len);
+    _commit_hdr.write_count = _rs[idx].write_count + 1u;
+    _commit_region = (int8_t)idx;
+    _commit_pos = 0u;
+    return true;
+}
 
-    Header h;
-    memset(&h, 0, sizeof(h));
-    h.magic = MAGIC;
-    h.version = VERSION;
-    h.seq = seq;
-    h.len = len;
-    h.crc = _payload_crc(region, len);
-
-    // ★最大写缓冲 = 1 个扇区(定长静态)★: 逐扇区擦+编程, 每扇区一个独立的 lockout 窗口。
-    // 若整份一次擦(ALGO_SRC 9 扇区)会把中断关上几百 ms, USB 在途传输被 abort —— 那是本类当初
-    // 要解决的问题, 不能因为区变大又还回去。写的是"另一份", 中途断电只会让这份 CRC 不过, 当前份完好。
+bool NvStore::_write_one_sector(Region region, uint32_t pos) {
+#ifdef PICO_PLATFORM
+    if (!_space_ok()) return false;
+    const uint32_t base_off = _region_offset(region);
+    const uint32_t len = _commit_hdr.len;
+    const uint32_t img_used = (uint32_t)sizeof(Header) + len;   // 本区实际有内容的字节数
+    // ★最大写缓冲 = 1 个扇区(定长静态)★
     static uint8_t sect[nv_layout::SECTOR_BYTES];
-    const uint32_t img_used = (uint32_t)sizeof(Header) + len;   // 本份实际有内容的字节数
-    {
-        // FlashWriteGuard 暂停定时 IN 推送并置 flash 忙标记(既有约定, 复用)。
-        FlashWriteGuard guard;
-        for (uint32_t pos = 0u; pos < region_bytes; pos += nv_layout::SECTOR_BYTES) {
-            if (pos >= img_used) {
-                // 尾部空扇区: 只擦不编程。必须擦 —— 否则下次写更长负载时会往未擦区域编程而写坏。
-                _nv_program(base_off + pos, nullptr, 0u);
-                watchdog_update();
-                continue;
-            }
-            memset(sect, 0xFF, sizeof(sect));
-            uint32_t dst = 0u;
-            uint32_t img = pos;
-            if (img < sizeof(Header)) {
-                const uint32_t n = (uint32_t)sizeof(Header) - img;
-                memcpy(sect, (const uint8_t*)&h + img, n);
-                dst = n;
-                img += n;
-            }
-            const uint32_t pay_off = img - (uint32_t)sizeof(Header);
-            if (pay_off < len) {
-                uint32_t n = len - pay_off;
-                if (n > nv_layout::SECTOR_BYTES - dst) n = nv_layout::SECTOR_BYTES - dst;
-                _payload_copy(region, pay_off, sect + dst, n);
-            }
-            _nv_program(base_off + pos, sect, nv_layout::SECTOR_BYTES);
-            watchdog_update();
-        }
-    }
 
-    // 回读校验后才认为写成功 —— 只有这样"切换有效份"才是安全的。
-    const uint8_t* base = (const uint8_t*)(XIP_BASE + base_off);
-    Header rh;
-    memcpy(&rh, base, sizeof(rh));
-    if (rh.magic != MAGIC || rh.version != VERSION || rh.seq != seq || rh.len != len) return false;
-    if (_crc32(base + sizeof(Header), len) != rh.crc) return false;
+    // FlashWriteGuard 暂停定时 IN 推送并置 flash 忙标记(既有约定, 复用)。
+    FlashWriteGuard guard;
+    if (pos >= img_used) {
+        // 尾部空扇区: 只擦不编程。必须擦 —— 否则下次写更长负载时会往未擦区域编程而写坏。
+        _nv_program(base_off + pos, nullptr, 0u);
+        watchdog_update();
+        return true;
+    }
+    memset(sect, 0xFF, sizeof(sect));
+    uint32_t dst = 0u;
+    uint32_t img = pos;
+    if (img < sizeof(Header)) {
+        const uint32_t n = (uint32_t)sizeof(Header) - img;
+        memcpy(sect, (const uint8_t*)&_commit_hdr + img, n);
+        dst = n;
+        img += n;
+    }
+    const uint32_t pay_off = img - (uint32_t)sizeof(Header);
+    if (pay_off < len) {
+        uint32_t n = len - pay_off;
+        if (n > nv_layout::SECTOR_BYTES - dst) n = nv_layout::SECTOR_BYTES - dst;
+        _payload_copy(region, pay_off, sect + dst, n);
+    }
+    _nv_program(base_off + pos, sect, nv_layout::SECTOR_BYTES);
+    watchdog_update();
     return true;
 #else
-    (void)region; (void)slot; (void)seq;
+    (void)region; (void)pos;
+    return false;
+#endif
+}
+
+bool NvStore::_verify_region(Region region) const {
+#ifdef PICO_PLATFORM
+    // 回读校验后才认为写成功 —— 否则"写坏了"会被记成 commit_ok, 直到下次启动才暴露。
+    const uint8_t* base = (const uint8_t*)(XIP_BASE + _region_offset(region));
+    Header rh;
+    memcpy(&rh, base, sizeof(rh));
+    if (rh.magic != MAGIC || rh.version != VERSION ||
+        rh.region != (uint32_t)region || rh.len != _commit_hdr.len) return false;
+    return _crc32(base + sizeof(Header), rh.len) == rh.crc;
+#else
+    (void)region;
     return false;
 #endif
 }
@@ -264,31 +278,19 @@ bool NvStore::load() {
     for (uint32_t i = 0; i < (uint32_t)Region::COUNT; i++) {
         const Region r = (Region)i;
         RegionState& rs = _rs[i];
-        rs.seq = 0;
-        rs.slot = 0;
+        rs.write_count = 0;
+        rs.valid = false;
         rs.dirty = false;
         if (r != Region::KV && rs.buf == nullptr) continue;   // 未注册的 blob 区跳过
 
-        // 两份都试, 取 seq 更大的那份。_read_slot 成功即已摊回镜像, 故先读旧的再读新的,
-        // 让最终留在镜像里的是新的那份。
-        uint32_t sa = 0, sb = 0;
-        const bool oka = _read_slot(r, 0, &sa);
-        const bool okb = _read_slot(r, 1, &sb);
-        if (okb && (!oka || sb > sa)) {
-            rs.seq = sb;
-            rs.slot = 1;
-        } else if (oka) {
-            // B 无效或更旧: 重读 A(上一步若读过 B, 镜像已被 B 覆盖)。
-            uint32_t again = 0;
-            if (_read_slot(r, 0, &again)) {
-                rs.seq = again;
-                rs.slot = 0;
-            }
-        }
-        const bool any = oka || okb;
+        // ★单份: 读就是读它, 没有"选哪一份"这一步★ —— 于是也不存在跨区选出不同代、拼出半新半旧
+        // 的可能。校验不过就是本区无效, 由持有者按默认值重建, 相邻区一个字节都不受影响。
+        uint32_t wc = 0;
+        rs.valid = _read_region(r, &wc);
+        if (rs.valid) rs.write_count = wc;
         if (r == Region::KV) {
-            kv_ok = any;
-            if (!any) _count = 0;
+            kv_ok = rs.valid;
+            if (!rs.valid) _count = 0;
         }
     }
     return kv_ok;
@@ -315,9 +317,53 @@ uint32_t NvStore::algo_src_len() const {
     return _payload_len(Region::ALGO_SRC);
 }
 
+uint8_t NvStore::valid_mask() const {
+    uint8_t mask = 0u;
+    for (uint32_t i = 0; i < (uint32_t)Region::COUNT; i++) {
+        if (_rs[i].valid) mask |= (uint8_t)(1u << i);
+    }
+    return mask;
+}
+
 bool NvStore::commit_step() {
-    // 起点随每次候选区轮转：KV 持续被置脏时，后续 CSD/ALGO 区仍会在有限轮内获得一次提交机会。
     constexpr uint32_t COUNT = (uint32_t)Region::COUNT;
+
+    // ① 已有分片写在进行中 ⇒ 只推进它, 绝不中途切到别的区。
+    //    切区会让两个区都停在半成品状态, 一次掉电同时丢两区 —— 与"坏只坏在变更那一区"相悖。
+    if (_commit_region >= 0) {
+        const uint32_t i = (uint32_t)_commit_region;
+        const Region r = (Region)i;
+        RegionState& rs = _rs[i];
+        const uint32_t region_bytes = nv_layout::region_bytes(i);
+
+        const bool wrote = _write_one_sector(r, _commit_pos);
+        _commit_pos += nv_layout::SECTOR_BYTES;
+        if (!wrote) {
+            // 连一个扇区都没写成(空间校验不过等) ⇒ 放弃本片, 保留脏标记, 如实标无效。
+            _commit_region = -1;
+            rs.valid = false;
+            _commit_fail++;
+            return true;
+        }
+        if (_commit_pos < region_bytes) return true;   // 还有扇区, 下一轮继续(中间 USB 正常服务)
+
+        _commit_region = -1;
+        if (_verify_region(r)) {
+            rs.write_count = _commit_hdr.write_count;
+            rs.valid = true;
+            rs.dirty = false;
+            _commit_ok++;
+        } else {
+            // 本区 flash 已被擦过又没写成 ⇒ 如实标无效并**保留脏标记**下轮重写。
+            // 谎报成功或悄悄清脏, 就会让"这一区其实已经没了"永远查不出来。
+            rs.valid = false;
+            _commit_fail++;
+        }
+        return true;
+    }
+
+    // ② 没有在进行的片 ⇒ 挑下一个脏区起片。
+    // 起点随每次候选区轮转：KV 持续被置脏时，后续 CSD/ALGO 区仍会在有限轮内获得一次提交机会。
     for (uint32_t pass = 0u; pass < COUNT; pass++) {
         const uint32_t i = ((uint32_t)_commit_next + pass) % COUNT;
         RegionState& rs = _rs[i];
@@ -329,18 +375,14 @@ bool NvStore::commit_step() {
             rs.dirty = false;
             continue;
         }
-
-        const uint8_t target = (uint8_t)(rs.slot ^ 1u);
-        const uint32_t next_seq = rs.seq + 1u;
-        if (_write_slot(r, target, next_seq)) {
-            rs.slot = target;
-            rs.seq = next_seq;
+        if (!_begin_commit(r)) {
+            // 负载超容量: 明确失败, 清脏避免死循环重试(容量问题重试一万次也一样)。
             rs.dirty = false;
-            _commit_ok++;
-        } else {
             _commit_fail++;
+            return true;
         }
-        return true;
+        // 起片这一轮就把第一个扇区写掉, 保持"调用一次 = 至多一次 flash 写"的既有语义。
+        return commit_step();
     }
     return false;
 }

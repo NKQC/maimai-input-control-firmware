@@ -1127,6 +1127,2023 @@ fn run_led_test(ctrl: &mut AppController) -> bool {
     passed
 }
 
+#[derive(Debug)]
+struct BusEnvelope {
+    msg_id: u8,
+    seq: u16,
+    total_len: u16,
+    frag_off: u16,
+    flags: u8,
+    /// 设备端组帧时刻 time_us_32()(线上头 off 10..13), 与 host_cmd 尾戳/TELEM_DATA 同源。
+    t_us: u32,
+    payload: Vec<u8>,
+}
+
+const BUS_MAGIC: u8 = 0xB5;
+/// 与固件 bus_types.h 的 BUS_LEN_UNKNOWN 一致: 流式/推送的总长未知哨兵值。
+const BUS_LEN_UNKNOWN: u16 = 0xFFFF;
+const BUS_MSG_LED_SET: u8 = 0x01;
+const BUS_MSG_LED_STATE: u8 = 0x02;
+const BUS_FLAG_FIRST: u8 = 0x01;
+const BUS_FLAG_LAST: u8 = 0x02;
+const BUS_FLAG_STREAM: u8 = 0x04;
+const BUS_FLAG_NAK: u8 = 0x20;
+const BUS_LED_STATE_FLAG_ERROR: u8 = 0x01;
+const BUS_POLL_INTERVAL_MS: u64 = 50;
+const BUS_POLL_ATTEMPTS: usize = 20;
+/// 与固件 bus_core.h 同源的容量常量: 重组暂存上限 / 单片 MTU / 推送环容量 / 子环池槽数。
+const BUS_ASM_MAX: u16 = 1024;
+const BUS_INLINE_MAX: usize = 64;
+const BUS_PUSH_RING_CAP: usize = 8;
+/// 与固件 bus_core.h 同源: 头加 t_us 后 BusEnv 96B, 为守住 12KB 硬上限子环池由 4 降为 3。
+const BUS_SUBRING_SLOTS: usize = 3;
+/// 线上信封头字节数(与固件 BUS_HDR_SIZE 同源): 12 → 16(插入 t_us(u32 LE) @ off 10..13)。
+const BUS_HDR_SIZE: usize = 16;
+/// 头内被 CRC 覆盖的字节数(off 1..13 = msg_id..t_us), 与固件 BUS_CRC_SPAN 同源。
+const BUS_CRC_SPAN: usize = 13;
+/// 未被任何服务订阅的自测 msg_id: 0x10 走分片重组, 0x11 由固件自测钩子当流式通道用。
+const BUS_MSG_PROBE_ASM: u8 = 0x10;
+const BUS_MSG_PROBE_STREAM: u8 = 0x11;
+/// 自测钩子请求码(BUS_XFER 请求 payload 恰好 1 字节时生效, 见 bus_usb_link.cpp 文件头注释)。
+const BUS_PROBE_STAT: u8 = 0x01;
+const BUS_PROBE_STREAM: u8 = 0x02;
+const BUS_PROBE_SUBRING: u8 = 0x03;
+const BUS_STAT_FIELDS: usize = 9;
+/// 一次排空动作的轮询轮数(每轮一次空 BUS_XFER + 50ms 间隔)。
+const BUS_DRAIN_ROUNDS: usize = 6;
+
+/// 固件 BusStat 的主机侧镜像。字段序与 bus_usb_link.cpp:_probe(BUS_XFER_PROBE_STAT) 写死一致。
+#[derive(Debug, Clone, Copy, Default)]
+struct BusStatSnapshot {
+    tx_frag: u32,
+    rx_frag: u32,
+    rx_drop_crc: u32,
+    rx_drop_full: u32,
+    retrans: u32,
+    timeout: u32,
+    deliver: u32,
+    svc_overwrite: u32,
+    push_overwrite: u32,
+}
+
+/// CRC 覆盖 = 头 off[1..1+BUS_CRC_SPAN)(msg_id..t_us) + payload; 不含 magic 与 crc 自身。
+fn _bus_crc(frame: &[u8]) -> u16 {
+    let mut crc = 0xFFFFu16;
+    for byte in frame[1..1 + BUS_CRC_SPAN]
+        .iter()
+        .chain(frame[BUS_HDR_SIZE..].iter())
+    {
+        crc ^= (*byte as u16) << 8;
+        for _ in 0..8 {
+            crc = if (crc & 0x8000) != 0 {
+                crc.wrapping_shl(1) ^ 0x1021
+            } else {
+                crc.wrapping_shl(1)
+            };
+        }
+    }
+    crc
+}
+
+/// 通用线上信封构帧(16B 头 + payload, CRC 现算)。LED_SET 与后续分片/超长/坏 CRC 子项
+/// 全部复用这一条构帧路径, 不另开第二套。
+/// 主机→设备方向的 t_us 填 0: 主机时钟对设备无意义, 设备侧也不解释入向 t_us(只是原样搬运)。
+fn _bus_make_frame(
+    msg_id: u8,
+    seq: u16,
+    total_len: u16,
+    frag_off: u16,
+    flags: u8,
+    payload: &[u8],
+) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(BUS_HDR_SIZE + payload.len());
+    frame.push(BUS_MAGIC);
+    frame.push(msg_id);
+    frame.extend_from_slice(&seq.to_le_bytes());
+    frame.extend_from_slice(&total_len.to_le_bytes());
+    frame.extend_from_slice(&frag_off.to_le_bytes());
+    frame.push(payload.len() as u8);
+    frame.push(flags);
+    frame.extend_from_slice(&0u32.to_le_bytes()); // t_us(off 10..13)
+    frame.extend_from_slice(&[0u8; 2]); // crc 占位(off 14..15)
+    frame.extend_from_slice(payload);
+    let crc = _bus_crc(&frame);
+    frame[BUS_HDR_SIZE - 2..BUS_HDR_SIZE].copy_from_slice(&crc.to_le_bytes());
+    frame
+}
+
+fn _bus_make_led_set(seq: u16, rgb: &[u8]) -> Vec<u8> {
+    _bus_make_frame(
+        BUS_MSG_LED_SET,
+        seq,
+        rgb.len() as u16,
+        0,
+        BUS_FLAG_FIRST | BUS_FLAG_LAST,
+        rgb,
+    )
+}
+
+/// 原有严格口径: 只接受"整条消息就一片"的帧(LED 回读专用)。
+fn _bus_parse_xfer(response: &[u8]) -> Result<(u8, u8, Vec<BusEnvelope>), String> {
+    _bus_parse_xfer_ex(response, true)
+}
+
+/// `strict_single=false` 时放宽单分片约束: 多片流式帧(frag_off 递增)与 NAK 信封都要能收。
+/// 头部 4B 解析与逐帧 CRC 校验两种口径完全共用, 不重写第二套。
+fn _bus_parse_xfer_ex(
+    response: &[u8],
+    strict_single: bool,
+) -> Result<(u8, u8, Vec<BusEnvelope>), String> {
+    if response.len() < 4 {
+        return Err(format!("BUS_XFER 响应过短: {}B", response.len()));
+    }
+    let (accepted, rejected, frame_count) = (response[0], response[1], response[2]);
+    let mut offset = 4usize;
+    let mut frames = Vec::with_capacity(frame_count as usize);
+    while offset < response.len() {
+        if response.len() - offset < BUS_HDR_SIZE {
+            return Err(format!("线上帧头截断: offset={} len={}", offset, response.len()));
+        }
+        if response[offset] != BUS_MAGIC {
+            return Err(format!("线上 magic 错误: 0x{:02X}", response[offset]));
+        }
+        let frag_len = response[offset + 8] as usize;
+        let frame_len = BUS_HDR_SIZE + frag_len;
+        if response.len() - offset < frame_len {
+            return Err(format!("线上帧载荷截断: offset={} frag_len={}", offset, frag_len));
+        }
+        let frame = &response[offset..offset + frame_len];
+        let total_len = u16::from_le_bytes([frame[4], frame[5]]);
+        let frag_off = u16::from_le_bytes([frame[6], frame[7]]);
+        // 单分片校验: 偏移必须为 0。总长有两种合法形态 ——
+        //   非流式: total_len == frag_len(整条消息就这一片);
+        //   流式/推送: total_len == BUS_LEN_UNKNOWN(0xFFFF), 长度本就未知, 不能拿 frag_len 去比。
+        let stream = (frame[9] & BUS_FLAG_STREAM) != 0;
+        let total_ok = if stream {
+            total_len == BUS_LEN_UNKNOWN || total_len == frag_len as u16
+        } else {
+            total_len == frag_len as u16
+        };
+        if strict_single && (frag_off != 0 || !total_ok) {
+            return Err(format!(
+                "非完整单分片: stream={} total={} off={} frag={}",
+                stream, total_len, frag_off, frag_len
+            ));
+        }
+        let actual_crc = u16::from_le_bytes([frame[14], frame[15]]);
+        let expected_crc = _bus_crc(frame);
+        if actual_crc != expected_crc {
+            return Err(format!(
+                "线上 CRC 错误: expected=0x{:04X} actual=0x{:04X}",
+                expected_crc, actual_crc
+            ));
+        }
+        let envelope = BusEnvelope {
+            msg_id: frame[1],
+            seq: u16::from_le_bytes([frame[2], frame[3]]),
+            total_len,
+            frag_off,
+            flags: frame[9],
+            t_us: u32::from_le_bytes([frame[10], frame[11], frame[12], frame[13]]),
+            payload: frame[BUS_HDR_SIZE..].to_vec(),
+        };
+        println!(
+            "[BUS] 收到信封: msg_id=0x{:02X} seq={} flags=0x{:02X} frag={}B t_us={} (设备端 time_us_32)",
+            envelope.msg_id, envelope.seq, envelope.flags, frag_len, envelope.t_us
+        );
+        frames.push(envelope);
+        offset += frame_len;
+    }
+    if frames.len() != frame_count as usize {
+        return Err(format!(
+            "frames_out 不匹配: header={} actual={}",
+            frame_count,
+            frames.len()
+        ));
+    }
+    Ok((accepted, rejected, frames))
+}
+
+fn _bus_send_led_set(ctrl: &mut AppController, seq: u16, rgb: &[u8]) -> Result<(), String> {
+    let response = ctrl
+        .bus_xfer(
+            _bus_make_led_set(seq, rgb),
+            Duration::from_millis(BUS_POLL_INTERVAL_MS),
+        )
+        .map_err(|error| format!("LED_SET BUS_XFER 失败: {}", error))?;
+    let (accepted, rejected, _) = _bus_parse_xfer(&response)?;
+    if accepted != 1 || rejected != 0 {
+        return Err(format!(
+            "LED_SET 未受理: accepted={} rejected={}",
+            accepted, rejected
+        ));
+    }
+    Ok(())
+}
+
+fn _bus_poll_led_state(ctrl: &mut AppController) -> Result<BusEnvelope, String> {
+    for _ in 0..BUS_POLL_ATTEMPTS {
+        thread::sleep(Duration::from_millis(BUS_POLL_INTERVAL_MS));
+        let response = ctrl
+            .bus_xfer(Vec::new(), Duration::from_millis(BUS_POLL_INTERVAL_MS))
+            .map_err(|error| format!("空 BUS_XFER 轮询失败: {}", error))?;
+        let (_, rejected, frames) = _bus_parse_xfer(&response)?;
+        if rejected != 0 {
+            return Err(format!("空 BUS_XFER 被拒绝: rejected={}", rejected));
+        }
+        if let Some(frame) = frames
+            .into_iter()
+            .find(|frame| frame.msg_id == BUS_MSG_LED_STATE)
+        {
+            return Ok(frame);
+        }
+    }
+    Err(format!(
+        "{} 次空 BUS_XFER 轮询未收到 LED_STATE",
+        BUS_POLL_ATTEMPTS
+    ))
+}
+
+fn _bus_validate_led_state(
+    state: &BusEnvelope,
+    rgb: [u8; 3],
+    expect_error: bool,
+) -> Result<(), String> {
+    if state.msg_id != BUS_MSG_LED_STATE {
+        return Err(format!("msg_id 错误: 0x{:02X}", state.msg_id));
+    }
+    if (state.flags & BUS_FLAG_STREAM) == 0 {
+        return Err(format!("LED_STATE 非 STREAM: flags=0x{:02X}", state.flags));
+    }
+    if state.payload.len() != 4 {
+        return Err(format!("LED_STATE payload 长度错误: {}", state.payload.len()));
+    }
+    if state.payload[0..3] != rgb {
+        return Err(format!(
+            "LED_STATE RGB 错误: expected={:02X?} actual={:02X?}",
+            rgb,
+            &state.payload[0..3]
+        ));
+    }
+    let has_error = (state.payload[3] & BUS_LED_STATE_FLAG_ERROR) != 0;
+    if has_error != expect_error {
+        return Err(format!(
+            "LED_STATE 错误标志错误: expected={} actual=0x{:02X}",
+            expect_error, state.payload[3]
+        ));
+    }
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// --bus 扩展子项的公共通道: 一次 BUS_XFER 喂入任意信封流 / 排空出向 / 读 BusStat /
+// 触发固件自测钩子。全部复用 _bus_make_frame + _bus_parse_xfer_ex, 不另开构帧或解析路径。
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// 喂入一段(可含多帧的)信封流, 返回 (accepted, rejected, 顺带排空到的出向帧)。
+fn _bus_send_raw(
+    ctrl: &mut AppController,
+    payload: Vec<u8>,
+) -> Result<(u8, u8, Vec<BusEnvelope>), String> {
+    let response = ctrl
+        .bus_xfer(payload, Duration::from_millis(BUS_POLL_INTERVAL_MS * 4))
+        .map_err(|error| format!("BUS_XFER 失败: {}", error))?;
+    _bus_parse_xfer_ex(&response, false)
+}
+
+/// 固定轮数排空出向帧(空 payload = 纯轮询)。返回本次收到的全部帧。
+fn _bus_drain(ctrl: &mut AppController, rounds: usize) -> Result<Vec<BusEnvelope>, String> {
+    let mut collected = Vec::new();
+    for _ in 0..rounds {
+        thread::sleep(Duration::from_millis(BUS_POLL_INTERVAL_MS));
+        let response = ctrl
+            .bus_xfer(Vec::new(), Duration::from_millis(BUS_POLL_INTERVAL_MS * 4))
+            .map_err(|error| format!("空 BUS_XFER 轮询失败: {}", error))?;
+        let (_, rejected, frames) = _bus_parse_xfer_ex(&response, false)?;
+        if rejected != 0 {
+            return Err(format!("空 BUS_XFER 被拒绝: rejected={}", rejected));
+        }
+        collected.extend(frames);
+    }
+    Ok(collected)
+}
+
+/// 触发一个自测钩子(payload 恰好 1 字节)并取回响应体。
+/// 头部 3 字节必须为 0 —— 钩子不喂入信封、不排空出向队列, 正常数据路径不受影响。
+fn _bus_probe(ctrl: &mut AppController, code: u8) -> Result<Vec<u8>, String> {
+    let response = ctrl
+        .bus_xfer(vec![code], Duration::from_millis(BUS_POLL_INTERVAL_MS * 8))
+        .map_err(|error| format!("自测钩子 0x{:02X} BUS_XFER 失败: {}", code, error))?;
+    if response.len() < 4 {
+        return Err(format!(
+            "自测钩子 0x{:02X} 响应过短: {}B",
+            code,
+            response.len()
+        ));
+    }
+    if response[0] != 0 || response[1] != 0 || response[2] != 0 {
+        return Err(format!(
+            "自测钩子 0x{:02X} 头部应为 accepted/rejected/frames_out 全 0, 实际 {:02X?}",
+            code,
+            &response[0..3]
+        ));
+    }
+    if response.len() == 4 {
+        return Err(format!(
+            "自测钩子 0x{:02X} 响应体为空: 设备固件不支持该钩子",
+            code
+        ));
+    }
+    Ok(response[4..].to_vec())
+}
+
+fn _bus_stat(ctrl: &mut AppController) -> Result<BusStatSnapshot, String> {
+    let body = _bus_probe(ctrl, BUS_PROBE_STAT)?;
+    if body.len() != BUS_STAT_FIELDS * 4 {
+        return Err(format!(
+            "BusStat 响应体长度错误: 期望 {}B 实际 {}B",
+            BUS_STAT_FIELDS * 4,
+            body.len()
+        ));
+    }
+    let field = |i: usize| -> u32 {
+        u32::from_le_bytes([body[i * 4], body[i * 4 + 1], body[i * 4 + 2], body[i * 4 + 3]])
+    };
+    Ok(BusStatSnapshot {
+        tx_frag: field(0),
+        rx_frag: field(1),
+        rx_drop_crc: field(2),
+        rx_drop_full: field(3),
+        retrans: field(4),
+        timeout: field(5),
+        deliver: field(6),
+        svc_overwrite: field(7),
+        push_overwrite: field(8),
+    })
+}
+
+/// 子项 10: BusStat 可读性。两次读数必须逐字段单调不减(计数器只增), 否则后面所有增量断言都不可信。
+fn _bus_step_stat(ctrl: &mut AppController) -> Result<BusStatSnapshot, String> {
+    let first = _bus_stat(ctrl)?;
+    let second = _bus_stat(ctrl)?;
+    let pairs: [(&str, u32, u32); BUS_STAT_FIELDS] = [
+        ("tx_frag", first.tx_frag, second.tx_frag),
+        ("rx_frag", first.rx_frag, second.rx_frag),
+        ("rx_drop_crc", first.rx_drop_crc, second.rx_drop_crc),
+        ("rx_drop_full", first.rx_drop_full, second.rx_drop_full),
+        ("retrans", first.retrans, second.retrans),
+        ("timeout", first.timeout, second.timeout),
+        ("deliver", first.deliver, second.deliver),
+        ("svc_overwrite", first.svc_overwrite, second.svc_overwrite),
+        ("push_overwrite", first.push_overwrite, second.push_overwrite),
+    ];
+    for (name, before, after) in pairs {
+        if after < before {
+            return Err(format!("BusStat.{} 倒退: {} → {}", name, before, after));
+        }
+    }
+    println!(
+        "[BUS] stat PASS: tx={} rx={} drop_crc={} drop_full={} retrans={} timeout={} deliver={} svc_ovr={} push_ovr={}",
+        second.tx_frag,
+        second.rx_frag,
+        second.rx_drop_crc,
+        second.rx_drop_full,
+        second.retrans,
+        second.timeout,
+        second.deliver,
+        second.svc_overwrite,
+        second.push_overwrite
+    );
+    Ok(second)
+}
+
+/// 子项 5 前半: 一条 200B 消息拆 64/64/64/8 四片依序喂入, 校验全部受理且无丢帧计数增长。
+fn _bus_step_fragment(ctrl: &mut AppController, before: &BusStatSnapshot) -> Result<(), String> {
+    const TOTAL: u16 = 200;
+    let seq = 0x2000u16;
+    let body: Vec<u8> = (0..TOTAL as usize).map(|i| (i & 0xFF) as u8).collect();
+    let lens = [BUS_INLINE_MAX, BUS_INLINE_MAX, BUS_INLINE_MAX, 8usize];
+    let mut stream = Vec::new();
+    let mut off = 0usize;
+    for (index, len) in lens.iter().enumerate() {
+        let mut flags = 0u8;
+        if index == 0 {
+            flags |= BUS_FLAG_FIRST;
+        }
+        if index + 1 == lens.len() {
+            flags |= BUS_FLAG_LAST;
+        }
+        stream.extend(_bus_make_frame(
+            BUS_MSG_PROBE_ASM,
+            seq,
+            TOTAL,
+            off as u16,
+            flags,
+            &body[off..off + len],
+        ));
+        off += len;
+    }
+    if off != TOTAL as usize {
+        return Err(format!("构造分片总长错误: {}", off));
+    }
+
+    let (accepted, rejected, _) = _bus_send_raw(ctrl, stream)?;
+    if accepted != lens.len() as u8 || rejected != 0 {
+        return Err(format!(
+            "分片未全部受理: accepted={} rejected={} (期望 accepted={})",
+            accepted,
+            rejected,
+            lens.len()
+        ));
+    }
+    thread::sleep(Duration::from_millis(BUS_POLL_INTERVAL_MS * 2));
+    let after = _bus_stat(ctrl)?;
+    if after.rx_frag < before.rx_frag + lens.len() as u32 {
+        return Err(format!(
+            "rx_frag 未按分片数增长: {} → {} (期望 +{})",
+            before.rx_frag,
+            after.rx_frag,
+            lens.len()
+        ));
+    }
+    if after.rx_drop_crc != before.rx_drop_crc || after.rx_drop_full != before.rx_drop_full {
+        return Err(format!(
+            "顺序分片竟被记为丢帧: drop_crc {} → {} drop_full {} → {}",
+            before.rx_drop_crc, after.rx_drop_crc, before.rx_drop_full, after.rx_drop_full
+        ));
+    }
+    println!(
+        "[BUS] frag-reassembly PASS: 4 片(64/64/64/8) 全受理 rx_frag {} → {} 丢帧计数未增长",
+        before.rx_frag, after.rx_frag
+    );
+    Ok(())
+}
+
+/// 子项 5 后半: frag_off 不接续必须回 NAK 信封(flags bit5), 不能静默吞掉。
+fn _bus_step_fragment_gap(ctrl: &mut AppController) -> Result<(), String> {
+    let seq = 0x2001u16;
+    let chunk = [0x5Au8; BUS_INLINE_MAX];
+    let mut stream = _bus_make_frame(BUS_MSG_PROBE_ASM, seq, 200, 0, BUS_FLAG_FIRST, &chunk);
+    // 期望偏移是 64, 故意写 128 → 固件必须弃槽 + NAK。
+    stream.extend(_bus_make_frame(BUS_MSG_PROBE_ASM, seq, 200, 128, 0, &chunk));
+    let (accepted, rejected, mut frames) = _bus_send_raw(ctrl, stream)?;
+    if accepted != 2 || rejected != 0 {
+        return Err(format!(
+            "失序分片的线上受理异常: accepted={} rejected={} (两帧都应通过 CRC 校验)",
+            accepted, rejected
+        ));
+    }
+    frames.extend(_bus_drain(ctrl, BUS_DRAIN_ROUNDS)?);
+    let nak = frames.iter().find(|frame| {
+        frame.msg_id == BUS_MSG_PROBE_ASM && (frame.flags & BUS_FLAG_NAK) != 0 && frame.seq == seq
+    });
+    match nak {
+        Some(frame) => {
+            println!(
+                "[BUS] frag-gap-nak PASS: frag_off 不接续 → NAK 信封 msg_id=0x{:02X} seq={} flags=0x{:02X}",
+                frame.msg_id, frame.seq, frame.flags
+            );
+            Ok(())
+        }
+        None => Err(format!(
+            "frag_off 不接续未收到 NAK: 收到 {} 帧 {:?}",
+            frames.len(),
+            frames
+                .iter()
+                .map(|f| (f.msg_id, f.seq, f.flags))
+                .collect::<Vec<_>>()
+        )),
+    }
+}
+
+/// 子项 6: total_len 超 BUS_ASM_MAX 必须显式拒绝(NAK), 不允许静默截断后照收。
+fn _bus_step_oversize(ctrl: &mut AppController, before: &BusStatSnapshot) -> Result<(), String> {
+    let seq = 0x2002u16;
+    let chunk = [0x33u8; BUS_INLINE_MAX];
+    let frame = _bus_make_frame(BUS_MSG_PROBE_ASM, seq, 2000, 0, BUS_FLAG_FIRST, &chunk);
+    let (_, _, mut frames) = _bus_send_raw(ctrl, frame)?;
+    frames.extend(_bus_drain(ctrl, BUS_DRAIN_ROUNDS)?);
+    let nak = frames.iter().any(|f| {
+        f.msg_id == BUS_MSG_PROBE_ASM && (f.flags & BUS_FLAG_NAK) != 0 && f.seq == seq
+    });
+    if !nak {
+        return Err(format!(
+            "声明 total_len=2000(>{}) 未被显式拒绝: 收到 {:?}",
+            BUS_ASM_MAX,
+            frames.iter().map(|f| (f.msg_id, f.seq, f.flags)).collect::<Vec<_>>()
+        ));
+    }
+    let after = _bus_stat(ctrl)?;
+    // 静默截断的表征 = 它被当成一条正常消息派发出去了。deliver 不许增长。
+    if after.deliver != before.deliver {
+        return Err(format!(
+            "超长消息竟被派发(疑似静默截断): deliver {} → {}",
+            before.deliver, after.deliver
+        ));
+    }
+    println!(
+        "[BUS] oversize PASS: total_len=2000 > BUS_ASM_MAX={} 回 NAK, deliver 未增长({})",
+        BUS_ASM_MAX, after.deliver
+    );
+    Ok(())
+}
+
+/// 子项 7: 坏 CRC 必须被线上层拒绝(rejected+1, rx_drop_crc+1)且不产生任何派发。
+fn _bus_step_bad_crc(ctrl: &mut AppController, before: &BusStatSnapshot) -> Result<(), String> {
+    let mut frame = _bus_make_led_set(0x30, &[7, 7, 7]);
+    frame[BUS_HDR_SIZE - 2] ^= 0xFF;   // 只翻 CRC 低字节(off 14), 其余字段保持完全合法
+    let (accepted, rejected, _) = _bus_send_raw(ctrl, frame)?;
+    if accepted != 0 || rejected != 1 {
+        return Err(format!(
+            "坏 CRC 帧未被拒绝: accepted={} rejected={}",
+            accepted, rejected
+        ));
+    }
+    thread::sleep(Duration::from_millis(BUS_POLL_INTERVAL_MS * 2));
+    let after = _bus_stat(ctrl)?;
+    if after.rx_drop_crc != before.rx_drop_crc + 1 {
+        return Err(format!(
+            "rx_drop_crc 未按坏帧数增长: {} → {} (期望 +1)",
+            before.rx_drop_crc, after.rx_drop_crc
+        ));
+    }
+    if after.deliver != before.deliver {
+        return Err(format!(
+            "坏 CRC 帧竟产生派发: deliver {} → {}",
+            before.deliver, after.deliver
+        ));
+    }
+    let _ = _bus_drain(ctrl, 2)?;   // 顺手排掉这条坏帧引出的 NAK 信封
+    println!(
+        "[BUS] bad-crc PASS: rejected=1 rx_drop_crc {} → {} deliver 未增长({})",
+        before.rx_drop_crc, after.rx_drop_crc, after.deliver
+    );
+    Ok(())
+}
+
+/// 子项 8: 推送环溢出 → 计数跳号可见。★"丢包可见而非静默丢"的核心判据★
+fn _bus_step_push_overflow(ctrl: &mut AppController) -> Result<(), String> {
+    let _ = _bus_drain(ctrl, BUS_DRAIN_ROUNDS)?;
+    // 先拿一个已知的基准 seq: 没有它, 环丢掉最旧几条后剩下的序列本身是连续的, 跳号无从对比。
+    _bus_send_led_set(ctrl, 0x40, &[2, 4, 6])?;
+    let baseline = _bus_drain(ctrl, BUS_DRAIN_ROUNDS)?
+        .into_iter()
+        .filter(|f| f.msg_id == BUS_MSG_LED_STATE)
+        .next_back()
+        .ok_or_else(|| "基准 LED_STATE 未收到".to_string())?;
+
+    let before = _bus_stat(ctrl)?;
+    // 12 条合法 LED_SET 打进同一次 BUS_XFER: 响应在 task() 之前就返回, 期间没有任何排空机会,
+    // 因此 12 条 LED_STATE 全部在同一轮 task() 里推入容量 8 的 _push_out → 必然覆盖 4 条。
+    let burst = 12usize;
+    let mut stream = Vec::new();
+    for i in 0..burst {
+        stream.extend(_bus_make_led_set(0x50 + i as u16, &[i as u8, 0x11, 0x22]));
+    }
+    let (accepted, rejected, _) = _bus_send_raw(ctrl, stream)?;
+    if accepted != burst as u8 || rejected != 0 {
+        return Err(format!(
+            "突发 LED_SET 未全部受理: accepted={} rejected={} (期望 {})",
+            accepted, rejected, burst
+        ));
+    }
+
+    let states: Vec<BusEnvelope> = _bus_drain(ctrl, BUS_DRAIN_ROUNDS)?
+        .into_iter()
+        .filter(|f| f.msg_id == BUS_MSG_LED_STATE)
+        .collect();
+    if states.is_empty() {
+        return Err("突发后未收到任何 LED_STATE".to_string());
+    }
+    if states.len() > BUS_PUSH_RING_CAP {
+        return Err(format!(
+            "推送环容量应为 {}, 却收到 {} 帧",
+            BUS_PUSH_RING_CAP,
+            states.len()
+        ));
+    }
+    let after = _bus_stat(ctrl)?;
+    if after.push_overwrite <= before.push_overwrite {
+        return Err(format!(
+            "推送环未记录覆盖: push_overwrite {} → {}",
+            before.push_overwrite, after.push_overwrite
+        ));
+    }
+    // 跳号判定一律用 wrapping_sub 增量, 对 u16 回绕天然成立。
+    let mut previous = baseline.seq;
+    let mut gaps = Vec::new();
+    for state in &states {
+        let delta = state.seq.wrapping_sub(previous);
+        if delta > 1 {
+            gaps.push((previous, state.seq, delta));
+        }
+        previous = state.seq;
+    }
+    if gaps.is_empty() {
+        return Err(format!(
+            "推送环溢出后 seq 竟连续(丢包不可见): baseline={} seqs={:?}",
+            baseline.seq,
+            states.iter().map(|f| f.seq).collect::<Vec<_>>()
+        ));
+    }
+    println!(
+        "[BUS] push-overflow PASS: 发 {} 收 {} 帧, push_overwrite {} → {}, 跳号 {:?}",
+        burst,
+        states.len(),
+        before.push_overwrite,
+        after.push_overwrite,
+        gaps
+    );
+    Ok(())
+}
+
+/// 子项 9: 计数回绕。65536 次真跑无意义, 只需断言 wrapping_sub 的增量语义跨回绕点成立。
+fn _bus_step_wrap() -> Result<(), String> {
+    let series: [u16; 4] = [0xFFFE, 0xFFFF, 0x0000, 0x0001];
+    for pair in series.windows(2) {
+        let delta = pair[1].wrapping_sub(pair[0]);
+        if delta != 1 {
+            return Err(format!(
+                "回绕点相邻计数增量应为 1: {} → {} delta={}",
+                pair[0], pair[1], delta
+            ));
+        }
+    }
+    // 跨回绕的跳号同样必须表现为 delta > 1(否则丢包在回绕点会被误判成连续)。
+    let skipped = series[3].wrapping_sub(series[1]);
+    if skipped != 2 {
+        return Err(format!("跨回绕跳号增量应为 2, 实际 {}", skipped));
+    }
+    // 回退(乱序/重放)在回绕点必须表现为一个巨大的增量, 而不是负数溢出成 1。
+    let backwards = series[0].wrapping_sub(series[2]);
+    if backwards != 0xFFFE {
+        return Err(format!("回绕点回退增量应为 0xFFFE, 实际 0x{:04X}", backwards));
+    }
+    println!("[BUS] wrap PASS: 0xFFFE→0xFFFF→0x0000→0x0001 增量恒为 1, 跳号=2, 回退=0xFFFE");
+    Ok(())
+}
+
+/// 子项 11: 流式通道。固件自测钩子自己 open/write×3/close, 主机排空校验帧形态。
+fn _bus_step_stream(ctrl: &mut AppController) -> Result<(), String> {
+    let _ = _bus_drain(ctrl, 2)?;
+    let body = _bus_probe(ctrl, BUS_PROBE_STREAM)?;
+    if body.len() != 5 {
+        return Err(format!("流式钩子响应体长度错误: {}B (期望 5)", body.len()));
+    }
+    let names = ["stream_open", "write#0", "write#1", "write#2", "stream_close"];
+    for (index, name) in names.iter().enumerate() {
+        if body[index] != 1 {
+            return Err(format!("固件侧 {} 失败", name));
+        }
+    }
+
+    let frames: Vec<BusEnvelope> = _bus_drain(ctrl, BUS_DRAIN_ROUNDS)?
+        .into_iter()
+        .filter(|f| f.msg_id == BUS_MSG_PROBE_STREAM)
+        .collect();
+    let data: Vec<&BusEnvelope> = frames.iter().filter(|f| !f.payload.is_empty()).collect();
+    let closes: Vec<&BusEnvelope> = frames
+        .iter()
+        .filter(|f| f.payload.is_empty() && (f.flags & BUS_FLAG_LAST) != 0)
+        .collect();
+    if data.len() != 3 {
+        return Err(format!(
+            "流式数据帧数错误: 期望 3 实际 {} (全部帧 {:?})",
+            data.len(),
+            frames
+                .iter()
+                .map(|f| (f.seq, f.frag_off, f.payload.len(), f.flags))
+                .collect::<Vec<_>>()
+        ));
+    }
+    if closes.len() != 1 {
+        return Err(format!("流式收尾帧数错误: 期望 1 实际 {}", closes.len()));
+    }
+    let mut expect_off = 0u16;
+    for (index, frame) in data.iter().enumerate() {
+        if (frame.flags & BUS_FLAG_STREAM) == 0 {
+            return Err(format!("流式帧 #{} 未置 STREAM: flags=0x{:02X}", index, frame.flags));
+        }
+        if frame.total_len != BUS_LEN_UNKNOWN {
+            return Err(format!(
+                "流式帧 #{} total_len 应为 0x{:04X}, 实际 0x{:04X}",
+                index, BUS_LEN_UNKNOWN, frame.total_len
+            ));
+        }
+        if frame.frag_off != expect_off {
+            return Err(format!(
+                "流式帧 #{} frag_off 应为 {}, 实际 {}",
+                index, expect_off, frame.frag_off
+            ));
+        }
+        // 同一条流的全部分片共享 open 时取的那一个 seq(bus_core.cpp:248-262),
+        // 因此这里必须断言"seq 恒等 + frag_off 递增", 而不是 seq 递增。
+        if frame.seq != data[0].seq {
+            return Err(format!(
+                "同一条流的 seq 应恒等: #{} seq={} 首片 seq={}",
+                index, frame.seq, data[0].seq
+            ));
+        }
+        expect_off = expect_off.wrapping_add(frame.payload.len() as u16);
+    }
+    if (data[0].flags & BUS_FLAG_FIRST) == 0 {
+        return Err(format!("流式首片未置 FIRST: flags=0x{:02X}", data[0].flags));
+    }
+    if closes[0].seq != data[0].seq || closes[0].frag_off != expect_off {
+        return Err(format!(
+            "收尾帧不接续: seq={} off={} (期望 seq={} off={})",
+            closes[0].seq, closes[0].frag_off, data[0].seq, expect_off
+        ));
+    }
+    println!(
+        "[BUS] stream PASS: msg_id=0x{:02X} seq={} 3 片 frag_off=0/8/16 total_len=0x{:04X} + LAST 收尾帧",
+        BUS_MSG_PROBE_STREAM, data[0].seq, BUS_LEN_UNKNOWN
+    );
+    Ok(())
+}
+
+/// 子项 12: 子环池。★必须验证第 5 次 acquire 失败(容量硬上限)★
+fn _bus_step_subring(ctrl: &mut AppController) -> Result<(), String> {
+    let body = _bus_probe(ctrl, BUS_PROBE_SUBRING)?;
+    if body.len() != BUS_SUBRING_SLOTS + 3 {
+        return Err(format!(
+            "子环钩子响应体长度错误: {}B (期望 {})",
+            body.len(),
+            BUS_SUBRING_SLOTS + 3
+        ));
+    }
+    for slot in 0..BUS_SUBRING_SLOTS {
+        if body[slot] != 1 {
+            return Err(format!("第 {} 次 acquire 失败(应能借满 {} 个)", slot + 1, BUS_SUBRING_SLOTS));
+        }
+    }
+    if body[BUS_SUBRING_SLOTS] != 1 {
+        return Err(format!(
+            "第 {} 次 acquire 竟成功: 子环池容量硬上限被突破",
+            BUS_SUBRING_SLOTS + 1
+        ));
+    }
+    if body[BUS_SUBRING_SLOTS + 1] != 1 {
+        return Err("release 未能全部归还".to_string());
+    }
+    if body[BUS_SUBRING_SLOTS + 2] != 1 {
+        return Err("全部归还后再 acquire 仍失败(槽位未真正释放)".to_string());
+    }
+    println!(
+        "[BUS] subring PASS: 借满 {} 个, 第 {} 次被拒, 全还后可再借",
+        BUS_SUBRING_SLOTS,
+        BUS_SUBRING_SLOTS + 1
+    );
+    Ok(())
+}
+
+fn run_bus_test(ctrl: &mut AppController) -> Result<(), String> {
+    _bus_send_led_set(ctrl, 0, &[10, 20, 30])?;
+    println!("[BUS] step 1 PASS: accepted=1 rejected=0");
+
+    let first = _bus_poll_led_state(ctrl)?;
+    _bus_validate_led_state(&first, [10, 20, 30], false)?;
+    println!("[BUS] step 2 PASS: LED_STATE seq={}", first.seq);
+
+    let mut previous_seq = first.seq;
+    let mut sequences = Vec::with_capacity(3);
+    for (index, rgb) in [[1, 2, 3], [4, 5, 6], [7, 8, 9]].iter().enumerate() {
+        _bus_send_led_set(ctrl, (index + 1) as u16, rgb)?;
+        let state = _bus_poll_led_state(ctrl)?;
+        _bus_validate_led_state(&state, *rgb, false)?;
+        let delta = state.seq.wrapping_sub(previous_seq);
+        if delta == 0 || delta > 16 {
+            return Err(format!(
+                "LED_STATE seq 未严格小步递增: previous={} current={} delta={}",
+                previous_seq, state.seq, delta
+            ));
+        }
+        previous_seq = state.seq;
+        sequences.push(state.seq);
+    }
+    println!("[BUS] step 3 PASS: LED_STATE seq={:?}", sequences);
+
+    // 步骤 4: 非法长度必须被显式拒绝, 而不是夹取/截断后照用。
+    // 注意不能断言"RGB 仍等于上一步的值": main.cpp:442 的主循环心跳每 150ms 翻转 LED,
+    // 会正常改写 LedService 内部存储值, 任何等值断言都是竞态。
+    // 真正要证的是"非法载荷没有被施加": 心跳只会写 0 或 255, 所以只要 RGB 前两字节
+    // 不是非法载荷 [1,2], 就说明设备拒绝了它。同时错误标志必须置位。
+    _bus_send_led_set(ctrl, 4, &[1, 2])?;
+    let invalid = _bus_poll_led_state(ctrl)?;
+    if invalid.msg_id != BUS_MSG_LED_STATE {
+        return Err(format!("msg_id 错误: 0x{:02X}", invalid.msg_id));
+    }
+    if invalid.payload.len() != 4 {
+        return Err(format!("LED_STATE payload 长度错误: {}", invalid.payload.len()));
+    }
+    if (invalid.payload[3] & BUS_LED_STATE_FLAG_ERROR) == 0 {
+        return Err(format!(
+            "非法长度未置错误标志: payload[3]=0x{:02X}",
+            invalid.payload[3]
+        ));
+    }
+    if invalid.payload[0] == 1 && invalid.payload[1] == 2 {
+        return Err(format!(
+            "非法载荷竟被施加(应拒绝而非截断): rgb={:02X?}",
+            &invalid.payload[0..3]
+        ));
+    }
+    println!(
+        "[BUS] step 4 PASS: 非法长度被拒(错误标志置位, 未施加), 回显设备真值 rgb={:02X?} seq={}",
+        &invalid.payload[0..3], invalid.seq
+    );
+
+    // ── 扩展子项: 分片/重组、超长拒绝、坏帧、推送环溢出、回绕、统计、流式、子环池 ──
+    // 每项独立打印 PASS/FAIL; 任一项失败即整体非零退出(由 main 的分支负责)。
+    let _ = _bus_drain(ctrl, 2)?;
+    let base = _bus_step_stat(ctrl)?;
+    _bus_step_fragment(ctrl, &base)?;
+    _bus_step_fragment_gap(ctrl)?;
+    let before_oversize = _bus_stat(ctrl)?;
+    _bus_step_oversize(ctrl, &before_oversize)?;
+    let before_crc = _bus_stat(ctrl)?;
+    _bus_step_bad_crc(ctrl, &before_crc)?;
+    _bus_step_push_overflow(ctrl)?;
+    _bus_step_wrap()?;
+    _bus_step_stream(ctrl)?;
+    _bus_step_subring(ctrl)?;
+    Ok(())
+}
+
+// ============================================================================
+// --kbd-repair: 把 --nv-soak 写坏的**这几项**定向救回来, 不做整体 RESET_DEFAULTS。
+//
+// 只改三处:
+//   1) kbd.pl00..kbd.pl11 → AUTO(2)。soak 把它们从 0 改成 1(12 键全高电平触发),
+//      上拉工装上恒读按下 0xFFF → 边沿环零记录 → 键盘卡死。
+//   2) led.enable → true(schema 默认)
+//   3) led.status_brightness → 128(schema 默认)
+// 防抖 kbd.dbNN 保留当前设备值(不趁机改写)。
+// ★其余被 soak 改过的键(kbd.key*/kbd.zone*/kbd.hd*/kbd.mh*/kbd.cb*/bind.*/PARAM/算法源)
+//   一律不动★ —— 那些不属于本次故障, 是否恢复由用户自己决定。
+// ============================================================================
+fn run_kbd_repair(ctrl: &mut AppController) -> ! {
+    use mai2control_ui::proto::{CfgValue, ConfigEntry, KBD_POL_AUTO};
+
+    const REPAIR_KEY_COUNT: u8 = 12;
+    const LED_ENABLE_KEY: &str = "led.enable";
+    const LED_BRIGHTNESS_KEY: &str = "led.status_brightness";
+    // 与固件 app_config.cpp:132/135 的 schema 默认值同源。
+    const LED_ENABLE_DEFAULT: bool = true;
+    const LED_BRIGHTNESS_DEFAULT: u8 = 128;
+
+    macro_rules! fail {
+        ($($arg:tt)*) => {{
+            println!("[REPAIR] FAIL: {}", format!($($arg)*));
+            std::process::exit(1);
+        }};
+    }
+    macro_rules! require {
+        ($expr:expr, $label:expr) => {{
+            if let Err(error) = $expr {
+                fail!("{}: {}", $label, error);
+            }
+        }};
+    }
+
+    let pump = |ctrl: &mut AppController, ms: u64| -> bool {
+        let deadline = std::time::Instant::now() + Duration::from_millis(ms);
+        while std::time::Instant::now() < deadline {
+            ctrl.poll();
+            if ctrl.state() == ConnState::Disconnected {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(16));
+        }
+        true
+    };
+    let wait_version = |ctrl: &mut AppController,
+                        before: u64,
+                        label: &str,
+                        version: fn(&AppController) -> u64,
+                        timeout: Duration| {
+        let deadline = std::time::Instant::now() + timeout;
+        while std::time::Instant::now() < deadline && version(ctrl) <= before {
+            if !pump(ctrl, 16) {
+                fail!("{} 回读期间设备断开: {:?}", label, ctrl.last_error());
+            }
+        }
+        if version(ctrl) <= before {
+            fail!("{} 回读超时(version 仍为 {})", label, version(ctrl));
+        }
+    };
+    let read_keycfg = |ctrl: &mut AppController, label: &str| {
+        let before = ctrl.kbd_keycfg_version();
+        require!(ctrl.kbd_request_keycfg(), format!("{} KBD_GET_KEYCFG 请求", label));
+        wait_version(
+            ctrl,
+            before,
+            &format!("{} KBD_GET_KEYCFG", label),
+            AppController::kbd_keycfg_version,
+            Duration::from_secs(8),
+        );
+    };
+    let read_state = |ctrl: &mut AppController, label: &str| {
+        let before = ctrl.kbd_state_version();
+        require!(ctrl.kbd_request_state(), format!("{} KBD_GET_STATE 请求", label));
+        wait_version(
+            ctrl,
+            before,
+            &format!("{} KBD_GET_STATE", label),
+            AppController::kbd_state_version,
+            Duration::from_secs(8),
+        );
+    };
+    let read_config = |ctrl: &mut AppController, label: &str| {
+        let before = ctrl.config_version();
+        require!(ctrl.request_config_all(), format!("{} CFG_GET_ALL 请求", label));
+        let deadline = std::time::Instant::now() + Duration::from_secs(12);
+        while std::time::Instant::now() < deadline && ctrl.config_version() <= before {
+            if !pump(ctrl, 16) {
+                fail!("{} CFG_GET_ALL 期间设备断开: {:?}", label, ctrl.last_error());
+            }
+        }
+        if ctrl.config_version() <= before {
+            fail!("{} CFG_GET_ALL 回读超时", label);
+        }
+    };
+
+    read_keycfg(ctrl, "修复前");
+    read_state(ctrl, "修复前");
+    println!(
+        "[REPAIR] 修复前: pol_cfg={:?} resolved=0x{:03X} phys_state=0x{:03X}",
+        (0..REPAIR_KEY_COUNT)
+            .map(|i| ctrl.kbd_keycfg(i).pol)
+            .collect::<Vec<_>>(),
+        ctrl.kbd_pol_resolved_mask(),
+        ctrl.kbd_state()
+    );
+
+    // 1) 12 个物理键的极性一律设为 AUTO, 防抖沿用设备当前值。
+    for index in 0..REPAIR_KEY_COUNT {
+        let debounce = ctrl.kbd_keycfg(index).debounce_us;
+        require!(
+            ctrl.kbd_set_keycfg(index, KBD_POL_AUTO, debounce),
+            format!("kbd_set_keycfg {} → AUTO", index)
+        );
+    }
+    // 2) 状态灯两项回 schema 默认(走通用 CFG_SET, 与界面上改这两项完全同一条路)。
+    require!(
+        ctrl.set_config(ConfigEntry::new(
+            LED_ENABLE_KEY.to_string(),
+            CfgValue::Bool(LED_ENABLE_DEFAULT)
+        )),
+        format!("set_config {}", LED_ENABLE_KEY)
+    );
+    require!(
+        ctrl.set_config(ConfigEntry::new(
+            LED_BRIGHTNESS_KEY.to_string(),
+            CfgValue::U8(LED_BRIGHTNESS_DEFAULT)
+        )),
+        format!("set_config {}", LED_BRIGHTNESS_KEY)
+    );
+
+    // 3) 走既有"保存到设备"路径落盘, 等串行队列排空 + 设备侧脏位归零, 再重启。
+    println!("[REPAIR] 提交保存(仅上述 3 项)…");
+    require!(ctrl.save_config(), "save_config");
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while std::time::Instant::now() < deadline && ctrl.cfg_tx_pending() != 0 {
+        if !pump(ctrl, 16) {
+            fail!("保存队列期间设备断开: {:?}", ctrl.last_error());
+        }
+    }
+    if ctrl.cfg_tx_pending() != 0 {
+        fail!("保存队列超时: cfg_pending={}", ctrl.cfg_tx_pending());
+    }
+    let flush_deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        if !pump(ctrl, 250) {
+            fail!("等待落盘期间设备断开: {:?}", ctrl.last_error());
+        }
+        let Some(now) = read_soak_debug(ctrl) else {
+            fail!("无法读取设备 NvStore 状态(EP0 诊断不可用)");
+        };
+        if now.nv_dirty_mask == 0 {
+            println!(
+                "[REPAIR] 落盘完成 dirty_mask=0 commit_ok={} commit_fail={}",
+                now.nv_commit_ok, now.nv_commit_fail
+            );
+            break;
+        }
+        if std::time::Instant::now() >= flush_deadline {
+            fail!("落盘未在 60 秒内完成: dirty_mask=0x{:X}", now.nv_dirty_mask);
+        }
+    }
+
+    println!("[REPAIR] 重启设备并等待重新枚举…");
+    require!(ctrl.reboot(), "reboot");
+    let reconnect_deadline = std::time::Instant::now() + Duration::from_secs(45);
+    let mut saw_disconnect = false;
+    let mut last_refresh = std::time::Instant::now() - Duration::from_secs(1);
+    let mut last_hello = std::time::Instant::now();
+    while std::time::Instant::now() < reconnect_deadline {
+        ctrl.poll();
+        if ctrl.state() == ConnState::Disconnected {
+            saw_disconnect = true;
+            if last_refresh.elapsed() >= Duration::from_millis(300) {
+                last_refresh = std::time::Instant::now();
+                ctrl.refresh_devices();
+                let _ = ctrl.connect(0);
+                last_hello = std::time::Instant::now();
+            }
+        } else if saw_disconnect && ctrl.state() == ConnState::Connected {
+            break;
+        } else if ctrl.state() == ConnState::Connecting
+            && last_hello.elapsed() >= Duration::from_millis(300)
+        {
+            let _ = ctrl.resend_hello();
+            last_hello = std::time::Instant::now();
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    if !saw_disconnect || ctrl.state() != ConnState::Connected {
+        fail!(
+            "未在 45 秒内重新枚举并连接 (seen_disconnect={} state={:?})",
+            saw_disconnect,
+            ctrl.state()
+        );
+    }
+    let _ = pump(ctrl, 1200);
+
+    // 4) 重启后回读校验。
+    read_keycfg(ctrl, "重启后");
+    read_state(ctrl, "重启后");
+    read_config(ctrl, "重启后");
+
+    let mut reasons: Vec<String> = Vec::new();
+
+    let pol: Vec<u8> = (0..REPAIR_KEY_COUNT)
+        .map(|i| ctrl.kbd_keycfg(i).pol)
+        .collect();
+    let wrong: Vec<String> = pol
+        .iter()
+        .enumerate()
+        .filter(|(_, value)| **value != KBD_POL_AUTO)
+        .map(|(index, value)| format!("键{}={}", index + 1, value))
+        .collect();
+    if !wrong.is_empty() {
+        reasons.push(format!("pol_cfg 未全为 AUTO(2): {}", wrong.join(",")));
+    }
+
+    let resolved = ctrl.kbd_pol_resolved_mask();
+    if !ctrl.kbd_pol_resolved_known() {
+        reasons.push("设备未回传生效极性掩码(固件过旧)".to_string());
+    }
+    let levels: Vec<String> = (0..REPAIR_KEY_COUNT)
+        .map(|i| {
+            format!(
+                "键{}={}",
+                i + 1,
+                if (resolved >> i) & 1 != 0 { "高" } else { "低" }
+            )
+        })
+        .collect();
+    println!(
+        "[REPAIR] pol_cfg={:?} resolved=0x{:03X} 生效电平: {}",
+        pol,
+        resolved,
+        levels.join(" ")
+    );
+
+    // ★AUTO 功能的真机判据★: 修复前 0xFFF(恒读按下), AUTO 把上电电平学成"抬起"后应为 0x000。
+    let phys_state = ctrl.kbd_state();
+    if phys_state != 0 {
+        reasons.push(format!(
+            "phys_state 应为 0x000, 实际 0x{:03X}(仍有键被判成按下)",
+            phys_state
+        ));
+    }
+    println!("[REPAIR] phys_state=0x{:03X}", phys_state);
+
+    let led_enable = ctrl.config_get(LED_ENABLE_KEY);
+    match &led_enable {
+        Some(entry) => {
+            println!("[REPAIR] {} = {}", LED_ENABLE_KEY, soak_val_text(&entry.value));
+            if soak_val_text(&entry.value) != LED_ENABLE_DEFAULT.to_string() {
+                reasons.push(format!(
+                    "{} 期望 {} 实际 {}",
+                    LED_ENABLE_KEY,
+                    LED_ENABLE_DEFAULT,
+                    soak_val_text(&entry.value)
+                ));
+            }
+        }
+        None => reasons.push(format!("{} 回读缺失", LED_ENABLE_KEY)),
+    }
+    let led_brightness = ctrl.config_get(LED_BRIGHTNESS_KEY);
+    match &led_brightness {
+        Some(entry) => {
+            println!(
+                "[REPAIR] {} = {}",
+                LED_BRIGHTNESS_KEY,
+                soak_val_text(&entry.value)
+            );
+            if soak_val_text(&entry.value) != LED_BRIGHTNESS_DEFAULT.to_string() {
+                reasons.push(format!(
+                    "{} 期望 {} 实际 {}",
+                    LED_BRIGHTNESS_KEY,
+                    LED_BRIGHTNESS_DEFAULT,
+                    soak_val_text(&entry.value)
+                ));
+            }
+        }
+        None => reasons.push(format!("{} 回读缺失", LED_BRIGHTNESS_KEY)),
+    }
+
+    println!(
+        "[REPAIR] 本次只改了 kbd.pl00..pl11 → AUTO 与 {} / {}; \
+         其余 --nv-soak 改动(kbd.key*/kbd.zone*/kbd.hd*/kbd.mh*/kbd.cb*/bind.*/PARAM/算法源)未动。",
+        LED_ENABLE_KEY, LED_BRIGHTNESS_KEY
+    );
+    if reasons.is_empty() {
+        println!("[REPAIR] PASS");
+        std::process::exit(0);
+    }
+    println!("[REPAIR] FAIL: {}", reasons.join(" | "));
+    std::process::exit(1);
+}
+
+// ============================================================================
+// --mai2-load: 三路同时顶流压测(mai2serial CDC + mai2light CDC + vendor)
+// ----------------------------------------------------------------------------
+// 存在理由: 本仓此前**没有任何**驱动两条 mai2 协议的测试设施(comport 只做 COM 口识别/改名),
+// 所谓"压流量"只压了 vendor 一路 —— 于是"设备自发重启"这类 bug 只能等实机暴露。
+// 核心指标不是"有没有报错", 而是 ★主循环最长阻塞时长 与 距 5s 看门狗的余量★:
+// 那才是决定会不会被看门狗咬死的量, 其余都是旁证。
+// 剖面数据来自固件 UsbDebugCounters 尾部(见 main_firmware/src/service/usb_debug.h),
+// 经 EP0 0x50 读、0x53 清零(峰值量不可差分, 必须能开干净窗口)。
+// ============================================================================
+
+/// 与固件 `UsbDebugCounters`(pack(1)) 尾部字段同源的偏移。改固件结构必须同步这里。
+/// nv 段止于 @66, 故剖面段从 @67 起; 总长 108。
+const DBG_OFF_LOOP_MAX_US: usize = 67;
+const DBG_OFF_SEG_MAX_US: usize = 71;
+const DBG_OFF_HEAVY_REJECTS: usize = 103;
+const DBG_OFF_HEAVY_BUSY: usize = 107;
+const DBG_LEN_WITH_PROFILE: usize = 108;
+/// 跨复位死前遗言(增强段)。改固件结构必须同步这里。
+const DBG_OFF_LAST_LOOP_MAX_US: usize = 108;
+const DBG_OFF_LAST_WAS_FAULT: usize = 112;
+const DBG_OFF_LAST_RESET_REASON: usize = 113;
+const DBG_LEN_WITH_POSTMORTEM: usize = 114;
+/// game_io 子段最长耗时数组。
+const DBG_OFF_SEG2_MAX_US: usize = 114;
+const DBG_LEN_WITH_SEG2: usize = 146;
+/// NvStore 各区有效掩码(单份存储: 坏只坏在那一区, 必须看得见)。
+const DBG_OFF_NV_VALID_MASK: usize = 154;
+const DBG_LEN_WITH_NV_VALID: usize = 155;
+/// 上次复位时"最后一次进段时本轮已耗时"(ms) —— 定位时间到底花在哪一段。
+const DBG_OFF_LAST_STAGE_AT_MS: usize = 150;
+const DBG_LEN_WITH_STAGE_AT: usize = 154;
+/// 固件 CRASH_STAGE_LOOP_BASE / CRASH_STAGE_GAMEIO_BASE(usb_debug.h)。
+const CRASH_STAGE_LOOP_BASE: u8 = 0x10;
+const CRASH_STAGE_GAMEIO_BASE: u8 = 0x20;
+/// 段名顺序必须与固件 `enum GameIoSeg` 一一对应。
+const GAMEIO_SEG_NAMES: [&str; 8] = [
+    "binding", "serial_rx", "ser_reset", "light", "touch_map", "send_touch", "light_state",
+    "ledmap",
+];
+/// 段名顺序必须与固件 `enum LoopSeg` 一一对应。
+const LOOP_SEG_NAMES: [&str; 8] = [
+    "usb_task", "psoc", "host_cmd", "tx_sched", "game_io", "keyboard", "nv_commit", "led",
+];
+/// 固件 WATCHDOG_TIMEOUT_MS = 5000(main.cpp) ⇒ 余量以此为基准。
+const WATCHDOG_BUDGET_US: u32 = 5_000_000;
+
+#[derive(Clone, Copy, Default)]
+struct LoopProfile {
+    loop_count: u32,
+    rx_dropped: u32,
+    loop_max_us: u32,
+    seg_max_us: [u32; 8],
+    heavy_rejects: u32,
+    heavy_busy: u8,
+    nv_commit_fail: u32,
+    seg2_max_us: [u32; 8],
+}
+
+/// 上次复位的死前遗言。定性三分: fault=1 → 跑飞; fault=0 且 last_loop_max 接近 5s → 主循环真被拖死;
+/// fault=0 且 last_loop_max 很小 → 既没跑飞也没拖慢, 那就是外部原因(掉电/XRES/主动重启)。
+fn print_post_mortem(tag: &str, b: &[u8]) {
+    if b.len() < DBG_LEN_WITH_POSTMORTEM {
+        println!("{} 诊断结构无死前遗言增强段(len={}), 固件需更新", tag, b.len());
+        return;
+    }
+    let stage = b[48];
+    let stage_text = if stage == 0xFF {
+        "不可信(上次非运行中复位)".to_string()
+    } else if let Some(name) = match stage {
+        // Mai2Light/CDC 语句级阶段码, 见固件 usb_debug.h 的 PM_STAGE_*。
+        0x30 => Some("light/cdc_read(搬 CDC 环)"),
+        0x31 => Some("light/_feed 逐字节(含 dispatch/ack)"),
+        0x32 => Some("light/ack 查 TX 剩余空间"),
+        0x33 => Some("light/ack 写 TX FIFO"),
+        0x34 => Some("light/_fade_step"),
+        0x36 => Some("cdc/tud_cdc_n_write_available"),
+        0x37 => Some("cdc/tud_cdc_n_write"),
+        0x38 => Some("cdc/tud_cdc_n_write_flush"),
+        0x39 => Some("cdc/tud_cdc_n_read(rx 回调)"),
+        0x3A => Some("cdc/rx 回调: read 已返回, 搬环中"),
+        0x3B => Some("cdc/rx 回调已结束 → 卡在 tud_task 内部别处"),
+        0x3C => Some("usb/tud_task 内部(尚未进 rx 回调)"),
+        0x3D => Some("usb/tud_task 已返回"),
+        _ => None,
+    } {
+        name.to_string()
+    } else if stage >= CRASH_STAGE_GAMEIO_BASE
+        && (stage - CRASH_STAGE_GAMEIO_BASE) < GAMEIO_SEG_NAMES.len() as u8
+    {
+        format!(
+            "game_io 子段 {}",
+            GAMEIO_SEG_NAMES[(stage - CRASH_STAGE_GAMEIO_BASE) as usize]
+        )
+    } else if stage >= CRASH_STAGE_LOOP_BASE
+        && (stage - CRASH_STAGE_LOOP_BASE) < LOOP_SEG_NAMES.len() as u8
+    {
+        format!("主循环段 {}", LOOP_SEG_NAMES[(stage - CRASH_STAGE_LOOP_BASE) as usize])
+    } else {
+        format!("CrashStage {}", stage)
+    };
+    let last_loop_max = u32::from_le_bytes([
+        b[DBG_OFF_LAST_LOOP_MAX_US],
+        b[DBG_OFF_LAST_LOOP_MAX_US + 1],
+        b[DBG_OFF_LAST_LOOP_MAX_US + 2],
+        b[DBG_OFF_LAST_LOOP_MAX_US + 3],
+    ]);
+    let fault = b[DBG_OFF_LAST_WAS_FAULT];
+    let reason = b[DBG_OFF_LAST_RESET_REASON];
+    // ★关键判据★: 进入最后那一段时"本轮已耗时"。接近 5s ⇒ 时间花在**它前面**的段, stage 指向的是
+    // 无辜的短段; 接近 0 ⇒ 时间确实花在 stage 指的那一段里。
+    let stage_at_ms: Option<u16> = if b.len() >= DBG_LEN_WITH_STAGE_AT {
+        Some(u16::from_le_bytes([
+            b[DBG_OFF_LAST_STAGE_AT_MS],
+            b[DBG_OFF_LAST_STAGE_AT_MS + 1],
+        ]))
+    } else {
+        None
+    };
+    let verdict = if fault != 0 {
+        "跑飞(hardfault)"
+    } else if b[49] == 0 {
+        "上电复位/主动重启(scratch 已清)"
+    } else if matches!(stage_at_ms, Some(ms) if (ms as u32) * 1000 >= WATCHDOG_BUDGET_US / 2) {
+        "主循环被拖死: 时间花在 stage 之前的段(见 进段时已耗时)"
+    } else if stage_at_ms.is_some() {
+        "主循环被拖死: 时间花在 stage 指的那一段里面"
+    } else if last_loop_max >= WATCHDOG_BUDGET_US / 2 {
+        "主循环被拖死(看门狗超时)"
+    } else {
+        "运行中复位, 但主循环并未变慢 —— 查外部原因(供电/XRES/软复位)"
+    };
+    println!(
+        "{} 死前遗言: 定性={} | 运行中复位={} hardfault={} 停在={} 进段时已耗时={} 上次整轮峰值={}us wd_reason=0x{:X}",
+        tag,
+        verdict,
+        b[49],
+        fault,
+        stage_text,
+        stage_at_ms
+            .map(|ms| format!("{}ms", ms))
+            .unwrap_or_else(|| "n/a".to_string()),
+        last_loop_max,
+        reason
+    );
+}
+
+fn read_loop_profile(ctrl: &AppController) -> Option<LoopProfile> {
+    let bytes = ctrl.read_debug_counters().ok()?;
+    if bytes.len() < DBG_LEN_WITH_PROFILE {
+        return None;
+    }
+    let u32_at = |o: usize| u32::from_le_bytes([bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]]);
+    let mut seg = [0u32; 8];
+    for (i, slot) in seg.iter_mut().enumerate() {
+        *slot = u32_at(DBG_OFF_SEG_MAX_US + i * 4);
+    }
+    let mut seg2 = [0u32; 8];
+    if bytes.len() >= DBG_LEN_WITH_SEG2 {
+        for (i, slot) in seg2.iter_mut().enumerate() {
+            *slot = u32_at(DBG_OFF_SEG2_MAX_US + i * 4);
+        }
+    }
+    Some(LoopProfile {
+        seg2_max_us: seg2,
+        loop_count: u32_at(4),
+        rx_dropped: u32_at(20),
+        loop_max_us: u32_at(DBG_OFF_LOOP_MAX_US),
+        seg_max_us: seg,
+        heavy_rejects: u32_at(DBG_OFF_HEAVY_REJECTS),
+        heavy_busy: bytes[DBG_OFF_HEAVY_BUSY],
+        nv_commit_fail: u32_at(59),
+    })
+}
+
+#[derive(Default)]
+struct Mai2LoadStats {
+    ser_rx_bytes: std::sync::atomic::AtomicU64,
+    ser_touch_frames: std::sync::atomic::AtomicU64,
+    ser_cmd_resp: std::sync::atomic::AtomicU64,
+    ser_halts: std::sync::atomic::AtomicU64,
+    ser_restarts: std::sync::atomic::AtomicU64,
+    ser_errors: std::sync::atomic::AtomicU64,
+    light_tx_frames: std::sync::atomic::AtomicU64,
+    light_tx_bytes: std::sync::atomic::AtomicU64,
+    light_ack_ok: std::sync::atomic::AtomicU64,
+    light_ack_sum_err: std::sync::atomic::AtomicU64,
+    light_bad_sum: std::sync::atomic::AtomicU64,
+    light_errors: std::sync::atomic::AtomicU64,
+}
+
+impl Mai2LoadStats {
+    fn bump(counter: &std::sync::atomic::AtomicU64, by: u64) {
+        counter.fetch_add(by, std::sync::atomic::Ordering::Relaxed);
+    }
+    fn get(counter: &std::sync::atomic::AtomicU64) -> u64 {
+        counter.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// 组一帧 mai2light 请求。body = dst,src,len,cmd,payload...; len = command 起到 sum 之前的字节数;
+/// sum = **转义前** dst 起逐字节相加取低 8 位; 先算 sum 再对 body 做 0xD0 转义(sum 本身不转义)。
+///
+/// ★sum 落在 0xE0/0xD0 上必须回避★: sum 不转义, 收端遇 0xE0 会当成新 sync、遇 0xD0 会当成转义前缀,
+/// 于是整帧被吃掉。官方板与本固件都有这个协议瑕疵。压测器要量的是"设备在满负载下的行为",
+/// 不是这个已知瑕疵, 故此处微调最后一个 payload 字节把 sum 挪开(payload 为空的命令 sum 恒定, 已核过安全)。
+fn mai2_light_frame(dst: u8, src: u8, cmd: u8, payload: &[u8]) -> Vec<u8> {
+    let mut body = Vec::with_capacity(4 + payload.len());
+    body.push(dst);
+    body.push(src);
+    body.push((1 + payload.len()) as u8);
+    body.push(cmd);
+    body.extend_from_slice(payload);
+    let mut sum = body.iter().fold(0u8, |a, b| a.wrapping_add(*b));
+    if (sum == 0xE0 || sum == 0xD0) && !payload.is_empty() {
+        let last = body.len() - 1;
+        body[last] = body[last].wrapping_add(1);
+        sum = sum.wrapping_add(1);
+    }
+    let mut out = Vec::with_capacity(2 * body.len() + 2);
+    out.push(0xE0);
+    for b in &body {
+        if *b == 0xE0 || *b == 0xD0 {
+            out.push(0xD0);
+            out.push(b.wrapping_sub(1));
+        } else {
+            out.push(*b);
+        }
+    }
+    out.push(sum);
+    out
+}
+
+/// mai2light 应答解析。★与固件 `Mai2Light::_feed` 同一状态机★(sync 重同步 / 0xD0 转义 /
+/// len 自描述 / 末字节为 sum)。不能只数 0xE0 —— sum 不转义且可能等于 0xE0, 会把一帧数成两帧。
+struct LightAckParser {
+    body: Vec<u8>,
+    sum: u8,
+    active: bool,
+    escape: bool,
+}
+
+impl LightAckParser {
+    fn new() -> Self {
+        Self {
+            body: Vec::with_capacity(32),
+            sum: 0,
+            active: false,
+            escape: false,
+        }
+    }
+    fn feed(&mut self, byte: u8, stats: &Mai2LoadStats) {
+        if byte == 0xE0 {
+            self.body.clear();
+            self.sum = 0;
+            self.active = true;
+            self.escape = false;
+            return;
+        }
+        if !self.active {
+            return;
+        }
+        let mut b = byte;
+        if b == 0xD0 {
+            self.escape = true;
+            return;
+        }
+        if self.escape {
+            b = b.wrapping_add(1);
+            self.escape = false;
+        }
+        if self.body.len() >= 4 && self.body.len() == self.body[2] as usize + 3 {
+            self.active = false;
+            if self.sum == b {
+                // body = dst,src,len,status,cmd,report,payload...; status 0x02 = 设备判我们 sum 错。
+                if self.body.get(3).copied() == Some(0x02) {
+                    Mai2LoadStats::bump(&stats.light_ack_sum_err, 1);
+                } else {
+                    Mai2LoadStats::bump(&stats.light_ack_ok, 1);
+                }
+            } else {
+                Mai2LoadStats::bump(&stats.light_bad_sum, 1);
+            }
+            return;
+        }
+        if self.body.len() >= 48 {
+            self.active = false; // 超长必为错位, 丢弃等重同步(与固件一致)
+            return;
+        }
+        self.body.push(b);
+        self.sum = self.sum.wrapping_add(b);
+    }
+}
+
+/// mai2serial 设备→主机帧解析: 触控帧 `(`+7B+`)`, 命令回执 `(`+4B+`)`。
+/// 触控载荷每字节只用低 5 位(0..31), 不可能撞上 '('(0x28)/')'(0x29) ⇒ 按定界符切帧不会错帧。
+struct TouchFrameParser {
+    active: bool,
+    len: usize,
+}
+
+impl TouchFrameParser {
+    fn new() -> Self {
+        Self {
+            active: false,
+            len: 0,
+        }
+    }
+    fn feed(&mut self, b: u8, stats: &Mai2LoadStats) {
+        if b == b'(' {
+            self.active = true;
+            self.len = 0;
+            return;
+        }
+        if !self.active {
+            return;
+        }
+        if b == b')' {
+            self.active = false;
+            if self.len == 7 {
+                Mai2LoadStats::bump(&stats.ser_touch_frames, 1);
+            } else {
+                Mai2LoadStats::bump(&stats.ser_cmd_resp, 1);
+            }
+            return;
+        }
+        self.len += 1;
+        if self.len > 16 {
+            self.active = false;
+        }
+    }
+}
+
+/// 线程A: mai2serial。起流 + 持续读触控帧 + 周期性启停/快速重启扰动。
+/// 收尾必须 `{HALT}` —— 否则设备被留在 RUNNING, 后续测试的"未启用发送"基线就不对了。
+fn mai2_load_serial_thread(
+    port_name: String,
+    baud: u32,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    stats: std::sync::Arc<Mai2LoadStats>,
+) {
+    use std::io::{Read, Write};
+    let mut port = match serialport::new(&port_name, baud)
+        .timeout(Duration::from_millis(20))
+        .open()
+    {
+        Ok(p) => p,
+        Err(e) => {
+            println!("[LOAD] 线程A 打开 {} 失败: {}", port_name, e);
+            Mai2LoadStats::bump(&stats.ser_errors, 1);
+            return;
+        }
+    };
+    let _ = port.write_all(b"{STAT}");
+    let mut parser = TouchFrameParser::new();
+    let mut buf = [0u8; 4096];
+    let started = std::time::Instant::now();
+    let mut next_halt = Duration::from_millis(3000);
+    let mut next_reset = Duration::from_millis(11000);
+    // ★错误必须退避并封顶★: 设备一掉线, 句柄上的每次 read/write 都立刻返回错误, 不退避就会在
+    // 几秒里刷出几百万次计数(首轮实测 543 万), 既污染统计又把 CPU 占满、干扰同机的 vendor 一路。
+    let mut consecutive_errors = 0u32;
+    const ERROR_GIVE_UP: u32 = 40;
+    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+        match port.read(&mut buf) {
+            Ok(0) => {}
+            Ok(n) => {
+                consecutive_errors = 0;
+                Mai2LoadStats::bump(&stats.ser_rx_bytes, n as u64);
+                for b in &buf[..n] {
+                    parser.feed(*b, &stats);
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                consecutive_errors = 0;
+            }
+            Err(e) => {
+                Mai2LoadStats::bump(&stats.ser_errors, 1);
+                consecutive_errors += 1;
+                if consecutive_errors <= 3 {
+                    println!("[LOAD] 线程A 读错误: {}", e);
+                }
+                if consecutive_errors >= ERROR_GIVE_UP {
+                    println!("[LOAD] 线程A 连续 {} 次错误, 判端口已失效, 退出。", ERROR_GIVE_UP);
+                    return;
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+        let now = started.elapsed();
+        // 启停扰动: {HALT} 停发 → 200ms 后 {STAT} 续发。命令字符在索引 3, 直接用真实 ASCII 命令。
+        if now >= next_halt {
+            next_halt = now + Duration::from_millis(3000);
+            if port.write_all(b"{HALT}").is_ok() {
+                Mai2LoadStats::bump(&stats.ser_halts, 1);
+            }
+            thread::sleep(Duration::from_millis(200));
+            let _ = port.write_all(b"{STAT}");
+        }
+        // 快速重启扰动: {RSET} 令协议层回 READY 且停发, 立刻再 {STAT} 起流。
+        if now >= next_reset {
+            next_reset = now + Duration::from_millis(11000);
+            if port.write_all(b"{RSET}").is_ok() {
+                Mai2LoadStats::bump(&stats.ser_restarts, 1);
+            }
+            thread::sleep(Duration::from_millis(120));
+            let _ = port.write_all(b"{STAT}");
+        }
+    }
+    let _ = port.write_all(b"{HALT}");
+    let _ = port.flush();
+}
+
+/// 线程B: mai2light。满速灌请求帧并读应答, 覆盖单灯/多灯/提交/查询四类命令。
+fn mai2_load_light_thread(
+    port_name: String,
+    baud: u32,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    stats: std::sync::Arc<Mai2LoadStats>,
+) {
+    use std::io::{Read, Write};
+    let mut port = match serialport::new(&port_name, baud)
+        .timeout(Duration::from_millis(5))
+        .open()
+    {
+        Ok(p) => p,
+        Err(e) => {
+            println!("[LOAD] 线程B 打开 {} 失败: {}", port_name, e);
+            Mai2LoadStats::bump(&stats.light_errors, 1);
+            return;
+        }
+    };
+    let mut parser = LightAckParser::new();
+    let mut buf = [0u8; 4096];
+    let mut tick: u32 = 0;
+    // 同线程A: 错误退避 + 封顶, 否则掉线后会空转刷千万级计数。
+    let mut consecutive_errors = 0u32;
+    const ERROR_GIVE_UP: u32 = 40;
+    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+        // 每轮一组: 单灯 → 多灯 → 提交 → (每 32 轮插一次板状态查询, 走带 payload 应答的分支)。
+        let phase = (tick % 8) as u8;
+        let color = [
+            (tick & 0xFF) as u8,
+            ((tick >> 3) & 0xFF) as u8,
+            ((tick >> 5) & 0xFF) as u8,
+        ];
+        let mut frames: Vec<Vec<u8>> = Vec::with_capacity(4);
+        frames.push(mai2_light_frame(
+            0,
+            0,
+            0x31,
+            &[phase % 8, color[0], color[1], color[2]],
+        ));
+        frames.push(mai2_light_frame(
+            0,
+            0,
+            0x32,
+            &[0, 0x20, 0, color[2], color[0], color[1]],
+        ));
+        frames.push(mai2_light_frame(0, 0, 0x3C, &[]));
+        if tick % 32 == 0 {
+            frames.push(mai2_light_frame(0, 0, 0xF1, &[]));
+        }
+        let mut errored = false;
+        for frame in &frames {
+            match port.write_all(frame) {
+                Ok(()) => {
+                    Mai2LoadStats::bump(&stats.light_tx_frames, 1);
+                    Mai2LoadStats::bump(&stats.light_tx_bytes, frame.len() as u64);
+                }
+                Err(e) => {
+                    Mai2LoadStats::bump(&stats.light_errors, 1);
+                    errored = true;
+                    if consecutive_errors < 3 {
+                        println!("[LOAD] 线程B 写错误: {}", e);
+                    }
+                }
+            }
+        }
+        match port.read(&mut buf) {
+            Ok(n) => {
+                for b in &buf[..n] {
+                    parser.feed(*b, &stats);
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(e) => {
+                Mai2LoadStats::bump(&stats.light_errors, 1);
+                errored = true;
+                if consecutive_errors < 3 {
+                    println!("[LOAD] 线程B 读错误: {}", e);
+                }
+            }
+        }
+        if errored {
+            consecutive_errors += 1;
+            if consecutive_errors >= ERROR_GIVE_UP {
+                println!("[LOAD] 线程B 连续 {} 次错误, 判端口已失效, 退出。", ERROR_GIVE_UP);
+                return;
+            }
+            thread::sleep(Duration::from_millis(50));
+        } else {
+            consecutive_errors = 0;
+        }
+        tick = tick.wrapping_add(1);
+    }
+    // 收尾: 全灯灭 + 提交, 别把灯留在压测色上。
+    let _ = port.write_all(&mai2_light_frame(0, 0, 0x32, &[0, 0x20, 0, 0, 0, 0]));
+    let _ = port.write_all(&mai2_light_frame(0, 0, 0x3C, &[]));
+    let _ = port.flush();
+}
+
+/// 压测通道开关。三路同压能复现故障, 但复现不等于定位 —— 必须能逐路关掉做二分。
+#[derive(Clone, Copy)]
+struct Mai2LoadLanes {
+    serial: bool,
+    light: bool,
+    vendor: bool,
+    heavy: bool,
+}
+
+fn run_mai2_load(
+    ctrl: &mut AppController,
+    port_name: &str,
+    seconds: u64,
+    lanes: Mai2LoadLanes,
+) -> ! {
+    use mai2control_ui::comport::{self, CdcFunction};
+    use mai2control_ui::proto::{FIELD_BASELINE, FIELD_DIFF, FIELD_RAW, FIELD_STATUS};
+
+    println!(
+        "[LOAD] 压测 {}s | serial={} light={} vendor={}{}",
+        seconds,
+        lanes.serial,
+        lanes.light,
+        lanes.vendor,
+        if lanes.heavy {
+            " + 长周期 PSoC 指令堆叠(--heavy)"
+        } else {
+            ""
+        }
+    );
+
+    let ports = comport::identify_ports();
+    let pick = |f: CdcFunction| -> Option<String> {
+        ports
+            .iter()
+            .find(|p| p.function == f)
+            .map(|p| p.port_name.clone())
+    };
+    let serial_port = if lanes.serial {
+        pick(CdcFunction::Serial)
+    } else {
+        None
+    };
+    let light_port = if lanes.light {
+        pick(CdcFunction::Light)
+    } else {
+        None
+    };
+    println!(
+        "[LOAD] 端口: mai2serial={} mai2light={}",
+        serial_port.as_deref().unwrap_or("未识别"),
+        light_port.as_deref().unwrap_or("未识别")
+    );
+    if serial_port.is_none() && light_port.is_none() && !lanes.vendor {
+        println!("[LOAD] FAIL 三路全关, 无事可压");
+        std::process::exit(1);
+    }
+    if lanes.serial && lanes.light && serial_port.is_none() && light_port.is_none() {
+        println!("[LOAD] FAIL 两条 CDC 都没识别到(设备需处于 serial 工作模式)");
+        std::process::exit(1);
+    }
+
+    // 波特率取设备真值(KV), 与固件实际配置同源; 缺省 115200。
+    let baud_of = |key: &str| -> u32 {
+        match ctrl.config_get(key).map(|e| e.value) {
+            Some(CfgValue::U32(v)) => v,
+            Some(CfgValue::U16(v)) => v as u32,
+            _ => 115_200,
+        }
+    };
+    let serial_baud = baud_of("comm.serial_baud");
+    let light_baud = baud_of("comm.light_baud");
+    println!(
+        "[LOAD] 波特率: serial={} light={}",
+        serial_baud, light_baud
+    );
+
+    // 干净窗口: 峰值量不可差分, 先清零再压。
+    if let Err(e) = ctrl.clear_loop_profile() {
+        println!("[LOAD] FAIL 清零主循环剖面失败(固件是否为带剖面的新版本?): {}", e);
+        std::process::exit(1);
+    }
+    let base = match read_loop_profile(ctrl) {
+        Some(p) if p.loop_max_us < 200_000 => p,
+        Some(p) => {
+            println!(
+                "[LOAD] 注意: 清零后 loop_max_us 仍为 {}us(清零到读取之间已跑过长轮), 继续。",
+                p.loop_max_us
+            );
+            p
+        }
+        None => {
+            println!("[LOAD] FAIL 诊断结构过短, 固件不含主循环剖面字段 —— 请先烧录本轮固件。");
+            std::process::exit(1);
+        }
+    };
+    println!(
+        "[LOAD] 基线: loop_count={} rx_dropped={} heavy_rejects={}",
+        base.loop_count, base.rx_dropped, base.heavy_rejects
+    );
+
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stats = std::sync::Arc::new(Mai2LoadStats::default());
+    let mut workers = Vec::new();
+    if let Some(name) = serial_port {
+        let (s, st) = (stop.clone(), stats.clone());
+        workers.push(thread::spawn(move || {
+            mai2_load_serial_thread(name, serial_baud, s, st)
+        }));
+    }
+    if let Some(name) = light_port {
+        let (s, st) = (stop.clone(), stats.clone());
+        workers.push(thread::spawn(move || {
+            mai2_load_light_thread(name, light_baud, s, st)
+        }));
+    }
+
+    // 主线程(vendor): 遥测拉满 + 轮询参数 + 周期采剖面。★AppController 不跨线程★ —— 它持有的
+    // IoHandle 与 nusb 会话按单线程使用设计, 故 vendor 一路固定留在主线程, 只有两条 CDC 开子线程。
+    if lanes.vendor {
+        let _ = ctrl.start_telemetry(
+            250,
+            FIELD_RAW | FIELD_BASELINE | FIELD_DIFF | FIELD_STATUS,
+            u64::MAX,
+        );
+    }
+    let t0 = std::time::Instant::now();
+    let total = Duration::from_secs(seconds);
+    let mut last_sample = std::time::Instant::now();
+    let mut last_param = std::time::Instant::now();
+    let mut last_heavy = std::time::Instant::now();
+    let mut last_loop_count = base.loop_count;
+    let mut reboots = 0u32;
+    let mut disconnects = 0u32;
+    let mut worst = base;
+    let mut heavy_sent = 0u32;
+    let mut heavy_tune_fired = false;
+    let mut param_polls = 0u32;
+    let param_ids: [u8; 4] = [0x01, 0x08, 0x0B, 0x07];
+
+    while t0.elapsed() < total {
+        ctrl.poll();
+        // ★掉线即收尾★: 继续跑只是在死链路上空转, 而死前遗言(scratch)会被下一次复位覆盖,
+        // 越早去读越可信。判据已经成立, 没有再压下去的价值。
+        if ctrl.state() == ConnState::Disconnected {
+            disconnects += 1;
+            println!(
+                "[LOAD] ★掉线★ @{}s —— 已达判据, 提前收尾去读死前遗言",
+                t0.elapsed().as_secs()
+            );
+            break;
+        }
+        if lanes.vendor && last_param.elapsed() >= Duration::from_millis(100) {
+            last_param = std::time::Instant::now();
+            let id = param_ids[(param_polls as usize) % param_ids.len()];
+            let _ = ctrl.request_param_all_channels(id);
+            param_polls += 1;
+        }
+        // --heavy: 故意堆叠长周期指令。用 CP_MEASURE 而不是 AUTO_TUNE —— 两者走同一条反堆叠闸门,
+        // 但 CP 测量不改写任何持久参数, 而自适应会重写 SNS_CLK_DIV(上一轮 nv-soak 写坏配置的教训)。
+        // ★真正制造堆叠★: CP 测量是"读类"提交(core0 等到完成才返回), 天然自我串行, 拒不了自己 ——
+        // 只用它压, 闸门永远是 0 次拒绝, 等于没测。频率自适应才是异步长周期(20s+)的那一类:
+        // 开一条在途, 后续每条 CP 测量都必须被回 DEVICE_BUSY。这也正是用户崩溃日志里的场景。
+        if lanes.heavy && !heavy_tune_fired && t0.elapsed() >= Duration::from_secs(2) {
+            heavy_tune_fired = true;
+            match ctrl.auto_tune(0) {
+                Ok(()) => println!("[LOAD] 已发起 ch0 频率自适应(长周期在途), 后续长周期指令应被闸门拒绝"),
+                Err(e) => println!("[LOAD] 频率自适应发起失败: {}", e),
+            }
+        }
+        if lanes.heavy && last_heavy.elapsed() >= Duration::from_millis(400) {
+            last_heavy = std::time::Instant::now();
+            let _ = ctrl.measure_cp();
+            heavy_sent += 1;
+        }
+        if last_sample.elapsed() >= Duration::from_millis(500) {
+            last_sample = std::time::Instant::now();
+            if let Some(p) = read_loop_profile(ctrl) {
+                // loop_count 回退 = 设备重启(计数器从 0 重来)。ms 类时基会被 PSoC 复位干扰, 这个不会。
+                if p.loop_count < last_loop_count {
+                    reboots += 1;
+                    println!(
+                        "[LOAD] ★设备重启★ @{}s (loop_count {} → {})",
+                        t0.elapsed().as_secs(),
+                        last_loop_count,
+                        p.loop_count
+                    );
+                    worst = p; // 重启已清零剖面, 峰值从新窗口重新累计
+                } else {
+                    if p.loop_max_us > worst.loop_max_us {
+                        worst.loop_max_us = p.loop_max_us;
+                    }
+                    for i in 0..8 {
+                        if p.seg_max_us[i] > worst.seg_max_us[i] {
+                            worst.seg_max_us[i] = p.seg_max_us[i];
+                        }
+                        if p.seg2_max_us[i] > worst.seg2_max_us[i] {
+                            worst.seg2_max_us[i] = p.seg2_max_us[i];
+                        }
+                    }
+                }
+                worst.rx_dropped = p.rx_dropped;
+                worst.heavy_rejects = p.heavy_rejects;
+                worst.heavy_busy = p.heavy_busy;
+                worst.nv_commit_fail = p.nv_commit_fail;
+                last_loop_count = p.loop_count;
+            }
+        }
+        thread::sleep(Duration::from_millis(4));
+    }
+
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    for w in workers {
+        let _ = w.join();
+    }
+    let _ = ctrl.stop_telemetry();
+    ctrl.poll();
+
+    let elapsed = t0.elapsed().as_secs_f64().max(0.001);
+    let io = ctrl.io_stats();
+    println!("[LOAD] ---- mai2serial ----");
+    println!(
+        "[LOAD] rx={}B 触控帧={} ({:.0} 帧/s) 命令回执={} 启停={} 快速重启={} 错误={}",
+        Mai2LoadStats::get(&stats.ser_rx_bytes),
+        Mai2LoadStats::get(&stats.ser_touch_frames),
+        Mai2LoadStats::get(&stats.ser_touch_frames) as f64 / elapsed,
+        Mai2LoadStats::get(&stats.ser_cmd_resp),
+        Mai2LoadStats::get(&stats.ser_halts),
+        Mai2LoadStats::get(&stats.ser_restarts),
+        Mai2LoadStats::get(&stats.ser_errors)
+    );
+    println!("[LOAD] ---- mai2light ----");
+    println!(
+        "[LOAD] tx={}帧/{}B ({:.0} 帧/s) 应答ok={} 设备判我sum错={} 我判设备sum错={} 错误={}",
+        Mai2LoadStats::get(&stats.light_tx_frames),
+        Mai2LoadStats::get(&stats.light_tx_bytes),
+        Mai2LoadStats::get(&stats.light_tx_frames) as f64 / elapsed,
+        Mai2LoadStats::get(&stats.light_ack_ok),
+        Mai2LoadStats::get(&stats.light_ack_sum_err),
+        Mai2LoadStats::get(&stats.light_bad_sum),
+        Mai2LoadStats::get(&stats.light_errors)
+    );
+    println!("[LOAD] ---- vendor ----");
+    println!(
+        "[LOAD] rx={}B tx={}B stall恢复={} 队列丢弃={} 遥测帧={} 参数轮询={}",
+        io.bytes_read,
+        io.bytes_written,
+        io.stall_recoveries,
+        io.queue_dropped,
+        ctrl.telem_frame_count(),
+        param_polls
+    );
+    println!("[LOAD] ---- 主循环阻塞剖面(核心指标) ----");
+    let margin = WATCHDOG_BUDGET_US.saturating_sub(worst.loop_max_us);
+    println!(
+        "[LOAD] 整轮最长 = {}us ({:.1}ms) → 距 5s 看门狗余量 {}us ({:.1}ms, 占用 {:.2}%)",
+        worst.loop_max_us,
+        worst.loop_max_us as f64 / 1000.0,
+        margin,
+        margin as f64 / 1000.0,
+        worst.loop_max_us as f64 * 100.0 / WATCHDOG_BUDGET_US as f64
+    );
+    let mut ranked: Vec<(usize, u32)> = worst.seg_max_us.iter().copied().enumerate().collect();
+    ranked.sort_by(|a, b| b.1.cmp(&a.1));
+    for (idx, us) in &ranked {
+        println!(
+            "[LOAD]   {:<9} 最长 {:>8}us ({:.1}ms)",
+            LOOP_SEG_NAMES[*idx],
+            us,
+            *us as f64 / 1000.0
+        );
+    }
+    let mut ranked2: Vec<(usize, u32)> = worst.seg2_max_us.iter().copied().enumerate().collect();
+    ranked2.sort_by(|a, b| b.1.cmp(&a.1));
+    for (idx, us) in ranked2.iter().take(4) {
+        println!(
+            "[LOAD]   └ game_io/{:<11} 最长 {:>8}us ({:.1}ms)",
+            GAMEIO_SEG_NAMES[*idx],
+            us,
+            *us as f64 / 1000.0
+        );
+    }
+    println!(
+        "[LOAD] 重启={} 掉线={} vendor_rx_dropped={}(基线 {}) nv_commit_fail={} 最后成功采样 loop_count={}",
+        reboots, disconnects, worst.rx_dropped, base.rx_dropped, worst.nv_commit_fail, last_loop_count
+    );
+    println!(
+        "[LOAD] 反堆叠闸门: 拒绝累计={}(基线 {}, 本轮 +{}) 当前在途={} 主动发起长周期指令={}",
+        worst.heavy_rejects,
+        base.heavy_rejects,
+        worst.heavy_rejects.saturating_sub(base.heavy_rejects),
+        worst.heavy_busy,
+        heavy_sent
+    );
+    // 死前遗言必须**独立开句柄**读: 掉线后 AppController 的会话已废, 而 EP0 在 bulk 死后仍存活。
+    // 掉线场景下这是唯一还能问到"设备当时怎么死的"的通道。
+    // ★掉线 ≠ 设备重启★: 掉线只说明 vendor 会话没了; 设备是否真的重启, 唯一可信判据是 loop_count
+    // 相对基线是否回退(计数器只增, 复位归零)。此前把两者混为一谈, 白追了一轮。
+    // 重新枚举需要时间, 故重试几轮而不是一次失败就放弃。
+    // 会话还活着就用它读: 另开句柄会与本进程已 claim 的接口冲突而失败(不是设备的问题)。
+    let mut fresh: Option<Vec<u8>> = if ctrl.state() != ConnState::Disconnected {
+        ctrl.read_debug_counters().ok()
+    } else {
+        None
+    };
+    if fresh.is_none() {
+        for _ in 0..12 {
+            match io::read_debug(port_name) {
+                Ok(bytes) => {
+                    fresh = Some(bytes);
+                    break;
+                }
+                Err(_) => thread::sleep(Duration::from_millis(500)),
+            }
+        }
+    }
+    match fresh {
+        Some(bytes) => {
+            if bytes.len() >= 8 {
+                let now_loop = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+                println!(
+                    "[LOAD] 设备是否重启: loop_count 基线={} 现在={} → {}",
+                    base.loop_count,
+                    now_loop,
+                    if now_loop < base.loop_count {
+                        "★已重启★"
+                    } else {
+                        "未重启(计数器连续, 掉线只是 vendor 会话断开)"
+                    }
+                );
+            }
+            print_post_mortem("[LOAD]", &bytes);
+        }
+        None => println!("[LOAD] 设备迟迟未重新枚举, 死前遗言无法读取"),
+    }
+
+    // 判据: 重启/掉线是硬失败; rx_dropped 增长 = core0 曾长时间没来取命令(命令被截断), 同样是失败。
+    let mut fails: Vec<String> = Vec::new();
+    if reboots > 0 {
+        fails.push(format!("设备重启 {} 次", reboots));
+    }
+    if disconnects > 0 {
+        fails.push(format!("USB 掉线 {} 次", disconnects));
+    }
+    if worst.rx_dropped > base.rx_dropped {
+        fails.push(format!(
+            "vendor_rx_dropped 增长 {}(core0 曾长时间未取命令, 主机命令被截断)",
+            worst.rx_dropped - base.rx_dropped
+        ));
+    }
+    if worst.loop_max_us >= WATCHDOG_BUDGET_US / 2 {
+        fails.push(format!(
+            "整轮最长 {}us 已过看门狗预算一半(余量不足)",
+            worst.loop_max_us
+        ));
+    }
+    if fails.is_empty() {
+        println!("[LOAD] PASS");
+        std::process::exit(0);
+    }
+    println!("[LOAD] FAIL: {}", fails.join(" | "));
+    std::process::exit(1);
+}
+
 fn main() {
     env_logger::init();
 
@@ -1145,6 +3162,25 @@ fn main() {
     let algo_test = args.iter().any(|a| a == "--algo");
     let global_test = args.iter().any(|a| a == "--global");
     let kbd_test = args.iter().any(|a| a == "--kbd");
+    let bus_test = args.iter().any(|a| a == "--bus");
+    // --mai2-load [秒]: 两条 mai2 CDC + vendor 三路同时顶流, 量主循环最长阻塞与看门狗余量。
+    // 追加 --heavy 则同时故意堆叠长周期 PSoC 指令, 检验反堆叠闸门。
+    let mai2_load = args.iter().any(|a| a == "--mai2-load");
+    let mai2_load_secs: u64 = args
+        .iter()
+        .position(|a| a == "--mai2-load")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(60);
+    // 逐路开关: 复现之后必须能二分定位, 否则三路同压只能证明"有问题"不能证明"问题在哪"。
+    let mai2_load_lanes = Mai2LoadLanes {
+        serial: !args.iter().any(|a| a == "--only-light"),
+        light: !args.iter().any(|a| a == "--only-serial"),
+        vendor: !args.iter().any(|a| a == "--no-vendor"),
+        heavy: args.iter().any(|a| a == "--heavy"),
+    };
+    // 定向修复: 只把 --nv-soak 写坏的极性与状态灯这几项救回来, 不做整体 RESET_DEFAULTS。
+    let kbd_repair = args.iter().any(|a| a == "--kbd-repair");
     let led_test = args.iter().any(|a| a == "--led");
     let soak = args.iter().any(|a| a == "--soak");
     let list_only = args.iter().any(|a| a == "--list-only");
@@ -1309,6 +3345,46 @@ fn main() {
                         le32(63)
                     );
                 }
+                // 主循环阻塞剖面(仅新固件有): 整轮最长 + 各段最长 + 反堆叠闸门实证。
+                if b.len() >= DBG_LEN_WITH_PROFILE {
+                    let loop_max = le32(DBG_OFF_LOOP_MAX_US);
+                    println!(
+                        "[DBG] loop_max_us={} (距 5s 看门狗余量 {}us) heavy_rejects={} heavy_busy={}",
+                        loop_max,
+                        WATCHDOG_BUDGET_US.saturating_sub(loop_max),
+                        le32(DBG_OFF_HEAVY_REJECTS),
+                        b[DBG_OFF_HEAVY_BUSY]
+                    );
+                    for (i, name) in LOOP_SEG_NAMES.iter().enumerate() {
+                        println!(
+                            "[DBG]   seg {:<9} max={}us",
+                            name,
+                            le32(DBG_OFF_SEG_MAX_US + i * 4)
+                        );
+                    }
+                }
+                if b.len() >= DBG_LEN_WITH_NV_VALID {
+                    const NV_REGION_NAMES: [&str; 4] = ["KV", "CSD", "ALGO_BIN", "ALGO_SRC"];
+                    let m = b[DBG_OFF_NV_VALID_MASK];
+                    let list: Vec<String> = NV_REGION_NAMES
+                        .iter()
+                        .enumerate()
+                        .map(|(i, n)| {
+                            format!("{}={}", n, if (m >> i) & 1 == 1 { "有效" } else { "无效" })
+                        })
+                        .collect();
+                    println!("[DBG] nv_valid_mask=0x{:X} {}", m, list.join(" "));
+                }
+                if b.len() >= DBG_LEN_WITH_SEG2 {
+                    for (i, name) in GAMEIO_SEG_NAMES.iter().enumerate() {
+                        println!(
+                            "[DBG]   gio {:<11} max={}us",
+                            name,
+                            le32(DBG_OFF_SEG2_MAX_US + i * 4)
+                        );
+                    }
+                }
+                print_post_mortem("[DBG]", &b);
                 std::process::exit(0);
             }
             Ok(b) => {
@@ -1407,6 +3483,34 @@ fn main() {
         thread::sleep(Duration::from_millis(350));
         println!("[SELFTEST] BOOTSEL REQUESTED");
         std::process::exit(0);
+    }
+
+    if bus_test {
+        match run_bus_test(&mut ctrl) {
+            Ok(()) => {
+                println!("[BUS] ALL PASS");
+                std::process::exit(0);
+            }
+            Err(reason) => {
+                println!("[BUS] FAIL: {}", reason);
+                std::process::exit(1);
+            }
+        }
+    }
+
+    if kbd_repair {
+        run_kbd_repair(&mut ctrl);
+    }
+
+    // 压测前先把配置取到手: 波特率要用设备真值而不是默认值。
+    if mai2_load {
+        let _ = ctrl.request_config_all();
+        let deadline = std::time::Instant::now() + Duration::from_millis(1200);
+        while std::time::Instant::now() < deadline && ctrl.config_entries().is_empty() {
+            ctrl.poll();
+            thread::sleep(Duration::from_millis(20));
+        }
+        run_mai2_load(&mut ctrl, &port_name, mai2_load_secs, mai2_load_lanes);
     }
 
     if led_test {
@@ -2705,6 +4809,36 @@ fn main() {
 
     // 算法回读实验: 读设备信息 + C 源(映射表) + ASM 机器码, 打印长度与内容首部,
     // 确认"读取信息"能否真正取回设备保存的(已滤注释)C 源与机器码。
+    // --algo-default: 单独把触控算法恢复为内嵌默认并落盘。
+    // ★为什么需要它★: --algo 是"上传测试算法 → 校验 → 恢复默认"的闭环, 而上传是**先落盘再校验**;
+    // 校验失败时测试提前退出, 那份未通过校验的测试算法就留在 flash 里, 每次开机都被下发给 PSoC,
+    // 可能把 PSoC 打死(实测: scan=0 ms=0 link_valid=false)。此时需要一个不依赖 PSoC 存活的
+    // 恢复入口 —— 本命令只改 RP2040 侧的算法 store, 不需要 PSoC 配合。
+    if args.iter().any(|a| a == "--algo-default") {
+        println!("[ALGODEF] 恢复内嵌默认算法并落盘...");
+        if let Err(e) = ctrl.algo_reset_default() {
+            println!("[ALGODEF] FAIL 发送失败: {}", e);
+            std::process::exit(1);
+        }
+        let start = std::time::Instant::now();
+        while start.elapsed() < Duration::from_millis(2500) {
+            ctrl.poll();
+            thread::sleep(Duration::from_millis(20));
+        }
+        let _ = ctrl.algo_get_info();
+        let start = std::time::Instant::now();
+        while start.elapsed() < Duration::from_millis(1500) {
+            ctrl.poll();
+            thread::sleep(Duration::from_millis(20));
+        }
+        println!(
+            "[ALGODEF] 现在: is_default/psoc_valid/len = {:?}",
+            ctrl.algo_info().map(|i| (i.is_default, i.psoc_valid, i.len))
+        );
+        println!("[ALGODEF] DONE (请重启设备使 PSoC 重新加载默认算法)");
+        std::process::exit(0);
+    }
+
     if args.iter().any(|a| a == "--algo-dump") {
         let _ = ctrl.algo_get_info();
         let _ = ctrl.request_algo_src();

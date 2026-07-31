@@ -10,6 +10,13 @@ import { Theme } from "../common/theme.slint";
 // 附加属性冲突(编译报 "Cannot override property 'row'")。用 `entry` 代替。
 component ConfigRowItem inherits Rectangle {
     in property <ConfigRow> entry;
+    // 是否属于当前分组。★行高与显隐由本组件自己算★: 原先调用方各写一遍
+    // `height: 属于本组 ? (有取值范围 ? 60px : 48px) : 0px`, 同一份三元式散在多处, 迟早漂移。
+    in property <bool> shown: true;
+    // 显式 height 在 Slint 里是**权威**的(编译器不允许同时再给 min-height), 故行本身不会被压扁;
+    // 会被压扁/摊开的是外层容器, 那由调用方给 vertical-stretch: 0 + 末尾弹性占位来解决(见 protocol.slint)。
+    height: root.shown ? (root.entry.range_hex != "" ? 60px : 48px) : 0px;
+    visible: root.shown;
 
     callback set_bool(string, bool);
     callback set_number(string, float);
@@ -127,10 +134,9 @@ export component ConfigGroupSection inherits GroupBox {
 
         for row in root.rows: ConfigRowItem {
             entry: row;
-            // Slint 的 `for` 不支持直接接 `if` 元素, 故按行是否属于当前组控制显隐与占位高度。
-            visible: row.group == root.group_title;
-            // 数字整数行多一行 hex 取值范围, 高度略增避免范围文字被裁。
-            height: row.group == root.group_title ? (row.range_hex != "" ? 60px : 48px) : 0px;
+            // Slint 的 `for` 不支持直接接 `if` 元素, 故按"是否属于本组"控制显隐与占位高度;
+            // 高度/最小高度由 ConfigRowItem 自己按 shown 算(单一来源, 见其定义)。
+            shown: row.group == root.group_title;
             set_bool(key, v) => { root.set_bool(key, v); }
             set_number(key, v) => { root.set_number(key, v); }
             set_number_hex(key, v) => { root.set_number_hex(key, v); }

@@ -118,4 +118,16 @@ pub mod keys {
     pub const ALGO_BIN_AMP_PREFIX: &str = "algo_bin_amp";
     /// 触发判定(out_active)线的归一化幅度 N(同上, 千分之一整数存储)。
     pub const ALGO_BIN_AMP_ACTIVE: &str = "algo_bin_amp_active";
+    // —— 曲线页"画哪些系列"的记忆 ——
+    // 纯显示偏好(与归一化幅度同一性质): 勾哪几条线是看图前第一件要做的事, 重启即丢等于每次开
+    // 程序都要重新点一遍。默认值与 .slint 里的属性默认值保持一致, 免得首次启动被"记忆"改掉观感。
+    pub const CURVE_SHOW_RAW: &str = "curve_show_raw";
+    pub const CURVE_SHOW_BSLN: &str = "curve_show_bsln";
+    pub const CURVE_SHOW_DIFF: &str = "curve_show_diff";
+    /// 触发判定(out_active)线的勾选。
+    pub const CURVE_SHOW_ACTIVE: &str = "curve_show_active";
+    /// 算法上报叠加总开关(关着时 4 条上报线勾了也不画)。
+    pub const CURVE_ALGO_OVERLAY: &str = "curve_algo_overlay";
+    /// 4 条算法上报线各自的勾选。实际键 = 前缀 + idx(0..3)。
+    pub const CURVE_REPORT_SHOW_PREFIX: &str = "curve_report_show";
 }

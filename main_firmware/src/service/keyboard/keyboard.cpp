@@ -1,5 +1,6 @@
 #include "keyboard.h"
 #include "../config_manager/config_manager.h"
+#include "../game_io/game_io.h"
 #include "../binding_service/binding_service.h"
 #include "../../protocol/hid/hid.h"
 #include "../../protocol/psoc/psoc.h"
@@ -11,11 +12,13 @@
 KeyboardService* KeyboardService::_instance = nullptr;
 
 KeyboardService::KeyboardService()
-    : _kbd_map_en(false), _phys_state(0), _phys_out(0),
+    : _kbd_map_en(false), _kbd_map_serial_only(false), _phys_state(0), _phys_out(0),
       _touch_active(0), _gpio_ready(false), _pol_high_mask(0),
+      _boot_level_mask(0), _boot_level_valid(false),
       _edge_last_raw(0), _edge_last_deb(0), _edge_last_out(0) {
     _edges.clear();
     for (uint8_t i = 0; i < KEY_COUNT; i++) {
+        _pol_cfg[i] = 2;   // 默认 AUTO
         _keycode[i] = 0; _keymod[i] = 0;
         _hold[i].clear(); _hold_st[i].clear();
         _debounce_us[i] = DEBOUNCE_US_DEFAULT; _deb[i].clear();
@@ -80,18 +83,17 @@ void KeyboardService::reload_map() {
         _hold[i].delay_ms = ConfigManager::get_uint16(key_buf);
         snprintf(key_buf, sizeof(key_buf), "kbd.mh%02u", i);
         _hold[i].max_hold_ms = ConfigManager::get_uint16(key_buf);
-        // 触发极性: 0=低电平触发(默认, 与改造前一致) / 1=高电平触发。
+        // 触发极性配置态: 0=低电平触发 / 1=高电平触发 / 2=AUTO(默认)。
+        // 这里只存配置, 解析成生效掩码交给 _resolve_pol()(AUTO 需要启动电平参与)。
         snprintf(key_buf, sizeof(key_buf), "kbd.pl%02u", i);
-        if (ConfigManager::get_uint8(key_buf) != 0) {
-            _pol_high_mask |= (uint16_t)(1u << i);
-        } else {
-            _pol_high_mask &= (uint16_t)~(1u << i);
-        }
+        _pol_cfg[i] = ConfigManager::get_uint8(key_buf);
         // 每键防抖窗。KV 已带 0..DEBOUNCE_US_MAX 围栏, 这里再夹一次防止旧配置文件带入越界值。
         snprintf(key_buf, sizeof(key_buf), "kbd.db%02u", i);
         const uint16_t db = ConfigManager::get_uint16(key_buf);
         _debounce_us[i] = (db > DEBOUNCE_US_MAX) ? DEBOUNCE_US_MAX : db;
     }
+    // 配置态 → 生效掩码(AUTO 用开机那次采样解析)。必须在 _apply_pulls() 之前。
+    _resolve_pol();
     // 极性变了要跟着换内部上/下拉, 否则空闲电平与判定口径相反。
     if (_gpio_ready) _apply_pulls();
     for (uint8_t z = 0; z < ZONE_COUNT; z++) {
@@ -105,6 +107,7 @@ void KeyboardService::reload_map() {
         _zone_hold[z].max_hold_ms = ConfigManager::get_uint16(key_buf);
     }
     _kbd_map_en = ConfigManager::get_bool("comm.keyboard_map_en");
+    _kbd_map_serial_only = ConfigManager::get_bool("comm.keyboard_map_serial_only");
     _load_combo();
 }
 
@@ -175,6 +178,37 @@ void KeyboardService::_apply_pulls() {
             gpio_pull_up(pin);
         }
     }
+}
+
+// 配置态(_pol_cfg, 含 AUTO) + 启动电平 → 生效掩码 _pol_high_mask。
+// AUTO 语义: 把**启动时**的电平当作该键的"抬起"电平 ⇒
+//   启动电平为高 → 抬起是高 → 按下必然是低 → 低电平触发(清位);
+//   启动电平为低 → 抬起是低 → 按下必然是高 → 高电平触发(置位)。
+// 还没采到启动电平时回落"清位"(= 改造前的默认低电平触发), 该窗口只存在于首次 task() 之前。
+void KeyboardService::_resolve_pol() {
+    for (uint8_t i = 0; i < KEY_COUNT; i++) {
+        const uint16_t bit = (uint16_t)(1u << i);
+        bool high;
+        switch (_pol_cfg[i]) {
+            case 1:  high = true; break;
+            case 2:  high = _boot_level_valid && (((_boot_level_mask >> i) & 1u) == 0); break;
+            default: high = false; break;   // 0 与任何越界值都按低电平触发处理
+        }
+        if (high) _pol_high_mask |= bit; else _pol_high_mask &= (uint16_t)~bit;
+    }
+}
+
+// 采样一次启动电平并重解析极性 + 重设上下拉。**只在首次 task() 调用一次, 此后永不重采**。
+// 直读 GPIO 原始电平(不经 _read_raw(), 那会先套一遍极性, 拿到的就不是电平了)。
+void KeyboardService::_latch_boot_level() {
+    uint16_t level = 0;
+    for (uint8_t i = 0; i < KEY_COUNT; i++) {
+        if (gpio_get(GPIO_BASE + i) != 0) level |= (uint16_t)(1u << i);
+    }
+    _boot_level_mask = level;
+    _boot_level_valid = true;
+    _resolve_pol();
+    _apply_pulls();
 }
 
 uint16_t KeyboardService::_read_raw() const {
@@ -277,6 +311,12 @@ void KeyboardService::_apply_combo(uint64_t area_raw, uint32_t now_us) {
 void KeyboardService::task() {
     if (!_gpio_ready) return;
 
+    // ★AUTO 只认启动时电平★ 采样点放在首次 task() 而不是 init():
+    // init() 里刚刚配好上下拉, 线路未必稳定; 而首次 task() 之前已经历阻塞式 PSoC bring-up(秒级),
+    // 线路早已稳定, 因此**不需要任何 delay**。采样时引脚保持 init() 设的上拉, 与板上 1K 外部上拉同向。
+    // 已知取舍: 启动瞬间被按住的键会被学成"抬起", 该键极性判反 —— 这是 AUTO 的指定语义, 不做纠正。
+    if (!_boot_level_valid) { _latch_boot_level(); }
+
     // 物理键逐键去抖 + 逐键长按判定。两件事合进同一个 12 次循环: 每键各自的稳定窗互不干扰,
     // 一个抖动键不再拖累其它键的提交时刻。debounce_us=0 时 (now - stable_since) >= 0 恒成立 → 不去抖。
     const uint32_t now = time_us_32();
@@ -319,20 +359,25 @@ void KeyboardService::task() {
         _phys_out = phys_out;
     }
 
-    // ★总开关必须低频重读★
-    // comm.keyboard_map_en 由主机经 CFG_SET 修改, 而 CFG_SET 只落 ConfigManager, **没有任何人通知
-    // 本服务** ⇒ _kbd_map_en 一直停在启动时读到的旧值。实测表现: 界面勾了"启用触控键盘映射"、映射也
-    // 已保存, 但触控完全不出键, 必须重启设备才生效。
+    // ★总开关与协议发送限定开关必须低频重读★
+    // 两项均由主机经 CFG_SET 修改，而 CFG_SET 只落 ConfigManager、不会通知本服务。
     // 这里每 200ms 查一次本地 config map(纯内存查找, 不涉及 USB/SPI, 不影响任何轮询周期)。
     static uint32_t last_en_poll_us = 0;
     if ((uint32_t)(now - last_en_poll_us) > 200000u) {
         last_en_poll_us = now;
         _kbd_map_en = ConfigManager::get_bool("comm.keyboard_map_en");
+        _kbd_map_serial_only = ConfigManager::get_bool("comm.keyboard_map_serial_only");
     }
 
-    // 触控→键盘(组合语义): 开启时取当前分区触摸态; 关闭时按"全松开"走同一路径确保释放。
+    // 映射是否生效: 总开关为纲; 若“仅协议发送时生效”开启, 再叠加 mai2serial 真实发送态。
+    // 总开关关闭时本修饰开关不起作用 —— 直接不生效, 与改造前一致。
+    bool map_active = _kbd_map_en;
+    if (map_active && _kbd_map_serial_only) {
+        map_active = GameIoService::getInstance()->mai2_touch_sending();
+    }
+    // 触控→键盘(组合语义): 不生效时 area_raw 保持 0，继续走同一全松开路径确保释放已按下的映射键。
     uint64_t area_raw = 0;
-    if (_kbd_map_en) {
+    if (map_active) {
         Psoc* psoc = Psoc::getInstance();
         if (psoc->link_ok()) {
             area_raw = BindingService::getInstance()->map_to_areas(psoc->touch_mask());
@@ -392,20 +437,25 @@ void KeyboardService::_handle_get_keycfg(const HostFrame& frame, uint8_t* resp, 
     r.cmd = static_cast<uint8_t>(HostCmd::KBD_GET_KEYCFG);
     r.flags = HOST_CMD_FLAG_RESPONSE;
     r.seq = frame.seq;
-    // [count(u8)=12] + 12×(pol(u8), debounce_us(u16 LE))
+    // [count(u8)=12] + 12×(pol(u8), debounce_us(u16 LE)) + resolved_pol_high_mask(u16 LE)
     r.payload[0] = KEY_COUNT;
     uint16_t off = 1;
     for (uint8_t i = 0; i < KEY_COUNT; i++) {
-        r.payload[off++] = (uint8_t)(((self->_pol_high_mask >> i) & 1u) != 0 ? 1 : 0);
+        // 回显**配置态**(0/1/2), 不是解析结果: AUTO 必须原样回显, 否则界面永远看不到 AUTO 档。
+        r.payload[off++] = self->_pol_cfg[i];
         r.payload[off++] = (uint8_t)(self->_debounce_us[i] & 0xFF);
         r.payload[off++] = (uint8_t)((self->_debounce_us[i] >> 8) & 0xFF);
     }
+    // ★尾部追加而非新命令★(与 _handle_get_state 同口径): 旧上位机只读前面的 1+12×3 字节仍正确,
+    // 新上位机据此显示 AUTO 到底判成了高还是低 —— 不然用户看不出 AUTO 学到了什么。
+    r.payload[off++] = (uint8_t)(self->_pol_high_mask & 0xFF);
+    r.payload[off++] = (uint8_t)((self->_pol_high_mask >> 8) & 0xFF);
     r.len = off;
     *resp_len = HostCmdCodec::encode_frame(r, resp, 512);
 }
 
 void KeyboardService::_handle_set_keycfg(const HostFrame& frame, uint8_t* resp, uint16_t* resp_len) {
-    // 每项 4 字节: [idx, pol(0=低/1=高), debounce_us(u16 LE)]。
+    // 每项 4 字节: [idx, pol(0=低/1=高/2=AUTO), debounce_us(u16 LE)]。
     if (frame.len < 4 || (frame.len % 4) != 0) {
         *resp_len = HostCmdCodec::encode_nak(frame.seq, HostCmdError::INVALID_PARAM,
             "kbd_set_keycfg payload must be [idx,pol,debounce16] quads", resp, 512);
@@ -422,9 +472,9 @@ void KeyboardService::_handle_set_keycfg(const HostFrame& frame, uint8_t* resp, 
                 "kbd_set_keycfg idx out of range (0..11)", resp, 512);
             return;
         }
-        if (pol > 1) {
+        if (pol > 2) {
             *resp_len = HostCmdCodec::encode_nak(frame.seq, HostCmdError::INVALID_PARAM,
-                "kbd_set_keycfg pol must be 0(low) or 1(high)", resp, 512);
+                "kbd_set_keycfg pol must be 0(low) 1(high) or 2(auto)", resp, 512);
             return;
         }
         if (db > DEBOUNCE_US_MAX) {

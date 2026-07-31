@@ -146,7 +146,7 @@ public:
     bool init();
     void deinit();
 
-    inline bool is_ready() const;
+    bool is_ready() const;
 
     bool set_config(const Mai2Serial_Config& config);
     Mai2Serial_Config get_config() const;

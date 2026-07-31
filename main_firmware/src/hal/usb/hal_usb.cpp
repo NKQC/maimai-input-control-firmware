@@ -15,6 +15,26 @@
 #include "../../service/usb_debug.h"
 
 
+// ★我们自己发起的 tud_* 端点调用必须与 USB IRQ 互斥★
+// 依据(实测, 见 --mai2-load 二分): 只压 mai2light 那条 CDC、vendor 与 serial 全不动, 设备仍在
+// 1~5s 内必挂; 死前遗言给出的定性是"主循环被拖死"且停在**我们自己**发起的 tud_cdc_n_read /
+// tud_cdc_n_write 上, hardfault=0(不是跑飞)、进段时已耗时=0ms(不是前面的段拖慢), 之后主循环
+// 再也没出来 → 5s 看门狗复位整机。只压 mai2serial 25s 则 740 帧/s 全程零错误 —— 差别正是
+// 灯板方向每轮要发很多条小应答, 命中"端点操作窗口被 ISR 抢占"的机会高一个量级。
+// 本工程 CFG_TUSB_OS=OPT_OS_PICO(tusb_config.h:41), 端点 claim 走 pico 阻塞互斥量, 该互斥量
+// 不关中断; 主循环持锁期间被 USB ISR 抢占, 两边就永久等在一起。
+// 本仓早有同类结论并写在案: vendor_service() 注释 "从主循环调用 dcd_edpt_xfer 会与 USB IRQ
+// 竞态导致 hardfault(实测 bulk 连接即崩)"。此处是同一个坑的另一面。
+// 代价: 这些调用只是搬 FIFO + 启一次传输, 微秒级; 关中断窗口极短, 不影响 USB 时序。
+// ★禁止把 tud_task() / sleep 放进这个窗口★ —— 那会把中断关成毫秒级。
+struct UsbIrqLock {
+    uint32_t _saved;
+    UsbIrqLock() : _saved(save_and_disable_interrupts()) {}
+    ~UsbIrqLock() { restore_interrupts(_saved); }
+    UsbIrqLock(const UsbIrqLock&) = delete;
+    UsbIrqLock& operator=(const UsbIrqLock&) = delete;
+};
+
 // 静态实例指针
 HAL_USB_Device* HAL_USB_Device::instance_ = nullptr;
 
@@ -339,6 +359,11 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_requ
         g_usb_dbg.debug_enabled = (request->wValue != 0u) ? 1u : 0u;
         return tud_control_xfer(rhport, request, NULL, 0);
     }
+    // 0x53=清零主循环阻塞剖面(loop_max_us / seg_max_us)。峰值量不可差分, 压测须能开一个干净窗口。
+    if (request->bmRequestType_bit.type == TUSB_REQ_TYPE_VENDOR && request->bRequest == 0x53) {
+        loop_prof_clear();
+        return tud_control_xfer(rhport, request, NULL, 0);
+    }
     // 0x52=进 BOOTSEL：置请求位，由 loop() 在 ACK 完成后 reset_usb_boot。EP0 通道使得 bulk 死时仍可软件进烧录。
     if (request->bmRequestType_bit.type == TUSB_REQ_TYPE_VENDOR && request->bRequest == 0x52) {
         g_bootsel_request = 1u;
@@ -449,14 +474,23 @@ bool HAL_USB_Device::config_write(const uint8_t* data, size_t length) {
     size_t total_written = 0;
     const uint64_t start_time = time_us_64();
     while (total_written < length) {
-        const uint32_t available = tud_vendor_write_available();
+        // ★端点操作在关中断窗口内完成★(见 UsbIrqLock 注释); tud_task/sleep 绝不进这个窗口。
+        uint32_t available;
+        {
+            UsbIrqLock lock;
+            available = tud_vendor_write_available();
+        }
         if (available > 0) {
             const size_t chunk = std::min((size_t)available, length - total_written);
-            const uint32_t written = tud_vendor_write(data + total_written, (uint32_t)chunk);
+            uint32_t written;
+            {
+                UsbIrqLock lock;
+                written = tud_vendor_write(data + total_written, (uint32_t)chunk);
+                if (written > 0) tud_vendor_write_flush();
+            }
             if (written > 0) {
                 total_written += written;
                 last_avail_time = time_us_64();
-                tud_vendor_write_flush();
             }
         } else {
             const uint64_t now = time_us_64();
@@ -465,7 +499,10 @@ bool HAL_USB_Device::config_write(const uint8_t* data, size_t length) {
                 break;   // 过载超时: 放弃(拒绝)
             }
             if (initialized_) tud_task();       // 推进 IN 泵出腾 FIFO
-            tud_vendor_write_flush();
+            {
+                UsbIrqLock lock;
+                tud_vendor_write_flush();
+            }
             sleep_us(50);                       // 给 USB IRQ 完成 IN 传输的时间窗口
         }
     }
@@ -479,6 +516,7 @@ bool HAL_USB_Device::config_write(const uint8_t* data, size_t length) {
 size_t HAL_USB_Device::config_write_some(const uint8_t* data, size_t length) {
     if (!is_ready() || !data || length == 0) return 0;
 
+    UsbIrqLock lock;
     const size_t chunk = std::min((size_t)tud_vendor_write_available(), length);
     const size_t written = chunk > 0 ? tud_vendor_write(data, (uint32_t)chunk) : 0;
     tud_vendor_write_flush();
@@ -597,45 +635,35 @@ void HAL_USB_Device::tud_vendor_rx_cb(uint8_t itf, uint8_t const* buffer, uint16
     }
 }
 
+size_t HAL_USB_Device::cdc_write_available(UsbCdcPort port) const {
+    if (!initialized_) return 0;
+    pm_stage(PM_STAGE_CDC_AVAIL);
+    UsbIrqLock lock;
+    return tud_cdc_n_write_available(static_cast<uint8_t>(port));
+}
+
+// ★非阻塞、整帧原子★
+// 原实现在这里 `sleep_us(100)` 自旋最多 10ms 等 FIFO 腾空, 既不喂狗也不泵 tud_task:
+//   * 违反"禁止任何形式的 delay 与空转忙等";
+//   * 主机稍慢读 CDC IN, 每帧就付 10ms —— 灯板一轮 task 最多派发 ~28 帧应答 ⇒ 单轮主循环被拖到
+//     百毫秒级, 而 vendor(WinUSB)只在主循环开头被泵一次 ⇒ 主机在途传输被 Windows abort、判掉线
+//     (实测 --mai2-load: os error 121/22 + ConnectionAborted, 随后设备复位)。
+// 现在: 空间够就整帧写, 不够就整帧不写并返回 false, 由调用方按各自语义处理(触控帧丢一帧、
+// 灯板应答丢一条), 绝不半帧写入 —— 半帧会让收端永久错帧, 比丢帧严重得多。
 bool HAL_USB_Device::cdc_write(UsbCdcPort port, const uint8_t* data, size_t length) {
     if (!is_ready() || !data || length == 0) {
         return length == 0;
     }
-
     const uint8_t itf = static_cast<uint8_t>(port);
-    static uint64_t last_avail_time[CDC_PORT_COUNT] = {0};
-    const uint64_t TIMEOUT_US = 10000; // 10ms timeout
-
-    size_t total_written = 0;
-    uint64_t start_time = time_us_64();
-
-    while (total_written < length) {
-        uint32_t available = tud_cdc_n_write_available(itf);
-
-        if (available > 0) {
-            size_t to_write = std::min((size_t)available, length - total_written);
-            uint32_t written = tud_cdc_n_write(itf, data + total_written, to_write);
-
-            if (written > 0) {
-                total_written += written;
-                last_avail_time[itf] = time_us_64();
-                tud_cdc_n_write_flush(itf);
-            }
-        } else {
-            // No space available, check timeout
-            uint64_t current_time = time_us_64();
-            if (current_time - start_time > TIMEOUT_US ||
-                (last_avail_time[itf] > 0 && current_time - last_avail_time[itf] > TIMEOUT_US)) {
-                break; // Timeout reached
-            }
-
-            // Brief delay and flush
-            sleep_us(100);
-            tud_cdc_n_write_flush(itf);
-        }
+    pm_stage(PM_STAGE_CDC_WRITE);
+    UsbIrqLock lock;
+    if (tud_cdc_n_write_available(itf) < length) {
+        tud_cdc_n_write_flush(itf);   // 催一次让 IN 尽快腾空, 下一轮再试
+        return false;
     }
-
-    return total_written == length;
+    const uint32_t written = tud_cdc_n_write(itf, data, (uint32_t)length);
+    tud_cdc_n_write_flush(itf);
+    return written == length;
 }
 
 size_t HAL_USB_Device::cdc_read(UsbCdcPort port, uint8_t* buffer, size_t max_length) {
@@ -662,13 +690,16 @@ size_t HAL_USB_Device::cdc_available(UsbCdcPort port) const {
 
 void HAL_USB_Device::cdc_flush(UsbCdcPort port) {
     if (initialized_) {
+        UsbIrqLock lock;
         tud_cdc_n_write_flush(static_cast<uint8_t>(port));
     }
 }
 
 void HAL_USB_Device::task() {
     if (initialized_) {
+        pm_stage(PM_STAGE_TUD_TASK);
         tud_task();
+        pm_stage(PM_STAGE_TUD_TASK_DONE);
         g_usb_dbg.tud_task_count++;
     }
 }
@@ -690,7 +721,14 @@ void HAL_USB_Device::_handle_cdc_rx(uint8_t itf) {
     if (!tud_cdc_n_available(itf)) return;
 
     uint8_t buffer[64];
-    uint32_t count = tud_cdc_n_read(itf, buffer, sizeof(buffer));
+    pm_stage(PM_STAGE_CDC_READ);
+    uint32_t count;
+    {
+        // tud_cdc_n_read 内部会重新武装 OUT 端点(usbd_edpt_xfer), 同样属于端点操作。
+        UsbIrqLock lock;
+        count = tud_cdc_n_read(itf, buffer, sizeof(buffer));
+    }
+    pm_stage(PM_STAGE_CDC_READ_DONE);
 
     if (count > 0) {
         // 存储到该角色对应的环形缓冲区
@@ -702,6 +740,7 @@ void HAL_USB_Device::_handle_cdc_rx(uint8_t itf) {
             }
         }
     }
+    pm_stage(PM_STAGE_CDC_RX_DONE);
 }
 
 // TinyUSB回调函数实现：按 itf 分流到对应角色的环形缓冲。

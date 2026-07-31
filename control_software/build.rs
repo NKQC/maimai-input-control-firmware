@@ -1,6 +1,8 @@
 use std::fs;
 
 fn main() {
+    embed_windows_icon();
+
     slint_build::compile("ui/app.slint").unwrap();
 
     const PSOC_HEADER: &str = "../main_firmware/src/protocol/psoc/psoc_fw_image.h";
@@ -73,4 +75,35 @@ fn main() {
         None => "pub const EMBEDDED: bool = false;\npub static BYTES: &[u8] = &[];\n".to_string(),
     };
     fs::write(generated, embedded).expect("write embedded virtual camera source");
+}
+
+/// 把 `ui/assets/icon.ico` 作为 Win32 ICON 资源嵌进可执行文件，
+/// 使 exe 在资源管理器 / 任务栏 / Alt-Tab 里显示图标（而非默认空白图标）。
+///
+/// 要点:
+///  - 目标判定用 `CARGO_CFG_TARGET_OS` 而不是 `cfg!(windows)`：build.rs 里的 `cfg` 描述的是
+///    **宿主**平台，交叉编译时会判错；`CARGO_CFG_TARGET_OS` 才是真正的目标平台。
+///  - MSVC ABI 下 winresource 需要 Windows SDK 的 `rc.exe`。找不到时**不让整个构建失败**：
+///    图标只是外观，缺它不影响功能，故降级为 warning 继续编译。
+///  - ★该资源会附加到本 crate 的**所有** bin（`mai2control-ui.exe` 与 `selftest.exe`）★——
+///    winresource 无法按 bin 目标分别设置资源。selftest 跟着有图标无害，故不额外绕。
+///  - `.ico` 是从同目录 `icon.png`(1024×1024) 派生的多尺寸容器(16/24/32/48/64/128/256, PNG 编码)。
+///    换图标时请重新生成 `.ico`，否则两者会不一致。
+fn embed_windows_icon() {
+    const ICON: &str = "ui/assets/icon.ico";
+    println!("cargo:rerun-if-changed={ICON}");
+
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
+        return;
+    }
+    if !std::path::Path::new(ICON).is_file() {
+        println!("cargo:warning=未找到 {ICON}，exe 将使用默认图标");
+        return;
+    }
+
+    let mut res = winresource::WindowsResource::new();
+    res.set_icon(ICON);
+    if let Err(error) = res.compile() {
+        println!("cargo:warning=嵌入 exe 图标失败({error})，继续构建；如需图标请确认 Windows SDK 的 rc.exe 可用");
+    }
 }

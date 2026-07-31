@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <map>
 #include <string>
+#include <pico/stdlib.h>   // time_us_32(): 出向帧尾部时间戳的唯一时基(同 bus_core.cpp)
 #ifdef PICO_PLATFORM
 #include <hardware/watchdog.h>
 #endif
@@ -208,7 +209,15 @@ uint16_t HostCmdCodec::encode_frame(const HostFrame& frame, uint8_t* out_buffer,
     if (!out_buffer || max_len < HOST_CMD_HEADER_SIZE + 2 + frame.len) {
         return 0;
     }
-    
+
+    // ★设备时间戳唯一追加点★(设计与退化条件见 host_cmd.h 的 HOST_CMD_FLAG_TS 注释)。
+    // 本函数是固件唯一的出向组帧口 ⇒ 所有设备→主机的帧自动带戳, 新增命令无需任何改动。
+    const bool with_ts =
+        ((uint32_t)frame.len + HOST_CMD_TS_SIZE <= HOST_CMD_PAYLOAD_MAX) &&
+        ((uint32_t)max_len >= (uint32_t)HOST_CMD_HEADER_SIZE + 2u + frame.len + HOST_CMD_TS_SIZE);
+    const uint16_t body_len =
+        with_ts ? (uint16_t)(frame.len + HOST_CMD_TS_SIZE) : frame.len;
+
     uint16_t pos = 0;
     
     // SOF
@@ -217,22 +226,31 @@ uint16_t HostCmdCodec::encode_frame(const HostFrame& frame, uint8_t* out_buffer,
     
     // 头部: cmd flags seq len_lo len_hi
     out_buffer[pos++] = frame.cmd;
-    out_buffer[pos++] = frame.flags;
+    out_buffer[pos++] = with_ts ? (uint8_t)(frame.flags | HOST_CMD_FLAG_TS) : frame.flags;
     out_buffer[pos++] = frame.seq;
-    out_buffer[pos++] = frame.len & 0xFF;
-    out_buffer[pos++] = (frame.len >> 8) & 0xFF;
+    out_buffer[pos++] = body_len & 0xFF;
+    out_buffer[pos++] = (body_len >> 8) & 0xFF;
     
     // payload
     if (frame.len > 0) {
         memcpy(&out_buffer[pos], frame.payload, frame.len);
         pos += frame.len;
     }
+    // 时间戳尾巴(u32 LE), 紧跟原 payload 之后。
+    if (with_ts) {
+        const uint32_t t_us = time_us_32();
+        out_buffer[pos++] = (uint8_t)(t_us & 0xFF);
+        out_buffer[pos++] = (uint8_t)((t_us >> 8) & 0xFF);
+        out_buffer[pos++] = (uint8_t)((t_us >> 16) & 0xFF);
+        out_buffer[pos++] = (uint8_t)((t_us >> 24) & 0xFF);
+    }
     
-    // CRC: 计算 cmd flags seq len_lo len_hi payload
-    // 使用增量 CRC 避免 4KB 栈缓冲
+    // CRC: 计算 cmd flags seq len_lo len_hi payload(含时间戳尾巴)
+    // 使用增量 CRC 避免 4KB 栈缓冲; body 直接读 out_buffer, 不再单独走 frame.payload,
+    // 否则时间戳尾巴会漏出校验范围。
     uint16_t crc = HostCmdCrc16::crc16((const uint8_t*)(&out_buffer[2]), 5);  // header starts at offset 2
-    if (frame.len > 0) {
-        crc = HostCmdCrc16::crc16(frame.payload, frame.len, crc);
+    if (body_len > 0) {
+        crc = HostCmdCrc16::crc16(&out_buffer[HOST_CMD_HEADER_SIZE], body_len, crc);
     }
     
     out_buffer[pos++] = crc & 0xFF;

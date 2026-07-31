@@ -66,6 +66,10 @@ export component ProtocolPage inherits Rectangle {
             spacing: 8px;
 
             // 默认折叠: 平时只需确认"有没有在发", 展开才是手动覆盖操作。
+            // ★本页所有块都必须 vertical-stretch: 0 + 末尾留一个弹性占位★
+            // 否则视口比内容高时, 多余高度会被两个 ConfigGroupSection 平分并把其中的行压扁,
+            // 表现为"两个组标题下各有一大片等高空白, 参数一个都看不见"(实测就是这个症状)。
+            // 有了末尾占位, 多余空间全部归它, 各块保持自身首选高度; 内容超过视口时 ScrollView 正常滚动。
             CollapsibleSection {
                 title: "mai2serial 发送状态";
                 expanded <=> root.mai2_panel_expanded;
@@ -80,6 +84,9 @@ export component ProtocolPage inherits Rectangle {
                         enabled: root.mai2_send_en_known;
                         toggled => { root.mai2_set_send_en(self.checked); }
                     }
+                    // 注: 「触控映射仅协议启动时生效」不在此处放专属勾选框 —— 它已作为
+                    // comm.keyboard_map_serial_only 归入本页下方「mai2serial 协议参数」组,
+                    // 那里带完整中文说明。同一页放两个控件控同一个键只会让人以为是两个设置。
                     Text {
                         text: "状态: " + root.mai2_status;
                         color: root.mai2_status == "运行" ? #2b8a3e : #b0b8c0;
@@ -108,6 +115,7 @@ export component ProtocolPage inherits Rectangle {
             // mai2serial 协议参数(串口波特率 / 触控上报延迟 / 发送节流 / {E}RSET 善后行为)。
             // 编辑仅入草稿, 点左下角"保存到设备"才写 flash, 与通信系统 Tab 完全同一条路径。
             ConfigGroupSection {
+                vertical-stretch: 0;
                 group_title: "mai2serial 协议参数";
                 rows: root.config_rows;
                 set_bool(k, v) => { root.cfg_set_bool(k, v); }
@@ -380,6 +388,7 @@ export component ProtocolPage inherits Rectangle {
             // mai2light 协议参数(灯板串口波特率 / 节点 ID / 灯珠总数)。灯链长度与全局亮度在上方
             // 专用 SpinBox 里编辑, 映射表由上方 11 单元编辑器负责, 故不在此以裸 KV 重复出现。
             ConfigGroupSection {
+                vertical-stretch: 0;
                 group_title: "mai2light 协议参数";
                 rows: root.config_rows;
                 set_bool(k, v) => { root.cfg_set_bool(k, v); }
@@ -388,6 +397,9 @@ export component ProtocolPage inherits Rectangle {
                 set_enum(k, v) => { root.cfg_set_enum(k, v); }
                 set_string(k, v) => { root.cfg_set_string(k, v); }
             }
+
+            // 弹性占位: 视口比内容高时多余空间全归它, 上面各块保持首选高度不被压扁。
+            Rectangle { vertical-stretch: 1; }
         }
     }
 }

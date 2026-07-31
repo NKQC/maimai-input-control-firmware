@@ -7,7 +7,8 @@
  * KeyboardService - 物理键盘(GPIO1-12) + 触控→键盘映射 → HID 键盘输出
  *
  * 职责:
- *  - 物理键: 读 GPIO1-12(1K 上拉直连键), 每键可选触发极性(config kbd.plNN, 默认 0=低电平触发)
+ *  - 物理键: 读 GPIO1-12(1K 上拉直连键), 每键可选触发极性(config kbd.plNN,
+ *    0=低电平触发 / 1=高电平触发 / 2=AUTO, 默认 2; AUTO 只看启动时电平并把它当作"抬起"电平)
  *    与独立防抖窗(config kbd.dbNN, 0..10000us, 默认 3000), 逐键去抖后经可配 HID 键码
  *    (config kbd.keyNN)驱动 HID::press_key/release_key。
  *  - 逻辑分析仪: 12 位掩码每次变化即带 time_us_32() 时间戳入定长环形缓冲(去抖前 raw + 仅去抖后 deb + 输出 out),
@@ -167,6 +168,7 @@ private:
     uint8_t  _zone_keycode[ZONE_COUNT];  // 触控分区 HID 键码(0=不映射)
     uint8_t  _zone_mod[ZONE_COUNT];      // 触控分区修饰位
     bool     _kbd_map_en;                // 触控→键盘 总开关
+    bool     _kbd_map_serial_only;       // 仅 mai2serial 实际发送触控数据时生效
 
     HoldCfg   _hold[KEY_COUNT];          // 物理键长按参数(kbd.hdNN / kbd.mhNN)
     HoldCfg   _zone_hold[ZONE_COUNT];    // 分区长按参数(kbd.zhdNN / kbd.zmhNN, 旧模型保留供迁移读取)
@@ -207,9 +209,17 @@ private:
     uint64_t _touch_active;              // 上次驱动键盘的分区 mask(用于差分 press/release)
     bool     _gpio_ready;
 
-    // 每键触发极性掩码: bit i = 1 → 该键"高电平触发"; 0 → 低电平触发(默认, 与改造前一致)。
-    // 用掩码而非 bool 数组: _read_raw() 热路径里只做一次异或即可完成 12 键极性归一。
+    // ★配置态与生效态分离★
+    // _pol_cfg = 用户配置(kbd.plNN): 0=低电平触发 / 1=高电平触发 / 2=AUTO(默认)。
+    // _pol_high_mask = 解析后的**生效**掩码: bit i = 1 → 该键按"高电平触发"判定。
+    // 分开存是因为 AUTO 必须回显成 AUTO(而不是它解析出来的那一档), 否则界面上永远看不到 AUTO。
+    // 用掩码承载生效态: _read_raw() 热路径里只做一次异或即可完成 12 键极性归一。
+    uint8_t  _pol_cfg[KEY_COUNT];
     uint16_t _pol_high_mask;
+    // AUTO 的判定依据: **启动时**的 GPIO 原始电平(bit i = 1 → 启动时为高)。
+    // 存"电平"而不是存"解析结果": 运行期把某键改成 AUTO 时仍能用开机那次采样正确解析。
+    uint16_t _boot_level_mask;
+    bool     _boot_level_valid;   // 首次 task() 采样后置位, 此后永不重采
     uint16_t _debounce_us[KEY_COUNT];    // 每键防抖窗(us, 0=不去抖, 上限 DEBOUNCE_US_MAX)
     DebounceState _deb[KEY_COUNT];       // 每键去抖运行态
     EdgeRing _edges;                     // 边沿记录环(逻辑分析仪)
@@ -219,6 +229,8 @@ private:
 
     uint16_t _read_raw() const;                          // 读 GPIO1-12, 按极性归一 → 1=按下
     void _apply_pulls();                                 // 按极性设置内部上/下拉
+    void _resolve_pol();                                 // _pol_cfg(含 AUTO) + 启动电平 → _pol_high_mask
+    void _latch_boot_level();                            // 采样一次启动电平并重解析极性
     void _apply_phys(uint8_t idx, bool pressed);         // 物理键 idx → HID
     void _apply_touch(uint64_t area_mask);               // 触控分区差分 → HID
     void _load_combo();                                  // 从 ConfigManager 读 64 个打包 KV

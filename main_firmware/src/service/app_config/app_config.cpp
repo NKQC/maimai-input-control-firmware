@@ -15,6 +15,8 @@ void app_config_register_schema() {
         config_map["comm.rate_limit_en"]         = ConfigValue(false);
         config_map["comm.rate_limit_hz"]         = ConfigValue(uint16_t(120), uint16_t(1), uint16_t(1000));
         config_map["comm.keyboard_map_en"]       = ConfigValue(false);
+        // 仅当 comm.keyboard_map_en 为真时有意义；为真时触控映射仅在 mai2serial 实际发送触控数据期间生效。
+        config_map["comm.keyboard_map_serial_only"] = ConfigValue(false);
         config_map["comm.serial_baud"]           = ConfigValue(uint32_t(115200));
         config_map["comm.light_baud"]            = ConfigValue(uint32_t(115200));
         config_map["comm.serial_reset_calibrate"] = ConfigValue(false);
@@ -89,14 +91,18 @@ void app_config_register_schema() {
         }
 
         // ===== 物理键每键触发极性 + 独立防抖 =====
-        // kbd.plNN: 0=低电平触发(默认, 与旧固件的全局 active-low 一致) / 1=高电平触发。
-        //   ★默认必须是 0★: 若默认高电平触发, 升级固件后既有硬件的按键行为会整体反转。
+        // kbd.plNN: 0=低电平触发 / 1=高电平触发 / 2=AUTO(默认)。
+        //   AUTO = 只看**启动时**的电平并把它当作该键的"抬起"电平: 启动为高 → 低电平触发,
+        //   启动为低 → 高电平触发; 启动后不再重采样。既有硬件(1K 外部上拉直连键)开机空闲为高,
+        //   AUTO 会解析成低电平触发, 与旧固件的全局 active-low 行为一致, 故默认 AUTO 不会反转行为。
+        //   ★围栏上限必须是 2★: ConfigValue 构造会 clamp_value(), 上限仍写 1 的话默认值 2 会被
+        //   静默夹成 1(全部键变成高电平触发), 表现为开机后按键全程常按, 极难自查。
         // kbd.dbNN: 该键防抖窗(微秒), 0=不去抖, 上限 10000。默认 3000 = 改造前的全局 DEBOUNCE_US。
         //   逐键独立(固件侧各自记录稳定起点), 一个抖动键不再重置其它键的防抖窗。
         for (int i = 0; i < 12; i++) {
             char key_buf[16];
             snprintf(key_buf, sizeof(key_buf), "kbd.pl%02d", i);
-            config_map[key_buf] = ConfigValue(uint8_t(0), uint8_t(0), uint8_t(1));
+            config_map[key_buf] = ConfigValue(uint8_t(2), uint8_t(0), uint8_t(2));
             snprintf(key_buf, sizeof(key_buf), "kbd.db%02d", i);
             config_map[key_buf] = ConfigValue(uint16_t(3000), uint16_t(0), uint16_t(10000));
         }

@@ -80,8 +80,9 @@ pub fn group_counts(ctrl: &AppController) -> GroupCounts {
         globals: 9,
         // 算法源、机器码与 cfg[0..7]。
         algo: 10,
-        // 12 个物理键 + 34 个触控分区键(各含键码、修饰位与长按参数)。
-        keyboard: 46,
+        // 12 个物理键 + 34 个触控分区键(各含键码、修饰位与长按参数) + 现有组合映射条数。
+        // ★组合映射按实际条数计★: 它是变长表, 写死常数会让勾选框上的数字与实际导出内容不符。
+        keyboard: 46 + ctrl.kbd_combos().len() as i32,
         zones: 34,
     }
 }
@@ -386,7 +387,7 @@ fn _export_globals(ctrl: &AppController) -> JsonValue {
     // CSD 处理模式(0=自动校准 1=半自动手动)不是 config 键值, 走 MODE_SET 独立命令, 但它与
     // gparam 1..8 同属"全局 CSD"且同在触控全局调整页, 故归入本组。旧文件没有该字段时按"文件缺键"
     // 处理(保持当前值不动)。未回读到设备真模式时不导出, 免得把未知当成 AUTO 写进文件。
-    if let Some(mode) = ctrl.mode_draft().or_else(|| ctrl.csd_mode()) {
+    if let Some(mode) = ctrl.csd_mode_effective() {
         group.insert("csd_mode".to_string(), JsonValue::Number(mode as f64));
     }
     JsonValue::Object(group)
@@ -439,9 +440,45 @@ fn _export_keyboard(ctrl: &AppController) -> JsonValue {
             hold,
         ));
     }
+    // ★组合映射(触控键盘映射页的"若干分区同时按下 → 若干键同时按下")★
+    // 原先整张表既不导出也不导入: 它不是逐分区的一对一映射, 不落在 physical/touch 任何一类里,
+    // 而 `_is_keyboard_key` 又没收 `kbd.cb`, 于是它被当成普通 KV 混进 config 组 —— 那是打包过的
+    // 裸字节, 导入回去 UI 的组合表缓存并不会跟着更新, 表现就是"导出再导入, 组合映射没了"。
+    // 现在由本组独占, 与 physical/touch 同一个出口。
+    let mut combo = Vec::new();
+    for item in ctrl.kbd_combos() {
+        let mut obj = BTreeMap::new();
+        obj.insert(
+            "zone_mask".to_string(),
+            JsonValue::Number(item.zone_mask as f64),
+        );
+        obj.insert(
+            "keycodes".to_string(),
+            JsonValue::Array(
+                item.keycodes
+                    .iter()
+                    .map(|k| JsonValue::Number(*k as f64))
+                    .collect(),
+            ),
+        );
+        obj.insert(
+            "modifiers".to_string(),
+            JsonValue::Number(item.modifiers as f64),
+        );
+        obj.insert(
+            "delay_ms".to_string(),
+            JsonValue::Number(item.delay_ms as f64),
+        );
+        obj.insert(
+            "max_hold_ms".to_string(),
+            JsonValue::Number(item.max_hold_ms as f64),
+        );
+        combo.push(JsonValue::Object(obj));
+    }
     let mut group = BTreeMap::new();
     group.insert("physical".to_string(), JsonValue::Array(physical));
     group.insert("touch".to_string(), JsonValue::Array(touch));
+    group.insert("combo".to_string(), JsonValue::Array(combo));
     JsonValue::Object(group)
 }
 
@@ -687,6 +724,44 @@ fn _import_keyboard(
     for item in touch {
         _import_key_entry(ctrl, item, KBD_HOLD_KIND_ZONE, 34, sum)?;
     }
+    // ★combo 缺失时不报错★: 旧版本导出的文件没有这一段, 直接失败会让用户连键盘组都导不进来。
+    // 缺失即"不动组合映射", 与"导入未勾选该组"同语义。
+    if let Some(raw) = group.get("combo") {
+        let items = _array(raw, "keyboard.combo")?;
+        let mut table: Vec<crate::proto::KbdComboItem> = Vec::new();
+        for item in items {
+            let obj = _object(item, "keyboard.combo")?;
+            let zone_mask = _number(_required(obj, "zone_mask", "keyboard.combo")?, "zone_mask")? as u64;
+            let modifiers = _number(_required(obj, "modifiers", "keyboard.combo")?, "modifiers")? as u8;
+            let delay_ms = _number(_required(obj, "delay_ms", "keyboard.combo")?, "delay_ms")? as u16;
+            let max_hold_ms =
+                _number(_required(obj, "max_hold_ms", "keyboard.combo")?, "max_hold_ms")? as u16;
+            let codes = _array(_required(obj, "keycodes", "keyboard.combo")?, "keycodes")?;
+            let mut keycodes = [0u8; crate::proto::KBD_COMBO_KEY_COUNT];
+            for (slot, raw_code) in keycodes.iter_mut().zip(codes.iter()) {
+                *slot = _number(raw_code, "keycodes")? as u8;
+            }
+            // 空条目(无分区或无按键)一律丢弃: 下发出去只会被固件丢, 留在表里反而占用上限名额。
+            if zone_mask == 0 || (keycodes.iter().all(|k| *k == 0) && modifiers == 0) {
+                sum._skip("keyboard.combo(空条目)", SkipReason::OutOfRange);
+                continue;
+            }
+            if table.len() >= crate::proto::KBD_COMBO_COUNT {
+                sum._skip("keyboard.combo(超上限)", SkipReason::OutOfRange);
+                continue;
+            }
+            table.push(crate::proto::KbdComboItem {
+                zone_mask,
+                keycodes,
+                modifiers,
+                delay_ms,
+                max_hold_ms,
+            });
+        }
+        let applied = table.len();
+        ctrl.kbd_combo_replace_table(table);
+        sum.applied_items += applied;
+    }
     Ok(())
 }
 
@@ -809,7 +884,13 @@ fn _is_zone_key(key: &str) -> bool {
 }
 
 /// 键盘映射与长按参数键：由 keyboard 组独占导入/导出。
+/// ★`kbd.cb*`(组合映射打包 KV)也归本组★: 它原先谁都不认, 于是被当成普通 KV 落进 config 组 ——
+/// 那是打包过的裸字节, 导入回去 UI 的组合表缓存不会更新, 表现就是"导出再导入组合映射没了"。
+/// 现在组合映射由 keyboard 组以结构化的 `combo` 数组独占进出, 裸 KV 不再是第二个出口。
 fn _is_keyboard_key(key: &str) -> bool {
+    if key.starts_with("kbd.cb") {
+        return true;
+    }
     const PHYS: [&str; 4] = ["kbd.key", "kbd.km", "kbd.hd", "kbd.mh"];
     const ZONE: [&str; 4] = ["kbd.zone", "kbd.zm", "kbd.zhd", "kbd.zmh"];
     PHYS.iter().any(|p| _indexed_key(key, p, 12).is_some())

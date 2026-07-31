@@ -24,6 +24,8 @@
 #include "service/tx_scheduler/tx_scheduler.h"
 #include "service/keyboard/keyboard.h"
 #include "service/tx_scheduler/tx_scheduler.h"
+#include "service/bus/bus_core.h"
+#include "service/bus/bus_usb_link.h"
 #include "service/usb_debug.h"
 #include "protocol/psoc/psoc.h"
 #include "protocol/hid/hid.h"
@@ -34,6 +36,17 @@ extern "C" {
 }
 
 static constexpr uint32_t WATCHDOG_TIMEOUT_MS = 5000;
+
+// ★hardfault 兜底 + 取证★
+// pico-sdk 的默认 isr_hardfault 落进 while(1), 于是"跑飞"最终也表现为看门狗超时复位 ——
+// 与"主循环真的跑太慢"完全同形, 无从区分(实测一次复位报 stage=0 就卡在这里)。
+// 覆盖它: 先在 scratch[2] 留标记(跨复位保留), 再立刻软复位。scratch[4..7] 归 SDK 的
+// watchdog_reboot 自用, 故标记只能放 0..3(见 usb_debug.h 的 scratch 分配注释)。
+extern "C" void isr_hardfault(void) {
+    watchdog_hw->scratch[CRASH_SCRATCH_FAULT] = CRASH_FAULT_MAGIC;
+    watchdog_reboot(0u, 0u, 0u);
+    while (true) { tight_loop_contents(); }
+}
 
 // ★主机租约超时★：上位机每~1s PING 续期(刷新 g_last_host_cmd_ms)。超过本时长未收到任何
 // 主机指令 = 上位机已丢失(关闭/崩溃)→ 固件自停遥测流,避免遗留流淹没下次连接的 DEVICE_INFO。
@@ -89,6 +102,18 @@ void setup() {
         ? (uint8_t)(watchdog_hw->scratch[CRASH_SCRATCH_STAGE] & 0xFFu)
         : 0xFFu;
     g_usb_dbg.last_boot_was_wd = ran_before ? 1u : 0u;
+    // 死前遗言增强: 上次是否 hardfault + 上次运行期整轮耗时峰值 + 硬件复位原因。
+    // 三者合起来才能定性: fault=1 → 跑飞; fault=0 且 loop_max 接近 5s → 主循环真被拖死;
+    // fault=0 且 loop_max 很小 → 既没跑飞也没拖慢, 那就是外部原因(掉电/XRES)。
+    g_usb_dbg.last_boot_was_fault =
+        (watchdog_hw->scratch[CRASH_SCRATCH_FAULT] == CRASH_FAULT_MAGIC) ? 1u : 0u;
+    const uint32_t pm_word = watchdog_hw->scratch[CRASH_SCRATCH_PM];
+    g_usb_dbg.last_boot_stage_at_ms = ran_before ? (uint16_t)(pm_word >> 16) : 0u;
+    g_usb_dbg.last_boot_peak_ms = ran_before ? (uint16_t)(pm_word & 0xFFFFu) : 0u;
+    g_usb_dbg.last_boot_loop_max_us = (uint32_t)g_usb_dbg.last_boot_peak_ms * 1000u;
+    g_usb_dbg.last_reset_reason = (uint8_t)(watchdog_hw->reason & 0x3u);
+    watchdog_hw->scratch[CRASH_SCRATCH_FAULT] = 0u;
+    watchdog_hw->scratch[CRASH_SCRATCH_PM] = 0u;
     watchdog_hw->scratch[CRASH_SCRATCH_RUN] = 0u;
     watchdog_hw->scratch[CRASH_SCRATCH_STAGE] = 0u;
     watchdog_hw->scratch[7] = 0u;
@@ -115,6 +140,13 @@ void setup() {
     CsdConfig::getInstance()->register_storage();
     PsocAlgo::getInstance()->register_storage();
     NvStore::getInstance()->load();
+    // ★单份存储: 某区无效必须上报★
+    // 无效区会被持有者按默认值重建, 用户看到的只是"设置又丢了", 不上报就无从分辨是"这一区坏了"
+    // 还是"固件有 bug"。四个区都注册在 load() 之前, 故此刻的 valid_mask 是完整判据(全好 = 0x0F)。
+    {
+        const uint8_t nv_valid = NvStore::getInstance()->valid_mask();
+        if (nv_valid != 0x0Fu) SelfHeal::getInstance()->note(SH_NV_REGION_INVALID, nv_valid);
+    }
     ConfigManager::initialize();
 
     Psoc* psoc = Psoc::getInstance();
@@ -135,6 +167,8 @@ void setup() {
 
     HAL_USB_Device::getInstance()->init();
     UsbComm::getInstance()->init();
+    Mai2Bus::getInstance()->init();
+    BusUsbLink::getInstance()->init();
     SensorLink::getInstance()->init();
     BindingService::getInstance()->init();
 
@@ -168,7 +202,12 @@ void setup() {
 
 void loop() {
     g_usb_dbg.loop_count++;
+    // ★阻塞剖面★: loop_t0 量整轮(= 与 5s 看门狗竞争的真实量), seg_t 量各段。纯测量, 不改控制流。
+    const uint32_t loop_t0 = loop_prof_begin();
+    uint32_t seg_t = loop_seg_begin(LOOP_SEG_USB_TASK);
     HAL_USB_Device::getInstance()->task();
+    Mai2Bus::getInstance()->task();
+    loop_prof_mark(LOOP_SEG_USB_TASK, seg_t);
 
     // ★控制通道 BOOTSEL★：EP0 请求 0x52 置位后，泵几轮 task 让 ACK 发出，再进烧录。
     // 因 EP0 在 bulk vendor 死后仍存活，此路径免去 vendor 卡死时的物理 BOOTSEL。
@@ -192,6 +231,7 @@ void loop() {
         return;
     }
 
+    seg_t = loop_seg_begin(LOOP_SEG_PSOC);
     Psoc* psoc = Psoc::getInstance();
     // ★不再在 core0 调 psoc->update()★：SPI 已由 core1 (core1_run) 固定周期独占;
     // core0 只经 seqlock 读 touch_mask()/snapshot()、经命令队列投递 CSD 指令。
@@ -330,12 +370,31 @@ void loop() {
         provisioned = false;
     }
 
+    // ★运行期掉枚举: 如实宣判失效, 不做救援★
+    // 主机一旦拆掉接口, 设备这边任何"重新武装/重开"都改变不了主机的判断, 只会把主循环搅乱。
+    // 事件是粘性的(队列 + note_rearm 兜底), 故即使掉枚举期间无人可发, 重新连上后仍会送达 ——
+    // 于是"上次运行期间掉过枚举"永远有据可查, 而不是只剩用户一句"它自己断了"。
+    {
+        static bool usb_was_up = false;
+        const bool usb_up = HAL_USB_Device::getInstance()->is_ready();
+        if (usb_was_up && !usb_up) {
+            // detail: bit0=serial 协议在跑, bit1=灯板协议已就绪 —— 便于分辨掉的是哪一侧的负载。
+            uint32_t detail = 0u;
+            GameIoService* gio = GameIoService::getInstance();
+            if (gio->mai2_touch_sending()) detail |= 0x1u;
+            if (gio->is_ready()) detail |= 0x2u;
+            SelfHeal::getInstance()->note(SH_CDC_LOST, detail);
+        }
+        usb_was_up = usb_up;
+    }
+
     // ★自持恢复事件必达兜底★: note() 只在事件发生那一刻拉起推送任务, 若当时上位机没连(或租约过期
     // 自取消), 队列里的事件就再也没人推 → 用户永远看不到"设备被固件改过"。故只要队列非空且任务不在,
     // 就重新拉起(有上位机时 10Hz 排空, 无上位机时靠租约自灭, 不常驻)。
     if (!SelfHeal::getInstance()->empty() && !TxScheduler::getInstance()->active(TX_TASK_SELFHEAL)) {
         SelfHeal::getInstance()->note_rearm();
     }
+    loop_prof_mark(LOOP_SEG_PSOC, seg_t);
 
     // ★每轮重写运行标记★: 判定"上次是否运行中崩溃"依赖 scratch[7]==WD_RUNNING_MAGIC。setup 里只
     // 设一次的话, 任何把它冲掉的路径都会让判定失真。每轮一条 store, 代价可忽略。
@@ -343,9 +402,11 @@ void loop() {
     // hardfault 都会保留 scratch, 只有上电复位(POR)会清。即: 供电跌落, 而非软件问题。
     watchdog_hw->scratch[7] = WD_RUNNING_MAGIC;
     crash_run_mark();
+    seg_t = loop_seg_begin(LOOP_SEG_HOST_CMD);
     crash_stage_set(CRASH_STAGE_USB_UPDATE);
     UsbComm::getInstance()->update();
     crash_stage_set(CRASH_STAGE_NONE);
+    loop_prof_mark(LOOP_SEG_HOST_CMD, seg_t);
 
     // ★主机租约★：ping 续期。超时未续期即认定上位机丢失,暂停遥测(自洽:绿灯亦据此判连接)。
     // ★只挂起、不永久停★: core0 可能只是被长设备操作(JIT 算法下发/校准/flash 落地)按在
@@ -366,12 +427,23 @@ void loop() {
 
     // ★大吞吐统一走定时任务队列★: 遥测等周期发送由 TxScheduler 按各自频率+租约驱动(续期制),
     // 帧经非阻塞 config_write 入 vendor TX FIFO, 由 HAL_USB task() 泵出。不再在此直接 tick 遥测。
+    seg_t = loop_seg_begin(LOOP_SEG_TX_SCHED);
     TxScheduler::getInstance()->tick();
-    BindingService::getInstance()->tick(psoc->link_ok() ? psoc->touch_mask() : 0, psoc->link_ok());
+    loop_prof_mark(LOOP_SEG_TX_SCHED, seg_t);
+
+    seg_t = loop_seg_begin(LOOP_SEG_GAME_IO);
+    {
+        const uint32_t gio_t = gio_seg_begin(GIO_SEG_BINDING);
+        BindingService::getInstance()->tick(psoc->link_ok() ? psoc->touch_mask() : 0, psoc->link_ok());
+        gio_seg_mark(GIO_SEG_BINDING, gio_t);
+    }
     GameIoService::getInstance()->task();
+    loop_prof_mark(LOOP_SEG_GAME_IO, seg_t);
     // 物理键盘(GPIO1-12) + 触控→键盘映射 → HID(内部 task HID 发报文)。
 #if MAI2_ENABLE_SERIAL_HID
+    seg_t = loop_seg_begin(LOOP_SEG_KEYBOARD);
     KeyboardService::getInstance()->task();
+    loop_prof_mark(LOOP_SEG_KEYBOARD, seg_t);
 #endif
 
     // ★flash 落地安全窗口★：命令 handler 只置保存信号，实际 flash 写在此(命令已处理完、ACK 已发)执行。
@@ -382,6 +454,7 @@ void loop() {
     // 三份背靠背写 = 数百 ms 连续 USB 黑洞, 主机侧待处理的 OUT 传输会被 Windows 直接 abort
     // (实测 kind=ConnectionAborted → 拆端点 → 判断开)。分轮落地, 每份之间必有一次完整 USB 服务轮。
     {
+        seg_t = loop_seg_begin(LOOP_SEG_NV_COMMIT);
         // ★必须等 core1 空闲才落盘★: flash 写内部 multicore_lockout_start_blocking(core1), 而
         // core1 若正在执行重操作(PSoC 重初始化 / 全通道校准, _wait_op_done 轮询数秒), 期间它不进
         // wfe 也就响应不了 lockout ⇒ core0 死等、不喂狗 ⇒ 5s 看门狗复位整机。实测正是"保存后约
@@ -394,9 +467,13 @@ void loop() {
         // ★命令信封关闭后才允许擦 flash★：200ms 足以吸收同一批 host 命令的正常帧间抖动，
         // 同时避免命令洪流期间反复进入 flash 黑洞；脏标记保持粘性，门未开时只延后本轮。
         constexpr uint32_t NV_COMMIT_QUIET_MS = 200u;
+        // ★安静窗口只管"起片", 不管"续片"★: 落盘已按扇区分片跨轮进行(见 NvStore 的分片注释)。
+        // 若续片也要等安静窗口, 命令洪流下一个区会长时间停在半成品状态 —— 单份存储下那正是最该
+        // 缩短的窗口。core1_idle 仍是硬条件(它关系到 lockout 死锁, 不能让)。
         const bool commit_window_open = psoc->core1_idle() &&
-            static_cast<uint32_t>(millis() - g_last_host_cmd_ms) >= NV_COMMIT_QUIET_MS &&
-            !UsbComm::getInstance()->has_pending_response();
+            (NvStore::getInstance()->commit_in_progress() ||
+             (static_cast<uint32_t>(millis() - g_last_host_cmd_ms) >= NV_COMMIT_QUIET_MS &&
+              !UsbComm::getInstance()->has_pending_response()));
         if (commit_window_open) {
             // ★先把各服务的"待保存"信号收进 NvStore 镜像(纯内存), 再由 commit_step 落一个区★
             // 这三步都不擦写 flash, 只更新镜像 + 置脏; 真正的擦写只有下面 commit_step 一处。
@@ -420,6 +497,7 @@ void loop() {
                 crash_stage_set(CRASH_STAGE_NONE);
             }
         }
+        loop_prof_mark(LOOP_SEG_NV_COMMIT, seg_t);
     }
 
     {
@@ -428,6 +506,9 @@ void loop() {
         g_usb_dbg.nv_commit_ok = nv->commit_ok_count();
         g_usb_dbg.nv_commit_fail = nv->commit_fail_count();
         g_usb_dbg.nv_algo_src_len = nv->algo_src_len();
+        g_usb_dbg.nv_valid_mask = nv->valid_mask();
+        g_usb_dbg.psoc_heavy_rejects = psoc->heavy_reject_count();
+        g_usb_dbg.psoc_heavy_busy = psoc->heavy_busy() ? 1u : 0u;
     }
 
     // ★vendor OUT 自愈★：每轮检查 config vendor OUT 是否仍处 arm 态，若因 flash 扰动等
@@ -436,6 +517,7 @@ void loop() {
 
     // ★主循环心跳★：LED 每 150ms 亮灭翻转 = loop 在跑；若卡住则 LED 停在某态(不再闪)。
     // 状态优先级保持既有语义：主机连接常亮优先，其余依次为 flash 未就绪、SPI 链路断、健康。
+    seg_t = loop_seg_begin(LOOP_SEG_LED);
     const PsocBringupReport& report = updater->report();
     LedService* led = LedService::getInstance();
     const uint8_t status_brightness = std::min<uint8_t>(
@@ -475,6 +557,8 @@ void loop() {
             : (!report.link_ok ? link_error_color : healthy_color);
         led->set_color(status_color, hb_on ? status_brightness : 0u);
     }
+    loop_prof_mark(LOOP_SEG_LED, seg_t);
 
+    loop_prof_total(loop_t0);
     watchdog_update();
 }

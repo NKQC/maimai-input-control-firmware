@@ -137,6 +137,9 @@ fn main() -> Result<()> {
 
     let ui = AppWindow::new().map_err(|e| anyhow::anyhow!("Failed to create UI: {}", e))?;
 
+    // 全局项数字输入围栏: 常量, 只需回填一次(不进每 tick 的刷新循环)。
+    ui.set_global_fences(build_global_fences());
+
     let controller = Rc::new(RefCell::new(AppController::new()));
 
     // ★关键★: 必须持有 Timer 直到 ui.run() 结束。slint::Timer 一旦 drop 即停止,
@@ -167,9 +170,24 @@ fn algo_bin_amp_key(idx: usize) -> String {
     }
 }
 
+/// 单条算法上报线勾选态的 config.cfg 键名(idx 0..3)。
+fn report_show_key(idx: usize) -> String {
+    format!(
+        "{}{}",
+        mai2control_ui::ui_config::keys::CURVE_REPORT_SHOW_PREFIX,
+        idx
+    )
+}
+
 /// 把当前界面偏好写回 config.cfg。由 16ms tick 调用: UiConfig::set_* 内部只在值真变了才落盘,
 /// 所以这里无脑对账即可, 不必给每个开关都挂一个回调(那样每加一项设置都得改多处)。
-fn persist_ui_settings(ui: &AppWindow, cfg: &mut mai2control_ui::ui_config::UiConfig) {
+/// `report_show` 不是 UI 属性(真相源在 Rust 侧那个 Rc, 见 on_report_toggle 的说明), 故随参传入,
+/// 与其余偏好在同一处对账 —— 不给它单开一条落盘路径。
+fn persist_ui_settings(
+    ui: &AppWindow,
+    report_show: &[bool; 4],
+    cfg: &mut mai2control_ui::ui_config::UiConfig,
+) {
     use mai2control_ui::ui_config::keys as k;
     cfg.set_i32(k::LOG_FILTER, ui.get_log_filter());
     cfg.set_bool(k::LOG_AUTO_SCROLL, ui.get_log_auto_scroll());
@@ -181,6 +199,15 @@ fn persist_ui_settings(ui: &AppWindow, cfg: &mut mai2control_ui::ui_config::UiCo
     cfg.set_i32(k::CURRENT_VIEW, ui.get_current_view());
     cfg.set_i32(k::SETTINGS_TAB, ui.get_settings_tab());
     cfg.set_i32(k::SEL_CHANNEL, ui.get_sel_channel());
+    // 曲线页"画哪些系列": 与上面各项同口径无脑对账(UiConfig::set_* 只在值真变了才落盘)。
+    cfg.set_bool(k::CURVE_SHOW_RAW, ui.get_show_raw());
+    cfg.set_bool(k::CURVE_SHOW_BSLN, ui.get_show_bsln());
+    cfg.set_bool(k::CURVE_SHOW_DIFF, ui.get_show_diff());
+    cfg.set_bool(k::CURVE_SHOW_ACTIVE, ui.get_show_active());
+    cfg.set_bool(k::CURVE_ALGO_OVERLAY, ui.get_show_algo_overlay());
+    for (idx, on) in report_show.iter().enumerate() {
+        cfg.set_bool(&report_show_key(idx), *on);
+    }
 }
 
 /// 重新枚举 HID 键盘并刷新设备树: 首行固定"所有键盘"(dev_index=0),
@@ -536,8 +563,11 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
     });
 
     let ctrl_clone = controller.clone();
-    ui.on_combo_add(move || {
-        ctrl_clone.borrow_mut().kbd_combo_commit_pending();
+    ui.on_combo_add(move |delay, max_hold| {
+        ctrl_clone.borrow_mut().kbd_combo_commit_pending(
+            delay.clamp(0, u16::MAX as i32) as u16,
+            max_hold.clamp(0, u16::MAX as i32) as u16,
+        );
     });
 
     let ctrl_clone = controller.clone();
@@ -558,6 +588,36 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
             delay.clamp(0, u16::MAX as i32) as u16,
             max_hold.clamp(0, u16::MAX as i32) as u16,
         );
+    });
+
+    // 已有映射的按键就地重录。★键码解析复用新建区那一套(char_to_hid + 同样的修饰位打包)★,
+    // 不另写一份解析, 否则两条路径迟早对不上。会话边沿(capture_started) → 登记待替换行。
+    let ctrl_clone = controller.clone();
+    ui.on_combo_key_capture_started(move |index| {
+        if index < 0 {
+            return;
+        }
+        ctrl_clone
+            .borrow_mut()
+            .kbd_combo_begin_edit_keys(index as usize);
+    });
+
+    let ctrl_clone = controller.clone();
+    ui.on_combo_key_captured(move |index, text, ctrl_k, shift, alt, gui| {
+        if index < 0 {
+            return;
+        }
+        let code = char_to_hid(text.as_str());
+        let mods = (ctrl_k as u8) | ((shift as u8) << 1) | ((alt as u8) << 2) | ((gui as u8) << 3);
+        if code == 0 && mods == 0 {
+            ctrl_clone
+                .borrow_mut()
+                .push_log("组合映射: 该按键无法识别为 HID 键码".to_string());
+            return;
+        }
+        ctrl_clone
+            .borrow_mut()
+            .kbd_combo_capture_key_at(index as usize, code, mods);
     });
 
     // 全通道页"批量应用": 勾选态与应用动作全部落在 AppController, UI 只转发事件。
@@ -609,6 +669,19 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
             return;
         }
         ctrl_clone.borrow_mut().batch_set_source(ch as u8);
+    });
+
+    // 批量面板里逐项手改的"待写值"。★围栏不在这里判★: 用户把数字从一个值改到另一个值的中间态
+    // 完全可能越界(退格删到只剩一位), 这里提前拒绝会让人根本改不动; 合法性统一在"应用"时由
+    // set_param 的唯一围栏(proto::param_value_legal)判定并写日志告知。
+    let ctrl_clone = controller.clone();
+    ui.on_batch_param_value_set(move |param_id, value| {
+        if !(0x01..=0x0B).contains(&param_id) || value < 0 {
+            return;
+        }
+        ctrl_clone
+            .borrow_mut()
+            .batch_set_value(param_id as u8, value as u32);
     });
 
     let ctrl_clone = controller.clone();
@@ -870,14 +943,18 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
     // 每键触发极性 + 独立防抖: 写草稿(与长按参数同一条路径), 由"保存到设备"统一下发。
     // 越界(>10000us)由 AppController 直接拒绝并落日志 —— UI 围栏已同源, 走到这里说明是非 UI 路径。
     let ctrl_clone = controller.clone();
-    ui.on_kbd_set_keycfg(move |idx, pol_high, debounce_us| {
+    ui.on_kbd_set_keycfg(move |idx, pol_mode, debounce_us| {
         if !(0..12).contains(&idx) {
+            return;
+        }
+        // 极性档位围栏与 ComboBox 的 model 长度同源(0=低/1=高/2=AUTO)。
+        if !(0..=2).contains(&pol_mode) {
             return;
         }
         let mut ctrl = ctrl_clone.borrow_mut();
         if let Err(e) = ctrl.kbd_set_keycfg(
             idx as u8,
-            pol_high,
+            pol_mode as u8,
             debounce_us.clamp(0, u16::MAX as i32) as u16,
         ) {
             ctrl.push_log_warn(format!("物理键每键配置: {}", e));
@@ -898,16 +975,6 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
     let ctrl_clone = controller.clone();
     ui.on_la_clear(move || {
         ctrl_clone.borrow_mut().kbd_edges_clear();
-    });
-
-    let ctrl_clone = controller.clone();
-    ui.on_kbd_refresh(move || {
-        let mut ctrl = ctrl_clone.borrow_mut();
-        let _ = ctrl.kbd_request_map();
-        let _ = ctrl.kbd_request_touchmap();
-        let _ = ctrl.kbd_request_hold();
-        let _ = ctrl.kbd_request_keycfg();
-        let _ = ctrl.kbd_request_state();
     });
 
     // 编译容量(PSoC 可执行槽字节数)一次性回填, 供进度条计算占用百分比。
@@ -1075,18 +1142,16 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
         }
         let mut ctrl = ctrl_clone.borrow_mut();
         // AUTO 下这些值由 PSoC 接管；UI 已锁定，这里再守住异步旧事件。
-        if ctrl.mode_draft().or(ctrl.csd_mode()) != Some(1) {
+        // 模式判定唯一来源(含"未知也不放行"): AppController::csd_mode_effective。
+        if ctrl.csd_mode_effective() != Some(1) {
             return;
         }
         let _ = ctrl.set_param_all(param_id as u8, value as u32);
     });
 
-    // 全局页始终以 CH0 作为三项 CSD 采样参数的代表值。
-    let ctrl_clone = controller.clone();
-    ui.on_csd_refresh(move || {
-        let mut ctrl = ctrl_clone.borrow_mut();
-        let _ = ctrl.request_params(0);
-    });
+    // ★原 on_csd_refresh(「刷新 CH0 参数」按钮)已删★: 全局页的 CH0 代表值本就有两条自动加载
+    // 路径 —— 连接边沿(见下方 `connected && !was_connected` 块的 request_params(0))与每次真正
+    // 进入本页(`global_tune_visible` 边沿)各拉一次, 手动按钮拿不到任何额外真值。
 
     // 绑区页
     let ctrl_clone = controller.clone();
@@ -1309,7 +1374,7 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
         let ui = ui_th.upgrade().unwrap();
         let ch = ui.get_sel_channel() as u8;
         let mut ctrl = ctrl_clone.borrow_mut();
-        if ctrl.mode_draft().or(ctrl.csd_mode()) != Some(1) {
+        if ctrl.csd_mode_effective() != Some(1) {
             return;
         }
         let _ = ctrl.set_param(ch, param_id as u8, value as u32);
@@ -1321,7 +1386,7 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
         let ui = ui_param.upgrade().unwrap();
         let ch = ui.get_sel_channel() as u8;
         let mut ctrl = ctrl_clone.borrow_mut();
-        if ctrl.mode_draft().or(ctrl.csd_mode()) != Some(1) {
+        if ctrl.csd_mode_effective() != Some(1) {
             return;
         }
         let _ = ctrl.set_param(ch, param_id as u8, value as u32);
@@ -1427,10 +1492,40 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
         ui.set_vcam_submit_secs(cfg.get_i32(k::VCAM_SUBMIT_SECS, 2).clamp(1, 10));
         ui.set_vcam_display_secs(cfg.get_i32(k::VCAM_DISPLAY_SECS, 10).clamp(1, 60));
         ui.set_measure_latency(cfg.get_bool(k::LATENCY_MEASURE, false));
-        ui.set_current_view(cfg.get_i32(k::CURRENT_VIEW, 0).clamp(0, 3));
+        // ★环境变量可强制初始页签★(MAI2_UI_VIEW / MAI2_UI_TAB)
+        // 界面类缺陷必须能"打开就在那一页"地复现与截图, 否则每次验证都要人工点几下, 无法自动化取证
+        // (本轮排"协议页参数一片空白"时就卡在这一步: 记忆值总把程序开在主页)。
+        // 不设置时行为完全不变, 仍用持久化的记忆值。
+        let env_i32 = |name: &str| -> Option<i32> {
+            std::env::var(name).ok().and_then(|s| s.trim().parse().ok())
+        };
+        ui.set_current_view(
+            env_i32("MAI2_UI_VIEW")
+                .unwrap_or_else(|| cfg.get_i32(k::CURRENT_VIEW, 0))
+                .clamp(0, 3),
+        );
         // 上限 8: 共 9 个标签(0绑区 1协议 2触控通道 3触控全局 4精调 5触控键映 6物理键盘 7通信 8算法)。
-        ui.set_settings_tab(cfg.get_i32(k::SETTINGS_TAB, 0).clamp(0, 8));
+        ui.set_settings_tab(
+            env_i32("MAI2_UI_TAB")
+                .unwrap_or_else(|| cfg.get_i32(k::SETTINGS_TAB, 0))
+                .clamp(0, 8),
+        );
         ui.set_sel_channel(cfg.get_i32(k::SEL_CHANNEL, 0).clamp(0, 35));
+        // 曲线页"画哪些系列": 默认值必须与 curves.slint 的属性默认值一致(raw/bsln 关, diff 开,
+        // 触发判定开, 算法叠加关), 否则首次启动会被"记忆"改掉初始观感。
+        ui.set_show_raw(cfg.get_bool(k::CURVE_SHOW_RAW, false));
+        ui.set_show_bsln(cfg.get_bool(k::CURVE_SHOW_BSLN, false));
+        ui.set_show_diff(cfg.get_bool(k::CURVE_SHOW_DIFF, true));
+        ui.set_show_active(cfg.get_bool(k::CURVE_SHOW_ACTIVE, true));
+        ui.set_show_algo_overlay(cfg.get_bool(k::CURVE_ALGO_OVERLAY, false));
+        {
+            // 4 条上报线的勾选真相源在 Rust 侧(见 report_show 的说明), 回填进那个 Rc 即可 ——
+            // 行模型下一 tick 由主图回填统一重建, 复选框自然显示恢复后的状态。
+            let mut show = report_show.borrow_mut();
+            for (idx, slot) in show.iter_mut().enumerate() {
+                *slot = cfg.get_bool(&report_show_key(idx), true);
+            }
+        }
         // 日志落盘: 关掉过就保持关掉(logging::init 默认开)。
         if !cfg.get_bool(k::LOG_FILE_ON, true) {
             mai2control_ui::logging::hub().set_file_enabled(false);
@@ -1781,6 +1876,11 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
     let mut last_param_version = 0u64;
     let mut last_batch_sel_version = u64::MAX;
     let mut last_combo_version = u64::MAX;
+    // 上次下发给 UI 的组合映射分区文本。★行身份稳定所需★: combo_zones_text 是已有映射列表
+    // Repeater 的 model, 每次 set 新 ModelRc 都会重建全部 ComboRow —— 行内 KeyCaptureBox 的
+    // 录制态与焦点随之丢失, 一次和弦只能录到第一个键(第二个键根本收不到)。就地重录改的是
+    // keys_text, 分区文本并不变, 所以只在分区文本真的变了(增删条目/改分区)时才换 model。
+    let mut last_combo_zones: Vec<slint::SharedString> = Vec::new();
     let mut last_channel = -1i32;
     let mut last_curve_visibility = (false, false, false);
     // 算法叠加脏标记: 它会改变主图 path, 与遥测版本一起做门控(绘图区尺寸已不再参与, 见 fit: fill)。
@@ -1945,6 +2045,12 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
         if ctrl.state() == ConnState::Connecting && reconnect_tick % 25 == 0 {
             let _ = ctrl.resend_hello();
         }
+        // PSoC 链路活性探测(~1s 一次)。★只在用户手动停流时才真的发包★(门控在 psoc_link_probe
+        // 内): 遥测在跑时每帧的 samples_per_sec 就是代数推进证据, 不需要探; 而 HELLO 会顺带停流,
+        // 流式期间探测等于把遥测踢停。停流后链路状态没有别的来源, 不探就只能显示握手时的旧快照。
+        if reconnect_tick % 62 == 0 {
+            ctrl.psoc_link_probe();
+        }
 
         ui.set_conn_status(ctrl.status_line().into());
         // 主页默认看摘要(人可读), 原始 debug 诊断在折叠区里备查。
@@ -1993,7 +2099,11 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
 
         // 界面偏好对账落盘(值未变则不写盘)。放在 tick 里而不是给每个开关挂回调:
         // Slint 侧有些开关(自动滚动、页签、通道)是直接改 in-out 属性的, 本来就没有回调可挂。
-        persist_ui_settings(&ui, &mut ui_cfg_tick.borrow_mut());
+        persist_ui_settings(
+            &ui,
+            &report_show_timer.borrow(),
+            &mut ui_cfg_tick.borrow_mut(),
+        );
 
         // 日志页: 版本号门控重建行模型。只取尾部 VIEW_MAX 条, 长日志下 UI 模型不随之膨胀
         // (全量仍在 logs/ 文件里)。行号用全局序号, 过滤切换后仍能与文件对上。
@@ -2215,11 +2325,14 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
         // 连接成功边沿主动拉取当前通道参数与 Cp，并开启全通道遥测；
         // 断线边沿清空 CpPollState，避免重连后展示旧设备/旧会话 Cp。
         let connected = ctrl.state() == ConnState::Connected;
-        // DEVICE_INFO 诊断携带的 mode 是唯一真值；未知时 UI 显示“读取中”，不再以默认 AUTO 冒充设备状态。
-        ui.set_mode_known(ctrl.csd_mode().is_some());
-        if let Some(mode) = ctrl.mode_draft().or(ctrl.csd_mode()) {
-            ui.set_scan_mode((mode != 0) as i32);
-        }
+        // ★CSD 模式回填: 两个 UI 属性同一个来源★ mode_known 与 scan_mode 全部由
+        // csd_mode_effective()(草稿 → 设备真值 → None) 派生, 不再各走一条路。
+        // None(尚未取得任何真值) ⇒ 显式 mode_known=false 且 scan_mode 归 0:
+        // 旧实现在此用 `if let Some` 直接不赋值, 使 scan_mode 锁存上一次的模式 —— 掉线重连后
+        // 页面仍按旧模式渲染, 与 mode_known=false 组合出"下拉说半自动、时钟树说 AUTO"的自相矛盾。
+        let csd_mode = ctrl.csd_mode_effective();
+        ui.set_mode_known(csd_mode.is_some());
+        ui.set_scan_mode(csd_mode.map_or(0, |mode| (mode != 0) as i32));
         if connected && !was_connected {
             let ch = ui.get_sel_channel().clamp(0, 35) as u8;
             ctrl.push_log("已连接 → 自动请求配置、当前通道参数、CH0 全局采样参数 + 开启全通道遥测");
@@ -2390,6 +2503,22 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
             last_config_version = current_config_version;
             let entries = ctrl.config_entries();
             let rows = build_config_rows(&entries);
+            // ★分组直方图★: 组标题就是渲染归属, 一旦某组为 0 行, 对应页面就是一片空白, 而"空白"
+            // 这个症状说不出是"没取到配置""归组名写错"还是"页面没接上数据源"。这行日志把三者分开:
+            // entries=0 ⇒ 没取到; 某组=0 ⇒ 归组名对不上; 都正常却仍空白 ⇒ 页面绑定问题。
+            {
+                let mut hist: std::collections::BTreeMap<String, usize> =
+                    std::collections::BTreeMap::new();
+                for r in &rows {
+                    *hist.entry(r.group.to_string()).or_insert(0) += 1;
+                }
+                log::info!(
+                    "配置分组直方图: entries={} rows={} {:?}",
+                    entries.len(),
+                    rows.len(),
+                    hist
+                );
+            }
             // 未归类行数: Slint 没有数组过滤/计数, 空组不渲染要靠这里给出行数。
             ui.set_config_other_count(rows.iter().filter(|r| r.group == "其他").count() as i32);
             ui.set_config_rows(slint::ModelRc::new(slint::VecModel::from(rows)));
@@ -2406,6 +2535,8 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
                     ui.set_keyboard_map_en(v);
                 }
             }
+            // comm.keyboard_map_serial_only 走通用配置组(协议页 mai2serial 块)回填,
+            // 不再需要专属属性 —— 见 protocol.slint 内注释。
         }
 
         // 34 分区固定: 原地比较后只写变化行，保留列表内通道输入、侦听与移除按钮的焦点状态。
@@ -2496,7 +2627,10 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
             ui.set_cp_text(text.into());
         }
 
-        // 主图回填: 主曲线(左轴) + 算法叠加线(右轴)共享同一时间窗口, 必须在同一处生成。
+        // ★主图回填: 唯一绘图管线的唯一消费处★
+        // 主曲线(左轴)、4 条算法上报、触发判定全部来自同一个 ChartFrame ⇒ x 定义域与绘制面积
+        // 天然一致。这里【不许】再出现第二个产物, 也不许把 t_first/t_last 传给别的生成函数 ——
+        // 那正是旧实现"叠加线只覆盖部分宽度"的来路(见 build_chart_frame 顶部的不变量)。
         // 门控里【不再】有绘图区尺寸: PlotPath 用 fit: fill 拉满, 拖分栏/改窗口只是元素几何变化,
         // path 不必重算 —— 纯 UI 交互不该把 36 通道的采样重新投影一遍。
         if current_telem_version != last_telem_version
@@ -2508,60 +2642,68 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
             last_channel = current_channel;
             last_curve_visibility = curve_visibility;
             algo_overlay_dirty = false;
-            let curves = build_curve_paths(
-                &ctrl,
-                current_channel as u8,
-                curve_visibility.0,
-                curve_visibility.1,
-                curve_visibility.2,
-            );
-            // 横轴真实时间: 跨度(ms)给 UI 换算刻度/十字线读数, 绝对时刻只做一行文本展示
-            // (f32 存不住小时级的 ms 绝对值, 故 UI 侧一律用"相对最新样本"的偏移)。
-            ui.set_curve_t_span_ms(curves.t_span_ms());
-            ui.set_curve_t_end_text(dev_time_text(curves.t_last_us).into());
-
-            // 算法叠加线: 与主曲线同一时间窗口 + 独立右轴量程。
-            let overlay_on = ui.get_show_algo_overlay();
-            let show_active = ui.get_show_active();
             let decls = ctrl.algo_report_decls();
             let amps = *report_norm_timer.borrow();
-            let mut wanted = [false; 4];
-            for (idx, slot) in wanted.iter_mut().enumerate() {
+            // 上报线"参与绘制"的三重判定: 叠加总开关开 + 算法声明了该 idx + 用户未取消勾选。
+            let overlay_on = ui.get_show_algo_overlay();
+            let mut report_wanted = [false; 4];
+            for (idx, slot) in report_wanted.iter_mut().enumerate() {
                 *slot = overlay_on
                     && decls.iter().any(|d| d.idx == idx as u8)
                     && report_show_timer.borrow()[idx];
             }
-            let overlay = build_algo_overlay(
+            let frame = build_chart_frame(
                 &ctrl,
-                &wanted,
-                show_active,
+                current_channel as u8,
+                SeriesShow {
+                    raw: curve_visibility.0,
+                    bsln: curve_visibility.1,
+                    diff: curve_visibility.2,
+                    report: report_wanted,
+                    active: ui.get_show_active(),
+                },
                 &amps,
-                curves.t_first_us,
-                curves.t_last_us,
                 algo_report_idxs.len(),
             );
-            ui.set_curve_r_min(overlay.r_min);
-            ui.set_curve_r_max(overlay.r_max);
-            ui.set_active_point_count(overlay.active_count);
-            ui.set_active_path(overlay.active_path.into());
+
+            // 横轴真实时间: 跨度(ms)给 UI 换算刻度/十字线读数, 绝对时刻只做一行文本展示
+            // (f32 存不住小时级的 ms 绝对值, 故 UI 侧一律用"相对最新样本"的偏移)。
+            ui.set_curve_t_span_ms(frame.x.t_span_ms());
+            ui.set_curve_t_end_text(dev_time_text(frame.x.t_last_us).into());
+
+            // 左轴(ADC 量纲)三条主曲线。★颜色也由本图唯一调色板给出★: .slint 里再写一份色值
+            // 就等于两套色表, 必然跨组撞色(旧实现的上报线用了 [绿,蓝,橙], 与主曲线三条全撞)。
+            ui.set_raw_path(frame.path_of(SeriesId::Raw).into());
+            ui.set_bsln_path(frame.path_of(SeriesId::Bsln).into());
+            ui.set_diff_path(frame.path_of(SeriesId::Diff).into());
+            ui.set_raw_color(frame.color_of(SeriesId::Raw));
+            ui.set_bsln_color(frame.color_of(SeriesId::Bsln));
+            ui.set_diff_color(frame.color_of(SeriesId::Diff));
+            ui.set_curve_y_min(frame.left.min);
+            ui.set_curve_y_mid(frame.left.mid);
+            ui.set_curve_y_max(frame.left.max);
+            ui.set_curve_point_count(frame.point_count);
+
+            // 右轴(算法量纲)量程 + 触发判定线。左右轴各有 y 量程, 但共享上面那一套 x。
+            ui.set_curve_r_min(frame.right.min);
+            ui.set_curve_r_max(frame.right.max);
+            ui.set_active_path(frame.path_of(SeriesId::Active).into());
+            ui.set_active_point_count(frame.count_of(SeriesId::Active));
+            ui.set_active_color(frame.color_of(SeriesId::Active));
             ui.set_active_norm_amp(amps[4]);
-            let colors: [slint::Color; 4] = [
-                slint::Color::from_rgb_u8(0x33, 0xcc, 0x33),
-                slint::Color::from_rgb_u8(0x33, 0x99, 0xff),
-                slint::Color::from_rgb_u8(0xff, 0xaa, 0x00),
-                slint::Color::from_rgb_u8(0xff, 0x66, 0xcc),
-            ];
+
             for idx in 0usize..4 {
+                let id = SeriesId::Report(idx as u8);
                 let decl = decls.iter().find(|d| d.idx == idx as u8);
                 let line = AlgoReportLine {
                     idx: idx as i32,
                     name: decl.map(|d| d.name.clone()).unwrap_or_default().into(),
-                    path: overlay.report_paths[idx].clone().into(),
+                    path: frame.path_of(id).into(),
                     // 声明 + 有数据 + 用户未取消勾选 → 才画在主图上。
-                    visible: wanted[idx] && overlay.report_has_data[idx],
-                    is_binary: overlay.report_binary[idx],
+                    visible: report_wanted[idx] && frame.count_of(id) > 0,
+                    is_binary: frame.binary_of(id),
                     norm_amp: amps[idx],
-                    line_color: colors[idx],
+                    line_color: frame.color_of(id),
                 };
                 if algo_report_lines_model_timer.row_data(idx).as_ref() != Some(&line) {
                     if idx < algo_report_lines_model_timer.row_count() {
@@ -2572,19 +2714,11 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
                 }
             }
 
+            // 阈值线走左轴的同一套映射(与曲线逐像素同坐标系, 缩放时永不错层)。
             let finger_th = ctrl.param(current_channel as u8, PARAM_FINGER_TH).unwrap_or(0) as f32;
             let noise_th = ctrl.param(current_channel as u8, PARAM_NOISE_TH).unwrap_or(0) as f32;
-            let finger_th_y = curves.value_to_y(finger_th);
-            let noise_th_y = curves.value_to_y(noise_th);
-            ui.set_raw_path(curves.raw_path.into());
-            ui.set_bsln_path(curves.bsln_path.into());
-            ui.set_diff_path(curves.diff_path.into());
-            ui.set_curve_y_min(curves.y_min);
-            ui.set_curve_y_mid(curves.y_mid);
-            ui.set_curve_y_max(curves.y_max);
-            ui.set_curve_point_count(curves.point_count);
-            ui.set_finger_th_y(finger_th_y);
-            ui.set_noise_th_y(noise_th_y);
+            ui.set_finger_th_y(frame.left_value_to_y(finger_th));
+            ui.set_noise_th_y(frame.left_value_to_y(noise_th));
 
             // 当前值读数(raw/diff/baseline + 量程 + 阈值), 兑现"折线图数值与范围提醒"。
             let (lr, ld, lb) = match ctrl.telem_latest(current_channel as u8) {
@@ -2595,11 +2729,11 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
                 ),
                 None => (0, 0, 0),
             };
-            let readout = if curves.point_count > 0 {
+            let readout = if frame.point_count > 0 {
                 format!(
                     "CH{} 当前 raw={} diff={} bsln={} | 纵轴量程 [{} .. {}] | 手指阈值 {} 噪声阈值 {}",
                     current_channel, lr, ld, lb,
-                    curves.y_min.round() as i32, curves.y_max.round() as i32,
+                    frame.left.min.round() as i32, frame.left.max.round() as i32,
                     finger_th as i32, noise_th as i32
                 )
             } else {
@@ -2642,7 +2776,11 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
             let delays: Vec<i32> = table.iter().map(|c| c.delay_ms as i32).collect();
             let maxes: Vec<i32> = table.iter().map(|c| c.max_hold_ms as i32).collect();
             ui.set_combo_count(table.len() as i32);
-            ui.set_combo_zones_text(slint::ModelRc::new(slint::VecModel::from(zones_text)));
+            // 见 last_combo_zones 的说明: 内容没变就不换 model, 以保住行内键框的录制态。
+            if zones_text != last_combo_zones {
+                last_combo_zones = zones_text.clone();
+                ui.set_combo_zones_text(slint::ModelRc::new(slint::VecModel::from(zones_text)));
+            }
             ui.set_combo_keys_text(slint::ModelRc::new(slint::VecModel::from(keys_text)));
             ui.set_combo_delay(slint::ModelRc::new(slint::VecModel::from(delays)));
             ui.set_combo_max_hold(slint::ModelRc::new(slint::VecModel::from(maxes)));
@@ -2668,16 +2806,17 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
             ui.set_combo_status(status.into());
         }
 
-        // 批量应用抽屉回填: 勾选态走自己的 version, 源通道参数值随 param_version/换通道刷新。
-        // 两者都并入既有 16ms tick 门控, 不新增定时器、不提高频率。
-        let current_batch_sel_version = ctrl.batch_sel_version();
-        if current_batch_sel_version != last_batch_sel_version
+        // 批量应用抽屉回填: 勾选态与"每参数待写值"共用 batch_sel_version 门控, 值在 param_version
+        // 推进/换通道时补空(★只补空, 不覆盖用户手改过的项★, 见 batch_fill_missing_values)。
+        // 全部并入既有 16ms tick 门控, 不新增定时器、不提高频率。
+        if ctrl.batch_sel_version() != last_batch_sel_version
             || current_param_version != last_param_version
             || channel_changed
         {
-            last_batch_sel_version = current_batch_sel_version;
-            let batch_src = ctrl.batch_source();
-            ui.set_batch_source(batch_src as i32);
+            // 先补空再取版本号: 补空自身会 bump 版本, 顺序反了会多触发一次无谓的行模型重建。
+            ctrl.batch_fill_missing_values();
+            last_batch_sel_version = ctrl.batch_sel_version();
+            ui.set_batch_source(ctrl.batch_source() as i32);
             ui.set_batch_ch_selected(slint::ModelRc::new(slint::VecModel::from(
                 ctrl.batch_ch_selected())));
             ui.set_batch_param_selected(slint::ModelRc::new(slint::VecModel::from(
@@ -2686,15 +2825,16 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
                 .map(|id| param_display_name(id).into())
                 .collect();
             ui.set_batch_param_names(slint::ModelRc::new(slint::VecModel::from(names)));
-            // 源通道该参数无真值时显示"—", 明确区别于"值为 0"。取的是 batch_source 而不是当前精调
-            // 通道: 抽屉里勾目标通道时不应把"源值"一列跟着改掉。
-            let values: Vec<slint::SharedString> = (0x01u8..=0x0Bu8)
-                .map(|id| match ctrl.param(batch_src, id) {
-                    Some(v) => slint::SharedString::from(v.to_string()),
-                    None => slint::SharedString::from("—"),
-                })
-                .collect();
-            ui.set_batch_param_values(slint::ModelRc::new(slint::VecModel::from(values)));
+            // 值一列现在是可编辑数字框: -1 = 面板上尚无值(源通道未回读且用户未手填), .slint 侧
+            // 显示为"—", 明确区别于"值为 0"。取的是 batch_source 的值而不是当前精调通道的 ——
+            // 抽屉里勾目标通道时不应把这一列跟着改掉。
+            ui.set_batch_param_values(slint::ModelRc::new(slint::VecModel::from(
+                ctrl.batch_values())));
+            // ★围栏随行下发★: 上下限唯一来源是 proto::param_fence(与两处固件同源),
+            // .slint 里不许按 param_id 再写一份阈值。
+            let (mins, maxs) = ctrl.batch_value_bounds();
+            ui.set_batch_param_min(slint::ModelRc::new(slint::VecModel::from(mins)));
+            ui.set_batch_param_max(slint::ModelRc::new(slint::VecModel::from(maxs)));
         }
 
         if current_param_version != last_param_version || channel_changed {
@@ -2780,19 +2920,52 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
         // 每键触发极性 + 防抖(version 门控, 草稿优先值)。
         if ctrl.kbd_keycfg_version() != last_kbd_keycfg_version {
             last_kbd_keycfg_version = ctrl.kbd_keycfg_version();
-            let pol: Vec<bool> = (0..12u8).map(|i| ctrl.kbd_keycfg(i).active_high).collect();
+            let pol: Vec<i32> = (0..12u8).map(|i| ctrl.kbd_keycfg(i).pol as i32).collect();
+            // ★生效电平只从固件回传的 resolved mask 逐位摊平★: 不用 pol_mode 推算, 否则
+            // 显示的就不是设备真值而是本地二值化猜测。掩码没读到过时标记"未知"而非假装低电平。
+            let resolved = ctrl.kbd_pol_resolved_mask();
+            let resolved_known = ctrl.kbd_pol_resolved_known();
+            let pol_hi: Vec<bool> = (0..12u8).map(|i| (resolved >> i) & 1 != 0).collect();
+            let pol_known: Vec<bool> = vec![resolved_known; 12];
             let db: Vec<i32> = (0..12u8)
                 .map(|i| ctrl.kbd_keycfg(i).debounce_us as i32)
                 .collect();
-            ui.set_kbd_phys_pol_high(slint::ModelRc::new(slint::VecModel::from(pol)));
+            ui.set_kbd_phys_pol_mode(slint::ModelRc::new(slint::VecModel::from(pol)));
+            ui.set_kbd_phys_pol_resolved_high(slint::ModelRc::new(slint::VecModel::from(pol_hi)));
+            ui.set_kbd_phys_pol_resolved_known(slint::ModelRc::new(slint::VecModel::from(pol_known)));
             ui.set_kbd_phys_debounce(slint::ModelRc::new(slint::VecModel::from(db)));
             // 旧固件没有这两条命令: 明说"不支持"而不是显示一份看起来能改的假默认值。
             let status = match ctrl.kbd_keycfg_supported() {
                 Some(false) => "设备固件不支持每键极性/防抖(需升级固件)".to_string(),
                 None => "每键极性/防抖: 未回读".to_string(),
+                Some(true) if !resolved_known => {
+                    "当前生效电平: 未知(设备固件未回传生效极性掩码)".to_string()
+                }
                 Some(true) => {
-                    let high = (0..12u8).filter(|i| ctrl.kbd_keycfg(*i).active_high).count();
-                    format!("{} 键高电平触发 · 其余低电平触发", high)
+                    // ★按生效电平统计★: 只报"高/低"而不说明有多少是自动判定的, 等于把三态
+                    // 折成二值; 自动档数量必须一起给出, 用户才知道这些结论是上电学来的。
+                    let high = (0..12u8)
+                        .filter(|i| (resolved >> *i) & 1 != 0)
+                        .count();
+                    let auto_high = (0..12u8)
+                        .filter(|i| {
+                            ctrl.kbd_keycfg(*i).pol == mai2control_ui::proto::KBD_POL_AUTO
+                                && (resolved >> *i) & 1 != 0
+                        })
+                        .count();
+                    let auto_low = (0..12u8)
+                        .filter(|i| {
+                            ctrl.kbd_keycfg(*i).pol == mai2control_ui::proto::KBD_POL_AUTO
+                                && (resolved >> *i) & 1 == 0
+                        })
+                        .count();
+                    format!(
+                        "{} 键当前高电平触发(其中 {} 键为自动判定) · {} 键当前低电平触发(其中 {} 键为自动判定)",
+                        high,
+                        auto_high,
+                        12 - high,
+                        auto_low
+                    )
                 }
             };
             ui.set_kbd_keycfg_status(status.into());
@@ -2949,6 +3122,9 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
         ui.set_sample_rate_hz(ctrl.telem_samples_per_sec() as i32);
         ui.set_scan_period_ms(ctrl.telem_scan_period_us() as f32 / 1000.0);
         ui.set_scan_period_us(ctrl.telem_scan_period_us() as i32);
+        // ★停流时不要把 0 当成实测值★ 主页/全通道页/全局调整页共用同一来源(telem_scan_period_us),
+        // 该来源只在遥测帧带 STATS 时更新; 无值时靠这个标志让三处一致显示"未测"。
+        ui.set_scan_period_valid(ctrl.telem_scan_period_valid());
         // 期望探测周期由当前分辨率解算(CH0 代表值), ★与 SnsClk 分频无关★:
         // CSDv2 子转换数 ∝ 1/snsClkDiv, 换能时长 = 2^res/ModClk, 分频相互抵消(真机已证)。
         // 改变周期的是分辨率(2^res); 分频只改传感激励频率(Cp 灵敏度/抗噪)。见 expected_scan_period_us 注释。
@@ -3164,7 +3340,10 @@ fn parse_config_label(key: &str) -> (String, String, String) {
         | "comm.rate_limit_en"
         | "comm.rate_limit_hz"
         | "comm.serial_reset_calibrate"
-        | "comm.serial_reset_baseline" => "mai2serial 协议参数",
+        | "comm.serial_reset_baseline"
+        // 「触控映射仅协议启动时生效」的判定依据就是 mai2serial 的实际发送态,
+        // 语义上属协议能力而非键盘映射本身, 故归到协议页 mai2serial 块。
+        | "comm.keyboard_map_serial_only" => "mai2serial 协议参数",
         // mai2light: 灯板串口 + 节点号 + 灯珠总数 → 协议页 mai2light 块
         "comm.light_baud" | "led.node_id" | "led.count" => "mai2light 协议参数",
         // 触控 → 键盘映射: 虽在 comm. 前缀下, 语义与协议无关
@@ -3193,6 +3372,10 @@ fn parse_config_label(key: &str) -> (String, String, String) {
         "comm.rate_limit_en" => ("启用速率限制", "限制遥测上报的最大帧率"),
         "comm.rate_limit_hz" => ("速率上限 (Hz)", "遥测上报帧率的上限"),
         "comm.keyboard_map_en" => ("启用触摸→键盘", "把触摸分区映射为键盘按键输出"),
+        "comm.keyboard_map_serial_only" => (
+            "触控映射仅协议启动时生效",
+            "需先开启「启用触摸→键盘」；开启后触摸→键盘映射只在 mai2serial 实际发送触控数据期间生效，停发时映射失效并释放已按下的键",
+        ),
         "comm.serial_baud" => ("触控串口波特率", "游戏触控串口 (COM) 的波特率"),
         "comm.serial_reset_calibrate" => (
             "串口重启后自动 IDAC 校准",
@@ -3287,36 +3470,149 @@ fn build_zone_cells(ctrl: &AppController) -> Vec<ZoneCell> {
     cells
 }
 
-/// 单通道精调主图一次回填的产物: 左轴(ADC 量纲)三条曲线 + 全量共享时间窗口。
-/// 算法叠加线(右轴)复用同一时间窗口, 见 `build_algo_overlay`。
-struct CurvePaths {
-    raw_path: String,
-    bsln_path: String,
-    diff_path: String,
-    y_min: f32,
-    y_mid: f32,
-    y_max: f32,
-    point_count: i32,
-    /// 全量时间窗口(展开后的设备时间 us): 最旧样本→最新样本。UI 的横向缩放在其上取子区间。
-    t_first_us: u64,
-    t_last_us: u64,
+// ============================================================================
+// 单通道精调主图: 唯一绘图管线
+// ============================================================================
+//
+// ★不变量(改这块之前先读这段)★
+// 「同一张图内所有系列共享唯一 x 定义域与唯一绘制面积; 任何新增系列只能加入本管线,
+//   不得自带坐标计算」
+//
+// 旧实现把主曲线(CurvePaths)与算法叠加线(AlgoOverlay)做成两套产物, 后者自带 x 时间窗与量程,
+// 而主曲线的 x 窗只由 raw/bsln/diff 求出。算法追踪点是主机轮询取回的, 时间范围与遥测缓冲并不
+// 一致 ⇒ 落在主曲线时间窗之外的那一段被裁掉, 表现为"红线只画一半、左边一块空窗、线到那儿就
+// 消失"。★根子不在坐标轴, 在两套产物各算一套"有效绘制面积"。★ 现在 x 定义域由【全部参与绘制
+// 的系列】一次求并集算定后分发, 缺口阈值同样只在这一处给出: 某系列在某段无数据 ⇒ 那一段断线
+// (gap), 而不是把整条线压缩到局部宽度。
+//
+// ★左右双 Y 轴是正当设计, 不要合并★: 左轴是 ADC 量纲(raw/bsln/diff 与阈值线), 右轴是算法量纲
+// (计数/permille/布尔)。共用一轴会把 0/1 的布尔线压成贴底直线。统一的只有 x 定义域与绘制面积
+// —— 两轴各有自己的 y 量程, 但横向对位逐像素一致。
+
+/// ★同一张图内的唯一调色板★。容量 32 —— 当前图只用到 8 条(主曲线 3 + 算法上报 4 + 触发判定 1),
+/// 留足余量是为了让"同图颜色永不重复"这条不变量在系列数增长时**不必再改代码**
+/// (旧版容量恰好等于 8, 一加系列就立刻溢出到灰色降级)。
+///
+/// 前 8 项顺序与旧版逐项一致(蓝 raw / 琥珀 bsln / 绿 diff / 紫 / 青 / 近白 / 珊瑚 / 品红 触发判定),
+/// 保持既有观感不变; 第 9 项起按黄金角(0.618)散布色相补足。
+///
+/// ★两条可复核的量化约束★(用脚本算过, 改表时请重算, 别凭眼睛加色):
+///  - 最小两两 RGB 欧氏色距 = 55.3 —— 保证任意两条线不会被看成同色;
+///  - 最低亮度(0.299R+0.587G+0.114B) = 112 —— 图底是 #1c2126(亮度约 32), 低于此值的色在深色底上看不清,
+///    故所有色都设了亮度下限; 这也是为什么表里没有深蓝/深紫那类"色距够但看不见"的颜色。
+const SERIES_PALETTE: [(u8, u8, u8); 32] = [
+    (0x33, 0x99, 0xff), // 蓝(raw)
+    (0xff, 0xaa, 0x00), // 琥珀(bsln)
+    (0x33, 0xcc, 0x33), // 绿(diff)
+    (0xb0, 0x8c, 0xff), // 紫
+    (0x00, 0xd4, 0xc8), // 青
+    (0xdf, 0xe8, 0xf0), // 近白
+    (0xff, 0x7a, 0x45), // 珊瑚
+    (0xff, 0x33, 0x99), // 品红(触发判定)
+    (0xff, 0x84, 0x9e),
+    (0xd5, 0xf2, 0x60),
+    (0xc9, 0x2f, 0xd8),
+    (0x84, 0xff, 0xd0),
+    (0x65, 0x60, 0xf2),
+    (0x19, 0xda, 0xff),
+    (0x93, 0xd8, 0x2f),
+    (0xff, 0x84, 0xf0),
+    (0xf2, 0xae, 0x60),
+    (0x8a, 0xff, 0x84),
+    (0x60, 0xbd, 0xf2),
+    (0xcc, 0xd8, 0x2f),
+    (0x19, 0xff, 0x89),
+    (0x19, 0xff, 0x3d),
+    (0xf2, 0x60, 0x74),
+    (0xfc, 0x19, 0xff),
+    (0xff, 0xf8, 0x84),
+    (0xff, 0x3b, 0x19),
+    (0x6b, 0xff, 0x19),
+    (0x2f, 0xd8, 0xaa),
+    (0xff, 0xf9, 0x19),
+    (0x60, 0xf2, 0x62),
+    (0x60, 0xf2, 0xa7),
+    (0xd5, 0x60, 0xf2),
+];
+
+/// 调色板耗尽后的降级色(灰): 明确表示"这条线没分到专色", 而不是静默与别人同色。
+fn series_fallback_color() -> slint::Color {
+    slint::Color::from_rgb_u8(0x9e, 0x9e, 0x9e)
 }
 
-impl CurvePaths {
-    fn value_to_y(&self, value: f32) -> f32 {
-        if self.point_count == 0 {
-            return 500.0;
+/// 按"系列在图中的出现顺序"取色的游标。
+/// ★递增游标而不是 `idx % len`★: 取模在系列数超过表长时会静默让两条线同色, 看图的人无法分辨
+/// 谁是谁; 游标只增不减 ⇒ 同一张图内颜色永不重复, 超出容量的部分明确降级并由调用方记一条日志。
+struct PaletteCursor {
+    _next: usize,
+    _overflow: usize,
+}
+
+impl PaletteCursor {
+    fn new() -> Self {
+        Self {
+            _next: 0,
+            _overflow: 0,
         }
-        (1000.0 - (value - self.y_min) / (self.y_max - self.y_min) * 1000.0).clamp(0.0, 1000.0)
     }
-    /// 全量时间跨度(ms), 供 UI 把 viewbox 横坐标换算成真实时刻。
-    fn t_span_ms(&self) -> f32 {
-        self.t_last_us.saturating_sub(self.t_first_us) as f32 / 1000.0
+    /// 取下一个颜色。★分配顺序固定为图内声明顺序, 与该系列是否可见无关★ ——
+    /// 否则勾掉一条线会让它后面所有线换颜色。
+    fn take(&mut self) -> slint::Color {
+        match SERIES_PALETTE.get(self._next) {
+            Some(&(r, g, b)) => {
+                self._next += 1;
+                slint::Color::from_rgb_u8(r, g, b)
+            }
+            None => {
+                self._overflow += 1;
+                series_fallback_color()
+            }
+        }
     }
+    /// 未分到专色的系列数(>0 ⇒ 调色板容量该扩了, 绝不靠重复颜色顶过去)。
+    fn overflow(&self) -> usize {
+        self._overflow
+    }
+}
+
+/// 图内一条系列的身份: 决定它走哪根 Y 轴、按哪种采样节奏判缺口、回填到哪个 UI 属性。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SeriesId {
+    Raw,
+    Bsln,
+    Diff,
+    /// 算法上报 report[idx](idx 0..3)。
+    Report(u8),
+    /// 算法触发判定 out_active。
+    Active,
+}
+
+impl SeriesId {
+    /// true = 走右轴(算法量纲), false = 走左轴(ADC 量纲)。
+    fn on_right_axis(self) -> bool {
+        !matches!(self, SeriesId::Raw | SeriesId::Bsln | SeriesId::Diff)
+    }
+    /// 采样节奏: 上报/触发判定是主机轮询取回的, 单条线的采样间隔是遥测周期的若干倍。
+    fn cadence(self) -> SeriesCadence {
+        if self.on_right_axis() {
+            SeriesCadence::Poll
+        } else {
+            SeriesCadence::Frame
+        }
+    }
+}
+
+/// 采样节奏 ⇒ 缺口阈值取哪一档(两档都在 `XWindow` 一处算定, 见其注释)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SeriesCadence {
+    /// 遥测直出: 每帧一点。
+    Frame,
+    /// 主机轮询: n 个 report idx 轮转, 单条线的间隔 = 遥测周期 × n。
+    Poll,
 }
 
 /// 采样间隔超过多少视为"时间缺口"(暂停/掉帧): 取标称周期的若干倍, 并给一个绝对下限,
-/// 免得采样率未知(sps=0)或抖动时误判。缺口两侧不连线, 见 `points_to_svg_path`。
+/// 免得采样率未知(sps=0)或抖动时误判。缺口段按 0 绘制, 见 `fill_uncovered_with_zero`。
 fn gap_threshold_us(sample_rate_hz: u32, period_mult: u32, floor_us: u64) -> u64 {
     let nominal = if sample_rate_hz > 0 {
         1_000_000 / sample_rate_hz as u64
@@ -3326,146 +3622,302 @@ fn gap_threshold_us(sample_rate_hz: u32, period_mult: u32, floor_us: u64) -> u64
     (nominal * period_mult as u64).max(floor_us)
 }
 
-/// 把 (设备时间us, 值) 序列按时间窗口 [t0,t1] 与数值窗口 [v_min,v_max] 投影成 SVG path。
+/// 整张图【唯一】的 x 定义域(展开后的设备时间 us)与【唯一】的缺口判据。
+/// 由 `build_chart_frame` 在一处算定后分发给每条系列, 任何系列不得自己再算 x。
 ///
-/// ★横坐标按时间而非序号★: 掉帧/暂停时等间距序号会把时间轴画错(同样的像素距离代表不同时长)。
-/// ★缺口断开★: 相邻两点间隔超过 gap_us 就用 `M` 重开子路径 —— 直线插值会伪造"这段时间数值在
-/// 线性变化"的假象, 停流几十秒后尤其误导。
-/// ★x 值域固定 [0,1000]★: 主图 PlotPath 用 fit: fill(非等比拉伸), viewbox 无论什么宽高比都被
-/// 拉满绘图区, 所以不需要按绘图区宽高比预拉伸 x —— 那套修正在横向缩放后必然失配并留出空白带。
-fn points_to_svg_path(
-    points: &[(u64, f32)],
-    t0: u64,
-    t1: u64,
-    v_min: f32,
-    v_max: f32,
-    gap_us: u64,
-) -> String {
+/// ★为什么缺口阈值是两档而不是一个数★: 主曲线每帧一点, 算法追踪是 n 个 idx 轮转取回,
+/// 单条线的采样间隔本就相差 n 倍。同一个阈值必然错一头: 取小的会把算法线逐点切碎成归零段,
+/// 取大的会让主曲线上真实的停流被直线插值伪造成"这段时间数值在变化"。故按采样节奏分两档,
+/// 但两档都在这里一次算定 —— 系列自己不许算。
+///
+/// ★阈值的语义 = "覆盖半径"★: 与某个采样点时间距离在阈值内的时刻算被该采样覆盖(正常的帧间
+/// 抖动/一个轮询周期都在此内); 超出即视为**没有数据**, 由 `fill_uncovered_with_zero` 按 0 补齐。
+struct XWindow {
+    /// 最旧样本时刻 → viewbox x = 0。
+    t_first_us: u64,
+    /// 最新样本时刻 → viewbox x = 1000。
+    t_last_us: u64,
+    /// 遥测节奏(每帧一点)的缺口阈值。
+    gap_frame_us: u64,
+    /// 轮询节奏(n 个 report idx 轮转)的缺口阈值。
+    gap_poll_us: u64,
+}
+
+impl XWindow {
+    /// ★整张图唯一的 x 映射★: 设备时刻 → viewbox x(0..1000)。所有系列必须经由它。
+    /// x 值域固定 [0,1000]: 主图 PlotPath 用 fit: fill(非等比拉伸), viewbox 无论什么宽高比都被
+    /// 拉满绘图区, 故不需要按绘图区宽高比预拉伸 —— 那套修正在横向缩放后必然失配并留出空白带。
+    /// ★结果夹在 [0,1000]★ 与 `AxisScale::y_of` 同一处理。补齐后的系列本就恰好铺满
+    /// [t_first_us, t_last_us], 夹取对它们是恒等变换; 它挡住的是退化窗口(整张图一条参与系列都
+    /// 没数据 ⇒ 窗口塌成 0..0)下未参与系列被顺带投影时算出的天文数字坐标 —— 那会让下游的
+    /// 虚线分段循环按 i32::MAX 跑。
+    fn x_of(&self, t_us: u64) -> f32 {
+        let span = self.t_last_us.saturating_sub(self.t_first_us).max(1) as f32;
+        (t_us.saturating_sub(self.t_first_us) as f32 / span * 1000.0).clamp(0.0, 1000.0)
+    }
+    fn gap_us(&self, cadence: SeriesCadence) -> u64 {
+        match cadence {
+            SeriesCadence::Frame => self.gap_frame_us,
+            SeriesCadence::Poll => self.gap_poll_us,
+        }
+    }
+    /// 全量时间跨度(ms), 供 UI 把 viewbox 横坐标换算成真实时刻。
+    fn t_span_ms(&self) -> f32 {
+        self.t_last_us.saturating_sub(self.t_first_us) as f32 / 1000.0
+    }
+}
+
+/// 一根 Y 轴的量程(已含两侧 5% 留白)。左轴 = ADC 量纲, 右轴 = 算法量纲。
+struct AxisScale {
+    min: f32,
+    mid: f32,
+    max: f32,
+}
+
+impl AxisScale {
+    /// 无参与系列时的退化量程: 不能是 0 宽, 否则 y 映射除零。
+    fn unit() -> Self {
+        Self {
+            min: 0.0,
+            mid: 0.5,
+            max: 1.0,
+        }
+    }
+    /// 由参与系列的取值范围求量程。两侧各留 5%, 免得极值贴边看不出来。
+    /// `flat_floor` = 全平序列(min==max)时的最小留白: 左轴取 1(ADC 最小有意义刻度是 1 个计数),
+    /// 右轴取 0.5(算法量纲可以是 0/1 布尔, 再大就把一条平线撑到看不出高度差)。
+    fn from_span(min: f32, max: f32, flat_floor: f32) -> Self {
+        if !min.is_finite() || !max.is_finite() || min > max {
+            return Self::unit();
+        }
+        let span = max - min;
+        let padding = if span.abs() < f32::EPSILON {
+            (min.abs() * 0.05).max(flat_floor)
+        } else {
+            span * 0.05
+        };
+        let lo = min - padding;
+        let hi = max + padding;
+        Self {
+            min: lo,
+            mid: (lo + hi) * 0.5,
+            max: hi,
+        }
+    }
+    /// 值 → viewbox y(0..1000, 向下增大)。
+    fn y_of(&self, value: f32) -> f32 {
+        let range = (self.max - self.min).max(f32::EPSILON);
+        (1000.0 - (value - self.min) / range * 1000.0).clamp(0.0, 1000.0)
+    }
+}
+
+/// 补齐后的一个绘图点。
+///
+/// `zeroed = true` 表示该点是"此处无采样覆盖"合成出来的 0 值点, 不是设备真的报了 0。
+/// 两者必须在图上可区分, 见 `points_to_svg_path` 的虚线处理。
+#[derive(Clone, Copy)]
+struct PlotPoint {
+    t_us: u64,
+    val: f32,
+    zeroed: bool,
+}
+
+/// 归零段的"虚线"节拍(viewbox x 单位, 值域 0..1000)。
+///
+/// ★为什么用手工虚线而不是另开一条低透明度路径★: 另开路径要给 8 条系列各加一个 UI 元素与
+/// 一份颜色, 等于把"一条系列一个 path"的模型撑成两份, 且 .slint 侧要再复制一遍描边参数。
+/// 在同一条 path 里把归零段拆成 on/off 小段, 颜色/线宽天然与本系列一致(仍取自 SERIES_PALETTE),
+/// UI 一行都不用改, 而"虚线 = 无数据"与"实线贴底 = 真值 0"一眼可分。
+const ZERO_DASH_ON: i32 = 9;
+const ZERO_DASH_OFF: i32 = 7;
+
+/// 一条系列的最终产物。★除 path 外不带任何坐标信息★: 坐标全在 `XWindow`/`AxisScale` 里,
+/// 谁也不能凭这个结构自己再投影一遍。
+struct SeriesPath {
+    id: SeriesId,
+    path: String,
+    /// 线条/图例颜色, 由本图唯一调色板顺序分配(见 `SERIES_PALETTE`)。
+    color: slint::Color,
+    /// 本系列的采样点数(0 ⇒ UI 可退化成基线, 或整行收起)。
+    point_count: i32,
+    /// 取值只有 0/1(布尔类) ⇒ UI 才为它显示"归一化幅度 N"输入。
+    binary: bool,
+}
+
+/// 单通道精调主图一次回填的【唯一】产物: 一个函数一次产出全部系列。
+///
+/// ── 结构性不变量(由 `build_chart_frame` + `fill_uncovered_with_zero` 联合保证) ──────────
+/// 「同一张图内所有系列共享唯一 x 定义域(`ChartFrame::x`), 且每条**有采样**的系列在该定义域上
+///  处处有定义; 无采样覆盖处一律为 0(以垂直阶跃进出), 既不保持末值也不插值, 更不允许提前截断。」
+///
+/// 展开说明:
+///  · 唯一 x: 只有 `XWindow::x_of` 一处做时间→横坐标映射, 任何系列不得自带 x 计算;
+///  · 处处有定义: 左端(早于首样本)、中间缺口、右端(晚于末样本)三种无覆盖区间全部补 0;
+///  · 垂直阶跃: 补 0 与真实数据之间用同一时刻的两个点表达跳变, 绝不画斜线 —— 斜线会伪造
+///    "数值在这段时间里连续过渡"的假象;
+///  · 不保持末值: 右端最新采样早于窗口末端超过该系列 gap 阈值时其后必须归零。★这是修掉的 bug★
+///    旧实现让路径停在末样本, PlotPath 把最后一段一直画到右边缘, 看着像"稳定读数"其实无数据;
+///  · 不提前截断: 每条系列路径的 x 覆盖与 `x` 一致, 不会出现"叠加线只盖住图的左半边";
+///  · 归零段与真值 0 可区分: 归零段画成同色虚线(见 `ZERO_DASH_ON`), 真值 0 是实线。
+/// 空系列(该系列一个采样都没有)例外: 它不参与绘制, path 为空 —— 无数据的系列不该凭空多出一条
+/// 贴底的线, 它的"没有数据"由 `point_count == 0` 表达, UI 据此收起整行。
+struct ChartFrame {
+    /// 唯一 x 定义域 + 唯一缺口判据。
+    x: XWindow,
+    /// 左轴(ADC 量纲): raw/bsln/diff 与阈值线共用。
+    left: AxisScale,
+    /// 右轴(算法量纲): 算法上报线与触发判定共用。
+    right: AxisScale,
+    /// 全部系列, 顺序 = 图内声明顺序 = 调色板分配顺序。
+    series: Vec<SeriesPath>,
+    /// 左轴系列的最大采样点数: UI 的"有无遥测数据"判据。
+    point_count: i32,
+}
+
+impl ChartFrame {
+    fn _find(&self, id: SeriesId) -> Option<&SeriesPath> {
+        self.series.iter().find(|s| s.id == id)
+    }
+    fn path_of(&self, id: SeriesId) -> &str {
+        self._find(id).map_or("", |s| s.path.as_str())
+    }
+    fn color_of(&self, id: SeriesId) -> slint::Color {
+        self._find(id)
+            .map_or_else(series_fallback_color, |s| s.color)
+    }
+    fn count_of(&self, id: SeriesId) -> i32 {
+        self._find(id).map_or(0, |s| s.point_count)
+    }
+    fn binary_of(&self, id: SeriesId) -> bool {
+        self._find(id).map_or(false, |s| s.binary)
+    }
+    /// 左轴值 → viewbox y, 供阈值线定位。
+    /// ★无遥测数据时回中线★: 此时左轴是退化的单位量程(0..1), 按它映射会把阈值线贴到顶边,
+    /// 看上去像"阈值恰好等于量程上限"。UI 侧此时本就隐藏阈值线, 回中线只是不留下误导性坐标。
+    fn left_value_to_y(&self, value: f32) -> f32 {
+        if self.point_count == 0 {
+            return 500.0;
+        }
+        self.left.y_of(value)
+    }
+}
+
+/// 把一条系列在 `XWindow` 定义域上补成"处处有定义": 无采样覆盖处一律 0, 以垂直阶跃进出。
+///
+/// ★唯一实现点★ 归零语义只在这里表达, `points_to_svg_path` 只管画、不再判缺口;
+/// `XWindow::gap_us` 仍是唯一的缺口判据来源(作为"覆盖半径", 由调用方按系列节奏取好传进来)。
+///
+/// 三种无覆盖区间的处理(全部产出 `zeroed = true` 的点):
+///  · 左端: 首样本比 `t_first_us` 晚出阈值 ⇒ 从 `t_first_us` 起画 0, 到首样本处垂直升上去;
+///  · 中间: 相邻样本间隔超阈值 ⇒ 在前一点处垂直落到 0, 平推到后一点, 再垂直升回;
+///  · 右端: 末样本比 `t_last_us` 早出阈值 ⇒ 在末样本处垂直落到 0, 平推到 `t_last_us`。
+///    ★这条就是"末值被拖到右边缘"那个 bug 的修法★
+/// 差距在阈值内时不补 0, 而是把边缘值平推到窗口边界: 那段时间**确实**被该采样覆盖(不足一个
+/// 采样周期), 补 0 会让最新的一条线每帧都闪出一小截虚线; 但仍必须推到边界, 否则就是提前截断。
+///
+/// 空输入返回空(该系列没有任何采样 ⇒ 不参与绘制, 不能凭空造一条贴底的 0 线)。
+fn fill_uncovered_with_zero(points: &[(u64, f32)], x: &XWindow, gap_us: u64) -> Vec<PlotPoint> {
+    let (Some(&(first_t, first_v)), Some(&(last_t, last_v))) = (points.first(), points.last())
+    else {
+        return Vec::new();
+    };
+    // 每个缺口最多插 2 点, 首尾各最多 2 点。
+    let mut out: Vec<PlotPoint> = Vec::with_capacity(points.len() + 4);
+    let zero_at = |t_us: u64| PlotPoint {
+        t_us,
+        val: 0.0,
+        zeroed: true,
+    };
+
+    if first_t > x.t_first_us {
+        if first_t - x.t_first_us > gap_us {
+            out.push(zero_at(x.t_first_us));
+            out.push(zero_at(first_t));
+        } else {
+            out.push(PlotPoint {
+                t_us: x.t_first_us,
+                val: first_v,
+                zeroed: false,
+            });
+        }
+    }
+
+    let mut prev_t: Option<u64> = None;
+    for &(t, v) in points {
+        if let Some(pt) = prev_t {
+            if t.saturating_sub(pt) > gap_us {
+                out.push(zero_at(pt));
+                out.push(zero_at(t));
+            }
+        }
+        out.push(PlotPoint {
+            t_us: t,
+            val: v,
+            zeroed: false,
+        });
+        prev_t = Some(t);
+    }
+
+    if x.t_last_us > last_t {
+        if x.t_last_us - last_t > gap_us {
+            out.push(zero_at(last_t));
+            out.push(zero_at(x.t_last_us));
+        } else {
+            out.push(PlotPoint {
+                t_us: x.t_last_us,
+                val: last_v,
+                zeroed: false,
+            });
+        }
+    }
+    out
+}
+
+/// 在同一条 path 里把一段水平归零段画成虚线, 并把画笔停在段末(保证后续垂直阶跃起点正确)。
+fn push_zero_dashes(path: &mut String, x_from: i32, x_to: i32, y: i32) {
+    let mut cursor = x_from;
+    while cursor < x_to {
+        let on_end = (cursor + ZERO_DASH_ON).min(x_to);
+        path.push_str(&format!(" M {} {} L {} {}", cursor, y, on_end, y));
+        cursor = on_end + ZERO_DASH_OFF;
+    }
+    path.push_str(&format!(" M {} {}", x_to, y));
+}
+
+/// 把补齐后的绘图点投影成 SVG path。
+///
+/// ★x 只走 XWindow★: 横坐标按时间而非序号 —— 掉帧/暂停时等间距序号会把时间轴画错(同样的像素
+/// 距离代表不同时长); 且整张图共用同一个 XWindow, 任何系列都不得自带 x 计算。
+/// ★不再有"断线"★: 缺口已由 `fill_uncovered_with_zero` 补成显式的归零段, 于是这里只需逐点连线;
+/// 无数据不再表现为"没有线"(那与"线被裁到框外"无法区分), 而是明确的一条虚线 0。
+/// ★归零段画虚线★: 两端都是合成 0 点且同高的水平段 ⇒ 拆成 on/off 小段(同色, 见 `ZERO_DASH_ON`),
+/// 与"设备真的报 0"的实线区分开; 进出归零段的垂直阶跃仍画实线, 阶跃本身必须清晰可见。
+fn points_to_svg_path(points: &[PlotPoint], x: &XWindow, axis: &AxisScale) -> String {
     if points.is_empty() {
         return String::new();
     }
-    let t_span = t1.saturating_sub(t0).max(1) as f32;
-    let v_range = (v_max - v_min).max(f32::EPSILON);
     let mut path = String::new();
-    let mut prev_t: Option<u64> = None;
-    for &(t, v) in points {
-        let x = t.saturating_sub(t0) as f32 / t_span * 1000.0;
-        let y = (1000.0 - (v - v_min) / v_range * 1000.0).clamp(0.0, 1000.0);
-        let broken = prev_t.map_or(true, |p| t.saturating_sub(p) > gap_us);
-        if path.is_empty() {
-            path.push_str(&format!("M {} {}", x as i32, y as i32));
-        } else {
-            path.push_str(&format!(
-                " {} {} {}",
-                if broken { "M" } else { "L" },
-                x as i32,
-                y as i32
-            ));
+    let mut prev: Option<(i32, i32, bool)> = None;
+    for p in points {
+        let px = x.x_of(p.t_us) as i32;
+        let py = axis.y_of(p.val) as i32;
+        match prev {
+            None => path.push_str(&format!("M {} {}", px, py)),
+            Some((ppx, ppy, pz)) => {
+                if pz && p.zeroed && py == ppy {
+                    push_zero_dashes(&mut path, ppx, px, py);
+                } else {
+                    path.push_str(&format!(" L {} {}", px, py));
+                }
+            }
         }
-        prev_t = Some(t);
+        prev = Some((px, py, p.zeroed));
     }
     path
 }
 
-fn build_curve_paths(
-    ctrl: &AppController,
-    ch: u8,
-    show_raw: bool,
-    show_bsln: bool,
-    show_diff: bool,
-) -> CurvePaths {
-    let raw_pts = if show_raw {
-        ctrl.telem_points(ch, FIELD_RAW)
-    } else {
-        vec![]
-    };
-    let bsln_pts = if show_bsln {
-        ctrl.telem_points(ch, FIELD_BASELINE)
-    } else {
-        vec![]
-    };
-    let diff_pts = if show_diff {
-        ctrl.telem_points(ch, FIELD_DIFF)
-    } else {
-        vec![]
-    };
-    let all_pts = [&raw_pts[..], &bsln_pts[..], &diff_pts[..]];
-
-    let mut min = f32::INFINITY;
-    let mut max = f32::NEG_INFINITY;
-    let mut point_count = 0usize;
-    let mut t_first = u64::MAX;
-    let mut t_last = 0u64;
-    for points in all_pts {
-        point_count = point_count.max(points.len());
-        if let (Some(first), Some(last)) = (points.first(), points.last()) {
-            t_first = t_first.min(first.0);
-            t_last = t_last.max(last.0);
-        }
-        for &(_, value) in points {
-            if value.is_finite() {
-                min = min.min(value);
-                max = max.max(value);
-            }
-        }
-    }
-
-    if !min.is_finite() || !max.is_finite() || t_first > t_last {
-        return CurvePaths {
-            raw_path: String::new(),
-            bsln_path: String::new(),
-            diff_path: String::new(),
-            y_min: 0.0,
-            y_mid: 0.5,
-            y_max: 1.0,
-            point_count: 0,
-            t_first_us: 0,
-            t_last_us: 0,
-        };
-    }
-
-    let span = max - min;
-    let padding = if span.abs() < f32::EPSILON {
-        (min.abs() * 0.05).max(1.0)
-    } else {
-        span * 0.05
-    };
-    let y_min = min - padding;
-    let y_max = max + padding;
-    let y_mid = (y_min + y_max) * 0.5;
-    // 遥测帧缺口: 超过 5 个标称周期(且至少 250ms)才算缺口, 容忍正常的帧间抖动。
-    let gap_us = gap_threshold_us(ctrl.telem_samples_per_sec(), 5, 250_000);
-
-    CurvePaths {
-        raw_path: points_to_svg_path(&raw_pts, t_first, t_last, y_min, y_max, gap_us),
-        bsln_path: points_to_svg_path(&bsln_pts, t_first, t_last, y_min, y_max, gap_us),
-        diff_path: points_to_svg_path(&diff_pts, t_first, t_last, y_min, y_max, gap_us),
-        y_min,
-        y_mid,
-        y_max,
-        point_count: point_count as i32,
-        t_first_us: t_first,
-        t_last_us: t_last,
-    }
-}
-
-/// 算法叠加线(4 条上报 + 触发判定)在主图上的一次回填产物。
-/// 走**独立右轴**: 算法量纲(计数/permille/布尔)与 ADC 量纲无关, 共用左轴会被压成一条平线。
-struct AlgoOverlay {
-    /// 右轴量程(已含二值线归一化后的幅度)。
-    r_min: f32,
-    r_max: f32,
-    report_paths: [String; 4],
-    /// 某条上报线是否为二值(取值只有 0/1) → UI 才为它显示"归一化幅度 N"输入。
-    report_binary: [bool; 4],
-    /// 某条上报线是否已有追踪数据(无数据的线不勾选也不算进右轴量程)。
-    report_has_data: [bool; 4],
-    active_path: String,
-    /// 触发判定的采样点数(供 UI 判断"有无追踪数据", 免得再取一遍序列)。
-    active_count: i32,
-}
-
 /// 判定二值序列: 非空且全部取值只有 0/1。0/1 在共享右轴上几乎不可见, 需要拉伸到 0..N。
+/// ★只看真实采样★: 在归零补齐**之前**判定, 否则补出来的 0 会把非二值线也算成二值。
 fn points_are_binary(points: &[(u64, f32)]) -> bool {
     !points.is_empty() && points.iter().all(|&(_, v)| v == 0.0 || v == 1.0)
 }
@@ -3475,86 +3927,230 @@ fn normalize_binary(points: &[(u64, f32)], amp: f32) -> Vec<(u64, f32)> {
     points.iter().map(|&(t, v)| (t, v * amp)).collect()
 }
 
-/// 生成算法叠加线的 path 与右轴量程。`wanted` 决定哪些线参与右轴量程计算 ——
-/// 没画出来的线不该影响量程, 否则勾掉一条线后其余线的高度会莫名其妙地变。
-/// amps[0..3] 对应 report[idx], amps[4] 对应触发判定。
-fn build_algo_overlay(
-    ctrl: &AppController,
-    wanted: &[bool; 4],
-    show_active: bool,
-    amps: &[f32; 5],
-    t0: u64,
-    t1: u64,
-    poll_slots: usize,
-) -> AlgoOverlay {
-    // 算法追踪是主机轮询取回的: n 个 idx 轮转 → 单条线的采样间隔是遥测周期的 n 倍。
-    let gap_us = gap_threshold_us(
-        ctrl.telem_samples_per_sec(),
-        (poll_slots.max(1) * 6) as u32,
-        400_000,
-    );
-    let mut series: [Vec<(u64, f32)>; 4] = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
-    let mut report_binary = [false; 4];
-    let mut report_has_data = [false; 4];
-    let mut r_min = f32::INFINITY;
-    let mut r_max = f32::NEG_INFINITY;
-    let track = |points: &[(u64, f32)]| -> (f32, f32) {
-        let mut lo = f32::INFINITY;
-        let mut hi = f32::NEG_INFINITY;
-        for &(_, v) in points {
-            if v.is_finite() {
-                lo = lo.min(v);
-                hi = hi.max(v);
+/// 求一组序列的取值范围(忽略非有限值)。空 ⇒ 返回 (+inf, -inf),
+/// 由 `AxisScale::from_span` 退化成单位量程。
+///
+/// ★入参是"补齐后"的点, 于是"0 是否进量程"由数据本身决定, 不需要额外开关★
+/// 该系列窗口内确实存在归零段 ⇒ 补齐后就含 0 值点 ⇒ 0 自然落进量程, 归零段不会被裁到边框外
+/// (裁出去就与"贴底的真实低值"分不清了); 不存在归零段 ⇒ 一个 0 点都没有 ⇒ 量程保持紧凑。
+/// 无条件把 0 塞进量程是错的: RAW 常在 2500..4095, 强行含 0 会把整条线压成贴顶的一条细带,
+/// 几十个计数的变化就此看不见。
+fn value_span(series: &[&[PlotPoint]]) -> (f32, f32) {
+    let mut lo = f32::INFINITY;
+    let mut hi = f32::NEG_INFINITY;
+    for points in series {
+        for p in *points {
+            if p.val.is_finite() {
+                lo = lo.min(p.val);
+                hi = hi.max(p.val);
             }
         }
-        (lo, hi)
-    };
+    }
+    (lo, hi)
+}
+
+/// 一张图里"哪些系列参与绘制"。
+/// ★参与 = 既画线、也算进唯一 x 定义域与它那根轴的量程★: 没画出来的线不该影响别人的位置,
+/// 否则勾掉一条线其余线会莫名其妙地跳。
+#[derive(Debug, Clone, Copy)]
+struct SeriesShow {
+    raw: bool,
+    bsln: bool,
+    diff: bool,
+    /// 4 条算法上报线各自的勾选(调用方已并入"叠加总开关 + 算法已声明该 idx"的判定)。
+    report: [bool; 4],
+    active: bool,
+}
+
+/// 主图一次回填: ★唯一入口★, 一次产出全部系列。
+/// `amps[0..3]` 对应 report[idx] 的二值归一化幅度, `amps[4]` 对应触发判定。
+/// `poll_slots` = 当前算法声明的 report idx 个数(轮询轮转长度), 只用于算轮询节奏的缺口阈值。
+fn build_chart_frame(
+    ctrl: &AppController,
+    ch: u8,
+    show: SeriesShow,
+    amps: &[f32; 5],
+    poll_slots: usize,
+) -> ChartFrame {
+    // ---- 1. 取点 ----
+    // 左轴三条按勾选取(不画就不取); 右轴五条一律取: 行模型要靠"有无数据 / 是否二值"决定整行
+    // 是否收起、是否显示归一化输入, 那与"画不画"是两件事(勾掉一条线不该让它的输入框消失)。
+    let left_pts: [Vec<(u64, f32)>; 3] = [
+        if show.raw {
+            ctrl.telem_points(ch, FIELD_RAW)
+        } else {
+            Vec::new()
+        },
+        if show.bsln {
+            ctrl.telem_points(ch, FIELD_BASELINE)
+        } else {
+            Vec::new()
+        },
+        if show.diff {
+            ctrl.telem_points(ch, FIELD_DIFF)
+        } else {
+            Vec::new()
+        },
+    ];
+    let mut report_pts: [Vec<(u64, f32)>; 4] = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+    let mut report_binary = [false; 4];
     for idx in 0..4usize {
         let raw = ctrl.algo_trace_report_points(idx as u8);
-        report_has_data[idx] = !raw.is_empty();
+        // 二值判定必须在归一化【之前】: 乘上 N 之后取值不再是 0/1, 归一化输入框会自己消失。
         report_binary[idx] = points_are_binary(&raw);
-        let norm = if report_binary[idx] {
+        report_pts[idx] = if report_binary[idx] {
             normalize_binary(&raw, amps[idx])
         } else {
             raw
         };
-        if wanted[idx] && report_has_data[idx] {
-            let (lo, hi) = track(&norm);
-            r_min = r_min.min(lo);
-            r_max = r_max.max(hi);
+    }
+    let active_raw = ctrl.algo_trace_active_points();
+    let active_binary = points_are_binary(&active_raw);
+    let active_pts = normalize_binary(&active_raw, amps[4]);
+
+    // ---- 2. ★唯一的 x 定义域★: 全部参与绘制的系列求并集, 整张图只在这里算一次 ----
+    let mut t_first = u64::MAX;
+    let mut t_last = 0u64;
+    {
+        let mut union_x = |points: &[(u64, f32)]| {
+            if let (Some(first), Some(last)) = (points.first(), points.last()) {
+                t_first = t_first.min(first.0);
+                t_last = t_last.max(last.0);
+            }
+        };
+        for points in &left_pts {
+            union_x(&points[..]);
         }
-        series[idx] = norm;
+        for idx in 0..4usize {
+            if show.report[idx] {
+                union_x(&report_pts[idx][..]);
+            }
+        }
+        if show.active {
+            union_x(&active_pts[..]);
+        }
     }
-    let active_pts = normalize_binary(&ctrl.algo_trace_active_points(), amps[4]);
-    if show_active {
-        let (lo, hi) = track(&active_pts);
-        r_min = r_min.min(lo);
-        r_max = r_max.max(hi);
-    }
-    if !r_min.is_finite() || !r_max.is_finite() {
-        r_min = 0.0;
-        r_max = 1.0;
-    }
-    let span = r_max - r_min;
-    let padding = if span.abs() < f32::EPSILON {
-        (r_max.abs() * 0.05).max(0.5)
-    } else {
-        span * 0.05
+    // 一条参与系列都没有数据 ⇒ 空窗归零(不能留 u64::MAX, 那会让 x 映射全部落到 0)。
+    let no_data = t_first > t_last;
+    let x = XWindow {
+        t_first_us: if no_data { 0 } else { t_first },
+        t_last_us: if no_data { 0 } else { t_last },
+        // 遥测帧缺口: 超过 5 个标称周期(且至少 250ms)才算缺口, 容忍正常的帧间抖动。
+        gap_frame_us: gap_threshold_us(ctrl.telem_samples_per_sec(), 5, 250_000),
+        // 轮询缺口: n 个 idx 轮转 → 单条线的间隔是遥测周期的 n 倍, 阈值同比放大。
+        gap_poll_us: gap_threshold_us(
+            ctrl.telem_samples_per_sec(),
+            (poll_slots.max(1) * 6) as u32,
+            400_000,
+        ),
     };
-    let r_min = r_min - padding;
-    let r_max = r_max + padding;
-    let mut report_paths = [String::new(), String::new(), String::new(), String::new()];
-    for idx in 0..4usize {
-        report_paths[idx] = points_to_svg_path(&series[idx], t0, t1, r_min, r_max, gap_us);
+
+    // ---- 3. ★归零补齐★: 每条有采样的系列在 x 的整个定义域上处处有定义(见 ChartFrame 不变量)
+    // 阈值按系列节奏取(两档都由 XWindow 一处算定), 补齐结果同时是后面量程与路径的唯一输入 ——
+    // 量程用原始点、路径用补齐点会让归零段落在量程外, 那正是"归零段被裁到边框外"的来路。
+    // 节奏仍由系列身份决定(SeriesId::cadence 是那条映射的唯一实现), 这里只是把两档各取一次。
+    let gap_frame = x.gap_us(SeriesId::Raw.cadence());
+    let gap_poll = x.gap_us(SeriesId::Active.cadence());
+    let left_fill: [Vec<PlotPoint>; 3] = [
+        fill_uncovered_with_zero(&left_pts[0][..], &x, gap_frame),
+        fill_uncovered_with_zero(&left_pts[1][..], &x, gap_frame),
+        fill_uncovered_with_zero(&left_pts[2][..], &x, gap_frame),
+    ];
+    let report_fill: [Vec<PlotPoint>; 4] = [
+        fill_uncovered_with_zero(&report_pts[0][..], &x, gap_poll),
+        fill_uncovered_with_zero(&report_pts[1][..], &x, gap_poll),
+        fill_uncovered_with_zero(&report_pts[2][..], &x, gap_poll),
+        fill_uncovered_with_zero(&report_pts[3][..], &x, gap_poll),
+    ];
+    let active_fill = fill_uncovered_with_zero(&active_pts[..], &x, gap_poll);
+
+    // ---- 4. 两根轴的量程: 各自只由"参与绘制且走该轴"的系列决定 ----
+    let left = {
+        let (lo, hi) = value_span(&[&left_fill[0][..], &left_fill[1][..], &left_fill[2][..]]);
+        AxisScale::from_span(lo, hi, 1.0)
+    };
+    let right = {
+        let mut participants: Vec<&[PlotPoint]> = Vec::with_capacity(5);
+        for idx in 0..4usize {
+            if show.report[idx] {
+                participants.push(&report_fill[idx][..]);
+            }
+        }
+        if show.active {
+            participants.push(&active_fill[..]);
+        }
+        let (lo, hi) = value_span(&participants);
+        AxisScale::from_span(lo, hi, 0.5)
+    };
+
+    // ---- 5. 生成路径: 同一个 x 映射 + 各自所属的轴。point_count 仍是**真实采样数**
+    // (补齐点不是数据, 计进去会让"有无遥测数据"的判据永远为真)。
+    let entries: [(SeriesId, &[PlotPoint], bool, usize); 8] = [
+        (SeriesId::Raw, &left_fill[0][..], false, left_pts[0].len()),
+        (SeriesId::Bsln, &left_fill[1][..], false, left_pts[1].len()),
+        (SeriesId::Diff, &left_fill[2][..], false, left_pts[2].len()),
+        (
+            SeriesId::Report(0),
+            &report_fill[0][..],
+            report_binary[0],
+            report_pts[0].len(),
+        ),
+        (
+            SeriesId::Report(1),
+            &report_fill[1][..],
+            report_binary[1],
+            report_pts[1].len(),
+        ),
+        (
+            SeriesId::Report(2),
+            &report_fill[2][..],
+            report_binary[2],
+            report_pts[2].len(),
+        ),
+        (
+            SeriesId::Report(3),
+            &report_fill[3][..],
+            report_binary[3],
+            report_pts[3].len(),
+        ),
+        (
+            SeriesId::Active,
+            &active_fill[..],
+            active_binary,
+            active_pts.len(),
+        ),
+    ];
+    let mut palette = PaletteCursor::new();
+    let series: Vec<SeriesPath> = entries
+        .iter()
+        .map(|&(id, points, binary, raw_count)| SeriesPath {
+            id,
+            path: points_to_svg_path(
+                points,
+                &x,
+                if id.on_right_axis() { &right } else { &left },
+            ),
+            color: palette.take(),
+            point_count: raw_count as i32,
+            binary,
+        })
+        .collect();
+    if palette.overflow() > 0 {
+        log::warn!(
+            "主图系列数超出调色板容量({} 色): {} 条线只能用降级灰, 请扩充 SERIES_PALETTE — \
+             绝不靠重复颜色顶过去(两条同色线等于看不出谁是谁)。",
+            SERIES_PALETTE.len(),
+            palette.overflow()
+        );
     }
-    AlgoOverlay {
-        r_min,
-        r_max,
-        report_paths,
-        report_binary,
-        report_has_data,
-        active_path: points_to_svg_path(&active_pts, t0, t1, r_min, r_max, gap_us),
-        active_count: active_pts.len() as i32,
+
+    ChartFrame {
+        x,
+        left,
+        right,
+        series,
+        // "有无遥测数据"只看左轴三条: 算法追踪即使有点, 也不代表遥测在流。
+        point_count: left_pts.iter().map(|p| p.len()).max().unwrap_or(0) as i32,
     }
 }
 
@@ -3960,12 +4556,46 @@ fn build_param_rows(params: &[(u8, u32)]) -> Vec<ParamRow> {
         // 单通道精调展示全部由 CSD 模式接管的逐通道参数；AUTO 时 Slint 统一显示 AUTO 并锁定，
         // SEMI 时恢复数值与编辑，避免自动实时值被误当作用户的手动设置。
         .filter(|&&(param_id, _)| matches!(param_id, 0x01..=0x06 | 0x08..=0x0B))
-        .map(|&(param_id, value)| ParamRow {
-            param_id: param_id as i32,
-            label: param_display_name(param_id).into(),
-            value: value as i32,
+        .map(|&(param_id, value)| {
+            // 围栏随行下发: Slint 只消费数值, 不再自己按 param_id 派生阈值(见 types.slint::ParamRow)。
+            let fence = mai2control_ui::proto::param_fence(param_id);
+            ParamRow {
+                param_id: param_id as i32,
+                label: param_display_name(param_id).into(),
+                value: value as i32,
+                min: fence.ui_min() as i32,
+                max: fence.ui_max() as i32,
+            }
         })
         .collect()
+}
+
+/// 全局项(GPARAM_*)的数字输入围栏, 供触控全局调整页的 SpinBox 取上下界。
+///
+/// ★围栏唯一来源 = `proto::telemetry::global_fence`★(与 RP2040 `_handle_global_set`、
+/// PSoC `cmd_set_global` 同源, 见该文件该节头注释)。slint 侧只消费数值, 不按 gparam_id
+/// 自己派生阈值 —— 那会变成与两处固件必然漂移的第三份围栏。
+/// GPARAM_INACTIVE_SNS(0x01) 取值离散({1,2,4}), 由 ComboBox 表达, 不需要数值上下界。
+fn build_global_fences() -> GlobalFences {
+    use mai2control_ui::proto::algo as ga;
+    use mai2control_ui::proto::global_fence;
+    let gain = global_fence(ga::GPARAM_IDAC_GAIN_INIT);
+    let imin = global_fence(ga::GPARAM_IDAC_MIN);
+    let tgt = global_fence(ga::GPARAM_RAW_TARGET);
+    let f1 = global_fence(ga::GPARAM_MFS_DIV_F1);
+    let f2 = global_fence(ga::GPARAM_MFS_DIV_F2);
+    GlobalFences {
+        idac_gain_min: gain.ui_min() as i32,
+        idac_gain_max: gain.ui_max() as i32,
+        idac_min_min: imin.ui_min() as i32,
+        idac_min_max: imin.ui_max() as i32,
+        raw_target_min: tgt.ui_min() as i32,
+        raw_target_max: tgt.ui_max() as i32,
+        mfs_f1_min: f1.ui_min() as i32,
+        mfs_f1_max: f1.ui_max() as i32,
+        mfs_f2_min: f2.ui_min() as i32,
+        mfs_f2_max: f2.ui_max() as i32,
+    }
 }
 
 /// per-channel 参数的中文显示名。单一真相源: 单通道精调的参数行与全通道页的批量应用面板

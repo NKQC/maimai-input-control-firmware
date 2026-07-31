@@ -58,6 +58,23 @@ bool Psoc::init() {
 //   共享态经 seqlock 发布(u64/快照防撕裂), 低频指令经命令信箱投递。
 // ======================================================================
 
+// 长周期指令判定(反堆叠闸门与"设备忙"上报的唯一名单)。判据 = 该操作由 PSoC 主循环同步执行、
+// 耗时可达秒级(逐通道校准实测 12s+, 自适应 20s+)。写在一处, 避免各调用点各列一份名单而漂移。
+bool Psoc::_op_is_heavy(SpiOp op) {
+    switch (op) {
+        case SpiOp::APPLY:
+        case SpiOp::CALIBRATE:
+        case SpiOp::BASELINE_RESET:
+        case SpiOp::GLOBAL_COMMIT:
+        case SpiOp::AUTO_TUNE:
+        case SpiOp::MEASURE_CP:
+        case SpiOp::UPLOAD_ALGO:
+            return true;
+        default:
+            return false;
+    }
+}
+
 // core1 每周期执行体: 命令信箱 → 触控快路 → 快照慢路 → 采样率统计。
 void Psoc::_spi_service() {
     if (!_spi_ready) return;
@@ -81,6 +98,8 @@ void Psoc::_spi_service() {
         c.done = true;                              // 发布结果(读类 core0 在等)
         __dmb();
         _cmd_tail = (_cmd_tail + 1) % CMD_RING_SIZE; // 消费者推进 tail, 释放槽位
+        // 长周期指令出清: core1 是本计数器的唯一写者, 与 core0 的 _heavy_enq 配对(见 heavy_busy)。
+        if (_op_is_heavy(c.op)) _heavy_done = _heavy_done + 1u;
         __dmb();
         _core1_in_cmd = 0u;
     }
@@ -370,6 +389,9 @@ bool Psoc::_submit(SpiOp op, uint8_t ch, uint8_t pid, uint32_t val, uint32_t* ou
     c.result = 0;
     c.ok = false;
     c.done = false;
+    // ★必须在推进 head 之前置★: 否则 core1 可能先执行完并递增 _heavy_done, 之后 core0 再递增
+    // _heavy_enq, heavy_busy() 就会在指令早已完成后仍报忙(且永不复位)。
+    if (_op_is_heavy(op)) _heavy_enq = _heavy_enq + 1u;
     __dmb();
     _cmd_head = (slot + 1u) % CMD_RING_SIZE;   // 发布: 推进 head, core1 下周期可见
     __sev();

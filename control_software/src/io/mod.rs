@@ -133,6 +133,25 @@ impl IoHandle {
         read_debug_from_interface(self.debug_interface.as_ref())
     }
 
+    /// 清零固件的主循环阻塞剖面(EP0 vendor 0x53)。峰值量不可差分，压测必须能开一个干净窗口。
+    pub fn clear_loop_profile(&self) -> Result<()> {
+        self.debug_interface
+            .control_out(
+                ControlOut {
+                    control_type: ControlType::Vendor,
+                    recipient: Recipient::Device,
+                    request: 0x53,
+                    value: 0,
+                    index: 0,
+                    data: &[],
+                },
+                Duration::from_millis(500),
+            )
+            .wait()
+            .map(|_| ())
+            .context("control_out 0x53 clear loop profile")
+    }
+
     pub fn stop(mut self) {
         self.running.store(false, Ordering::Release);
         if let Some(handle) = self._thread_handle.take() {

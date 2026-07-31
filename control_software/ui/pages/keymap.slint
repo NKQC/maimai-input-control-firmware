@@ -37,8 +37,12 @@ component ZoneChip inherits Rectangle {
     }
 }
 
-// 已保存的一条组合映射。分区集合与键组合只读展示(要改就删了重建, 保持单一编辑路径),
-// 两个时间参数可就地改。
+// 已保存的一条组合映射: 压成单行表格。分区集合只读展示(要改仍是删了重建, 保持单一编辑路径);
+// 按键组合可就地重录(点键框直接录, 语义同新建区: 跨会话覆盖、会话内累加), 两个时间参数可就地改。
+// ★列宽/间距/内边距必须与 ComboHeader 逐项一致★, 两者同为页面 VerticalBox 的直接子项、等宽;
+// fluent 的 ScrollView 滚动条是覆盖式绘制(flickable.width = parent.width, 不吃内容宽度),
+// 因此滚动条出现与否都不会让表头与数据行错列。
+// 单位文字全部上移到表头, 行内不再重复 —— 这才是把 62px 压到 36px 的空间来源。
 component ComboRow inherits Rectangle {
     in property <int> index;
     in property <string> zones_text;
@@ -46,79 +50,110 @@ component ComboRow inherits Rectangle {
     in property <int> delay_ms;
     in property <int> max_hold_ms;
     callback hold_edited(int, int);   // delay, maxhold
+    callback key_capture_started();
+    callback key_captured(string, bool, bool, bool, bool);  // text, ctrl,shift,alt,gui
     callback removed();
 
-    height: 62px;
+    // 36px = 内边距 3px×2 + fluent SpinBox 的 min-height 30px, 再矮就会把数字框挤出行外。
+    // 行内 KeyCaptureBox 自身固定 28px < 30px, 因此换成可录制键框不会撑高本行。
+    height: 36px;
     border-radius: 5px;
     border-width: 1px;
     border-color: Theme.border-light;
     background: #1c2126;
 
-    VerticalLayout {
-        padding: 5px;
-        spacing: 2px;
-        HorizontalLayout {
-            spacing: 8px;
-            Text {
-                text: "#" + (root.index + 1);
-                width: 26px;
-                font-weight: 700;
-                color: Theme.text-sub;
-                font-size: Theme.fs-small;
-                vertical-alignment: center;
-            }
-            Text {
-                text: root.zones_text;
-                color: Theme.accent;
-                font-size: Theme.fs-small;
-                vertical-alignment: center;
-                horizontal-stretch: 1;
-                overflow: elide;
-            }
-            Text {
-                text: "→ " + root.keys_text;
-                width: 150px;
-                color: Theme.text-title;
-                font-size: Theme.fs-small;
-                vertical-alignment: center;
-                overflow: elide;
-            }
-            Button {
-                text: @tr("删除");
-                clicked => { root.removed(); }
-            }
+    HorizontalLayout {
+        padding: 3px;
+        spacing: 8px;
+        Text {
+            text: "#" + (root.index + 1);
+            width: 30px;
+            font-weight: 700;
+            color: Theme.text-sub;
+            font-size: Theme.fs-small;
+            vertical-alignment: center;
         }
-        HorizontalLayout {
-            spacing: 6px;
-            Text {
-                text: @tr("触发延时(ms)");
-                font-size: Theme.fs-small;
-                color: Theme.text-sub;
-                vertical-alignment: center;
-            }
-            SpinBox {
-                width: 112px;
-                minimum: 0;
-                maximum: 65535;
-                value: root.delay_ms;
-                edited(v) => { root.hold_edited(v, root.max_hold_ms); }
-            }
-            Text {
-                text: @tr("自动抬起(ms)");
-                font-size: Theme.fs-small;
-                color: Theme.text-sub;
-                vertical-alignment: center;
-            }
-            SpinBox {
-                width: 112px;
-                minimum: 0;
-                maximum: 65535;
-                value: root.max_hold_ms;
-                edited(v) => { root.hold_edited(root.delay_ms, v); }
-            }
-            Rectangle { horizontal-stretch: 1; }
+        Text {
+            text: root.zones_text;
+            color: Theme.accent;
+            font-size: Theme.fs-small;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+            overflow: elide;
+        }
+        // 就地重录按键: 与新建区用同一个 KeyCaptureBox, 因此覆盖/累加语义天然一致。
+        // ★列宽 150px 必须与 ComboHeader 的「按键组合」列一致★。
+        KeyCaptureBox {
+            width: 150px;
+            display: root.keys_text;
+            capture_started() => { root.key_capture_started(); }
+            captured(t, c, s, a, g) => { root.key_captured(t, c, s, a, g); }
+        }
+        SpinBox {
+            width: Theme.spin-width;
+            minimum: 0;
+            maximum: 65535;
+            value: root.delay_ms;
+            edited(v) => { root.hold_edited(v, root.max_hold_ms); }
+        }
+        SpinBox {
+            width: Theme.spin-width;
+            minimum: 0;
+            maximum: 65535;
+            value: root.max_hold_ms;
+            edited(v) => { root.hold_edited(root.delay_ms, v); }
+        }
+        Button {
+            width: 52px;
+            text: @tr("删除");
+            clicked => { root.removed(); }
         }
     }
+}
+
+// 映射列表的表头。列宽与 ComboRow 一一对应(改一处必须同时改另一处)。
+component ComboHeader inherits HorizontalLayout {
+    height: 16px;
+    padding-left: 3px;
+    padding-right: 3px;
+    spacing: 8px;
+    Text {
+        text: "#";
+        width: 30px;
+        font-size: Theme.fs-small;
+        color: Theme.text-sub;
+        vertical-alignment: center;
+    }
+    Text {
+        text: @tr("分区集合");
+        horizontal-stretch: 1;
+        font-size: Theme.fs-small;
+        color: Theme.text-sub;
+        vertical-alignment: center;
+        overflow: elide;
+    }
+    Text {
+        text: @tr("按键组合(点击重录)");
+        width: 150px;
+        font-size: Theme.fs-small;
+        color: Theme.text-sub;
+        vertical-alignment: center;
+    }
+    Text {
+        text: @tr("触发延时(ms)");
+        width: Theme.spin-width;
+        font-size: Theme.fs-small;
+        color: Theme.text-sub;
+        vertical-alignment: center;
+    }
+    Text {
+        text: @tr("自动抬起(ms)");
+        width: Theme.spin-width;
+        font-size: Theme.fs-small;
+        color: Theme.text-sub;
+        vertical-alignment: center;
+    }
+    Rectangle { width: 52px; }
 }
 
 export component KeyMapPage inherits Rectangle {
@@ -135,16 +170,23 @@ export component KeyMapPage inherits Rectangle {
     in property <string> pending_keys_text: "";    // 待新建映射已抓到的键组合
     in property <string> combo_status: "";         // 设备支持性/条数等提示
     in property <int> combo_count: 0;
+    // 新建区的两个时间参数(ms)。★刻意只存在于 UI 侧、且添加成功后不清零★:
+    // 连续添加同类映射时不必反复重填同一组延时(分区与按键仍照旧清空)。
+    // Rust 侧不回写这两个值 —— 这是有意为之的行为, 不是忘记清理的 bug, 请勿"修正"。
+    in-out property <int> new_delay_ms: 0;
+    in-out property <int> new_max_hold_ms: 0;
 
     callback set_keyboard_map_en(bool);
-    callback refresh_kbd();
     callback combo_zone_toggled(int);
     callback combo_zones_clear();
     callback combo_captured(string, bool, bool, bool, bool);  // text, ctrl,shift,alt,gui
     callback combo_keys_clear();
-    callback combo_add();
+    callback combo_add(int, int);   // delay_ms, max_hold_ms
     callback combo_removed(int);
     callback combo_hold_set(int, int, int);
+    // 已有映射的按键就地重录: 行号 + 与新建区完全相同的键捕获载荷。
+    callback combo_key_capture_started(int);
+    callback combo_key_captured(int, string, bool, bool, bool, bool);
 
     VerticalBox {
         padding: 8px;
@@ -160,7 +202,10 @@ export component KeyMapPage inherits Rectangle {
                 horizontal-stretch: 1;
                 vertical-alignment: center;
             }
-            Button { text: @tr("刷新"); clicked => { root.refresh_kbd(); } }
+            // ★这里原来有一个「刷新」按钮, 已删★: 连接成功后 main.rs 的自动加载块已经发过
+            // kbd_request_combo(), 组合表进页即有真值, 该按钮纯属多余入口。
+            // 物理键盘页的「刷新」同样已删 —— 那页的 map/touchmap/hold/keycfg/state 也都在
+            // 自动加载块里请求过, 整条 refresh_kbd/kbd_refresh 链路已连根移除。
         }
 
         HorizontalBox {
@@ -207,9 +252,9 @@ export component KeyMapPage inherits Rectangle {
             }
         }
 
-        // 新建条: 已选分区 + 抓键 + 添加。
+        // 新建条: 已选分区 + 抓键 + 两个时间参数 + 添加。
         Rectangle {
-            height: 76px;
+            height: 80px;
             border-radius: 5px;
             border-width: 1px;
             border-color: #ffd166;
@@ -229,6 +274,10 @@ export component KeyMapPage inherits Rectangle {
                     KeyCaptureBox {
                         horizontal-stretch: 1;
                         display: root.pending_keys_text;
+                        // ★每次录制独立覆盖★: 会话开始即清空待新建键组合, 于是"上次录的键"
+                        // 不会跟这次的攒在一起(以前不同时间按的 F7/F6/F5 会累成一条四键映射)。
+                        // 同一次会话内仍然累加, 所以"同时按住 F5+F6"这种真实和弦照旧能录成多键。
+                        capture_started() => { root.combo_keys_clear(); }
                         captured(t, c, s, a, g) => { root.combo_captured(t, c, s, a, g); }
                     }
                     Button {
@@ -242,10 +291,35 @@ export component KeyMapPage inherits Rectangle {
                         text: @tr("清空已选分区");
                         clicked => { root.combo_zones_clear(); }
                     }
+                    Text {
+                        text: @tr("触发延时(ms)");
+                        font-size: Theme.fs-small;
+                        color: Theme.text-sub;
+                        vertical-alignment: center;
+                    }
+                    // 两个 SpinBox 用两向绑定持有页面属性: 添加成功后 Rust 不回写 ⇒ 值自然留存。
+                    SpinBox {
+                        width: Theme.spin-width;
+                        minimum: 0;
+                        maximum: 65535;
+                        value <=> root.new_delay_ms;
+                    }
+                    Text {
+                        text: @tr("自动抬起(ms)");
+                        font-size: Theme.fs-small;
+                        color: Theme.text-sub;
+                        vertical-alignment: center;
+                    }
+                    SpinBox {
+                        width: Theme.spin-width;
+                        minimum: 0;
+                        maximum: 65535;
+                        value <=> root.new_max_hold_ms;
+                    }
                     Button {
                         text: @tr("添加为一条映射");
                         primary: true;
-                        clicked => { root.combo_add(); }
+                        clicked => { root.combo_add(root.new_delay_ms, root.new_max_hold_ms); }
                     }
                     Rectangle { horizontal-stretch: 1; }
                 }
@@ -257,6 +331,7 @@ export component KeyMapPage inherits Rectangle {
             font-size: Theme.fs-small;
             color: Theme.text-title;
         }
+        ComboHeader { }
         ScrollView {
             vertical-stretch: 1;
             VerticalLayout {
@@ -270,6 +345,8 @@ export component KeyMapPage inherits Rectangle {
                     delay_ms: i < root.combo_delay.length ? root.combo_delay[i] : 0;
                     max_hold_ms: i < root.combo_max_hold.length ? root.combo_max_hold[i] : 0;
                     hold_edited(d, m) => { root.combo_hold_set(i, d, m); }
+                    key_capture_started() => { root.combo_key_capture_started(i); }
+                    key_captured(t, c, s, a, g) => { root.combo_key_captured(i, t, c, s, a, g); }
                     removed => { root.combo_removed(i); }
                 }
             }
@@ -366,13 +443,19 @@ component PhysKeyRow inherits Rectangle {
     in property <bool> pressed: false;
     in property <bool> raw_on: false;
     in property <string> display;
-    in property <bool> pol_high: false;
+    // 极性配置态: 0=低电平触发 / 1=高电平触发 / 2=AUTO(默认)。
+    in property <int> pol_mode: 2;
+    // ★固件回传的生效极性掩码逐位摊平★(true=当前按高电平触发)。所有档位都用它显示"当前实际
+    // 是什么电平触发" —— 绝不用 pol_mode 自己推算, 那等于把设备真值换成本地猜测。
+    in property <bool> pol_resolved_high: false;
+    // 上面那位是否真的读到过。false = 旧固件没回传 resolved mask → 显示"未知", 不假装低电平。
+    in property <bool> pol_resolved_known: false;
     in property <int> debounce_us: 0;
     in property <int> hold_delay: 0;
     in property <int> hold_max: 0;
     callback captured(string, bool, bool, bool, bool);
     callback cleared();
-    callback keycfg_set(bool, int);
+    callback keycfg_set(int, int);
     callback hold_set(int, int);
 
     height: 66px;
@@ -414,10 +497,23 @@ component PhysKeyRow inherits Rectangle {
         }
         HorizontalLayout {
             spacing: Theme.gap;
-            CheckBox {
-                text: @tr("高电平触发");
-                checked: root.pol_high;
-                toggled => { root.keycfg_set(self.checked, root.debounce_us); }
+            ComboBox {
+                width: 150px;
+                // ★model 下标必须与协议值一一对应(0/1/2)★ 另设映射表就是 off-by-one 的温床。
+                model: [@tr("低电平触发"), @tr("高电平触发"), @tr("自动(启动电平=抬起)")];
+                current-index: root.pol_mode;
+                selected => { root.keycfg_set(self.current-index, root.debounce_us); }
+            }
+            Text {
+                // 恒显"当前实际是什么电平触发"(不再只在 AUTO 档露出, 也不做二值化推断):
+                // 电平文案一律取固件回传的生效掩码; AUTO 档只多加一个"自动 → "前缀说明来源。
+                text: !root.pol_resolved_known
+                    ? @tr("当前: 未知")
+                    : (root.pol_mode == 2 ? @tr("自动 → ") : "")
+                      + (root.pol_resolved_high ? @tr("当前: 高电平触发") : @tr("当前: 低电平触发"));
+                font-size: Theme.fs-small;
+                color: root.pol_resolved_known ? Theme.text-sub : Theme.muted;
+                vertical-alignment: center;
             }
             Text { text: @tr("防抖(us)"); font-size: Theme.fs-small; vertical-alignment: center; }
             SpinBox {
@@ -426,7 +522,7 @@ component PhysKeyRow inherits Rectangle {
                 // 上限与固件 KeyboardService::DEBOUNCE_US_MAX 同源: 越界固件会 NAK, 不给用户设的机会。
                 maximum: 10000;
                 value: root.debounce_us;
-                edited(v) => { root.keycfg_set(root.pol_high, v); }
+                edited(v) => { root.keycfg_set(root.pol_mode, v); }
             }
             Text { text: @tr("触发延时(ms)"); font-size: Theme.fs-small; vertical-alignment: center; }
             SpinBox {
@@ -457,8 +553,12 @@ export component PhysKbdPage inherits Rectangle {
     // 数值单位为毫秒：0..65535，与设备 kbd.hdNN/kbd.mhNN KV 完全一致。
     in property <[int]> phys_hold_delay: [];
     in property <[int]> phys_hold_max: [];
-    // 每键触发极性(true=高电平触发)与防抖窗(us, 0..10000)。设备 kbd.plNN / kbd.dbNN。
-    in property <[bool]> phys_pol_high: [];
+    // 每键触发极性配置态(0=低/1=高/2=AUTO)与防抖窗(us, 0..10000)。设备 kbd.plNN / kbd.dbNN。
+    in property <[int]> phys_pol_mode: [];
+    // 固件解析后的生效极性(true=当前按高电平触发)。所有档位的"当前电平"都只从这里读。
+    in property <[bool]> phys_pol_resolved_high: [];
+    // 上面那份掩码是否有真实来源。false = 旧固件未回传 → 显示"未知"。
+    in property <[bool]> phys_pol_resolved_known: [];
     in property <[int]> phys_debounce: [];
     in property <string> keycfg_status: "";
     // ---- 逻辑分析仪(12 通道共用一张图) ----
@@ -480,10 +580,9 @@ export component PhysKbdPage inherits Rectangle {
     callback phys_captured(int, string, bool, bool, bool, bool);  // idx, text, ctrl,shift,alt,gui
     callback phys_cleared(int);
     callback phys_hold_set(int, int, int);
-    callback phys_keycfg_set(int, bool, int);   // idx, 高电平触发, 防抖 us
+    callback phys_keycfg_set(int, int, int);   // idx, 极性(0=低/1=高/2=AUTO), 防抖 us
     callback la_window_set(int);
     callback la_clear();
-    callback refresh_kbd();
 
     VerticalBox {
         padding: 8px;
@@ -493,13 +592,12 @@ export component PhysKbdPage inherits Rectangle {
             padding: 0px;
             spacing: 8px;
             Text {
-                text: @tr("GPIO1–12 物理键。触发极性默认低电平触发（按下=接地）；防抖 0–10000us，0=不去抖，每键各自独立计时。触发延时=按住达到该时长才真正输出；自动抬起=输出后最长保持该时长即自动松开；两者 0 表示禁用。极性/防抖/长按改动均进草稿，需点左下角“保存到设备”才下发。");
+                text: @tr("GPIO1–12 物理键。每键旁的「当前: 高/低电平触发」显示的是设备此刻真正生效的电平（由固件回传，不是本地推算）；固定档位就是所设档位，「自动」档则由上电那一刻的电平决定（上电为高→低电平触发，上电为低→高电平触发），之后不再重新采样，因此上电瞬间被按住的键会判反，可改成固定档位。旧固件不回传生效电平时显示「当前: 未知」。防抖 0–10000us，0=不去抖，每键各自独立计时。触发延时=按住达到该时长才真正输出；自动抬起=输出后最长保持该时长即自动松开；两者 0 表示禁用。极性/防抖/长按改动均进草稿，需点左下角“保存到设备”才下发。");
                 color: Theme.text-sub;
                 wrap: word-wrap;
                 horizontal-stretch: 1;
                 vertical-alignment: center;
             }
-            Button { text: @tr("刷新"); clicked => { root.refresh_kbd(); } }
         }
 
         ScrollView {
@@ -576,9 +674,13 @@ export component PhysKbdPage inherits Rectangle {
                             background: (i < root.phys_out.length && root.phys_out[i]) ? Theme.ok : #262b31;
                         }
                         Text {
-                            text: (i < root.phys_pol_high.length && root.phys_pol_high[i])
-                                ? @tr("高电平触发") : @tr("低电平触发");
-                            width: 84px;
+                            // 恒显"当前生效电平"; 电平只取固件掩码, AUTO 档额外标注来源。
+                            text: !(i < root.phys_pol_resolved_known.length && root.phys_pol_resolved_known[i])
+                                ? @tr("当前: 未知")
+                                : ((i < root.phys_pol_mode.length && root.phys_pol_mode[i] == 2) ? @tr("自动 → ") : "")
+                                  + ((i < root.phys_pol_resolved_high.length && root.phys_pol_resolved_high[i])
+                                      ? @tr("当前: 高电平") : @tr("当前: 低电平"));
+                            width: 132px;
                             font-size: Theme.fs-small;
                             color: Theme.text-sub;
                             vertical-alignment: center;
@@ -615,7 +717,9 @@ export component PhysKbdPage inherits Rectangle {
                         pressed: i < root.phys_pressed.length ? root.phys_pressed[i] : false;
                         raw_on: i < root.phys_raw.length ? root.phys_raw[i] : false;
                         display: i < root.phys_display.length ? root.phys_display[i] : "";
-                        pol_high: i < root.phys_pol_high.length ? root.phys_pol_high[i] : false;
+                        pol_mode: i < root.phys_pol_mode.length ? root.phys_pol_mode[i] : 2;
+                        pol_resolved_high: i < root.phys_pol_resolved_high.length ? root.phys_pol_resolved_high[i] : false;
+                        pol_resolved_known: i < root.phys_pol_resolved_known.length ? root.phys_pol_resolved_known[i] : false;
                         debounce_us: i < root.phys_debounce.length ? root.phys_debounce[i] : 0;
                         hold_delay: i < root.phys_hold_delay.length ? root.phys_hold_delay[i] : 0;
                         hold_max: i < root.phys_hold_max.length ? root.phys_hold_max[i] : 0;

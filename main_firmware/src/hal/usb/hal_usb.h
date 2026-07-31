@@ -122,6 +122,10 @@ public:
     bool cdc_write(UsbCdcPort port, const uint8_t* data, size_t length);
     size_t cdc_read(UsbCdcPort port, uint8_t* buffer, size_t max_length);
     size_t cdc_available(UsbCdcPort port) const;
+    /// CDC TX FIFO 真实剩余空间。★调用方据此决定丢不丢帧, 故必须是真值★:
+    /// 原先 HAL_USB_CDC_UART::get_tx_buffer_free_space() 恒返回 64(谎报), 于是 mai2light 那句
+    /// "写不下就丢, 不阻塞"永远不成立, 每条应答都掉进阻塞写里。
+    size_t cdc_write_available(UsbCdcPort port) const;
     void cdc_flush(UsbCdcPort port);
 
     static void tud_cdc_rx_cb(uint8_t itf);

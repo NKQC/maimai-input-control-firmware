@@ -1,4 +1,5 @@
 #include "mai2light.h"
+#include "../../service/usb_debug.h"
 #include <pico/time.h>
 #include <cstring>
 
@@ -82,11 +83,14 @@ void Mai2Light::task() {
 
     uint8_t chunk[RX_CHUNK_SIZE];
     for (uint8_t round = 0; round < RX_CHUNKS_PER_TASK; round++) {
+        pm_stage(PM_STAGE_LIGHT_RX_READ);
         const size_t got = _uart->read_from_rx_buffer(chunk, sizeof(chunk));
+        pm_stage(PM_STAGE_LIGHT_FEED);
         for (size_t i = 0; i < got; i++) _feed(chunk[i]);
         if (got < sizeof(chunk)) break;
     }
 
+    pm_stage(PM_STAGE_LIGHT_FADE);
     const uint32_t now = now_ms();
     _fade_step(now);
     // 长时间无合法帧 = 游戏侧已停止刷灯 → 回落 READY(链路仍在, 只是没人驱动)。
@@ -355,6 +359,8 @@ void Mai2Light::_ack_send(uint8_t payload_len, uint8_t status, uint8_t report) {
     }
     out[out_len++] = sum;   // 校验和本身不转义(与官方板一致)
 
+    pm_stage(PM_STAGE_LIGHT_ACK_FREE);
     if (_uart->get_tx_buffer_free_space() < out_len) return;   // 写不下就丢, 不阻塞
+    pm_stage(PM_STAGE_LIGHT_ACK_WRITE);
     _uart->write_to_tx_buffer(out, out_len);
 }

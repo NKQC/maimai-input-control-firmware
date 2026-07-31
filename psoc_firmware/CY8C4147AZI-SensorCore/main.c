@@ -796,7 +796,9 @@ static void spi_load_touch(void)
 /* CSD 参数合法性防护: 非法值会让转换railed(满量程)/时钟异常/校准发散, 故在应用点拒绝越界值,
  * 保留原值不变。范围依据 CSDv2(cy_capsense_structure.h):
  *   RESOLUTION 6..16 位; SNS_CLK_DIV 1..255(0会除零); IDAC_MOD 0..127(7位);
- *   IDAC_GAIN 增益档 0..7; SNS_CLK_SOURCE 低7位(去 AUTO 0x80)取值 0..6。 */
+ *   IDAC_GAIN 增益档 0..6(表7项, 索引7越界崩溃); SNS_CLK_SOURCE 低7位(去 AUTO 0x80)取值 0..6。
+ * ★三处同源★ 与 main_firmware/src/service/sensor_link/sensor_link.cpp::_handle_param_set 及
+ * control_software/src/proto/telemetry.rs::param_fence 必须逐位等价, 任何一处改动三处同改。 */
 static bool _param_value_legal(uint8_t param_id, uint32_t value)
 {
     switch (param_id)

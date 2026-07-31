@@ -56,10 +56,34 @@ export struct ZoneCell {
 
 // 一条参数行的展平数据,由 main.rs::build_param_rows 从
 // AppController::param(ch, pid) 转换而来。
+// min/max = 该参数的合法输入范围, 由 Rust 侧 `proto::telemetry::param_fence` 单一声明表填充
+// (main.rs::build_param_rows)。★不许在 .slint 里按 param_id 硬编码阈值★: 那会变成第三份围栏,
+// 与固件两处必然漂移(历史上 SNS_CLK_SOURCE 就被 slint 写死上界 6, 把设备合法的 128 = AUTO 标志
+// 夹成 6, 用户一碰这一行就把 AUTO 标志抹掉)。
 export struct ParamRow {
     param_id: int,
     label: string,
     value: int,
+    min: int,
+    max: int,
+}
+
+// 全局项(GPARAM_*)的数字输入围栏, 由 main.rs::build_global_fences 从 Rust 侧单一声明表
+// `proto::telemetry::global_fence` 填充。★与 ParamRow.min/max 同一理由: 不许在 .slint 里按
+// gparam_id 硬编码阈值★ —— 那会成为与两处固件必然漂移的第三份围栏。
+// 用一个 struct 而不是十来个平行 int 属性, 是为了只穿一层属性就能透传三层(app → settings → 本页)。
+// INACTIVE_SNS(0x01) 取值离散({1,2,4}) 由 ComboBox 表达, 不需要数值上下界, 故不在此列。
+export struct GlobalFences {
+    idac_gain_min: int,
+    idac_gain_max: int,
+    idac_min_min: int,
+    idac_min_max: int,
+    raw_target_min: int,
+    raw_target_max: int,
+    mfs_f1_min: int,
+    mfs_f1_max: int,
+    mfs_f2_min: int,
+    mfs_f2_max: int,
 }
 
 // 单通道实时状态，由 main.rs 每 tick 从 AppController::telem_latest(ch) 构建(36 个)。

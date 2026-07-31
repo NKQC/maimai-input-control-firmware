@@ -1,5 +1,5 @@
 import { Button, VerticalBox, HorizontalBox, CheckBox, TabWidget } from "std-widgets.slint";
-import { ConfigRow, ZoneCell, ParamRow, ChannelStatus, AlgoReportLine, AlgoSettingRow, LedUnitRow } from "../common/types.slint";
+import { ConfigRow, ZoneCell, ParamRow, GlobalFences, ChannelStatus, AlgoReportLine, AlgoSettingRow, LedUnitRow } from "../common/types.slint";
 import { AlgoPage } from "./algo.slint";
 import { AllChannelsPage } from "./all_channels.slint";
 import { BindingPage } from "./binding.slint";
@@ -124,6 +124,11 @@ export component SettingsPage inherits Rectangle {
     in property <string> diff_path: "";
     in property <string> raw_path: "";
     in property <string> bsln_path: "";
+    // 主图线色: 唯一真相源是 Rust 侧调色板(main.rs::SERIES_PALETTE), 本层只透传。
+    in property <color> raw_color: #3399ff;
+    in property <color> bsln_color: #ffaa00;
+    in property <color> diff_color: #33cc33;
+    in property <color> active_color: #ff3399;
     in property <float> curve_y_min: 0;
     in property <float> curve_y_mid: 0;
     in property <float> curve_y_max: 0;
@@ -180,16 +185,22 @@ export component SettingsPage inherits Rectangle {
     callback combo_zones_clear();
     callback combo_captured(string, bool, bool, bool, bool);
     callback combo_keys_clear();
-    callback combo_add();
+    callback combo_add(int, int);   // delay_ms, max_hold_ms
     callback combo_removed(int);
     callback combo_hold_set(int, int, int);
+    callback combo_key_capture_started(int);
+    callback combo_key_captured(int, string, bool, bool, bool, bool);
     // 全通道页"批量应用"抽屉: 勾选状态与参数名/源值由 main.rs 回填, 真相源在 AppController。
     in property <[bool]> batch_ch_selected: [];
     in property <[bool]> batch_param_selected: [];
     in property <[string]> batch_param_names: [];
-    in property <[string]> batch_param_values: [];
+    // 每参数的可手改"待写值"(-1 = 无值) + 围栏上下限(唯一来源 proto::param_fence)。
+    in property <[int]> batch_param_values: [];
+    in property <[int]> batch_param_min: [];
+    in property <[int]> batch_param_max: [];
     callback batch_toggle_channel(int);
     callback batch_toggle_param(int);
+    callback batch_param_value_set(int, int);
     callback batch_channels_all();
     callback batch_channels_invert();
     callback batch_params_all();
@@ -200,7 +211,11 @@ export component SettingsPage inherits Rectangle {
     in property <int> batch_source: 0;
     in property <float> scan_period_ms: 0;
     in property <int> scan_period_us: 0;
+    // 探测周期是否有实测值; 无值时下游页面显示"未测"而不是 0 ms(透传自 AppWindow)。
+    in property <bool> scan_period_valid: false;
     in property <int> scan_period_expected_us: 0;
+    // 全局项(GPARAM_*)数字输入围栏, 透传给 GlobalTunePage(唯一来源在 Rust global_fence)。
+    in property <GlobalFences> global_fences;
 
     in property <bool> keyboard_map_en: false;
     callback set_keyboard_map_en(bool);
@@ -223,7 +238,10 @@ export component SettingsPage inherits Rectangle {
     // 物理键盘页: 实时三态 + 每键极性/防抖 + 逻辑分析仪视图, 全部由 main.rs 回填(真相源在 AppController)。
     in property <[bool]> kbd_phys_raw: [];
     in property <[bool]> kbd_phys_out: [];
-    in property <[bool]> kbd_phys_pol_high: [];
+    // 极性配置态(0=低/1=高/2=AUTO)与固件解析后的生效极性(true=高电平触发)。
+    in property <[int]> kbd_phys_pol_mode: [];
+    in property <[bool]> kbd_phys_pol_resolved_high: [];
+    in property <[bool]> kbd_phys_pol_resolved_known: [];
     in property <[int]> kbd_phys_debounce: [];
     in property <string> kbd_keycfg_status: "";
     in property <[string]> la_raw_paths: [];
@@ -241,7 +259,7 @@ export component SettingsPage inherits Rectangle {
     in-out property <bool> phys_live_expanded: true;
     in-out property <bool> phys_keys_expanded: false;
     in-out property <bool> phys_la_expanded: false;
-    callback kbd_set_keycfg(int, bool, int);
+    callback kbd_set_keycfg(int, int, int);   // idx, 极性(0=低/1=高/2=AUTO), 防抖 us
     callback la_window_set(int);
     callback la_clear();
     callback kbd_set_phys(int, int, int);
@@ -252,7 +270,6 @@ export component SettingsPage inherits Rectangle {
     callback kbd_capture_zone(int, string, bool, bool, bool, bool);
     callback kbd_clear_phys(int);
     callback kbd_clear_zone(int);
-    callback kbd_refresh();
 
     // 算法页
     in property <string> algo_info_text: "算法信息未读取";
@@ -303,7 +320,6 @@ export component SettingsPage inherits Rectangle {
     callback algo_source_edited(string);
     callback algo_global_set(int, int);
     callback csd_param_set(int, int);
-    callback csd_refresh();
 
     VerticalBox {
         padding: 0px;
@@ -404,12 +420,16 @@ export component SettingsPage inherits Rectangle {
                 selected_channel: root.sel_channel;
                 sample_rate_hz: root.sample_rate_hz;
                 scan_period_ms: root.scan_period_ms;
+                scan_period_valid: root.scan_period_valid;
                 batch_ch_selected: root.batch_ch_selected;
                 batch_param_selected: root.batch_param_selected;
                 batch_param_names: root.batch_param_names;
                 batch_param_values: root.batch_param_values;
+                batch_param_min: root.batch_param_min;
+                batch_param_max: root.batch_param_max;
                 batch_toggle_channel(ch) => { root.batch_toggle_channel(ch); }
                 batch_toggle_param(id) => { root.batch_toggle_param(id); }
+                batch_param_value_set(id, v) => { root.batch_param_value_set(id, v); }
                 batch_channels_all() => { root.batch_channels_all(); }
                 batch_channels_invert() => { root.batch_channels_invert(); }
                 batch_params_all() => { root.batch_params_all(); }
@@ -455,13 +475,14 @@ export component SettingsPage inherits Rectangle {
                 psoc_rescue() => { root.psoc_rescue(); }
                 scan_period_ms: root.scan_period_ms;
                 scan_period_us: root.scan_period_us;
+                scan_period_valid: root.scan_period_valid;
                 expected_period_us: root.scan_period_expected_us;
+                global_fences: root.global_fences;
                 config_dirty: root.config_dirty;
                 mode_changed(m) => { root.curve_mode_changed(m); }
                 capture_params() => { root.curve_capture_params(); }
                 algo_global_set(id, v) => { root.algo_global_set(id, v); }
                 csd_param_set(id, v) => { root.csd_param_set(id, v); }
-                csd_refresh() => { root.csd_refresh(); }
                 reboot_psoc() => { root.reboot_psoc(); }
                 reset_defaults() => { root.cfg_reset(); }
                 discard_draft() => { root.discard_draft(); }
@@ -489,6 +510,10 @@ export component SettingsPage inherits Rectangle {
                 diff_path: root.diff_path;
                 raw_path: root.raw_path;
                 bsln_path: root.bsln_path;
+                raw_color: root.raw_color;
+                bsln_color: root.bsln_color;
+                diff_color: root.diff_color;
+                active_color: root.active_color;
                 curve_y_min: root.curve_y_min;
                 curve_y_mid: root.curve_y_mid;
                 curve_y_max: root.curve_y_max;
@@ -552,14 +577,15 @@ export component SettingsPage inherits Rectangle {
                 combo_status: root.combo_status;
                 combo_count: root.combo_count;
                 set_keyboard_map_en(v) => { root.set_keyboard_map_en(v); }
-                refresh_kbd() => { root.kbd_refresh(); }
                 combo_zone_toggled(z) => { root.combo_zone_toggled(z); }
                 combo_zones_clear() => { root.combo_zones_clear(); }
                 combo_captured(t, c, s, a, g) => { root.combo_captured(t, c, s, a, g); }
                 combo_keys_clear() => { root.combo_keys_clear(); }
-                combo_add() => { root.combo_add(); }
+                combo_add(d, m) => { root.combo_add(d, m); }
                 combo_removed(i) => { root.combo_removed(i); }
                 combo_hold_set(i, d, m) => { root.combo_hold_set(i, d, m); }
+                combo_key_capture_started(i) => { root.combo_key_capture_started(i); }
+                combo_key_captured(i, t, c, s, a, g) => { root.combo_key_captured(i, t, c, s, a, g); }
             }
         }
 
@@ -573,7 +599,9 @@ export component SettingsPage inherits Rectangle {
                 phys_hold_max: root.kbd_phys_hold_max;
                 phys_raw: root.kbd_phys_raw;
                 phys_out: root.kbd_phys_out;
-                phys_pol_high: root.kbd_phys_pol_high;
+                phys_pol_mode: root.kbd_phys_pol_mode;
+                phys_pol_resolved_high: root.kbd_phys_pol_resolved_high;
+                phys_pol_resolved_known: root.kbd_phys_pol_resolved_known;
                 phys_debounce: root.kbd_phys_debounce;
                 keycfg_status: root.kbd_keycfg_status;
                 la_raw_paths: root.la_raw_paths;
@@ -595,7 +623,6 @@ export component SettingsPage inherits Rectangle {
                 phys_keycfg_set(i, pol, db) => { root.kbd_set_keycfg(i, pol, db); }
                 la_window_set(i) => { root.la_window_set(i); }
                 la_clear() => { root.la_clear(); }
-                refresh_kbd() => { root.kbd_refresh(); }
             }
         }
 

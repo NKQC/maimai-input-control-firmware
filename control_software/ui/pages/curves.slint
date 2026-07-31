@@ -19,10 +19,17 @@ export component CurvesPage inherits Rectangle {
     // 仅诊断报告明确上报模式后才开放参数编辑，杜绝未连接时默认显示为自动模式。
     in property <bool> mode_known: false;
 
-    // 由 main.rs::build_curve_paths 回填的 SVG path 命令串,viewbox 1000x1000
+    // 由 main.rs::build_chart_frame 回填的 SVG path 命令串,viewbox 1000x1000
     in property <string> diff_path: "";
     in property <string> raw_path: "";
     in property <string> bsln_path: "";
+    // ★线条颜色由 Rust 侧唯一调色板回填(main.rs::SERIES_PALETTE), 不在本文件写色值★
+    // 主曲线三条与算法上报四条 + 触发判定同处一张图, 两套色表必然跨组撞色(旧实现上报线用了
+    // [绿,蓝,橙], 与 diff/raw/bsln 三条全撞)。默认值只为设计期预览, 与调色板前三项/末项一致。
+    in property <color> raw_color: #3399ff;
+    in property <color> bsln_color: #ffaa00;
+    in property <color> diff_color: #33cc33;
+    in property <color> active_color: #ff3399;
     // 所有勾选序列共享的纵轴尺度，由 main.rs 计算后回填。
     in property <float> curve_y_min: 0;
     in property <float> curve_y_mid: 0;
@@ -292,21 +299,21 @@ export component CurvesPage inherits Rectangle {
                 PlotPath {
                     vx: root.view_x; vy: root.view_y; vw: root.view_w; vh: root.view_h;
                     commands: root.bsln_path;
-                    stroke: #ffaa00;
+                    stroke: root.bsln_color;
                     stroke-width: 2px;
                     visible: root.show_bsln && root.curve_point_count > 0;
                 }
                 PlotPath {
                     vx: root.view_x; vy: root.view_y; vw: root.view_w; vh: root.view_h;
                     commands: root.raw_path;
-                    stroke: #3399ff;
+                    stroke: root.raw_color;
                     stroke-width: 2px;
                     visible: root.show_raw && root.curve_point_count > 0;
                 }
                 PlotPath {
                     vx: root.view_x; vy: root.view_y; vw: root.view_w; vh: root.view_h;
                     commands: root.diff_path;
-                    stroke: #33cc33;
+                    stroke: root.diff_color;
                     stroke-width: 2px;
                     visible: root.show_diff && root.curve_point_count > 0;
                 }
@@ -351,7 +358,7 @@ export component CurvesPage inherits Rectangle {
                     commands: root.active_point_count > 0
                         ? root.active_path
                         : "M 0 \{root.active_base_y} L 1000 \{root.active_base_y}";
-                    stroke: #ff3399;
+                    stroke: root.active_color;
                     stroke-width: 2px;
                     visible: root.show_active;
                 }
@@ -760,19 +767,19 @@ export component CurvesPage inherits Rectangle {
                             }
                             SeriesRow {
                                 label: "RAW";
-                                tint: #3399ff;
+                                tint: root.raw_color;
                                 checked: root.show_raw;
                                 toggled(on) => { root.show_raw = on; }
                             }
                             SeriesRow {
                                 label: "BASELINE";
-                                tint: #ffaa00;
+                                tint: root.bsln_color;
                                 checked: root.show_bsln;
                                 toggled(on) => { root.show_bsln = on; }
                             }
                             SeriesRow {
                                 label: "DIFF";
-                                tint: #33cc33;
+                                tint: root.diff_color;
                                 checked: root.show_diff;
                                 toggled(on) => { root.show_diff = on; }
                             }
@@ -780,7 +787,7 @@ export component CurvesPage inherits Rectangle {
                             // 输出 out_active, 属于"读设备", 故归原生组; N 用于把 0/1 拉到看得见的高度。
                             SeriesRow {
                                 label: "触发判定";
-                                tint: #ff3399;
+                                tint: root.active_color;
                                 checked: root.show_active;
                                 has_norm: true;
                                 norm: root.active_norm_amp;

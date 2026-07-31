@@ -3,6 +3,7 @@
 #include "../binding_service/binding_service.h"
 #include "../latency_stats.h"
 #include "../self_heal/self_heal.h"
+#include "../usb_debug.h"
 #include "../../protocol/psoc/psoc.h"
 #include <pico/stdlib.h>
 
@@ -27,6 +28,10 @@ GameIoService::GameIoService()
 GameIoService* GameIoService::getInstance() {
     if (_instance == nullptr) _instance = new GameIoService();
     return _instance;
+}
+
+bool GameIoService::mai2_touch_sending() const {
+    return _serial.is_ready() && _serial.get_serial_ok();
 }
 
 bool GameIoService::init(UsbWorkMode mode) {
@@ -293,14 +298,24 @@ void GameIoService::_consume_light_state() {
 void GameIoService::task() {
     if (!_initialized) return;
 
+    // ★子段阶段码 + 子段耗时★(纯测量): 实测一次看门狗复位停在 game_io 段, 但该段含两条协议 +
+    // 延迟线 + WS2812 共七件事, 段级粒度说不出是哪一件。见 usb_debug.h 的 GameIoSeg。
+    uint32_t gio_t = gio_seg_begin(GIO_SEG_SERIAL_RX);
     _serial.task();
+    gio_seg_mark(GIO_SEG_SERIAL_RX, gio_t);
+
+    gio_t = gio_seg_begin(GIO_SEG_SER_RESET);
     _process_serial_reset();
+    gio_seg_mark(GIO_SEG_SER_RESET, gio_t);
+
+    gio_t = gio_seg_begin(GIO_SEG_LIGHT);
     _light.task();
+    gio_seg_mark(GIO_SEG_LIGHT, gio_t);
 
     // 实时触控快路：链路正常时取 36 位 on/off 掩码，经 BindingService 真实绑定表转 34 区；
     // 链路异常时上报全 0（无触摸），保持诚实。
     Psoc* psoc = Psoc::getInstance();
-    const uint32_t _lt0 = time_us_32();
+    const uint32_t _lt0 = gio_seg_begin(GIO_SEG_TOUCH_MAP);
     const uint64_t channel_mask = psoc->link_ok() ? psoc->touch_mask() : 0;
     const uint64_t area_now = BindingService::getInstance()->map_to_areas(channel_mask);
     // 触控延迟线(100us 片, 0..100ms, UI 可配): 单拷贝环形, O(1)。延迟值 50ms 缓存刷新一次避免频繁查表。
@@ -310,11 +325,22 @@ void GameIoService::task() {
     }
     Mai2Serial_TouchState touch(_touch_delay.tick(_lt0, _touch_delay_units, area_now));
     const uint32_t _lt1 = time_us_32();
+    gio_seg_mark(GIO_SEG_TOUCH_MAP, _lt0);
+    gio_seg_begin(GIO_SEG_SEND_TOUCH);
     _serial.send_touch_data(touch);
     const uint32_t _lt2 = time_us_32();
+    gio_seg_mark(GIO_SEG_SEND_TOUCH, _lt1);
     latency_note(&g_lat_proc_us, _lt1 - _lt0);
     latency_note(&g_lat_usb_us, _lt2 - _lt1);
+
+    gio_t = gio_seg_begin(GIO_SEG_LIGHT_STATE);
     _consume_light_state();
+    gio_seg_mark(GIO_SEG_LIGHT_STATE, gio_t);
+
     // 建链失败时不再每 tick 进灯服务: 内部虽有 _initialized 短路, 但辅路故障不该占快路的调用开销。
-    if (_led_map_ready) LedMapService::getInstance()->task();
+    if (_led_map_ready) {
+        gio_t = gio_seg_begin(GIO_SEG_LEDMAP);
+        LedMapService::getInstance()->task();
+        gio_seg_mark(GIO_SEG_LEDMAP, gio_t);
+    }
 }

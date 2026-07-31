@@ -55,6 +55,7 @@ pub use telemetry::{
     PARAM_RESOLUTION,
     PARAM_SNS_CLK_DIV,
     PARAM_SNS_CLK_SOURCE,
+    ParamFence,
     PsocRescueProgress,
     decode_auto_tune_progress,
     decode_cp_get,
@@ -71,6 +72,13 @@ pub use telemetry::{
     encode_param_get_all_channels,
     encode_param_set,
     encode_telem_start,
+    // 全局项(GPARAM_*)围栏, 与单通道 param_* 同构、共用 ParamFence
+    global_clamp,
+    global_fence,
+    global_value_legal,
+    param_clamp,
+    param_fence,
+    param_value_legal,
 };
 
 // ============================================================================
@@ -92,6 +100,16 @@ const CRC_INIT: u16 = 0xFFFF;
 const FLAG_RESPONSE: u8 = 0x01; // bit0=1: response frame
 const FLAG_STREAM: u8 = 0x02; // bit1=1: stream data frame
 const FLAG_NAK_ERR: u8 = 0x04; // bit2=1: NAK (error)
+/// bit3=1: payload 末 4 字节是设备端 `time_us_32()` 时间戳(u32 LE)。
+///
+/// ★加法式协议扩展, 与固件 `HOST_CMD_FLAG_TS` 同源★ 设备侧在**唯一**出向组帧口
+/// (`HostCmdCodec::encode_frame`)统一追加, 于是所有设备→主机的帧都带戳。
+/// ★本侧的关键约定★: 时间戳在 `Decoder` 里就被**剥离**进 `Frame::device_t_us`,
+/// `Frame::payload` 恢复为不含时间戳的原样 ⇒ 全部 `decode_*` 函数一行都不用改,
+/// 也不存在"某个解析函数忘了减 4"的可能。新增命令同样自动获得 `device_t_us`。
+const FLAG_TS: u8 = 0x08;
+/// 尾部时间戳字节数(u32 LE)。
+const TS_SIZE: usize = 4;
 
 // ============================================================================
 // HostCmd Enumeration (mirrors firmware host_cmd.h)
@@ -205,6 +223,9 @@ pub enum HostCmd {
     // Response codes 0x7E-0x7F
     Ack = 0x7E,
     Nak = 0x7F,
+
+    // Mai2Bus transport domain
+    BusXfer = 0x80,
 }
 
 impl TryFrom<u8> for HostCmd {
@@ -285,6 +306,7 @@ impl TryFrom<u8> for HostCmd {
             0x79 => Ok(Mai2SetSendEn),
             0x7E => Ok(Ack),
             0x7F => Ok(Nak),
+            0x80 => Ok(BusXfer),
             _ => Err(HostCmdError::Unknown),
         }
     }
@@ -345,17 +367,26 @@ pub struct Frame {
     pub cmd: u8,
     pub flags: u8,
     pub seq: u8,
+    /// ★不含尾部时间戳★: 带 `FLAG_TS` 的帧在 `Decoder` 里已把末 4 字节剥进 `device_t_us`,
+    /// 这里始终是命令自身定义的 payload ⇒ 所有 `decode_*` 按原偏移解析即正确。
     pub payload: Vec<u8>,
+    /// 设备端 `time_us_32()`(u32 微秒, 约 71.6 分钟回绕)= 该帧在设备侧组帧那一刻的时间。
+    ///
+    /// `None` = 该帧不带 `FLAG_TS`(主机自己构造的请求帧, 或旧固件)。
+    /// ★用途★ 把"主机轮询取回"的数据(如 ALGO_GET_TRACE)放回设备时间轴, 与 TELEM_DATA
+    /// (payload 内自带 ts_us)、KBD_GET_EDGES 的 t_us 同源, 于是横向对位不再是近似值。
+    pub device_t_us: Option<u32>,
 }
 
 impl Frame {
-    /// Create a new frame
+    /// Create a new frame. 主机→设备方向不带时间戳(主机时钟对设备无意义)。
     pub fn new(cmd: u8, flags: u8, seq: u8, payload: Vec<u8>) -> Self {
         Frame {
             cmd,
             flags,
             seq,
             payload,
+            device_t_us: None,
         }
     }
 
@@ -568,11 +599,23 @@ impl Decoder {
                         self.state = DecoderState::FindSof0;
 
                         if expected_crc == received_crc {
+                            // ★时间戳剥离唯一点★: 带 FLAG_TS 就把末 4 字节取走存进
+                            // device_t_us, payload 还原成命令自身的原样布局 ⇒ 下游
+                            // 全部 decode_* 无需感知本扩展(见 FLAG_TS 注释)。
+                            let mut payload = self.payload.clone();
+                            let mut device_t_us = None;
+                            if (self.header[1] & FLAG_TS) != 0 && payload.len() >= TS_SIZE {
+                                let tail = payload.split_off(payload.len() - TS_SIZE);
+                                device_t_us = Some(u32::from_le_bytes([
+                                    tail[0], tail[1], tail[2], tail[3],
+                                ]));
+                            }
                             let frame = Frame {
                                 cmd: self.header[0],
                                 flags: self.header[1],
                                 seq: self.header[2],
-                                payload: self.payload.clone(),
+                                payload,
+                                device_t_us,
                             };
                             return Some(frame);
                         }
@@ -1184,20 +1227,28 @@ pub const KBD_DEBOUNCE_US_MAX: u16 = 10000;
 /// 每键防抖默认值(= 改造前的全局 DEBOUNCE_US)。
 pub const KBD_DEBOUNCE_US_DEFAULT: u16 = 3000;
 
+/// 触发极性: 低电平触发(按下=接地)。
+pub const KBD_POL_LOW: u8 = 0;
+/// 触发极性: 高电平触发(按下=被主动拉高)。
+pub const KBD_POL_HIGH: u8 = 1;
+/// 触发极性: AUTO(默认) —— 固件只看**启动时**的电平并把它当作该键的"抬起"电平:
+/// 启动为高 → 低电平触发; 启动为低 → 高电平触发。启动后不再重采样。
+pub const KBD_POL_AUTO: u8 = 2;
+
 /// 单个物理键的触发极性与防抖窗。
 ///
-/// - `active_high`: true = 高电平触发; false = 低电平触发(默认, 与旧固件全局 active-low 一致)。
+/// - `pol`: `KBD_POL_LOW` / `KBD_POL_HIGH` / `KBD_POL_AUTO`(默认)。三态, 不能折叠成 bool。
 /// - `debounce_us`: 0..=`KBD_DEBOUNCE_US_MAX`, 0 = 不去抖。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KbdKeyCfg {
-    pub active_high: bool,
+    pub pol: u8,
     pub debounce_us: u16,
 }
 
 impl Default for KbdKeyCfg {
     fn default() -> Self {
         KbdKeyCfg {
-            active_high: false,
+            pol: KBD_POL_AUTO,
             debounce_us: KBD_DEBOUNCE_US_DEFAULT,
         }
     }
@@ -1234,14 +1285,18 @@ pub fn encode_kbd_set_keycfg(items: &[(u8, KbdKeyCfg)]) -> Vec<u8> {
     let mut payload = Vec::with_capacity(items.len() * 4);
     for (idx, cfg) in items {
         payload.push(*idx);
-        payload.push(u8::from(cfg.active_high));
+        payload.push(cfg.pol);
         payload.extend_from_slice(&cfg.debounce_us.to_le_bytes());
     }
     payload
 }
 
-/// 解码 KBD_GET_KEYCFG 响应: [count(u8)] + count×(pol(u8), debounce_us(u16 LE))。
-pub fn decode_kbd_get_keycfg(payload: &[u8]) -> Result<Vec<KbdKeyCfg>, String> {
+/// 解码 KBD_GET_KEYCFG 响应:
+/// [count(u8)] + count×(pol(u8), debounce_us(u16 LE)) + 可选 resolved_pol_high_mask(u16 LE)。
+///
+/// pol 是**配置态**(含 AUTO=2), 不折叠成 bool。尾部的 resolved mask 是固件解析后的生效极性
+/// (bit i = 1 → 该键按高电平触发判定), 只有支持 AUTO 的固件才追加; 旧固件不带该字段 → `None`。
+pub fn decode_kbd_get_keycfg(payload: &[u8]) -> Result<(Vec<KbdKeyCfg>, Option<u16>), String> {
     if payload.is_empty() {
         return Err("KBD_GET_KEYCFG 响应为空".to_string());
     }
@@ -1259,11 +1314,16 @@ pub fn decode_kbd_get_keycfg(payload: &[u8]) -> Result<Vec<KbdKeyCfg>, String> {
     for i in 0..count {
         let b = 1 + i * 3;
         out.push(KbdKeyCfg {
-            active_high: payload[b] != 0,
+            pol: payload[b],
             debounce_us: u16::from_le_bytes([payload[b + 1], payload[b + 2]]),
         });
     }
-    Ok(out)
+    let resolved = if payload.len() >= need + 2 {
+        Some(u16::from_le_bytes([payload[need], payload[need + 1]]))
+    } else {
+        None
+    };
+    Ok((out, resolved))
 }
 
 /// 编码 KBD_GET_EDGES 请求载荷: [max(u8)]; 0 = 用固件默认上限。

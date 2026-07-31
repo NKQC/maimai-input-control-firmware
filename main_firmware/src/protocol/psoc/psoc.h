@@ -58,6 +58,18 @@ public:
     bool upload_algo(const uint8_t* data, uint16_t len, uint16_t crc16);
     bool algo_download_busy() const { return _algo_dl.busy != 0u; }
 
+    // ---------- 长周期指令在途判据(反堆叠闸门的唯一真相源) ----------
+    /// 是否有长周期 PSoC 指令在途(已入队但未执行完)。长周期 = PSoC 主循环同步执行数秒~数十秒的那类:
+    /// APPLY / CALIBRATE / BASELINE_RESET / GLOBAL_COMMIT / AUTO_TUNE / MEASURE_CP / UPLOAD_ALGO。
+    /// ★调用方不得自行用 core1_idle() 或 busy_grace_active() 重新组合出"忙"★:
+    /// 前者把普通读写命令也算忙(过严, 正常轮询就会被拒), 后者是 30s 宽限窗(过宽, 会把设备锁死半分钟)。
+    /// 判据 = 两个单写者计数器之差 —— core0 只写 _heavy_enq, core1 只写 _heavy_done, 故无跨核 RMW 竞态
+    /// (与 _cmd_head/_cmd_tail 同一手法); 用单个 bool 会在"内部 APPLY 与主机指令先后入队"时被提前清掉。
+    bool heavy_busy() const { return _heavy_enq != _heavy_done; }
+    /// 因"忙"被拒的长周期指令累计次数。压测据此**确证**堆叠真实发生过, 而不是靠推断。
+    uint32_t heavy_reject_count() const { return _heavy_rejects; }
+    void note_heavy_reject() { _heavy_rejects++; }
+
     /// core1 是否空闲(命令环已排空且当前没有在执行的命令)。
     /// core0 落 flash 前必须确认为 true —— flash 写会 multicore_lockout core1, 而 core1 正在跑的
     /// 重操作(重初始化/全通道校准)会在 _wait_op_done 里轮询数秒, 那期间它响应不了 lockout,
@@ -250,6 +262,11 @@ private:
     volatile uint32_t _cmd_head = 0;   // core0 生产位置(生产者独占推进)
     volatile uint32_t _cmd_tail = 0;   // core1 消费位置(消费者独占推进)
     volatile uint8_t  _core1_in_cmd = 0;  // core1 正在执行一条 SPI 命令(见 core1_idle 注释)
+    // 长周期指令在途计数(见 heavy_busy)。core0 只写 _heavy_enq, core1 只写 _heavy_done。
+    volatile uint32_t _heavy_enq = 0;
+    volatile uint32_t _heavy_done = 0;
+    uint32_t          _heavy_rejects = 0;   // core0 独占
+    static bool _op_is_heavy(SpiOp op);
 
     void _spi_service();   // core1 每周期: 命令队列 + 触控快路 + 快照慢路 + 采样率统计
     bool _submit(SpiOp op, uint8_t ch, uint8_t pid, uint32_t val, uint32_t* out, const uint8_t* data = nullptr, uint32_t timeout_us = 0u);  // core0 投递(读类等结果); timeout_us=0 用默认

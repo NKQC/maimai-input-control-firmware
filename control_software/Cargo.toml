@@ -53,3 +53,6 @@ windows = { version = "0.62.2", default-features = false, features = [
 
 [build-dependencies]
 slint-build = "1.17.1"
+# 把 ui/assets/icon.ico 作为 Win32 图标资源嵌进 exe(资源管理器/任务栏/Alt-Tab 显示)。
+# 用 winresource 而非 winres: 后者已不维护, 在 Rust 1.61+ 上失效。
+winresource = "=0.1.31"

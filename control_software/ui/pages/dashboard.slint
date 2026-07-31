@@ -21,6 +21,8 @@ export component DashboardPage inherits Rectangle {
     in property <int> sample_rate_hz: 0;
     in property <string> curve_threshold_warning: "";
     in property <float> scan_period_ms: 0;
+    // 探测周期是否有实测值; 停流时来源恒为 0, 无值显示"未测"而不是 0 ms。
+    in property <bool> scan_period_valid: false;
     in-out property <int> scan_mode: 0;
     in property <int> latency_total_us: 0;
     in property <int> latency_spi_us: 0;
@@ -232,7 +234,9 @@ export component DashboardPage inherits Rectangle {
                         Text {
                             width: 150px;
                             overflow: elide;
-                            text: @tr("探测周期: ") + Math.round(root.scan_period_ms * 100) / 100 + " ms";
+                            text: @tr("探测周期: ") + (root.scan_period_valid
+                                ? (Math.round(root.scan_period_ms * 100) / 100 + " ms")
+                                : @tr("未测"));
                             horizontal-alignment: left;
                             color: Theme.text-sub;
                         }

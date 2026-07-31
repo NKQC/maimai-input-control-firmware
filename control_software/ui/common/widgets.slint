@@ -104,23 +104,29 @@ export component ParamEditorRow inherits HorizontalBox {
         horizontal-alignment: center;
         vertical-alignment: center;
     }
-    // 围栏依据固件 sensor_link.cpp::_handle_param_set 与 psoc main.c::_param_value_legal 的合法性校验:
-    // 0x08 SNS_CLK_DIV 1..255 / 0x09 IDAC_MOD 0..127 / 0x0A SNS_CLK_SOURCE 0..6 / 0x0B IDAC_GAIN 0..6;
-    // 0x05 ON_DEBOUNCE 落在 uint8_t 字段(越界会被静默截断); 其余阈值类为 16 位无额外限制。
-    // 按 entry.param_id 派生而非在调用处传: 调用方是 for row in params 的整表循环, 逐行范围只能由行自身的
-    // param_id 决定; 本组件语义即"单通道 CSD 参数行", 该表就是它的对外契约, 不会波及其它页。
+    // 围栏随行下发(entry.min/entry.max), 唯一来源是 Rust 侧 `proto::telemetry::param_fence`
+    // —— 与 RP2040 `sensor_link.cpp::_handle_param_set`、PSoC `main.c::_param_value_legal` 三处同源。
+    // ★这里不许再按 param_id 写阈值★: 旧实现把 SNS_CLK_SOURCE 上界写死 6, 而设备合法持有 128
+    // (0x80 = CapSense AUTO 标志), 于是 UI 把 128 夹成 6, 用户一碰就把 AUTO 标志抹掉下发。
+    // 含标志位的参数其区间内存在非法点(如 0x0A 的 7..127), 那些值由 Rust 侧下发前明确拒绝并告知。
     param_value := SpinBox {
         visible: root.mode_known && !root.auto_mode;
         horizontal-stretch: 0;
         min-width: Theme.spin-width;
-        minimum: root.entry.param_id == 8 ? 1 : 0;
-        maximum: root.entry.param_id == 8 ? 255
-            : (root.entry.param_id == 9 ? 127
-            : ((root.entry.param_id == 10 || root.entry.param_id == 11) ? 6
-            : (root.entry.param_id == 5 ? 255 : 65535)));
+        minimum: root.entry.min;
+        maximum: root.entry.max;
         value: root.entry.value;
         edited(v) => { root.edited(root.entry.param_id, v); }
     }
+    // ★必须显式把真值重推进部件★
+    // std-widgets 的 SpinBox 是 `value <=> base.value`, 而 SpinBoxBase.update-value() 里对
+    // `root.value` 是**赋值**(common/spinbox-base.slint)。Slint 里一次赋值会永久摧毁该属性上
+    // 的声明式绑定 ⇒ 用户编辑过这一行之后, 上面 `value: root.entry.value` 就不存在了, 此后
+    // Rust 侧 set_row_data 换 entry 也推不进来。Repeater 又复用行实例(换通道只换 entry, 不重建
+    // 元素), 于是该参数行永远停在用户键入的数字 —— 表现为"改一个参数后所有通道都是同一个值",
+    // 只有重开 UI(元素重建, 绑定恢复)才好。这里在 entry 变化时手动写回, 让"显示 = 所选通道的
+    // 设备真值(草稿只覆盖同通道同参数)"这条不变量不再依赖那条会被摧毁的绑定。
+    changed entry => { param_value.value = root.entry.value; }
 }
 
 // 可调变量编辑行: 0..255(u8), 与 ParamEditorRow 分开(范围不同, 语义是共享算法 cfg 而非 CSD 参数)。
@@ -140,7 +146,7 @@ export component AlgoSettingEditorRow inherits HorizontalBox {
         vertical-alignment: center;
         color: Theme.text-strong;
     }
-    SpinBox {
+    cfg_value := SpinBox {
         horizontal-stretch: 0;
         min-width: Theme.spin-width;
         minimum: 0;
@@ -148,6 +154,9 @@ export component AlgoSettingEditorRow inherits HorizontalBox {
         value: root.entry.value;
         edited(v) => { root.edited(root.entry.idx, v); }
     }
+    // 与 ParamEditorRow 同一处坑(见其 changed entry 注释): 编辑过的行会丢掉 value 绑定,
+    // 此后设备回读/换算法的 cfg 真值再也推不进来。
+    changed entry => { cfg_value.value = root.entry.value; }
 }
 
 // 主图里的一条折线。所有线共用同一套 viewbox 视图变换(缩放/平移永不错层), 数据坐标固定 1000x1000。
@@ -243,6 +252,10 @@ export component SeriesRow inherits HorizontalLayout {
 export component KeyCaptureBox inherits Rectangle {
     in property <string> display;
     callback captured(string, bool, bool, bool, bool);  // text, ctrl, shift, alt, gui
+    // 一次录制会话开始的那一刻触发, 且**只触发一次**(见 _begin)。
+    // 使用方可借它实现"每次录制独立覆盖上次结果"; 不接这个回调则完全无副作用
+    // —— 物理键盘页(PhysKeyRow)就不接, 行为与从前一致。
+    callback capture_started();
     property <bool> _recording: false;
     // 已收到过至少一个按键动作 ⇒ 空闲计时才有意义(Timer 的 running 由它门控)。
     property <bool> _acted: false;
@@ -254,13 +267,24 @@ export component KeyCaptureBox inherits Rectangle {
     border-color: root._recording ? #4a90d9 : Theme.border-light;
     background: root._recording ? #16222e : #262b31;
 
+    // 进入录制态的唯一入口。★边沿判据 = _recording 由假变真★: 只有这条边沿上报
+    // capture_started(), 因此一次会话(点进去 → 静默 0.5s 退出)只触发一次, 会话内的后续按键
+    // 走不到这条分支。语义上 = "跨会话覆盖、会话内累加"。
+    function _begin() {
+        if (!root._recording) {
+            root._recording = true;
+            root.capture_started();
+        }
+    }
+
     // 空闲焦点置于捕获域外，超时后既停止 key-pressed 冒泡也清除录制角标。
     idle_focus := FocusScope { }
     fs := FocusScope {
         width: parent.width;
         height: parent.height;
         key-pressed(e) => {
-            root._recording = true;
+            // 从非录制态收到第一个按键也算一次会话开始(必须先于 captured, 否则清零会把本键抹掉)。
+            root._begin();
             // 置 false 再置 true 让 Timer 的 running 边沿变化 → 空闲计时从本次按键重新起算。
             root._acted = false;
             root._acted = true;
@@ -274,7 +298,7 @@ export component KeyCaptureBox inherits Rectangle {
                 fs.focus();
                 // 进入录制态但**不启动**空闲计时: 第一个动作到来前一直等待。
                 root._acted = false;
-                root._recording = true;
+                root._begin();
             }
         }
     }
@@ -284,7 +308,12 @@ export component KeyCaptureBox inherits Rectangle {
         triggered => {
             root._recording = false;
             root._acted = false;
-            idle_focus.focus();
+            // ★只有焦点仍在本捕获框内才主动失焦★: 用户在这 0.5s 内很可能已经点进旁边的
+            // SpinBox 开始输入数字, 此时无条件 idle_focus.focus() 会把焦点从他正在编辑的
+            // 数字框抢走(表现为"数字框高亮自动取消"、键入被吞)。焦点已不在本框时只退录制态。
+            if (fs.has-focus) {
+                idle_focus.focus();
+            }
         }
     }
     // 始终显示当前组合键(捕获后立即更新, 不再被焦点占位符遮挡); 录制时右侧显示角标。

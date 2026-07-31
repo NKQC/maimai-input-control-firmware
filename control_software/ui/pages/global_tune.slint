@@ -1,4 +1,5 @@
 import { Button, ComboBox, VerticalBox, HorizontalBox, GroupBox, CheckBox, SpinBox, ScrollView, TabWidget, Slider } from "std-widgets.slint";
+import { GlobalFences } from "../common/types.slint";
 
 
 // ============================================================================
@@ -62,6 +63,13 @@ export component GlobalTunePage inherits Rectangle {
     in-out property <int> scan_mode: 0;
     // 仅从设备诊断读到真实模式后显示下拉；未读到时不能用默认值冒充设备状态。
     in property <bool> mode_known: false;
+    // ★必须显式把真值重推进下拉★ 与 widgets.slint 的 `changed entry` 同一处坑:
+    // std-widgets 的 ComboBox 在用户选中时**赋值**自己的 current-index, 而 Slint 里一次赋值
+    // 会永久摧毁该属性上的声明式绑定 ⇒ 用户手动切过一次模式后, 下方 `current-index: root.scan_mode`
+    // 就不存在了, 此后 Rust 侧回填(设备真值/撤销草稿/重连清值)都推不进下拉。
+    // 表现正是"下拉停在半自动手动, 同页 SnsClk DIV/时钟源却按 root.scan_mode 显示 AUTO"。
+    // 这里在 scan_mode 变化时手动写回, 让"下拉 = 当前生效模式"这条不变量不依赖那条会被摧毁的绑定。
+    changed scan_mode => { mode_combo.current-index = root.scan_mode; }
     in property <int> g_inactive_sns: 1;   // 1=GND 2=High-Z 4=Shield
     in property <int> g_idac_gain: 4;
     in property <int> g_idac_sense_config: 0;   // 0=IDAC sourcing, 1=IDAC sinking
@@ -70,6 +78,10 @@ export component GlobalTunePage inherits Rectangle {
     in property <int> g_raw_target: 85;
     in property <int> g_mfs_div_f1: 1;
     in property <int> g_mfs_div_f2: 2;
+    // 全局项数字输入围栏。★唯一来源在 Rust 侧 `proto::telemetry::global_fence`★
+    // (main.rs::build_global_fences 回填), 与 RP2040 `_handle_global_set` / PSoC `cmd_set_global`
+    // 同源。★不许在本文件里写死上下界★: 那会成为与两处固件必然漂移的第三份围栏。
+    in property <GlobalFences> global_fences;
     // 以下两项始终显示 CH0 的当前值，编辑时统一写入全部 36 通道。
     in property <int> csd_sns_clk_div: 0;
     in property <int> csd_resolution: 0;
@@ -97,6 +109,9 @@ export component GlobalTunePage inherits Rectangle {
     in property <float> scan_period_ms: 0;
     // 设备实测探测周期(µs 原值), 用于与"期望周期"精确比较并显示差值。
     in property <int> scan_period_us: 0;
+    // 探测周期是否有实测值。★与主页同源(AppController::telem_scan_period_us)★, 但停流时该来源
+    // 恒为 0; 无值时本页显示"未测"且不算差值/倍率, 否则会给出"实际 0ms/差值 -5796µs/倍率 ×0"的伪结论。
+    in property <bool> scan_period_valid: false;
     // 由当前 CSD 参数(分辨率)解算的理论采集周期下限(µs); 0=参数超范围无法解算。
     in property <int> expected_period_us: 0;
     // 是否有未保存草稿(供撤销按钮与提示)。
@@ -105,7 +120,6 @@ export component GlobalTunePage inherits Rectangle {
     callback capture_params();
     callback algo_global_set(int, int);   // gparam_id, value
     callback csd_param_set(int, int);     // param_id, value → set_param_all
-    callback csd_refresh();               // 重新请求 CH0 代表值
     callback reboot_psoc();               // 脉冲 XRES 重启 PSoC
     callback reset_defaults();            // 恢复设备默认配置
     callback discard_draft();             // 撤销全部未保存草稿
@@ -231,7 +245,7 @@ export component GlobalTunePage inherits Rectangle {
                             color: #8b98a5;
                             vertical-alignment: center;
                         }
-                        ComboBox {
+                        mode_combo := ComboBox {
                             visible: root.mode_known;
                             model: ["自动校准", "半自动手动"];
                             current-index: root.scan_mode;
@@ -263,8 +277,10 @@ export component GlobalTunePage inherits Rectangle {
                     spacing: 6px;
                     HorizontalBox {
                         spacing: 8px;
+                        // ★原「刷新 CH0 参数」按钮已删★: CH0 代表值有两条自动加载路径 ——
+                        // 连接边沿(main.rs:2332)与每次真正进入本页(main.rs:2375)各拉一次,
+                        // 手动按钮不会带来任何额外真值, 只是让用户以为需要自己点。
                         Text { text: "全局校准项; 采样时钟/分辨率/MFS 见下方时钟树。"; color: #8fd6ff; horizontal-stretch: 1; vertical-alignment: center; }
-                        Button { text: "刷新 CH0 参数"; clicked => { root.csd_refresh(); } }
                     }
                     HorizontalBox {
                         spacing: 8px;
@@ -308,13 +324,21 @@ export component GlobalTunePage inherits Rectangle {
                     HorizontalBox {
                         spacing: 8px;
                         Text { text: "IDAC 增益档:"; color: #b0b8c0; vertical-alignment: center; }
-                        SpinBox { value: root.g_idac_gain; minimum: 0; maximum: 6; edited(v) => { root.algo_global_set(2, v); } }
+                        SpinBox { value: root.g_idac_gain; minimum: root.global_fences.idac_gain_min; maximum: root.global_fences.idac_gain_max; edited(v) => { root.algo_global_set(2, v); } }
                         Text { text: "IDAC min:"; color: #b0b8c0; vertical-alignment: center; }
-                        SpinBox { value: root.g_idac_min; minimum: 0; maximum: 127; edited(v) => { root.algo_global_set(3, v); } }
+                        SpinBox { value: root.g_idac_min; minimum: root.global_fences.idac_min_min; maximum: root.global_fences.idac_min_max; edited(v) => { root.algo_global_set(3, v); } }
                         Text { text: "校准目标%:"; color: #b0b8c0; vertical-alignment: center; }
-                        SpinBox { value: root.g_raw_target; minimum: 1; maximum: 99; edited(v) => { root.algo_global_set(4, v); } }
+                        SpinBox { value: root.g_raw_target; minimum: root.global_fences.raw_target_min; maximum: root.global_fences.raw_target_max; edited(v) => { root.algo_global_set(4, v); } }
                     }
-                    Text { text: "作用: 设置 IDAC 参数。增益0–6、最小值0–127、目标1–99%，重新校准生效。"; color: #7f8c96; font-size: 10px; wrap: word-wrap; }
+                    // 范围文案同样取自围栏, 不写死数字(否则围栏一改这里就变成谎话)。
+                    Text {
+                        text: "作用: 设置 IDAC 参数。增益"
+                            + root.global_fences.idac_gain_min + "–" + root.global_fences.idac_gain_max
+                            + "、最小值" + root.global_fences.idac_min_min + "–" + root.global_fences.idac_min_max
+                            + "、目标" + root.global_fences.raw_target_min + "–" + root.global_fences.raw_target_max
+                            + "%，重新校准生效。";
+                        color: #7f8c96; font-size: 10px; wrap: word-wrap;
+                    }
                     HorizontalBox {
                         spacing: 8px;
                         Text { text: "校准频率偏好:"; color: #b0b8c0; vertical-alignment: center; }
@@ -396,21 +420,22 @@ export component GlobalTunePage inherits Rectangle {
                                 HorizontalBox {
                                     padding: 0px;
                                     spacing: 6px;
-                                    // 围栏依据固件 psoc main.c::cmd_set_global 把 MFS 偏移写入 uint8_t 字段(>255 会被静默截断)。
+                                    // 围栏取自 Rust 侧 global_fence(0x05/0x06), 与 RP2040 `_handle_global_set`
+                                    // 及 PSoC `cmd_set_global` 的 <=255 同源; 超范围两处固件都 NAK/拒写。
                                     SpinBox {
                                         horizontal-stretch: 1;
                                         min-width: 130px;
                                         value: root.g_mfs_div_f1;
-                                        minimum: 0;
-                                        maximum: 255;
+                                        minimum: root.global_fences.mfs_f1_min;
+                                        maximum: root.global_fences.mfs_f1_max;
                                         edited(v) => { root.algo_global_set(5, v); }
                                     }
                                     SpinBox {
                                         horizontal-stretch: 1;
                                         min-width: 130px;
                                         value: root.g_mfs_div_f2;
-                                        minimum: 0;
-                                        maximum: 255;
+                                        minimum: root.global_fences.mfs_f2_min;
+                                        maximum: root.global_fences.mfs_f2_max;
                                         edited(v) => { root.algo_global_set(6, v); }
                                     }
                                 }
@@ -580,10 +605,13 @@ export component GlobalTunePage inherits Rectangle {
                                 alignment: center;
                                 Text { text: "设备实测探测周期"; font-size: 11px; color: #9fe0b0; horizontal-alignment: center; }
                                 Text {
-                                    text: (Math.round(root.scan_period_ms * 100) / 100) + " ms";
+                                    // 无实测值时显示"— 未测", 不显示 0.00 ms(会被读成"设备真的 0ms")。
+                                    text: root.scan_period_valid
+                                        ? ((Math.round(root.scan_period_ms * 100) / 100) + " ms")
+                                        : "—  未测";
                                     font-size: 15px;
                                     font-weight: 700;
-                                    color: #d6ffd9;
+                                    color: root.scan_period_valid ? #d6ffd9 : #7f9a86;
                                     horizontal-alignment: center;
                                 }
                             }
@@ -596,16 +624,23 @@ export component GlobalTunePage inherits Rectangle {
                         spacing: 8px;
                         alignment: start;
                         Text {
+                            // 实际值只有一个来源(root.scan_period_us, 与主页同源)。★无实测值时它恒为 0,
+                            // 绝不允许拿这个 0 去算差值/倍率★ —— 那会给出"差值 -5796 µs / 倍率 ×0"这种
+                            // 看着像故障诊断、实则纯属数据缺失的伪结论。故无值时一律"未测/不可用"。
+                            property <string> actual_text: root.scan_period_valid
+                                ? ((Math.round(root.scan_period_us / 10) / 100) + " ms")
+                                : "未测(遥测未在运行)";
                             text: root.expected_period_us > 0
                                 ? ("期望(解算) " + (Math.round(root.expected_period_us / 10) / 100) + " ms"
-                                    + "  实际 " + (Math.round(root.scan_period_us / 10) / 100) + " ms"
-                                    + "  差值 " + (root.scan_period_us - root.expected_period_us) + " µs"
-                                    + (root.expected_period_us > 0
-                                        ? ("  倍率 ×" + (Math.round(root.scan_period_us * 10 / root.expected_period_us) / 10))
-                                        : ""))
-                                : ("实际 " + (Math.round(root.scan_period_us / 10) / 100) + " ms  (分辨率参数超范围, 期望无法解算)");
-                            color: (root.expected_period_us > 0 && root.scan_period_us > root.expected_period_us * 3)
-                                ? #f5a623 : #9fe0b0;
+                                    + "  实际 " + self.actual_text
+                                    + (root.scan_period_valid
+                                        ? ("  差值 " + (root.scan_period_us - root.expected_period_us) + " µs"
+                                            + "  倍率 ×" + (Math.round(root.scan_period_us * 10 / root.expected_period_us) / 10))
+                                        : "  差值/倍率不可用"))
+                                : ("实际 " + self.actual_text + "  (分辨率参数超范围, 期望无法解算)");
+                            color: !root.scan_period_valid ? #7f9a86
+                                : (root.expected_period_us > 0 && root.scan_period_us > root.expected_period_us * 3)
+                                    ? #f5a623 : #9fe0b0;
                             vertical-alignment: center;
                             wrap: word-wrap;
                             horizontal-stretch: 1;

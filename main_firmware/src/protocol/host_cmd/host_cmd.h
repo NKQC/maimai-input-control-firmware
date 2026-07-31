@@ -14,6 +14,8 @@
  * - CRC-16/CCITT-FALSE(poly 0x1021, init 0xFFFF), 覆盖 cmd..payload
  * - 接收状态机: 增量喂字节，找 SOF→读头→按 len 收 payload→校验 CRC
  * - 编码: 给定 cmd/flags/seq/payload 组帧到输出缓冲(含 CRC)
+ * - 设备→主机方向的 payload 末尾统一追加 4 字节设备时间戳并置 HOST_CMD_FLAG_TS,
+ *   详见该宏的注释(加法式, 对既有命令零影响)。
  */
 
 // 帧格式常量
@@ -33,6 +35,24 @@
 #define HOST_CMD_FLAG_RESPONSE  0x01  // bit0=1 表示响应
 #define HOST_CMD_FLAG_STREAM    0x02  // bit1=1 流数据帧
 #define HOST_CMD_FLAG_NAK_ERR   0x04  // bit2=1 NAK(错误)
+// bit3=1: payload 末 4 字节是设备端时间戳 t_us(u32 LE) = time_us_32()。
+//
+// ★加法式设计, 不是破坏式改版★ 60+ 条既有命令的 payload 布局一律不动, 时间戳只**追加**在
+// 末尾并由本 flag 位标识 —— 与 KBD_GET_STATE(0x70) "尾部追加 raw/out, 旧上位机只读前 2 字节
+// 仍然正确"是同一条先例。于是:
+//   · 所有按固定偏移读前部字段的处理器/解析器完全不受影响, 一行都不用改;
+//   · 忽略本 flag 的旧上位机只会多看到 4 字节尾巴, 按 len 收帧、按偏移解析都仍正确;
+//   · 新增命令不必单独处理时间戳 —— 唯一填充点在 HostCmdCodec::encode_frame。
+// ★方向★ 只有设备→主机的帧带戳(主机时钟对设备无意义), 主机→设备的请求帧一律不带。
+// ★退化条件(两个, 均为"不追加"而非"报错")★
+//   · frame.len + 4 > HOST_CMD_PAYLOAD_MAX: 追加会让 len 超协议上限, 对端会当超长帧丢弃;
+//   · max_len 放不下多出的 4 字节: 保证任何原本能编码成功的帧都仍然成功(零回归)。
+//   这两种情形只出现在满载的批量传输帧(CFG_GET_ALL/ALGO 源分片)上, 那些帧的时刻本无意义。
+// ★时基★ time_us_32(), u32 微秒, 约 71.6 分钟 32 位回绕; 与 bus 信封头 t_us、
+//   KBD_GET_EDGES 的 t_us、TELEM_DATA 的 ts_us 同源同口径 ⇒ 可直接横向对位。
+#define HOST_CMD_FLAG_TS        0x08
+// 尾部时间戳字节数(u32 LE)。
+#define HOST_CMD_TS_SIZE        4
 
 // 命令码 enum class
 enum class HostCmd : uint8_t {
@@ -143,9 +163,11 @@ enum class HostCmd : uint8_t {
     //    count×(t_us(u32 LE), raw(u16 LE 去抖前), out(u16 LE 实际输出 HID))]
     // 返回即消费(FIFO 最旧优先)。overflow 只增不清零, 主机取差值判断"有事件丢失"。
     KBD_GET_EDGES    = 0x77,
-    // 每键触发极性 + 独立防抖窗。pol: 0=低电平触发(默认, 与旧固件一致) / 1=高电平触发;
-    // debounce_us: 0..10000(0=不去抖), 越界 NAK 不夹取。
-    KBD_GET_KEYCFG   = 0x7C,  // 空 → [count(u8)=12, 12×(pol(u8), debounce_us(u16 LE))]
+    // 每键触发极性 + 独立防抖窗。pol: 0=低电平触发 / 1=高电平触发 / 2=AUTO(默认);
+    // AUTO = 只看启动时电平并当作"抬起"电平(启动高→低触发, 启动低→高触发), 启动后不再重采样。
+    // GET 回显的是**配置态**(含 2), 尾部另追加解析后的生效掩码; debounce_us: 0..10000(0=不去抖),
+    // 越界 NAK 不夹取。
+    KBD_GET_KEYCFG   = 0x7C,  // 空 → [count(u8)=12, 12×(pol(u8), debounce_us(u16 LE)), resolved_pol_high_mask(u16 LE)]
     KBD_SET_KEYCFG   = 0x7D,  // [idx(u8), pol(u8), debounce_us(u16 LE)]×n → ACK/NAK(整批校验后才落值)
     // 组合映射(N 个分区同时按下 → M 个键同时输出)。单条 16B:
     //   zone_mask(u64 LE) | key0..key3(u8×4) | mod(u8) | delay(u16 LE) | maxhold(u16 LE)
@@ -159,6 +181,9 @@ enum class HostCmd : uint8_t {
     // 应答 0x7E-0x7F
     ACK             = 0x7E,
     NAK             = 0x7F,
+
+    // 0x80..0xFF 保留给总线。
+    BUS_XFER        = 0x80,
 };
 
 // NAK 错误码

@@ -48,6 +48,292 @@ pub const KNOWN_PARAM_IDS: &[u8] = &[
 ];
 
 // ============================================================================
+// 单通道参数合法范围(围栏) —— 上位机侧唯一权威声明表
+// ============================================================================
+//
+// ★本表是上位机侧唯一权威★: UI 输入围栏、下发前拒绝、回读防污染三条路径全部只读本表,
+// 上位机任何其它位置(含 .slint)都不许再写第二份阈值 —— 三份围栏各自漂移正是本次要收掉的病灶。
+//
+// ★三处必须同源(判定逐位等价), 任何一处改动必须三处同改★:
+//   1. 上位机: 本文件 `param_fence` / `param_value_legal`
+//      (`control_software/src/proto/telemetry.rs`)
+//   2. RP2040: `main_firmware/src/service/sensor_link/sensor_link.cpp::_handle_param_set`
+//      的合法性 switch(约 :420-435, 非法 → NAK, 不下发 PSoC、不写真相源)
+//   3. PSoC:   `psoc_firmware/CY8C4147AZI-SensorCore/main.c::_param_value_legal`
+//      (约 :800-812, 非法 → `cmd_set_param` 直接 return false, 不写 widgetContext)
+//
+// 逐位等价的两个要点:
+//   - `value_mask`: 固件对 SNS_CLK_SOURCE 判的是 `(value & 0x7F) <= 6`, 即高位(含 0x80 的
+//     CapSense AUTO 标志)根本不参与判定。故本表用 value_mask 精确复刻固件的取位, 而不是
+//     用 `!flag_mask` 反推 —— 后者会把 0x100 这类高位判成非法, 与固件行为不一致。
+//   - `guarded`: 固件的 switch 只拦 0x07/0x08/0x09/0x0A/0x0B, 其余走 `default: return true`
+//     完全不限制。故未被拦截项的 min/max 只是主机侧 UI 输入范围(依据 PSoC widgetContext
+//     字段位宽: onDebounce 是 uint8_t, 其余阈值类是 uint16_t; 越界是静默截断而非拒绝),
+//     判定必须放行, 否则上位机会拒绝固件本来接受的值。
+
+/// 单个 param 的围栏声明。★全局项(GPARAM_*)复用同一结构★, 见本文件 `global_fence`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParamFence {
+    /// 协议名(与固件 `PARAM_*` / `GPARAM_*` 宏同名), 供告警文案指名道姓。
+    pub name: &'static str,
+    /// 值域下界(对取位后的"值域部分"生效)。
+    pub min: u32,
+    /// 值域上界(同上)。
+    pub max: u32,
+    /// 值域部分的取位掩码, 与固件 `value & 0x??` 逐位对齐。
+    pub value_mask: u32,
+    /// 标志位掩码: 不参与范围判定、且 clamp 必须原样保留的位。
+    /// SNS_CLK_SOURCE 的 0x80 = CapSense AUTO 标志, 设备合法持有 128(=AUTO + 源 0)。
+    pub flag_mask: u32,
+    /// ★枚举型取值集合★: `bit_v == 1` 表示值 `v` 合法(仅覆盖 0..=31)。`0` = 不用集合判定,
+    /// 只按 `min..=max` 连续区间。为 `GPARAM_INACTIVE_SNS` 这种非连续取值而设 ——
+    /// 固件判的是 `(value==1)||(value==2)||(value==4)`, 用 min/max 表达会把 3 误判成合法。
+    /// ★不另造第二种结构★: 全局项与单通道项共用本 ParamFence, 单通道项该字段一律 0。
+    pub value_set: u32,
+    /// 该项是否被固件的合法性 switch 真正拦截(NAK / 拒写)。false ⇒ 判定一律放行。
+    pub guarded: bool,
+}
+
+impl ParamFence {
+    /// 取值域部分(丢弃标志位与固件同样不看的高位)。
+    pub fn core(&self, value: u32) -> u32 {
+        value & self.value_mask
+    }
+    /// UI 输入下界。
+    pub fn ui_min(&self) -> u32 {
+        self.min
+    }
+    /// UI 输入上界。★必须容得下"值域上界 + 全部标志位"★: SNS_CLK_SOURCE 的设备合法值 128
+    /// 若被 UI 上界(6)夹掉, 用户一碰这一行就会把 AUTO 标志抹掉并下发 6。
+    /// 标志位与值域不连续 ⇒ 区间内存在非法点(如 0x0A 的 7..127), 那些点由下发前的
+    /// `param_value_legal` 明确拒绝并告知, 不会静默走到设备上。
+    pub fn ui_max(&self) -> u32 {
+        self.max | self.flag_mask
+    }
+    /// 值域部分是否落在允许集合/区间内(不含 `guarded` 短路, 由调用方判断)。
+    fn _core_in_range(&self, core: u32) -> bool {
+        if self.value_set != 0 {
+            return core < 32 && (self.value_set & (1u32 << core)) != 0;
+        }
+        core >= self.min && core <= self.max
+    }
+    /// 把值域部分收到最近的合法取值。集合型取"绝对差最小"的成员(并列取小者), 区间型即 clamp。
+    fn _core_fix(&self, core: u32) -> u32 {
+        if self.value_set == 0 {
+            return core.clamp(self.min, self.max);
+        }
+        let mut best = self.min;
+        let mut best_d = u32::MAX;
+        for v in 0u32..32 {
+            if (self.value_set & (1u32 << v)) == 0 {
+                continue;
+            }
+            let d = if v > core { v - core } else { core - v };
+            if d < best_d {
+                best_d = d;
+                best = v;
+            }
+        }
+        best
+    }
+    /// 合法范围的中文描述(告警文案用)。
+    pub fn range_text(&self) -> String {
+        if self.value_set != 0 {
+            let members: Vec<String> = (0u32..32)
+                .filter(|v| (self.value_set & (1u32 << v)) != 0)
+                .map(|v| v.to_string())
+                .collect();
+            return format!("仅 {{{}}}", members.join(", "));
+        }
+        if self.flag_mask != 0 {
+            format!(
+                "{}..{}, 或叠加标志位 0x{:02X}(如 {} = 标志位 + 值 0)",
+                self.min,
+                self.max,
+                self.flag_mask,
+                self.flag_mask | self.min
+            )
+        } else {
+            format!("{}..{}", self.min, self.max)
+        }
+    }
+}
+
+/// 固件不拦截项: min 固定 0, min/max 仅作主机侧 UI 输入范围。
+const fn _fence_soft(name: &'static str, max: u32) -> ParamFence {
+    ParamFence {
+        name,
+        min: 0,
+        max,
+        value_mask: 0xFFFF_FFFF,
+        flag_mask: 0,
+        value_set: 0,
+        guarded: false,
+    }
+}
+
+/// 固件硬拦截项(非法即 NAK / 拒写)。
+const fn _fence_hard(
+    name: &'static str,
+    min: u32,
+    max: u32,
+    value_mask: u32,
+    flag_mask: u32,
+) -> ParamFence {
+    ParamFence {
+        name,
+        min,
+        max,
+        value_mask,
+        flag_mask,
+        value_set: 0,
+        guarded: true,
+    }
+}
+
+/// 固件硬拦截 + 取值为非连续集合的项(如 `GPARAM_INACTIVE_SNS` 的 {1,2,4})。
+/// `min`/`max` 仍给出, 只作 UI 输入范围(SpinBox 表达不了离散集合); 合法性判定用 `value_set`。
+const fn _fence_set(name: &'static str, min: u32, max: u32, value_set: u32) -> ParamFence {
+    ParamFence {
+        name,
+        min,
+        max,
+        value_mask: 0xFFFF_FFFF,
+        flag_mask: 0,
+        value_set,
+        guarded: true,
+    }
+}
+
+/// 取某个 param 的围栏。未知 param_id 视为无限制(与固件 `default` 一致)。
+pub fn param_fence(param_id: u8) -> ParamFence {
+    match param_id {
+        // —— 阈值/迟滞/消抖类: 固件 default 放行, 上界=PSoC widgetContext 字段位宽 ——
+        PARAM_FINGER_TH => _fence_soft("PARAM_FINGER_TH", 0xFFFF),
+        PARAM_NOISE_TH => _fence_soft("PARAM_NOISE_TH", 0xFFFF),
+        PARAM_NEG_NOISE_TH => _fence_soft("PARAM_NEG_NOISE_TH", 0xFFFF),
+        PARAM_HYSTERESIS => _fence_soft("PARAM_HYSTERESIS", 0xFFFF),
+        // onDebounce 是 uint8_t → 越界静默截断, UI 上界收到 255。
+        PARAM_ON_DEBOUNCE => _fence_soft("PARAM_ON_DEBOUNCE", 0xFF),
+        PARAM_LOW_BSLN_RST => _fence_soft("PARAM_LOW_BSLN_RST", 0xFFFF),
+        // —— 硬件类: 非法值会让转换 railed / 时钟异常 / 校准发散, 固件拒收 ——
+        PARAM_RESOLUTION => _fence_hard("PARAM_RESOLUTION", 6, 16, 0xFFFF_FFFF, 0),
+        // 0 会除零。
+        PARAM_SNS_CLK_DIV => _fence_hard("PARAM_SNS_CLK_DIV", 1, 255, 0xFFFF_FFFF, 0),
+        // idacMod 是 7 位。
+        PARAM_IDAC_MOD => _fence_hard("PARAM_IDAC_MOD", 0, 127, 0xFFFF_FFFF, 0),
+        // 固件: `(value & 0x7F) <= 6`; 0x80 = AUTO 标志, 不参与判定且必须保留。
+        PARAM_SNS_CLK_SOURCE => _fence_hard("PARAM_SNS_CLK_SOURCE", 0, 6, 0x7F, 0x80),
+        // 增益档表只有 7 项, 索引 7 越界会让 PSoC 崩溃。
+        PARAM_IDAC_GAIN => _fence_hard("PARAM_IDAC_GAIN", 0, 6, 0xFFFF_FFFF, 0),
+        _ => _fence_soft("PARAM_UNKNOWN", 0xFFFF_FFFF),
+    }
+}
+
+/// 值是否合法。★与固件判定逐位等价★(见本节头部注释)。
+pub fn param_value_legal(param_id: u8, value: u32) -> bool {
+    let fence = param_fence(param_id);
+    if !fence.guarded {
+        return true;
+    }
+    fence._core_in_range(fence.core(value))
+}
+
+/// 把非法值截断到最近的极值。★标志位原样保留★: 截断只作用于值域部分,
+/// 因此 `param_clamp(PARAM_SNS_CLK_SOURCE, 128)` 仍是 128(AUTO 标志 + 源 0),
+/// 绝不会被夹成 6 —— 那等于上位机自己把设备的 AUTO 标志抹掉。
+pub fn param_clamp(param_id: u8, value: u32) -> u32 {
+    let fence = param_fence(param_id);
+    // ★不变量: `param_value_legal` 放行的值, clamp 必须原样返回★。固件不拦截项(guarded=false)
+    // 不存在"非法值"概念(其 min/max 只是主机侧 UI 输入范围), 若在这里照样夹取, clamp 就会去改
+    // 一个合法值 —— 那等于上位机自作主张。故先按 guarded 短路。
+    if !fence.guarded {
+        return value;
+    }
+    let flags = value & fence.flag_mask;
+    let core = fence._core_fix(fence.core(value));
+    core | flags
+}
+
+// ============================================================================
+// 全局 CSD 配置(GPARAM_*)合法范围(围栏) —— 上位机侧唯一权威声明表
+// ============================================================================
+//
+// 与上面单通道 `param_fence` 完全同构(共用 `ParamFence` 结构与 clamp/legal 语义), 只是判据表
+// 对齐的是**全局项**的两处固件围栏。上位机任何其它位置(含 .slint 的 SpinBox 上下界)都不许再写
+// 第二份阈值。
+//
+// ★三处必须同源(判定逐位等价), 任何一处改动必须三处同改★:
+//   1. 上位机: 本文件 `global_fence` / `global_value_legal`
+//      (`control_software/src/proto/telemetry.rs`)
+//   2. RP2040: `main_firmware/src/service/sensor_link/sensor_link.cpp::_handle_global_set`
+//      的 `glegal` switch(约 :735-747, 非法 → NAK, 不下发 PSoC、不写 CsdConfig 真相源)
+//   3. PSoC:   `psoc_firmware/CY8C4147AZI-SensorCore/main.c::cmd_set_global`
+//      (约 :509-546, 非法 → 该 case 直接不写, 保持原值; 回显走 `cmd_get_global` 的存储值)
+//
+// 逐位等价的几个要点:
+//   - `INACTIVE_SNS` 固件判的是 `(value==1)||(value==2)||(value==4)` —— 离散集合, 3 是非法的。
+//     故用 `value_set` 精确复刻, 不能写成 min=1/max=4(那会放行 3)。
+//   - `IDAC_SENSE_CONFIG` / `AUTO_CALIBRATE_EN`: PSoC 侧只做 `value != 0` 判真不限范围, 但
+//     **RP2040 侧硬 NAK `value > 1`**。主机的每一条 GLOBAL_SET 都必先过 RP2040, 故有效判据取
+//     RP2040 的 0..1(取两者更严的一侧才不会出现"上位机放行、设备 NAK"的错配)。
+//   - `MFS_DIV_F1/F2` 的 0..255 是真围栏而非位宽推测: 两处固件都已显式判 `<= 255`, 超范围 NAK。
+//   - 只读诊断项(`0x09` BOOT_OVERRIDE、`0x80..0x84` DBG_*)以及未知 id: 两处固件的 set 路径都是
+//     `default` 不处理/不限制 ⇒ 判定必须放行(guarded=false), 否则上位机会拒绝固件本来接受的值。
+
+/// 取某个全局项(GPARAM)的围栏。未知 gparam_id 视为无限制(与两处固件的 `default` 一致)。
+pub fn global_fence(gparam_id: u8) -> ParamFence {
+    match gparam_id {
+        // 未激活传感器连接: 1=GND 2=High-Z 4=Shield —— 离散集合, 3/0/其它皆非法。
+        crate::proto::algo::GPARAM_INACTIVE_SNS => {
+            _fence_set("GPARAM_INACTIVE_SNS", 1, 4, (1 << 1) | (1 << 2) | (1 << 4))
+        }
+        // idacGainTable 只有 7 项(CY_CAPSENSE_IDAC_GAIN_NUMBER), 索引 7 越界 → 写非法 IDAC → 挂死。
+        crate::proto::algo::GPARAM_IDAC_GAIN_INIT => {
+            _fence_hard("GPARAM_IDAC_GAIN_INIT", 0, 6, 0xFFFF_FFFF, 0)
+        }
+        // csdIdacMin 是 7 位。
+        crate::proto::algo::GPARAM_IDAC_MIN => _fence_hard("GPARAM_IDAC_MIN", 0, 127, 0xFFFF_FFFF, 0),
+        // 校准目标 raw 百分比: 0 / ≥100 会让自动校准发散 → 全通道 railed。
+        crate::proto::algo::GPARAM_RAW_TARGET => _fence_hard("GPARAM_RAW_TARGET", 1, 99, 0xFFFF_FFFF, 0),
+        // MFS 分频偏移落在 PSoC 的 uint8_t 字段; 两处固件都已显式判 <=255 并 NAK, 不再静默截断。
+        crate::proto::algo::GPARAM_MFS_DIV_F1 => _fence_hard("GPARAM_MFS_DIV_F1", 0, 255, 0xFFFF_FFFF, 0),
+        crate::proto::algo::GPARAM_MFS_DIV_F2 => _fence_hard("GPARAM_MFS_DIV_F2", 0, 255, 0xFFFF_FFFF, 0),
+        // 0=IDAC sourcing, 1=IDAC sinking(RP2040 硬 NAK >1)。
+        crate::proto::algo::GPARAM_IDAC_SENSE_CONFIG => {
+            _fence_hard("GPARAM_IDAC_SENSE_CONFIG", 0, 1, 0xFFFF_FFFF, 0)
+        }
+        // 0=固定 IDAC, 1=Init/Apply 自动校准(RP2040 硬 NAK >1)。
+        crate::proto::algo::GPARAM_AUTO_CALIBRATE_EN => {
+            _fence_hard("GPARAM_AUTO_CALIBRATE_EN", 0, 1, 0xFFFF_FFFF, 0)
+        }
+        // 只读诊断: 0x09=BOOT_OVERRIDE(启动强制改写位掩码), 0x80..0x84=SPI 链路计数。
+        // 写路径两处固件都不处理 ⇒ 一律放行, 也不参与回读夹取(否则会去"修正"设备的诊断读数)。
+        _ => _fence_soft("GPARAM_READONLY_OR_UNKNOWN", 0xFFFF_FFFF),
+    }
+}
+
+/// 全局项值是否合法。★与两处固件判定逐位等价★(见本节头部注释)。
+pub fn global_value_legal(gparam_id: u8, value: u32) -> bool {
+    let fence = global_fence(gparam_id);
+    if !fence.guarded {
+        return true;
+    }
+    fence._core_in_range(fence.core(value))
+}
+
+/// 把非法的全局项值收到最近的合法取值。语义与 `param_clamp` 一致:
+/// `global_value_legal` 放行的值必须原样返回(不拦截项不存在"非法"概念, 不许自作主张地改)。
+pub fn global_clamp(gparam_id: u8, value: u32) -> u32 {
+    let fence = global_fence(gparam_id);
+    if !fence.guarded {
+        return value;
+    }
+    let flags = value & fence.flag_mask;
+    fence._core_fix(fence.core(value)) | flags
+}
+
+// ============================================================================
 // 遥测字段位(T2)
 // ============================================================================
 
@@ -722,6 +1008,96 @@ mod tests {
         let payload = vec![0x05, 0x01, 0x64];
         let result = decode_param_get(&payload);
         assert!(result.is_err());
+    }
+
+    /// ★本次围栏收敛的核心回归★: SNS_CLK_SOURCE 的 0x80 是 CapSense AUTO 标志, 设备合法持有 128。
+    /// 旧实现(slint 里写死 max=6)会把 128 夹成 6, 用户一碰这一行就把 AUTO 标志抹掉。
+    /// 这里逐条钉死: 判定放行、clamp 恒等、UI 上界容得下。
+    #[test]
+    fn test_sns_clk_source_auto_flag_survives() {
+        // 128 = AUTO 标志 + 源 0 ⇒ 合法(固件判的是 `(value & 0x7F) <= 6`)。
+        assert!(param_value_legal(PARAM_SNS_CLK_SOURCE, 128));
+        assert_eq!(param_clamp(PARAM_SNS_CLK_SOURCE, 128), 128);
+        // 带标志位的其余合法源同样恒等。
+        for src in 0u32..=6u32 {
+            assert!(param_value_legal(PARAM_SNS_CLK_SOURCE, 0x80 | src));
+            assert_eq!(param_clamp(PARAM_SNS_CLK_SOURCE, 0x80 | src), 0x80 | src);
+            assert_eq!(param_clamp(PARAM_SNS_CLK_SOURCE, src), src);
+        }
+        // 非法值只夹值域部分, 标志位原样保留。
+        assert!(!param_value_legal(PARAM_SNS_CLK_SOURCE, 0x80 | 7));
+        assert_eq!(param_clamp(PARAM_SNS_CLK_SOURCE, 0x80 | 7), 0x80 | 6);
+        assert_eq!(param_clamp(PARAM_SNS_CLK_SOURCE, 7), 6);
+        // UI 上界必须容得下"值域上界 + 标志位", 否则 SpinBox 又会夹掉 AUTO。
+        let fence = param_fence(PARAM_SNS_CLK_SOURCE);
+        assert!(fence.ui_max() >= 128, "UI 上界必须 >= 128 才装得下 AUTO 标志");
+        assert_eq!(fence.ui_max(), 6 | 0x80);
+        assert_eq!(fence.ui_min(), 0);
+    }
+
+    /// 硬拦截项与固件 `_param_value_legal` / `sensor_link.cpp` 的边界逐位对齐。
+    #[test]
+    fn test_guarded_param_fence_boundaries() {
+        // RESOLUTION 6..16
+        assert!(!param_value_legal(PARAM_RESOLUTION, 5));
+        assert!(param_value_legal(PARAM_RESOLUTION, 6));
+        assert!(param_value_legal(PARAM_RESOLUTION, 16));
+        assert!(!param_value_legal(PARAM_RESOLUTION, 17));
+        assert_eq!(param_clamp(PARAM_RESOLUTION, 0), 6);
+        assert_eq!(param_clamp(PARAM_RESOLUTION, 99), 16);
+        // SNS_CLK_DIV 1..255 (0 会除零)
+        assert!(!param_value_legal(PARAM_SNS_CLK_DIV, 0));
+        assert!(param_value_legal(PARAM_SNS_CLK_DIV, 1));
+        assert!(param_value_legal(PARAM_SNS_CLK_DIV, 255));
+        assert!(!param_value_legal(PARAM_SNS_CLK_DIV, 256));
+        assert_eq!(param_clamp(PARAM_SNS_CLK_DIV, 0), 1);
+        // IDAC_MOD 0..127
+        assert!(param_value_legal(PARAM_IDAC_MOD, 127));
+        assert!(!param_value_legal(PARAM_IDAC_MOD, 128));
+        assert_eq!(param_clamp(PARAM_IDAC_MOD, 200), 127);
+        // IDAC_GAIN 0..6 (增益表 7 项, 索引 7 会让 PSoC 崩溃)
+        assert!(param_value_legal(PARAM_IDAC_GAIN, 6));
+        assert!(!param_value_legal(PARAM_IDAC_GAIN, 7));
+        assert_eq!(param_clamp(PARAM_IDAC_GAIN, 7), 6);
+    }
+
+    /// 固件 `default: return true` 的项一律放行 —— 上位机不许比固件更严, 否则会拒掉设备本来接受的值。
+    #[test]
+    fn test_unguarded_params_always_legal() {
+        for &id in &[
+            PARAM_FINGER_TH,
+            PARAM_NOISE_TH,
+            PARAM_NEG_NOISE_TH,
+            PARAM_HYSTERESIS,
+            PARAM_ON_DEBOUNCE,
+            PARAM_LOW_BSLN_RST,
+        ] {
+            assert!(!param_fence(id).guarded, "0x{:02X} 固件不拦截", id);
+            for v in [0u32, 1, 255, 256, 65535, 0xFFFF_FFFF] {
+                assert!(param_value_legal(id, v), "0x{:02X} = {} 必须放行", id, v);
+                assert_eq!(param_clamp(id, v), v, "放行项不许改值");
+            }
+        }
+        // 未知 param_id 同样放行(复刻固件 default)。
+        assert!(param_value_legal(0x7F, 0xFFFF_FFFF));
+    }
+
+    /// 表里每一项都必须有名字与自洽的区间, 且 KNOWN_PARAM_IDS 全部有声明。
+    #[test]
+    fn test_param_fence_table_selfconsistent() {
+        for &id in KNOWN_PARAM_IDS {
+            let f = param_fence(id);
+            assert_ne!(f.name, "PARAM_UNKNOWN", "0x{:02X} 缺围栏声明", id);
+            assert!(f.min <= f.max, "0x{:02X} 区间反了", id);
+            assert_eq!(f.value_mask & f.flag_mask, 0, "0x{:02X} 值域与标志位重叠", id);
+            assert_eq!(f.max & f.value_mask, f.max, "0x{:02X} 上界超出取位掩码", id);
+            // 极值本身必须合法, 且 clamp 是幂等的。
+            assert_eq!(param_clamp(id, f.min), f.min);
+            assert_eq!(param_clamp(id, f.max), f.max);
+            let c = param_clamp(id, 0xFFFF_FFFF);
+            assert_eq!(param_clamp(id, c), c, "0x{:02X} clamp 非幂等", id);
+            assert!(param_value_legal(id, c), "0x{:02X} clamp 结果仍非法", id);
+        }
     }
 }
 

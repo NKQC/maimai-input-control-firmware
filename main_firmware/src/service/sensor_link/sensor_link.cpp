@@ -51,6 +51,22 @@ constexpr uint8_t kParamCount = sizeof(kParamIds) / sizeof(kParamIds[0]);
 constexpr uint32_t CP_UNMEASURED_FF = 0x00FFFFFFu;
 // PARAM_GET_ALL 的"全通道单参数"变体标记(payload = 0xFF + param_id)。
 constexpr uint8_t kAllChannels = 0xFFu;
+
+// ★长周期 PSoC 指令的反堆叠闸门★
+// 已有一条在途时新请求一律回 DEVICE_BUSY, **绝不排队**。排队会让若干条秒级操作背靠背堆在 core1 上,
+// 而 core1 忙 = core0 的落盘窗口关闭 + 命令环满时 core0 卡在入队自旋, 主循环被整体拖长 ——
+// 用户实测"一次保存后紧接一次 CH8 自适应就掉线"正落在这条上。
+// DEVICE_BUSY 是可重试语义(上位机既有重试/冷却路径认它), 比排队后延迟数十秒才生效诚实得多。
+// 返回 true = 已写好 NAK, 调用方直接 return。
+inline bool heavy_gate_reject(const char* what, const HostFrame& frame,
+                              uint8_t* response, uint16_t* response_length) {
+    Psoc* psoc = Psoc::getInstance();
+    if (!psoc->heavy_busy()) return false;
+    psoc->note_heavy_reject();
+    *response_length = HostCmdCodec::encode_nak(frame.seq, HostCmdError::DEVICE_BUSY,
+                                                what, response, 512);
+    return true;
+}
 }  // namespace
 
 SensorLink::SensorLink()
@@ -416,8 +432,12 @@ void SensorLink::_handle_param_set(const HostFrame& frame, uint8_t* response, ui
                            (static_cast<uint32_t>(frame.payload[4]) << 16) |
                            (static_cast<uint32_t>(frame.payload[5]) << 24);
 
+    // ★三处同源★ 本围栏与以下两处必须逐位等价, 任何一处改动必须三处同改:
+    //   - PSoC:   psoc_firmware/CY8C4147AZI-SensorCore/main.c::_param_value_legal
+    //   - 上位机: control_software/src/proto/telemetry.rs::param_fence(上位机侧唯一权威声明表,
+    //             UI 输入范围 / 下发前拒绝 / 回读防污染都只读它)
     // 合法性防护(与 PSoC 端一致): 拒绝会 railed/时钟异常/校准发散的非法值, 不下发也不写真相源。
-    // RESOLUTION 6..16; SNS_CLK_DIV 1..255; IDAC_MOD 0..127; IDAC_GAIN 0..7; SNS_CLK_SOURCE 低7位 0..6。
+    // RESOLUTION 6..16; SNS_CLK_DIV 1..255; IDAC_MOD 0..127; IDAC_GAIN 0..6; SNS_CLK_SOURCE 低7位 0..6。
     bool legal = true;
     switch (param_id) {
         case 0x07: legal = (value >= 6u)  && (value <= 16u);  break;   // RESOLUTION
@@ -552,6 +572,7 @@ void SensorLink::_emit_param_all_channels(const HostFrame& frame, uint8_t* respo
 void SensorLink::_handle_calibrate(const HostFrame& frame, uint8_t* response, uint16_t* response_length) {
     // payload = ch_mask(u64 LE)；当前 PSoC APPLY 对全部 widget 重校准，不细分通道。
     // 真正的 IDAC 重校准(把 railed 的 raw 拉回目标)+ 基线复位; 与 APPLY(仅重配)区分。
+    if (heavy_gate_reject("PSoC 正在执行长周期指令, 请稍后重试(校准)", frame, response, response_length)) return;
     if (Psoc::getInstance()->calibrate()) {
         *response_length = HostCmdCodec::encode_ack(frame.seq, response, 512);
     } else {
@@ -562,6 +583,7 @@ void SensorLink::_handle_calibrate(const HostFrame& frame, uint8_t* response, ui
 
 void SensorLink::_handle_baseline_reset(const HostFrame& frame, uint8_t* response, uint16_t* response_length) {
     // payload = ch_mask(u64 LE)(当前 PSoC 对全部通道统一复位基线, 不细分通道)。
+    if (heavy_gate_reject("PSoC 正在执行长周期指令, 请稍后重试(基线复位)", frame, response, response_length)) return;
     if (Psoc::getInstance()->baseline_reset()) {
         *response_length = HostCmdCodec::encode_ack(frame.seq, response, 512);
     } else {
@@ -584,6 +606,8 @@ void SensorLink::_handle_auto_tune(const HostFrame& frame, uint8_t* response, ui
             "auto_tune channel out of range", response, 512);
         return;
     }
+    // ★首要嫌疑就是这条的堆叠★: 自适应单次 20s+, 期间再来一条只会背靠背排队, 把主循环整体拖长。
+    if (heavy_gate_reject("PSoC 正在执行长周期指令, 请稍后重试(频率自适应)", frame, response, response_length)) return;
     SensorLink* self = getInstance();
     self->_at_req_ch = req_ch;
     self->_at_ticks = 0;
@@ -635,6 +659,7 @@ void SensorLink::_handle_cp_measure(const HostFrame& frame, uint8_t* response, u
             "cp_measure payload must be empty", response, 512);
         return;
     }
+    if (heavy_gate_reject("PSoC 正在执行长周期指令, 请稍后重试(Cp 测量)", frame, response, response_length)) return;
     if (Psoc::getInstance()->measure_cp()) {
         *response_length = HostCmdCodec::encode_ack(frame.seq, response, 512);
     } else {
@@ -760,6 +785,7 @@ void SensorLink::_handle_global_set(const HostFrame& frame, uint8_t* response, u
 
 // 批量全局项下发完毕后, 单次触发 PSoC 完整重初始化(合并, 防反复重校准漂移/风暴)。
 void SensorLink::_handle_global_commit(const HostFrame& frame, uint8_t* response, uint16_t* response_length) {
+    if (heavy_gate_reject("PSoC 正在执行长周期指令, 请稍后重试(全局提交)", frame, response, response_length)) return;
     Psoc::getInstance()->global_commit();
     *response_length = HostCmdCodec::encode_ack(frame.seq, response, 512);
 }

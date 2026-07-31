@@ -20,6 +20,8 @@ public:
     // HID 模式不跑 game_io 也要能被上位机查询, 此时如实回 STOPPED。
     void register_host_cmds();
     bool is_ready() const { return _initialized; }
+    // 触控数据是否真的在发的唯一定义；调用方不得自行重新组合 is_ready()/get_serial_ok()，以免判定分叉。
+    bool mai2_touch_sending() const;
 
     const Mai2Light_LEDStatus* light_state() const { return _light_state; }
     uint32_t light_generation() const { return _light_generation; }

@@ -2,7 +2,7 @@
 // 全通道实时状态页
 // ============================================================================
 
-import { Button, CheckBox, VerticalBox, HorizontalBox, ScrollView } from "std-widgets.slint";
+import { Button, CheckBox, VerticalBox, HorizontalBox, ScrollView, SpinBox } from "std-widgets.slint";
 import { ChannelStatus } from "../common/types.slint";
 import { Theme } from "../common/theme.slint";
 
@@ -129,14 +129,25 @@ component ChannelStatusCell inherits Rectangle {
     }
 }
 
-// 批量应用抽屉里的一行"参数复选框"。每个参数各自独立勾选, 只有勾上的才会被写到目标通道。
+// 批量应用抽屉里的一行: 勾选 + 参数名 + ★可手改的目标值★。每个参数各自独立勾选, 只有勾上的
+// 才会被写到目标通道。
+//
+// ★值为什么要能改★: 原实现这一列是只读文本, 只能把源通道的值整份复制过去; 想给一批通道写一个
+// 源通道上并不存在的新数字, 就得先跑去源通道改一次再回来复制, 绕一大圈还会把源通道也改掉。
+// ★上下限由 Rust 侧随行下发(minimum/maximum)★: 唯一来源是 proto::telemetry::param_fence,
+// 与 RP2040/PSoC 两处固件同源。这里绝不许按 param_id 写死阈值 —— 那会变成第四份围栏, 与固件
+// 必然漂移(widgets.slint 里刚清掉过一份写死 SNS_CLK_SOURCE 上界 6 的实现)。
 component BatchParamRow inherits Rectangle {
     in property <string> label;
     in property <bool> checked: false;
-    in property <string> value_text: "";
+    // -1 = 面板上尚无值(源通道未回读到该参数且用户也没手填) → 显示"—", 不摆一个假的 0。
+    in property <int> value: -1;
+    in property <int> minimum: 0;
+    in property <int> maximum: 0;
     callback toggled();
+    callback value_set(int);
 
-    height: 26px;
+    height: Theme.row-height;
     HorizontalLayout {
         spacing: 6px;
         CheckBox {
@@ -152,16 +163,32 @@ component BatchParamRow inherits Rectangle {
             horizontal-stretch: 1;
             overflow: elide;
         }
-        Text {
-            // 固定 width: 源通道值随遥测/草稿变化, min-width 挡不住位数变化驱动的重分配。
-            width: 56px;
-            text: root.value_text;
+        // 无值时用"—"占位、数字框隐身(与 widgets.slint::ParamEditorRow 的 AUTO 占位同一手法):
+        // SpinBox 装不下 -1 这个哨兵, 而摆一个 0 会被误读成"该参数真的是 0"。
+        if root.value < 0: Text {
+            min-width: Theme.spin-width;
+            horizontal-stretch: 0;
+            text: "—";
             font-size: Theme.fs-small;
             color: Theme.accent;
-            horizontal-alignment: right;
+            horizontal-alignment: center;
             vertical-alignment: center;
-            overflow: elide;
         }
+        batch_value := SpinBox {
+            visible: root.value >= 0;
+            horizontal-stretch: 0;
+            min-width: Theme.spin-width;
+            minimum: root.minimum;
+            maximum: root.maximum;
+            value: root.value >= root.minimum ? root.value : root.minimum;
+            edited(v) => { root.value_set(v); }
+        }
+    }
+    // ★必须显式把新值重推进部件★: 同 widgets.slint::ParamEditorRow 那个坑 —— SpinBox 内部对
+    // value 是赋值, 用户编辑过一次就永久摧毁了上面那条声明式绑定; 而本行在 Repeater 里被复用
+    // (换源通道只换属性、不重建元素), 不手动写回的话 Rust 侧预填的新值再也推不进来。
+    changed value => {
+        batch_value.value = root.value >= root.minimum ? root.value : root.minimum;
     }
 }
 
@@ -173,10 +200,14 @@ export component AllChannelsPage inherits Rectangle {
     in property <[bool]> batch_ch_selected: [];
     in property <[bool]> batch_param_selected: [];
     in property <[string]> batch_param_names: [];
-    in property <[string]> batch_param_values: [];
+    // 每参数的"待写值"(可手改)。-1 = 面板上尚无值; 上下限唯一来源是 Rust 侧 proto::param_fence。
+    in property <[int]> batch_param_values: [];
+    in property <[int]> batch_param_min: [];
+    in property <[int]> batch_param_max: [];
     in-out property <bool> batch_drawer_open: false;
     callback batch_toggle_channel(int);
     callback batch_toggle_param(int);   // 传 param_id(0x01..0x0B)
+    callback batch_param_value_set(int, int);   // param_id(0x01..0x0B), 新值
     callback batch_channels_all();
     callback batch_channels_invert();
     callback batch_params_all();
@@ -191,6 +222,8 @@ export component AllChannelsPage inherits Rectangle {
     in property <string> curve_threshold_warning: "";
     // 设备实测探测周期(ms, 两位小数), 由 telem_scan_period_us / 1000.0 换算回填。
     in property <float> scan_period_ms: 0;
+    // 探测周期是否有实测值; 停流时来源恒为 0, 无值显示"未测"而不是 0 ms。
+    in property <bool> scan_period_valid: false;
 
     callback telem_start();
     callback telem_stop();
@@ -228,7 +261,9 @@ export component AllChannelsPage inherits Rectangle {
                 width: 300px;
                 overflow: elide;
                 horizontal-alignment: right;
-                text: @tr("采样率") + root.sample_rate_hz + " Hz  " + @tr("探测周期 ") + Math.round(root.scan_period_ms * 100) / 100 + " ms";
+                text: @tr("采样率") + root.sample_rate_hz + " Hz  " + @tr("探测周期 ") + (root.scan_period_valid
+                    ? (Math.round(root.scan_period_ms * 100) / 100 + " ms")
+                    : @tr("未测"));
                 vertical-alignment: center;
                 color: Theme.accent;
             }
@@ -310,7 +345,7 @@ export component AllChannelsPage inherits Rectangle {
                     color: Theme.text-title;
                 }
                 Text {
-                    text: @tr("以下把“源通道”的选定参数复制到选定通道。只影响勾选的通道与勾选的参数，其余一律不动；改动进草稿，需点“保存到设备”才下发。");
+                    text: @tr("下面这一列值默认预填“源通道”的当前值，可逐项直接改成想写的数字。点“应用到已选通道”后，只有勾选的参数会按这一列的值写进勾选的通道，其余一律不动；改动进草稿，需点“保存到设备”才下发。超出合法范围的值会被明确拒绝并写进日志。");
                     font-size: Theme.fs-small;
                     color: Theme.text-sub;
                     wrap: word-wrap;
@@ -372,10 +407,15 @@ export component AllChannelsPage inherits Rectangle {
                             label: name;
                             checked: i < root.batch_param_selected.length
                                 ? root.batch_param_selected[i] : false;
-                            value_text: i < root.batch_param_values.length
-                                ? root.batch_param_values[i] : "";
+                            value: i < root.batch_param_values.length
+                                ? root.batch_param_values[i] : -1;
+                            minimum: i < root.batch_param_min.length
+                                ? root.batch_param_min[i] : 0;
+                            maximum: i < root.batch_param_max.length
+                                ? root.batch_param_max[i] : 0;
                             // 行下标 i 对应 param_id = i + 1(0x01..0x0B), 与 Rust 侧掩码位序一致。
                             toggled => { root.batch_toggle_param(i + 1); }
+                            value_set(v) => { root.batch_param_value_set(i + 1, v); }
                         }
                 }
 

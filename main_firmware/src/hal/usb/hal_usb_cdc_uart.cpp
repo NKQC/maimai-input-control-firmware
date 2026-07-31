@@ -40,7 +40,9 @@ size_t HAL_USB_CDC_UART::read_from_rx_buffer(uint8_t* buffer, size_t length) {
 }
 
 size_t HAL_USB_CDC_UART::get_tx_buffer_free_space() const {
-    return _initialized ? 64 : 0;
+    // ★必须是真值★: 原先恒返回 64, 于是 Mai2Light 的"写不下就丢, 不阻塞"guard 永远不触发,
+    // 每条应答都进到写路径里去等空间。调用方拿这个数决定丢不丢帧, 谎报等于取消了它的背压。
+    return (_initialized && _usb != nullptr) ? _usb->cdc_write_available(_port) : 0;
 }
 
 size_t HAL_USB_CDC_UART::get_rx_buffer_data_count() const {

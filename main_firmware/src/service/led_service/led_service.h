@@ -15,6 +15,8 @@ public:
 
     void set_color(uint8_t color_mask, uint8_t brightness);
     void set_rgb(uint8_t r, uint8_t g, uint8_t b);
+    void get_rgb(uint8_t& r, uint8_t& g, uint8_t& b) const;
+    void push_state(uint8_t flags = 0u);
 
     // 兼容既有布尔状态灯接口
     void set_r(bool on);
@@ -30,9 +32,10 @@ private:
 
     void _set_duty(uint8_t pin, uint8_t duty);
     void _set_rgb_duty(uint8_t r, uint8_t g, uint8_t b);
+    static void _handle_bus_led_set(uint8_t msg_id, uint16_t counter, const uint8_t* data, uint16_t len, void* ctx);
 
     bool _initialized;
-    bool _g_state;
+    uint8_t _rgb[3];
 
     static LedService* _instance;
 };

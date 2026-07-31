@@ -31,6 +31,9 @@ use crate::proto::{
 use crate::proto::{LED_CH_UNMAPPED, LED_PREVIEW_ALL, LED_UNIT_COUNT, LedRegion, LedState};
 use std::collections::{BTreeMap, VecDeque};
 
+mod drafts;
+use drafts::ConfigDrafts;
+
 /// 全局项回读对账的等待窗口(tick @16ms ≈ 12s)。
 /// 必须覆盖"PSoC 重初始化 + RP2040 自持恢复重下发"的完整过程 —— 实测重下发在保存后约 9s 才完成,
 /// 早于此对账会读到 PSoC 启动时的编译默认值(RAW_TARGET=85 / IDAC_GAIN_INIT=4 …), 把一次正常保存
@@ -154,6 +157,23 @@ impl DevClock {
         self.prev_raw = Some(ts_us);
     }
 
+    /// 把**任意**设备帧的 32 位 us 原值映射到本累加器的展开时间轴(只读锚点, 不推进累加值)。
+    ///
+    /// ★为什么可以这么做★ 全协议时间戳同源于设备 `time_us_32()`(bus 头 t_us / host_cmd 尾戳 /
+    /// TELEM_DATA.ts_us / KBD_GET_EDGES.t_us), 因此任一帧的原值与本累加器的锚点 `prev_raw`
+    /// 之间做**有符号** 32 位差值即得它相对锚点的真实偏移 —— 帧比锚点新(正)或旧(负)都正确,
+    /// 且 32 位回绕被 `wrapping_sub as i32` 自然吸收。
+    /// 尚无锚点(还没收到任何遥测帧)时以本值建立 0 点, 于是"停流期间只有轮询数据"也有正确时间轴。
+    /// 累加值的推进权仍**只**属于 `feed()`(遥测帧), 这里不改 `prev_raw`, 避免两个推进者互相打乱。
+    fn unwrap_us(&mut self, raw: u32) -> u64 {
+        let Some(prev) = self.prev_raw else {
+            self.feed(raw);
+            return self.acc_us;
+        };
+        let delta = raw.wrapping_sub(prev) as i32 as i64;
+        (self.acc_us as i64 + delta).max(0) as u64
+    }
+
     fn clear(&mut self) {
         self.prev_raw = None;
         self.acc_us = 0;
@@ -162,9 +182,11 @@ impl DevClock {
 
 /// 算法追踪的一个采样点: 值 + 采样时刻(展开后的设备时间 us)。
 ///
-/// ★时间是近似值★: ALGO_GET_TRACE 是主机轮询取回的, 协议里不带设备端采样时刻, 因此这里
-/// 取"收到响应时最近一次遥测帧的设备时间"作为其时刻。误差量级 = 一个轮询周期(16ms)，
-/// 与遥测帧间隔(30Hz≈33ms)同量级, 落在同一时间轴上不会产生肉眼可见的错位。
+/// ★时间是设备真值, 不再是近似★ 协议已统一给设备→主机的每一帧追加 `time_us_32()` 尾戳
+/// (`proto::FLAG_TS`, 由 `Frame::device_t_us` 承载), 因此这里直接用**设备组帧那一刻**的时刻,
+/// 经 `DevClock::unwrap_us` 折进与遥测同一条展开时间轴。
+/// ⇒ 触发判定/上报线与 TELEM_DATA 从此是同一个时钟, 横向对位精确到设备侧组帧时刻,
+/// 不再受主机轮询周期(16ms)、USB 往返抖动、GUI tick 漂移影响。
 #[derive(Clone, Copy)]
 struct TracePoint {
     t_us: u64,
@@ -266,6 +288,25 @@ pub enum ConnState {
     Connected,
 }
 
+/// PSoC SPI 链路活性证据 —— 链路是否联通的**唯一判定结论**, 判定式与文案同源。
+///
+/// ★为什么要枚举而不是一个 bool★: 原实现直接读 DEVICE_INFO 的 `psoc_link_valid` 布尔位,
+/// 而那个位只在 HELLO 的响应里回一次(见 AppController::psoc_scan_live_at 注释), 于是
+/// "系统状态"的文案与"采样卡"的红字各自去读同一个过期布尔, 一个说通一个说断都发现不了。
+/// 现在只有这一个来源, 携带证据本身, 谁要显示都从它取, 不可能不同步。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PsocLinkEvidence {
+    /// 遥测帧里 samples_per_sec>0 = PSoC 快照代数在推进(最强证据, 随 20~100Hz 遥测持续刷新)。
+    ScanAdvancing { sps: u32 },
+    /// 停流时的唯一证据: DEVICE_INFO 回读 link_ok=1, 或两次回读之间代数推进了。
+    Handshake { generation: u16 },
+    /// 判定窗口内没有任何活性证据。`since_ms=None` = 本次连接从未拿到过证据。
+    Stale {
+        since_ms: Option<u64>,
+        last_generation: Option<u16>,
+    },
+}
+
 // ============================================================================
 // 设备候选(合并 io::list_devices + comport::identify_ports)
 // ============================================================================
@@ -310,6 +351,17 @@ pub struct AppController {
     device_info: Option<DeviceInfo>,
     /// 从 DEVICE_INFO 诊断尾部回读的真实 CSD 模式；缺失表示旧固件或尚未握手。
     csd_mode: Option<u8>,
+    /// 最近一次"遥测证明 PSoC 快照代数在推进"的主机时刻。
+    /// ★为什么不能只看 DEVICE_INFO.psoc_link_valid★: 那个字节只在 HELLO 的 DEVICE_INFO 响应里
+    /// 回一次, 而 HELLO 只在握手/重连/救砖后发 ⇒ 它是"握手那一瞬的快照", 之后永不刷新。固件的
+    /// link_ok 本身会因 SPI 残帧抖动(psoc_spi.cpp 注释), 握手恰好撞上抖动就把"未联通"钉死到下次
+    /// 重连 —— 界面于是一边显示 179Hz 采样一边说链路断了。改由活性证据判定: 遥测帧的
+    /// samples_per_sec 就是 PSoC scan_count 的增量速率(psoc.cpp 每 500ms 折算), >0 即代数在推进。
+    psoc_scan_live_at: Option<std::time::Instant>,
+    /// 最近一次"DEVICE_INFO 证明链路活着"的主机时刻(停流时的唯一证据)。
+    psoc_info_live_at: Option<std::time::Instant>,
+    /// 上一次 DEVICE_INFO 读到的代数: 两次读之间推进过 = 活着(即便 link_ok 那一帧恰好抖动为 0)。
+    psoc_gen_seen: Option<u16>,
     seq: u8,
     last_error: Option<String>,
     status_text: String,
@@ -447,6 +499,12 @@ pub struct AppController {
     /// 批量应用的源通道(参数从这里复制)。独立于"当前精调通道": 抽屉里要一边看着源通道的值、
     /// 一边勾目标通道, 两者若共用一个字段, 勾选动作就会把源通道改掉。
     batch_source: u8,
+    /// 批量应用的"每参数待写值"(下标 = param_id - 1, 0x01..=0x0B)。
+    /// `None` = 还没有值(源通道尚未回读到该参数, 且用户也没手填) ⇒ 应用时跳过该项, 绝不拿 0 顶替。
+    /// ★为什么要独立于源通道真值★: 面板上的值现在是可手改的输入框, 用户改过之后必须以他填的数
+    /// 为准; 若每次 PARAM_GET 回来都按源通道真值重置, 刚键入的数会被弹回(工程内 ParamEditorRow
+    /// 踩过同一个坑)。故只在"选定源通道"与"该项仍为空"时才用真值预填。
+    batch_values: [Option<u32>; 11],
     /// 当前遥测档位: Some(true)=逐通道档, Some(false)=仅统计/延迟轻档, None=未知(需重新下发)。
     telem_scope_channels: Option<bool>,
     /// 配置写类命令的串行发送队列 + 在途帧(cmd, seq, 已等 tick 数)。
@@ -461,6 +519,13 @@ pub struct AppController {
     /// 改用 PARAM_GET_ALL 的 0xFF 全通道变体(一条命令覆盖 36 通道的同一参数), 11 个参数即 11 条命令,
     /// 且每个 16ms tick 只发一条 —— 既不提高轮询频率, 也不会像 36 条单通道请求那样打爆 OUT 端点。
     param_refetch_ids: Vec<u8>,
+    /// 已自动回写过修正值的 `(ch, param_id)` 登记表 —— 回读防污染的防写风暴闸门。
+    /// 同一项自动回写至多一次; 回读到合法值即注销, 允许下次真出问题时重新纠正。
+    /// (设备若一直回非法值, 只会继续告警, 不会变成"回读→回写→回读"的无限风暴。)
+    param_fix_sent: std::collections::HashSet<(u8, u8)>,
+    /// 已自动回写过修正值的 gparam_id 登记表 —— 全局项回读防污染的防写风暴闸门。
+    /// 语义与 `param_fix_sent` 完全一致(每项至多回写一次, 回读到合法值即注销), 只是键无通道维度。
+    global_fix_sent: std::collections::HashSet<u8>,
 
     /// 阻塞类操作(校准/基线复位/重启/频率自适应)进行中标志 + 中文标签, 供 UI 锁定按钮+显示运行图标。
     /// 触发时置位并记录期望回执 seq; 收到匹配 seq 的 ACK/NAK 或 AUTO_TUNE 响应即清除。
@@ -519,10 +584,15 @@ pub struct AppController {
     /// 旧固件只回 phys_state 时保持 0 —— 不拿 phys_state 冒充 raw/out(那会让防抖效果看不出来)。
     kbd_state_raw: u16,
     kbd_state_out: u16,
-    /// 每键触发极性 + 独立防抖: 设备真值缓存 + 草稿(与长按参数同一套草稿范式)+ 版本号。
+    /// 每键触发极性 + 独立防抖: 设备真值缓存 + 版本号(草稿在 `drafts` 内)。
     kbd_keycfg: [KbdKeyCfg; KBD_HOLD_PHYS_COUNT],
-    kbd_keycfg_draft: BTreeMap<u8, KbdKeyCfg>,
     kbd_keycfg_version: u64,
+    /// 固件解析后的**生效**极性掩码(bit i = 1 → 按高电平触发判定)。AUTO 档到底学成了高还是低
+    /// 只能靠它显示。旧固件不追加该字段时保持 0。
+    kbd_pol_resolved_mask: u16,
+    /// 上面这份掩码是否真的从设备读到过。false = 旧固件没回传该尾部字段, 生效电平**未知**;
+    /// 此时 UI 必须显示"未知", 不能把 mask=0 当成"全部低电平触发"那样凭空造结论。
+    kbd_pol_resolved_known: bool,
     /// 设备是否支持每键配置/边沿记录。None=尚未问过; Some(false)=旧固件回了 NAK, 停止轮询。
     kbd_keycfg_supported: Option<bool>,
     kbd_edges_supported: Option<bool>,
@@ -538,11 +608,10 @@ pub struct AppController {
     /// 同时用于把 NAK 归因到"旧固件不支持"而不是"没有边沿"。
     kbd_edge_req_seq: Option<u8>,
     kbd_keycfg_req_seq: Option<u8>,
-    /// 触控组合映射: 设备真值缓存 / 草稿(None=无改动) / 版本号 / 设备是否支持 / 在途回读 seq。
+    /// 触控组合映射: 设备真值缓存 / 版本号 / 设备是否支持 / 在途回读 seq(草稿在 `drafts` 内)。
     /// 整表管理而不是逐条: 固件的 KBD_SET_COMBO 就是整表替换语义(逐条增删会产生半新半旧的中间态,
     /// 而同一分区可能同时属于多条, 中间态会瞬时输出错误按键)。
     kbd_combo_cache: Vec<crate::proto::KbdComboItem>,
-    kbd_combo_draft: Option<Vec<crate::proto::KbdComboItem>>,
     kbd_combo_version: u64,
     kbd_combo_supported: Option<bool>,
     kbd_combo_req_seq: Option<u8>,
@@ -550,6 +619,9 @@ pub struct AppController {
     kbd_combo_pending_mask: u64,
     kbd_combo_pending_keys: [u8; crate::proto::KBD_COMBO_KEY_COUNT],
     kbd_combo_pending_mods: u8,
+    /// 已有映射里"下一次抓到的键要整行替换"的行号(见 kbd_combo_capture_key_at)。
+    /// None = 累加。只是一个待替换登记, 不代表该行此刻被清空过。
+    kbd_combo_key_edit_row: Option<usize>,
 
     /// mai2 串口(游戏触控上报)运行态回读缓存(MAI2_GET_STATE 响应)+ 版本号; None=尚未回读。
     mai2_state: Option<Mai2State>,
@@ -558,9 +630,6 @@ pub struct AppController {
     /// mai2light 灯板协议运行态快照(LED_GET 响应)+ 版本号; None=尚未回读。
     led_state: Option<LedState>,
     led_version: u64,
-    /// 11 单元映射编辑草稿; None = 跟随设备回读值(用户尚未改过)。
-    /// 与配置草稿分开: 映射靠 LED_SET_REGION 即时整批下发, 不参与 SAVE_CONFIG 流程。
-    led_region_draft: Option<[LedRegion; LED_UNIT_COUNT]>,
     /// 灯效写操作(LED_SET_REGION / LED_PREVIEW)的下发 seq + 类型: 用于把 ACK/NAK 归因到
     /// 具体操作, 失败原因必须显示而非静默。预览与映射共用本槽位(两者不会并发)。
     led_apply_seq: Option<(u8, LedWriteOp)>,
@@ -569,25 +638,19 @@ pub struct AppController {
     desired: DesiredState,
     restore_verify: RestoreVerify,
 
-    /// 有未保存到设备 flash 的设置草稿: 任意设置改动置真, SAVE_CONFIG 后清。
-    /// 供 UI 提示"已修改未保存"并在离开设置页时统一保存(保护 flash 寿命)。
-    config_dirty: bool,
-    config_dirty_version: u64,
-    /// 未保存到 flash 的配置项 key 集合, 供 UI 显示"N 项未保存"。SAVE_CONFIG 后清空。
-    config_dirty_keys: std::collections::BTreeSet<String>,
-
     // ------------------------------------------------------------------
     // 配置草稿覆盖层 (draft overlay)
     //
-    // UI 的所有编辑只写入以下草稿, 不再即时下发设备; 只有点击"保存"(save_config)
+    // UI 的所有编辑只写入草稿, 不再即时下发设备; 只有点击"保存"(save_config)
     // 才把草稿统一下发并请求写 flash。读取类 getter 一律"草稿优先 → 缓存兜底",
     // 使 UI 立即看到自己编辑的值, 而设备运行态保持不变直到保存。
-    // dirty key 采用稳定命名: cfg:<key> / param:<ch>:<id> / param:all:<id> /
-    // global:<id> / algo:cfg:<idx> / mode / kbd:phys:<idx> / kbd:zone:<zone>。
+    //
+    // ★12 份草稿 + 未保存脏键集合 + 版本号全部收在 `ConfigDrafts` 内且字段私有★:
+    // 草稿本体拿不到 `&mut`, 任何修改只能经其方法, 方法内部必定同步登记/撤销脏键并
+    // bump version —— "改了草稿却忘记标记未保存"在编译期即不可能(见 drafts.rs 文件头)。
+    // 脏状态不再有独立 bool: `is_config_dirty()` 派生自脏键集合是否为空。
     // ------------------------------------------------------------------
-    cfg_draft: BTreeMap<String, CfgValue>,
-    param_draft: BTreeMap<(u8, u8), u32>,
-    global_draft: BTreeMap<u8, u32>,
+    drafts: ConfigDrafts,
     /// 刚下发出去的全局项期望值, 等回读真值后逐项对账(不一致即固件夹取/拒收, 必须告警)。
     globals_expected: BTreeMap<u8, u32>,
     /// 回读对账倒计时(tick 数)与"本次 GET_ALL 响应用于对账"的标记。
@@ -595,13 +658,6 @@ pub struct AppController {
     globals_verify_active: bool,
     /// 已处理的自持恢复事件 seq(设备背压时会重发同一条, 按此去重)。
     self_heal_last_seq: Option<u16>,
-    algo_cfg_draft: BTreeMap<u8, u8>,
-    mode_draft: Option<u8>,
-    kbd_map_draft: BTreeMap<u8, (u8, u8)>,
-    kbd_touch_draft: BTreeMap<u8, (u8, u8)>,
-    /// 物理键与触控分区的长按参数草稿；保存时合并为一帧 KBD_SET_HOLD 下发。
-    kbd_hold_phys_draft: BTreeMap<u8, HoldParam>,
-    kbd_hold_zone_draft: BTreeMap<u8, HoldParam>,
     /// 保存时若提交了 mode.work(USB Serial/HID 拓扑)改动, 置真: 该改动需整机重启重枚举才生效,
     /// 由 UI 侧在保存后延时自动重启设备并清除本标记。
     pending_reboot: bool,
@@ -661,6 +717,9 @@ impl AppController {
             state: ConnState::Disconnected,
             device_info: None,
             csd_mode: None,
+            psoc_scan_live_at: None,
+            psoc_info_live_at: None,
+            psoc_gen_seen: None,
             seq: 0,
             last_error: None,
             status_text: "未连接".to_string(),
@@ -733,10 +792,13 @@ impl AppController {
             batch_sel: BatchApplySel::new(),
             batch_sel_version: 0,
             batch_source: 0,
+            batch_values: [None; 11],
             telem_scope_channels: None,
             cfg_tx_queue: std::collections::VecDeque::new(),
             cfg_tx_inflight: None,
             param_refetch_ids: Vec::new(),
+            param_fix_sent: std::collections::HashSet::new(),
+            global_fix_sent: std::collections::HashSet::new(),
 
             op_busy: false,
             op_busy_ticks: 0,
@@ -773,8 +835,9 @@ impl AppController {
             kbd_state_raw: 0,
             kbd_state_out: 0,
             kbd_keycfg: [KbdKeyCfg::default(); KBD_HOLD_PHYS_COUNT],
-            kbd_keycfg_draft: BTreeMap::new(),
             kbd_keycfg_version: 0,
+            kbd_pol_resolved_mask: 0,
+            kbd_pol_resolved_known: false,
             kbd_keycfg_supported: None,
             kbd_edges_supported: None,
             kbd_edges: VecDeque::new(),
@@ -785,38 +848,26 @@ impl AppController {
             kbd_edge_req_seq: None,
             kbd_keycfg_req_seq: None,
             kbd_combo_cache: Vec::new(),
-            kbd_combo_draft: None,
             kbd_combo_version: 0,
             kbd_combo_supported: None,
             kbd_combo_req_seq: None,
             kbd_combo_pending_mask: 0,
             kbd_combo_pending_keys: [0; crate::proto::KBD_COMBO_KEY_COUNT],
             kbd_combo_pending_mods: 0,
+            kbd_combo_key_edit_row: None,
             mai2_state: None,
             mai2_version: 0,
             led_state: None,
             led_version: 0,
-            led_region_draft: None,
             led_apply_seq: None,
             led_apply_status: String::new(),
             desired: DesiredState::default(),
             restore_verify: RestoreVerify::default(),
-            config_dirty: false,
-            config_dirty_version: 0,
-            config_dirty_keys: std::collections::BTreeSet::new(),
-            cfg_draft: BTreeMap::new(),
-            param_draft: BTreeMap::new(),
-            global_draft: BTreeMap::new(),
+            drafts: ConfigDrafts::new(),
             globals_expected: BTreeMap::new(),
             globals_verify_in: None,
             globals_verify_active: false,
             self_heal_last_seq: None,
-            algo_cfg_draft: BTreeMap::new(),
-            mode_draft: None,
-            kbd_map_draft: BTreeMap::new(),
-            kbd_touch_draft: BTreeMap::new(),
-            kbd_hold_phys_draft: BTreeMap::new(),
-            kbd_hold_zone_draft: BTreeMap::new(),
             pending_reboot: false,
             algo_source: String::new(),
             algo_asm: String::new(),
@@ -1155,7 +1206,7 @@ impl AppController {
         self.restore_verify.clear();
         // 灯效映射草稿按设备灯链长度校验, 换设备/重连后必须重来, 否则会拿旧链长的区段去 NAK。
         self.led_state = None;
-        self.led_region_draft = None;
+        self.drafts.drop_led_region();
         self.led_apply_seq = None;
         self.led_apply_status.clear();
         self.led_version = self.led_version.wrapping_add(1);
@@ -1171,6 +1222,10 @@ impl AppController {
         // 换设备/重连后设备可能已重启, ts_us 从头开始 → 时钟必须归零, 否则会算出一个巨大的假间隙。
         self.telem_clock.clear();
         self.telem_frame_at = None;
+        // 链路活性证据必须随缓存一起清: 换设备/重连后旧设备的"活着"不能算新链路的证据。
+        self.psoc_scan_live_at = None;
+        self.psoc_info_live_at = None;
+        self.psoc_gen_seen = None;
         for param_map in &mut self.params {
             param_map.clear();
         }
@@ -1276,6 +1331,13 @@ impl AppController {
                     // 模式与诊断同帧回读，只有设备明确上报后才允许 UI 展示/编辑对应状态。
                     let was_connected = self.state == ConnState::Connected;
                     self.csd_mode = info.diagnostics.as_ref().map(|diag| diag.csd_mode);
+                    // 链路活性证据(停流时的唯一来源): link_ok=1, 或两次 DEVICE_INFO 之间代数推进了
+                    // —— 后者能盖住 link_ok 那一帧恰好因 SPI 残帧抖动为 0 的情况。
+                    let gen_advanced = self.psoc_gen_seen.is_some_and(|g| g != info.psoc_generation);
+                    self.psoc_gen_seen = Some(info.psoc_generation);
+                    if info.psoc_link_valid || gen_advanced {
+                        self.psoc_info_live_at = Some(std::time::Instant::now());
+                    }
                     self.device_info = Some(info);
                     self.state = ConnState::Connected;
                     self.status_text = "已连接".to_string();
@@ -1363,8 +1425,7 @@ impl AppController {
                     self.kbd_combo_req_seq = None;
                     self.kbd_combo_cache = items;
                     // 回读到设备真值后丢弃草稿: 与其它页"回读即真值"的口径一致。
-                    self.kbd_combo_draft = None;
-                    self.config_dirty_keys.remove("kbd:combo");
+                    self.drafts.drop_kbd_combo();
                     self.kbd_combo_version = self.kbd_combo_version.wrapping_add(1);
                 }
                 Err(e) => {
@@ -1413,36 +1474,13 @@ impl AppController {
             }
         }
         // ★值未变不标脏★: 重新选一遍当前内容(或改回原值)不应产生"未保存改动"。
-        let dirty_key = format!("cfg:{}", entry.key);
-        if let Some(dev) = self.config_cache.get(&entry.key) {
-            if Self::_cfg_eq(&dev.value, &entry.value) {
-                self.cfg_draft.remove(&entry.key);
-                self._drop_dirty(&dirty_key);
-                return Ok(());
-            }
-        }
-        self.config_dirty_keys.insert(dirty_key);
-        self.cfg_draft.insert(entry.key, entry.value);
-        self.mark_config_dirty();
+        let same_as_device = self
+            .config_cache
+            .get(&entry.key)
+            .is_some_and(|dev| Self::_cfg_eq(&dev.value, &entry.value));
+        self.drafts
+            .set_cfg(&entry.key, entry.value, same_as_device);
         Ok(())
-    }
-
-    /// 标记有未保存改动(任意设置已下发设备生效, 但未写 flash)。
-    pub fn mark_config_dirty(&mut self) {
-        if !self.config_dirty {
-            self.config_dirty = true;
-            self.config_dirty_version = self.config_dirty_version.wrapping_add(1);
-        }
-    }
-    /// 与 `mark_config_dirty` 对称: 某项值回到设备当前值时清掉它的脏标记;
-    /// dirty key 集合变空即把整体 dirty 归零(否则"改回原值"后仍显示 N 项未保存)。
-    fn _drop_dirty(&mut self, key: &str) {
-        if self.config_dirty_keys.remove(key) {
-            if self.config_dirty_keys.is_empty() {
-                self.config_dirty = false;
-            }
-            self.config_dirty_version = self.config_dirty_version.wrapping_add(1);
-        }
     }
 
     /// 两个配置值是否等价。CfgValue 未派生 PartialEq(含 F32/Str), 故逐变体比较。
@@ -1459,15 +1497,17 @@ impl AppController {
         }
     }
 
+    /// 有未保存到设备 flash 的设置草稿。★派生量★: 脏键集合(未保存项的引用计数)非空即为脏,
+    /// 不再有独立 bool 可与集合漂移, 故与 `config_dirty_count()` 数学上不可能矛盾。
     pub fn is_config_dirty(&self) -> bool {
-        self.config_dirty
+        self.drafts.is_dirty()
     }
     pub fn config_dirty_version(&self) -> u64 {
-        self.config_dirty_version
+        self.drafts.version()
     }
     /// 未保存配置项数量, 供 UI 显示"N 项未保存"。
     pub fn config_dirty_count(&self) -> i32 {
-        self.config_dirty_keys.len() as i32
+        self.drafts.dirty_count() as i32
     }
 
     /// 按缓存原始类型设置数值配置项。
@@ -1524,22 +1564,21 @@ impl AppController {
         // ACK/NAK(或超时)才发下一帧(窗口=1)。原来是一次性把上百帧直接灌进 IO 队列, 设备侧 core0
         // 在写 flash / 重初始化期间根本不解析命令, 背靠背灌入必然把链路打崩。
         let mut queued: Vec<Frame> = Vec::new();
-        if !self.config_dirty {
+        if !self.drafts.is_dirty() {
             // 无草稿改动: 仅请求写 flash(把设备当前运行态落盘)。
             let seq = self.next_seq();
             self._queue_tx(Frame::new(HostCmd::SaveConfig as u8, 0, seq, vec![]))?;
             return Ok(());
         }
+        // 提交前先取快照: 下方 `_commit_combo` 会撤销 kbd:combo 的脏键(取草稿即提交),
+        // mode.work 判定也必须在清草稿之前, 故两者统一在此处定格。
+        let dirty_count = self.drafts.dirty_count();
+        let mode_work_changed = self.drafts.has_cfg("mode.work");
 
         // 1) 普通配置。绑定槽 bind.mapNN 且映射到有效物理通道时用 BIND_SET_MAP
         //    [zone, channel] 下发, 使固件 reload_binding() 真正刷新运行态映射;
         //    其余(含"清除"=0xFFFFFFFF)走 CFG_SET 写配置。两类最终都随 SAVE_CONFIG 落 flash。
-        let cfg_items: Vec<(String, CfgValue)> = self
-            .cfg_draft
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-        for (key, value) in cfg_items {
+        for (key, value) in self.drafts.cfg_items() {
             let bind_channel = key
                 .strip_prefix("bind.map")
                 .and_then(|s| s.parse::<usize>().ok())
@@ -1572,9 +1611,8 @@ impl AppController {
             }
         }
         // 2) 参数
-        let param_items: Vec<((u8, u8), u32)> =
-            self.param_draft.iter().map(|(k, v)| (*k, *v)).collect();
-        for ((ch, id), value) in param_items {
+        let param_items: Vec<((u8, u8), u32)> = self.drafts.param_items();
+        for ((ch, id), value) in param_items.iter().copied() {
             let payload = crate::proto::encode_param_set(ch, id, value);
             let seq = self.next_seq();
             if self.io.is_some() {
@@ -1593,10 +1631,9 @@ impl AppController {
         //     CALIBRATE")会让 PSoC 的校准把用户刚选的增益档冲回全局起点档, 即用户改了档位却被
         //     自己这条 CALIBRATE 抹掉, UI 显示的与设备实际不符。0x0B 的生效由固件在 SET 时自行
         //     re-init 保证, 故此处跳过; 其余硬件类参数行为不变。
-        let hw_ids: Vec<u8> = self
-            .param_draft
-            .keys()
-            .map(|(_, id)| *id)
+        let hw_ids: Vec<u8> = param_items
+            .iter()
+            .map(|((_, id), _)| *id)
             .filter(|id| *id >= 0x07)
             .collect();
         let idac_gain_only =
@@ -1621,7 +1658,7 @@ impl AppController {
             }
         }
         // 3) 全局 CSD
-        let g_items: Vec<(u8, u32)> = self.global_draft.iter().map(|(k, v)| (*k, *v)).collect();
+        let g_items: Vec<(u8, u32)> = self.drafts.global_items();
         if !g_items.is_empty() {
             // ★CSD 调试★: 记录本次下发的全局项序列。GLOBAL_SET 只写 PSoC 影子，
             // 全部项写完后的单次 GLOBAL_COMMIT 才触发完整重初始化，避免逐项重初始化风暴。
@@ -1671,11 +1708,7 @@ impl AppController {
             self.globals_verify_in = Some(GLOBALS_VERIFY_TICKS);
         }
         // 4) 算法可设置变量。SET_CFG 不触发重初始化，无需 GLOBAL_COMMIT 或额外冷却。
-        let algo_cfg_items: Vec<(u8, u8)> = self
-            .algo_cfg_draft
-            .iter()
-            .map(|(idx, val)| (*idx, *val))
-            .collect();
+        let algo_cfg_items: Vec<(u8, u8)> = self.drafts.algo_cfg_items();
         for (idx, val) in algo_cfg_items {
             let seq = self.next_seq();
             if self.io.is_some() {
@@ -1686,14 +1719,14 @@ impl AppController {
         // 4b) 触控组合映射(整表替换)。放在物理键/触控键之前无所谓: 固件侧是独立表, 互不影响。
         self._commit_combo(&mut queued)?;
         // 5) 工作模式
-        if let Some(mode) = self.mode_draft {
+        if let Some(mode) = self.drafts.mode() {
             let seq = self.next_seq();
             if self.io.is_some() {
                 queued.push(Frame::new(HostCmd::ModeSet as u8, 0, seq, vec![mode]));
             }
         }
         // 5) 键盘物理键
-        let km: Vec<(u8, (u8, u8))> = self.kbd_map_draft.iter().map(|(k, v)| (*k, *v)).collect();
+        let km: Vec<(u8, (u8, u8))> = self.drafts.kbd_map_items();
         for (idx, (code, m)) in km {
             let seq = self.next_seq();
             if self.io.is_some() {
@@ -1710,7 +1743,7 @@ impl AppController {
             }
         }
         // 6) 键盘触控映射
-        let kt: Vec<(u8, (u8, u8))> = self.kbd_touch_draft.iter().map(|(k, v)| (*k, *v)).collect();
+        let kt: Vec<(u8, (u8, u8))> = self.drafts.kbd_touch_items();
         for (zone, (code, m)) in kt {
             let seq = self.next_seq();
             if self.io.is_some() {
@@ -1727,20 +1760,7 @@ impl AppController {
             }
         }
         // 6b) 长按参数草稿。KBD_SET_HOLD 的 payload 是 n×6B 项数组，全部草稿项合成一帧下发。
-        let hold_items: Vec<KbdHoldItem> = self
-            .kbd_hold_phys_draft
-            .iter()
-            .map(|(idx, hold)| KbdHoldItem {
-                kind: KBD_HOLD_KIND_PHYS,
-                idx: *idx,
-                hold: *hold,
-            })
-            .chain(self.kbd_hold_zone_draft.iter().map(|(idx, hold)| KbdHoldItem {
-                kind: KBD_HOLD_KIND_ZONE,
-                idx: *idx,
-                hold: *hold,
-            }))
-            .collect();
+        let hold_items: Vec<KbdHoldItem> = self.drafts.kbd_hold_items();
         if !hold_items.is_empty() {
             let seq = self.next_seq();
             let payload = crate::proto::encode_kbd_set_hold(&hold_items);
@@ -1759,11 +1779,7 @@ impl AppController {
         }
         // 6c) 每键触发极性 + 独立防抖草稿。与长按参数同口径: 全部草稿项合成一帧 KBD_SET_KEYCFG。
         // 固件对该帧做"整批校验后才落值"(任一项越界整帧 NAK), 因此这里也必须整批发, 不逐项。
-        let keycfg_items: Vec<(u8, KbdKeyCfg)> = self
-            .kbd_keycfg_draft
-            .iter()
-            .map(|(idx, cfg)| (*idx, *cfg))
-            .collect();
+        let keycfg_items: Vec<(u8, KbdKeyCfg)> = self.drafts.kbd_keycfg_items();
         if !keycfg_items.is_empty() {
             let seq = self.next_seq();
             let payload = crate::proto::encode_kbd_set_keycfg(&keycfg_items);
@@ -1789,8 +1805,6 @@ impl AppController {
         }
 
         // mode.work(USB Serial/HID 拓扑)改动需整机重启重枚举才生效, 记录待重启标记。
-        let mode_work_changed = self.cfg_draft.contains_key("mode.work");
-        let count = self.config_dirty_keys.len();
         self._clear_drafts();
         if mode_work_changed {
             self.pending_reboot = true;
@@ -1798,7 +1812,10 @@ impl AppController {
         }
         // 缓存已随下发同步; 递增版本让 UI 用已提交值刷新各页。
         self._bump_view_versions();
-        self.push_log(format!("保存: 已下发 {} 项草稿改动并请求写入 flash", count));
+        self.push_log(format!(
+            "保存: 已下发 {} 项草稿改动并请求写入 flash",
+            dirty_count
+        ));
         Ok(())
     }
 
@@ -1827,7 +1844,7 @@ impl AppController {
 
     /// 草稿中是否包含 mode.work(USB Serial/HID)改动 —— 该改动需整机重启才生效, 供 UI 提示。
     pub fn draft_needs_reboot(&self) -> bool {
-        self.cfg_draft.contains_key("mode.work")
+        self.drafts.has_cfg("mode.work")
     }
 
     /// 保存后是否有待执行的自动重启(mode.work 拓扑切换)。
@@ -1842,7 +1859,7 @@ impl AppController {
 
     /// 撤销全部未保存草稿, 恢复到设备当前运行态(缓存值)。供 CSD/配置页"撤销"使用。
     pub fn discard_draft(&mut self) {
-        if !self.config_dirty {
+        if !self.drafts.is_dirty() {
             return;
         }
         self._clear_drafts();
@@ -1850,28 +1867,14 @@ impl AppController {
         self.push_log("撤销: 已丢弃全部未保存草稿");
     }
 
-    /// 清空全部草稿与脏标记(内部辅助)。
+    /// 清空全部草稿与脏键(内部辅助)。12 份草稿(含灯效单元映射与组合映射整表)由
+    /// `ConfigDrafts::clear_all` 一次清净 —— 逐个手写清理正是"漏一个就永远显示未保存"的来源。
     fn _clear_drafts(&mut self) {
-        let algo_cfg_changed = !self.algo_cfg_draft.is_empty();
-        self.cfg_draft.clear();
-        self.param_draft.clear();
-        self.global_draft.clear();
-        self.algo_cfg_draft.clear();
-        self.mode_draft = None;
-        self.kbd_map_draft.clear();
-        self.kbd_touch_draft.clear();
-        self.kbd_hold_phys_draft.clear();
-        self.kbd_hold_zone_draft.clear();
-        self.kbd_keycfg_draft.clear();
-        // 灯效单元映射同属草稿层(led_set_region 只写不发), 撤销/提交后必须一并回到设备真值,
-        // 否则"撤销未保存改动"之后灯效页仍停在草稿值。
-        self.led_region_draft = None;
+        let algo_cfg_changed = self.drafts.has_algo_cfg();
+        self.drafts.clear_all();
         if algo_cfg_changed {
             self.algo_cfg_version = self.algo_cfg_version.wrapping_add(1);
         }
-        self.config_dirty = false;
-        self.config_dirty_keys.clear();
-        self.config_dirty_version = self.config_dirty_version.wrapping_add(1);
     }
 
     /// 重置为默认配置
@@ -1919,13 +1922,77 @@ impl AppController {
 
     /// 设置源通道(UI 上是 Shift+单击)。源通道自身不需要也不应被勾成目标 —— 顺手把它从目标集里
     /// 摘掉, 免得用户看到"源=目标"这种无意义的选择还以为会生效。
+    /// ★换源通道即整列重新预填★: 换源的语义就是"改用另一个通道的值当模板", 保留上一个源的手改
+    /// 残留只会让人分不清面板上这一列到底是谁的值。
     pub fn batch_set_source(&mut self, ch: u8) {
         if ch >= 36 {
             return;
         }
         self.batch_source = ch;
         self.batch_sel.ch_mask &= !(1u64 << ch);
+        self.batch_values = [None; 11];
+        self._batch_fill_missing();
         self.batch_sel_version = self.batch_sel_version.wrapping_add(1);
+    }
+
+    /// 批量面板每参数的待写值(下标 = param_id - 1)。`-1` = 尚无值(源通道未回读且用户未手填):
+    /// 用一个不可能合法的哨兵值表达"无", 免得再并排一个 bool 数组(围栏 min 一律 >= 0)。
+    pub fn batch_values(&self) -> Vec<i32> {
+        self.batch_values
+            .iter()
+            .map(|v| v.map_or(-1i32, |x| x as i32))
+            .collect()
+    }
+
+    /// 各参数的合法输入范围(下标 = param_id - 1), 唯一来源 = `proto::param_fence`。
+    /// ★不许在 .slint 里按 param_id 写阈值★: 那会变成第四份围栏, 与固件两处必然漂移。
+    pub fn batch_value_bounds(&self) -> (Vec<i32>, Vec<i32>) {
+        let mut mins = Vec::with_capacity(11);
+        let mut maxs = Vec::with_capacity(11);
+        for id in 0x01u8..=0x0Bu8 {
+            let fence = crate::proto::param_fence(id);
+            mins.push(fence.ui_min() as i32);
+            maxs.push(fence.ui_max() as i32);
+        }
+        (mins, maxs)
+    }
+
+    /// 用户在批量面板里手改某项的待写值。不校验围栏 —— 校验统一在应用时由 `set_param` 做
+    /// (与手工编辑同一条路径), 这里若提前拒绝, 用户就没法把数字从一个非法中间态改到合法值。
+    pub fn batch_set_value(&mut self, param_id: u8, value: u32) {
+        if !(0x01..=0x0B).contains(&param_id) {
+            return;
+        }
+        self.batch_values[(param_id - 1) as usize] = Some(value);
+        self.batch_sel_version = self.batch_sel_version.wrapping_add(1);
+    }
+
+    /// 把仍为空的项用当前源通道的真值补上(源通道参数是异步回读的, 选源那一刻可能还没到)。
+    /// ★只补空项★: 已有值的项可能是用户手改过的, 覆盖它就等于把人家键入的数抹掉。
+    /// 返回是否补进了新值, 供调用方决定要不要 bump 版本号(避免每 tick 无意义地重建行模型)。
+    pub fn batch_fill_missing_values(&mut self) -> bool {
+        let filled = self._batch_fill_missing();
+        if filled {
+            self.batch_sel_version = self.batch_sel_version.wrapping_add(1);
+        }
+        filled
+    }
+
+    /// 预填实现(不动版本号): 供 `batch_set_source` 与 `batch_fill_missing_values` 复用。
+    fn _batch_fill_missing(&mut self) -> bool {
+        let src = self.batch_source;
+        let mut filled = false;
+        for id in 0x01u8..=0x0Bu8 {
+            let slot = (id - 1) as usize;
+            if self.batch_values[slot].is_some() {
+                continue;
+            }
+            if let Some(value) = self.param(src, id) {
+                self.batch_values[slot] = Some(value);
+                filled = true;
+            }
+        }
+        filled
     }
 
     pub fn batch_toggle_channel(&mut self, ch: u8) {
@@ -1970,9 +2037,11 @@ impl AppController {
         self.batch_sel_version = self.batch_sel_version.wrapping_add(1);
     }
 
-    /// 把源通道 `src` 上被勾选的参数, 写进被勾选的目标通道的草稿。
+    /// 把批量面板上被勾选的参数【按面板上的当前值】写进被勾选目标通道的草稿。
+    /// 值来自 `batch_values`(选源通道时用源真值预填, 之后可由用户逐项手改) —— ★写的是面板上
+    /// 显示的那个数★, 而不是重新去读源通道, 否则用户手改的值会被静默忽略。
     /// 严格隔离: 未勾选的通道、未勾选的参数一律不碰; 源通道自身即使被勾选也跳过(自我复制无意义)。
-    /// 源通道缺该参数真值时跳过该项并计数, 绝不拿 0 或默认值顶替。
+    /// 无值的项跳过并计数, 绝不拿 0 或默认值顶替; 非法值由 `set_param` 的围栏明确拒绝并记日志。
     pub fn batch_apply_from(&mut self, src: u8) -> anyhow::Result<()> {
         if src >= 36 {
             return Ok(());
@@ -1992,15 +2061,27 @@ impl AppController {
             return Ok(());
         }
         let mut missing = 0usize;
+        let mut rejected = 0usize;
         let mut written = 0usize;
         for id in &ids {
-            let Some(value) = self.param(src, *id) else {
+            let Some(value) = self.batch_values[(*id - 1) as usize] else {
                 missing += 1;
                 continue;
             };
+            // ★非法项只跳过它自己, 不中断整批★: 一个参数越界就 `?` 返回, 会让前面已写入草稿的
+            // 项半途而废, 用户既不知道写到哪了, 也不知道剩下的没写。围栏判定与通道无关(同一个
+            // 值对 36 个通道同样合法或同样非法), 故第一个通道被拒即整项跳过 —— 告警只出现一次,
+            // 不刷 36 条同样的日志(拒绝原因与合法范围由 set_param 内部写进日志)。
+            let mut ok = true;
             for ch in &targets {
-                self.set_param(*ch, *id, value)?;
+                if self.set_param(*ch, *id, value).is_err() {
+                    ok = false;
+                    break;
+                }
                 written += 1;
+            }
+            if !ok {
+                rejected += 1;
             }
         }
         // 批量写草稿不经控件, 必须显式 bump 让下一 tick 的既有门控重建行模型(同 JSON 导入路径)。
@@ -2009,13 +2090,19 @@ impl AppController {
             "批量应用完成: 源 CH{} → {} 个通道 × {} 项参数, 共写入 {} 项草稿。需点“保存到设备”才生效。",
             src,
             targets.len(),
-            ids.len() - missing,
+            ids.len() - missing - rejected,
             written
         );
         if missing > 0 {
             msg.push_str(&format!(
-                " 跳过 {} 项(源通道尚无该参数真值, 未用默认值顶替)。",
+                " 跳过 {} 项(面板上无值: 源通道尚无该参数真值且未手填, 未用默认值顶替)。",
                 missing
+            ));
+        }
+        if rejected > 0 {
+            msg.push_str(&format!(
+                " 拒绝 {} 项(面板上填的值超出该参数合法范围, 见上方告警)。",
+                rejected
             ));
         }
         self.push_log(msg);
@@ -2130,6 +2217,38 @@ impl AppController {
             true
         } else {
             false
+        }
+    }
+
+    /// 在已有 IO 会话中同步执行一条 BUS_XFER，期间照常派发无关的 IO 事件。
+    pub fn bus_xfer(
+        &mut self,
+        payload: Vec<u8>,
+        timeout: std::time::Duration,
+    ) -> anyhow::Result<Vec<u8>> {
+        let seq = self.next_seq();
+        self.io
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("未连接，无法发送 BUS_XFER"))?
+            .send(Frame::new(HostCmd::BusXfer as u8, 0, seq, payload))?;
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(anyhow::anyhow!("BUS_XFER 响应超时"));
+            }
+            let event = self
+                .io
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("等待 BUS_XFER 响应时设备断开"))?
+                .recv_timeout(remaining)
+                .map_err(|error| anyhow::anyhow!("BUS_XFER 响应失败: {}", error))?;
+            match event {
+                IoEvent::Frame(frame) if frame.cmd == HostCmd::BusXfer as u8 => {
+                    return Ok(frame.payload);
+                }
+                event => self.handle_event(event),
+            }
         }
     }
 
@@ -2271,7 +2390,7 @@ impl AppController {
     pub fn config_entries(&self) -> Vec<ConfigEntry> {
         self.config_cache
             .values()
-            .map(|e| match self.cfg_draft.get(&e.key) {
+            .map(|e| match self.drafts.cfg(&e.key) {
                 Some(v) => ConfigEntry::new(e.key.clone(), v.clone()),
                 None => e.clone(),
             })
@@ -2280,7 +2399,7 @@ impl AppController {
 
     /// 查询单个配置项, 草稿优先。
     pub fn config_get(&self, key: &str) -> Option<ConfigEntry> {
-        if let Some(v) = self.cfg_draft.get(key) {
+        if let Some(v) = self.drafts.cfg(key) {
             return Some(ConfigEntry::new(key.to_string(), v.clone()));
         }
         self.config_cache.get(key).cloned()
@@ -2433,9 +2552,83 @@ impl AppController {
         Ok(())
     }
 
+    /// 下发前的围栏校验: 非法即拒绝(不落草稿、不下发), 并把"哪个参数、什么值、合法范围"写进日志。
+    /// ★为什么不夹取后照发★: 夹取是上位机替用户改主意 —— 用户看到的是自己填的数, 设备里却是另一个值,
+    /// 且下一次回读会把夹取值写回界面, 用户根本不知道自己的输入被改过。宁可拒绝并告知。
+    /// 围栏唯一来源 = `proto::telemetry::param_fence`(与两处固件同源, 见该文件头注释)。
+    /// `ch = 0xFF` 表示整组(全 36 通道)写入, 仅影响文案。
+    fn _reject_illegal_param(&mut self, ch: u8, param_id: u8, value: u32) -> anyhow::Result<()> {
+        if crate::proto::param_value_legal(param_id, value) {
+            return Ok(());
+        }
+        let fence = crate::proto::param_fence(param_id);
+        let scope = if ch == crate::proto::PARAM_ALL_CHANNELS {
+            "全通道".to_string()
+        } else {
+            format!("CH{}", ch)
+        };
+        let message = format!(
+            "已拒绝非法参数: {} 0x{:02X} {} = {} 超出合法范围 {} → 未下发也未暂存(固件同样会拒收)。",
+            scope,
+            param_id,
+            fence.name,
+            value,
+            fence.range_text()
+        );
+        self.push_log_warn(message.clone());
+        Err(anyhow::anyhow!(message))
+    }
+
+    /// 回读方向防污染: 设备回来的值若非法, 返回应写入缓存的**修正值**, 并按需回写设备。
+    /// 返回值即调用方要存进 `self.params[ch]` 的值 —— 界面回显修正后的正确值而不是脏值。
+    ///
+    /// ★为什么回写而不是只夹显示★: 只夹显示会让上位机与设备长期不一致 —— 用户看到的是修正值,
+    /// 设备里躺的还是脏值, 他以为"改好了"其实没有。回写才能真正把设备纠回合法态。
+    ///
+    /// ★防写风暴/死循环★: 每个 `(ch, param_id)` 自动回写至多一次(`param_fix_sent` 登记),
+    /// 回读到合法值时才注销该登记, 允许下次真出问题时重新纠正。链路不可用时只记日志不回写,
+    /// 回写值自身再过一次围栏(clamp 实现出错也不会发出非法值)。
+    fn _guard_readback_param(&mut self, ch: u8, param_id: u8, value: u32) -> u32 {
+        if crate::proto::param_value_legal(param_id, value) {
+            self.param_fix_sent.remove(&(ch, param_id));
+            return value;
+        }
+        let fixed = crate::proto::param_clamp(param_id, value);
+        let fence = crate::proto::param_fence(param_id);
+        self.push_log_warn(format!(
+            "设备回读到非法参数: CH{} 0x{:02X} {} = {}(合法范围 {}), 已按极值修正为 {}。\
+             正常不应出现, 出现说明该项修改未真正生效或链路异常。",
+            ch,
+            param_id,
+            fence.name,
+            value,
+            fence.range_text(),
+            fixed
+        ));
+        let first_fix = self.param_fix_sent.insert((ch, param_id));
+        if !first_fix {
+            return fixed;
+        }
+        if self.state != ConnState::Connected || self.io.is_none() {
+            self.push_log_warn("链路不可用, 本次仅修正界面显示, 未回写设备。".to_string());
+            return fixed;
+        }
+        // 走既有 PARAM_SET 路径(内含围栏校验 + 串行发送队列)纠正下位机脏值。
+        if let Err(e) = self.debug_param_now(ch, param_id, fixed) {
+            self.push_log_warn(format!("非法参数回写失败: {}", e));
+        } else {
+            self.push_log_warn(format!(
+                "已向设备回写修正值: CH{} 0x{:02X} {} = {}。",
+                ch, param_id, fence.name, fixed
+            ));
+        }
+        fixed
+    }
+
     /// 诊断用: 直接下发单通道参数到设备(不经草稿、不写 flash), 供无头探针实时改参验证时钟生效。
     /// 与 GUI 的 set_param(草稿) 区分: 这条立即经 PARAM_SET 送达设备并同步本地缓存。
     pub fn debug_param_now(&mut self, ch: u8, param_id: u8, value: u32) -> anyhow::Result<()> {
+        self._reject_illegal_param(ch, param_id, value)?;
         let payload = crate::proto::encode_param_set(ch, param_id, value);
         let seq = self.next_seq();
         if self.io.is_some() {
@@ -2458,11 +2651,72 @@ impl AppController {
 
     /// 诊断用: 直接下发全局 CSD 配置(不写草稿), 使 global_get 回读到的是设备真值而非草稿乐观值。
     pub fn debug_global_now(&mut self, gparam_id: u8, value: u32) -> anyhow::Result<()> {
+        self._reject_illegal_global(gparam_id, value)?;
         let seq = self.next_seq();
         if self.io.is_some() {
             self._queue_tx(crate::proto::algo::encode_global_set(seq, gparam_id, value))?;
         }
         Ok(())
+    }
+
+    /// 全局项下发前的围栏校验: 非法即拒绝(不落草稿、不下发), 并告知合法范围。
+    /// 语义与 `_reject_illegal_param` 逐条对应 —— ★不夹取后照发★, 那是替用户改主意。
+    /// 围栏唯一来源 = `proto::telemetry::global_fence`(与两处固件同源, 见该文件该节头注释)。
+    fn _reject_illegal_global(&mut self, gparam_id: u8, value: u32) -> anyhow::Result<()> {
+        if crate::proto::global_value_legal(gparam_id, value) {
+            return Ok(());
+        }
+        let fence = crate::proto::global_fence(gparam_id);
+        let message = format!(
+            "已拒绝非法全局项: {} 0x{:02X} {} = {} 超出合法范围 {} → 未下发也未暂存(固件同样会 NAK)。",
+            Self::_gparam_name(gparam_id),
+            gparam_id,
+            fence.name,
+            value,
+            fence.range_text()
+        );
+        self.push_log_warn(message.clone());
+        Err(anyhow::anyhow!(message))
+    }
+
+    /// 全局项回读方向防污染: 设备回来的值若非法, 返回应写入缓存的**修正值**, 并按需回写设备。
+    /// 与 `_guard_readback_param` 同一套机制(含防写风暴), 只是键是 gparam_id。
+    ///
+    /// ★防写风暴/死循环★: 每个 gparam_id 自动回写至多一次(`global_fix_sent` 登记), 回读到合法值
+    /// 时才注销该登记; 链路不可用时只记日志不回写; 回写走 `debug_global_now`(内含围栏再校验)。
+    fn _guard_readback_global(&mut self, gparam_id: u8, value: u32) -> u32 {
+        if crate::proto::global_value_legal(gparam_id, value) {
+            self.global_fix_sent.remove(&gparam_id);
+            return value;
+        }
+        let fixed = crate::proto::global_clamp(gparam_id, value);
+        let fence = crate::proto::global_fence(gparam_id);
+        self.push_log_warn(format!(
+            "设备回读到非法全局项: {} 0x{:02X} {} = {}(合法范围 {}), 已按最近合法值修正为 {}。\
+             正常不应出现, 出现说明该项修改未真正生效或链路异常。",
+            Self::_gparam_name(gparam_id),
+            gparam_id,
+            fence.name,
+            value,
+            fence.range_text(),
+            fixed
+        ));
+        if !self.global_fix_sent.insert(gparam_id) {
+            return fixed;
+        }
+        if self.state != ConnState::Connected || self.io.is_none() {
+            self.push_log_warn("链路不可用, 本次仅修正界面显示, 未回写设备。".to_string());
+            return fixed;
+        }
+        if let Err(e) = self.debug_global_now(gparam_id, fixed) {
+            self.push_log_warn(format!("非法全局项回写失败: {}", e));
+        } else {
+            self.push_log_warn(format!(
+                "已向设备回写修正值: 0x{:02X} {} = {}。",
+                gparam_id, fence.name, fixed
+            ));
+        }
+        fixed
     }
 
     /// 暂存单个参数到草稿(不下发)。保存时统一下发。
@@ -2475,34 +2729,19 @@ impl AppController {
         if param_id == 0x07 {
             return self.set_param_all(param_id, value);
         }
-        let dirty_key = format!("param:{}:{}", ch, param_id);
-        if self.params[ch as usize].get(&param_id) == Some(&value) {
-            self.param_draft.remove(&(ch, param_id));
-            self._drop_dirty(&dirty_key);
-            return Ok(());
-        }
-        self.param_draft.insert((ch, param_id), value);
-        self.config_dirty_keys.insert(dirty_key);
-        self.mark_config_dirty();
+        self._reject_illegal_param(ch, param_id, value)?;
+        let same_as_device = self.params[ch as usize].get(&param_id) == Some(&value);
+        self.drafts.set_param(ch, param_id, value, same_as_device);
         Ok(())
     }
 
     /// 将一个参数值暂存到全部 36 个物理通道草稿。整组视为一项脏计数(param:all:<id>)。
     pub fn set_param_all(&mut self, param_id: u8, value: u32) -> anyhow::Result<()> {
+        self._reject_illegal_param(0xFF, param_id, value)?;
         // 整组语义: 仅当全部 36 通道都已等于设备值时才算无改动(否则任一通道不同即需下发)。
-        let dirty_key = format!("param:all:{}", param_id);
-        if (0..36usize).all(|ch| self.params[ch].get(&param_id) == Some(&value)) {
-            for ch in 0..36u8 {
-                self.param_draft.remove(&(ch, param_id));
-            }
-            self._drop_dirty(&dirty_key);
-            return Ok(());
-        }
-        for ch in 0..36u8 {
-            self.param_draft.insert((ch, param_id), value);
-        }
-        self.config_dirty_keys.insert(dirty_key);
-        self.mark_config_dirty();
+        let same_as_device =
+            (0..36usize).all(|ch| self.params[ch].get(&param_id) == Some(&value));
+        self.drafts.set_param_all(param_id, value, same_as_device);
         Ok(())
     }
 
@@ -2749,20 +2988,17 @@ impl AppController {
     /// 与其他草稿写入一致: 值等于设备真值(DEVICE_INFO 诊断回读的 csd_mode)时撤回草稿并清脏,
     /// 免得"选回原模式"或"导入同值文件"留下一条永远存在的未保存项。
     pub fn set_mode(&mut self, mode: u8) -> anyhow::Result<()> {
-        if self.csd_mode == Some(mode) {
-            self.mode_draft = None;
-            self._drop_dirty("mode");
-            return Ok(());
-        }
-        self.mode_draft = Some(mode);
-        self.config_dirty_keys.insert("mode".to_string());
-        self.mark_config_dirty();
+        let same_as_device = self.csd_mode == Some(mode);
+        self.drafts.set_mode(mode, same_as_device);
         Ok(())
     }
 
-    /// 草稿优先的当前 CSD 处理模式(未编辑时为 None, 由 UI 决定默认展示)。
+    /// CSD 处理模式的**草稿层**原值(未编辑时 None)。
+    ///
+    /// ★不要用它做"当前模式"判定★ 判定一律用 [`Self::csd_mode_effective`]。
+    /// 本访问器只表达"草稿里有没有一个待保存的值", 供脏态/导出这类需要区分草稿与真值的场景。
     pub fn mode_draft(&self) -> Option<u8> {
-        self.mode_draft
+        self.drafts.mode()
     }
 
     /// 触发 CSD 参数捕获(PSoC 当前自整定值 → RP2040 store)
@@ -2978,23 +3214,19 @@ impl AppController {
     }
     /// 全局 CSD 参数: 仅暂存草稿，点击“保存到设备”后统一下发。
     pub fn global_set(&mut self, gparam_id: u8, value: u32) -> anyhow::Result<()> {
+        // ★围栏在"写入草稿之前"★: 草稿是唯一的批量下发来源(save_config 逐项 encode_global_set),
+        // 一旦非法值进了草稿, 保存时才被固件 NAK, 用户只会看到一次失败而不知道是哪项、为什么。
+        self._reject_illegal_global(gparam_id, value)?;
         // ★统一草稿★: 全局项只暂存, 由“保存到设备”批量下发 + 单次 GLOBAL_COMMIT 重初始化，
         // 避免逐项重初始化风暴与重复下发。
-        let dirty_key = format!("global:{}", gparam_id);
-        if self.globals.get(&gparam_id) == Some(&value) {
-            self.global_draft.remove(&gparam_id);
-            self._drop_dirty(&dirty_key);
-            return Ok(());
-        }
-        self.global_draft.insert(gparam_id, value);
-        self.config_dirty_keys.insert(dirty_key);
-        self.mark_config_dirty();
+        let same_as_device = self.globals.get(&gparam_id) == Some(&value);
+        self.drafts.set_global(gparam_id, value, same_as_device);
         Ok(())
     }
     /// 全局 CSD 参数, 草稿优先。
     pub fn global(&self, gparam_id: u8) -> Option<u32> {
-        if let Some(v) = self.global_draft.get(&gparam_id) {
-            return Some(*v);
+        if let Some(v) = self.drafts.global(gparam_id) {
+            return Some(v);
         }
         self.globals.get(&gparam_id).copied()
     }
@@ -3013,7 +3245,7 @@ impl AppController {
         Ok(())
     }
     // ------------------------------------------------------------------
-    // 触控组合映射(多分区 → 多键)。草稿制: 编辑只进 kbd_combo_draft, 由"保存到设备"整表下发。
+    // 触控组合映射(多分区 → 多键)。草稿制: 编辑只进 `drafts` 的组合整表, 由"保存到设备"下发。
     // 固件侧是整表替换语义, 所以草稿也按整表管理, 不做逐条增删的增量协议。
     // ------------------------------------------------------------------
 
@@ -3054,6 +3286,9 @@ impl AppController {
     }
 
     /// 抓到一个键: 追加到待新建的键位数组(去重, 满 4 个后忽略并提示)。修饰位取并集。
+    /// ★这里的累加是"一次录制会话内"的语义★(用于"同时按住 F5+F6"这类真实和弦):
+    /// 跨会话的覆盖由 UI 侧完成 —— KeyCaptureBox 每次进入录制态先调 kbd_combo_clear_keys(),
+    /// 所以不同时间按下的键不会攒成一条多键映射。本函数因此不需要自己判断会话边界。
     pub fn kbd_combo_capture_key(&mut self, keycode: u8, mods: u8) {
         self.kbd_combo_pending_mods |= mods;
         if keycode != 0 {
@@ -3077,12 +3312,13 @@ impl AppController {
         self.kbd_combo_version = self.kbd_combo_version.wrapping_add(1);
     }
 
-    /// 把待新建条目提交成一条映射。成功后清空待新建区。
-    pub fn kbd_combo_commit_pending(&mut self) {
+    /// 把待新建条目提交成一条映射。时间参数由新建区的两个输入框给出(不再硬编码 0/0)。
+    /// 成功后只清空分区与按键; ★两个时间参数留在 UI 侧且刻意不清零★(连续添加同类映射不必重填)。
+    pub fn kbd_combo_commit_pending(&mut self, delay_ms: u16, max_hold_ms: u16) {
         let mask = self.kbd_combo_pending_mask;
         let keys = self.kbd_combo_pending_keys;
         let mods = self.kbd_combo_pending_mods;
-        if self.kbd_combo_add(mask, keys, mods, 0, 0) {
+        if self.kbd_combo_add(mask, keys, mods, delay_ms, max_hold_ms) {
             self.kbd_combo_pending_mask = 0;
             self.kbd_combo_pending_keys = [0; crate::proto::KBD_COMBO_KEY_COUNT];
             self.kbd_combo_pending_mods = 0;
@@ -3092,8 +3328,8 @@ impl AppController {
 
     /// 当前生效的组合表(草稿优先)。未回读且无草稿时为空表。
     pub fn kbd_combos(&self) -> Vec<crate::proto::KbdComboItem> {
-        match &self.kbd_combo_draft {
-            Some(d) => d.clone(),
+        match self.drafts.kbd_combo() {
+            Some(d) => d.to_vec(),
             None => self.kbd_combo_cache.clone(),
         }
     }
@@ -3162,10 +3398,12 @@ impl AppController {
             return;
         }
         table.remove(index);
+        // 删除会让后续行号整体前移, 留着旧登记等于把"替换"落到另一行上, 直接撤销。
+        self.kbd_combo_key_edit_row = None;
         self._stage_combo(table);
     }
 
-    /// 改某条的时间参数(ms)。键与分区要改就删了重加 —— 保持编辑面板只有一条路径。
+    /// 改某条的时间参数(ms)。分区集合仍然只能删了重加(单一编辑路径); 按键可就地重录, 见下。
     pub fn kbd_combo_set_hold(&mut self, index: usize, delay_ms: u16, max_hold_ms: u16) {
         let mut table = self.kbd_combos();
         if index >= table.len() {
@@ -3176,15 +3414,68 @@ impl AppController {
         self._stage_combo(table);
     }
 
+    /// 登记"下一次抓到的键整行替换第 index 行"。★只登记, 绝不在这里清空该行按键★:
+    /// 清空会在草稿里留下一条 0 键映射, 用户此刻点"保存到设备"就会把空条目下发出去。
+    /// 改成"抓到键的那一刻才替换", 于是 0 键中间态根本不存在, 也就无从被保存。
+    pub fn kbd_combo_begin_edit_keys(&mut self, index: usize) {
+        if index >= self.kbd_combos().len() {
+            return;
+        }
+        self.kbd_combo_key_edit_row = Some(index);
+    }
+
+    /// 就地重录第 index 行的按键组合。语义与新建区 `kbd_combo_capture_key` 完全同口径 ——
+    /// ★跨会话覆盖、会话内累加★: 本行有待替换登记(由 KeyCaptureBox 的 capture_started 边沿
+    /// 打上, 一次录制会话只打一次)时本键替换整行; 否则累加(同键去重、修饰位取并集、
+    /// 满 KBD_COMBO_KEY_COUNT 忽略并告警)。所以"同时按住 F5+F6"照旧能录成多键。
+    pub fn kbd_combo_capture_key_at(&mut self, index: usize, keycode: u8, mods: u8) {
+        let mut table = self.kbd_combos();
+        if index >= table.len() {
+            return;
+        }
+        if self.kbd_combo_key_edit_row == Some(index) {
+            self.kbd_combo_key_edit_row = None;
+            table[index].keycodes = [0; crate::proto::KBD_COMBO_KEY_COUNT];
+            table[index].modifiers = 0;
+        }
+        table[index].modifiers |= mods;
+        if keycode != 0 {
+            if table[index].keycodes.contains(&keycode) {
+                // 同一键重复抓取不算错, 静默忽略。
+            } else if let Some(slot) = table[index].keycodes.iter_mut().find(|k| **k == 0) {
+                *slot = keycode;
+            } else {
+                self.push_log_warn(format!(
+                    "组合映射: 单条最多 {} 个键, 已忽略新键。",
+                    crate::proto::KBD_COMBO_KEY_COUNT
+                ));
+            }
+        }
+        self._stage_combo(table);
+    }
+
+    /// 用整张表覆盖组合映射草稿(JSON 导入用)。
+    /// ★为什么单独开一个入口★: 导入是"整表替换", 而 `kbd_combo_add` 带一堆交互态校验
+    /// (上限提示/重复分区拒绝/空键拒绝)并逐条追加 —— 拿它做导入会把文件里合法的整表判成冲突。
+    /// 合法性已在导入侧按同一口径过滤(空条目丢弃、超上限丢弃), 这里只负责落草稿。
+    pub fn kbd_combo_replace_table(&mut self, table: Vec<crate::proto::KbdComboItem>) {
+        self.kbd_combo_key_edit_row = None;
+        self._stage_combo(table);
+    }
+
+    /// 组合映射整表入草稿。★与设备缓存完全相等即撤稿★(与 param/keycfg 同口径):
+    /// 脏状态派生自脏键集合, 若不做这一步, "删了又加回原样"会被永久误报为未保存。
+    /// 脏键登记与 version bump 由 `ConfigDrafts::set_kbd_combo` 内部完成, 无从遗漏
+    /// —— 旧实现在这里只插脏键却漏了 `mark_config_dirty()`, 导致"添加组合映射后按钮不亮"。
     fn _stage_combo(&mut self, table: Vec<crate::proto::KbdComboItem>) {
-        self.kbd_combo_draft = Some(table);
-        self.config_dirty_keys.insert("kbd:combo".to_string());
+        let same_as_device = table == self.kbd_combo_cache;
+        self.drafts.set_kbd_combo(table, same_as_device);
         self.kbd_combo_version = self.kbd_combo_version.wrapping_add(1);
     }
 
     /// 由 save_config 调用: 把草稿整表排入统一写队列。无草稿则什么都不做。
     fn _commit_combo(&mut self, queued: &mut Vec<Frame>) -> anyhow::Result<()> {
-        let Some(table) = self.kbd_combo_draft.take() else {
+        let Some(table) = self.drafts.take_kbd_combo() else {
             return Ok(());
         };
         let payload = crate::proto::encode_kbd_set_combo(&table);
@@ -3215,20 +3506,14 @@ impl AppController {
         if idx >= 12 {
             return Err(anyhow::anyhow!("物理键索引非法: {}", idx));
         }
-        let dirty_key = format!("kbd:phys:{}", idx);
         let i = idx as usize;
-        if self.kbd_map.get(i) == Some(&keycode) && self.kbd_keymod.get(i) == Some(&modifier) {
-            self.kbd_map_draft.remove(&idx);
-            self._drop_dirty(&dirty_key);
-            // 草稿撤回也要 bump: getter 是"草稿优先", 撤回后可见值变回设备真值, UI 必须跟着回填。
-            self.kbd_map_version = self.kbd_map_version.wrapping_add(1);
-            return Ok(());
-        }
-        self.kbd_map_draft.insert(idx, (keycode, modifier));
-        self.config_dirty_keys.insert(dirty_key);
-        self.mark_config_dirty();
+        let same_as_device =
+            self.kbd_map.get(i) == Some(&keycode) && self.kbd_keymod.get(i) == Some(&modifier);
+        self.drafts
+            .set_kbd_map(idx, keycode, modifier, same_as_device);
         // ★必须 bump★: main.rs 的键码/修饰位/显示文本回填全部由该 version 门控; 只写草稿不 bump
         // 会让"捕获组合键"在界面上毫无反应(看起来只是退出了录制态), 用户无法确认是否落地。
+        // 撤稿分支同样要 bump: getter 是"草稿优先", 撤回后可见值变回设备真值, UI 必须跟着回填。
         self.kbd_map_version = self.kbd_map_version.wrapping_add(1);
         Ok(())
     }
@@ -3237,19 +3522,11 @@ impl AppController {
         if zone >= 34 {
             return Err(anyhow::anyhow!("分区索引非法: {}", zone));
         }
-        let dirty_key = format!("kbd:zone:{}", zone);
         let z = zone as usize;
-        if self.kbd_touchmap.get(z) == Some(&keycode) && self.kbd_zonemod.get(z) == Some(&modifier)
-        {
-            self.kbd_touch_draft.remove(&zone);
-            self._drop_dirty(&dirty_key);
-            // 同上: 撤回草稿后可见值回到设备真值, 不 bump 则 UI 停在草稿显示。
-            self.kbd_touchmap_version = self.kbd_touchmap_version.wrapping_add(1);
-            return Ok(());
-        }
-        self.kbd_touch_draft.insert(zone, (keycode, modifier));
-        self.config_dirty_keys.insert(dirty_key);
-        self.mark_config_dirty();
+        let same_as_device = self.kbd_touchmap.get(z) == Some(&keycode)
+            && self.kbd_zonemod.get(z) == Some(&modifier);
+        self.drafts
+            .set_kbd_touch(zone, keycode, modifier, same_as_device);
         // ★必须 bump★: 见 kbd_set_map 说明 —— 显示文本/下拉索引/修饰位都由该 version 门控回填。
         self.kbd_touchmap_version = self.kbd_touchmap_version.wrapping_add(1);
         Ok(())
@@ -3261,14 +3538,14 @@ impl AppController {
         self.kbd_state_version
     }
     pub fn kbd_map(&self, idx: u8) -> u8 {
-        if let Some((code, _)) = self.kbd_map_draft.get(&idx) {
-            return *code;
+        if let Some((code, _)) = self.drafts.kbd_map(idx) {
+            return code;
         }
         *self.kbd_map.get(idx as usize).unwrap_or(&0)
     }
     pub fn kbd_keymod(&self, idx: u8) -> u8 {
-        if let Some((_, m)) = self.kbd_map_draft.get(&idx) {
-            return *m;
+        if let Some((_, m)) = self.drafts.kbd_map(idx) {
+            return m;
         }
         *self.kbd_keymod.get(idx as usize).unwrap_or(&0)
     }
@@ -3276,14 +3553,14 @@ impl AppController {
         self.kbd_map_version
     }
     pub fn kbd_touch_keycode(&self, zone: u8) -> u8 {
-        if let Some((code, _)) = self.kbd_touch_draft.get(&zone) {
-            return *code;
+        if let Some((code, _)) = self.drafts.kbd_touch(zone) {
+            return code;
         }
         *self.kbd_touchmap.get(zone as usize).unwrap_or(&0)
     }
     pub fn kbd_zone_mod(&self, zone: u8) -> u8 {
-        if let Some((_, m)) = self.kbd_touch_draft.get(&zone) {
-            return *m;
+        if let Some((_, m)) = self.drafts.kbd_touch(zone) {
+            return m;
         }
         *self.kbd_zonemod.get(zone as usize).unwrap_or(&0)
     }
@@ -3351,9 +3628,8 @@ impl AppController {
     /// 物理键 idx(0..11) 的长按参数：草稿优先 → 设备回读兜底。
     pub fn kbd_hold_phys(&self, idx: u8) -> (u16, u16) {
         let hold = self
-            .kbd_hold_phys_draft
-            .get(&idx)
-            .copied()
+            .drafts
+            .kbd_hold_phys(idx)
             .or_else(|| self.kbd_hold_phys.get(idx as usize).copied())
             .unwrap_or_default();
         (hold.delay_ms, hold.max_hold_ms)
@@ -3362,9 +3638,8 @@ impl AppController {
     /// 触控分区 zone(0..33) 的长按参数：草稿优先 → 设备回读兜底。
     pub fn kbd_hold_zone(&self, zone: u8) -> (u16, u16) {
         let hold = self
-            .kbd_hold_zone_draft
-            .get(&zone)
-            .copied()
+            .drafts
+            .kbd_hold_zone(zone)
             .or_else(|| self.kbd_hold_zone.get(zone as usize).copied())
             .unwrap_or_default();
         (hold.delay_ms, hold.max_hold_ms)
@@ -3400,20 +3675,12 @@ impl AppController {
         if (idx as usize) >= KBD_HOLD_PHYS_COUNT {
             return Err(anyhow::anyhow!("物理键长按索引非法: {}", idx));
         }
-        let dirty_key = format!("kbd:hold:phys:{}", idx);
         let hold = HoldParam {
             delay_ms,
             max_hold_ms,
         };
-        if self.kbd_hold_phys.get(idx as usize) == Some(&hold) {
-            self.kbd_hold_phys_draft.remove(&idx);
-            self._drop_dirty(&dirty_key);
-            self.kbd_hold_version = self.kbd_hold_version.wrapping_add(1);
-            return Ok(());
-        }
-        self.kbd_hold_phys_draft.insert(idx, hold);
-        self.config_dirty_keys.insert(dirty_key);
-        self.mark_config_dirty();
+        let same_as_device = self.kbd_hold_phys.get(idx as usize) == Some(&hold);
+        self.drafts.set_kbd_hold_phys(idx, hold, same_as_device);
         self.kbd_hold_version = self.kbd_hold_version.wrapping_add(1);
         Ok(())
     }
@@ -3428,20 +3695,12 @@ impl AppController {
         if (zone as usize) >= KBD_HOLD_ZONE_COUNT {
             return Err(anyhow::anyhow!("触控分区长按索引非法: {}", zone));
         }
-        let dirty_key = format!("kbd:hold:zone:{}", zone);
         let hold = HoldParam {
             delay_ms,
             max_hold_ms,
         };
-        if self.kbd_hold_zone.get(zone as usize) == Some(&hold) {
-            self.kbd_hold_zone_draft.remove(&zone);
-            self._drop_dirty(&dirty_key);
-            self.kbd_hold_version = self.kbd_hold_version.wrapping_add(1);
-            return Ok(());
-        }
-        self.kbd_hold_zone_draft.insert(zone, hold);
-        self.config_dirty_keys.insert(dirty_key);
-        self.mark_config_dirty();
+        let same_as_device = self.kbd_hold_zone.get(zone as usize) == Some(&hold);
+        self.drafts.set_kbd_hold_zone(zone, hold, same_as_device);
         self.kbd_hold_version = self.kbd_hold_version.wrapping_add(1);
         Ok(())
     }
@@ -3457,20 +3716,30 @@ impl AppController {
 
     // ------------------------------------------------------------------
     // 物理键每键配置(触发极性 + 独立防抖)与逻辑分析仪边沿记录
-    // 草稿制与长按参数完全同一套: 编辑只进 kbd_keycfg_draft, "保存到设备"才下发。
+    // 草稿制与长按参数完全同一套: 编辑只进 `drafts` 的每键配置草稿, "保存到设备"才下发。
     // ------------------------------------------------------------------
 
     /// 物理键 idx(0..11) 的触发极性与防抖窗: 草稿优先 → 设备回读兜底。
     pub fn kbd_keycfg(&self, idx: u8) -> KbdKeyCfg {
-        self.kbd_keycfg_draft
-            .get(&idx)
-            .copied()
+        self.drafts
+            .kbd_keycfg(idx)
             .or_else(|| self.kbd_keycfg.get(idx as usize).copied())
             .unwrap_or_default()
     }
 
     pub fn kbd_keycfg_version(&self) -> u64 {
         self.kbd_keycfg_version
+    }
+
+    /// 固件解析后的生效极性掩码(bit i = 1 → 该键按高电平触发判定)。
+    /// AUTO 档的判定结果只能从这里读 —— `kbd_keycfg().pol` 是配置态, 值为 2 时不含判定结论。
+    pub fn kbd_pol_resolved_mask(&self) -> u16 {
+        self.kbd_pol_resolved_mask
+    }
+
+    /// 生效极性掩码是否有真实来源。false = 旧固件未回传 → 生效电平**未知**, UI 显示"未知"。
+    pub fn kbd_pol_resolved_known(&self) -> bool {
+        self.kbd_pol_resolved_known
     }
 
     /// 设备是否支持每键配置。None=还没问过; Some(false)=旧固件 NAK。
@@ -3480,14 +3749,16 @@ impl AppController {
 
     /// 暂存每键触发极性 + 防抖窗到草稿(不下发)。
     /// 防抖上限与固件同源(`KBD_DEBOUNCE_US_MAX`): 越界直接报错, 不下发一个必被 NAK 的值。
-    pub fn kbd_set_keycfg(
-        &mut self,
-        idx: u8,
-        active_high: bool,
-        debounce_us: u16,
-    ) -> anyhow::Result<()> {
+    pub fn kbd_set_keycfg(&mut self, idx: u8, pol: u8, debounce_us: u16) -> anyhow::Result<()> {
         if (idx as usize) >= KBD_HOLD_PHYS_COUNT {
             return Err(anyhow::anyhow!("物理键索引非法: {}", idx));
+        }
+        // 极性围栏与固件 _handle_set_keycfg 同源: 越界直接拒绝, 不下发一个必被 NAK 的值。
+        if pol > crate::proto::KBD_POL_AUTO {
+            return Err(anyhow::anyhow!(
+                "触发极性非法: {} (0=低电平 1=高电平 2=自动)",
+                pol
+            ));
         }
         if debounce_us > KBD_DEBOUNCE_US_MAX {
             return Err(anyhow::anyhow!(
@@ -3496,21 +3767,10 @@ impl AppController {
                 KBD_DEBOUNCE_US_MAX
             ));
         }
-        let dirty_key = format!("kbd:keycfg:{}", idx);
-        let cfg = KbdKeyCfg {
-            active_high,
-            debounce_us,
-        };
+        let cfg = KbdKeyCfg { pol, debounce_us };
         // 改回设备真值即自动撤稿(与 kbd_set_hold_phys 同口径), 免得界面一直挂着"未保存"。
-        if self.kbd_keycfg.get(idx as usize) == Some(&cfg) {
-            self.kbd_keycfg_draft.remove(&idx);
-            self._drop_dirty(&dirty_key);
-            self.kbd_keycfg_version = self.kbd_keycfg_version.wrapping_add(1);
-            return Ok(());
-        }
-        self.kbd_keycfg_draft.insert(idx, cfg);
-        self.config_dirty_keys.insert(dirty_key);
-        self.mark_config_dirty();
+        let same_as_device = self.kbd_keycfg.get(idx as usize) == Some(&cfg);
+        self.drafts.set_kbd_keycfg(idx, cfg, same_as_device);
         self.kbd_keycfg_version = self.kbd_keycfg_version.wrapping_add(1);
         Ok(())
     }
@@ -3592,10 +3852,16 @@ impl AppController {
     fn _handle_kbd_get_keycfg_response(&mut self, frame: &Frame) {
         self.kbd_keycfg_req_seq = None;
         match crate::proto::decode_kbd_get_keycfg(&frame.payload) {
-            Ok(list) => {
+            Ok((list, resolved)) => {
                 self.kbd_keycfg_supported = Some(true);
                 for (i, cfg) in list.iter().take(KBD_HOLD_PHYS_COUNT).enumerate() {
                     self.kbd_keycfg[i] = *cfg;
+                }
+                // 旧固件不追加 resolved mask: 保持上次读数而不是清 0 —— 清 0 会被 UI 显示成
+                // "全部判定为低电平触发", 那是凭空造出来的结论。
+                if let Some(mask) = resolved {
+                    self.kbd_pol_resolved_mask = mask;
+                    self.kbd_pol_resolved_known = true;
                 }
                 self.kbd_keycfg_version = self.kbd_keycfg_version.wrapping_add(1);
             }
@@ -3983,7 +4249,7 @@ impl AppController {
         if unit >= LED_UNIT_COUNT {
             return LedRegion::default();
         }
-        if let Some(draft) = &self.led_region_draft {
+        if let Some(draft) = self.drafts.led_region() {
             return draft[unit];
         }
         self.led_state
@@ -4018,7 +4284,7 @@ impl AppController {
         let mut regions = self._led_regions();
         let ch = if ch > 1 { LED_CH_UNMAPPED } else { ch };
         regions[unit] = LedRegion { ch, start, count };
-        self.led_region_draft = Some(regions);
+        self.drafts.set_led_region(regions);
         self.led_version = self.led_version.wrapping_add(1);
     }
 
@@ -4131,7 +4397,7 @@ impl AppController {
 
     /// 当前生效的 11 单元映射(草稿优先), 供校验/下发共用。
     fn _led_regions(&self) -> [LedRegion; LED_UNIT_COUNT] {
-        if let Some(draft) = &self.led_region_draft {
+        if let Some(draft) = self.drafts.led_region() {
             return *draft;
         }
         self.led_state
@@ -4154,8 +4420,8 @@ impl AppController {
         match crate::proto::decode_led_get(&frame.payload) {
             Ok(state) => {
                 // 设备真值到达即丢弃草稿: 否则"应用成功"后编辑框仍显示旧草稿, 与色块/设备不同源。
-                if self.led_region_draft == Some(state.regions) {
-                    self.led_region_draft = None;
+                if self.drafts.led_region() == Some(&state.regions) {
+                    self.drafts.drop_led_region();
                 }
                 self.led_state = Some(state);
                 self.led_version = self.led_version.wrapping_add(1);
@@ -4327,16 +4593,8 @@ impl AppController {
         if idx >= 8 {
             return Err(anyhow::anyhow!("算法可调变量索引非法: {}", idx));
         }
-        let dirty_key = format!("algo:cfg:{}", idx);
-        if self.algo_cfg.get(idx as usize) == Some(&val) {
-            self.algo_cfg_draft.remove(&idx);
-            self._drop_dirty(&dirty_key);
-            self.algo_cfg_version = self.algo_cfg_version.wrapping_add(1);
-            return Ok(());
-        }
-        self.algo_cfg_draft.insert(idx, val);
-        self.config_dirty_keys.insert(dirty_key);
-        self.mark_config_dirty();
+        let same_as_device = self.algo_cfg.get(idx as usize) == Some(&val);
+        self.drafts.set_algo_cfg(idx, val, same_as_device);
         // 草稿优先 getter 依赖版本号立即回显，不覆盖设备缓存以支持撤销恢复。
         self.algo_cfg_version = self.algo_cfg_version.wrapping_add(1);
         Ok(())
@@ -4352,9 +4610,8 @@ impl AppController {
         Ok(())
     }
     pub fn algo_cfg(&self, idx: u8) -> u8 {
-        self.algo_cfg_draft
-            .get(&idx)
-            .copied()
+        self.drafts
+            .algo_cfg(idx)
             .unwrap_or_else(|| *self.algo_cfg.get(idx as usize).unwrap_or(&0))
     }
     pub fn algo_cfg_version(&self) -> u64 {
@@ -4401,12 +4658,19 @@ impl AppController {
                 return; // 通道已切换, 丢弃过时响应(避免新旧通道数据混线)
             }
             const TRACE_CAP: usize = 512;
-            // 采样时刻 = 最近一帧的设备时间 + 此后主机侧流逝时间(见 telem_frame_at 注释):
-            // 流式期间修正量不足一帧, 与遥测曲线对齐; 停流期间仍能给出正确的采样间隔。
-            let t_us = self.telem_clock.acc_us
-                + self
-                    .telem_frame_at
-                    .map_or(0, |at| at.elapsed().as_micros() as u64);
+            // ★采样时刻 = 设备端组帧时刻(协议尾戳), 折进与遥测共用的展开时间轴★
+            // 旧实现用"最近一帧遥测时间 + 主机侧 Instant::elapsed"近似, 那是两个时钟拼接,
+            // 触发判定线与遥测曲线的横向对位只能是量级正确; 现在两者同源同口径。
+            // 无尾戳(旧固件)时退回原近似式, 保证不因固件版本而失去时间轴。
+            let t_us = match frame.device_t_us {
+                Some(raw) => self.telem_clock.unwrap_us(raw),
+                None => {
+                    self.telem_clock.acc_us
+                        + self
+                            .telem_frame_at
+                            .map_or(0, |at| at.elapsed().as_micros() as u64)
+                }
+            };
             let idx = self.algo_trace_pending_idx as usize;
             if let Some(buf) = self.algo_trace_report.get_mut(idx) {
                 if buf.len() >= TRACE_CAP {
@@ -5125,6 +5389,8 @@ impl AppController {
 
     fn _handle_global_get_response(&mut self, frame: &Frame) {
         if let Some((id, v)) = crate::proto::algo::decode_global_get(&frame.payload) {
+            // 回读防污染先做完再落缓存: 界面回显的是修正值, 且非法值会被回写纠正到设备。
+            let v = self._guard_readback_global(id, v);
             self.globals.insert(id, v);
             self.globals_version = self.globals_version.wrapping_add(1);
         }
@@ -5256,6 +5522,12 @@ impl AppController {
                 .collect();
             self.push_log_debug(format!("CSD诊断: 设备回读全局值 [{}]", dump.join(", ")));
         }
+        // 回读防污染先做完再落缓存/对账(与单通道 PARAM_GET_ALL 同口径): 非法值夹到最近合法值、
+        // 告警并按需回写设备, 缓存与对账都用修正后的值, 界面不会回显脏值。
+        let list: Vec<(u8, u32)> = list
+            .into_iter()
+            .map(|(id, v)| (id, self._guard_readback_global(id, v)))
+            .collect();
         for (id, v) in &list {
             self.globals.insert(*id, *v);
         }
@@ -5302,6 +5574,28 @@ impl AppController {
                     Self::_boot_override_text(detail)
                 ), true),
             7 => ("PSoC 救砖(强制重刷)已完成, 算法与 CSD 配置将重新下发。".to_string(), true),
+            8 => (format!(
+                    "mai2serial 收到 RSET, 固件已受理: {}{}",
+                    if detail & 0x01 != 0 { "IDAC 重校准 " } else { "" },
+                    if detail & 0x02 != 0 { "基线复位" } else { "" }
+                ), true),
+            9 => ("PSoC 重启/救砖后实测采样已恢复可信, 固件已清除「基线不可信」标志。".to_string(), true),
+            // 掉枚举纯属链路事件, 设备配置没变 ⇒ 不必回读真值(resync=false), 否则每次断连都白刷一轮。
+            10 => (format!(
+                    "⚠ 运行期 USB 掉枚举({}), 固件按约定【直接宣判失效, 不做救援】。若发生在游戏中, 该局的触控/灯效输出已中断。",
+                    if detail & 0x01 != 0 {
+                        "掉的时候 mai2serial 正在发触控数据"
+                    } else if detail & 0x02 != 0 {
+                        "掉的时候灯板协议已就绪但未在发触控"
+                    } else {
+                        "掉的时候两条协议都未在跑"
+                    }
+                ), false),
+            11 => (format!(
+                    "⚠ 存储区校验未通过, 该区已按默认值重建(有效掩码 0x{:X}: {})。单份存储的语义是「坏只坏在这一区」, 其余区完好。",
+                    detail,
+                    Self::_nv_valid_text(detail)
+                ), true),
             _ => (format!("固件自持恢复事件(未知码 {}, detail=0x{:08X})", code, detail), true),
         };
         if code == 3 {
@@ -5314,6 +5608,22 @@ impl AppController {
             self.globals_expected.clear();
             self.globals_verify_in = Some(60);
         }
+    }
+
+    /// 解释 NvStore 各区有效掩码(位序与 main_firmware 的 NvStore::Region 一致)。
+    /// 只列**无效**的那些 —— 用户要知道的是"哪一区丢了", 不是"哪些还在"。
+    fn _nv_valid_text(mask: u32) -> String {
+        const NAMES: [&str; 4] = ["配置项(KV)", "触控 CSD 调参", "算法二进制", "算法 C 源"];
+        let mut lost: Vec<&str> = Vec::new();
+        for (i, name) in NAMES.iter().enumerate() {
+            if mask & (1u32 << i) == 0 {
+                lost.push(name);
+            }
+        }
+        if lost.is_empty() {
+            return "全部有效".to_string();
+        }
+        format!("已丢失并重建: {}", lost.join(" / "))
     }
 
     /// 解释 PSoC 启动覆盖位掩码(与 psoc_firmware main.c 的 GPARAM_BOOT_OVERRIDE 注释一致)。
@@ -5484,8 +5794,22 @@ impl AppController {
     }
 
     /// 获取最近一次遥测帧解出的通道刷新延迟(us)
+    ///
+    /// ★这是"设备实测探测周期"的唯一来源★ 主页、全 36 通道页、触控全局调整页的时钟树末端节点
+    /// 都读它(经 main.rs 每 tick 回填 AppWindow.scan_period_us/scan_period_ms), 不允许再有第二份。
+    /// 只在收到带 FIELD_STATS 的 TELEM_DATA 时更新(见 :5833) ⇒ 从未开流时恒为 0。
     pub fn telem_scan_period_us(&self) -> u32 {
         self.telem_scan_period_us
+    }
+
+    /// 探测周期是否有实测值。
+    ///
+    /// ★为什么必须单独给标志★ 停流/从未开流时 `telem_scan_period_us` 恒为 0, 而界面直接把 0 换算成
+    /// "0.00 ms" 会被读成"设备真的 0ms"(还会连带算出 差值 -5796µs / 倍率 ×0 这种伪结论)。
+    /// 0 不是任何设备能给出的合法周期, 故以 >0 作为"有值"的判据; 与 led_rx_frames_valid() 等
+    /// 既有 *_valid 访问器同一约定, 界面无值时显示"未测"而不是 0。
+    pub fn telem_scan_period_valid(&self) -> bool {
+        self.telem_scan_period_us > 0
     }
 
     pub fn telem_lat_spi_us(&self) -> u16 {
@@ -5519,9 +5843,9 @@ impl AppController {
             return Vec::new();
         }
         let mut merged: BTreeMap<u8, u32> = self.params[ch as usize].clone();
-        for ((dch, id), v) in self.param_draft.iter() {
-            if *dch == ch {
-                merged.insert(*id, *v);
+        for ((dch, id), v) in self.drafts.param_items() {
+            if dch == ch {
+                merged.insert(id, v);
             }
         }
         merged.into_iter().collect()
@@ -5532,8 +5856,8 @@ impl AppController {
         if (ch as usize) >= 36 {
             return None;
         }
-        if let Some(v) = self.param_draft.get(&(ch, param_id)) {
-            return Some(*v);
+        if let Some(v) = self.drafts.param(ch, param_id) {
+            return Some(v);
         }
         self.params[ch as usize].get(&param_id).copied()
     }
@@ -5673,6 +5997,12 @@ impl AppController {
                 self.telem_frame_at = Some(std::time::Instant::now());
                 self.telem_samples_per_sec = telem_frame.samples_per_sec;
                 self.telem_scan_period_us = telem_frame.scan_period_us;
+                // ★PSoC 链路活性的最强证据★: samples_per_sec 是固件按 PSoC scan_count 增量折算的
+                // (psoc.cpp), >0 就等于"快照代数正在推进" —— 比只在握手那一瞬取一次的
+                // DEVICE_INFO.psoc_link_valid 可信得多, 且随遥测帧率(20~100Hz)持续刷新。
+                if telem_frame.samples_per_sec > 0 {
+                    self.psoc_scan_live_at = Some(std::time::Instant::now());
+                }
                 self.telem_lat_spi_us = telem_frame.lat_spi_us;
                 self.telem_lat_proc_us = telem_frame.lat_proc_us;
                 self.telem_lat_usb_us = telem_frame.lat_usb_us;
@@ -5780,6 +6110,8 @@ impl AppController {
                     let mut max_div = 0u32;
                     for (ch, value) in values {
                         if (ch as usize) < 36 {
+                            // 回读防污染: 非法值不进缓存, 存修正值并(至多一次)回写设备。
+                            let value = self._guard_readback_param(ch, param_id, value);
                             self.params[ch as usize].insert(param_id, value);
                             if param_id == 0x08 && value != 0 {
                                 min_div = min_div.min(value);
@@ -5826,9 +6158,17 @@ impl AppController {
                         log::warn!("PARAM_GET_ALL: ch={} 返回空参数集, 保留本地缓存不清空", ch);
                         return;
                     }
+                    // 回读防污染先做完再落缓存: `_guard_readback_param` 需要 `&mut self`
+                    // (要发回写帧/写日志), 不能在持有 `self.params[ch]` 可变借用时调用。
+                    let guarded: Vec<(u8, u32)> = params
+                        .into_iter()
+                        .map(|(param_id, value)| {
+                            (param_id, self._guard_readback_param(ch, param_id, value))
+                        })
+                        .collect();
                     let param_map = &mut self.params[ch as usize];
                     param_map.clear();
-                    for (param_id, value) in params {
+                    for (param_id, value) in guarded {
                         param_map.insert(param_id, value);
                     }
                     self.param_version += 1;
@@ -5891,7 +6231,7 @@ impl AppController {
             return 0xFFFF_FFFF;
         }
         let key = zone_key(zone);
-        if let Some(CfgValue::U32(v)) = self.cfg_draft.get(&key) {
+        if let Some(CfgValue::U32(v)) = self.drafts.cfg(&key) {
             return *v;
         }
         self.config_cache
@@ -6222,7 +6562,7 @@ impl AppController {
 
     /// 测试专用:直接向某通道的遥测环形缓冲追加一个样本,不经过
     /// io/协议帧路径。main.rs 的曲线页测试(#6g-2)需要构造带数据的
-    /// telem_buf 来验证 `build_curve_paths` 的 show_* 门控逻辑,但
+    /// telem_buf 来验证 `build_chart_frame` 的 SeriesShow 门控逻辑,但
     /// `telem_buf` 字段本身私有于本模块,故提供这条 `pub(crate)` 后门,
     /// 与 `test_insert_entries` 同一模式。仅 `#[cfg(test)]` 编译。
     #[cfg(test)]
@@ -6409,6 +6749,14 @@ impl AppController {
             .read_debug_counters()
     }
 
+    /// 清零固件主循环阻塞剖面(峰值量)；压测前调用即可在干净窗口内测最坏阻塞。
+    pub fn clear_loop_profile(&self) -> anyhow::Result<()> {
+        self.io
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("未连接，无法清零主循环剖面"))?
+            .clear_loop_profile()
+    }
+
     pub fn status_line(&self) -> String {
         self.status_text.clone()
     }
@@ -6422,12 +6770,110 @@ impl AppController {
     }
 
     /// 设备在最新 DIAGNOSE/DEVICE_INFO 中上报的真实 CSD 模式；None 表示尚未取得真值。
+    ///
+    /// ★这是"设备真值"而不是"当前生效模式"★ 判断界面该按哪个模式显示/放行时**不要**用它,
+    /// 用 [`Self::csd_mode_effective`]。本访问器只用于两处: 与草稿比对(撤稿判定)、诊断日志。
     pub fn csd_mode(&self) -> Option<u8> {
         self.csd_mode
     }
 
+    /// ★当前 CSD 处理模式的唯一真相★: 草稿(用户已选但未保存) → 设备真值 → `None`(都还不知道)。
+    ///
+    /// ★为什么必须唯一★ 旧实现在 UI 回填处并列了两个来源(`mode_known` 只看设备真值、
+    /// `scan_mode` 走"草稿优先"), 两个门控两个来源 ⇒ 同一页里下拉说"半自动手动"、时钟树说
+    /// "AUTO"; 且 `if let Some(..)` 在两者皆 `None` 时**不赋值**, 使 `scan_mode` 锁存上一次的值
+    /// (掉线重连后仍显示旧模式)。任何"是否自动模式"的判定一律经本函数, 不许再写
+    /// `mode_draft().or(csd_mode())`。
+    /// `None` 的含义是"真的还不知道", 调用方必须显式表达未知(UI 显示"读取中…"), 不得拿 0 冒充。
+    pub fn csd_mode_effective(&self) -> Option<u8> {
+        self.drafts.mode().or(self.csd_mode)
+    }
+
+    /// 判"未联通"所需的**连续无证据**时长(掉线去抖窗口)。
+    ///
+    /// ★为什么是非对称去抖★: 恢复要快、掉线不能误报, 两个目标对去抖的要求相反。这里做成
+    /// "有证据立即算通(0 去抖), 连续 PSOC_LINK_STALE 无证据才算断":
+    /// - 恢复: 遥测最慢档 20Hz(50ms/帧), 一帧证据即翻回"已联通", 加上 16ms 的 UI tick,
+    ///   可见延迟 <100ms; 用户手动停流时由 1s 一次的 DEVICE_INFO 探测兜住, 仍在 ~1s 内。
+    /// - 掉线: 1.5s ≈ 轻档 30 帧 / 逐通道档 150 帧, 足以吃掉单帧丢失、USB 抖动, 以及固件侧
+    ///   500ms 一次的 samples_per_sec 统计窗口本身的粒度(至少覆盖 3 个统计窗口), 不会把
+    ///   瞬时抖动放大成文案反复闪烁; 又远短于人对"点了重启 PSoC 却没反应"的忍耐阈值。
+    const PSOC_LINK_STALE: std::time::Duration = std::time::Duration::from_millis(1500);
+
+    /// PSoC SPI 链路活性证据。链路通/断的唯一判定入口(系统状态行与采样卡红字都走它)。
+    pub fn psoc_link_evidence(&self) -> PsocLinkEvidence {
+        let fresh = |at: Option<std::time::Instant>| {
+            at.is_some_and(|t| t.elapsed() < Self::PSOC_LINK_STALE)
+        };
+        if self.state == ConnState::Connected {
+            if fresh(self.psoc_scan_live_at) {
+                return PsocLinkEvidence::ScanAdvancing {
+                    sps: self.telem_samples_per_sec,
+                };
+            }
+            if fresh(self.psoc_info_live_at) {
+                return PsocLinkEvidence::Handshake {
+                    generation: self.psoc_gen_seen.unwrap_or(0),
+                };
+            }
+        }
+        // 最近一条证据(取两个来源里更新的那个)距今多久; 都没有则本次连接从未活过。
+        let since_ms = [self.psoc_scan_live_at, self.psoc_info_live_at]
+            .iter()
+            .filter_map(|at| at.map(|t| t.elapsed().as_millis() as u64))
+            .min();
+        PsocLinkEvidence::Stale {
+            since_ms,
+            last_generation: self.psoc_gen_seen,
+        }
+    }
+
+    /// 链路是否联通(由活性证据判定, 不看那个只在握手时刷新的布尔位)。
+    pub fn psoc_link_alive(&self) -> bool {
+        !matches!(
+            self.psoc_link_evidence(),
+            PsocLinkEvidence::Stale { .. }
+        )
+    }
+
+    /// 判定依据的一行说明。所有展示链路状态的地方共用, 保证文案与判定同源。
+    pub fn psoc_link_text(&self) -> String {
+        match self.psoc_link_evidence() {
+            PsocLinkEvidence::ScanAdvancing { sps } => {
+                format!("快照代数在推进 · 扫描 {} Hz", sps)
+            }
+            PsocLinkEvidence::Handshake { generation } => {
+                format!("停流中, 由 DEVICE_INFO 探测确认 · 第 {} 代", generation)
+            }
+            PsocLinkEvidence::Stale {
+                since_ms: None,
+                ..
+            } => "本次连接从未取得代数推进证据".to_string(),
+            PsocLinkEvidence::Stale {
+                since_ms: Some(ms),
+                last_generation,
+            } => format!(
+                "已 {:.1}s 无代数推进 · 最近读到第 {} 代",
+                ms as f32 / 1000.0,
+                last_generation.unwrap_or(0)
+            ),
+        }
+    }
+
+    /// 停流期间的链路活性探测: 发一条 HELLO 取回新的 DEVICE_INFO(代数 + link_ok)。
+    ///
+    /// ★只在停流时探★: 固件收到 HELLO 会先 `SensorLink::stop()`(host_cmd.cpp::_handle_hello),
+    /// 流式期间探测等于把遥测踢停。而遥测在跑时本来就有更强的证据(每帧的 samples_per_sec),
+    /// 压根不需要探。由 main.rs 的 16ms tick 每 ~1s 调一次。
+    pub fn psoc_link_probe(&mut self) {
+        if self.state != ConnState::Connected || self.telem_active {
+            return;
+        }
+        let _ = self.resend_hello();
+    }
+
     /// 传感器/PSoC 健康的友好中文总结, 供 UI 直观展示异常大致原因。
-    /// 综合 DEVICE_INFO 诊断(link/snapshot/bring-up 阶段/flags)与实时采样率。
+    /// 综合 DEVICE_INFO 诊断(bring-up 阶段/flags)、链路活性证据与实时采样率。
     pub fn sensor_health_summary(&self) -> String {
         let Some(info) = &self.device_info else {
             return "● 未获取设备信息(未连接或 DEVICE_INFO 未到达)".to_string();
@@ -6441,10 +6887,20 @@ impl AppController {
                 );
             }
         }
-        if !info.psoc_link_valid {
-            return "✕ PSoC SPI 链路未就绪 — PSoC 无响应/掉线。检查传感器供电、SPI 连线与复位, 或点\"重启 PSoC\"".to_string();
+        // ★链路判定改由活性证据驱动★: 原来直接读 info.psoc_link_valid, 那是握手那一瞬的快照,
+        // 之后永不刷新 → 握手撞上 SPI 残帧抖动就把这条红字钉死, 与同屏 179Hz 采样自相矛盾。
+        let evidence = self.psoc_link_evidence();
+        if let PsocLinkEvidence::Stale { .. } = evidence {
+            return format!(
+                "✕ PSoC SPI 链路未就绪({}) — PSoC 无响应/掉线。检查传感器供电、SPI 连线与复位, 或点\"重启 PSoC\"",
+                self.psoc_link_text()
+            );
         }
-        if !info.psoc_snapshot_valid {
+        // snapshot_valid 同样只在握手那一帧回读: 已经有"代数在推进"的实时证据时它必然过期,
+        // 不能再据它报警(否则握手时刚好在校准就永久显示"快照无效")。
+        if !info.psoc_snapshot_valid
+            && !matches!(evidence, PsocLinkEvidence::ScanAdvancing { .. })
+        {
             return "▲ 快照无效 — PSoC 未产出有效扫描数据(可能刚复位/正在校准)".to_string();
         }
         // 数据存活: 遥测仍在出帧但全部通道 raw 长时间完全不变 = 扫描/测量卡死(常见于改全局后重初始化叠加致死)。
@@ -6485,10 +6941,14 @@ impl AppController {
                 return 2;
             }
         }
-        if !info.psoc_link_valid {
+        // 与 sensor_health_summary 同一个判定入口(活性证据), 不再各读一次过期布尔。
+        let evidence = self.psoc_link_evidence();
+        if let PsocLinkEvidence::Stale { .. } = evidence {
             return 2;
         }
-        if !info.psoc_snapshot_valid {
+        if !info.psoc_snapshot_valid
+            && !matches!(evidence, PsocLinkEvidence::ScanAdvancing { .. })
+        {
             return 1;
         }
         if self.data_all_frozen() {
@@ -6605,7 +7065,10 @@ impl AppController {
             Some(diag) => Self::_fw_version_text(diag.embedded_psoc_version),
             None => "未知(legacy DEVICE_INFO)".to_string(),
         };
-        let psoc_link = if info.psoc_link_valid {
+        // ★与采样卡红字同源★: 都走 psoc_link_evidence, 不再各自去读握手那一瞬的过期布尔位,
+        // 杜绝"系统状态说断、采样卡说通"这种自相矛盾。括号里给出判定依据本身而不是一个死代数,
+        // 免得又出现"代数看着很大所以应该是通的"这类只能靠人猜的界面。
+        let psoc_link = if self.psoc_link_alive() {
             "已联通"
         } else {
             "未联通"
@@ -6617,14 +7080,14 @@ impl AppController {
             None => "未读取",
         };
         format!(
-            "主控固件: {}\nPSoC 固件: {}\n协议版本: {}\nCapSense 通道: {}\n设备能力: {}\nPSoC 链路: {} (第 {} 代)\nCSD 模式: {}",
+            "主控固件: {}\nPSoC 固件: {}\n协议版本: {}\nCapSense 通道: {}\n设备能力: {}\nPSoC 链路: {} ({})\nCSD 模式: {}",
             Self::_fw_version_text(info.fw_version),
             psoc_fw,
             info.protocol_version,
             info.capsense_channels,
             Self::_capability_text(info.capability_bits),
             psoc_link,
-            info.psoc_generation,
+            self.psoc_link_text(),
             csd_mode
         )
     }
@@ -6636,7 +7099,9 @@ impl AppController {
         };
 
         let mut text = format!(
-            "协议版本: {}\nRP2040 固件版本: 0x{:08X} ({})\nCapSense 通道数: {}\n能力位: 0x{:08X}\nPSoC 快照: generation={} link_valid={} snapshot_valid={}",
+            // 这三个值是"最近一次 HELLO 回响应那一瞬"的快照(设备只在 DEVICE_INFO 里回它们),
+            // 不是实时值 —— 明写出来, 否则排查时会拿它去否定实时的链路判定(见 psoc_link_evidence)。
+            "协议版本: {}\nRP2040 固件版本: 0x{:08X} ({})\nCapSense 通道数: {}\n能力位: 0x{:08X}\nPSoC 快照(握手瞬时值): generation={} link_valid={} snapshot_valid={}",
             info.protocol_version,
             info.fw_version,
             Self::_fw_version_brief(info.fw_version),

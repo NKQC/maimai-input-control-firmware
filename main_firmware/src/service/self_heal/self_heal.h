@@ -27,6 +27,13 @@ enum SelfHealCode : uint8_t {
     SH_PSOC_RESCUED = 7,         // PSoC 救砖(强制重刷)完成
     SH_SERIAL_RESET_ACTIONS = 8, // mai2serial RSET 后已受理的动作(detail bit0=IDAC校准, bit1=基线复位)
     SH_BASELINE_TRUST_RESTORED = 9, // PSoC 重启或救砖后实测采样可信，已清除 baseline_untrusted 运行态标志
+    // 运行期某条 mai2 CDC 掉了枚举(detail bit0=serial, bit1=light)。
+    // ★如实宣判失效, 不做救援★: 主机侧已经拆掉了该接口, 设备这边任何"重新武装/重开"都改变不了
+    // 主机的判断, 只会把主循环搅乱。用户明确要求: 掉枚举就直接宣判, 不做无意义救援。
+    SH_CDC_LOST = 10,
+    // 某个 NvStore 区在 flash 里判为无效(detail = valid_mask)。单份存储的"坏只坏在那一区"
+    // 必须让用户看得见, 否则该区静默恢复默认值, 用户只会以为"设置又丢了"。
+    SH_NV_REGION_INVALID = 11,
 };
 
 class SelfHeal {
