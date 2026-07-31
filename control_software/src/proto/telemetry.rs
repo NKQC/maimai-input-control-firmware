@@ -229,7 +229,9 @@ pub fn decode_telem_data(payload: &[u8]) -> Result<TelemFrame, String> {
         let c = u16::from_le_bytes([payload[pos + 4], payload[pos + 5]]);
         pos += 6;
         (a, b, c)
-    } else { (0u16, 0u16, 0u16) };
+    } else {
+        (0u16, 0u16, 0u16)
+    };
 
     let mut samples = Vec::new();
 
@@ -244,7 +246,14 @@ pub fn decode_telem_data(payload: &[u8]) -> Result<TelemFrame, String> {
         pos += 1;
 
         // 帧内所有通道同属一次扫描 → 共用帧级 ts_us 作为该样本的设备时间。
-        let mut sample = ChannelSample { ch, t_us: ts_us, raw: None, bsln: None, diff: None, status: None };
+        let mut sample = ChannelSample {
+            ch,
+            t_us: ts_us,
+            raw: None,
+            bsln: None,
+            diff: None,
+            status: None,
+        };
 
         // RAW (u16 LE)?
         if (fields & FIELD_RAW) != 0 {
@@ -422,7 +431,10 @@ pub fn decode_psoc_rescue_progress(payload: &[u8]) -> Result<PsocRescueProgress,
 /// payload = channel(u8) + cp(u32 LE)，返回 `(channel, cp_ff)`。
 pub fn decode_cp_get(payload: &[u8]) -> Result<(u8, u32), String> {
     if payload.len() != 5 {
-        return Err(format!("CP_GET response must be 5 bytes, got {}", payload.len()));
+        return Err(format!(
+            "CP_GET response must be 5 bytes, got {}",
+            payload.len()
+        ));
     }
     Ok((
         payload[0],
@@ -538,18 +550,18 @@ mod tests {
         payload.push(0x05);
 
         // Channel 0
-        payload.push(0);       // ch_index
-        payload.push(0x34);    // raw low
-        payload.push(0x12);    // raw high
-        payload.push(0x78);    // diff low
-        payload.push(0x56);    // diff high
+        payload.push(0); // ch_index
+        payload.push(0x34); // raw low
+        payload.push(0x12); // raw high
+        payload.push(0x78); // diff low
+        payload.push(0x56); // diff high
 
         // Channel 5
-        payload.push(5);       // ch_index
-        payload.push(0xCD);    // raw low
-        payload.push(0xAB);    // raw high
-        payload.push(0x00);    // diff low
-        payload.push(0xEF);    // diff high
+        payload.push(5); // ch_index
+        payload.push(0xCD); // raw low
+        payload.push(0xAB); // raw high
+        payload.push(0x00); // diff low
+        payload.push(0xEF); // diff high
 
         let frame = decode_telem_data(&payload).expect("decode should succeed");
 
@@ -590,14 +602,14 @@ mod tests {
         payload.push(0x0F);
 
         // Channel 0
-        payload.push(0);       // ch_index
-        payload.push(0x34);    // raw low
-        payload.push(0x12);    // raw high
-        payload.push(0x78);    // bsln low
-        payload.push(0x56);    // bsln high
-        payload.push(0x12);    // diff low
-        payload.push(0x34);    // diff high
-        payload.push(0x01);    // status
+        payload.push(0); // ch_index
+        payload.push(0x34); // raw low
+        payload.push(0x12); // raw high
+        payload.push(0x78); // bsln low
+        payload.push(0x56); // bsln high
+        payload.push(0x12); // diff low
+        payload.push(0x34); // diff high
+        payload.push(0x01); // status
 
         let frame = decode_telem_data(&payload).expect("decode should succeed");
 
@@ -614,9 +626,9 @@ mod tests {
     fn test_decode_param_get() {
         // 响应: ch=3, param_id=PARAM_FINGER_TH(0x01), value=250(0x000000FA)
         let mut payload = Vec::new();
-        payload.push(3);       // channel
+        payload.push(3); // channel
         payload.push(PARAM_FINGER_TH);
-        payload.push(0xFA);    // value low
+        payload.push(0xFA); // value low
         payload.push(0x00);
         payload.push(0x00);
         payload.push(0x00);
@@ -632,8 +644,8 @@ mod tests {
     fn test_decode_param_get_all() {
         // 响应: ch=7, count=3, params: (PARAM_FINGER_TH, 100), (PARAM_NOISE_TH, 40), (PARAM_HYSTERESIS, 10)
         let mut payload = Vec::new();
-        payload.push(7);       // channel
-        payload.push(3);       // count
+        payload.push(7); // channel
+        payload.push(3); // count
 
         // Entry 0: param_id=PARAM_FINGER_TH, value=100
         payload.push(PARAM_FINGER_TH);
@@ -671,7 +683,12 @@ mod tests {
         assert_eq!(KNOWN_PARAM_IDS.len(), 11);
         assert_eq!(KNOWN_PARAM_IDS[0], PARAM_FINGER_TH);
         assert_eq!(KNOWN_PARAM_IDS[10], PARAM_IDAC_GAIN);
-        assert_eq!(KNOWN_PARAM_IDS, &[0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B]);
+        assert_eq!(
+            KNOWN_PARAM_IDS,
+            &[
+                0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B
+            ]
+        );
     }
 
     #[test]

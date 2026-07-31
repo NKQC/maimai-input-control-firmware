@@ -25,6 +25,9 @@
 // encode_frame max_len 统一用它: 避免全量 CFG_GET_ALL(~140 项 ~2.1KB)超旧 2048/512
 // 上限时 encode_frame 返回 0 → 主机收 0 项 → 设置页空白。
 #define HOST_CMD_RESP_BUF_MAX   (HOST_CMD_PAYLOAD_MAX + 16)
+// 算法 C 源(最大 32KB)分片传输的单片字节数。payload 固定 4096 且 HostFrame 常作栈对象, 绝不放大,
+// 故源必须分片; 留出 4 字节片头(offset/total 或 total/offset)后仍有充裕余量。
+#define HOST_CMD_ALGO_SRC_CHUNK 2048
 
 // flags 定义
 #define HOST_CMD_FLAG_RESPONSE  0x01  // bit0=1 表示响应
@@ -111,15 +114,21 @@ enum class HostCmd : uint8_t {
     ALGO_RESET_DEFAULT = 0x63,  // 空 → 回退内嵌默认(v3.1 HDR)+下发 → ACK
     ALGO_SET_ROM       = 0x64,  // payload=[ch(u8),rom(u16 LE)]×count 设每通道 ROM+下发 → ACK
     ALGO_GET_ROM       = 0x65,  // 空 → 响应 36×u16 LE (每通道 ROM 表)
-    ALGO_GET_SRC       = 0x66,  // 空 → 响应 [len(u16 LE), src bytes] RP 存的算法 C 源(已滤注释)
-    ALGO_SET_SRC       = 0x67,  // payload=[len(u16 LE), src bytes] 存算法 C 源(映射表)+持久化 → ACK
+    // ★C 源(≤32KB)分片协议★ 单帧 payload 只有 4096, 所以按 HOST_CMD_ALGO_SRC_CHUNK 分片。
+    // GET: 请求 [offset(u16 LE)](空 payload 视作 offset=0) → 响应 [total(u16 LE), offset(u16 LE), chunk]
+    ALGO_GET_SRC       = 0x66,
+    // SET: [offset(u16 LE), total(u16 LE), chunk]; offset 从 0 开始严格连续, 收到最后一片
+    //      (offset+chunk==total)才更新有效长度并持久化。total=0 = 清空源。→ ACK / NAK
+    ALGO_SET_SRC       = 0x67,
     ALGO_GET_CODE      = 0x68,  // 空 → 响应 [len(u16 LE), asm bytes] RP 存的算法 ASM 机器码回读
     ALGO_GET_TRACE     = 0x69,  // payload=[ch(u8),idx(u8)] → 响应 [ch,out_active(u8),report(u16 LE)]
     ALGO_SET_CFG       = 0x6A,  // payload=[idx(u8),val(u8)] 设共享 cfg[idx]+持久化+下发 → ACK
     ALGO_GET_CFG       = 0x6B,  // payload=[idx(u8)] → 响应 [idx,cfg(u8)]
 
     // 物理键盘 / 触控键盘映射域 + mai2 串口状态 0x70-0x7D
-    KBD_GET_STATE    = 0x70,  // 空 → [phys_state(u16 LE)] 物理键 GPIO1-12 实时按下位
+    // 空 → [phys_state(u16 LE), raw(u16 LE), out(u16 LE)]: 去抖后 / 去抖前 / 实际输出 HID 三态。
+    // 后两个字段为后续追加, 旧上位机只读前 2 字节仍然正确。
+    KBD_GET_STATE    = 0x70,
     KBD_GET_MAP      = 0x71,  // 空 → [count(u8)=12, keycode(u8)×12] 物理键 HID 键码表
     KBD_SET_MAP      = 0x72,  // [idx(u8),keycode(u8)]×n 设物理键 HID 键码 → ACK
     KBD_GET_TOUCHMAP = 0x73,  // 空 → [en(u8), count(u8)=34, keycode(u8)×34] 触控→键盘映射表
@@ -128,6 +137,20 @@ enum class HostCmd : uint8_t {
     KBD_GET_HOLD     = 0x75,  // 空 → [phys_count(u8)=12, zone_count(u8)=34,
                               //       12×(delay u16 LE, maxhold u16 LE), 34×(delay u16 LE, maxhold u16 LE)]
     KBD_SET_HOLD     = 0x76,  // [kind(u8: 0=物理键/1=分区), idx(u8), delay(u16 LE), maxhold(u16 LE)]×n → ACK
+    // ★逻辑分析仪★ 物理键 12 位掩码每次变化即带 time_us_32() 时间戳入固件定长环形缓冲(192 条),
+    // 主机主动拉取(无推流)。请求 [max(u8) 可选, 0=默认上限 96] →
+    //   [cap(u16 LE), overflow(u32 LE 累计丢弃数), remaining(u16 LE 取完后剩余), count(u8),
+    //    count×(t_us(u32 LE), raw(u16 LE 去抖前), out(u16 LE 实际输出 HID))]
+    // 返回即消费(FIFO 最旧优先)。overflow 只增不清零, 主机取差值判断"有事件丢失"。
+    KBD_GET_EDGES    = 0x77,
+    // 每键触发极性 + 独立防抖窗。pol: 0=低电平触发(默认, 与旧固件一致) / 1=高电平触发;
+    // debounce_us: 0..10000(0=不去抖), 越界 NAK 不夹取。
+    KBD_GET_KEYCFG   = 0x7C,  // 空 → [count(u8)=12, 12×(pol(u8), debounce_us(u16 LE))]
+    KBD_SET_KEYCFG   = 0x7D,  // [idx(u8), pol(u8), debounce_us(u16 LE)]×n → ACK/NAK(整批校验后才落值)
+    // 组合映射(N 个分区同时按下 → M 个键同时输出)。单条 16B:
+    //   zone_mask(u64 LE) | key0..key3(u8×4) | mod(u8) | delay(u16 LE) | maxhold(u16 LE)
+    KBD_GET_COMBO    = 0x7A,  // 空 → [combo_count(u8)=16, key_count(u8)=4, 16×16B]
+    KBD_SET_COMBO    = 0x7B,  // [count(u8)] + count×16B → ACK (整表替换; 空掩码条目丢弃, 同掩码去重)
 
     // mai2 触控串口状态域
     MAI2_GET_STATE   = 0x78,  // 空 → [send_en(u8), status(u8: 0=STOPPED/1=READY/2=RUNNING), baud(u32 LE)]
@@ -249,6 +272,11 @@ public:
     
     // 分发命令
     void dispatch(const HostFrame& frame, uint8_t* resp_buf, uint16_t* resp_len);
+
+    // CFG_GET_ALL 分帧响应：UsbComm 在当前帧完全写入后调用以取得下一帧。
+    bool has_pending_stream() const;
+    bool next_stream_frame(uint8_t* resp_buf, uint16_t* resp_len);
+    void clear_pending_stream();
     
 private:
     HostCmdDispatcher();

@@ -10,7 +10,8 @@ checksum/protection 段（0x90xxxxxx）。按 128 字节 flash 行对齐，空�
 用法：
     python psoc_hex_to_c.py <input.hex> <output.h> [fw_version_hex]
 
-fw_version_hex 缺省为 0x00000400（对齐 PSoC main.c 的 FW_VERSION 0.4.0）。
+fw_version_hex 由调用方(dev.ps1 / build.ps1)从 PSoC 的 fw_build_stamp.h 读出的编译时间戳
+（十进制 YYMMDDHHMM）换算而来；缺省值仅作占位。
 """
 
 import sys
@@ -74,7 +75,7 @@ def emit_header(img, out_path, version):
     lines.append("")
     lines.append("#include <stdint.h>")
     lines.append("")
-    lines.append(f"// PSoC 固件版本（对齐 psoc main.c 的 FW_VERSION）")
+    lines.append(f"// PSoC 固件版本 = 编译时间戳 十进制 {version} (YYMMDDHHMM), 见 fw_build_stamp.h")
     lines.append(f"static const uint32_t PSOC_FW_VERSION = 0x{version:08X}u;")
     lines.append("")
     lines.append(f"// 镜像总长度 {len(img)} 字节 = {rows} 行 x {ROW_SIZE}B")

@@ -131,7 +131,11 @@ impl LogHub {
         let no = self.next_no.fetch_add(1, Ordering::Relaxed);
         {
             let mut ring = self.ring.lock().unwrap();
-            ring.push_back(LogEntry { no, level, text: view_line });
+            ring.push_back(LogEntry {
+                no,
+                level,
+                text: view_line,
+            });
             while ring.len() > RING_MAX {
                 ring.pop_front();
                 self.dropped.fetch_add(1, Ordering::Relaxed);
@@ -141,7 +145,9 @@ impl LogHub {
 
         // 落盘门槛 = 当前日志等级(与日志页的过滤等级同一个值)。选"信息"时 io 层每帧的十六进制
         // 转储(Debug 级、遥测 30Hz、实测约 1MB/分钟)不落盘; 选"调试"则连同这些一起写入文件。
-        if self.file_enabled.load(Ordering::Relaxed) && level <= self.file_level.load(Ordering::Relaxed) {
+        if self.file_enabled.load(Ordering::Relaxed)
+            && level <= self.file_level.load(Ordering::Relaxed)
+        {
             let mut rotate = false;
             if let Ok(mut guard) = self.file.lock() {
                 if let Some(w) = guard.as_mut() {
@@ -149,7 +155,9 @@ impl LogHub {
                     // ★每条都 flush★: 日志的用处就在崩溃/掉线/被强杀之后还能看。留在 BufWriter
                     // 里的内容在进程非正常结束时会全部丢失(实测被 kill 后文件里只剩表头)。
                     let _ = w.flush();
-                    let n = self.file_bytes.fetch_add(file_line.len() as u64 + 2, Ordering::Relaxed);
+                    let n = self
+                        .file_bytes
+                        .fetch_add(file_line.len() as u64 + 2, Ordering::Relaxed);
                     rotate = n > FILE_MAX_BYTES;
                 }
             }
@@ -183,7 +191,10 @@ impl LogHub {
     pub fn set_level(&self, level: u8) {
         let lv = level.min(3);
         if self.file_level.swap(lv, Ordering::Relaxed) != lv {
-            log::info!("日志等级 → {}(同时作用于文件与控制台)", level_tag(lv).trim());
+            log::info!(
+                "日志等级 → {}(同时作用于文件与控制台)",
+                level_tag(lv).trim()
+            );
         }
     }
 
@@ -271,7 +282,11 @@ impl LogHub {
         }
         prune_old_files(&dir);
         let (date, time) = now_strings();
-        let stamp = format!("{}-{}", date.replace('-', ""), time.replace(':', "").replace('.', "-"));
+        let stamp = format!(
+            "{}-{}",
+            date.replace('-', ""),
+            time.replace(':', "").replace('.', "-")
+        );
         let path = dir.join(format!("mai2control-{}.log", stamp));
         match File::create(&path) {
             Ok(f) => {
@@ -359,7 +374,9 @@ fn now_strings() -> (String, String) {
 #[cfg(not(windows))]
 fn now_strings() -> (String, String) {
     use std::time::{SystemTime, UNIX_EPOCH};
-    let d = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    let d = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
     let secs = d.as_secs();
     (
         "0000-00-00".to_string(),
@@ -380,7 +397,7 @@ pub fn copy_to_clipboard(text: &str) -> anyhow::Result<()> {
     use windows::Win32::System::DataExchange::{
         CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
     };
-    use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
+    use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
 
     const CF_UNICODETEXT: u32 = 13;
     let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();

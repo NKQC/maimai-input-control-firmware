@@ -36,7 +36,10 @@ impl UiConfig {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => log::warn!("读取界面配置失败({}): {}", path.display(), e),
         }
-        Self { _map: map, _path: path }
+        Self {
+            _map: map,
+            _path: path,
+        }
     }
 
     pub fn path_text(&self) -> String {

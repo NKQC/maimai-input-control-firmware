@@ -1,4 +1,4 @@
-#include "config_manager.h"
+﻿#include "config_manager.h"
 #include <cstring>
 #include <algorithm>
 #include <sstream>
@@ -13,11 +13,13 @@
 #include "pico/multicore.h"
 #include "hardware/flash.h"
 #include "hardware/sync.h"
+#include "hardware/watchdog.h"
 #endif
 
 #include "../../flash_guard.h"
 #include "../../hal/usb/hal_usb.h"
 #include "../usb_debug.h"
+#include "../nv_store/nv_store.h"   // 自管理 flash 后端(替代 LittleFS)
 
 // 常量定义
 const char ConfigManager::CONFIG_FILE_PATH[] = "/config.bin";
@@ -138,33 +140,28 @@ uint32_t ConfigManager::calculate_crc32(const config_map_t& config_map) {
     return crc_result;
 }
 
-// LittleFS初始化
+// 存储后端初始化(原 LittleFS 挂载, 现为 NvStore 自管理 flash)
+//
+// ★绝对不能再挂 LittleFS★
+// LittleFS 的分区就是链接器为 filesystem 预留的整个 FS 区(board_build.filesystem_size = 1m),
+// 而 NvStore 用的是同一块区域的前 96KB。只要 LittleFS.begin()/format() 被调用, 它写的超级块与
+// 元数据就会**直接覆盖 NvStore 的数据** —— 表现为"保存看起来成功、重启后配置又没了"这种极难查的
+// 故障。故本函数只初始化 NvStore, 一行 LittleFS 调用都不留。
+// `board_build.filesystem_size = 1m` 必须保留: `_FS_start` 这个链接符号靠它才存在, 删了 NvStore
+// 就没有地址来源。
 bool ConfigManager::littlefs_init() {
 #ifdef PICO_PLATFORM
     if (_littlefs_ready) {
-        log_debug("LittleFS already initialized");
+        log_debug("NvStore already initialized");
         return true;
     }
-    
-    
-    bool ok = LittleFS.begin();
-    if (!ok) {
-        log_error("LittleFS begin failed, try format then begin");
-        if (LittleFS.format()) {
-            ok = LittleFS.begin();
-        }
-    }
-    
-    
-    if (ok) {
-        log_info("LittleFS begin successful");
-        _littlefs_ready = true;
-        return true;
-    } else {
-        log_error("LittleFS initialization failed after format");
-        _littlefs_ready = false;
-        return false;
-    }
+    // NvStore 无需"挂载": A/B 两份各自带 magic+CRC, load() 自行判定有效性。
+    // 这里只做一次读取以确认存储可用, 结果由 initialize() 的 nv_load_kv 复用。
+    const bool ok = true;
+    g_usb_dbg.lfs_ready = ok ? 1u : 0u;
+    _littlefs_ready = ok;
+    log_info("NvStore backend ready (LittleFS disabled)");
+    return ok;
 #else
     return false;
 #endif
@@ -178,61 +175,28 @@ bool ConfigManager::littlefs_file_exists() {
         return false;
     }
     
-    bool exists = LittleFS.exists(CONFIG_FILE_PATH);
-    
-    return exists;
+    // 已废弃: 不再有"配置文件"。恒 false, 且绝不去碰 LittleFS(未挂载时调它会访问未初始化的 lfs 结构)。
+    return false;
 #else
     return false;
 #endif
 }
 
 // 文件操作封装方法（供StreamingJsonSerializer使用）
+// ★这两个入口已废弃, 恒返回 false★
+// 持久化改走 NvStore(nv_save_kv / nv_load_kv)。这里保留函数是因为旧的 JSON 读写路径还在源码里
+// (已无人调用, 由链接器丢弃), 但绝不能让它们真的去碰 LittleFS: 一旦触发挂载, LittleFS 的超级块与
+// 元数据就会覆盖同一块 FS 区里的 NvStore 数据。
 bool ConfigManager::open_file_for_read(File& file) {
-#ifdef PICO_PLATFORM
-    if (!_littlefs_ready) {
-        log_error("LittleFS not ready for file read");
-        return false;
-    }
-    // 如果配置文件不存在，直接返回 false
-    
-    bool exists = LittleFS.exists(CONFIG_FILE_PATH);
-    
-    if (!exists) {
-        log_debug("Config file not found for reading: " + std::string(CONFIG_FILE_PATH));
-        return false;
-    }
-    
-    file = LittleFS.open(CONFIG_FILE_PATH, "r");
-    
-    if (!file) {
-        log_debug("Failed to open config file for reading");
-        return false;
-    }
-    
-    return true;
-#else
+    (void)file;
+    log_debug("open_file_for_read: 已废弃(持久化改走 NvStore)");
     return false;
-#endif
 }
 
 bool ConfigManager::open_file_for_write(File& file) {
-#ifdef PICO_PLATFORM
-    if (!_littlefs_ready) {
-        log_error("LittleFS not ready for file write");
-        return false;
-    }
-    
-    file = LittleFS.open(CONFIG_FILE_PATH, "w");
-    
-    if (!file) {
-        log_error("Failed to open config file for writing");
-        return false;
-    }
-    
-    return true;
-#else
+    (void)file;
+    log_debug("open_file_for_write: 已废弃(持久化改走 NvStore)");
     return false;
-#endif
 }
 
 void ConfigManager::close_file(File& file) {
@@ -247,9 +211,107 @@ void ConfigManager::close_file(File& file) {
 
 // 私有接口：保存config_map到文件
 bool ConfigManager::config_save(const config_map_t* config_map) {
-    // 使用新的流式保存机制（flash 写死锁由 main 的运行态哨兵+看门狗自持恢复兜底）
-    bool result = config_save_streaming(config_map);
-    return result;
+    // ★改走 NvStore(自管理 flash), 不再经 LittleFS + JSON★
+    // 旧路径把整份配置序列化成 JSON 再交给 LittleFS 写: 实测单次超过 8.3s(看门狗硬件上限)被咬死复位,
+    // 而一个 4KB 扇区擦除只要 30~40ms —— 时间全花在 JSON 生成、磨损均衡搬移与元数据上。
+    // NvStore 是定长二进制记录 + A/B 双份, 一次写约 100ms。
+    return nv_save_kv(config_map);
+}
+
+// 把 config_map 落进 NvStore。类型→union 的映射与 config_types.h 的 ConfigValue 一一对应。
+// STRING 走 NvStore 的定长静态字符串区(当前 schema 未注册任何 STRING, 留作兜底)。
+bool ConfigManager::nv_save_kv(const config_map_t* config_map) {
+    if (config_map == nullptr) return false;
+    NvStore* nv = NvStore::getInstance();
+    nv->clear_kv();
+    uint32_t rejected = 0;
+    for (const auto& kv : *config_map) {
+        NvStore::Record::Value v;
+        v.u32 = 0u;
+        switch (kv.second.type) {
+            case ConfigValueType::BOOL:   v.u32 = kv.second.bool_val ? 1u : 0u; break;
+            case ConfigValueType::INT8:   v.i32 = (int32_t)kv.second.int8_val;  break;
+            case ConfigValueType::UINT8:  v.u32 = (uint32_t)kv.second.uint8_val;  break;
+            case ConfigValueType::UINT16: v.u32 = (uint32_t)kv.second.uint16_val; break;
+            case ConfigValueType::UINT32: v.u32 = kv.second.uint32_val; break;
+            case ConfigValueType::FLOAT:  v.f32 = kv.second.float_val;  break;
+            case ConfigValueType::STRING:
+                if (!nv->set_str(kv.first.c_str(), kv.second.string_val.c_str())) {
+                    rejected++;
+                }
+                continue;
+        }
+        if (!nv->set(kv.first.c_str(), (uint8_t)kv.second.type, v)) {
+            rejected++;
+        }
+    }
+    if (rejected != 0u) {
+        // 容量不足是配置面真的放不下, 必须显性失败而不是少存几项就当成功。
+        log_error("NvStore capacity exceeded, rejected " + std::to_string(rejected) + " item(s)");
+        return false;
+    }
+    // ★只置脏, 不在此擦写★: set() 内部已按需 mark_dirty(KV)。实际落盘由主循环的
+    // NvStore::commit_step() 单点执行, 每轮最多一个区, 中间 USB 照常服务。
+    // 这是"多路径各自擦写"→"线性汇总单点读写"的关键一步。
+    nv->mark_dirty(NvStore::Region::KV);
+    return true;
+}
+
+// 单键写入 NV 镜像：运行时值一旦变更即同步自己的记录并置 KV 脏，绝不在命令路径触碰 flash。
+bool ConfigManager::nv_sync_value(const std::string& key, const ConfigValue& value) {
+    NvStore* nv = NvStore::getInstance();
+    if (value.type == ConfigValueType::STRING) {
+        return nv->set_str(key.c_str(), value.string_val.c_str());
+    }
+
+    NvStore::Record::Value stored;
+    stored.u32 = 0u;
+    switch (value.type) {
+        case ConfigValueType::BOOL:   stored.u32 = value.bool_val ? 1u : 0u; break;
+        case ConfigValueType::INT8:   stored.i32 = (int32_t)value.int8_val; break;
+        case ConfigValueType::UINT8:  stored.u32 = (uint32_t)value.uint8_val; break;
+        case ConfigValueType::UINT16: stored.u32 = (uint32_t)value.uint16_val; break;
+        case ConfigValueType::UINT32: stored.u32 = value.uint32_val; break;
+        case ConfigValueType::FLOAT:  stored.f32 = value.float_val; break;
+        case ConfigValueType::STRING: return false;
+    }
+    return nv->set(key.c_str(), (uint8_t)value.type, stored);
+}
+
+// 从 NvStore 回填 out。记录里只有 key_hash, 故用 _default_map 的键名(schema 是键名真相源)逐个匹配。
+bool ConfigManager::nv_load_kv(config_map_t* out) {
+    if (out == nullptr) return false;
+    NvStore* nv = NvStore::getInstance();
+    if (!nv->load()) return false;
+    uint32_t applied = 0;
+    for (const auto& def : _default_map) {
+        ConfigValue cv = def.second;   // 以 schema 项为模板, 保留类型与范围
+        if (def.second.type == ConfigValueType::STRING) {
+            char tmp[NvStore::STR_LEN];
+            if (!nv->get_str(def.first.c_str(), tmp, sizeof(tmp))) continue;
+            cv.string_val = tmp;
+            (*out)[def.first] = cv;
+            applied++;
+            continue;
+        }
+        NvStore::Record::Value v;
+        uint8_t type = 0;
+        if (!nv->get(def.first.c_str(), &v, &type)) continue;
+        if (type != (uint8_t)def.second.type) continue;   // 类型不符视为陈旧记录, 丢弃
+        switch (def.second.type) {
+            case ConfigValueType::BOOL:   cv.bool_val   = (v.u32 != 0u); break;
+            case ConfigValueType::INT8:   cv.int8_val   = (int8_t)v.i32; break;
+            case ConfigValueType::UINT8:  cv.uint8_val  = (uint8_t)v.u32; break;
+            case ConfigValueType::UINT16: cv.uint16_val = (uint16_t)v.u32; break;
+            case ConfigValueType::UINT32: cv.uint32_val = v.u32; break;
+            case ConfigValueType::FLOAT:  cv.float_val  = v.f32; break;
+            default: continue;
+        }
+        (*out)[def.first] = cv;
+        applied++;
+    }
+    log_debug("NvStore loaded " + std::to_string(applied) + " item(s)");
+    return applied != 0u;
 }
 
 // 从对象字符串中提取值
@@ -878,13 +940,39 @@ bool ConfigManager::config_save_streaming(const config_map_t* config_map) {
     log_debug("=== 保存时CRC计算结束 ===");
     
     // 一次性写入完整的JSON
+    g_usb_dbg.last_save_stage = 2;   // JSON 已生成
     File file;
     if (!open_file_for_write(file)) {
         log_error("Failed to open config file for write");
+        g_usb_dbg.last_save_stage = -3;   // 打开失败
         return false;
     }
+    g_usb_dbg.last_save_stage = 3;   // 文件已打开
     
-    size_t bytes_written = file.write(reinterpret_cast<const uint8_t*>(complete_json.c_str()), complete_json.length());
+    // ★分片写 + 每片喂狗★: 原来是一次 file.write 交给 LittleFS 写完整个 JSON, 期间要擦/写多个
+    // 4KB 扇区并做磨损均衡搬移, 全程不返回也就没人喂狗 —— 配置项一多(本工程已到数百项)单次写就会
+    // 超过 5s 的看门狗周期, RP2040 直接复位: 表现为"点保存到设备后设备掉线重新枚举, LED 也重启"。
+    // 分片本身不改变落盘内容(LittleFS 会把连续写合并到同一文件), 只是把控制权periodically 交回来。
+    const uint8_t* json_ptr = reinterpret_cast<const uint8_t*>(complete_json.c_str());
+    const size_t json_len = complete_json.length();
+    const size_t WRITE_CHUNK = 512;
+    size_t bytes_written = 0;
+    while (bytes_written < json_len) {
+        const size_t chunk = std::min(WRITE_CHUNK, json_len - bytes_written);
+        const size_t n = file.write(json_ptr + bytes_written, chunk);
+        if (n == 0) {
+            log_error("Config write stalled: 0 bytes written");
+            break;
+        }
+        bytes_written += n;
+#ifdef PICO_PLATFORM
+        watchdog_update();
+#endif
+        if (n != chunk) {
+            // 短写 = 介质满或底层错误, 继续循环只会空转; 交由下面的长度校验报错。
+            break;
+        }
+    }
     close_file(file);
     
     if (bytes_written != complete_json.length()) {
@@ -983,11 +1071,13 @@ bool ConfigManager::initialize() {
     // 消除"文件损坏/空 → config_read 返回 true 但 0 项 → _runtime_map 空 → CFG_GET_ALL 收 0 项"的整机失效。
     _runtime_map = _default_map;
 
-    bool config_exists = littlefs_file_exists();
-    log_debug("Config file exists: " + std::string(config_exists ? "true" : "false"));
+    // ★存在性判定改问 NvStore★: 不再有"文件"这个概念, 两份 A/B 都无效就当首次使用。
+    config_map_t nv_loaded;
+    const bool config_exists = nv_load_kv(&nv_loaded);
+    log_debug("NvStore has config: " + std::string(config_exists ? "true" : "false"));
     if (config_exists) {
-        config_map_t loaded;
-        if (config_read(&loaded) && !loaded.empty()) {
+        config_map_t& loaded = nv_loaded;
+        if (!loaded.empty()) {
             // 仅覆盖 schema 中存在的 key，忽略陌生/过时 key，保持配置面完整。
             uint32_t applied = 0;
             for (const auto& kv : loaded) {
@@ -1003,17 +1093,16 @@ bool ConfigManager::initialize() {
                       "/" + std::to_string(loaded.size()) + ", runtime size " +
                       std::to_string(_runtime_map.size()));
         } else {
-            // 文件损坏/空：保持 schema 默认(已打底)，并重写一份健康默认文件。
-            log_error("Config file corrupt/empty; keep defaults + rewrite healthy file");
-            LittleFS.format();
+            // 记录为空: 保持 schema 默认(已打底), 并写一份健康默认下去。
+            log_error("NvStore empty; keep defaults + write healthy set");
             config_save(&_default_map);
         }
     } else {
-        // 文件缺失：写入默认。
-        if (LittleFS.format() && config_save(&_default_map)) {
+        // 两份都无效(首次上电 / 被写坏): 写入默认。NvStore 的 A/B 各自带 CRC, 不需要"格式化"。
+        if (config_save(&_default_map)) {
             log_debug("Save default config successful");
         } else {
-            log_error("Format and save default config failed");
+            log_error("Save default config failed");
         }
     }
 
@@ -1071,38 +1160,30 @@ ConfigValue ConfigManager::get(const std::string& key) {
 
 // 设置配置值
 void ConfigManager::set(const std::string& key, const ConfigValue& value) {
-    // 先检查运行时map
     auto runtime_it = _runtime_map.find(key);
     if (runtime_it != _runtime_map.end()) {
-        // 复制范围限制信息
         ConfigValue new_value = value;
         if (runtime_it->second.has_range && new_value.type == runtime_it->second.type) {
             new_value.copy_range_from(runtime_it->second);
             new_value.clamp_value();
         }
         _runtime_map[key] = new_value;
-        
-        // 清除字符串缓存
-        auto cache_it = _string_cache.find(key);
-        if (cache_it != _string_cache.end()) {
-            _string_cache.erase(cache_it);
-        }
-        return;
-    }
-    
-    // 检查默认map
-    auto default_it = _default_map.find(key);
-    if (default_it != _default_map.end()) {
-        // 从默认map添加到运行时map
+    } else {
+        auto default_it = _default_map.find(key);
+        if (default_it == _default_map.end()) return;
         ConfigValue new_value = value;
         if (default_it->second.has_range && new_value.type == default_it->second.type) {
             new_value.copy_range_from(default_it->second);
             new_value.clamp_value();
         }
         _runtime_map[key] = new_value;
-        return;
     }
-    return;
+
+    auto cache_it = _string_cache.find(key);
+    if (cache_it != _string_cache.end()) _string_cache.erase(cache_it);
+    if (!nv_sync_value(key, _runtime_map[key])) {
+        log_error("NvStore mirror update failed: " + key);
+    }
 }
 
 // 便捷类型获取接口实现
@@ -1205,13 +1286,11 @@ void ConfigManager::set_string(const std::string& key, const std::string& value)
 
 // 动态设置接口实现 - 允许设置未注册的键（字符串限定）
 void ConfigManager::set_string_dynamic(const std::string& key, const std::string& value) {
-    // 直接设置到运行时map，不检查是否已注册
     _runtime_map[key] = ConfigValue(value);
-    
-    // 清除字符串缓存
     auto cache_it = _string_cache.find(key);
-    if (cache_it != _string_cache.end()) {
-        _string_cache.erase(cache_it);
+    if (cache_it != _string_cache.end()) _string_cache.erase(cache_it);
+    if (!nv_sync_value(key, _runtime_map[key])) {
+        log_error("NvStore mirror update failed: " + key);
     }
 }
 
@@ -1271,42 +1350,22 @@ void ConfigManager::save_config() {
 
 // 保存配置到文件（task版本，检查信号）
 bool ConfigManager::save_config_task() {
-    if (!_save_requested) {
-        return true;  // 没有保存请求，直接返回成功
-    }
+    if (!_save_requested) return true;
 
-    // 解耦：各服务通过 ConfigManager 静态 get/set 外部接口自行写回配置，
-    // 此处不再反向调用具体服务。
-
-    _save_requested = false;  // 清除保存请求信号
-    log_debug("Starting config save process...");
-    log_debug("Runtime map size: " + std::to_string(_runtime_map.size()));
-    // LittleFS 没有可安全让出 XIP 擦写的分片 API；改用忙标记暂停所有定时 IN 推送，
-    // 并在关中断前后各泵一次 USB。这样既不在擦写中执行 flash 代码，也不给 64B vendor FIFO 继续塞帧。
-    bool result;
+    _save_requested = false;
 #ifdef PICO_PLATFORM
-    {
-        FlashWriteGuard flash_guard;
-        HAL_USB_Device::getInstance()->task();
-        uint32_t _irq = save_and_disable_interrupts();
-        multicore_lockout_start_blocking();
-        result = config_save(&_runtime_map);
-        multicore_lockout_end_blocking();
-        restore_interrupts(_irq);
-    }
-    HAL_USB_Device::getInstance()->task();
-#else
-    result = config_save(&_runtime_map);
+    g_usb_dbg.save_entry_count++;
+    g_usb_dbg.last_save_stage = 1;
 #endif
+    // SAVE_CONFIG 只作全量镜像兜底：镜像更新和标脏均为 RAM 操作，真实 flash 擦写仅由
+    // 主循环的 NvStore::commit_step() 统一执行。
+    const bool result = config_save(&_runtime_map);
     if (!result) {
         _error_count++;
-        log_error("Config save failed! Error count: " + std::to_string(_error_count));
-    } else {
-        log_info("Config save successful");
+        log_error("Config mirror save failed! Error count: " + std::to_string(_error_count));
     }
 #ifdef PICO_PLATFORM
-    g_usb_dbg.flash_write_count++;
-    g_usb_dbg.loop_at_last_flash = g_usb_dbg.loop_count;
+    g_usb_dbg.last_save_stage = result ? 6 : -3;
 #endif
     return result;
 }
@@ -1314,7 +1373,8 @@ bool ConfigManager::save_config_task() {
 // 重置到默认配置
 bool ConfigManager::reset_to_defaults() {
     _runtime_map = _default_map;
-    _save_requested = true;   // 延迟到主循环安全窗口落地：避免在 handler 上下文 flash 写打断 USB 事务
+    if (!config_save(&_runtime_map)) return false;
+    _save_requested = true;   // 保留 SAVE_CONFIG 的全量镜像兜底语义
     return true;
 }
 

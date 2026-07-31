@@ -12,40 +12,44 @@ use windows::Win32::Media::KernelStreaming::{
     IKsControl, IKsControl_Impl, KSCAMERAPROFILE_HighFrameRate, KSCAMERAPROFILE_Legacy,
     KSIDENTIFIER,
 };
-use windows::core::w;
 use windows::Win32::Media::MediaFoundation::{
     IMFAsyncCallback, IMFAsyncResult, IMFAttributes, IMFAttributes_Impl, IMFGetService,
     IMFGetService_Impl, IMFMediaEvent, IMFMediaEventGenerator_Impl, IMFMediaEventQueue,
-    IMFMediaSource, IMFMediaSourceEx, IMFMediaSourceEx_Impl, IMFMediaSource_Impl,
+    IMFMediaSource, IMFMediaSource_Impl, IMFMediaSourceEx, IMFMediaSourceEx_Impl,
     IMFPresentationDescriptor, IMFSampleAllocatorControl, IMFSampleAllocatorControl_Impl,
-    MFSampleAllocatorUsage, MFSampleAllocatorUsage_DoesNotAllocate,
     MEDIA_EVENT_GENERATOR_GET_EVENT_FLAGS, MENewStream, MESourcePaused, MESourceStarted,
-    MESourceStopped, MEUpdatedStream, MF_ATTRIBUTES_MATCH_TYPE, MF_ATTRIBUTE_TYPE,
-    MFCreateAttributes, MFCreateEventQueue, MFCreatePresentationDescriptor,
-    MFCreateStreamDescriptor, MFCreateSensorProfile, MFCreateSensorProfileCollection,
-    MF_DEVICEMFT_SENSORPROFILE_COLLECTION, MFMEDIASOURCE_IS_LIVE, MF_E_INVALIDREQUEST,
-    MF_E_SHUTDOWN, MF_E_UNSUPPORTED_SERVICE, MF_E_UNSUPPORTED_TIME_FORMAT,
-    MF_STREAM_STATE, MF_STREAM_STATE_PAUSED, MF_STREAM_STATE_RUNNING, MF_STREAM_STATE_STOPPED,
+    MESourceStopped, MEUpdatedStream, MF_ATTRIBUTE_TYPE, MF_ATTRIBUTES_MATCH_TYPE,
+    MF_DEVICEMFT_SENSORPROFILE_COLLECTION, MF_E_INVALIDREQUEST, MF_E_SHUTDOWN,
+    MF_E_UNSUPPORTED_SERVICE, MF_E_UNSUPPORTED_TIME_FORMAT, MF_STREAM_STATE,
+    MF_STREAM_STATE_PAUSED, MF_STREAM_STATE_RUNNING, MF_STREAM_STATE_STOPPED, MFCreateAttributes,
+    MFCreateEventQueue, MFCreatePresentationDescriptor, MFCreateSensorProfile,
+    MFCreateSensorProfileCollection, MFCreateStreamDescriptor, MFMEDIASOURCE_IS_LIVE,
+    MFSampleAllocatorUsage, MFSampleAllocatorUsage_DoesNotAllocate,
 };
 use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
+use windows::core::w;
 use windows::core::{
-    BOOL, ComObject, GUID, IUnknown, IUnknownImpl, Interface, PCWSTR, PWSTR, Ref, Result,
-    implement,
+    BOOL, ComObject, GUID, IUnknown, IUnknownImpl, Interface, PCWSTR, PWSTR, Ref, Result, implement,
 };
 
 use crate::stream::{VcamStream, create_media_types};
 use crate::{_ks_not_found, _object_created, _object_released, _trace_guid, _trace_result};
 
 macro_rules! _trace_source {
-    ($method:literal, $details:expr, $result:expr) => {{
-        _trace_result(|| format!("{} {}", $method, $details), $result)
-    }};
+    ($method:literal, $details:expr, $result:expr) => {{ _trace_result(|| format!("{} {}", $method, $details), $result) }};
 }
 
 macro_rules! _trace_attr {
     ($method:literal, $key:expr, $details:expr, $result:expr) => {{
         _trace_result(
-            || format!("IMFAttributes::{} key={} {}", $method, _trace_guid($key), $details),
+            || {
+                format!(
+                    "IMFAttributes::{} key={} {}",
+                    $method,
+                    _trace_guid($key),
+                    $details
+                )
+            },
             $result,
         )
     }};
@@ -102,11 +106,8 @@ impl VcamSource {
             let legacy = MFCreateSensorProfile(&KSCAMERAPROFILE_Legacy, 0, PCWSTR::null())?;
             legacy.AddProfileFilter(0, w!("((RES==;FRT<=30,1;SUT==))"))?;
             collection.AddProfile(&legacy)?;
-            let high_frame_rate = MFCreateSensorProfile(
-                &KSCAMERAPROFILE_HighFrameRate,
-                0,
-                PCWSTR::null(),
-            )?;
+            let high_frame_rate =
+                MFCreateSensorProfile(&KSCAMERAPROFILE_HighFrameRate, 0, PCWSTR::null())?;
             high_frame_rate.AddProfileFilter(0, w!("((RES==;FRT>=60,1;SUT==))"))?;
             collection.AddProfile(&high_frame_rate)?;
             attrs.SetUnknown(&MF_DEVICEMFT_SENSORPROFILE_COLLECTION, &collection)?;
@@ -167,21 +168,31 @@ impl windows::Win32::System::Com::IAgileObject_Impl for VcamSource_Impl {}
 
 impl IMFAttributes_Impl for VcamSource_Impl {
     fn GetItem(&self, guidkey: *const GUID, pvalue: *mut PROPVARIANT) -> Result<()> {
-        _trace_attr!("GetItem", guidkey, format!("pvalue_null={}", pvalue.is_null()), {
-            // pvalue 允许为 NULL，帧服务器可仅探测属性是否存在。
-            let value = if pvalue.is_null() { None } else { Some(pvalue) };
-            unsafe { self._attrs.GetItem(guidkey, value) }
-        })
+        _trace_attr!(
+            "GetItem",
+            guidkey,
+            format!("pvalue_null={}", pvalue.is_null()),
+            {
+                // pvalue 允许为 NULL，帧服务器可仅探测属性是否存在。
+                let value = if pvalue.is_null() { None } else { Some(pvalue) };
+                unsafe { self._attrs.GetItem(guidkey, value) }
+            }
+        )
     }
 
     fn GetItemType(&self, guidkey: *const GUID) -> Result<MF_ATTRIBUTE_TYPE> {
-        _trace_attr!("GetItemType", guidkey, "", unsafe { self._attrs.GetItemType(guidkey) })
+        _trace_attr!("GetItemType", guidkey, "", unsafe {
+            self._attrs.GetItemType(guidkey)
+        })
     }
 
     fn CompareItem(&self, guidkey: *const GUID, value: *const PROPVARIANT) -> Result<BOOL> {
-        _trace_attr!("CompareItem", guidkey, format!("value_null={}", value.is_null()), unsafe {
-            self._attrs.CompareItem(guidkey, value)
-        })
+        _trace_attr!(
+            "CompareItem",
+            guidkey,
+            format!("value_null={}", value.is_null()),
+            unsafe { self._attrs.CompareItem(guidkey, value) }
+        )
     }
 
     fn Compare(
@@ -192,25 +203,37 @@ impl IMFAttributes_Impl for VcamSource_Impl {
         _trace_attr!(
             "Compare",
             std::ptr::null::<GUID>(),
-            format!("attributes_null={} match_type={}", pattributes.is_null(), matchtype.0),
+            format!(
+                "attributes_null={} match_type={}",
+                pattributes.is_null(),
+                matchtype.0
+            ),
             unsafe { self._attrs.Compare(pattributes.ok()?, matchtype) }
         )
     }
 
     fn GetUINT32(&self, guidkey: *const GUID) -> Result<u32> {
-        _trace_attr!("GetUINT32", guidkey, "", unsafe { self._attrs.GetUINT32(guidkey) })
+        _trace_attr!("GetUINT32", guidkey, "", unsafe {
+            self._attrs.GetUINT32(guidkey)
+        })
     }
 
     fn GetUINT64(&self, guidkey: *const GUID) -> Result<u64> {
-        _trace_attr!("GetUINT64", guidkey, "", unsafe { self._attrs.GetUINT64(guidkey) })
+        _trace_attr!("GetUINT64", guidkey, "", unsafe {
+            self._attrs.GetUINT64(guidkey)
+        })
     }
 
     fn GetDouble(&self, guidkey: *const GUID) -> Result<f64> {
-        _trace_attr!("GetDouble", guidkey, "", unsafe { self._attrs.GetDouble(guidkey) })
+        _trace_attr!("GetDouble", guidkey, "", unsafe {
+            self._attrs.GetDouble(guidkey)
+        })
     }
 
     fn GetGUID(&self, guidkey: *const GUID) -> Result<GUID> {
-        _trace_attr!("GetGUID", guidkey, "", unsafe { self._attrs.GetGUID(guidkey) })
+        _trace_attr!("GetGUID", guidkey, "", unsafe {
+            self._attrs.GetGUID(guidkey)
+        })
     }
 
     fn GetStringLength(&self, guidkey: *const GUID) -> Result<u32> {
@@ -229,7 +252,12 @@ impl IMFAttributes_Impl for VcamSource_Impl {
         _trace_attr!(
             "GetString",
             guidkey,
-            format!("value_null={} buffer_size={} length_null={}", pwszvalue.0.is_null(), cchbufsize, pcchlength.is_null()),
+            format!(
+                "value_null={} buffer_size={} length_null={}",
+                pwszvalue.0.is_null(),
+                cchbufsize,
+                pcchlength.is_null()
+            ),
             {
                 let value = if cchbufsize == 0 {
                     &mut []
@@ -237,7 +265,11 @@ impl IMFAttributes_Impl for VcamSource_Impl {
                     unsafe { std::slice::from_raw_parts_mut(pwszvalue.0, cchbufsize as usize) }
                 };
                 // pcchlength 是可选出参，NULL 合法。
-                let length = if pcchlength.is_null() { None } else { Some(pcchlength) };
+                let length = if pcchlength.is_null() {
+                    None
+                } else {
+                    Some(pcchlength)
+                };
                 unsafe { self._attrs.GetString(guidkey, value, length) }
             }
         )
@@ -252,13 +284,22 @@ impl IMFAttributes_Impl for VcamSource_Impl {
         _trace_attr!(
             "GetAllocatedString",
             guidkey,
-            format!("value_out_null={} length_out_null={}", ppwszvalue.is_null(), pcchlength.is_null()),
-            unsafe { self._attrs.GetAllocatedString(guidkey, ppwszvalue, pcchlength) }
+            format!(
+                "value_out_null={} length_out_null={}",
+                ppwszvalue.is_null(),
+                pcchlength.is_null()
+            ),
+            unsafe {
+                self._attrs
+                    .GetAllocatedString(guidkey, ppwszvalue, pcchlength)
+            }
         )
     }
 
     fn GetBlobSize(&self, guidkey: *const GUID) -> Result<u32> {
-        _trace_attr!("GetBlobSize", guidkey, "", unsafe { self._attrs.GetBlobSize(guidkey) })
+        _trace_attr!("GetBlobSize", guidkey, "", unsafe {
+            self._attrs.GetBlobSize(guidkey)
+        })
     }
 
     fn GetBlob(
@@ -271,7 +312,12 @@ impl IMFAttributes_Impl for VcamSource_Impl {
         _trace_attr!(
             "GetBlob",
             guidkey,
-            format!("buffer_null={} buffer_size={} size_out_null={}", pbuf.is_null(), cbbufsize, pcbblobsize.is_null()),
+            format!(
+                "buffer_null={} buffer_size={} size_out_null={}",
+                pbuf.is_null(),
+                cbbufsize,
+                pcbblobsize.is_null()
+            ),
             {
                 let value = if cbbufsize == 0 {
                     &mut []
@@ -279,7 +325,11 @@ impl IMFAttributes_Impl for VcamSource_Impl {
                     unsafe { std::slice::from_raw_parts_mut(pbuf, cbbufsize as usize) }
                 };
                 // pcbblobsize 同为可选出参。
-                let size = if pcbblobsize.is_null() { None } else { Some(pcbblobsize) };
+                let size = if pcbblobsize.is_null() {
+                    None
+                } else {
+                    Some(pcbblobsize)
+                };
                 unsafe { self._attrs.GetBlob(guidkey, value, size) }
             }
         )
@@ -294,7 +344,11 @@ impl IMFAttributes_Impl for VcamSource_Impl {
         _trace_attr!(
             "GetAllocatedBlob",
             guidkey,
-            format!("buffer_out_null={} size_out_null={}", ppbuf.is_null(), pcbsize.is_null()),
+            format!(
+                "buffer_out_null={} size_out_null={}",
+                ppbuf.is_null(),
+                pcbsize.is_null()
+            ),
             unsafe { self._attrs.GetAllocatedBlob(guidkey, ppbuf, pcbsize) }
         )
     }
@@ -321,13 +375,18 @@ impl IMFAttributes_Impl for VcamSource_Impl {
     }
 
     fn SetItem(&self, guidkey: *const GUID, value: *const PROPVARIANT) -> Result<()> {
-        _trace_attr!("SetItem", guidkey, format!("value_null={}", value.is_null()), unsafe {
-            self._attrs.SetItem(guidkey, value)
-        })
+        _trace_attr!(
+            "SetItem",
+            guidkey,
+            format!("value_null={}", value.is_null()),
+            unsafe { self._attrs.SetItem(guidkey, value) }
+        )
     }
 
     fn DeleteItem(&self, guidkey: *const GUID) -> Result<()> {
-        _trace_attr!("DeleteItem", guidkey, "", unsafe { self._attrs.DeleteItem(guidkey) })
+        _trace_attr!("DeleteItem", guidkey, "", unsafe {
+            self._attrs.DeleteItem(guidkey)
+        })
     }
 
     fn DeleteAllItems(&self) -> Result<()> {
@@ -355,15 +414,21 @@ impl IMFAttributes_Impl for VcamSource_Impl {
     }
 
     fn SetGUID(&self, guidkey: *const GUID, guidvalue: *const GUID) -> Result<()> {
-        _trace_attr!("SetGUID", guidkey, format!("value={}", _trace_guid(guidvalue)), unsafe {
-            self._attrs.SetGUID(guidkey, guidvalue)
-        })
+        _trace_attr!(
+            "SetGUID",
+            guidkey,
+            format!("value={}", _trace_guid(guidvalue)),
+            unsafe { self._attrs.SetGUID(guidkey, guidvalue) }
+        )
     }
 
     fn SetString(&self, guidkey: *const GUID, wszvalue: &PCWSTR) -> Result<()> {
-        _trace_attr!("SetString", guidkey, format!("value_null={}", wszvalue.0.is_null()), unsafe {
-            self._attrs.SetString(guidkey, *wszvalue)
-        })
+        _trace_attr!(
+            "SetString",
+            guidkey,
+            format!("value_null={}", wszvalue.0.is_null()),
+            unsafe { self._attrs.SetString(guidkey, *wszvalue) }
+        )
     }
 
     fn SetBlob(&self, guidkey: *const GUID, pbuf: *const u8, cbsize: u32) -> Result<()> {
@@ -383,21 +448,30 @@ impl IMFAttributes_Impl for VcamSource_Impl {
     }
 
     fn SetUnknown(&self, guidkey: *const GUID, punkunknown: Ref<IUnknown>) -> Result<()> {
-        _trace_attr!("SetUnknown", guidkey, format!("unknown_null={}", punkunknown.is_null()), unsafe {
-            self._attrs.SetUnknown(guidkey, punkunknown.ok()?)
-        })
+        _trace_attr!(
+            "SetUnknown",
+            guidkey,
+            format!("unknown_null={}", punkunknown.is_null()),
+            unsafe { self._attrs.SetUnknown(guidkey, punkunknown.ok()?) }
+        )
     }
 
     fn LockStore(&self) -> Result<()> {
-        _trace_attr!("LockStore", std::ptr::null::<GUID>(), "", unsafe { self._attrs.LockStore() })
+        _trace_attr!("LockStore", std::ptr::null::<GUID>(), "", unsafe {
+            self._attrs.LockStore()
+        })
     }
 
     fn UnlockStore(&self) -> Result<()> {
-        _trace_attr!("UnlockStore", std::ptr::null::<GUID>(), "", unsafe { self._attrs.UnlockStore() })
+        _trace_attr!("UnlockStore", std::ptr::null::<GUID>(), "", unsafe {
+            self._attrs.UnlockStore()
+        })
     }
 
     fn GetCount(&self) -> Result<u32> {
-        _trace_attr!("GetCount", std::ptr::null::<GUID>(), "", unsafe { self._attrs.GetCount() })
+        _trace_attr!("GetCount", std::ptr::null::<GUID>(), "", unsafe {
+            self._attrs.GetCount()
+        })
     }
 
     fn GetItemByIndex(
@@ -409,7 +483,12 @@ impl IMFAttributes_Impl for VcamSource_Impl {
         _trace_attr!(
             "GetItemByIndex",
             std::ptr::null::<GUID>(),
-            format!("index={} key_out_null={} value_out_null={}", unindex, pguidkey.is_null(), pvalue.is_null()),
+            format!(
+                "index={} key_out_null={} value_out_null={}",
+                unindex,
+                pguidkey.is_null(),
+                pvalue.is_null()
+            ),
             {
                 // pvalue 可为 NULL，只取键名时必须原样转发。
                 let value = if pvalue.is_null() { None } else { Some(pvalue) };
@@ -439,7 +518,10 @@ impl IMFMediaEventGenerator_Impl for VcamSource_Impl {
         punkstate: Ref<IUnknown>,
     ) -> Result<()> {
         self._alive()?;
-        unsafe { self._queue.BeginGetEvent(pcallback.ok()?, punkstate.as_ref()) }
+        unsafe {
+            self._queue
+                .BeginGetEvent(pcallback.ok()?, punkstate.as_ref())
+        }
     }
     fn EndGetEvent(&self, presult: Ref<IMFAsyncResult>) -> Result<IMFMediaEvent> {
         self._alive()?;
@@ -462,17 +544,25 @@ impl IMFMediaEventGenerator_Impl for VcamSource_Impl {
 
 impl IMFMediaSource_Impl for VcamSource_Impl {
     fn GetCharacteristics(&self) -> Result<u32> {
-        _trace_source!("IMFMediaSource::GetCharacteristics", "", (|| {
-            self._alive()?;
-            Ok(MFMEDIASOURCE_IS_LIVE.0 as u32)
-        })())
+        _trace_source!(
+            "IMFMediaSource::GetCharacteristics",
+            "",
+            (|| {
+                self._alive()?;
+                Ok(MFMEDIASOURCE_IS_LIVE.0 as u32)
+            })()
+        )
     }
 
     fn CreatePresentationDescriptor(&self) -> Result<IMFPresentationDescriptor> {
-        _trace_source!("IMFMediaSource::CreatePresentationDescriptor", "", (|| {
-            self._alive()?;
-            unsafe { self._pd.Clone() }
-        })())
+        _trace_source!(
+            "IMFMediaSource::CreatePresentationDescriptor",
+            "",
+            (|| {
+                self._alive()?;
+                unsafe { self._pd.Clone() }
+            })()
+        )
     }
 
     fn Start(
@@ -483,7 +573,12 @@ impl IMFMediaSource_Impl for VcamSource_Impl {
     ) -> Result<()> {
         _trace_source!(
             "IMFMediaSource::Start",
-            format!("presentation_descriptor_null={} time_format={} start_position_null={}", ppresentationdescriptor.is_null(), _trace_guid(pguidtimeformat), pvarstartposition.is_null()),
+            format!(
+                "presentation_descriptor_null={} time_format={} start_position_null={}",
+                ppresentationdescriptor.is_null(),
+                _trace_guid(pguidtimeformat),
+                pvarstartposition.is_null()
+            ),
             (|| {
                 self._alive()?;
                 VcamSource::_check_time_format(pguidtimeformat)?;
@@ -503,11 +598,19 @@ impl IMFMediaSource_Impl for VcamSource_Impl {
                 };
 
                 // 锁外入队, 避免在持锁时回调外部接口。
-                let event = if announced { MEUpdatedStream } else { MENewStream };
+                let event = if announced {
+                    MEUpdatedStream
+                } else {
+                    MENewStream
+                };
                 let stream = self._stream.to_interface::<IUnknown>();
                 unsafe {
-                    self._queue
-                        .QueueEventParamUnk(event.0 as u32, &GUID::zeroed(), S_OK, &stream)?
+                    self._queue.QueueEventParamUnk(
+                        event.0 as u32,
+                        &GUID::zeroed(),
+                        S_OK,
+                        &stream,
+                    )?
                 };
                 self._stream.get()._start(pvarstartposition)?;
 
@@ -530,86 +633,118 @@ impl IMFMediaSource_Impl for VcamSource_Impl {
     }
 
     fn Stop(&self) -> Result<()> {
-        _trace_source!("IMFMediaSource::Stop", "", (|| {
-            {
-                let mut g = self._lock();
-                if g._shutdown {
-                    return Err(MF_E_SHUTDOWN.into());
+        _trace_source!(
+            "IMFMediaSource::Stop",
+            "",
+            (|| {
+                {
+                    let mut g = self._lock();
+                    if g._shutdown {
+                        return Err(MF_E_SHUTDOWN.into());
+                    }
+                    g._state = MF_STREAM_STATE_STOPPED;
                 }
-                g._state = MF_STREAM_STATE_STOPPED;
-            }
-            self._stream.get()._stop()?;
-            let empty = PROPVARIANT::default();
-            unsafe {
-                self._queue
-                    .QueueEventParamVar(MESourceStopped.0 as u32, &GUID::zeroed(), S_OK, &empty)
-            }
-        })())
+                self._stream.get()._stop()?;
+                let empty = PROPVARIANT::default();
+                unsafe {
+                    self._queue.QueueEventParamVar(
+                        MESourceStopped.0 as u32,
+                        &GUID::zeroed(),
+                        S_OK,
+                        &empty,
+                    )
+                }
+            })()
+        )
     }
 
     fn Pause(&self) -> Result<()> {
-        _trace_source!("IMFMediaSource::Pause", "", (|| {
-            {
-                let mut g = self._lock();
-                if g._shutdown {
-                    return Err(MF_E_SHUTDOWN.into());
+        _trace_source!(
+            "IMFMediaSource::Pause",
+            "",
+            (|| {
+                {
+                    let mut g = self._lock();
+                    if g._shutdown {
+                        return Err(MF_E_SHUTDOWN.into());
+                    }
+                    if g._state != MF_STREAM_STATE_RUNNING {
+                        return Err(MF_E_INVALIDREQUEST.into());
+                    }
+                    g._state = MF_STREAM_STATE_PAUSED;
                 }
-                if g._state != MF_STREAM_STATE_RUNNING {
-                    return Err(MF_E_INVALIDREQUEST.into());
+                self._stream.get()._pause()?;
+                let empty = PROPVARIANT::default();
+                unsafe {
+                    self._queue.QueueEventParamVar(
+                        MESourcePaused.0 as u32,
+                        &GUID::zeroed(),
+                        S_OK,
+                        &empty,
+                    )
                 }
-                g._state = MF_STREAM_STATE_PAUSED;
-            }
-            self._stream.get()._pause()?;
-            let empty = PROPVARIANT::default();
-            unsafe {
-                self._queue
-                    .QueueEventParamVar(MESourcePaused.0 as u32, &GUID::zeroed(), S_OK, &empty)
-            }
-        })())
+            })()
+        )
     }
 
     fn Shutdown(&self) -> Result<()> {
-        _trace_source!("IMFMediaSource::Shutdown", "", (|| {
-            {
-                let mut g = self._lock();
-                if g._shutdown {
-                    return Err(MF_E_SHUTDOWN.into());
+        _trace_source!(
+            "IMFMediaSource::Shutdown",
+            "",
+            (|| {
+                {
+                    let mut g = self._lock();
+                    if g._shutdown {
+                        return Err(MF_E_SHUTDOWN.into());
+                    }
+                    g._shutdown = true;
+                    g._state = MF_STREAM_STATE_STOPPED;
                 }
-                g._shutdown = true;
-                g._state = MF_STREAM_STATE_STOPPED;
-            }
-            self._stream.get()._shutdown();
-            unsafe { self._queue.Shutdown() }
-        })())
+                self._stream.get()._shutdown();
+                unsafe { self._queue.Shutdown() }
+            })()
+        )
     }
 }
 
 impl IMFMediaSourceEx_Impl for VcamSource_Impl {
     fn GetSourceAttributes(&self) -> Result<IMFAttributes> {
-        _trace_source!("IMFMediaSourceEx::GetSourceAttributes", "return=self", (|| {
-            self._alive()?;
-            // 帧服务器会在返回对象上继续 QI IMFMediaSourceEx/IMFGetService/IKsControl。
-            Ok(self.to_object().to_interface::<IMFAttributes>())
-        })())
+        _trace_source!(
+            "IMFMediaSourceEx::GetSourceAttributes",
+            "return=self",
+            (|| {
+                self._alive()?;
+                // 帧服务器会在返回对象上继续 QI IMFMediaSourceEx/IMFGetService/IKsControl。
+                Ok(self.to_object().to_interface::<IMFAttributes>())
+            })()
+        )
     }
 
     fn GetStreamAttributes(&self, dwstreamidentifier: u32) -> Result<IMFAttributes> {
-        _trace_source!("IMFMediaSourceEx::GetStreamAttributes", format!("stream_id={dwstreamidentifier}"), (|| {
-            self._alive()?;
-            if dwstreamidentifier != 0 {
-                return Err(windows::Win32::Foundation::E_INVALIDARG.into());
-            }
-            // 平台需由属性对象继续 QI 流接口，故返回流自身而非底层属性存储。
-            Ok(self._stream.to_interface::<IMFAttributes>())
-        })())
+        _trace_source!(
+            "IMFMediaSourceEx::GetStreamAttributes",
+            format!("stream_id={dwstreamidentifier}"),
+            (|| {
+                self._alive()?;
+                if dwstreamidentifier != 0 {
+                    return Err(windows::Win32::Foundation::E_INVALIDARG.into());
+                }
+                // 平台需由属性对象继续 QI 流接口，故返回流自身而非底层属性存储。
+                Ok(self._stream.to_interface::<IMFAttributes>())
+            })()
+        )
     }
 
     /// 纯 CPU 输出, 不使用 D3D; 但必须返回 S_OK, 否则帧服务器会认为源不可用。
     fn SetD3DManager(&self, pmanager: Ref<IUnknown>) -> Result<()> {
-        _trace_source!("IMFMediaSourceEx::SetD3DManager", format!("manager_null={}", pmanager.is_null()), (|| {
-            self._alive()?;
-            Ok(())
-        })())
+        _trace_source!(
+            "IMFMediaSourceEx::SetD3DManager",
+            format!("manager_null={}", pmanager.is_null()),
+            (|| {
+                self._alive()?;
+                Ok(())
+            })()
+        )
     }
 }
 
@@ -620,11 +755,19 @@ impl IMFSampleAllocatorControl_Impl for VcamSource_Impl {
         // windows 0.62 的绑定里这个参数是裸 Ref<IUnknown>(不是 IMFSampleAllocator)。
         pallocator: Ref<IUnknown>,
     ) -> Result<()> {
-        _trace_source!("IMFSampleAllocatorControl::SetDefaultAllocator", format!("output_stream_id={} allocator_null={}", dwoutputstreamid, pallocator.is_null()), (|| {
-            self._alive()?;
-            // 帧数据来自共享内存，并由 MFCreateMemoryBuffer 创建系统内存缓冲；不接受帧服务器的 D3D 分配器。
-            Err(E_NOTIMPL.into())
-        })())
+        _trace_source!(
+            "IMFSampleAllocatorControl::SetDefaultAllocator",
+            format!(
+                "output_stream_id={} allocator_null={}",
+                dwoutputstreamid,
+                pallocator.is_null()
+            ),
+            (|| {
+                self._alive()?;
+                // 帧数据来自共享内存，并由 MFCreateMemoryBuffer 创建系统内存缓冲；不接受帧服务器的 D3D 分配器。
+                Err(E_NOTIMPL.into())
+            })()
+        )
     }
 
     fn GetAllocatorUsage(
@@ -633,17 +776,26 @@ impl IMFSampleAllocatorControl_Impl for VcamSource_Impl {
         pdwinputstreamid: *mut u32,
         peusage: *mut MFSampleAllocatorUsage,
     ) -> Result<()> {
-        _trace_source!("IMFSampleAllocatorControl::GetAllocatorUsage", format!("output_stream_id={} input_stream_out_null={} usage_out_null={}", dwoutputstreamid, pdwinputstreamid.is_null(), peusage.is_null()), (|| {
-            self._alive()?;
-            if pdwinputstreamid.is_null() || peusage.is_null() {
-                return Err(windows::Win32::Foundation::E_POINTER.into());
-            }
-            unsafe {
-                *pdwinputstreamid = dwoutputstreamid;
-                *peusage = MFSampleAllocatorUsage_DoesNotAllocate;
-            }
-            Ok(())
-        })())
+        _trace_source!(
+            "IMFSampleAllocatorControl::GetAllocatorUsage",
+            format!(
+                "output_stream_id={} input_stream_out_null={} usage_out_null={}",
+                dwoutputstreamid,
+                pdwinputstreamid.is_null(),
+                peusage.is_null()
+            ),
+            (|| {
+                self._alive()?;
+                if pdwinputstreamid.is_null() || peusage.is_null() {
+                    return Err(windows::Win32::Foundation::E_POINTER.into());
+                }
+                unsafe {
+                    *pdwinputstreamid = dwoutputstreamid;
+                    *peusage = MFSampleAllocatorUsage_DoesNotAllocate;
+                }
+                Ok(())
+            })()
+        )
     }
 }
 
@@ -654,10 +806,19 @@ impl IMFGetService_Impl for VcamSource_Impl {
         riid: *const GUID,
         ppvobject: *mut *mut core::ffi::c_void,
     ) -> Result<()> {
-        _trace_source!("IMFGetService::GetService", format!("service={} riid={} value_out_null={}", _trace_guid(guidservice), _trace_guid(riid), ppvobject.is_null()), (|| {
-            self._alive()?;
-            Err(MF_E_UNSUPPORTED_SERVICE.into())
-        })())
+        _trace_source!(
+            "IMFGetService::GetService",
+            format!(
+                "service={} riid={} value_out_null={}",
+                _trace_guid(guidservice),
+                _trace_guid(riid),
+                ppvobject.is_null()
+            ),
+            (|| {
+                self._alive()?;
+                Err(MF_E_UNSUPPORTED_SERVICE.into())
+            })()
+        )
     }
 }
 
@@ -670,10 +831,21 @@ impl IKsControl_Impl for VcamSource_Impl {
         datalength: u32,
         bytesreturned: *mut u32,
     ) -> Result<()> {
-        _trace_source!("IKsControl::KsProperty", format!("property_null={} property_length={} data_null={} data_length={} bytes_out_null={}", property.is_null(), propertylength, propertydata.is_null(), datalength, bytesreturned.is_null()), (|| {
-            self._alive()?;
-            Err(_ks_not_found())
-        })())
+        _trace_source!(
+            "IKsControl::KsProperty",
+            format!(
+                "property_null={} property_length={} data_null={} data_length={} bytes_out_null={}",
+                property.is_null(),
+                propertylength,
+                propertydata.is_null(),
+                datalength,
+                bytesreturned.is_null()
+            ),
+            (|| {
+                self._alive()?;
+                Err(_ks_not_found())
+            })()
+        )
     }
     fn KsMethod(
         &self,
@@ -683,10 +855,21 @@ impl IKsControl_Impl for VcamSource_Impl {
         datalength: u32,
         bytesreturned: *mut u32,
     ) -> Result<()> {
-        _trace_source!("IKsControl::KsMethod", format!("method_null={} method_length={} data_null={} data_length={} bytes_out_null={}", method.is_null(), methodlength, methoddata.is_null(), datalength, bytesreturned.is_null()), (|| {
-            self._alive()?;
-            Err(_ks_not_found())
-        })())
+        _trace_source!(
+            "IKsControl::KsMethod",
+            format!(
+                "method_null={} method_length={} data_null={} data_length={} bytes_out_null={}",
+                method.is_null(),
+                methodlength,
+                methoddata.is_null(),
+                datalength,
+                bytesreturned.is_null()
+            ),
+            (|| {
+                self._alive()?;
+                Err(_ks_not_found())
+            })()
+        )
     }
     fn KsEvent(
         &self,
@@ -696,9 +879,20 @@ impl IKsControl_Impl for VcamSource_Impl {
         datalength: u32,
         bytesreturned: *mut u32,
     ) -> Result<()> {
-        _trace_source!("IKsControl::KsEvent", format!("event_null={} event_length={} data_null={} data_length={} bytes_out_null={}", event.is_null(), eventlength, eventdata.is_null(), datalength, bytesreturned.is_null()), (|| {
-            self._alive()?;
-            Err(_ks_not_found())
-        })())
+        _trace_source!(
+            "IKsControl::KsEvent",
+            format!(
+                "event_null={} event_length={} data_null={} data_length={} bytes_out_null={}",
+                event.is_null(),
+                eventlength,
+                eventdata.is_null(),
+                datalength,
+                bytesreturned.is_null()
+            ),
+            (|| {
+                self._alive()?;
+                Err(_ks_not_found())
+            })()
+        )
     }
 }

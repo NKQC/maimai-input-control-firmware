@@ -2,6 +2,8 @@
 
 #include "protocol/host_cmd/host_cmd.h"
 
+class HAL_USB_Device;
+
 /**
  * UsbComm - USB 通信服务
  * 单例模式，负责:
@@ -14,6 +16,7 @@ public:
 
     bool init();
     void update();
+    bool has_pending_response() const;
 
 private:
     UsbComm();
@@ -21,9 +24,14 @@ private:
     UsbComm& operator=(const UsbComm&) = delete;
 
     static UsbComm* _instance;
+
+    bool _pump_pending_tx(HAL_USB_Device* usb);
+    void _clear_pending_tx(HAL_USB_Device* usb);
     
     HostCmdCodec _codec;
     uint8_t _resp_buf[HOST_CMD_RESP_BUF_MAX];  // 全量 CFG_GET_ALL(~140 项 ~2.1KB)整帧, 见 host_cmd.h
+    uint16_t _pending_resp_len = 0;
+    uint16_t _pending_resp_off = 0;
     HostFrame _frame;  // Reuse frame buffer across loop iterations to avoid stack bloat
     uint32_t _frame_open_since = 0;  // 当前半帧起始 millis(0=空闲), 供陈旧半帧超时复位
     

@@ -13,18 +13,35 @@ component ChannelStatusCell inherits Rectangle {
     in property <bool> pick_mode: false;
     in property <bool> picked: false;
 
+    // 抽屉展开时本卡片是否为"源通道"(参数复制的来源), 与勾选态、精调选中态三者视觉分开。
+    in property <bool> is_source: false;
+
     callback activated(int);   // 双击 → 进入单通道精调
     callback selected_click(int); // 单击 → 仅高亮选中
     callback picked_click(int);   // 勾选模式下的单击 → 切换勾选
+    callback source_click(int);   // 勾选模式下 Shift+单击 → 设为源通道
 
     width: 124px;
     height: 90px;
-    border-width: (root.selected || root.picked) ? 2px : 1px;
-    border-color: root.picked ? #ffd166 : (root.selected ? #4fc3f7 : touch.has-hover ? #6b8191 : Theme.border-light);
-    // 触摸、选择和 hover 都有区分明确的反馈; 勾选态再叠一层暖色边框与角标, 与"当前精调通道"区分。
-    background: root.picked ? #3a3320
-        : (root.selected ? #203b4a : touch.has-hover ? #242c33 : root.entry.active ? #245f35 : #1a1e22);
+    border-width: (root.selected || root.picked || root.is_source) ? 2px : 1px;
+    // 源通道优先着色(它是本次批量应用的数据来源, 必须一眼能找到), 其次勾选态, 再次精调选中态。
+    border-color: root.is_source ? #7cf5a0
+        : (root.picked ? #ffd166 : (root.selected ? #4fc3f7 : touch.has-hover ? #6b8191 : Theme.border-light));
+    background: root.is_source ? #1f3a29
+        : (root.picked ? #3a3320
+            : (root.selected ? #203b4a : touch.has-hover ? #242c33 : root.entry.active ? #245f35 : #1a1e22));
     border-radius: 5px;
+
+    // 源通道角标: 与勾选角标分列左右, 避免两种状态叠在同一位置分不清。
+    Text {
+        visible: root.is_source;
+        x: 4px;
+        y: root.height - 16px;
+        text: @tr("源");
+        font-size: 10px;
+        font-weight: 700;
+        color: #7cf5a0;
+    }
 
     // 勾选角标: 只在勾选模式下出现, 避免平时多一块视觉噪声。
     Rectangle {
@@ -82,16 +99,33 @@ component ChannelStatusCell inherits Rectangle {
         }
     }
 
+    // Shift 状态只能在 pointer-event 里读到(TouchArea 的 clicked 不带修饰键), 故在按下沿记住它,
+    // 供随后的 clicked 判断。工程内已有同类做法: curves.slint 用 scroll-event 的 e.modifiers.shift。
+    property <bool> _shift_down: false;
+
     touch := TouchArea {
         mouse-cursor: pointer;
+        pointer-event(e) => {
+            if (e.kind == PointerEventKind.down) {
+                root._shift_down = e.modifiers.shift;
+            }
+        }
         clicked => {
-            if (root.pick_mode) {
+            if (root.pick_mode && root._shift_down) {
+                // Shift+单击 = 指定"源通道"(参数从哪个通道复制)。
+                root.source_click(root.entry.index);
+            } else if (root.pick_mode) {
                 root.picked_click(root.entry.index);
             } else {
                 root.selected_click(root.entry.index);
             }
         }
-        double-clicked => { root.activated(root.entry.index); }
+        // ★勾选模式下屏蔽双击进精调★: 勾选目标通道时双击极易误触, 一跳页就丢掉刚勾的一批。
+        double-clicked => {
+            if (!root.pick_mode) {
+                root.activated(root.entry.index);
+            }
+        }
     }
 }
 
@@ -149,6 +183,9 @@ export component AllChannelsPage inherits Rectangle {
     callback batch_params_invert();
     callback batch_clear();
     callback batch_apply(int);          // 源通道号
+    callback batch_set_source(int);
+    // 源通道: 真相源在 Rust(抽屉里显示的"源值"一列也得按它取), 这里只读回填。
+    in property <int> batch_source: 0;
     // 由 main.rs 每 tick 从 AppController::telem_samples_per_sec()/telem_scan_period_us() 回填
     in property <int> sample_rate_hz: 0;
     in property <string> curve_threshold_warning: "";
@@ -233,10 +270,12 @@ export component AllChannelsPage inherits Rectangle {
                     pick_mode: root.batch_drawer_open;
                     picked: cell.index < root.batch_ch_selected.length
                         ? root.batch_ch_selected[cell.index] : false;
+                    is_source: root.batch_drawer_open && cell.index == root.batch_source;
                     x: Math.mod(idx, grid_view.cols) * 130px;
                     y: Math.floor(idx / grid_view.cols) * 100px;
                     selected_click(ch) => { root.selected_channel = ch; }
                     picked_click(ch) => { root.batch_toggle_channel(ch); }
+                    source_click(ch) => { root.batch_set_source(ch); }
                     activated(ch) => { root.channel_selected(ch); }
                 }
             }
@@ -278,9 +317,9 @@ export component AllChannelsPage inherits Rectangle {
                 }
 
                 Text {
-                    text: @tr("源通道: CH") + root.selected_channel + @tr("（在网格中双击卡片可换源通道）");
+                    text: @tr("源通道: CH") + root.batch_source + @tr("（按住 Shift 单击网格中的卡片可换源通道；普通单击是勾选目标）");
                     font-size: Theme.fs-small;
-                    color: Theme.accent;
+                    color: #7cf5a0;
                     wrap: word-wrap;
                 }
 
@@ -343,7 +382,7 @@ export component AllChannelsPage inherits Rectangle {
                 Button {
                     text: @tr("应用到已选通道");
                     primary: true;
-                    clicked => { root.batch_apply(root.selected_channel); }
+                    clicked => { root.batch_apply(root.batch_source); }
                 }
             }
             }

@@ -8,7 +8,11 @@
 #include "../../service/sensor_link/sensor_link.h"
 #include <cstring>
 #include <cstdio>
+#include <map>
 #include <string>
+#ifdef PICO_PLATFORM
+#include <hardware/watchdog.h>
+#endif
 
 // Forward declarations of handler functions
 static void _handle_cfg_get(const HostFrame& frame, uint8_t* resp_buf, uint16_t* resp_len);
@@ -18,6 +22,79 @@ static void _handle_cfg_get_all(const HostFrame& frame, uint8_t* resp_buf, uint1
 static void _handle_cfg_set_batch(const HostFrame& frame, uint8_t* resp_buf, uint16_t* resp_len);
 static void _handle_save_config(const HostFrame& frame, uint8_t* resp_buf, uint16_t* resp_len);
 static void _handle_reset_defaults(const HostFrame& frame, uint8_t* resp_buf, uint16_t* resp_len);
+
+namespace {
+struct CfgGetAllStreamState {
+    uint8_t seq = 0;
+    uint16_t cursor = 0;
+    uint16_t total = 0;
+    bool active = false;
+    std::map<std::string, ConfigValue> entries;
+    std::map<std::string, ConfigValue>::const_iterator next;
+
+    void clear() {
+        seq = 0;
+        cursor = 0;
+        total = 0;
+        active = false;
+        entries.clear();
+        next = entries.cend();
+    }
+};
+
+CfgGetAllStreamState _cfg_get_all_stream;
+
+uint16_t _encode_cfg_get_all_stream_frame(uint8_t* resp_buf) {
+    if (!resp_buf || !_cfg_get_all_stream.active) return 0;
+
+    HostFrame resp;
+    resp.cmd = static_cast<uint8_t>(HostCmd::CFG_GET_ALL);
+    resp.flags = HOST_CMD_FLAG_RESPONSE;
+    resp.seq = _cfg_get_all_stream.seq;
+    resp.len = 0;
+
+    const uint16_t header_len = _cfg_get_all_stream.cursor == 0 ? 2 : 0;
+    if (header_len != 0) {
+        resp.payload[resp.len++] = static_cast<uint8_t>(_cfg_get_all_stream.total);
+        resp.payload[resp.len++] = static_cast<uint8_t>(_cfg_get_all_stream.total >> 8);
+    }
+
+    const uint16_t cursor_before = _cfg_get_all_stream.cursor;
+    while (_cfg_get_all_stream.next != _cfg_get_all_stream.entries.cend()) {
+        const auto& kv = *_cfg_get_all_stream.next;
+        const uint16_t entry_len = HostCmdCodec::encode_entry(
+            kv.second, kv.first.c_str(), &resp.payload[resp.len], HOST_CMD_PAYLOAD_MAX - resp.len);
+        if (entry_len == 0) {
+            if (resp.len > header_len) break;
+
+            const uint8_t seq = _cfg_get_all_stream.seq;
+            _cfg_get_all_stream.clear();
+            return HostCmdCodec::encode_nak(
+                seq, HostCmdError::CONFIG_ERROR, "entry encode failed", resp_buf, HOST_CMD_RESP_BUF_MAX);
+        }
+
+        resp.len += entry_len;
+        ++_cfg_get_all_stream.cursor;
+        ++_cfg_get_all_stream.next;
+    }
+
+    if (_cfg_get_all_stream.cursor == cursor_before &&
+        _cfg_get_all_stream.cursor < _cfg_get_all_stream.total) {
+        const uint8_t seq = _cfg_get_all_stream.seq;
+        _cfg_get_all_stream.clear();
+        return HostCmdCodec::encode_nak(
+            seq, HostCmdError::CONFIG_ERROR, "stream made no progress", resp_buf, HOST_CMD_RESP_BUF_MAX);
+    }
+
+    if (_cfg_get_all_stream.cursor < _cfg_get_all_stream.total) {
+        resp.flags |= HOST_CMD_FLAG_STREAM;
+    } else {
+        _cfg_get_all_stream.clear();
+    }
+
+    return HostCmdCodec::encode_frame(resp, resp_buf, HOST_CMD_RESP_BUF_MAX);
+}
+}  // namespace
 
 // ============ HostCmdCodec ============
 
@@ -249,6 +326,21 @@ void HostCmdDispatcher::dispatch(const HostFrame& frame, uint8_t* resp_buf, uint
     }
 }
 
+bool HostCmdDispatcher::has_pending_stream() const {
+    return _cfg_get_all_stream.active;
+}
+
+bool HostCmdDispatcher::next_stream_frame(uint8_t* resp_buf, uint16_t* resp_len) {
+    if (!resp_len) return false;
+
+    *resp_len = _encode_cfg_get_all_stream_frame(resp_buf);
+    return *resp_len > 0;
+}
+
+void HostCmdDispatcher::clear_pending_stream() {
+    _cfg_get_all_stream.clear();
+}
+
 void HostCmdDispatcher::_handle_hello(const HostFrame& frame, uint8_t* resp_buf, uint16_t* resp_len) {
     // ★新会话先停遗留遥测流★：上一会话若未 TELEM_STOP(如 UI 崩溃/直接关闭),设备会持续
     // 狂发 TELEM_DATA 淹没 vendor 端点,导致本次 HELLO 的 DEVICE_INFO 响应挤不出去→UI 卡在
@@ -333,6 +425,13 @@ void HostCmdDispatcher::_handle_hello(const HostFrame& frame, uint8_t* resp_buf,
     }
     // CSD 真正运行模式由 RP2040 store 持有；追加在诊断尾部，旧上位机按 report_length 自然忽略。
     resp.payload[resp.len++] = CsdConfig::getInstance()->mode();
+    // PSoC 运行态 SWD 调试块：无论读取是否成功均固定追加 37B，便于上位机稳定解析。
+    uint32_t spi_dbg_counters[SwdProgrammer::DEBUG_COUNTER_WORDS] = {};
+    Psoc* psoc = Psoc::getInstance();
+    (void)psoc->psoc_debug_counters(spi_dbg_counters);
+    resp.payload[resp.len++] = static_cast<uint8_t>(psoc->psoc_debug_status());
+    append_u32(psoc->psoc_debug_block_addr());
+    for (uint8_t i = 0; i < SwdProgrammer::DEBUG_COUNTER_WORDS; ++i) append_u32(spi_dbg_counters[i]);
     resp.payload[report_start + 1] = static_cast<uint8_t>(resp.len - report_start);
 
     *resp_len = HostCmdCodec::encode_frame(resp, resp_buf, 512);
@@ -724,37 +823,15 @@ static void _handle_cfg_get_group(const HostFrame& frame, uint8_t* resp_buf, uin
 
 static void _handle_cfg_get_all(const HostFrame& frame, uint8_t* resp_buf, uint16_t* resp_len) {
     // CFG_GET_ALL(0x13): 空 payload
-    // 响应: count(u16 LE) + Entry×count; 超 4096B 则分帧
-    
-    auto all = ConfigManager::get_all();
-    
-    HostFrame resp;
-    resp.cmd = (uint8_t)HostCmd::CFG_GET_ALL;
-    resp.flags = HOST_CMD_FLAG_RESPONSE;
-    resp.seq = frame.seq;
-    resp.len = 0;
-    
-    // count
-    uint16_t count = all.size();
-    resp.payload[resp.len++] = count & 0xFF;
-    resp.payload[resp.len++] = (count >> 8) & 0xFF;
-    
-    // entries - 简化：一次全发，不做分帧（假设总量 < 4096B）
-    for (auto& kv : all) {
-        uint16_t entry_len = HostCmdCodec::encode_entry(kv.second, kv.first.c_str(), 
-                                                         &resp.payload[resp.len], 
-                                                         HOST_CMD_PAYLOAD_MAX - resp.len);
-        if (entry_len == 0) {
-            *resp_len = HostCmdCodec::encode_nak(frame.seq, HostCmdError::CONFIG_ERROR, 
-                                                 "entry encode failed", resp_buf, 512);
-            return;
-        }
-        resp.len += entry_len;
-    }
-    
-    // ⚠ 全量配置响应随 schema 增长(键盘/绑区 key 后 ~140 项 ~2.1KB)。max_len 与 _resp_buf 统一用
-    // HOST_CMD_RESP_BUF_MAX(满载帧上限); 旧硬编码 2048 会让 encode_frame 返回 0 → 上位机收 0 项。
-    *resp_len = HostCmdCodec::encode_frame(resp, resp_buf, HOST_CMD_RESP_BUF_MAX);
+    // 响应流: 首帧为 count(u16 LE) + Entry×N，后续帧为 Entry×N。
+    // 每帧只在 Entry 边界切分；中间帧带 RESPONSE|STREAM，末帧仅 RESPONSE。
+    _cfg_get_all_stream.clear();
+    _cfg_get_all_stream.seq = frame.seq;
+    _cfg_get_all_stream.entries = ConfigManager::get_all();
+    _cfg_get_all_stream.total = static_cast<uint16_t>(_cfg_get_all_stream.entries.size());
+    _cfg_get_all_stream.next = _cfg_get_all_stream.entries.cbegin();
+    _cfg_get_all_stream.active = true;
+    *resp_len = _encode_cfg_get_all_stream_frame(resp_buf);
 }
 
 static void _handle_cfg_set_batch(const HostFrame& frame, uint8_t* resp_buf, uint16_t* resp_len) {
@@ -824,6 +901,10 @@ static void _handle_reset_defaults(const HostFrame& frame, uint8_t* resp_buf, ui
     // RESET_DEFAULTS(0x0F): 恢复默认。除普通 config 外, 一并清空 CSD 参数 store 并重启 PSoC:
     // 清 store 后 PSoC 启动 provisioning 跳过参数下发 → 用其生成的出厂默认(已验证 180Hz 正常),
     // 从而把被调崩(railed/降速)的 CSD 恢复到可用基线。
+    // 清空整个 CSD store 是"用户所有逐通道调参就此消失"的破坏性动作, 本来就该留痕上报;
+    // 同时它也是判定"RESET_DEFAULTS 到底有没有真的执行"的唯一可观测证据 —— 实测出现过
+    // "上位机报 PASS, 但设备端 store 模式仍是 SEMI、PSoC 也没重启"的情况, 缺了这个计数就只能靠猜。
+    SelfHeal::getInstance()->note(SH_STORE_CLEARED, 1u);
     ConfigManager::reset_to_defaults();
     CsdConfig* csd = CsdConfig::getInstance();
     csd->clear();              // 清 store → PSoC 重启后以出厂强制好全局(增益4/目标85)自动校准, 不再被坏全局污染

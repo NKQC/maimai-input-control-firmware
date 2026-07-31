@@ -1,4 +1,4 @@
-#include "psoc_algo.h"
+﻿#include "psoc_algo.h"
 #include "psoc_algo_default.h"
 #include "../../protocol/psoc/psoc.h"
 #include "../../protocol/host_cmd/host_cmd.h"   // HostCmdCrc16::crc16 (CCITT-FALSE)
@@ -12,6 +12,7 @@
 #include "LittleFS.h"
 #include "pico/multicore.h"
 #include "hardware/sync.h"
+#include "../nv_store/nv_store.h"   // 自管理 flash blob(替代 LittleFS 文件)
 #endif
 
 namespace {
@@ -20,19 +21,6 @@ constexpr const char* ALGO_BLOB_PATH = "/algo.bin";
 constexpr uint32_t ALGO_SRC_MAGIC = 0x31435241u;   // "ARC1" (algo source / mapping table)
 constexpr const char* ALGO_SRC_PATH = "/algo_src.bin";
 
-#pragma pack(push, 1)
-struct AlgoBlob {
-    uint32_t magic;
-    uint16_t len;
-    uint16_t crc16;               // CCITT-FALSE over data[0,len)
-    uint8_t  is_default;
-    uint8_t  reserved[3];
-    uint8_t  data[PSOC_ALGO_MAX_LEN];
-    uint16_t rom[PSOC_ALGO_CHANNELS];   // 每通道 16 位只读 ROM
-    uint8_t  cfg[8];               // 共享算法可设置变量(ABI cfg[8])
-    uint32_t crc32;               // 覆盖前面全部字节
-};
-#pragma pack(pop)
 }  // namespace
 
 PsocAlgo* PsocAlgo::_instance = nullptr;
@@ -48,23 +36,34 @@ PsocAlgo::PsocAlgo() : _len(0), _crc16(0), _is_default(true) {
 void PsocAlgo::set_rom(uint8_t ch, uint16_t val) {
     if (ch >= PSOC_ALGO_CHANNELS) return;
     _rom[ch] = val;
+    _sync_bin_storage();
     request_save();
 }
 
 void PsocAlgo::set_cfg(uint8_t idx, uint8_t val) {
     if (idx >= 8u) return;
     _cfg[idx] = val;
+    _sync_bin_storage();
     request_save();
 }
 
-void PsocAlgo::set_src(const uint8_t* s, uint16_t n) {
-    if (s == nullptr) { _src_len = 0; }
-    else {
-        if (n > PSOC_ALGO_SRC_MAX) n = PSOC_ALGO_SRC_MAX;
-        std::memcpy(_src, s, n);
-        _src_len = n;
+bool PsocAlgo::set_src_chunk(uint32_t offset, uint32_t total, const uint8_t* s, uint32_t n) {
+    if (total > PSOC_ALGO_SRC_MAX) return false;
+    if (offset > total || n > total - offset) return false;
+    if (total != 0u && n == 0u) return false;
+    if (offset == 0u) _src_wr = 0u;        // offset=0 即"新一轮传输", 允许中途重来
+    if (offset != _src_wr) return false;   // 严格连续: 缺片/乱序会拼出半份源, 宁可失败
+    if (n > 0u) {
+        if (s == nullptr) return false;
+        std::memcpy(_src + offset, s, n);
     }
-    request_save();   // 与算法 blob 共用主循环安全窗口落盘
+    _src_wr = offset + n;
+    if (_src_wr < total) return true;       // 未收完: 不动生效长度, 不置脏
+    _src_len = total;                      // 最后一片才让新源生效(total=0 → 清空)
+    _src_wr = 0u;                          // 已提交；下一轮传输必须重新从 offset 0 开始
+    _sync_src_storage();
+    request_save();                        // 保留 SAVE_CONFIG 兜底，不参与实际落盘时机
+    return true;
 }
 
 PsocAlgo* PsocAlgo::getInstance() {
@@ -83,47 +82,37 @@ void PsocAlgo::_load_default() {
 
 void PsocAlgo::init() {
 #ifdef PICO_PLATFORM
-    File f = LittleFS.open(ALGO_BLOB_PATH, "r");
-    if (!f) return;   // 无存储 → 保留构造时载入的默认
-    AlgoBlob blob;
-    size_t rd = f.read((uint8_t*)&blob, sizeof(blob));
-    f.close();
-    if (rd != sizeof(blob) || blob.magic != ALGO_BLOB_MAGIC) return;
-    uint32_t crc = ConfigCRC::calculate_crc32((const uint8_t*)&blob, sizeof(blob) - sizeof(uint32_t));
-    if (crc != blob.crc32) return;
-    // ROM 表随算法一起持久化, 与 is_default 无关(每通道校准数据独立于代码 blob 是否默认)。
-    std::memcpy(_rom, blob.rom, sizeof(_rom));
-    std::memcpy(_cfg, blob.cfg, sizeof(_cfg));   // 共享可设置变量同样与 is_default 无关
-    if (blob.is_default != 0u || blob.len == 0u || blob.len > PSOC_ALGO_MAX_LEN) return;  // 默认/非法 → 用内嵌默认(但 ROM 已载入)
-    // 二次校验 blob 内容 crc16, 防存储位翻转导致下发坏算法。
-    uint16_t c16 = HostCmdCrc16::crc16(blob.data, blob.len);
-    if (c16 != blob.crc16) return;
-    std::memcpy(_blob, blob.data, blob.len);
-    _len = blob.len;
-    _crc16 = blob.crc16;
-    // 内容等于内嵌默认则视为默认(纠正历史上被误存为 custom 的默认算法)。
-    _is_default = (blob.len == (uint16_t)PSOC_ALGO_DEFAULT_LEN && blob.crc16 == PSOC_ALGO_DEFAULT_CRC16);
+    // ALGO_BIN 校验只决定是否采用自定义二进制；ALGO_SRC 必须始终独立加载，不能因默认/损坏
+    // 的二进制镜像提前 return 而丢弃已校验的源码区。
+    Mirror& blob = _mirror;
+    if (_mirror_len == sizeof(blob) && blob.magic == ALGO_BLOB_MAGIC) {
+        const uint32_t crc = ConfigCRC::calculate_crc32((const uint8_t*)&blob, sizeof(blob) - sizeof(uint32_t));
+        if (crc == blob.crc32) {
+            std::memcpy(_rom, blob.rom, sizeof(_rom));
+            std::memcpy(_cfg, blob.cfg, sizeof(_cfg));
+            if (blob.is_default == 0u && blob.len > 0u && blob.len <= PSOC_ALGO_MAX_LEN &&
+                HostCmdCrc16::crc16(blob.data, blob.len) == blob.crc16) {
+                std::memcpy(_blob, blob.data, blob.len);
+                _len = blob.len;
+                _crc16 = blob.crc16;
+                _is_default = (blob.len == (uint16_t)PSOC_ALGO_DEFAULT_LEN &&
+                               blob.crc16 == PSOC_ALGO_DEFAULT_CRC16);
+            }
+        }
+    }
 #endif
-    _load_src();   // 算法 C 源(映射表)独立文件, 与 blob 是否默认无关
+    _load_src();
 }
 
 void PsocAlgo::_load_src() {
 #ifdef PICO_PLATFORM
-    File f = LittleFS.open(ALGO_SRC_PATH, "r");
-    if (!f) return;
-    uint8_t hdr[10];
-    size_t rd = f.read(hdr, sizeof(hdr));
-    if (rd != sizeof(hdr)) { f.close(); return; }
-    uint32_t magic = (uint32_t)hdr[0] | ((uint32_t)hdr[1] << 8) | ((uint32_t)hdr[2] << 16) | ((uint32_t)hdr[3] << 24);
-    uint16_t len   = (uint16_t)hdr[4] | ((uint16_t)hdr[5] << 8);
-    uint32_t crc32 = (uint32_t)hdr[6] | ((uint32_t)hdr[7] << 8) | ((uint32_t)hdr[8] << 16) | ((uint32_t)hdr[9] << 24);
-    if (magic != ALGO_SRC_MAGIC || len > PSOC_ALGO_SRC_MAX) { f.close(); return; }
-    uint16_t got = (uint16_t)f.read(_src, len);
-    f.close();
-    if (got != len) { _src_len = 0; return; }
-    if (ConfigCRC::calculate_crc32(_src, len) != crc32) { _src_len = 0; return; }
-    _src_len = len;
+    // ★"C 源只读回一半"的老出处★: 原实现自己拼 10 字节头 + 两次 LittleFS read, 文件系统一不一致
+    // 就读出截断内容。现在 _src 由 NvStore 直接注册, 区头自带 len + CRC32, 一次 memcpy 摊回,
+    // 长度不符或 CRC 不过整区丢弃 —— 不可能出现半份源码。
+    if (_src_store_len > PSOC_ALGO_SRC_MAX) { _src_len = 0; _src_store_len = 0; return; }
+    _src_len = _src_store_len;
 #endif
+    _src_wr = 0u;   // 已加载源只影响有效长度；新上传始终要求从 offset 0 开始
 }
 
 bool PsocAlgo::set_algo(const uint8_t* src, uint16_t src_len, uint16_t src_crc16) {
@@ -136,13 +125,17 @@ bool PsocAlgo::set_algo(const uint8_t* src, uint16_t src_len, uint16_t src_crc16
     // 内容等于内嵌默认(v3.1 HDR)则标记为默认: 使上位机"读取信息"能正确识别并载入默认 C 源,
     // 而非误判为无源可还原的自定义算法。
     _is_default = (src_len == (uint16_t)PSOC_ALGO_DEFAULT_LEN && src_crc16 == PSOC_ALGO_DEFAULT_CRC16);
+    _sync_bin_storage();
     request_save();
     return true;
 }
 
 void PsocAlgo::reset_default() {
     _load_default();
-    _src_len = 0;   // 恢复默认: 清源, host 端读回为空时会载入内嵌默认模板
+    _src_len = 0;
+    _src_wr = 0;
+    _sync_bin_storage();
+    _sync_src_storage();
     request_save();
 }
 
@@ -161,10 +154,9 @@ bool PsocAlgo::download_to_psoc(Psoc* psoc) {
     return true;
 }
 
-bool PsocAlgo::save() {
-    _save_pending = false;
+void PsocAlgo::_sync_bin_storage() {
 #ifdef PICO_PLATFORM
-    AlgoBlob blob;
+    Mirror& blob = _mirror;
     std::memset(&blob, 0, sizeof(blob));
     blob.magic = ALGO_BLOB_MAGIC;
     blob.len = _len;
@@ -174,44 +166,43 @@ bool PsocAlgo::save() {
     std::memcpy(blob.rom, _rom, sizeof(blob.rom));
     std::memcpy(blob.cfg, _cfg, sizeof(blob.cfg));
     blob.crc32 = ConfigCRC::calculate_crc32((const uint8_t*)&blob, sizeof(blob) - sizeof(uint32_t));
+    _mirror_len = sizeof(_mirror);
+    NvStore::getInstance()->mark_dirty(NvStore::Region::ALGO_BIN);
+#endif
+}
 
-    // LittleFS 擦写无法在 XIP 禁用期间安全分片；忙标记暂停所有定时 IN 推送，临界区前后各泵 USB。
-    // 这避免共享 64B vendor FIFO 在 flash 窗口累积；实际有效频率边界由 soak 的 out_stalled/rearm 计数验证。
-    size_t n = 0;
-    {
-        FlashWriteGuard flash_guard;
-        HAL_USB_Device::getInstance()->task();
-        uint32_t _irq = save_and_disable_interrupts();
-        multicore_lockout_start_blocking();
-        File f = LittleFS.open(ALGO_BLOB_PATH, "w");
-        if (f) {
-            n = f.write((const uint8_t*)&blob, sizeof(blob));
-            f.close();
-        }
-    // 同一安全窗口内顺带落盘算法 C 源(映射表), 复用已暂停的 core1 lockout。
-    {
-        uint8_t hdr[10];
-        uint32_t src_crc = ConfigCRC::calculate_crc32(_src, _src_len);
-        hdr[0] = (uint8_t)ALGO_SRC_MAGIC;       hdr[1] = (uint8_t)(ALGO_SRC_MAGIC >> 8);
-        hdr[2] = (uint8_t)(ALGO_SRC_MAGIC >> 16); hdr[3] = (uint8_t)(ALGO_SRC_MAGIC >> 24);
-        hdr[4] = (uint8_t)_src_len;             hdr[5] = (uint8_t)(_src_len >> 8);
-        hdr[6] = (uint8_t)src_crc;              hdr[7] = (uint8_t)(src_crc >> 8);
-        hdr[8] = (uint8_t)(src_crc >> 16);      hdr[9] = (uint8_t)(src_crc >> 24);
-        File sf = LittleFS.open(ALGO_SRC_PATH, "w");
-        if (sf) {
-            sf.write(hdr, sizeof(hdr));
-            if (_src_len > 0u) { sf.write(_src, _src_len); }
-            sf.close();
-        }
-    }
-    multicore_lockout_end_blocking();
-        restore_interrupts(_irq);
-    }
-    HAL_USB_Device::getInstance()->task();
-    g_usb_dbg.flash_write_count++;
-    g_usb_dbg.loop_at_last_flash = g_usb_dbg.loop_count;
-    return n == sizeof(blob);
+void PsocAlgo::_sync_src_storage() {
+#ifdef PICO_PLATFORM
+    _src_store_len = _src_len;
+    NvStore::getInstance()->mark_dirty(NvStore::Region::ALGO_SRC);
+#endif
+}
+
+bool PsocAlgo::save() {
+    _save_pending = false;
+    _sync_bin_storage();
+    _sync_src_storage();
+#ifdef PICO_PLATFORM
+    return true;
 #else
     return false;
+#endif
+}
+
+// ★落盘由 NvStore 单点负责★
+// 本类不再自己碰 flash: ALGO_BIN 注册 _mirror, ALGO_SRC 直接注册 _src(它本身就是连续缓冲, 不需要
+// 再复制一份镜像 —— 少一份就少一处不一致的可能)。必须在 NvStore::load() 之前调用。
+void PsocAlgo::register_storage() {
+#ifdef PICO_PLATFORM
+    // 编译期核对两个区的容量: 区变小/结构变大都在编译时就炸, 而不是等落盘静默截断。
+    static_assert(sizeof(Mirror) <= NvStore::payload_capacity(NvStore::Region::ALGO_BIN),
+                  "ALGO_BIN 镜像超出该区一份的负载容量");
+    static_assert(PSOC_ALGO_SRC_MAX <= NvStore::payload_capacity(NvStore::Region::ALGO_SRC),
+                  "ALGO_SRC 上限超出该区一份的负载容量");
+    NvStore* nv = NvStore::getInstance();
+    _mirror_len = sizeof(_mirror);
+    nv->register_blob(NvStore::Region::ALGO_BIN, (uint8_t*)&_mirror, &_mirror_len, sizeof(_mirror));
+    _src_store_len = 0;
+    nv->register_blob(NvStore::Region::ALGO_SRC, _src, &_src_store_len, PSOC_ALGO_SRC_MAX);
 #endif
 }

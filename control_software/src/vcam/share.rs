@@ -5,19 +5,19 @@
 
 use std::mem::size_of;
 use std::ptr::NonNull;
-use std::sync::atomic::{fence, Ordering};
+use std::sync::atomic::{Ordering, fence};
 
-use anyhow::{anyhow, Result};
-use windows::core::{w, HRESULT};
+use anyhow::{Result, anyhow};
 use windows::Win32::Foundation::{CloseHandle, ERROR_ACCESS_DENIED, HANDLE, HLOCAL};
-use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
 use windows::Win32::Security::Authorization::{
     ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
 };
+use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
 use windows::Win32::System::Memory::{
-    CreateFileMappingW, MapViewOfFile, UnmapViewOfFile, FILE_MAP_ALL_ACCESS,
-    MEMORY_MAPPED_VIEW_ADDRESS, PAGE_READWRITE,
+    CreateFileMappingW, FILE_MAP_ALL_ACCESS, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
+    PAGE_READWRITE, UnmapViewOfFile,
 };
+use windows::core::{HRESULT, w};
 
 use super::{FRAME_H, FRAME_W};
 
@@ -62,8 +62,13 @@ impl FramePublisher {
                 log::info!("虚拟摄像头: 共享内存已创建 Global\\mai2control_vcam_frame");
                 Ok(publisher)
             }
-            Err(error) if error.downcast_ref::<windows::core::Error>()
-                .is_some_and(|win| win.code() == HRESULT::from_win32(ERROR_ACCESS_DENIED.0)) => {
+            Err(error)
+                if error
+                    .downcast_ref::<windows::core::Error>()
+                    .is_some_and(|win| {
+                        win.code() == HRESULT::from_win32(ERROR_ACCESS_DENIED.0)
+                    }) =>
+            {
                 log::warn!(
                     "虚拟摄像头: 非管理员运行，帧共享退回会话内命名空间 Local；Frame Server(Local Service)可能读不到 → 需要以管理员运行上位机"
                 );
@@ -83,10 +88,18 @@ impl FramePublisher {
     /// 视为该次像素拷贝已完成的提交标志，避免先看到新序号而后半帧仍是旧数据。
     pub fn publish(&mut self, rgb: &[u8]) -> Result<()> {
         if rgb.len() != _FRAME_BYTES {
-            return Err(anyhow!("RGB24 帧大小错误: {}，期望 {}", rgb.len(), _FRAME_BYTES));
+            return Err(anyhow!(
+                "RGB24 帧大小错误: {}，期望 {}",
+                rgb.len(),
+                _FRAME_BYTES
+            ));
         }
         unsafe {
-            std::ptr::copy_nonoverlapping(rgb.as_ptr(), self._view.as_ptr().add(_HEADER_BYTES), _FRAME_BYTES);
+            std::ptr::copy_nonoverlapping(
+                rgb.as_ptr(),
+                self._view.as_ptr().add(_HEADER_BYTES),
+                _FRAME_BYTES,
+            );
             fence(Ordering::Release);
             self._sequence = self._sequence.wrapping_add(1);
             std::ptr::write_volatile(self._view.as_ptr().add(20).cast::<u32>(), self._sequence);
@@ -168,7 +181,9 @@ impl FramePublisher {
 impl Drop for FramePublisher {
     fn drop(&mut self) {
         unsafe {
-            _ = UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: self._view.as_ptr().cast() });
+            _ = UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
+                Value: self._view.as_ptr().cast(),
+            });
             _ = CloseHandle(self._map);
         }
     }

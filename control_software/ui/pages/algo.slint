@@ -18,6 +18,10 @@ export component AlgoPage inherits Rectangle {
     in property <string> algo_asm: "";   // 编译产物反汇编(objdump -d .text)
     in property <int> algo_asm_bytes: 0;      // 最近一次编译产物字节数(进度条用)
     in property <int> algo_asm_capacity: 1024; // PSoC 可执行槽容量(字节)
+    // C 源占用: 字节数 = 编辑器内容去注释后的 UTF-8 字节数(= 编译器实际看到的有效内容),
+    // 容量 = 设备 ALGO_SRC 区上限。超限时编译/上传都会被拒, 故这里必须先红着提醒。
+    in property <int> algo_c_bytes: 0;
+    in property <int> algo_c_capacity: 32768;
     property <int> editor_tab: 0;        // 0=C 源 1=反汇编 ASM(复用同一编辑面板)
     // 右侧子标签: 0=原生(C源/反汇编) 1=算法上报(report[]折线+触发判定追踪) 2=可调变量(cfg[8])
     property <int> content_tab: 0;
@@ -185,6 +189,41 @@ export component AlgoPage inherits Rectangle {
                         wrap: word-wrap;
                         horizontal-stretch: 1;
                         vertical-alignment: center;
+                    }
+                }
+
+                // C 源空间占用进度条(在 ASM 条正上方): 占用 = 去注释后 C 字节 / 设备存储上限。
+                // 超限=红(编译与上传都会被拒), 接近满=橙, 富余=绿。
+                VerticalBox {
+                    padding: 0px;
+                    spacing: 3px;
+                    Text {
+                        text: "C 源：" + root.algo_c_bytes + " / " + root.algo_c_capacity + " 字节"
+                            + (root.algo_c_capacity > 0
+                                ? ("  (" + Math.round(root.algo_c_bytes * 100 / root.algo_c_capacity) + "%)")
+                                : "")
+                            + (root.algo_c_bytes > root.algo_c_capacity ? "  超出上限, 无法编译/上传" : "");
+                        color: root.algo_c_bytes > root.algo_c_capacity ? #ff6b6b : #b0b8c0;
+                        font-size: 11px;
+                    }
+                    Rectangle {
+                        height: 10px;
+                        // 同 ASM 条: 显式 min-width 断开 "parent.width ← min ← 子 min" 的布局环。
+                        min-width: 120px;
+                        border-radius: 5px;
+                        background: #23282e;
+                        clip: true;
+                        Rectangle {
+                            x: 0;
+                            width: root.algo_c_capacity > 0
+                                ? (parent.width * Math.min(1.0, root.algo_c_bytes / root.algo_c_capacity))
+                                : 0px;
+                            height: parent.height;
+                            border-radius: 5px;
+                            background: root.algo_c_bytes > root.algo_c_capacity
+                                ? #d64545
+                                : ((root.algo_c_bytes * 10 > root.algo_c_capacity * 9) ? #f5a623 : #2b8a3e);
+                        }
                     }
                 }
 

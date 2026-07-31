@@ -5,19 +5,18 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, Result};
-use windows::core::{HSTRING, PCWSTR};
+use anyhow::{Result, anyhow};
 use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS};
 use windows::Win32::Media::MediaFoundation::{
-    MFCreateVirtualCamera, MFStartup, IMFVirtualCamera, MFVirtualCameraAccess_AllUsers,
-    MFVirtualCameraAccess_CurrentUser, MFVirtualCameraLifetime_Session,
-    MFVirtualCameraType_SoftwareCameraSource, MFSTARTUP_FULL, MF_VERSION,
+    IMFVirtualCamera, MF_VERSION, MFCreateVirtualCamera, MFSTARTUP_FULL, MFStartup,
+    MFVirtualCameraAccess_AllUsers, MFVirtualCameraAccess_CurrentUser,
+    MFVirtualCameraLifetime_Session, MFVirtualCameraType_SoftwareCameraSource,
 };
 use windows::Win32::System::Registry::{
-    HKEY, HKEY_LOCAL_MACHINE, KEY_READ, KEY_WOW64_32KEY, KEY_WOW64_64KEY, REG_EXPAND_SZ,
-    REG_SZ, REG_VALUE_TYPE, RegCloseKey, RegOpenKeyExW, RegQueryValueExW,
+    HKEY, HKEY_LOCAL_MACHINE, KEY_READ, KEY_WOW64_32KEY, KEY_WOW64_64KEY, REG_EXPAND_SZ, REG_SZ,
+    REG_VALUE_TYPE, RegCloseKey, RegOpenKeyExW, RegQueryValueExW,
 };
-
+use windows::core::{HSTRING, PCWSTR};
 
 const _CLSID: &str = "{B7C5F1A2-3D64-4E8B-9A11-2F6C8D0E4A73}";
 const _FRIENDLY_NAME: &str = "mai2control Virtual Camera";
@@ -46,13 +45,14 @@ impl VirtualCamera {
                 windows::Win32::System::Com::COINIT_APARTMENTTHREADED,
             );
             if hr.is_err() {
-                return Err(anyhow!("CoInitializeEx(STA) 失败: HRESULT 0x{:08X}", hr.0 as u32));
+                return Err(anyhow!(
+                    "CoInitializeEx(STA) 失败: HRESULT 0x{:08X}",
+                    hr.0 as u32
+                ));
             }
         }
-        unsafe { MFStartup(MF_VERSION, MFSTARTUP_FULL) }.map_err(|error| anyhow!(
-            "MFStartup 失败: HRESULT 0x{:08X}",
-            error.code().0 as u32
-        ))?;
+        unsafe { MFStartup(MF_VERSION, MFSTARTUP_FULL) }
+            .map_err(|error| anyhow!("MFStartup 失败: HRESULT 0x{:08X}", error.code().0 as u32))?;
         // ★降级判断必须看 Start 而不是 Create★: 实测非管理员下 MFCreateVirtualCamera(AllUsers)
         // 照样返回 S_OK, 真正的拒绝发生在 IMFVirtualCamera::Start(0x80070005 E_ACCESSDENIED)。
         // 原来只在 Create 失败时才退回 CurrentUser, 于是非提权运行必然死在 Start 上。
@@ -78,7 +78,11 @@ impl VirtualCamera {
             last_error.unwrap_or_else(|| anyhow!("MFCreateVirtualCamera 未返回可用实例"))
         })?;
         log::info!("虚拟摄像头: Media Foundation 已启动（{}）", access_name);
-        Ok(Self { _camera: camera, _access_name: access_name, _com_initialized: true })
+        Ok(Self {
+            _camera: camera,
+            _access_name: access_name,
+            _com_initialized: true,
+        })
     }
 
     pub fn access_name(&self) -> &'static str {
@@ -94,7 +98,10 @@ impl VirtualCamera {
         access: windows::Win32::Media::MediaFoundation::MFVirtualCameraAccess,
     ) -> Result<IMFVirtualCamera> {
         let camera = Self::_create(access).map_err(|error| {
-            anyhow!("MFCreateVirtualCamera 失败: HRESULT 0x{:08X}", error.code().0 as u32)
+            anyhow!(
+                "MFCreateVirtualCamera 失败: HRESULT 0x{:08X}",
+                error.code().0 as u32
+            )
         })?;
         if let Err(error) = unsafe { camera.Start(None) } {
             let hr = error.code().0 as u32;
@@ -108,7 +115,11 @@ impl VirtualCamera {
                 0x8004_0154 => "(媒体源 DLL 未注册, 先点安装)",
                 _ => "",
             };
-            return Err(anyhow!("IMFVirtualCamera::Start 失败: HRESULT 0x{:08X}{}", hr, hint));
+            return Err(anyhow!(
+                "IMFVirtualCamera::Start 失败: HRESULT 0x{:08X}{}",
+                hr,
+                hint
+            ));
         }
         Ok(camera)
     }
@@ -171,7 +182,9 @@ pub fn is_registered() -> Result<bool> {
 /// 发起管理员安装，并始终独立读取 HKLM 核验；绝不把“命令已发出”当作成功。
 pub fn install() -> Result<String> {
     if !embedded_available() {
-        return Err(anyhow!("本次构建未内置媒体源 DLL，先执行 cargo build -p mai2vcam-source 后重建上位机"));
+        return Err(anyhow!(
+            "本次构建未内置媒体源 DLL，先执行 cargo build -p mai2vcam-source 后重建上位机"
+        ));
     }
     let (staged, target) = _stage_payload(&_install_path())?;
     let dir = target.parent().ok_or_else(|| anyhow!("DLL 安装目录无效"))?;
@@ -201,11 +214,16 @@ pub fn install() -> Result<String> {
         ));
     }
     let registered = _registered_dll_paths()?;
-    if let Some(path) = registered.iter().find(|entry| _same_path(&entry._path, &target)) {
+    if let Some(path) = registered
+        .iter()
+        .find(|entry| _same_path(&entry._path, &target))
+    {
         return Ok(format!("已安装 ({})", path._path.display()));
     }
     if registered.is_empty() {
-        return Err(anyhow!("安装命令已发出，但注册表核验未通过；请在 UAC 完成后重试安装"));
+        return Err(anyhow!(
+            "安装命令已发出，但注册表核验未通过；请在 UAC 完成后重试安装"
+        ));
     }
     Err(anyhow!(
         "安装命令已发出，但注册表路径不匹配；期望路径: {}; 注册表实际值: {}",
@@ -234,7 +252,10 @@ pub fn uninstall() -> Result<String> {
 
 /// 保留对外的单一路径接口；优先返回 64 位视图，所有调用方实际核验则读取两种视图。
 pub fn registered_dll_path() -> Result<Option<PathBuf>> {
-    Ok(_registered_dll_paths()?.into_iter().next().map(|entry| entry._path))
+    Ok(_registered_dll_paths()?
+        .into_iter()
+        .next()
+        .map(|entry| entry._path))
 }
 
 struct _RegisteredDllPath {
@@ -263,7 +284,11 @@ fn _registered_dll_paths() -> Result<Vec<_RegisteredDllPath>> {
     }
     Err(anyhow!(
         "两个注册表视图均无法读取媒体源 CLSID: {}",
-        errors.into_iter().map(|error| error.to_string()).collect::<Vec<_>>().join("; "),
+        errors
+            .into_iter()
+            .map(|error| error.to_string())
+            .collect::<Vec<_>>()
+            .join("; "),
     ))
 }
 
@@ -271,7 +296,10 @@ fn _registered_dll_path_in_view(
     view: windows::Win32::System::Registry::REG_SAM_FLAGS,
     view_name: &'static str,
 ) -> Result<Option<_RegisteredDllPath>> {
-    let key_name = _wide(&format!("SOFTWARE\\Classes\\CLSID\\{}\\InprocServer32", _CLSID));
+    let key_name = _wide(&format!(
+        "SOFTWARE\\Classes\\CLSID\\{}\\InprocServer32",
+        _CLSID
+    ));
     let mut key = HKEY::default();
     let status = unsafe {
         RegOpenKeyExW(
@@ -286,27 +314,48 @@ fn _registered_dll_path_in_view(
         return Ok(None);
     }
     if status != ERROR_SUCCESS {
-        return Err(anyhow!("打开 {} 媒体源注册表键失败: {}", view_name, status.0));
+        return Err(anyhow!(
+            "打开 {} 媒体源注册表键失败: {}",
+            view_name,
+            status.0
+        ));
     }
     let result = _read_registry_dll_value(key, view_name);
     unsafe { _ = RegCloseKey(key) };
     result
 }
 
-fn _read_registry_dll_value(key: HKEY, view_name: &'static str) -> Result<Option<_RegisteredDllPath>> {
+fn _read_registry_dll_value(
+    key: HKEY,
+    view_name: &'static str,
+) -> Result<Option<_RegisteredDllPath>> {
     let mut kind = REG_VALUE_TYPE(0);
     let mut bytes = 0u32;
     let status = unsafe {
-        RegQueryValueExW(key, PCWSTR::null(), None, Some(&mut kind), None, Some(&mut bytes))
+        RegQueryValueExW(
+            key,
+            PCWSTR::null(),
+            None,
+            Some(&mut kind),
+            None,
+            Some(&mut bytes),
+        )
     };
     if status == ERROR_FILE_NOT_FOUND {
         return Ok(None);
     }
     if status != ERROR_SUCCESS {
-        return Err(anyhow!("读取 {} 媒体源注册表长度失败: {}", view_name, status.0));
+        return Err(anyhow!(
+            "读取 {} 媒体源注册表长度失败: {}",
+            view_name,
+            status.0
+        ));
     }
     if bytes % std::mem::size_of::<u16>() as u32 != 0 {
-        return Err(anyhow!("{} 媒体源注册表值不是有效 UTF-16 字节长度", view_name));
+        return Err(anyhow!(
+            "{} 媒体源注册表值不是有效 UTF-16 字节长度",
+            view_name
+        ));
     }
     let mut raw = vec![0u16; bytes as usize / std::mem::size_of::<u16>()];
     let status = unsafe {
@@ -320,16 +369,28 @@ fn _read_registry_dll_value(key: HKEY, view_name: &'static str) -> Result<Option
         )
     };
     if status != ERROR_SUCCESS {
-        return Err(anyhow!("读取 {} 媒体源注册表值失败: {}", view_name, status.0));
+        return Err(anyhow!(
+            "读取 {} 媒体源注册表值失败: {}",
+            view_name,
+            status.0
+        ));
     }
     let words = bytes as usize / std::mem::size_of::<u16>();
-    let raw_value = String::from_utf16_lossy(&raw[..words]).trim_end_matches('\0').to_string();
+    let raw_value = String::from_utf16_lossy(&raw[..words])
+        .trim_end_matches('\0')
+        .to_string();
     let value = match kind {
         REG_SZ => raw_value.clone(),
         REG_EXPAND_SZ => _expand_environment_strings(&raw_value).map_err(|error| {
             anyhow!("展开 {} 媒体源 REG_EXPAND_SZ 值失败: {}", view_name, error)
         })?,
-        _ => return Err(anyhow!("{} 媒体源注册表值类型不受支持: {}", view_name, kind.0)),
+        _ => {
+            return Err(anyhow!(
+                "{} 媒体源注册表值类型不受支持: {}",
+                view_name,
+                kind.0
+            ));
+        }
     };
     Ok((!value.is_empty()).then(|| _RegisteredDllPath {
         _view: view_name,
@@ -348,7 +409,11 @@ fn _expand_environment_strings(value: &str) -> Result<String> {
     }
     let mut expanded = vec![0u16; required as usize];
     let written = unsafe {
-        ExpandEnvironmentStringsW(source.as_ptr(), expanded.as_mut_ptr(), expanded.len() as u32)
+        ExpandEnvironmentStringsW(
+            source.as_ptr(),
+            expanded.as_mut_ptr(),
+            expanded.len() as u32,
+        )
     };
     if written == 0 || written > expanded.len() as u32 {
         return Err(anyhow!("{}", std::io::Error::last_os_error()));
@@ -366,7 +431,10 @@ fn _describe_registry_paths(paths: &[_RegisteredDllPath]) -> String {
             if entry._raw_value == expanded {
                 format!("{}: {}", entry._view, entry._raw_value)
             } else {
-                format!("{}: {}（展开后: {}）", entry._view, entry._raw_value, expanded)
+                format!(
+                    "{}: {}（展开后: {}）",
+                    entry._view, entry._raw_value, expanded
+                )
             }
         })
         .collect::<Vec<_>>()
@@ -444,7 +512,7 @@ fn _numbered_install_path(primary: &Path) -> PathBuf {
 fn _run_elevated(file: &str, parameters: &str) -> Result<u32> {
     use windows::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
     use windows::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject};
-    use windows::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
+    use windows::Win32::UI::Shell::{SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW};
 
     let file = _wide(file);
     let parameters = _wide(parameters);
@@ -507,7 +575,10 @@ fn _normalize_path(path: &Path) -> String {
 
 fn _normalize_path_text(path: &str) -> String {
     let mut value = path.trim();
-    while let Some(unquoted) = value.strip_prefix('"').and_then(|value| value.strip_suffix('"')) {
+    while let Some(unquoted) = value
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+    {
         value = unquoted.trim();
     }
     // Win32 接受两类分隔符；统一为反斜杠才能消除注册值与本地路径的表示差异。
@@ -571,7 +642,11 @@ fn _long_path_name(path: &str) -> Option<String> {
     }
     let mut long_path = vec![0u16; required as usize];
     let written = unsafe {
-        GetLongPathNameW(short_path.as_ptr(), long_path.as_mut_ptr(), long_path.len() as u32)
+        GetLongPathNameW(
+            short_path.as_ptr(),
+            long_path.as_mut_ptr(),
+            long_path.len() as u32,
+        )
     };
     if written == 0 || written >= long_path.len() as u32 {
         return None;

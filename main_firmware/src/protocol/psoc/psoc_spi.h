@@ -3,6 +3,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include "psoc_types.h"
+#include "../../hal/dma/hal_dma.h"
 
 class HAL_PIO;
 
@@ -15,6 +16,10 @@ class HAL_PIO;
  *
  * 协议：SPI MODE0(CPOL0/CPHA0)、8bit、MSB first、全双工。占用 HAL_PIO1（PIO1）。
  * CS 用普通 GPIO 手动管理，一次事务内保持拉低。
+ *
+ * ★链路不堵塞★：PIO 配 autopull/autopush(阈值 8bit)，收发各挂一条 DMA 通道(mem↔PIO FIFO，
+ * 由 SM 的 DREQ 节流)。transfer() 只做"配好地址与计数 → 启动 → 轮询 DMA 完成标志"，CPU 不触碰
+ * 任何单个字节，也不用固定 sleep 估算传输时长；事务间仅保留 PSoC ISR 装帧所需的最小窗口。
  * 命名规范：类内部成员/函数以 _ 开头，对外接口不加 _。
  */
 class PsocSpi {
@@ -24,7 +29,7 @@ public:
     // 初始化 PIO1 + SPI 程序 + 引脚方向 + CS GPIO
     bool init();
 
-    // 全双工传输 len 字节（内部拉低/拉高 CS）。tx/rx 可为 nullptr。
+    // 全双工传输 len 字节（内部拉低/拉高 CS，DMA 搬运，等 DMA 完成标志）。tx/rx 可为 nullptr。
     void transfer(const uint8_t* tx, uint8_t* rx, size_t len);
 
     // 发送 PING，保留独立链路健康检查。
@@ -38,7 +43,10 @@ public:
     bool set_param(uint8_t ch, uint8_t param_id, uint32_t value);  // 写并回显校验
     bool get_param(uint8_t ch, uint8_t param_id, uint32_t* out_value);
     bool get_raw(uint8_t ch, uint16_t* out_raw);                   // 指定通道实时 CSD 计数
-    bool get_stats(uint32_t* out_scan_count);                      // 读全局扫描计数(自由递增)
+    // 读全局扫描计数(自由递增)。out_busy 非空时同时回吐 PSoC 的"处理中"标志(响应 byte[2]):
+    // 主循环正在跑 APPLY/CALIBRATE/GLOBAL_COMMIT/AUTO_TUNE 等重操作时为非 0。
+    // ★调用方据此区分"主循环卡死"与"主循环正忙"★——重操作期间 scan_count 天然不推进, 不能判为卡死。
+    bool get_stats(uint32_t* out_scan_count, uint8_t* out_busy = nullptr);
     bool measure_cp();                                             // 发送命令并确认 PSoC SPI ACK；测量本身在 PSoC 主循环异步执行
     bool get_cp(uint8_t ch, uint32_t* out_cp);                     // 测量中=0，成功=fF，失败/未测量=0xFFFFFF
     bool apply();                                                   // 应用硬件参数(重扫/重校准)
@@ -87,8 +95,9 @@ public:
     bool ready() const { return _ready; }
 
 private:
-    uint8_t _xfer_byte(uint8_t out);
-    // 指令事务：发送 [magic,cmd,b2,b3,val24]，隔 RESPONSE_DELAY 读回 7 字节响应到 resp[7]。
+    // 事务超时(DMA 未在上限内完成)后复位 SM/FIFO/移位计数，防半个字节让后续帧永久错位。
+    void _recover();
+    // 指令事务：发送 [magic,cmd,b2,b3,val24]，隔 PSoC ISR 装帧窗口读回 7 字节响应到 resp[7]。
     bool _cmd_txn(uint8_t cmd, uint8_t b2, uint8_t b3, uint32_t val24, uint8_t resp[7]);
     psoc::Frame _make_request(psoc::Cmd command);
     static bool _response_matches(const psoc::Frame& response, psoc::Cmd command, uint8_t sequence);
@@ -98,6 +107,8 @@ private:
     // on_progress != nullptr 时额外每 PROGRESS_POLL_MS 读一次 AUTO_TUNE 进度回吐(busy 语义不变)。
     bool _wait_op_done(uint32_t timeout_ms, psoc::AutoTuneProgressFn on_progress = nullptr,
                        void* progress_ctx = nullptr);
+    // 把 PSoC 的默认响应换回实时触控帧(流水线收尾)，见 psoc_spi.cpp 实现处说明。
+    void _restore_touch_response();
     static constexpr uint32_t PROGRESS_POLL_MS = 100;   // 进度读取降频周期(busy 轮询仍为 3ms)
 
     uint8_t _sck_pin;
@@ -106,6 +117,7 @@ private:
     uint8_t _cs_pin;
 
     HAL_PIO* _pio;
+    HAL_DMA_Duplex _dma;   // 收发两条 DMA 通道（mem ↔ 本 SM 的 TX/RX FIFO）
     uint8_t _sm;
     uint8_t _offset;
     bool _ready;

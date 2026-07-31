@@ -22,10 +22,9 @@ use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
 use windows::Win32::Foundation::{
-    CLASS_E_NOAGGREGATION, CLASS_E_CLASSNOTAVAILABLE, E_POINTER, ERROR_SET_NOT_FOUND, S_FALSE,
-    S_OK,
+    CLASS_E_CLASSNOTAVAILABLE, CLASS_E_NOAGGREGATION, E_POINTER, ERROR_SET_NOT_FOUND, S_FALSE, S_OK,
 };
-use windows::Win32::Media::MediaFoundation::{MFSTARTUP_FULL, MFStartup, MF_VERSION};
+use windows::Win32::Media::MediaFoundation::{MF_VERSION, MFSTARTUP_FULL, MFStartup};
 use windows::Win32::System::Com::{IClassFactory, IClassFactory_Impl};
 // BOOL / Error / GUID / HRESULT / IUnknown / Interface / Ref / Result / implement 由上面
 // `pub use windows::core::*` 引入, 不再重复 import(否则会遮蔽公开的 glob 转出)。
@@ -95,7 +94,13 @@ impl IClassFactory_Impl for _Factory_Impl {
             unsafe { unknown.query(riid, ppvobject).ok() }
         })();
         _trace_result(
-            || format!("IClassFactory::CreateInstance riid={} ppv_null={}", _trace_guid(riid), ppvobject.is_null()),
+            || {
+                format!(
+                    "IClassFactory::CreateInstance riid={} ppv_null={}",
+                    _trace_guid(riid),
+                    ppvobject.is_null()
+                )
+            },
             result,
         )
     }
@@ -128,12 +133,14 @@ pub unsafe extern "system" fn DllGetClassObject(
         unsafe { factory.query(riid, ppv) }
     })();
     _trace_hresult(
-        || format!(
-            "DllGetClassObject rclsid={} riid={} ppv_null={}",
-            _trace_guid(rclsid),
-            _trace_guid(riid),
-            ppv.is_null(),
-        ),
+        || {
+            format!(
+                "DllGetClassObject rclsid={} riid={} ppv_null={}",
+                _trace_guid(rclsid),
+                _trace_guid(riid),
+                ppv.is_null(),
+            )
+        },
         result,
     )
 }

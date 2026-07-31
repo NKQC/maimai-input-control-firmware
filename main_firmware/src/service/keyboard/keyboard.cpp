@@ -11,11 +11,14 @@
 KeyboardService* KeyboardService::_instance = nullptr;
 
 KeyboardService::KeyboardService()
-    : _kbd_map_en(false), _phys_state(0), _phys_out(0), _raw_last(0), _raw_stable_since_us(0),
-      _touch_active(0), _gpio_ready(false) {
+    : _kbd_map_en(false), _phys_state(0), _phys_out(0),
+      _touch_active(0), _gpio_ready(false), _pol_high_mask(0),
+      _edge_last_raw(0), _edge_last_deb(0), _edge_last_out(0) {
+    _edges.clear();
     for (uint8_t i = 0; i < KEY_COUNT; i++) {
         _keycode[i] = 0; _keymod[i] = 0;
         _hold[i].clear(); _hold_st[i].clear();
+        _debounce_us[i] = DEBOUNCE_US_DEFAULT; _deb[i].clear();
     }
     for (uint8_t z = 0; z < ZONE_COUNT; z++) {
         _zone_keycode[z] = 0; _zone_mod[z] = 0;
@@ -39,7 +42,7 @@ KeyboardService* KeyboardService::getInstance() {
 }
 
 void KeyboardService::init() {
-    // GPIO1-12: 输入 + 上拉(硬件已有 1K, 内部上拉冗余但无害), active-low。
+    // GPIO1-12: 输入; 内部上/下拉按每键极性设置(见 _apply_pulls)。
     for (uint8_t i = 0; i < KEY_COUNT; i++) {
         const uint8_t pin = GPIO_BASE + i;
         gpio_init(pin);
@@ -58,6 +61,11 @@ void KeyboardService::init() {
     dispatcher->register_handler(HostCmd::KBD_SET_TOUCHMAP, _handle_set_touchmap);
     dispatcher->register_handler(HostCmd::KBD_GET_HOLD, _handle_get_hold);
     dispatcher->register_handler(HostCmd::KBD_SET_HOLD, _handle_set_hold);
+    dispatcher->register_handler(HostCmd::KBD_GET_COMBO, _handle_get_combo);
+    dispatcher->register_handler(HostCmd::KBD_SET_COMBO, _handle_set_combo);
+    dispatcher->register_handler(HostCmd::KBD_GET_KEYCFG, _handle_get_keycfg);
+    dispatcher->register_handler(HostCmd::KBD_SET_KEYCFG, _handle_set_keycfg);
+    dispatcher->register_handler(HostCmd::KBD_GET_EDGES, _handle_get_edges);
 }
 
 void KeyboardService::reload_map() {
@@ -72,7 +80,20 @@ void KeyboardService::reload_map() {
         _hold[i].delay_ms = ConfigManager::get_uint16(key_buf);
         snprintf(key_buf, sizeof(key_buf), "kbd.mh%02u", i);
         _hold[i].max_hold_ms = ConfigManager::get_uint16(key_buf);
+        // 触发极性: 0=低电平触发(默认, 与改造前一致) / 1=高电平触发。
+        snprintf(key_buf, sizeof(key_buf), "kbd.pl%02u", i);
+        if (ConfigManager::get_uint8(key_buf) != 0) {
+            _pol_high_mask |= (uint16_t)(1u << i);
+        } else {
+            _pol_high_mask &= (uint16_t)~(1u << i);
+        }
+        // 每键防抖窗。KV 已带 0..DEBOUNCE_US_MAX 围栏, 这里再夹一次防止旧配置文件带入越界值。
+        snprintf(key_buf, sizeof(key_buf), "kbd.db%02u", i);
+        const uint16_t db = ConfigManager::get_uint16(key_buf);
+        _debounce_us[i] = (db > DEBOUNCE_US_MAX) ? DEBOUNCE_US_MAX : db;
     }
+    // 极性变了要跟着换内部上/下拉, 否则空闲电平与判定口径相反。
+    if (_gpio_ready) _apply_pulls();
     for (uint8_t z = 0; z < ZONE_COUNT; z++) {
         snprintf(key_buf, sizeof(key_buf), "kbd.zone%02u", z);
         _zone_keycode[z] = ConfigManager::get_uint8(key_buf);
@@ -84,15 +105,87 @@ void KeyboardService::reload_map() {
         _zone_hold[z].max_hold_ms = ConfigManager::get_uint16(key_buf);
     }
     _kbd_map_en = ConfigManager::get_bool("comm.keyboard_map_en");
+    _load_combo();
+}
+
+// 组合表持久化: 每条打包成 4 个 uint32 KV。逐字段一个 KV 会新增 144 项, 明显放大 JSON 与 CRC 开销;
+// 打包后仅 64 项, 且省掉字符串解析。位域布局在 _load/_store 两侧必须严格镜像, 故写在一处注释里:
+//   cbA = zone_mask[31:0]
+//   cbB = bit0..1: zone_mask[33:32]; bit8..15: mod
+//   cbK = key0 | key1<<8 | key2<<16 | key3<<24
+//   cbT = delay_ms | max_hold_ms<<16
+void KeyboardService::_load_combo() {
+    char key_buf[16];
+    for (uint8_t i = 0; i < COMBO_COUNT; i++) {
+        ComboMap& cm = _combo[i];
+        cm.clear();
+        snprintf(key_buf, sizeof(key_buf), "kbd.cbA%02u", i);
+        const uint32_t a = ConfigManager::get_uint32(key_buf);
+        snprintf(key_buf, sizeof(key_buf), "kbd.cbB%02u", i);
+        const uint32_t b = ConfigManager::get_uint32(key_buf);
+        snprintf(key_buf, sizeof(key_buf), "kbd.cbK%02u", i);
+        const uint32_t k = ConfigManager::get_uint32(key_buf);
+        snprintf(key_buf, sizeof(key_buf), "kbd.cbT%02u", i);
+        const uint32_t t = ConfigManager::get_uint32(key_buf);
+        cm.zone_mask = (uint64_t)a | ((uint64_t)(b & 0x3u) << 32);
+        cm.mod = (uint8_t)((b >> 8) & 0xFFu);
+        for (uint8_t n = 0; n < COMBO_KEY_COUNT; n++) {
+            cm.keycode[n] = (uint8_t)((k >> (8u * n)) & 0xFFu);
+        }
+        cm.delay_ms = (uint16_t)(t & 0xFFFFu);
+        cm.max_hold_ms = (uint16_t)((t >> 16) & 0xFFFFu);
+        // 掩码为空的条目一律整条归零, 避免"没有分区却留着键码"的半条目被后续误用。
+        if (cm.zone_mask == 0) cm.clear();
+    }
+    for (uint8_t i = 0; i < COMBO_COUNT; i++) { _combo_st[i].clear(); }
+    _combo_out_count = 0;
+    _combo_out_mod = 0;
+}
+
+void KeyboardService::_store_combo() const {
+    char key_buf[16];
+    for (uint8_t i = 0; i < COMBO_COUNT; i++) {
+        const ComboMap& cm = _combo[i];
+        uint32_t k = 0;
+        for (uint8_t n = 0; n < COMBO_KEY_COUNT; n++) {
+            k |= (uint32_t)cm.keycode[n] << (8u * n);
+        }
+        snprintf(key_buf, sizeof(key_buf), "kbd.cbA%02u", i);
+        ConfigManager::set_uint32(key_buf, (uint32_t)(cm.zone_mask & 0xFFFFFFFFu));
+        snprintf(key_buf, sizeof(key_buf), "kbd.cbB%02u", i);
+        ConfigManager::set_uint32(key_buf,
+            (uint32_t)((cm.zone_mask >> 32) & 0x3u) | ((uint32_t)cm.mod << 8));
+        snprintf(key_buf, sizeof(key_buf), "kbd.cbK%02u", i);
+        ConfigManager::set_uint32(key_buf, k);
+        snprintf(key_buf, sizeof(key_buf), "kbd.cbT%02u", i);
+        ConfigManager::set_uint32(key_buf,
+            (uint32_t)cm.delay_ms | ((uint32_t)cm.max_hold_ms << 16));
+    }
+}
+
+// 内部上/下拉按极性设置: 低电平触发→上拉(空闲高), 高电平触发→下拉(空闲低)。
+// ★注意★ 硬件板上另有 1K 外部上拉, 强度远高于内部 ~50K; 高电平触发只对"外部主动驱动"的接法有效,
+// 直连按键的板子把某键设成高电平触发会读到常按。这是接线口径问题, 固件不做隐式纠正。
+void KeyboardService::_apply_pulls() {
+    for (uint8_t i = 0; i < KEY_COUNT; i++) {
+        const uint8_t pin = GPIO_BASE + i;
+        if (((_pol_high_mask >> i) & 1u) != 0) {
+            gpio_pull_down(pin);
+        } else {
+            gpio_pull_up(pin);
+        }
+    }
 }
 
 uint16_t KeyboardService::_read_raw() const {
-    uint16_t raw = 0;
+    uint16_t level = 0;
     for (uint8_t i = 0; i < KEY_COUNT; i++) {
-        // 上拉 active-low: 低电平=按下。
-        if (gpio_get(GPIO_BASE + i) == 0) raw |= (uint16_t)(1u << i);
+        if (gpio_get(GPIO_BASE + i) != 0) level |= (uint16_t)(1u << i);
     }
-    return raw;
+    // 按位极性归一: 高电平触发的键直接取电平, 低电平触发的键取反。
+    // 一次异或完成 12 键, 热路径不引入分支。
+    const uint16_t all = (uint16_t)((1u << KEY_COUNT) - 1u);
+    return (uint16_t)((level ^ (uint16_t)~_pol_high_mask) & all);
 }
 
 void KeyboardService::_apply_phys(uint8_t idx, bool pressed) {
@@ -130,27 +223,92 @@ void KeyboardService::_apply_touch(uint64_t area_mask) {
     _touch_active = area_mask;
 }
 
+void KeyboardService::_apply_combo(uint64_t area_raw, uint32_t now_us) {
+    // 1) 先算出"本轮应当按下的键码集合 + 修饰位并集"。
+    //    多条组合可能含同一键码, 必须先聚合去重再与上一轮差分 —— 否则逐条 release 会把
+    //    仍被别条按住的键误抬起(表现为按住一个组合时另一个组合松手就整体失效)。
+    uint8_t want_keys[COMBO_COUNT * COMBO_KEY_COUNT];
+    uint8_t want_count = 0;
+    uint8_t want_mod = 0;
+    for (uint8_t i = 0; i < COMBO_COUNT; i++) {
+        const ComboMap& cm = _combo[i];
+        const bool raw_down = !cm.empty() && ((area_raw & cm.zone_mask) == cm.zone_mask);
+        if (!_hold_eval(_combo_st[i], _combo_hold_cfg(cm), raw_down, now_us)) continue;
+        want_mod |= cm.mod;
+        for (uint8_t k = 0; k < COMBO_KEY_COUNT; k++) {
+            const uint8_t code = cm.keycode[k];
+            if (code == 0) continue;
+            bool dup = false;
+            for (uint8_t n = 0; n < want_count; n++) {
+                if (want_keys[n] == code) { dup = true; break; }
+            }
+            if (!dup) { want_keys[want_count++] = code; }
+        }
+    }
+
+    // 2) 与上一轮差分驱动 HID。集合规模 ≤ 64, 两层线性比对即可, 无需额外容器。
+    HID* hid = HID::getInstance();
+    for (uint8_t n = 0; n < _combo_out_count; n++) {
+        bool still = false;
+        for (uint8_t m = 0; m < want_count; m++) {
+            if (want_keys[m] == _combo_out_keys[n]) { still = true; break; }
+        }
+        if (!still) hid->release_key(static_cast<HID_KeyCode>(_combo_out_keys[n]));
+    }
+    for (uint8_t m = 0; m < want_count; m++) {
+        bool had = false;
+        for (uint8_t n = 0; n < _combo_out_count; n++) {
+            if (_combo_out_keys[n] == want_keys[m]) { had = true; break; }
+        }
+        if (!had) hid->press_key(static_cast<HID_KeyCode>(want_keys[m]));
+    }
+    if (want_mod != _combo_out_mod) {
+        // 只动变化位: 松开已撤销的修饰, 按下新增的修饰。
+        const uint8_t released = (uint8_t)(_combo_out_mod & ~want_mod);
+        const uint8_t pressed = (uint8_t)(want_mod & ~_combo_out_mod);
+        if (released != 0) _apply_mods(released, false);
+        if (pressed != 0) _apply_mods(pressed, true);
+        _combo_out_mod = want_mod;
+    }
+    for (uint8_t m = 0; m < want_count; m++) { _combo_out_keys[m] = want_keys[m]; }
+    _combo_out_count = want_count;
+}
+
 void KeyboardService::task() {
     if (!_gpio_ready) return;
 
-    // 物理键整字去抖: 原始采样稳定 DEBOUNCE_US 后一次性提交变化位。
+    // 物理键逐键去抖 + 逐键长按判定。两件事合进同一个 12 次循环: 每键各自的稳定窗互不干扰,
+    // 一个抖动键不再拖累其它键的提交时刻。debounce_us=0 时 (now - stable_since) >= 0 恒成立 → 不去抖。
     const uint32_t now = time_us_32();
     const uint16_t raw = _read_raw();
-    if (raw != _raw_last) {
-        _raw_last = raw;
-        _raw_stable_since_us = now;
-    }
-    if (raw != _phys_state && (now - _raw_stable_since_us) >= DEBOUNCE_US) {
-        _phys_state = raw;
-    }
-
-    // 去抖后的按下态再过一遍每键长按状态机(延迟触发 / 最长按住自动抬起), 差分驱动 HID。
     uint16_t phys_out = 0;
     for (uint8_t i = 0; i < KEY_COUNT; i++) {
-        if (_hold_eval(_hold_st[i], _hold[i], ((_phys_state >> i) & 1u) != 0, now)) {
-            phys_out |= (uint16_t)(1u << i);
+        const bool bit = ((raw >> i) & 1u) != 0;
+        DebounceState& db = _deb[i];
+        if (bit != db.raw_last) {
+            db.raw_last = bit;
+            db.stable_since_us = now;
+        }
+        const uint16_t mask = (uint16_t)(1u << i);
+        if (bit != (((_phys_state & mask) != 0))
+            && (uint32_t)(now - db.stable_since_us) >= (uint32_t)_debounce_us[i]) {
+            if (bit) _phys_state |= mask; else _phys_state &= (uint16_t)~mask;
+        }
+        // 去抖后的按下态再过一遍每键长按状态机(延迟触发 / 最长按住自动抬起)。
+        if (_hold_eval(_hold_st[i], _hold[i], (_phys_state & mask) != 0, now)) {
+            phys_out |= mask;
         }
     }
+
+    // ★逻辑分析仪入队★ 仅在三路掩码任一变化时记一条(边沿触发, 不是定时采样) ⇒ 稳态零流量、零开销。
+    // push 是 O(1) 纯内存写: 无 malloc / 无日志 / 无 flash / 无锁, 因此不影响按键输出延迟与 HID 上报。
+    if (raw != _edge_last_raw || _phys_state != _edge_last_deb || phys_out != _edge_last_out) {
+        _edge_last_raw = raw;
+        _edge_last_deb = _phys_state;
+        _edge_last_out = phys_out;
+        _edges.push(now, raw, _phys_state, phys_out);
+    }
+
     if (phys_out != _phys_out) {
         const uint16_t changed = phys_out ^ _phys_out;
         for (uint8_t i = 0; i < KEY_COUNT; i++) {
@@ -161,7 +319,18 @@ void KeyboardService::task() {
         _phys_out = phys_out;
     }
 
-    // 触控→键盘: 开启时按当前分区触摸驱动(同样过长按状态机); 关闭时按"全松开"走同一路径确保释放。
+    // ★总开关必须低频重读★
+    // comm.keyboard_map_en 由主机经 CFG_SET 修改, 而 CFG_SET 只落 ConfigManager, **没有任何人通知
+    // 本服务** ⇒ _kbd_map_en 一直停在启动时读到的旧值。实测表现: 界面勾了"启用触控键盘映射"、映射也
+    // 已保存, 但触控完全不出键, 必须重启设备才生效。
+    // 这里每 200ms 查一次本地 config map(纯内存查找, 不涉及 USB/SPI, 不影响任何轮询周期)。
+    static uint32_t last_en_poll_us = 0;
+    if ((uint32_t)(now - last_en_poll_us) > 200000u) {
+        last_en_poll_us = now;
+        _kbd_map_en = ConfigManager::get_bool("comm.keyboard_map_en");
+    }
+
+    // 触控→键盘(组合语义): 开启时取当前分区触摸态; 关闭时按"全松开"走同一路径确保释放。
     uint64_t area_raw = 0;
     if (_kbd_map_en) {
         Psoc* psoc = Psoc::getInstance();
@@ -169,13 +338,25 @@ void KeyboardService::task() {
             area_raw = BindingService::getInstance()->map_to_areas(psoc->touch_mask());
         }
     }
-    uint64_t area_out = 0;
-    for (uint8_t z = 0; z < ZONE_COUNT; z++) {
-        if (_hold_eval(_zone_hold_st[z], _zone_hold[z], ((area_raw >> z) & 1ULL) != 0, now)) {
-            area_out |= (1ULL << z);
+    // ★组合表为空时必须回落到旧的 per-zone 判定★
+    // 组合表是新增能力, 但存量设备的 flash 里只有 kbd.zoneNN 那套 per-zone 映射。若无条件只走
+    // 组合表, 升级固件后用户已配好的触控映射会**整体失效**(表空 → 一个键都不输出), 而界面上映射
+    // 明明还在, 极难自查。故: 有组合条目就用组合语义(它是 per-zone 的超集), 一条都没有才回落。
+    if (_combo_active()) {
+        // 逐条组合判定: 掩码内分区**全部**按下才算这条按下, 任一松开即 raw_down=false ——
+        // _hold_eval 在 !raw_down 时 clear(), 于是"全部达标后才开始计时、有一个不符合就算松开"
+        // 两条语义都由既有状态机天然满足, 不需要另写计时逻辑。
+        _apply_combo(area_raw, now);
+    } else {
+        // 回落路径与改造前完全一致: 每分区独立过一遍长按状态机再差分驱动 HID。
+        uint64_t area_out = 0;
+        for (uint8_t z = 0; z < ZONE_COUNT; z++) {
+            if (_hold_eval(_zone_hold_st[z], _zone_hold[z], ((area_raw >> z) & 1ULL) != 0, now)) {
+                area_out |= (1ULL << z);
+            }
         }
+        _apply_touch(area_out);
     }
-    _apply_touch(area_out);
 
     HID::getInstance()->task();
 }
@@ -187,10 +368,127 @@ void KeyboardService::_handle_get_state(const HostFrame& frame, uint8_t* resp, u
     r.cmd = static_cast<uint8_t>(HostCmd::KBD_GET_STATE);
     r.flags = HOST_CMD_FLAG_RESPONSE;
     r.seq = frame.seq;
-    r.len = 2;
+    // [phys_state(u16 LE), raw(u16 LE), out(u16 LE)]。
+    // ★尾部追加而非新命令★: 旧上位机只读前 2 字节, 兼容不变; 新上位机据 raw/out 直接看出
+    // "去抖前 / 实际输出" 两态, 不必再猜防抖与长按到底生效没有。
+    r.len = 6;
     r.payload[0] = (uint8_t)(self->_phys_state & 0xFF);
     r.payload[1] = (uint8_t)((self->_phys_state >> 8) & 0xFF);
+    r.payload[2] = (uint8_t)(self->_edge_last_raw & 0xFF);
+    r.payload[3] = (uint8_t)((self->_edge_last_raw >> 8) & 0xFF);
+    r.payload[4] = (uint8_t)(self->_phys_out & 0xFF);
+    r.payload[5] = (uint8_t)((self->_phys_out >> 8) & 0xFF);
     *resp_len = HostCmdCodec::encode_frame(r, resp, 512);
+}
+
+// ============================================================================
+// 每键触发极性 + 独立防抖 (KBD_GET_KEYCFG / KBD_SET_KEYCFG) 与边沿记录 (KBD_GET_EDGES)
+// ============================================================================
+
+void KeyboardService::_handle_get_keycfg(const HostFrame& frame, uint8_t* resp, uint16_t* resp_len) {
+    KeyboardService* self = getInstance();
+    HostFrame r;
+    r.clear();
+    r.cmd = static_cast<uint8_t>(HostCmd::KBD_GET_KEYCFG);
+    r.flags = HOST_CMD_FLAG_RESPONSE;
+    r.seq = frame.seq;
+    // [count(u8)=12] + 12×(pol(u8), debounce_us(u16 LE))
+    r.payload[0] = KEY_COUNT;
+    uint16_t off = 1;
+    for (uint8_t i = 0; i < KEY_COUNT; i++) {
+        r.payload[off++] = (uint8_t)(((self->_pol_high_mask >> i) & 1u) != 0 ? 1 : 0);
+        r.payload[off++] = (uint8_t)(self->_debounce_us[i] & 0xFF);
+        r.payload[off++] = (uint8_t)((self->_debounce_us[i] >> 8) & 0xFF);
+    }
+    r.len = off;
+    *resp_len = HostCmdCodec::encode_frame(r, resp, 512);
+}
+
+void KeyboardService::_handle_set_keycfg(const HostFrame& frame, uint8_t* resp, uint16_t* resp_len) {
+    // 每项 4 字节: [idx, pol(0=低/1=高), debounce_us(u16 LE)]。
+    if (frame.len < 4 || (frame.len % 4) != 0) {
+        *resp_len = HostCmdCodec::encode_nak(frame.seq, HostCmdError::INVALID_PARAM,
+            "kbd_set_keycfg payload must be [idx,pol,debounce16] quads", resp, 512);
+        return;
+    }
+    // ★先全量校验再落值★ 非法值一律 NAK 且不写入任何一项(不静默夹取, 也不写半张表):
+    // 半写会让界面显示的与设备实际生效的不一致, 排障时最难发现。
+    for (uint16_t off = 0; off + 3 < frame.len; off += 4) {
+        const uint8_t idx = frame.payload[off];
+        const uint8_t pol = frame.payload[off + 1];
+        const uint16_t db = (uint16_t)(frame.payload[off + 2] | ((uint16_t)frame.payload[off + 3] << 8));
+        if (idx >= KEY_COUNT) {
+            *resp_len = HostCmdCodec::encode_nak(frame.seq, HostCmdError::INVALID_PARAM,
+                "kbd_set_keycfg idx out of range (0..11)", resp, 512);
+            return;
+        }
+        if (pol > 1) {
+            *resp_len = HostCmdCodec::encode_nak(frame.seq, HostCmdError::INVALID_PARAM,
+                "kbd_set_keycfg pol must be 0(low) or 1(high)", resp, 512);
+            return;
+        }
+        if (db > DEBOUNCE_US_MAX) {
+            *resp_len = HostCmdCodec::encode_nak(frame.seq, HostCmdError::INVALID_PARAM,
+                "kbd_set_keycfg debounce_us must be 0..10000", resp, 512);
+            return;
+        }
+    }
+    char key_buf[16];
+    for (uint16_t off = 0; off + 3 < frame.len; off += 4) {
+        const uint8_t idx = frame.payload[off];
+        snprintf(key_buf, sizeof(key_buf), "kbd.pl%02u", idx);
+        ConfigManager::set_uint8(key_buf, frame.payload[off + 1]);
+        snprintf(key_buf, sizeof(key_buf), "kbd.db%02u", idx);
+        ConfigManager::set_uint16(key_buf,
+            (uint16_t)(frame.payload[off + 2] | ((uint16_t)frame.payload[off + 3] << 8)));
+    }
+    // 只写 RAM 影子并即时下发生效; flash 落地统一由 SAVE_CONFIG 触发(保护 flash 寿命)。
+    getInstance()->reload_map();
+    *resp_len = HostCmdCodec::encode_ack(frame.seq, resp, 512);
+}
+
+void KeyboardService::_handle_get_edges(const HostFrame& frame, uint8_t* resp, uint16_t* resp_len) {
+    KeyboardService* self = getInstance();
+    // 请求 [max(u8)] 可选; 0 或缺省 = EDGE_READ_MAX。
+    uint8_t want = EDGE_READ_MAX;
+    if (frame.len >= 1 && frame.payload[0] != 0 && frame.payload[0] < EDGE_READ_MAX) {
+        want = frame.payload[0];
+    }
+    HostFrame r;
+    r.clear();
+    r.cmd = static_cast<uint8_t>(HostCmd::KBD_GET_EDGES);
+    r.flags = HOST_CMD_FLAG_RESPONSE;
+    r.seq = frame.seq;
+    // [cap(u16 LE), overflow(u32 LE), remaining(u16 LE), count(u8)] + count×(t_us u32 LE, raw u16 LE, deb u16 LE, out u16 LE)
+    // overflow 是累计值(只增), 主机取差值即可知道"这段时间丢了多少条", 不做清零以免丢失计数。
+    r.payload[0] = (uint8_t)(EDGE_CAP & 0xFF);
+    r.payload[1] = (uint8_t)((EDGE_CAP >> 8) & 0xFF);
+    const uint32_t ovf = self->_edges.overflow;
+    r.payload[2] = (uint8_t)(ovf & 0xFF);
+    r.payload[3] = (uint8_t)((ovf >> 8) & 0xFF);
+    r.payload[4] = (uint8_t)((ovf >> 16) & 0xFF);
+    r.payload[5] = (uint8_t)((ovf >> 24) & 0xFF);
+    uint16_t off = 9;   // payload[6..7]=remaining, payload[8]=count, 取完再回填
+    uint8_t sent = 0;
+    EdgeRec rec;
+    while (sent < want && self->_edges.pop(rec)) {
+        r.payload[off++] = (uint8_t)(rec.t_us & 0xFF);
+        r.payload[off++] = (uint8_t)((rec.t_us >> 8) & 0xFF);
+        r.payload[off++] = (uint8_t)((rec.t_us >> 16) & 0xFF);
+        r.payload[off++] = (uint8_t)((rec.t_us >> 24) & 0xFF);
+        r.payload[off++] = (uint8_t)(rec.raw_mask & 0xFF);
+        r.payload[off++] = (uint8_t)((rec.raw_mask >> 8) & 0xFF);
+        r.payload[off++] = (uint8_t)(rec.deb_mask & 0xFF);
+        r.payload[off++] = (uint8_t)((rec.deb_mask >> 8) & 0xFF);
+        r.payload[off++] = (uint8_t)(rec.out_mask & 0xFF);
+        r.payload[off++] = (uint8_t)((rec.out_mask >> 8) & 0xFF);
+        sent++;
+    }
+    r.payload[6] = (uint8_t)(self->_edges.count & 0xFF);
+    r.payload[7] = (uint8_t)((self->_edges.count >> 8) & 0xFF);
+    r.payload[8] = sent;
+    r.len = off;
+    *resp_len = HostCmdCodec::encode_frame(r, resp, HOST_CMD_RESP_BUF_MAX);
 }
 
 void KeyboardService::_handle_get_map(const HostFrame& frame, uint8_t* resp, uint16_t* resp_len) {
@@ -330,5 +628,107 @@ void KeyboardService::_handle_set_touchmap(const HostFrame& frame, uint8_t* resp
     }
     // 只写 RAM 影子并即时下发生效; flash 落地统一由 SAVE_CONFIG 触发(保护 flash 寿命)。
     getInstance()->reload_map();
+    *resp_len = HostCmdCodec::encode_ack(frame.seq, resp, 512);
+}
+
+// ============================================================================
+// 组合映射(KBD_GET_COMBO / KBD_SET_COMBO)
+// 单条 16 字节: zone_mask(u64 LE) | key0..key3 | mod | delay_ms(u16 LE) | maxhold_ms(u16 LE)
+// SET 为**整表替换**: 逐条增删会产生"半新半旧"的中间态, 而组合判定依赖整表一致性
+// (同一分区可能同时属于多条), 中间态会瞬时输出错误按键。
+// ============================================================================
+
+void KeyboardService::_handle_get_combo(const HostFrame& frame, uint8_t* resp, uint16_t* resp_len) {
+    KeyboardService* self = getInstance();
+    HostFrame r;
+    r.clear();
+    r.cmd = static_cast<uint8_t>(HostCmd::KBD_GET_COMBO);
+    r.flags = HOST_CMD_FLAG_RESPONSE;
+    r.seq = frame.seq;
+    r.payload[0] = COMBO_COUNT;
+    r.payload[1] = COMBO_KEY_COUNT;
+    uint16_t off = 2;
+    for (uint8_t i = 0; i < COMBO_COUNT; i++) {
+        const ComboMap& cm = self->_combo[i];
+        for (uint8_t b = 0; b < 8; b++) {
+            r.payload[off++] = (uint8_t)((cm.zone_mask >> (8u * b)) & 0xFFu);
+        }
+        for (uint8_t k = 0; k < COMBO_KEY_COUNT; k++) {
+            r.payload[off++] = cm.keycode[k];
+        }
+        r.payload[off++] = cm.mod;
+        r.payload[off++] = (uint8_t)(cm.delay_ms & 0xFFu);
+        r.payload[off++] = (uint8_t)((cm.delay_ms >> 8) & 0xFFu);
+        r.payload[off++] = (uint8_t)(cm.max_hold_ms & 0xFFu);
+        r.payload[off++] = (uint8_t)((cm.max_hold_ms >> 8) & 0xFFu);
+    }
+    r.len = off;
+    *resp_len = HostCmdCodec::encode_frame(r, resp, 512);
+}
+
+void KeyboardService::_handle_set_combo(const HostFrame& frame, uint8_t* resp, uint16_t* resp_len) {
+    // payload = [count] + count × 16B。count 允许为 0(清空整表)。
+    if (frame.len < 1) {
+        *resp_len = HostCmdCodec::encode_nak(frame.seq, HostCmdError::INVALID_PARAM,
+            "kbd_set_combo payload must start with count", resp, 512);
+        return;
+    }
+    const uint8_t count = frame.payload[0];
+    if (count > COMBO_COUNT || frame.len != (uint16_t)(1 + count * COMBO_ENTRY_BYTES)) {
+        *resp_len = HostCmdCodec::encode_nak(frame.seq, HostCmdError::INVALID_PARAM,
+            "kbd_set_combo count/length mismatch", resp, 512);
+        return;
+    }
+
+    KeyboardService* self = getInstance();
+    ComboMap staged[COMBO_COUNT];
+    for (uint8_t i = 0; i < COMBO_COUNT; i++) { staged[i].clear(); }
+
+    uint8_t kept = 0;
+    for (uint8_t i = 0; i < count; i++) {
+        const uint16_t base = (uint16_t)(1 + i * COMBO_ENTRY_BYTES);
+        ComboMap cm;
+        cm.clear();
+        for (uint8_t b = 0; b < 8; b++) {
+            cm.zone_mask |= (uint64_t)frame.payload[base + b] << (8u * b);
+        }
+        // 只保留合法分区位: 高于 ZONE_COUNT 的位是主机侧错误, 静默保留会造成"永远无法全部按下"
+        // 的死条目(判定恒 false), 排障时极难发现, 故直接掩掉。
+        cm.zone_mask &= ((uint64_t)1u << ZONE_COUNT) - 1u;
+        for (uint8_t k = 0; k < COMBO_KEY_COUNT; k++) {
+            cm.keycode[k] = frame.payload[base + 8 + k];
+        }
+        cm.mod = frame.payload[base + 8 + COMBO_KEY_COUNT];
+        const uint16_t d_off = (uint16_t)(base + 9 + COMBO_KEY_COUNT);
+        cm.delay_ms = (uint16_t)(frame.payload[d_off] | ((uint16_t)frame.payload[d_off + 1] << 8));
+        cm.max_hold_ms = (uint16_t)(frame.payload[d_off + 2] | ((uint16_t)frame.payload[d_off + 3] << 8));
+        if (cm.zone_mask == 0) continue;   // 空掩码条目直接丢弃, 不占表位
+
+        // 去重按用户规则: **分区集合完全相同**才算重复; 只要 zone_mask 不同就允许共存。
+        bool dup = false;
+        for (uint8_t n = 0; n < kept; n++) {
+            if (staged[n].zone_mask == cm.zone_mask) { dup = true; break; }
+        }
+        if (dup) continue;
+        staged[kept++] = cm;
+    }
+
+    for (uint8_t i = 0; i < COMBO_COUNT; i++) { self->_combo[i] = staged[i]; }
+    // 整表换掉后所有时间状态机必须复位: 沿用旧状态会让新条目继承别人的计时起点/expired 标志。
+    for (uint8_t i = 0; i < COMBO_COUNT; i++) { self->_combo_st[i].clear(); }
+    // 已按下的键先全部松开, 否则被删掉的条目按住的键会永久卡住(表里已无人负责释放它)。
+    HID* hid = HID::getInstance();
+    for (uint8_t n = 0; n < self->_combo_out_count; n++) {
+        hid->release_key(static_cast<HID_KeyCode>(self->_combo_out_keys[n]));
+    }
+    if (self->_combo_out_mod != 0) { _apply_mods(self->_combo_out_mod, false); }
+    self->_combo_out_count = 0;
+    self->_combo_out_mod = 0;
+
+    // 写 RAM 影子; flash 落地统一由 SAVE_CONFIG 触发(与 set_map/set_touchmap 同口径, 保护 flash 寿命)。
+    self->_store_combo();
+    // 与 set_map/set_touchmap 同口径: 立刻重载一遍, 顺带把 comm.keyboard_map_en 的最新值读进来
+    // (整表已写进 KV, _load_combo 读回的内容与刚 staged 的一致, 不会丢)。
+    self->reload_map();
     *resp_len = HostCmdCodec::encode_ack(frame.seq, resp, 512);
 }

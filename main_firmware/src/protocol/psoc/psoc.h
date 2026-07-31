@@ -38,6 +38,9 @@ public:
     // 返回复位原因: 0=无, 1=SPI 链路持续丢失(PSoC 崩溃/掉线), 2=主循环卡死(scan_count 长时间不推进, 疑似坏算法)。
     uint8_t needs_reset() const { return _pub_reset_reason; }
     void clear_reset_request() { _pub_reset_reason = 0; }
+    // 宽限期内(XRES 启动中 / 正在执行重操作)链路失败不代表 PSoC 真的掉线或被复位。
+    // 调用方据此避免"把正忙的 PSoC 判成已复位"而重新下发配置(见 _reset_grace_until_ms 注释)。
+    bool busy_grace_active() const;
 
     // ---------- Phase A：CSD 运行时指令（core0 调用→命令信箱→core1 独占 SPI 执行；签名不变）----------
     bool set_param(uint8_t ch, uint8_t param_id, uint32_t value);
@@ -54,6 +57,14 @@ public:
     // 主机租约与 TxScheduler 租约一并过期 → 遥测被停且无恢复路径。改为入队即返回。
     bool upload_algo(const uint8_t* data, uint16_t len, uint16_t crc16);
     bool algo_download_busy() const { return _algo_dl.busy != 0u; }
+
+    /// core1 是否空闲(命令环已排空且当前没有在执行的命令)。
+    /// core0 落 flash 前必须确认为 true —— flash 写会 multicore_lockout core1, 而 core1 正在跑的
+    /// 重操作(重初始化/全通道校准)会在 _wait_op_done 里轮询数秒, 那期间它响应不了 lockout,
+    /// core0 就会死等到看门狗复位。宁可把落盘推迟到下一轮, 也不能在这个窗口里进 lockout。
+    bool core1_idle() const {
+        return (_cmd_head == _cmd_tail) && (_core1_in_cmd == 0u);
+    }
     // core0: 取走并清除"最近一次下发未通过 PSoC commit 校验"标志(用于一次性上报, 不重复刷屏)。
     bool algo_download_take_failure();
     bool get_algo_info(bool* out_valid, uint16_t* out_len);   // 读 PSoC 端算法 valid/len
@@ -104,6 +115,11 @@ public:
     void reset_run();   // 复位 PSoC 进运行态(脉冲 XRES) + 设启动宽限期防兜底复位死循环
     void release_swd() { _swd.release_swd(); }
     bool swd_ready() const { return _swd_ready; }
+
+    // 运行态带外 SWD 诊断（仅 core0 host 命令路径调用，不经 core1 SPI）。
+    bool psoc_debug_counters(uint32_t out[SwdProgrammer::DEBUG_COUNTER_WORDS]);
+    uint32_t psoc_debug_status() const;
+    uint32_t psoc_debug_block_addr() const;
 
     // ---------- 细粒度 flash 步骤 + 诊断（bring-up 用，Phase B 收敛） ----------
     bool set_imo() { return _swd.set_imo_48mhz(); }
@@ -183,7 +199,14 @@ private:
     volatile uint8_t  _pub_reset_reason = 0;   // 0/1/2, core1 置位, core0 处理后清零
     bool     _link_established = false;         // 链路曾就绪(避免启动期误判)
     uint32_t _link_fail_run = 0;                // 连续 read_touch 失败周期数
-    volatile uint32_t _reset_grace_until_ms = 0; // XRES 复位后 PSoC 启动宽限截止(core0 写, core1 读)
+    // 宽限截止时刻: 期内一律【不把 PSoC 判成死了】(不累计链路失败/不累计卡死/不清 provisioned)。
+    // 两个来源: ① XRES 复位后的启动宽限; ② 派发重操作(APPLY/CALIBRATE/GLOBAL_COMMIT/AUTO_TUNE)后的
+    // 执行宽限 —— 这些操作由 PSoC 主循环同步执行(逐通道校准可达 12s+), 期间 CapSense 内部临界区会
+    // 推迟 SPI DMA 中断, 响应装不上 → read_touch 成批失败。若照旧判为"PSoC 掉线/被复位", 就会
+    // XRES 它并清 provisioned 重新下发, 而重新下发又把 36 通道全部置脏、再触发一次 12s 重校准 ——
+    // 形成永久 provision 风暴(实测 setparam 约 428/s、apply 约 1.1/s、scan_count 几乎不动)。
+    // core0 写, core1 读。
+    volatile uint32_t _reset_grace_until_ms = 0;
     uint32_t _hang_intervals = 0;               // 连续 scan_count 不推进的统计间隔数
     // 频率自适应阶段进度: core1 唯一写者(经 _at_seq seqlock 发布多字段一致副本), core0 只读。
     // _at_req 反向: core0 唯一写者(启动时自增), core1 只读回显, 使 core0 能区分"上一轮的 done"。
@@ -226,6 +249,7 @@ private:
     SpiCmd            _cmd_ring[CMD_RING_SIZE];
     volatile uint32_t _cmd_head = 0;   // core0 生产位置(生产者独占推进)
     volatile uint32_t _cmd_tail = 0;   // core1 消费位置(消费者独占推进)
+    volatile uint8_t  _core1_in_cmd = 0;  // core1 正在执行一条 SPI 命令(见 core1_idle 注释)
 
     void _spi_service();   // core1 每周期: 命令队列 + 触控快路 + 快照慢路 + 采样率统计
     bool _submit(SpiOp op, uint8_t ch, uint8_t pid, uint32_t val, uint32_t* out, const uint8_t* data = nullptr, uint32_t timeout_us = 0u);  // core0 投递(读类等结果); timeout_us=0 用默认

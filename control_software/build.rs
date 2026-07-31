@@ -6,7 +6,8 @@ fn main() {
     const PSOC_HEADER: &str = "../main_firmware/src/protocol/psoc/psoc_fw_image.h";
     println!("cargo:rerun-if-changed={PSOC_HEADER}");
     let psoc_source = fs::read_to_string(PSOC_HEADER).expect("read generated PSoC image header");
-    let psoc_version = psoc_source.lines()
+    let psoc_version = psoc_source
+        .lines()
         .find(|line| line.contains("PSOC_FW_VERSION = 0x"))
         .and_then(|line| line.split("0x").nth(1))
         .and_then(|value| value.split('u').next())
@@ -14,10 +15,13 @@ fn main() {
         .expect("parse PSOC_FW_VERSION from generated image header");
     println!("cargo:rustc-env=EXPECTED_PSOC_FW_VERSION={psoc_version}");
 
-    const RP_HEADER: &str = "../main_firmware/src/service/psoc_updater/psoc_updater.h";
+    // 该头由 main_firmware 的 pre:gen_build_stamp.py 每次构建生成(版本=编译时间戳 YYMMDDHHMM),
+    // 十六进制字面量形式专为下面这段正则保留。
+    const RP_HEADER: &str = "../main_firmware/src/service/psoc_updater/rp_build_stamp.h";
     println!("cargo:rerun-if-changed={RP_HEADER}");
     let rp_source = fs::read_to_string(RP_HEADER).expect("read RP2040 firmware version header");
-    let rp_version = rp_source.lines()
+    let rp_version = rp_source
+        .lines()
         .find(|line| line.contains("RP_FIRMWARE_VERSION = 0x"))
         .and_then(|line| line.split("0x").nth(1))
         .and_then(|value| value.split('u').next())
@@ -35,7 +39,11 @@ fn main() {
     // 同名 Rust cdylib —— 那个 COM 实现未跑通, 静默嵌进去只会让安装看似成功、实际起不来。
     let manifest = std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
     // MSBuild 的配置名首字母大写，与 cargo 的 profile 名不同。
-    let msbuild_config = if std::env::var("PROFILE").unwrap() == "release" { "Release" } else { "Debug" };
+    let msbuild_config = if std::env::var("PROFILE").unwrap() == "release" {
+        "Release"
+    } else {
+        "Debug"
+    };
     let mut candidates: Vec<std::path::PathBuf> = Vec::new();
     println!("cargo:rerun-if-env-changed=MAI2_VCAM_DLL");
     if let Some(path) = std::env::var_os("MAI2_VCAM_DLL") {
@@ -48,8 +56,8 @@ fn main() {
             .join(msbuild_config)
             .join("mai2vcam_source.dll"),
     );
-    let generated = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap())
-        .join("vcam_embedded.rs");
+    let generated =
+        std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap()).join("vcam_embedded.rs");
     let mut found: Option<&std::path::PathBuf> = None;
     for dll in &candidates {
         println!("cargo:rerun-if-changed={}", dll.display());

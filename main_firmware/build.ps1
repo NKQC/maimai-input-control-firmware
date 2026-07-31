@@ -1,4 +1,4 @@
-# mai2control fixed autonomous build/flash/validation entry.
+﻿# mai2control fixed autonomous build/flash/validation entry.
 # Change only this constant between "Build" and "Flash"; invocation stays fixed.
 $WorkflowMode = "Build"
 
@@ -25,6 +25,7 @@ $PythonExe = (Get-Command python.exe -ErrorAction Stop).Source
 $CargoExe = (Get-Command cargo.exe -ErrorAction Stop).Source
 $PsocConverter = Join-Path $FirmwareDir "tools\psoc_hex_to_c.py"
 $PsocMain = Join-Path $PsocDir "main.c"
+$PsocStampHeader = Join-Path $PsocDir "fw_build_stamp.h"
 
 function Assert-Path([string]$Path, [string]$Description) {
     if (-not (Test-Path -LiteralPath $Path)) {
@@ -54,18 +55,24 @@ function Invoke-NativeStep(
     }
 }
 
-function Get-PsocVersionHex {
-    $source = Get-Content -LiteralPath $PsocMain -Raw
-    $majorMatch = [regex]::Match($source, '#define\s+FW_VERSION_MAJOR\s+\((\d+)u\)')
-    $minorMatch = [regex]::Match($source, '#define\s+FW_VERSION_MINOR\s+\((\d+)u\)')
-    $patchMatch = [regex]::Match($source, '#define\s+FW_VERSION_PATCH\s+\((\d+)u\)')
-    if (-not ($majorMatch.Success -and $minorMatch.Success -and $patchMatch.Success)) {
-        throw "Unable to parse FW_VERSION_MAJOR/MINOR/PATCH from $PsocMain"
+# PSoC 版本 = 编译时间戳(十进制 YYMMDDHHMM), 由 make build 的 PREBUILD 写入 fw_build_stamp.h;
+# 读生成头而不是 main.c, 因为它就是刚编进 HEX 的那个值。
+function Get-PsocStamp {
+    Assert-Path $PsocStampHeader "PSoC build stamp header"
+    $source = Get-Content -LiteralPath $PsocStampHeader -Raw
+    $match = [regex]::Match($source, '#define\s+FW_BUILD_STAMP\s+\((\d+)u\)')
+    if (-not $match.Success) {
+        throw "Unable to parse FW_BUILD_STAMP from $PsocStampHeader"
     }
-    $version = ([int]$majorMatch.Groups[1].Value -shl 16) -bor
-               ([int]$minorMatch.Groups[1].Value -shl 8) -bor
-               [int]$patchMatch.Groups[1].Value
-    return "0x{0:X8}" -f $version
+    return [uint32]$match.Groups[1].Value
+}
+
+# 2607310427 -> "2026-07-31 04:27"
+function Format-BuildStamp([uint32]$Stamp) {
+    $text = "{0:D10}" -f $Stamp
+    return "20{0}-{1}-{2} {3}:{4}" -f $text.Substring(0, 2), $text.Substring(2, 2),
+                                      $text.Substring(4, 2), $text.Substring(6, 2),
+                                      $text.Substring(8, 2)
 }
 
 function Get-RpiBootVolume {
@@ -302,7 +309,10 @@ try {
     if ($hexFiles.Count -ne 1) {
         throw "Expected exactly one PSoC HEX in $PsocHexDir, found $($hexFiles.Count)."
     }
-    $psocVersion = Get-PsocVersionHex
+    $psocStamp = Get-PsocStamp
+    $psocVersion = "0x{0:X8}" -f $psocStamp
+    Write-Host ("PSoC build stamp: {0} ({1}) -> {2}" -f
+        $psocStamp, (Format-BuildStamp $psocStamp), $psocVersion)
     Invoke-NativeStep "Embed PSoC HEX ($psocVersion)" $PythonExe @(
         $PsocConverter, $hexFiles[0].FullName, $PsocImageHeader, $psocVersion
     ) $FirmwareDir

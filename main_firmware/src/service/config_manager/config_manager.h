@@ -203,6 +203,10 @@ private:
     
     // 私有文件操作接口（不对外访问）
     static bool config_save(const config_map_t* config_map);
+    /// NvStore(自管理 flash)后端: 替代原 LittleFS + JSON 的落盘/读取。
+    static bool nv_save_kv(const config_map_t* config_map);
+    static bool nv_sync_value(const std::string& key, const ConfigValue& value);
+    static bool nv_load_kv(config_map_t* out);
     static bool config_read(config_map_t* config_map);
     
     // 辅助函数

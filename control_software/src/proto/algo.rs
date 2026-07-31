@@ -86,7 +86,12 @@ pub fn decode_global_get_all(payload: &[u8]) -> Vec<(u8, u32)> {
             break;
         }
         let id = payload[p];
-        let v = u32::from_le_bytes([payload[p + 1], payload[p + 2], payload[p + 3], payload[p + 4]]);
+        let v = u32::from_le_bytes([
+            payload[p + 1],
+            payload[p + 2],
+            payload[p + 3],
+            payload[p + 4],
+        ]);
         out.push((id, v));
         p += 5;
     }
@@ -164,20 +169,39 @@ pub fn decode_algo_get_rom(payload: &[u8]) -> Vec<u16> {
 }
 
 /// 算法 C 源(映射表)存储上限, 与固件 PSOC_ALGO_SRC_MAX 一致。
-pub const ALGO_SRC_MAX: usize = 3072;
+pub const ALGO_SRC_MAX: usize = 32768;
+/// 单片字节数, 与固件 HOST_CMD_ALGO_SRC_CHUNK 一致。32KB 装不进 4096 的单帧 payload, 必须分片。
+pub const ALGO_SRC_CHUNK: usize = 2048;
 
-/// 请求回读算法 C 源(映射表)。
-pub fn encode_algo_get_src(seq: u8) -> Frame {
-    Frame::new(HostCmd::AlgoGetSrc as u8, 0, seq, vec![])
+/// 请求回读算法 C 源的某一片: payload = [offset(u16 LE)]。
+pub fn encode_algo_get_src(seq: u8, offset: usize) -> Frame {
+    let off = (offset.min(ALGO_SRC_MAX)) as u16;
+    Frame::new(
+        HostCmd::AlgoGetSrc as u8,
+        0,
+        seq,
+        off.to_le_bytes().to_vec(),
+    )
 }
 
-/// payload = [len(u16 LE), src bytes]; 存算法 C 源(已滤注释)。
-pub fn encode_algo_set_src(seq: u8, src: &[u8]) -> Frame {
-    let len = src.len().min(ALGO_SRC_MAX) as u16;
-    let mut p = Vec::with_capacity(2 + len as usize);
-    p.extend_from_slice(&len.to_le_bytes());
-    p.extend_from_slice(&src[..len as usize]);
+/// payload = [offset(u16 LE), total(u16 LE), chunk]; 存算法 C 源(已滤注释)的一片。
+/// offset 必须从 0 开始严格连续, 最后一片(offset+chunk==total)才让设备侧生效。
+pub fn encode_algo_set_src_chunk(seq: u8, offset: usize, total: usize, chunk: &[u8]) -> Frame {
+    let mut p = Vec::with_capacity(4 + chunk.len());
+    p.extend_from_slice(&(offset as u16).to_le_bytes());
+    p.extend_from_slice(&(total as u16).to_le_bytes());
+    p.extend_from_slice(chunk);
     Frame::new(HostCmd::AlgoSetSrc as u8, 0, seq, p)
+}
+
+/// 响应 [total(u16 LE), offset(u16 LE), chunk] → (total, offset, chunk)。
+pub fn decode_algo_src_chunk(payload: &[u8]) -> Option<(usize, usize, &[u8])> {
+    if payload.len() < 4 {
+        return None;
+    }
+    let total = u16::from_le_bytes([payload[0], payload[1]]) as usize;
+    let offset = u16::from_le_bytes([payload[2], payload[3]]) as usize;
+    Some((total, offset, &payload[4..]))
 }
 
 /// 请求回读算法 ASM 机器码。
@@ -340,15 +364,22 @@ fn _parse_paren_args(src: &str, open_paren_pos: usize) -> Option<(Vec<String>, u
             continue;
         }
         match c {
-            '"' => { in_str = true; cur.push(c); }
+            '"' => {
+                in_str = true;
+                cur.push(c);
+            }
             '(' => {
                 depth += 1;
-                if depth > 1 { cur.push(c); }
+                if depth > 1 {
+                    cur.push(c);
+                }
             }
             ')' => {
                 depth -= 1;
                 if depth == 0 {
-                    if !cur.trim().is_empty() { args.push(cur.trim().to_string()); }
+                    if !cur.trim().is_empty() {
+                        args.push(cur.trim().to_string());
+                    }
                     return Some((args, i + 1));
                 }
                 cur.push(c);
@@ -361,5 +392,5 @@ fn _parse_paren_args(src: &str, open_paren_pos: usize) -> Option<(Vec<String>, u
         }
         i += 1;
     }
-    None   // 未闭合括号
+    None // 未闭合括号
 }

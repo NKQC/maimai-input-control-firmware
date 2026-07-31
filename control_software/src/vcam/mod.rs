@@ -12,8 +12,8 @@
 //! 系统级虚拟摄像头输出后端见 `backend`(Windows Media Foundation `MFCreateVirtualCamera`)。
 
 use std::sync::{
-    atomic::{AtomicBool, AtomicU32, Ordering},
     Arc, Mutex,
+    atomic::{AtomicBool, AtomicU32, Ordering},
 };
 use std::time::{Duration, Instant};
 
@@ -110,8 +110,11 @@ impl VcamState {
         let dur = Duration::from_millis(self.display_ms.load(Ordering::SeqCst) as u64);
         *self.show_until.lock().unwrap() = Some(Instant::now() + dur);
         self.publish(frame);
-        log::info!("虚拟摄像头: 已提交数据(长度 {}) → 显示 QR {} 秒", data.len(),
-            self.display_ms.load(Ordering::SeqCst) / 1000);
+        log::info!(
+            "虚拟摄像头: 已提交数据(长度 {}) → 显示 QR {} 秒",
+            data.len(),
+            self.display_ms.load(Ordering::SeqCst) / 1000
+        );
     }
 
     /// 周期调用(定时器): 显示期满则转黑屏。返回帧是否发生变化。
@@ -162,14 +165,19 @@ pub fn render_qr_frame(data: &str) -> anyhow::Result<Rgb24> {
     for my in 0..total_modules {
         for mx in 0..total_modules {
             // 静区(白)与数据模块。
-            let dark = if mx < quiet || my < quiet || mx >= quiet + modules || my >= quiet + modules {
+            let dark = if mx < quiet || my < quiet || mx >= quiet + modules || my >= quiet + modules
+            {
                 false // 静区为白
             } else {
                 let cmx = mx - quiet;
                 let cmy = my - quiet;
                 matches!(colors[cmy * modules + cmx], qrcode::Color::Dark)
             };
-            let (r, g, b) = if dark { (0u8, 0u8, 0u8) } else { (255u8, 255u8, 255u8) };
+            let (r, g, b) = if dark {
+                (0u8, 0u8, 0u8)
+            } else {
+                (255u8, 255u8, 255u8)
+            };
             // 填充该模块的 mpx*mpx 像素块。
             for py in 0..mpx {
                 for px in 0..mpx {

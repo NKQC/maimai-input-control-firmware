@@ -1,11 +1,12 @@
-/******************************************************************************
+﻿/******************************************************************************
  * File Name:   main.c
  *
  * Description: PSoC 4 SPI Slave with CAPSENSE and Status LED
  * - SPI Slave: SCB0 (SLAVE, MODE0, 8-bit, MSB-first, CS ActiveLow)
  * - CAPSENSE: 36 buttons, immutable double-buffered snapshots
  * - Status LED: P1.6 (CYBSP_LED_SLD3)
- * - FW_VERSION: 0x0000040C (0.4.12)
+ * - FW_VERSION: 编译时间戳 YYMMDDHHMM(十进制, 本地时间), 由 Makefile PREBUILD 生成
+ *   fw_build_stamp.h 提供; 上位机补 "20" 前缀还原 YYYYMMDDHHMM
  * - JIT algo engine: 1KB executable RAM slot (ABI v1, psoc_algo_abi.h),
  *   uploaded via ALGO_BEGIN/PAGE/END/INFO SPI commands, CRC16-CCITT-FALSE
  *   verified commit in main loop, falls back to Cy_CapSense_IsWidgetActive
@@ -17,15 +18,15 @@
 #include "cycfg.h"
 #include "cycfg_capsense.h"
 #include "psoc_algo_abi.h"
+#include "fw_build_stamp.h"
 #include <stdint.h>
 #include <string.h>
 
-#define FW_VERSION_MAJOR                 (0u)
-#define FW_VERSION_MINOR                 (4u)
-#define FW_VERSION_PATCH                 (26u)
-#define FW_VERSION                       (((uint32_t)FW_VERSION_MAJOR << 16u) | \
-                                          ((uint32_t)FW_VERSION_MINOR << 8u) | \
-                                          FW_VERSION_PATCH)
+/* 版本号 = 编译时间戳(十进制 YYMMDDHHMM, 本地时间), 每次 make build 由 PREBUILD 重新生成。
+ * 线上格式不变: 仍是 u32, PING 响应照旧拆 4 字节上报。
+ * 已知上限: YY <= 42 才放得进 u32, 2043 年起下面的断言会让构建直接失败。 */
+#define FW_VERSION                       (FW_BUILD_STAMP)
+_Static_assert(FW_VERSION <= 0xFFFFFFFFu, "FW_BUILD_STAMP overflows uint32 (YY > 42?)");
 
 #define SENSOR_FRAME_MAGIC               (0xA5u)
 #define SENSOR_CMD_PING                  (0x01u)
@@ -77,6 +78,13 @@
 #define GPARAM_MFS_DIV_F2                (0x06u)  // csdMfsDividerOffsetF2(多频通道2分频偏移)
 #define GPARAM_IDAC_SENSE_CONFIG         (0x07u)  // csdChargeTransfer: 0=IDAC sourcing, 1=IDAC sinking (运行时可设)
 #define GPARAM_AUTO_CALIBRATE_EN         (0x08u)  // 运行时是否自动校准: 0=固定IDAC(不自动校准), 1=Init/Apply 自动校准
+// ---- SPI DMA 链路只读诊断计数(复用 GET_GLOBAL 通道, 不新增命令码) ----
+// 用于在"RP2040 读回全 0"时区分故障域: 帧到底有没有进来、magic 对不对、CS 重同步有没有在发生。
+#define GPARAM_DBG_RX_FRAMES             (0x80u)  // RX DMA 完成中断次数(收到的完整 7 字节帧数)
+#define GPARAM_DBG_RX_BAD_MAGIC          (0x81u)  // 收到但 magic != 0xA5 的帧数(=帧错位的直接证据)
+#define GPARAM_DBG_CS_RESYNC             (0x82u)  // CS 抬起时发现半帧而做重同步的次数
+#define GPARAM_DBG_TX_ARM                (0x83u)  // TX 描述符重挂次数
+#define GPARAM_DBG_RX_LEFTOVER           (0x84u)  // CS 抬起时 RX FIFO 仍有残字节的次数
 // 只读: 启动时固件对生成配置做过哪些强制改写(位掩码)。上位机据此把"设备被固件改过"如实告知用户,
 // 杜绝"UI 显示用户设定值、设备实际另一个值"的静默不同步。
 //   bit0 = IDAC 增益档被抬到下限(生成配置默认 0 会全片 railed, 必须抬)
@@ -107,6 +115,12 @@
 #define SENSOR_SNAPSHOT_PAGE_SIZE        (SENSOR_FRAME_PAYLOAD_SIZE)
 #define SENSOR_SNAPSHOT_PAGE_COUNT       (SENSOR_SNAPSHOT_SIZE / SENSOR_SNAPSHOT_PAGE_SIZE)
 
+/* SPI CS = P1.3 (SCB0 SPI SELECT0, 见 cycfg_routing.h)。HSIOM 交给 SCB 后端口输入仍可产生
+ * GPIO 中断, 故可用它的上升沿(取消选择)作帧边界做 RX 重同步。 */
+#define SPI_CS_PORT                      (GPIO_PRT1)
+#define SPI_CS_NUM                       (3u)
+#define SPI_CS_IRQ                       (ioss_interrupts_gpio_1_IRQn)
+
 #define CAPSENSE_INTR_PRIORITY           (3u)
 #define CY_ASSERT_FAILED                 (0u)
 #define STATUS_LED_PORT                  (CYBSP_LED_SLD3_PORT)
@@ -119,8 +133,118 @@
 #endif
 
 static cy_stc_scb_spi_context_t spi_context;
-static uint8_t spi_tx_frame[SENSOR_FRAME_SIZE];
-/* 实时触控帧：主循环每个 capsense 周期更新，SPI ISR 作为默认响应装入 TX FIFO（流水线）。 */
+
+typedef struct
+{
+    /* ★PING/PONG 双落帧缓冲(照搬官方 CE 的 SCB+DMAC 范式)★: 两个 RX 描述符【始终有效】、
+     * flipping 交替, 故 SCB 的电平请求永远落在一个有效描述符上, 不存在"描述符刚完成/被软件
+     * 重置时正好来触发"的窗口。此前单描述符 + ISR 内 SetState(true) 正是踩了这个窗口:
+     * SetState 会清 CURR_DATA_NR, 与仍在推进的字节流相撞 → RX 通道搬完一帧后即失效,
+     * 之后再不产生完成中断 ⇒ TX 永不重挂 ⇒ RP2040 恒读回全 0(与 TX 填充方式无关)。 */
+    volatile uint8_t rx_frame[2u][SENSOR_FRAME_SIZE];
+    uint8_t tx_frame[SENSOR_FRAME_SIZE];
+    volatile bool frame_received;
+    volatile bool snapshot_copy_pending;
+    volatile uint8_t snapshot_source_index;
+    volatile uint8_t snapshot_sequence;
+} spi_dma_state_t;
+
+static spi_dma_state_t spi_dma;
+
+/* SPI 链路诊断计数(只读, 经 GET_GLOBAL 的 GPARAM_DBG_* 上报)。同一功能组归拢成 struct,
+ * 避免散装全局量; 需要整体归零时用 _spi_dbg_clear()。 */
+/* ★带外 SWD 取数用的定位 magic★: 带内 GET_GLOBAL 在链路故障态读不出来(实测全 None), 故本块必须
+ * 能被 RP2040 经 SWD 直接读。为免改 BSP 链接脚本(生成文件, 改了脆), 不固定地址, 而是在块首放一对
+ * magic 字, 由 RP2040 扫描 SRAM(0x20000000..0x20004000, 16KB) 一次定位后缓存地址。 */
+#define SPI_DBG_MAGIC0                   (0x53504442u)   /* "SPDB" */
+#define SPI_DBG_MAGIC1                   (0x4C4E4B31u)   /* "LNK1" */
+
+/* 主循环阶段码: 每进入一个可能长耗时的段就写一次, 挂死时停在肇事段上(带外 SWD 读槽3)。
+ * 20+ 是 APPLY 分支内部的细分阶段, 用来把"APPLY 耗时 13s"落到具体哪一步。 */
+#define MLOOP_STAGE_TOP                  (1u)
+#define MLOOP_STAGE_LATCH                (2u)
+#define MLOOP_STAGE_WAIT_SCAN            (3u)   /* 等 Cy_CapSense_IsBusy 变 NOT_BUSY */
+#define MLOOP_STAGE_PROCESS              (4u)
+#define MLOOP_STAGE_TOUCH                (5u)
+#define MLOOP_STAGE_PUBLISH              (6u)
+#define MLOOP_STAGE_MEASURE_CP           (7u)
+#define MLOOP_STAGE_ALGO_COMMIT          (8u)
+#define MLOOP_STAGE_GLOBAL_APPLY         (9u)
+#define MLOOP_STAGE_APPLY                (10u)
+#define MLOOP_STAGE_CALIBRATE            (11u)
+#define MLOOP_STAGE_BASELINE_RESET       (12u)
+#define MLOOP_STAGE_AUTO_TUNE            (13u)
+#define MLOOP_STAGE_SCAN_START           (14u)
+/* APPLY 分支细分 */
+#define MLOOP_STAGE_APPLY_ENABLE         (20u)  /* AUTO+自动校准: Cy_CapSense_Enable(全通道自动校准) */
+#define MLOOP_STAGE_APPLY_RECAL          (21u)  /* 逐通道 _recalibrate_dirty_channels */
+#define MLOOP_STAGE_APPLY_INIT           (22u)  /* Cy_CapSense_Initialize */
+#define MLOOP_STAGE_APPLY_BASELINE       (23u)  /* Cy_CapSense_InitializeAllBaselines */
+
+/* 前 5 个 volatile 字段(block+8 .. block+24)是 RP2040 经 SWD 读走的"导出槽", 顺序即上报顺序;
+ * 其后的字段仍在内存里累计, 需要时再扩展读取范围即可。
+ * ★槽位内容已换代★: 帧对齐问题已由实测证伪(bad_magic 连续两轮为 0, 帧边界完全正确), 故把导出槽
+ * 让给当前真正待查的问题 —— PSoC 主循环是否活着、是否在扫描、是否在发布快照。 */
+typedef struct
+{
+    uint32_t magic0;
+    uint32_t magic1;
+    /* ★槽0/4/5/6 已换代为"钉死 snsClk 被谁改回 8"的四件套★(rx_frames/apply_cmd/apply_last_ms/
+     * apply_dirty 的使命已完成: 链路与 APPLY 风暴都已修复且有 scan/ms/stage/setparam 可继续监视)。
+     * 判据:
+     *   clk_boot==32 且 clk_now==8 且 clk_set_cnt>0  ⇒ 是 SET_PARAM 推下来的(store 侧问题)
+     *   clk_boot==32 且 clk_now==8 且 clk_set_cnt==0 ⇒ 是中间件内部路径改的(Init/Initialize/Enable)
+     *   clk_boot!=32                                 ⇒ 启动归一根本没生效 */
+    volatile uint32_t clk_boot;       /* 槽0: 启动 normalize 之后立刻采样的 widgetContext[0].snsClk */
+    volatile uint32_t scan_count_m;   /* 槽1: scan_count 镜像(主循环每完成一次全通道扫描 +1) */
+    volatile uint32_t ms_tick_m;      /* 槽2: g_ms_tick 镜像(SysTick 毫秒, 0 说明主循环/时基死了) */
+    /* 槽3: 主循环阶段码(见 MLOOP_STAGE_*)。主循环挂死时它就停在肇事阶段上, 带外 SWD 一读即知。 */
+    volatile uint32_t stage;
+    /* ★钉死 APPLY 问题的四个关键量★
+     * 槽4/槽7 回答"帧到底有没有反复到达"(ISR 计数, 与主循环无关):
+     *   apply_cmd  持续增长 ⇒ RP2040 真的在反复发 APPLY, 去 RP2040 侧抓发送方;
+     *   apply_cmd  恒为 1   ⇒ 没人重发, 那 stage=10 只能是 apply_pending 被别的途径置起。
+     *   setparam_cmd 同步增长 ⇒ provision 整体在重复(不只是 APPLY)。
+     * 槽5/槽6 回答"13s 花在哪": 上次 APPLY 实测耗时, 以及进入时的脏通道数(逐通道重校准的工作量)。 */
+    volatile uint32_t clk_set_cnt;    /* 槽4: cmd_set_param 写 PARAM_SNS_CLK_DIV 的次数 */
+    volatile uint32_t clk_set_last;   /* 槽5: 最后一次被写入的 snsClk 值(低16位) | 通道<<16 */
+    volatile uint32_t clk_now;        /* 槽6: 每轮主循环采样的 widgetContext[0].snsClk(当前生效值) */
+    volatile uint32_t setparam_cmd;   /* 槽7: ISR 收到 SENSOR_CMD_SET_PARAM 的次数 */
+    volatile uint32_t snap_pub;
+    volatile uint32_t rx_bad_magic;
+    volatile uint32_t cs_resync;
+    volatile uint32_t rx_leftover;
+} spi_dbg_t;
+/* 带 magic 常量初值 ⇒ 落在 .data(而非 .bss), 内容确定, SWD 扫描必然能命中。 */
+static spi_dbg_t spi_dbg = { SPI_DBG_MAGIC0, SPI_DBG_MAGIC1,
+                             0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u };
+
+static inline void _spi_dbg_clear(void)
+{
+    spi_dbg.magic0 = SPI_DBG_MAGIC0;
+    spi_dbg.magic1 = SPI_DBG_MAGIC1;
+    spi_dbg.clk_boot = 0u;
+    spi_dbg.scan_count_m = 0u;
+    spi_dbg.ms_tick_m = 0u;
+    spi_dbg.stage = 0u;
+    spi_dbg.clk_set_cnt = 0u;
+    spi_dbg.clk_set_last = 0u;
+    spi_dbg.clk_now = 0u;
+    spi_dbg.setparam_cmd = 0u;
+    spi_dbg.snap_pub = 0u;
+    spi_dbg.rx_bad_magic = 0u;
+    spi_dbg.cs_resync = 0u;
+    spi_dbg.rx_leftover = 0u;
+}
+
+/* 统计 64 位掩码里的置位数(APPLY 的脏通道工作量)。 */
+static inline uint32_t _popcount64(uint64_t v)
+{
+    uint32_t n = 0u;
+    while (v != 0u) { v &= (v - 1u); n++; }
+    return n;
+}
+/* 实时触控帧：主循环每个 capsense 周期更新，DMA 完成 ISR 作为默认响应装入 TX FIFO（流水线）。 */
 static volatile uint8_t touch_frame[SENSOR_FRAME_SIZE];
 /* APPLY 指令置位，主循环执行重校准（不能在 ISR 里做耗时重扫描）。 */
 static volatile bool apply_pending = false;
@@ -222,8 +346,12 @@ static cy_stc_capsense_common_config_t g_common_cfg_ram;
  * 有值即说明"设备实际配置 != 用户/生成配置给的值", 上位机必须据此告警, 不许静默不同步。 */
 static uint8_t g_boot_override = 0u;
 
-static void spi_slave_task(void);
-static void spi_isr(void);
+static void spi_slave_task(uint8_t rx_index);
+static void spi_dma_isr(void);
+static void spi_cs_isr(void);
+static void spi_dma_init(void);
+static void spi_dma_arm_tx(void);
+static void spi_snapshot_latch_task(void);
 
 static void capsense_isr(void)
 {
@@ -358,10 +486,19 @@ static void initialize_common_cfg_shadow(void)
         g_common_cfg_ram.csdRawTarget = 85u;
         g_boot_override |= 0x02u;
     }
-    /* ★不再强制改写 csdInactiveSnsConnection★: GND 会让 35 个非激活电极接地, 每通道多出约 4.3ms
-     * 固定硬件建立开销(实测 172.5µs → 4386µs/通道, 扫描率 169Hz → 6~7Hz), 但它同时降低抖动与
-     * 近场效应。该取舍归用户, 固件不得静默替用户决定 —— 原先在此把 GND 改成 High-Z, 导致用户选的
-     * GND 每次重启无声失效, 且 UI 无从知情。真值一律由上位机回读 GLOBAL_GET 呈现。 */
+    /* ★出厂默认(ROM)的 GND 在本 36 通道面板上不可用, 故只改"默认", 不改"用户选择"★
+     * GND 让 35 个非激活电极接地, 每通道多约 4.3ms 固定建立开销(实测 172.5µs → 4386µs/通道),
+     * 叠加 MFS 三频后实测整轮扫描约 833ms(1.2Hz), UI 上表现为"实测探测周期 1000ms / 期望 5.8ms,
+     * 倍率 ×172"且 raw 全通道同值不抖 —— 这就是采样异常的直接成因。
+     * ★与之前"不得静默替用户决定"的结论并不矛盾★: 那条针对的是【用户已选 GND】被启动改写;
+     * 而这里改的是【生成配置的出厂默认】—— store 为空时用户根本还没做过选择, 落在不可用的默认上
+     * 只会让"恢复默认"救不回来(空 store → GND → 采样不可信 → 拒绝固化基线 → 永远卡住)。
+     * 用户显式选择仍由 store 的 GLOBAL_SET(INACTIVE_SNS) 在 provision 时覆盖本默认, 优先级更高。
+     * 被改写时置位, 经 GPARAM_BOOT_OVERRIDE 上报, UI 可见, 不是静默行为。 */
+    if (g_common_cfg_ram.csdInactiveSnsConnection == (uint8_t)CY_CAPSENSE_SNS_CONNECTION_GROUND) {
+        g_common_cfg_ram.csdInactiveSnsConnection = (uint8_t)CY_CAPSENSE_SNS_CONNECTION_HIGHZ;
+        g_boot_override |= 0x04u;
+    }
 
     cy_capsense_context.ptrCommonConfig = &g_common_cfg_ram;
 }
@@ -387,8 +524,12 @@ static void cmd_set_global(uint8_t gparam_id, uint32_t value)
         case GPARAM_IDAC_GAIN_INIT: if (value <= 6u)   { g_common_cfg_ram.csdIdacGainInitIndex = (uint8_t)value; _idac_lock_clear(); } break;
         case GPARAM_IDAC_MIN:       if (value <= 127u) { g_common_cfg_ram.csdIdacMin           = (uint8_t)value; } break;
         case GPARAM_RAW_TARGET:     if ((value >= 1u) && (value <= 99u)) { g_common_cfg_ram.csdRawTarget = (uint8_t)value; } break;
-        case GPARAM_MFS_DIV_F1:     g_common_cfg_ram.csdMfsDividerOffsetF1   = (uint8_t)value; break;
-        case GPARAM_MFS_DIV_F2:     g_common_cfg_ram.csdMfsDividerOffsetF2   = (uint8_t)value; break;
+        /* ★补齐缺失的围栏★: 这两项原先无任何检查, 直接 (uint8_t)value 截断 —— 上位机写 300
+         * 会被静默变成 44, 而 SET_GLOBAL 的回显以前送回的是"请求值"而非"存储值", 于是上位机
+         * 完全看不出失败(唯一一条静默限制路径, 其余非法值都由 RP2040 侧 NAK 拦下)。
+         * 现在与其它项同口径: 超范围直接不写, 保持原值, 由回显的存储值让上位机据实回读。 */
+        case GPARAM_MFS_DIV_F1:     if (value <= 255u) { g_common_cfg_ram.csdMfsDividerOffsetF1 = (uint8_t)value; } break;
+        case GPARAM_MFS_DIV_F2:     if (value <= 255u) { g_common_cfg_ram.csdMfsDividerOffsetF2 = (uint8_t)value; } break;
         /* IDAC 感应配置(sourcing/sinking): 运行时可设的充电方向, 影响灵敏度极性/范围。 */
         case GPARAM_IDAC_SENSE_CONFIG: g_common_cfg_ram.csdChargeTransfer = (value != 0u) ? (uint8_t)CY_CAPSENSE_IDAC_SINKING : (uint8_t)CY_CAPSENSE_IDAC_SOURCING; break;
         /* ★由关转开必须立刻做一次真实校准★: 原生 CapSense 的"IDAC 自动校准"语义是
@@ -420,6 +561,12 @@ static uint32_t cmd_get_global(uint8_t gparam_id)
         case GPARAM_IDAC_SENSE_CONFIG: return (g_common_cfg_ram.csdChargeTransfer == (uint8_t)CY_CAPSENSE_IDAC_SINKING) ? 1u : 0u;
         case GPARAM_AUTO_CALIBRATE_EN: return g_auto_calibrate ? 1u : 0u;
         case GPARAM_BOOT_OVERRIDE:  return g_boot_override;
+        /* SPI 链路只读诊断(24 位截断足够: 这些计数在秒级量级内远小于 16M)。 */
+        case GPARAM_DBG_RX_FRAMES:    return spi_dbg.clk_now      & 0xFFFFFFu;
+        case GPARAM_DBG_RX_BAD_MAGIC: return spi_dbg.rx_bad_magic & 0xFFFFFFu;
+        case GPARAM_DBG_CS_RESYNC:    return spi_dbg.cs_resync     & 0xFFFFFFu;
+        case GPARAM_DBG_TX_ARM:       return spi_dbg.clk_set_cnt   & 0xFFFFFFu;
+        case GPARAM_DBG_RX_LEFTOVER:  return spi_dbg.rx_leftover   & 0xFFFFFFu;
         default: return 0u;
     }
 }
@@ -443,6 +590,41 @@ static void normalize_widget_params(void)
     }
 }
 
+/* ★保全逐通道硬件口径, 抵消 Init 的 ROM 重铺★
+ * Cy_CapSense_Init()(内部 Restore)会把整个 widgetContext 从生成配置重铺, 于是运行时的
+ * resolution/snsClk 被打回生成值(widget0-2: res=10/clk=8, widget3-35: res=12/clk=4)。
+ * 后果就是"DIV 异常固化": 每次全局应用后分频又变回 8, 高频下传感器建立不足 → raw 逼近满量程、
+ * 且各通道满量程口径不一致。这里在 Init 前后成对调用即可保全【当前生效值】——
+ * 既保住启动归一的 32, 也保住用户 SET_PARAM / AUTO_TUNE 的逐通道分频(不能像归一那样一律冲成 32)。
+ * 与 _idac_lock_save/restore 是同一模式, 只是管的字段不同。 */
+typedef struct
+{
+    uint16_t resolution;
+    uint16_t sns_clk;
+} widget_hw_t;
+
+static widget_hw_t g_widget_hw[SENSOR_CHANNEL_COUNT];
+
+static inline void _widget_hw_save(void)
+{
+    uint32_t w;
+    for (w = 0u; w < SENSOR_CHANNEL_COUNT; w++)
+    {
+        g_widget_hw[w].resolution = cy_capsense_tuner.widgetContext[w].resolution;
+        g_widget_hw[w].sns_clk    = cy_capsense_tuner.widgetContext[w].snsClk;
+    }
+}
+
+static inline void _widget_hw_restore(void)
+{
+    uint32_t w;
+    for (w = 0u; w < SENSOR_CHANNEL_COUNT; w++)
+    {
+        cy_capsense_tuner.widgetContext[w].resolution = g_widget_hw[w].resolution;
+        cy_capsense_tuner.widgetContext[w].snsClk     = g_widget_hw[w].sns_clk;
+    }
+}
+
 static void initialize_capsense(void)
 {
     cy_stc_sysint_t capsense_interrupt_config =
@@ -458,6 +640,9 @@ static void initialize_capsense(void)
         NVIC_EnableIRQ(capsense_interrupt_config.intrSrc);
         normalize_widget_params();   /* 首次校准(Enable)前把全部通道分辨率/时钟归一, 消除口径不一致 */
         Cy_CapSense_Enable(&cy_capsense_context);
+        /* 归一 + Enable 之后立刻取样: 这就是"启动结束时真正生效的分频", 供带外 SWD 判定
+         * 32 是否连启动都没活下来(见 spi_dbg.clk_boot 注释的判据表)。 */
+        spi_dbg.clk_boot = cy_capsense_tuner.widgetContext[0].snsClk;
     }
 }
 
@@ -486,6 +671,7 @@ static void publish_capsense_snapshot(void)
         destination[offset + 6u] = sensor->status;
     }
 
+    spi_dbg.snap_pub++;
     snapshot_generations[next_index] = (uint16_t)(snapshot_generations[current_index] + 1u);
     if (snapshot_generations[next_index] == 0u)
     {
@@ -595,13 +781,13 @@ static void update_touch_frame(void)
 /* 把当前触控帧装入 TX FIFO（作为默认/流水线响应）。 */
 static void spi_load_touch(void)
 {
-    uint8_t frame[SENSOR_FRAME_SIZE];
     uint32_t st = Cy_SysLib_EnterCriticalSection();
-    frame[0] = touch_frame[0]; frame[1] = touch_frame[1]; frame[2] = touch_frame[2];
-    frame[3] = touch_frame[3]; frame[4] = touch_frame[4]; frame[5] = touch_frame[5];
-    frame[6] = touch_frame[6];
+    spi_dma.tx_frame[0] = touch_frame[0]; spi_dma.tx_frame[1] = touch_frame[1];
+    spi_dma.tx_frame[2] = touch_frame[2]; spi_dma.tx_frame[3] = touch_frame[3];
+    spi_dma.tx_frame[4] = touch_frame[4]; spi_dma.tx_frame[5] = touch_frame[5];
+    spi_dma.tx_frame[6] = touch_frame[6];
     Cy_SysLib_ExitCriticalSection(st);
-    Cy_SCB_SPI_WriteArray(scb_0_HW, frame, SENSOR_FRAME_SIZE);
+    spi_dma_arm_tx();
 }
 
 // ---- Phase A：运行时 CSD 参数读写（直写 cy_capsense_tuner.widgetContext RAM）----
@@ -640,7 +826,13 @@ static bool cmd_set_param(uint8_t ch, uint8_t param_id, uint32_t value)
         case PARAM_ON_DEBOUNCE:  wc->onDebounce = (uint8_t)value;  break;
         case PARAM_LOW_BSLN_RST: wc->lowBslnRst = (uint16_t)value; break;
         case PARAM_RESOLUTION:    wc->resolution   = (uint16_t)value; break;
-        case PARAM_SNS_CLK_DIV:   wc->snsClk       = (uint16_t)value; break;
+        case PARAM_SNS_CLK_DIV:
+            wc->snsClk = (uint16_t)value;
+            /* 记录"谁把分频改了": 只有经 SET_PARAM 这条路才会累加。若 clk_now 变成 8 而本计数为 0,
+             * 说明是中间件内部路径(Init/Initialize/Enable)改的, 不是上位机/store 推的。 */
+            spi_dbg.clk_set_cnt++;
+            spi_dbg.clk_set_last = (value & 0xFFFFu) | ((uint32_t)ch << 16u);
+            break;
         case PARAM_IDAC_MOD:      wc->idacMod[0]   = (uint8_t)value;  break;
         case PARAM_SNS_CLK_SOURCE:wc->snsClkSource = (uint8_t)value;  break;
         /* 用户显式设增幅 → 锁定该通道, 后续任何校准/Enable 冲回后都会被恢复成此值。 */
@@ -700,14 +892,14 @@ static inline void _recalibrate_dirty_channels(void)
 // 装载指令响应帧（直接填 TX FIFO；ISR 上下文，与 spi_load_touch 同）。
 static void spi_load_cmd_response(uint8_t command, uint8_t b2, uint8_t b3, uint32_t val24)
 {
-    spi_tx_frame[0] = SENSOR_FRAME_MAGIC;
-    spi_tx_frame[1] = command;
-    spi_tx_frame[2] = b2;
-    spi_tx_frame[3] = b3;
-    spi_tx_frame[4] = (uint8_t)(val24 & 0xFFu);
-    spi_tx_frame[5] = (uint8_t)((val24 >> 8u) & 0xFFu);
-    spi_tx_frame[6] = (uint8_t)((val24 >> 16u) & 0xFFu);
-    Cy_SCB_SPI_WriteArray(scb_0_HW, spi_tx_frame, SENSOR_FRAME_SIZE);
+    spi_dma.tx_frame[0] = SENSOR_FRAME_MAGIC;
+    spi_dma.tx_frame[1] = command;
+    spi_dma.tx_frame[2] = b2;
+    spi_dma.tx_frame[3] = b3;
+    spi_dma.tx_frame[4] = (uint8_t)(val24 & 0xFFu);
+    spi_dma.tx_frame[5] = (uint8_t)((val24 >> 8u) & 0xFFu);
+    spi_dma.tx_frame[6] = (uint8_t)((val24 >> 16u) & 0xFFu);
+    spi_dma_arm_tx();
 }
 
 static uint16_t cmd_get_raw(uint8_t ch)
@@ -720,28 +912,28 @@ static uint16_t cmd_get_raw(uint8_t ch)
 static void spi_load_stats(void)
 {
     uint32_t sc = scan_count;   // CM0+ 上 32 位对齐读原子
-    spi_tx_frame[0] = SENSOR_FRAME_MAGIC;
-    spi_tx_frame[1] = SENSOR_CMD_GET_STATS;
-    spi_tx_frame[2] = g_op_busy;   // 处理中标志(1=主循环正在做重操作), 供 RP2040 轮询至真实完成
-    spi_tx_frame[3] = (uint8_t)(sc & 0xFFu);
-    spi_tx_frame[4] = (uint8_t)((sc >> 8u) & 0xFFu);
-    spi_tx_frame[5] = (uint8_t)((sc >> 16u) & 0xFFu);
-    spi_tx_frame[6] = (uint8_t)((sc >> 24u) & 0xFFu);
-    Cy_SCB_SPI_WriteArray(scb_0_HW, spi_tx_frame, SENSOR_FRAME_SIZE);
+    spi_dma.tx_frame[0] = SENSOR_FRAME_MAGIC;
+    spi_dma.tx_frame[1] = SENSOR_CMD_GET_STATS;
+    spi_dma.tx_frame[2] = g_op_busy;   // 处理中标志(1=主循环正在做重操作), 供 RP2040 轮询至真实完成
+    spi_dma.tx_frame[3] = (uint8_t)(sc & 0xFFu);
+    spi_dma.tx_frame[4] = (uint8_t)((sc >> 8u) & 0xFFu);
+    spi_dma.tx_frame[5] = (uint8_t)((sc >> 16u) & 0xFFu);
+    spi_dma.tx_frame[6] = (uint8_t)((sc >> 24u) & 0xFFu);
+    spi_dma_arm_tx();
 }
 
 static void spi_load_frame(uint8_t command, uint8_t sequence, const uint8_t payload[SENSOR_FRAME_PAYLOAD_SIZE])
 {
     uint32_t index;
 
-    spi_tx_frame[0] = SENSOR_FRAME_MAGIC;
-    spi_tx_frame[1] = command;
-    spi_tx_frame[2] = sequence;
+    spi_dma.tx_frame[0] = SENSOR_FRAME_MAGIC;
+    spi_dma.tx_frame[1] = command;
+    spi_dma.tx_frame[2] = sequence;
     for (index = 0u; index < SENSOR_FRAME_PAYLOAD_SIZE; index++)
     {
-        spi_tx_frame[3u + index] = (payload != NULL) ? payload[index] : 0u;
+        spi_dma.tx_frame[3u + index] = (payload != NULL) ? payload[index] : 0u;
     }
-    Cy_SCB_SPI_WriteArray(scb_0_HW, spi_tx_frame, SENSOR_FRAME_SIZE);
+    spi_dma_arm_tx();
 }
 
 static void spi_load_pong(uint8_t sequence)
@@ -757,24 +949,45 @@ static void spi_load_pong(uint8_t sequence)
 static void spi_latch_snapshot(uint8_t sequence)
 {
     uint8_t payload[SENSOR_FRAME_PAYLOAD_SIZE];
+    uint32_t interrupt_state = Cy_SysLib_EnterCriticalSection();
     uint8_t source_index = published_snapshot_index;
 
+    /* INFO must identify the published generation immediately; copying its 252-byte
+     * payload is deliberately deferred to the main loop so the DMA ISR stays bounded. */
     transfer_valid = published_snapshot_valid;
     transfer_generation = snapshot_generations[source_index];
-    if (transfer_valid)
-    {
-        memcpy(transfer_snapshot, snapshot_buffers[source_index], SENSOR_SNAPSHOT_SIZE);
-    }
-    else
-    {
-        memset(transfer_snapshot, 0, SENSOR_SNAPSHOT_SIZE);
-    }
+    spi_dma.snapshot_source_index = source_index;
+    spi_dma.snapshot_sequence = sequence;
+    spi_dma.snapshot_copy_pending = true;
+    Cy_SysLib_ExitCriticalSection(interrupt_state);
 
     payload[0] = (uint8_t)(transfer_generation & 0xFFu);
     payload[1] = (uint8_t)((transfer_generation >> 8u) & 0xFFu);
     payload[2] = transfer_valid ? 1u : 0u;
     payload[3] = SENSOR_CHANNEL_COUNT;
     spi_load_frame(SENSOR_CMD_SNAPSHOT_INFO, sequence, payload);
+}
+
+/* Complete the immutable snapshot latch outside the DMA ISR. Global IRQ masking keeps a
+ * new BEGIN from replacing transfer metadata while its corresponding buffer is copied. */
+static void spi_snapshot_latch_task(void)
+{
+    uint32_t interrupt_state = Cy_SysLib_EnterCriticalSection();
+
+    if (spi_dma.snapshot_copy_pending)
+    {
+        uint8_t source_index = spi_dma.snapshot_source_index;
+        if (transfer_valid)
+        {
+            memcpy(transfer_snapshot, snapshot_buffers[source_index], SENSOR_SNAPSHOT_SIZE);
+        }
+        else
+        {
+            memset(transfer_snapshot, 0, SENSOR_SNAPSHOT_SIZE);
+        }
+        spi_dma.snapshot_copy_pending = false;
+    }
+    Cy_SysLib_ExitCriticalSection(interrupt_state);
 }
 
 static void spi_load_snapshot_page(uint8_t sequence, uint8_t page)
@@ -796,14 +1009,14 @@ static void spi_load_snapshot_page(uint8_t sequence, uint8_t page)
 /* ---- JIT 算法引擎 SPI 命令处理（ISR 上下文，仅做快速缓冲写入/标志置位）---- */
 static void spi_load_algo_response(uint8_t command, uint8_t b2, uint8_t b3, uint16_t len)
 {
-    spi_tx_frame[0] = SENSOR_FRAME_MAGIC;
-    spi_tx_frame[1] = command;
-    spi_tx_frame[2] = b2;
-    spi_tx_frame[3] = b3;
-    spi_tx_frame[4] = (uint8_t)(len & 0xFFu);
-    spi_tx_frame[5] = (uint8_t)((len >> 8u) & 0xFFu);
-    spi_tx_frame[6] = 0u;
-    Cy_SCB_SPI_WriteArray(scb_0_HW, spi_tx_frame, SENSOR_FRAME_SIZE);
+    spi_dma.tx_frame[0] = SENSOR_FRAME_MAGIC;
+    spi_dma.tx_frame[1] = command;
+    spi_dma.tx_frame[2] = b2;
+    spi_dma.tx_frame[3] = b3;
+    spi_dma.tx_frame[4] = (uint8_t)(len & 0xFFu);
+    spi_dma.tx_frame[5] = (uint8_t)((len >> 8u) & 0xFFu);
+    spi_dma.tx_frame[6] = 0u;
+    spi_dma_arm_tx();
 }
 
 static void cmd_algo_begin(uint8_t len_lo, uint8_t len_hi)
@@ -885,53 +1098,205 @@ static void cmd_algo_get_cfg(uint8_t idx)
     spi_load_algo_response(ALGO_GET_CFG, idx, 0u, val);
 }
 
-static void spi_slave_init(void)
+/* 装载本次响应帧到 TX DMA 并重挂通道（照搬官方 CE 的 TX 重挂序: 设源 → 设长 → 指定当前描述符
+ * → 置有效 → 使能通道）。TX 描述符配 cpltState=true(完成即自失效), 故每帧必须显式重挂一次;
+ * 这同时消除了"描述符完成后仍有效 → TX FIFO 被主机抽空使电平请求重新有效 → 同一帧被反复重发"
+ * 的错位隐患。 */
+static void spi_dma_arm_tx(void)
 {
-    static const cy_stc_sysint_t spi_int_cfg =
+    /* 先清掉上一次响应在 FIFO 里的残留(流水线换帧), 再重挂描述符。 */
+    Cy_SCB_SPI_ClearTxFifo(scb_0_HW);
+    Cy_DMAC_Descriptor_SetSrcAddress(DMAC, cpuss_0_dmac_0_chan_1_CHANNEL,
+                                     CY_DMAC_DESCRIPTOR_PING, spi_dma.tx_frame);
+    Cy_DMAC_Descriptor_SetDataCount(DMAC, cpuss_0_dmac_0_chan_1_CHANNEL,
+                                    CY_DMAC_DESCRIPTOR_PING, SENSOR_FRAME_SIZE);
+    __DMB();
+    Cy_DMAC_Channel_SetCurrentDescriptor(DMAC, cpuss_0_dmac_0_chan_1_CHANNEL,
+                                         CY_DMAC_DESCRIPTOR_PING);
+    Cy_DMAC_Descriptor_SetState(DMAC, cpuss_0_dmac_0_chan_1_CHANNEL,
+                                CY_DMAC_DESCRIPTOR_PING, true);
+    Cy_DMAC_Channel_Enable(DMAC, cpuss_0_dmac_0_chan_1_CHANNEL);
+}
+
+static void spi_dma_init(void)
+{
+    static const cy_stc_sysint_t dma_int_cfg =
     {
-        .intrSrc = scb_0_IRQ,
-        .intrPriority = 2u,   /* 高于 capsense(3)，保证 SPI 及时响应，不被扫描阻塞 */
+        .intrSrc = cpuss_interrupt_dma_IRQn,
+        .intrPriority = 2u,
+    };
+    const cy_stc_dmac_channel_config_t rx_channel_config =
+    {
+        .priority = 3u, .enable = false, .descriptor = CY_DMAC_DESCRIPTOR_PING,
+    };
+    const cy_stc_dmac_channel_config_t tx_channel_config =
+    {
+        .priority = 3u, .enable = false, .descriptor = CY_DMAC_DESCRIPTOR_PING,
+    };
+    const cy_stc_dmac_descriptor_config_t rx_descriptor_config =
+    {
+        .srcAddress = &scb_0_HW->RX_FIFO_RD, .dstAddress = spi_dma.rx_frame[0],
+        .dataCount = SENSOR_FRAME_SIZE, .dataSize = CY_DMAC_BYTE,
+        /* ★外设 FIFO 侧必须按字(32bit)访问★: RX_FIFO_RD 是外设寄存器, 只支持字访问;
+         * 用 TRANSFER_SIZE_DATA(=dataSize=BYTE)去读它, DMAC 搬不出数据(实测 SPI 从机完全
+         * 不应答: link_valid=false、generation=0)。故源(FIFO)= WORD、目的(内存)= DATA(字节)。
+         * 这也是 dataSize=BYTE 与 transferSize 分开两个字段的用途所在。 */
+        .srcTransferSize = CY_DMAC_TRANSFER_SIZE_WORD, .srcAddrIncrement = false,
+        .dstTransferSize = CY_DMAC_TRANSFER_SIZE_DATA, .dstAddrIncrement = true,
+        /* ★16CYC★: SCB 的 tr_rx_req/tr_tx_req 是 FIFO **电平**请求(非脉冲)。
+         * cy_scb_spi.h 的 "DMA Trigger" 一节明确要求 DMA 描述符配置为 16 Clk_Slow 周期后重触发,
+         * 以正确处理 SCB 电平请求的置起/撤销。触发连线本身由 cycfg_routing.c 的
+         * Cy_TrigMux_Connect(TRIG0_IN_SCB0_TR_RX_REQ → TRIG0_OUT_CPUSS_DMAC_TR_IN0) 已生成。
+         * ★retrigger/cpltState/flipping 一律照搬官方 CE(mtb-example-psoc4-uart-transmit-receive-dma
+         * 的 RxDma_ping/pong_config): 4CYC 重触发、完成【不】失效、flipping=true 交替 PING/PONG。
+         * cpltState=false + 双描述符 = 任何时刻都有有效描述符接住电平请求, 软件永不需要在 ISR 里
+         * 重置正在服务的描述符(那正是此前 RX 只搬一帧就死的原因)。 */
+        .retrigger = CY_DMAC_RETRIG_4CYC, .cpltState = false, .interrupt = true,
+        .preemptable = true, .flipping = true, .triggerType = CY_DMAC_SINGLE_ELEMENT,
+    };
+    const cy_stc_dmac_descriptor_config_t tx_descriptor_config =
+    {
+        .srcAddress = spi_dma.tx_frame, .dstAddress = &scb_0_HW->TX_FIFO_WR,
+        .dataCount = SENSOR_FRAME_SIZE, .dataSize = CY_DMAC_BYTE,
+        /* 同 RX 反向: 源(内存)按字节, 目的(TX_FIFO_WR 外设寄存器)必须按字访问。 */
+        .srcTransferSize = CY_DMAC_TRANSFER_SIZE_DATA, .srcAddrIncrement = true,
+        .dstTransferSize = CY_DMAC_TRANSFER_SIZE_WORD, .dstAddrIncrement = false,
+        /* ★照搬官方 CE 的 TxDma_ping_config★: 4CYC 重触发 + cpltState=true(完成即自失效) +
+         * flipping=false。自失效是关键: 7 字节装完后描述符立即无效, 主机把 FIFO 抽空使 TX 电平
+         * 请求重新有效时不会再次搬运同一帧(否则响应会被重复写入而错位)。每帧由 spi_dma_arm_tx
+         * 显式重挂。 */
+        .retrigger = CY_DMAC_RETRIG_4CYC, .cpltState = true, .interrupt = false,
+        .preemptable = true, .flipping = false, .triggerType = CY_DMAC_SINGLE_ELEMENT,
     };
 
+    /* RX 用 PING/PONG 两个描述符交替落帧: 结构相同, 只有目的缓冲不同。 */
+    (void)Cy_DMAC_Descriptor_Init(DMAC, cpuss_0_dmac_0_chan_0_CHANNEL,
+                                  CY_DMAC_DESCRIPTOR_PING, &rx_descriptor_config);
+    (void)Cy_DMAC_Descriptor_Init(DMAC, cpuss_0_dmac_0_chan_0_CHANNEL,
+                                  CY_DMAC_DESCRIPTOR_PONG, &rx_descriptor_config);
+    Cy_DMAC_Descriptor_SetDstAddress(DMAC, cpuss_0_dmac_0_chan_0_CHANNEL,
+                                     CY_DMAC_DESCRIPTOR_PONG, spi_dma.rx_frame[1]);
+    (void)Cy_DMAC_Descriptor_Init(DMAC, cpuss_0_dmac_0_chan_1_CHANNEL,
+                                  CY_DMAC_DESCRIPTOR_PING, &tx_descriptor_config);
+    (void)Cy_DMAC_Channel_Init(DMAC, cpuss_0_dmac_0_chan_0_CHANNEL, &rx_channel_config);
+    (void)Cy_DMAC_Channel_Init(DMAC, cpuss_0_dmac_0_chan_1_CHANNEL, &tx_channel_config);
+    /* 两个 RX 描述符同时置有效(官方范式), 并把 PING 设为当前描述符。 */
+    Cy_DMAC_Descriptor_SetState(DMAC, cpuss_0_dmac_0_chan_0_CHANNEL,
+                                CY_DMAC_DESCRIPTOR_PING, true);
+    Cy_DMAC_Descriptor_SetState(DMAC, cpuss_0_dmac_0_chan_0_CHANNEL,
+                                CY_DMAC_DESCRIPTOR_PONG, true);
+    Cy_DMAC_Channel_SetCurrentDescriptor(DMAC, cpuss_0_dmac_0_chan_0_CHANNEL,
+                                         CY_DMAC_DESCRIPTOR_PING);
+    Cy_DMAC_Descriptor_SetState(DMAC, cpuss_0_dmac_0_chan_1_CHANNEL,
+                                CY_DMAC_DESCRIPTOR_PING, false);
+    Cy_DMAC_Channel_SetCurrentDescriptor(DMAC, cpuss_0_dmac_0_chan_1_CHANNEL,
+                                         CY_DMAC_DESCRIPTOR_PING);
+    Cy_DMAC_ClearInterrupt(DMAC, CY_DMAC_INTR_CHAN_0 | CY_DMAC_INTR_CHAN_1);
+    Cy_DMAC_SetInterruptMask(DMAC, CY_DMAC_INTR_CHAN_0);
+    Cy_SysInt_Init(&dma_int_cfg, spi_dma_isr);
+    NVIC_ClearPendingIRQ(cpuss_interrupt_dma_IRQn);
+    NVIC_EnableIRQ(cpuss_interrupt_dma_IRQn);
+    Cy_SCB_SetRxFifoLevel(scb_0_HW, 0u);
+    Cy_SCB_SetTxFifoLevel(scb_0_HW, SENSOR_FRAME_SIZE);
+
+    /* CS 上升沿(取消选择)中断: 帧边界重同步。优先级必须【低于】DMA 完成中断(2), 否则 CS 沿可能
+     * 抢在 RX 完成 ISR 之前把刚收满的帧判成半帧丢掉。 */
+    {
+        static const cy_stc_sysint_t cs_int_cfg =
+        {
+            .intrSrc = SPI_CS_IRQ,
+            .intrPriority = 3u,
+        };
+        /* cat2 无逐引脚中断屏蔽 API: 配置边沿(INTR_CFG.EDGE_SEL)即使能该引脚中断。 */
+        Cy_GPIO_SetInterruptEdge(SPI_CS_PORT, SPI_CS_NUM, CY_GPIO_INTR_RISING);
+        Cy_GPIO_ClearInterrupt(SPI_CS_PORT, SPI_CS_NUM);
+        Cy_SysInt_Init(&cs_int_cfg, spi_cs_isr);
+        NVIC_ClearPendingIRQ(SPI_CS_IRQ);
+        NVIC_EnableIRQ(SPI_CS_IRQ);
+    }
+
+    Cy_DMAC_Enable(DMAC);
+    Cy_DMAC_Channel_Enable(DMAC, cpuss_0_dmac_0_chan_0_CHANNEL);
+    /* TX 通道不在此使能: 描述符尚未装载(SetState false), 由首次 spi_load_touch → spi_dma_arm_tx
+     * 装帧后使能(与官方 CE 一致: configure_tx_dma 只配不使能)。 */
+}
+
+static void spi_slave_init(void)
+{
     Cy_SCB_SPI_Init(scb_0_HW, &scb_0_config, &spi_context);
     Cy_SCB_SPI_Enable(scb_0_HW);
     Cy_SCB_SPI_ClearRxFifo(scb_0_HW);
     Cy_SCB_SPI_ClearTxFifo(scb_0_HW);
     update_touch_frame();
-    spi_load_touch();   /* 默认响应=实时触控帧（流水线快路） */
-
-    /* 中断驱动：RX FIFO 达到整帧(7字节)即中断，ISR 立即装载响应。
-       RX LEVEL 中断在 FIFO 计数 > level 时触发，故 level=帧长-1=6 → 满 7 字节触发。 */
-    Cy_SysInt_Init(&spi_int_cfg, spi_isr);
-    NVIC_ClearPendingIRQ(scb_0_IRQ);
-    NVIC_EnableIRQ(scb_0_IRQ);
-    Cy_SCB_SetRxFifoLevel(scb_0_HW, SENSOR_FRAME_SIZE - 1u);
-    Cy_SCB_SetRxInterruptMask(scb_0_HW, CY_SCB_RX_INTR_LEVEL);
+    spi_dma_init();
+    spi_load_touch();   /* 默认响应=实时触控帧（DMA 流水线快路） */
 }
 
-static void spi_isr(void)
+static void spi_dma_isr(void)
 {
-    if (Cy_SCB_SPI_GetNumInRxFifo(scb_0_HW) >= SENSOR_FRAME_SIZE)
+    uint32_t interrupt = Cy_DMAC_GetInterruptStatusMasked(DMAC);
+
+    if ((interrupt & CY_DMAC_INTR_CHAN_0) != 0u)
     {
-        spi_slave_task();
+        /* flipping=true: 完成时通道的当前描述符已翻到【下一个】, 故刚落帧的是它的反面
+         * (照搬官方 CE 的 Isr_DMA 判定)。两个描述符都保持有效, 此处【绝不】调 SetState —— 那会
+         * 清掉正在服务中的描述符的传输索引。 */
+        cy_en_dmac_descriptor_t current =
+            Cy_DMAC_Channel_GetCurrentDescriptor(DMAC, cpuss_0_dmac_0_chan_0_CHANNEL);
+        uint8_t completed = (current == CY_DMAC_DESCRIPTOR_PING) ? 1u : 0u;
+
+        Cy_DMAC_ClearInterrupt(DMAC, CY_DMAC_INTR_CHAN_0);
+        spi_dma.frame_received = true;
+        /* (rx_frames 计数已退役: 链路已修好, 存活由 scan_count_m/ms_tick_m 监视) */
+        spi_slave_task(completed);
     }
-    Cy_SCB_ClearRxInterrupt(scb_0_HW, CY_SCB_RX_INTR_LEVEL);
 }
 
-static void spi_slave_task(void)
+/* ★CS 抬起帧重同步★: SCB 从机没有"被取消选择"的事件(只有 SLAVE_ERR=错时机取消), 而 RX DMA 是
+ * 按字节流连续搬运的 —— 一旦某次事务的字节数不等于 7(PSoC 复位期间主机仍在发、RP2040 侧
+ * _recover() 清 FIFO、任何一次时序抖动), 7 字节帧边界就会永久错位, 之后每帧 magic 都不在 rx[0],
+ * 表现为 RP2040 恒读回非法帧。故用 CS(P1.3) 上升沿(取消选择)做唯一权威的帧边界: 事务结束时若
+ * 描述符里留着半帧(或 RX FIFO 有残字节), 就丢弃这些残余并把描述符索引复位, 使下一次事务必然从
+ * 帧首开始。完整帧(索引已归零)不受影响, 零副作用。 */
+static void spi_cs_isr(void)
 {
-    uint8_t rx[SENSOR_FRAME_SIZE];
+    const uint32_t intr = Cy_GPIO_GetInterruptStatus(SPI_CS_PORT, SPI_CS_NUM);
 
-    if (Cy_SCB_SPI_GetNumInRxFifo(scb_0_HW) < SENSOR_FRAME_SIZE)
+    Cy_GPIO_ClearInterrupt(SPI_CS_PORT, SPI_CS_NUM);
+    if (intr == 0u) { return; }
+
+    /* RX FIFO 残字节: 上一事务未凑满一个 DMA 元素窗口的剩余, 必须丢掉。 */
+    if (Cy_SCB_GetNumInRxFifo(scb_0_HW) != 0u)
     {
-        return;
+        spi_dbg.rx_leftover++;
+        Cy_SCB_SPI_ClearRxFifo(scb_0_HW);
     }
 
-    Cy_SCB_SPI_ReadArray(scb_0_HW, rx, SENSOR_FRAME_SIZE);
-    Cy_SCB_SPI_ClearTxFifo(scb_0_HW);
+    /* 描述符里留着半帧 ⇒ 帧边界已错位, 复位两个描述符的传输索引重新对齐帧首。
+     * SetState(true) 会同时清 CURR_DATA_NR 与 RESPONSE(见 cy_dmac.h), 正是所需语义。 */
+    if ((Cy_DMAC_Descriptor_GetCurrentIndex(DMAC, cpuss_0_dmac_0_chan_0_CHANNEL,
+                                            CY_DMAC_DESCRIPTOR_PING) != 0u) ||
+        (Cy_DMAC_Descriptor_GetCurrentIndex(DMAC, cpuss_0_dmac_0_chan_0_CHANNEL,
+                                            CY_DMAC_DESCRIPTOR_PONG) != 0u))
+    {
+        spi_dbg.cs_resync++;
+        Cy_DMAC_Descriptor_SetState(DMAC, cpuss_0_dmac_0_chan_0_CHANNEL,
+                                    CY_DMAC_DESCRIPTOR_PING, true);
+        Cy_DMAC_Descriptor_SetState(DMAC, cpuss_0_dmac_0_chan_0_CHANNEL,
+                                    CY_DMAC_DESCRIPTOR_PONG, true);
+        Cy_DMAC_Channel_SetCurrentDescriptor(DMAC, cpuss_0_dmac_0_chan_0_CHANNEL,
+                                             CY_DMAC_DESCRIPTOR_PING);
+        Cy_DMAC_Channel_Enable(DMAC, cpuss_0_dmac_0_chan_0_CHANNEL);
+    }
+}
+
+static void spi_slave_task(uint8_t rx_index)
+{
+    const volatile uint8_t *rx = spi_dma.rx_frame[rx_index & 1u];
 
     if (rx[0] != SENSOR_FRAME_MAGIC)
     {
+        spi_dbg.rx_bad_magic++;
         spi_load_touch();   /* 默认回落触控帧 */
         return;
     }
@@ -957,6 +1322,7 @@ static void spi_slave_task(void)
             break;
 
         case SENSOR_CMD_SET_PARAM: {
+            spi_dbg.setparam_cmd++;
             uint32_t val = (uint32_t)rx[4] | ((uint32_t)rx[5] << 8u) | ((uint32_t)rx[6] << 16u);
             (void)cmd_set_param(rx[2], rx[3], val);
             // 回显【实际当前值】(非法被拒时=旧值), 供上位机据实回读, 天然拦截非法调参。
@@ -979,7 +1345,10 @@ static void spi_slave_task(void)
         case SENSOR_CMD_SET_GLOBAL: {
             uint32_t val = (uint32_t)rx[4] | ((uint32_t)rx[5] << 8u) | ((uint32_t)rx[6] << 16u);
             cmd_set_global(rx[2], val);
-            spi_load_cmd_response(SENSOR_CMD_SET_GLOBAL, rx[2], 0u, val);
+            /* ★回显存储值, 不回显请求值★: cmd_set_global 对非法值是"不写、保持原值", 若回显请求值,
+             * 上位机拿到的就是自己刚发的数, 无法分辨"写进去了"还是"被拒了"(实测 MFS 被静默截断时
+             * 界面显示正常)。回读存储值后, 上位机的回读对账就能自己发现不一致。 */
+            spi_load_cmd_response(SENSOR_CMD_SET_GLOBAL, rx[2], 0u, cmd_get_global(rx[2]));
             break;
         }
 
@@ -1009,6 +1378,7 @@ static void spi_slave_task(void)
 
         case SENSOR_CMD_APPLY:
             // ★不能在 ISR 里做重校准(耗时数ms/需扫描完成)★：仅置标志，主循环执行。
+    
             apply_pending = true;
             g_op_busy = 1u;   // 处理中锁定
             spi_load_cmd_response(SENSOR_CMD_APPLY, 0u, 0u, 0u);
@@ -1195,6 +1565,8 @@ int main(void)
     memset(snapshot_buffers, 0, sizeof(snapshot_buffers));
     memset(snapshot_generations, 0, sizeof(snapshot_generations));
     memset(transfer_snapshot, 0, sizeof(transfer_snapshot));
+    memset(&spi_dma, 0, sizeof(spi_dma));
+    _spi_dbg_clear();
     for (uint32_t channel = 0u; channel < SENSOR_CHANNEL_COUNT; channel++)
     {
         cp_value[channel] = 0xFFFFFFu;
@@ -1240,10 +1612,16 @@ int main(void)
 
     for (;;)
     {
-        /* SPI 从机改为中断驱动（spi_isr），主循环只做 capsense 扫描/发布快照。
-           SPI 响应不再被 ProcessAllWidgets 的耗时阻塞。 */
+        spi_dbg.stage = MLOOP_STAGE_LATCH;
+        /* Snapshot payload copies are intentionally outside the DMA completion ISR. */
+        spi_snapshot_latch_task();
+        spi_dbg.stage = MLOOP_STAGE_WAIT_SCAN;
+        spi_dbg.ms_tick_m = g_ms_tick;   /* 无条件刷新: 卡在等扫描时也能看出时间在走 */
+        spi_dbg.clk_now = cy_capsense_tuner.widgetContext[0].snsClk;   /* 当前生效分频 */
+        /* SPI frames are moved by DMAC; the completion ISR only prepares the next response. */
         if (CY_CAPSENSE_NOT_BUSY == Cy_CapSense_IsBusy(&cy_capsense_context))
         {
+            spi_dbg.stage = MLOOP_STAGE_PROCESS;
             if (scan_mode == SCAN_MODE_AUTO)
             {
                 /* 自动校准：运行中间件标准完整处理链。 */
@@ -1262,11 +1640,14 @@ int main(void)
                     (void)Cy_CapSense_ProcessWidgetExt(w, manual_mask, &cy_capsense_context);
                 }
             }
+            spi_dbg.stage = MLOOP_STAGE_TOUCH;
             update_touch_frame();       /* 刷新实时触控帧（快路数据源） */
-            /* 白 LED: 启动 800ms 内常亮(可见启动指示)；之后只有算法显式写 out_led 才亮。 */
+            /* 白 LED: 启动 800ms 内常亮(可见启动指示)；之后只有算法显式写 out_led 才亮。
+             * (DMA 攻坚期这里曾并入 spi_dma.frame_received 作带外探针, 链路已修复, 探针已回退。) */
             Cy_GPIO_Write(STATUS_LED_PORT, STATUS_LED_NUM,
                           (g_any_active || (g_ms_tick < led_boot_until_ms))
                               ? STATUS_LED_ON_STATE : STATUS_LED_OFF_STATE);
+            spi_dbg.stage = MLOOP_STAGE_PUBLISH;
             publish_capsense_snapshot();/* 刷新完整 raw/baseline/diff（调参慢路数据源） */
 
             /* MEASURE_CP：逐电极 BIST 寄生电容测量(fF)。测量会重配 CSD HW，完成后恢复扫描配置。 */
@@ -1283,6 +1664,7 @@ int main(void)
 
                 if (run_measure)
                 {
+                    spi_dbg.stage = MLOOP_STAGE_MEASURE_CP;
                     /* 先统一标为失败；BIST 可用的 Cp 结果随后覆盖。active 期间 SPI GET_CP 始终返回 0。 */
                     for (uint32_t w = 0u; w < SENSOR_CHANNEL_COUNT; w++)
                     {
@@ -1321,6 +1703,7 @@ int main(void)
              * 校验失败拒绝、保留旧算法(algo_valid 不变)，符合设计文档 §3 ALGO_END 语义。 */
             if (algo_commit_pending)
             {
+                spi_dbg.stage = MLOOP_STAGE_ALGO_COMMIT;
                 uint16_t len;
                 uint16_t crc_expect;
                 uint16_t crc_calc;
@@ -1343,13 +1726,18 @@ int main(void)
              * 的内部预计算。轻量 APPLY 不重算 → 会坏扫描,故全局改动必须走此完整路径。 */
             if (global_apply_pending)
             {
+                spi_dbg.stage = MLOOP_STAGE_GLOBAL_APPLY;
                 global_apply_pending = false;
                 /* 全局配置变更应用: Init 从 ptrCommonConfig(RAM 影子)重算内部预计算
                  * (含 csdInactiveSnsDm/HSIOM), Enable 校准+基线+首扫。
                  * ★不再调 Cy_CapSense_DeInit★: 实测运行时 DeInit→Init→Enable 会把扫描速率从 ~180Hz
                  * 掉到 ~15Hz(疑似 DeInit 未复位时钟分频, 再 Init 残留慢时钟); 仅 Init→Enable 同样重算
                  * 全局预计算且保持满速。 */
+                /* Init 会从 ROM 生成配置重铺 widgetContext, 打掉当前生效的 resolution/snsClk
+                 * (启动归一的 32, 或用户 SET_PARAM / AUTO_TUNE 的逐通道值) → 见 _widget_hw_save 注释。 */
+                _widget_hw_save();
                 (void)Cy_CapSense_Init(&cy_capsense_context);
+                _widget_hw_restore();
                 /* Init 会按 ptrCommonConfig 重铺 widgetContext 增益档 → 先把用户锁定值写回,
                  * 再由紧随其后的 Initialize 一并下到硬件(不额外触发校准)。 */
                 (void)_idac_lock_restore();
@@ -1365,10 +1753,14 @@ int main(void)
             /* APPLY 指令：在主循环(非 ISR)重新初始化扫描硬件使硬件参数(分辨率/时钟/IDAC)生效。 */
             if (apply_pending)
             {
+                const uint32_t apply_t0 = g_ms_tick;
+                spi_dbg.stage = MLOOP_STAGE_APPLY;
+
                 apply_pending = false;
                 if (scan_mode == SCAN_MODE_AUTO && g_auto_calibrate)
                 {
                     /* 自动校准开：重新启用 CapSense(含 IDAC 自动校准)，后续继续标准完整处理。 */
+                    spi_dbg.stage = MLOOP_STAGE_APPLY_ENABLE;
                     (void)Cy_CapSense_Enable(&cy_capsense_context);
                     idac_dirty_mask = 0u;
                     _idac_lock_reapply();   /* Enable 的自动校准会把增益档冲回起点档 */
@@ -1379,12 +1771,16 @@ int main(void)
                      * 关闭自动校准表示用户要求固定 IDAC，脏位保留到其重新允许校准。 */
                     if (g_auto_calibrate)
                     {
+                        spi_dbg.stage = MLOOP_STAGE_APPLY_RECAL;
                         _recalibrate_dirty_channels();
                     }
                     /* 从 widgetContext 重配硬件并重置基线，保留手动阈值与手动硬件参数。 */
+                    spi_dbg.stage = MLOOP_STAGE_APPLY_INIT;
                     (void)Cy_CapSense_Initialize(&cy_capsense_context);
+                    spi_dbg.stage = MLOOP_STAGE_APPLY_BASELINE;
                     Cy_CapSense_InitializeAllBaselines(&cy_capsense_context);
                 }
+                (void)apply_t0;
             }
 
             /* CALIBRATE：真正的 IDAC 重校准(把 raw 拉回目标, 修 railed), 再复位基线。
@@ -1392,9 +1788,21 @@ int main(void)
              * 才有效(否则 raw 一直卡满量程 diff=0)。CalibrateAllWidgets 需校准使能。 */
             if (calibrate_pending)
             {
+                spi_dbg.stage = MLOOP_STAGE_CALIBRATE;
                 calibrate_pending = false;
 #if (defined(CY_CAPSENSE_CSD_CALIBRATION_EN) && (CY_CAPSENSE_ENABLE == CY_CAPSENSE_CSD_CALIBRATION_EN))
-                (void)Cy_CapSense_CalibrateAllWidgets(&cy_capsense_context);
+                /* ★逐通道校准, 不用 CalibrateAllWidgets★
+                 * CalibrateAllWidgets 对全部 widget 一律用【全局起点增益档】csdIdacGainInitIndex,
+                 * 而本面板 36 段的 Cp 跨度极大(实测 ch8≈22pF、ch35≈138pF), 各通道的 IDAC 增益档
+                 * 本就不该相同 —— 用户逐通道设过的档位记在 g_idac_lock 里, 被它统一按全局档校准后
+                 * 等于全部作废(高 Cp 通道压不下来仍 railed, 低 Cp 通道又过冲)。
+                 * 故与 _recalibrate_dirty_channels() 同口径: 逐通道调用 _calibrate_widget_locked(),
+                 * 它会在校准该通道时临时把全局起点档替换为该通道自己的锁定档, 校准完还原。
+                 * 未锁定的通道行为不变(仍用全局档)。 */
+                for (uint32_t cal_ch = 0u; cal_ch < SENSOR_CHANNEL_COUNT; cal_ch++)
+                {
+                    (void)_calibrate_widget_locked(cal_ch);
+                }
 #else
                 (void)Cy_CapSense_Enable(&cy_capsense_context);
 #endif
@@ -1410,6 +1818,7 @@ int main(void)
             /* BASELINE_RESET：仅把全部通道基线重置到当前 raw(消除历史漂移), 不动 IDAC/参数。 */
             if (baseline_reset_pending)
             {
+                spi_dbg.stage = MLOOP_STAGE_BASELINE_RESET;
                 baseline_reset_pending = false;
                 Cy_CapSense_InitializeAllBaselines(&cy_capsense_context);
             }
@@ -1425,6 +1834,7 @@ int main(void)
              *                         各得其自身分频; 不再要求"全通道共用同一分频且全部通过"。 */
             if (auto_tune_pending)
             {
+                spi_dbg.stage = MLOOP_STAGE_AUTO_TUNE;
                 const uint8_t target_ch = auto_tune_ch;
                 const uint8_t pref = auto_tune_pref;
                 uint16_t final_div = 0u;
@@ -1475,6 +1885,9 @@ int main(void)
             }
 
             scan_count++;
+            /* 带外 SWD 可读的存活证据: 扫描计数。 */
+            spi_dbg.scan_count_m = scan_count;
+            spi_dbg.stage = MLOOP_STAGE_SCAN_START;
             Cy_CapSense_ScanAllWidgets(&cy_capsense_context);
         }
     }

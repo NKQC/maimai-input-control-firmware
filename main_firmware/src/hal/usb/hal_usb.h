@@ -65,6 +65,9 @@ public:
 
     // config 通道（恒定枚举的 vendor/WinUSB 接口，供 host_cmd/UsbComm 复用）。
     virtual bool config_write(const uint8_t* data, size_t length) = 0;
+    virtual size_t config_write_some(const uint8_t* data, size_t length) = 0;
+    virtual void begin_command_response() = 0;
+    virtual void end_command_response() = 0;
     virtual size_t config_read(uint8_t* buffer, size_t max_length) = 0;
     virtual size_t config_available() const = 0;
     // 异步发送队列(vendor TX FIFO)当前剩余可写字节, 供发送方按余量决策(过载即弃/保留响应余量)。
@@ -87,6 +90,9 @@ public:
     bool is_ready() const override;
     
     bool config_write(const uint8_t* data, size_t length) override;
+    size_t config_write_some(const uint8_t* data, size_t length) override;
+    void begin_command_response() override;
+    void end_command_response() override;
     size_t config_read(uint8_t* buffer, size_t max_length) override;
     size_t config_available() const override;
     size_t config_write_available() const override;
@@ -129,9 +135,13 @@ public:
 private:
     bool initialized_;
     bool connected_;
+    bool _command_response_active;
 
     // config（vendor）通道的接收环形缓冲，由 tud_vendor_rx_cb 填充。
-    static const size_t CONFIG_BUFFER_SIZE = 1024;
+    // ★1024 → 4096★: core0 做重操作(XRES 后 CSD 全量重下发 = 396 条阻塞 SPI + apply)时不解析
+    // vendor 帧, 只有 tud_vendor_rx_cb 在往这个环里搬字节。1024B 在上位机 16ms 一轮的命令下几秒
+    // 就满, 满了原来是**静默丢弃**, 命令凭空消失且无任何计数, 排障时完全看不见。
+    static const size_t CONFIG_BUFFER_SIZE = 4096;
     uint8_t config_rx_buffer_[CONFIG_BUFFER_SIZE];
     size_t config_rx_head_;
     size_t config_rx_tail_;

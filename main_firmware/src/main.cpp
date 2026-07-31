@@ -1,4 +1,4 @@
-#include "config.h"   // 必须在 Arduino.h 之前，避免 PIN_SPI1_* 宏冲突
+﻿#include "config.h"   // 必须在 Arduino.h 之前，避免 PIN_SPI1_* 宏冲突
 
 #include <Arduino.h>
 #include <pico/stdlib.h>
@@ -30,6 +30,7 @@
 
 extern "C" {
 #include "hal/global_irq.h"
+#include "service/nv_store/nv_store.h"   // NvStore::enable_lockout()
 }
 
 static constexpr uint32_t WATCHDOG_TIMEOUT_MS = 5000;
@@ -76,6 +77,20 @@ void setup() {
     // scratch[6] 由指令置/清, 掉电清零; scratch[7]=运行中标记, 每次启动清零。
     const uint32_t boot_flag = watchdog_hw->scratch[7];
     const bool crash_bootsel_armed = (watchdog_hw->scratch[6] == DEBUG_BOOTSEL_MAGIC);
+    // ★死前遗言★: scratch[5] 记录"复位前 core0 正处于哪个阶段"(见 CrashStage)。scratch 跨复位保留,
+    // 于是崩溃重启后能精确知道卡在哪一步, 不必再靠时间差反推 —— 掉线定位已经在退避/环容量/串行队列/
+    // 分片写/lockout 门控上猜错过多次, 这里改用实测。
+    // ★只有"运行中标记有效"时 scratch[5] 才可信★: 上电/BOOTSEL 复位不保证清 scratch, 里面是随机值。
+    // 上一轮就被一个随机的 1 误导成"死在 CFG_FLASH"。boot_flag 无效时一律报 0xFF=不可信。
+    // 判据只认 scratch[0..3](用户区)。scratch[7] 的旧 boot_flag 会被 SDK 的 watchdog_reboot 覆盖,
+    // 不能用来判断"上次是否运行中崩溃"。
+    const bool ran_before = (watchdog_hw->scratch[CRASH_SCRATCH_RUN] == CRASH_RUN_MAGIC);
+    g_usb_dbg.last_crash_stage = ran_before
+        ? (uint8_t)(watchdog_hw->scratch[CRASH_SCRATCH_STAGE] & 0xFFu)
+        : 0xFFu;
+    g_usb_dbg.last_boot_was_wd = ran_before ? 1u : 0u;
+    watchdog_hw->scratch[CRASH_SCRATCH_RUN] = 0u;
+    watchdog_hw->scratch[CRASH_SCRATCH_STAGE] = 0u;
     watchdog_hw->scratch[7] = 0u;
     if ((boot_flag == WD_RUNNING_MAGIC) && crash_bootsel_armed) {
         reset_usb_boot(0, 0);
@@ -91,7 +106,15 @@ void setup() {
         return;
     }
 
+    // ★存储初始化顺序是硬要求★
+    // 1) 各持有者先把自己的镜像缓冲注册给 NvStore(此时不读 flash);
+    // 2) NvStore::load() 一次性把 flash 里所有区摊进这些镜像 —— 这是**整个固件唯一一次读 flash**;
+    // 3) 各服务从镜像解出运行值。
+    // 顺序错了(比如先 init 再 load)就会拿到空镜像, 正是先前"保存看着成功、重启全丢"的成因之一。
     app_config_register_schema();
+    CsdConfig::getInstance()->register_storage();
+    PsocAlgo::getInstance()->register_storage();
+    NvStore::getInstance()->load();
     ConfigManager::initialize();
 
     Psoc* psoc = Psoc::getInstance();
@@ -134,6 +157,9 @@ void setup() {
     // ★启动 core1★：必须在任何 flash 写(loop 的 save_config_task)之前完成，
     // 使 multicore_lockout_start_blocking() 有已注册的 victim 可暂停，而非永久死锁。
     multicore_launch_core1_with_stack(core1_entry, core1_stack, sizeof(core1_stack));
+    // core1 已启动并会在 core1_entry 首行注册 lockout victim ⇒ 此后 NvStore 的 flash 写才允许
+    // lockout。在此之前(ConfigManager::initialize 首次上电写默认配置)必须不 lockout, 否则永久死锁。
+    NvStore::enable_lockout();
 
     watchdog_enable(WATCHDOG_TIMEOUT_MS, true);
     // 进入运行态标记：此后任何看门狗超时复位，启动时即判为"运行中死锁/异常"→进 BOOTSEL 自恢复。
@@ -202,6 +228,10 @@ void loop() {
         }
         psoc->reset_run();
         psoc->clear_reset_request();
+        // ★确知复位 ⇒ 显式清 provisioned★, 不再依赖"链路断开>400ms"去反推。
+        // 反推那条路现在有重操作宽限窗守着(APPLY 12s 期间链路必然抖动, 不能判成掉线),
+        // 若仍只靠它, 我们自己发起的复位就可能因宽限而不触发重新下发 → 算法/CSD 永久丢失。
+        provisioned = false;
         // 卡死型(reason=2)永远上报; 链路丢失型(reason=1)在主机主动重启的抑制窗内跳过, 免得把
         // "上位机自己发起的重启"报成"固件自行复位"。
         if (reset_reason == 2u) {
@@ -219,6 +249,9 @@ void loop() {
     if (g_psoc_reboot_request) {
         g_psoc_reboot_request = 0u;
         psoc->reset_run();
+        // 同上: 主机请求的重启是"确知复位", 显式清 provisioned 保证 RESET_DEFAULTS 后
+        // 清空的 store 一定会被重新下发(否则 PSoC 仍留着复位前推下去的旧参数, 恢复默认等于没生效)。
+        provisioned = false;
         host_reboot_quiet_until_ms = millis() + 3000u;
     }
 
@@ -251,7 +284,7 @@ void loop() {
             if (csd->mode() != CSD_MODE_SEMI) {
                 // AUTO 的实时参数由 CapSense 自动计算；即使采样可信也绝不能回读固化，
                 // 否则会覆盖用户原先保存的手动阈值/snsClk，切回 SEMI 时无法恢复。
-            } else if (csd->sampling_trustworthy(psoc) && csd->capture_from_psoc(psoc)) {
+            } else if (csd->capture_from_psoc(psoc)) {   // 可信度门禁已内置于 capture_from_psoc
                 csd->download_to_psoc(psoc);       // set_mode(SEMI)+参数+APPLY: 手动参数即时生效
                 csd->request_save();               // 持久化, 成为下次开机默认
             } else {
@@ -285,7 +318,15 @@ void loop() {
         }
     }
     // 持续断开 >400ms 视为真复位 → 清 provisioned, 链路恢复后重下发(算法/CSD 在 PSoC RAM, 复位丢失)。
-    if (!link_now && link_down_since_ms != 0u && (millis() - link_down_since_ms) > 400u) {
+    // ★但"正在执行重操作"不算掉线★: APPLY/CALIBRATE/GLOBAL_COMMIT/AUTO_TUNE 由 PSoC 主循环同步跑,
+    // provision 后的 APPLY 实测 12.4s(36 通道逐个重校准), 期间 CapSense 内部临界区推迟 SPI DMA 中断,
+    // read_touch 成批失败、链路"断开"远超 400ms。旧逻辑据此清 provisioned → 链路一恢复就重新下发
+    // 396 条 SET_PARAM(把 36 通道全部重新置脏) + APPLY → 又一次 12.4s 重校准 → 永久 provision 风暴。
+    // 实测(带外 SWD 读 PSoC 计数): setparam 约 428/s、apply 约 1.1/s、apply_dirty 恒 36、
+    // scan_count 每 14s 才 +1 ⇒ 扫描被彻底压住, raw 全 0、scan_period_us=0。
+    // 宽限窗由 Psoc 在派发重操作时开启(见 psoc.cpp 的 HEAVY_OP_GRACE_MS)。
+    if (!link_now && link_down_since_ms != 0u && (millis() - link_down_since_ms) > 400u &&
+        !psoc->busy_grace_active()) {
         provisioned = false;
     }
 
@@ -296,7 +337,15 @@ void loop() {
         SelfHeal::getInstance()->note_rearm();
     }
 
+    // ★每轮重写运行标记★: 判定"上次是否运行中崩溃"依赖 scratch[7]==WD_RUNNING_MAGIC。setup 里只
+    // 设一次的话, 任何把它冲掉的路径都会让判定失真。每轮一条 store, 代价可忽略。
+    // 这样下次崩溃后若仍读到 last_boot_was_wd=0, 就**确证**复位清掉了 scratch —— 看门狗复位与
+    // hardfault 都会保留 scratch, 只有上电复位(POR)会清。即: 供电跌落, 而非软件问题。
+    watchdog_hw->scratch[7] = WD_RUNNING_MAGIC;
+    crash_run_mark();
+    crash_stage_set(CRASH_STAGE_USB_UPDATE);
     UsbComm::getInstance()->update();
+    crash_stage_set(CRASH_STAGE_NONE);
 
     // ★主机租约★：ping 续期。超时未续期即认定上位机丢失,暂停遥测(自洽:绿灯亦据此判连接)。
     // ★只挂起、不永久停★: core0 可能只是被长设备操作(JIT 算法下发/校准/flash 落地)按在
@@ -333,13 +382,52 @@ void loop() {
     // 三份背靠背写 = 数百 ms 连续 USB 黑洞, 主机侧待处理的 OUT 传输会被 Windows 直接 abort
     // (实测 kind=ConnectionAborted → 拆端点 → 判断开)。分轮落地, 每份之间必有一次完整 USB 服务轮。
     {
-        if (ConfigManager::has_pending_save()) {
-            ConfigManager::save_config_task();
-        } else if (CsdConfig::getInstance()->has_pending_save()) {
-            CsdConfig::getInstance()->save();
-        } else if (PsocAlgo::getInstance()->has_pending_save()) {
-            PsocAlgo::getInstance()->save();
+        // ★必须等 core1 空闲才落盘★: flash 写内部 multicore_lockout_start_blocking(core1), 而
+        // core1 若正在执行重操作(PSoC 重初始化 / 全通道校准, _wait_op_done 轮询数秒), 期间它不进
+        // wfe 也就响应不了 lockout ⇒ core0 死等、不喂狗 ⇒ 5s 看门狗复位整机。实测正是"保存后约
+        // 8.5 秒掉线 + 设备重新枚举 + LED 重启"。落盘信号是粘性的, 推迟一轮没有任何副作用。
+        // ★本层绝对不要再套 lockout / 关中断★
+        // save_config_task / CsdConfig::save / PsocAlgo::save **内部已经**有完整的
+        // FlashWriteGuard + save_and_disable_interrupts() + multicore_lockout_start_blocking()
+        // (见 config_manager.cpp:1313)。在这里再包一层 = 嵌套 lockout: core1 已被内层锁住,
+        // 响应不了外层请求, core0 永久死等。本层只负责"什么时候允许落盘"这个门控。
+        // ★命令信封关闭后才允许擦 flash★：200ms 足以吸收同一批 host 命令的正常帧间抖动，
+        // 同时避免命令洪流期间反复进入 flash 黑洞；脏标记保持粘性，门未开时只延后本轮。
+        constexpr uint32_t NV_COMMIT_QUIET_MS = 200u;
+        const bool commit_window_open = psoc->core1_idle() &&
+            static_cast<uint32_t>(millis() - g_last_host_cmd_ms) >= NV_COMMIT_QUIET_MS &&
+            !UsbComm::getInstance()->has_pending_response();
+        if (commit_window_open) {
+            // ★先把各服务的"待保存"信号收进 NvStore 镜像(纯内存), 再由 commit_step 落一个区★
+            // 这三步都不擦写 flash, 只更新镜像 + 置脏; 真正的擦写只有下面 commit_step 一处。
+            if (ConfigManager::has_pending_save()) {
+                ConfigManager::save_config_task();
+            }
+            if (CsdConfig::getInstance()->has_pending_save()) {
+                CsdConfig::getInstance()->save();
+            }
+            if (PsocAlgo::getInstance()->has_pending_save()) {
+                PsocAlgo::getInstance()->save();
+            }
+            // 每轮最多落一个脏区: 一次"保存到设备"通常脏了 KV + 若干 blob, 背靠背写会连续几百 ms
+            // 停 XIP/关中断, 主机在途传输被 abort。摊到多轮, 每轮之间 USB 正常服务。
+            if (NvStore::getInstance()->dirty()) {
+                crash_stage_set(CRASH_STAGE_CFG_FLASH);
+                if (NvStore::getInstance()->commit_step()) {
+                    g_usb_dbg.flash_write_count++;
+                    g_usb_dbg.loop_at_last_flash = g_usb_dbg.loop_count;
+                }
+                crash_stage_set(CRASH_STAGE_NONE);
+            }
         }
+    }
+
+    {
+        NvStore* nv = NvStore::getInstance();
+        g_usb_dbg.nv_dirty_mask = nv->dirty_mask();
+        g_usb_dbg.nv_commit_ok = nv->commit_ok_count();
+        g_usb_dbg.nv_commit_fail = nv->commit_fail_count();
+        g_usb_dbg.nv_algo_src_len = nv->algo_src_len();
     }
 
     // ★vendor OUT 自愈★：每轮检查 config vendor OUT 是否仍处 arm 态，若因 flash 扰动等

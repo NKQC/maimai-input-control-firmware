@@ -125,6 +125,23 @@ constexpr uint32_t XPSR_THUMB     = 0x01000000;   // T 位
 constexpr uint8_t REG_SP   = 13;
 constexpr uint8_t REG_PC   = 15;
 constexpr uint8_t REG_XPSR = 16;
+
+constexpr uint32_t SPI_DBG_MAGIC0 = 0x53504442u;
+constexpr uint32_t SPI_DBG_MAGIC1 = 0x4C4E4B31u;
+// ★先按 hint 地址直查, 只在不命中时才做【收窄】扫描★
+// 原因是硬件安全, 不是性能: 本板 SWD 经 TXS0102 电平转换器, 而 _acquire_once() 的注释记录了实测
+// 教训 —— "连续数千次事务"会把 turnaround 期的驱动对冲放大成持续大电流, 曾热损坏芯片。全 16KB
+// SRAM 扫描 = 4096 次背靠背 SWD 读, 正是那个被禁止的流量模式。
+// hint = 当前固件 map 文件里 .data.spi_dbg 的实际地址(0.4.38: 0x20000BAC)。固件改动后地址会变,
+// 故保留兜底扫描, 但范围只覆盖 .data 段所在的低 8KB, 且带 magic 校验。
+constexpr uint32_t SPI_DBG_ADDR_HINT = 0x20000BACu;
+constexpr uint32_t SPI_DBG_SRAM_START = 0x20000000u;
+constexpr uint32_t SPI_DBG_SRAM_END = 0x20001FFCu;
+constexpr uint32_t SPI_DBG_TIMEOUT_US = 300000u;
+
+inline bool debug_timeout_reached(uint32_t deadline_us) {
+    return static_cast<int32_t>(time_us_32() - deadline_us) >= 0;
+}
 }  // namespace
 
 // ============================================================
@@ -134,6 +151,7 @@ SwdProgrammer::KeepAliveFn SwdProgrammer::_keepalive = nullptr;
 SwdProgrammer::SwdProgrammer(uint8_t io_pin, uint8_t clk_pin, uint8_t rst_pin)
     : _io_pin(io_pin), _clk_pin(clk_pin), _rst_pin(rst_pin),
       _pio(nullptr), _sm(0), _offset(0), _ready(false), _last_idcode(0),
+      _dbg_status(DEBUG_OK), _dbg_block_addr(0),
       _last_srom_status(0), _last_fail_row(0xFFFF), _last_fail_addr(0xFFFFFFFF),
       _last_verify_read(0), _last_verify_expect(0),
       _last_chip_prot(0xFF), _last_prot_raw(0), _last_rowprot0(0), _last_rowprot1(0),
@@ -332,6 +350,79 @@ bool SwdProgrammer::_read_io(uint32_t addr, uint32_t* data) {
     if (_swd_read(AP, A_DRW, &stale) != ACK_OK) return false;   // AP 读有一拍延迟，丢弃
     if (_swd_read(AP, A_DRW, data) != ACK_OK) return false;
     return true;
+}
+
+// ---------------- 运行态带外 SWD 诊断 ----------------
+
+bool SwdProgrammer::_debug_reclaim_pio() {
+    if (_ready) return true;
+    if (_pio == nullptr || !_pio->is_ready()) {
+        _dbg_status = DEBUG_PIO_NOT_READY;
+        return false;
+    }
+
+    _pio->init_pin(_io_pin);
+    _pio->init_pin(_clk_pin);
+    gpio_pull_up(_io_pin);
+    _pio->sm_set_enabled(_sm, false);
+    _pio->sm_clear_fifos(_sm);
+    _pio->sm_restart(_sm);
+    const uint8_t base = (_io_pin < _clk_pin) ? _io_pin : _clk_pin;
+    _pio->sm_set_pindirs_out(_sm, base, 2);
+    _pio->sm_exec(_sm, pio_encode_jmp(_offset + PROG_GET_NEXT_CMD));
+    _pio->sm_set_enabled(_sm, true);
+    _ready = true;
+    return true;
+}
+
+bool SwdProgrammer::_debug_attach() {
+    if (!_debug_reclaim_pio()) return false;
+
+    _swd_connect();
+    uint32_t id = 0;
+    if (_swd_read(DP, A_IDCODE, &id) != ACK_OK || id != SWD_IDCODE_CM0P) {
+        _dbg_status = DEBUG_IDCODE_FAILED;
+        return false;
+    }
+    _last_idcode = id;
+    if (_swd_write(DP, A_ABORT, 0x0000001Eu) != ACK_OK ||
+        _swd_write(DP, A_CTRLSTAT, 0x54000000) != ACK_OK ||
+        _swd_write(DP, A_SELECT, 0x00000000) != ACK_OK) {
+        _dbg_status = DEBUG_DP_POWER_FAILED;
+        return false;
+    }
+    if (_swd_write(AP, A_CSW, CSW_STD) != ACK_OK) {
+        _dbg_status = DEBUG_CSW_CONFIG_FAILED;
+        return false;
+    }
+    _dbg_status = DEBUG_OK;
+    return true;
+}
+
+bool SwdProgrammer::_debug_scan(uint32_t deadline_us) {
+    uint32_t previous = 0;
+    bool have_previous = false;
+    uint32_t reads = 0;
+    for (uint32_t addr = SPI_DBG_SRAM_START; addr <= SPI_DBG_SRAM_END; addr += sizeof(uint32_t)) {
+        if (debug_timeout_reached(deadline_us)) {
+            _dbg_status = DEBUG_MAGIC_NOT_FOUND;
+            return false;
+        }
+        uint32_t word = 0;
+        if (!_read_io(addr, &word)) {
+            _dbg_status = DEBUG_BLOCK_READ_FAILED;
+            return false;
+        }
+        if (have_previous && previous == SPI_DBG_MAGIC0 && word == SPI_DBG_MAGIC1) {
+            _dbg_block_addr = addr - sizeof(uint32_t);
+            return true;
+        }
+        previous = word;
+        have_previous = true;
+        if ((++reads & 0xFFu) == 0u) _keepalive_tick();
+    }
+    _dbg_status = DEBUG_MAGIC_NOT_FOUND;
+    return false;
 }
 
 // ---------------- SROM ----------------
@@ -687,6 +778,58 @@ uint32_t SwdProgrammer::read_idcode(uint8_t* ack_out) {
     uint8_t ack = _swd_read(DP, A_IDCODE, &id);
     if (ack_out) *ack_out = ack;
     return (ack == ACK_OK) ? id : 0;
+}
+
+bool SwdProgrammer::debug_read_spi_counters(uint32_t out_words[DEBUG_COUNTER_WORDS]) {
+    if (out_words == nullptr) {
+        _dbg_status = DEBUG_BLOCK_READ_FAILED;
+        return false;
+    }
+    for (uint8_t i = 0; i < DEBUG_COUNTER_WORDS; ++i) out_words[i] = 0;
+
+    const uint32_t deadline_us = time_us_32() + SPI_DBG_TIMEOUT_US;
+    if (!_debug_attach()) return false;
+    if (debug_timeout_reached(deadline_us)) {
+        _dbg_status = DEBUG_MAGIC_NOT_FOUND;
+        return false;
+    }
+
+    if (_dbg_block_addr != 0) {
+        uint32_t magic0 = 0;
+        uint32_t magic1 = 0;
+        if (debug_timeout_reached(deadline_us) ||
+            !_read_io(_dbg_block_addr, &magic0) ||
+            !_read_io(_dbg_block_addr + sizeof(uint32_t), &magic1)) {
+            _dbg_status = DEBUG_BLOCK_READ_FAILED;
+            return false;
+        }
+        if (magic0 != SPI_DBG_MAGIC0 || magic1 != SPI_DBG_MAGIC1) {
+            _dbg_block_addr = 0;
+        }
+    }
+
+    // 先试 hint 地址(2 次读), 命中就完全避开扫描 —— 见 SPI_DBG_ADDR_HINT 处的硬件安全说明。
+    if (_dbg_block_addr == 0) {
+        uint32_t m0 = 0;
+        uint32_t m1 = 0;
+        if (_read_io(SPI_DBG_ADDR_HINT, &m0) &&
+            _read_io(SPI_DBG_ADDR_HINT + sizeof(uint32_t), &m1) &&
+            m0 == SPI_DBG_MAGIC0 && m1 == SPI_DBG_MAGIC1) {
+            _dbg_block_addr = SPI_DBG_ADDR_HINT;
+        }
+    }
+
+    if (_dbg_block_addr == 0 && !_debug_scan(deadline_us)) return false;
+
+    for (uint8_t i = 0; i < DEBUG_COUNTER_WORDS; ++i) {
+        if (debug_timeout_reached(deadline_us) ||
+            !_read_io(_dbg_block_addr + 8u + static_cast<uint32_t>(i) * sizeof(uint32_t), &out_words[i])) {
+            _dbg_status = DEBUG_BLOCK_READ_FAILED;
+            return false;
+        }
+    }
+    _dbg_status = DEBUG_OK;
+    return true;
 }
 
 bool SwdProgrammer::read_silicon_id(uint32_t* out_id) {

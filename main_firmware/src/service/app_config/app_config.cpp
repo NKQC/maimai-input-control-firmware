@@ -87,6 +87,40 @@ void app_config_register_schema() {
             snprintf(key_buf, sizeof(key_buf), "kbd.zmh%02d", i);
             config_map[key_buf] = ConfigValue(uint16_t(0), uint16_t(0), uint16_t(65535));
         }
+
+        // ===== 物理键每键触发极性 + 独立防抖 =====
+        // kbd.plNN: 0=低电平触发(默认, 与旧固件的全局 active-low 一致) / 1=高电平触发。
+        //   ★默认必须是 0★: 若默认高电平触发, 升级固件后既有硬件的按键行为会整体反转。
+        // kbd.dbNN: 该键防抖窗(微秒), 0=不去抖, 上限 10000。默认 3000 = 改造前的全局 DEBOUNCE_US。
+        //   逐键独立(固件侧各自记录稳定起点), 一个抖动键不再重置其它键的防抖窗。
+        for (int i = 0; i < 12; i++) {
+            char key_buf[16];
+            snprintf(key_buf, sizeof(key_buf), "kbd.pl%02d", i);
+            config_map[key_buf] = ConfigValue(uint8_t(0), uint8_t(0), uint8_t(1));
+            snprintf(key_buf, sizeof(key_buf), "kbd.db%02d", i);
+            config_map[key_buf] = ConfigValue(uint16_t(3000), uint16_t(0), uint16_t(10000));
+        }
+
+        // ===== kbd.cbA/B/K/T 00..15: 触控组合映射(16 条) =====
+        // 一条 = "zone_mask 内的分区全部同时按下" → "keycode[0..3] 全部同时输出"。
+        // ★为什么打包成 4 个 uint32 而不是逐字段一个 KV★: 逐字段要新增 144 项, 明显放大配置 JSON
+        // 与 CRC 计算开销; 打包后仅 64 项。位域布局与 keyboard.cpp 的 _load_combo/_store_combo 严格镜像:
+        //   cbA = zone_mask[31:0]
+        //   cbB = bit0..1: zone_mask[33:32]; bit8..15: 修饰位(bit0=LCtrl bit1=LShift bit2=LAlt bit3=LGui)
+        //   cbK = key0 | key1<<8 | key2<<16 | key3<<24 (HID usage, 0=空位)
+        //   cbT = delay_ms | max_hold_ms<<16 (毫秒, 0=禁用该项)
+        // 默认全 0 = 组合表为空; 此时固件回落到 kbd.zoneNN 的 per-zone 判定, 存量配置不受影响。
+        for (int i = 0; i < 16; i++) {
+            char key_buf[16];
+            snprintf(key_buf, sizeof(key_buf), "kbd.cbA%02d", i);
+            config_map[key_buf] = ConfigValue(uint32_t(0), uint32_t(0), uint32_t(0xFFFFFFFF));
+            snprintf(key_buf, sizeof(key_buf), "kbd.cbB%02d", i);
+            config_map[key_buf] = ConfigValue(uint32_t(0), uint32_t(0), uint32_t(0x0000FF03));
+            snprintf(key_buf, sizeof(key_buf), "kbd.cbK%02d", i);
+            config_map[key_buf] = ConfigValue(uint32_t(0), uint32_t(0), uint32_t(0xFFFFFFFF));
+            snprintf(key_buf, sizeof(key_buf), "kbd.cbT%02d", i);
+            config_map[key_buf] = ConfigValue(uint32_t(0), uint32_t(0), uint32_t(0xFFFFFFFF));
+        }
         
         // ===== led.* (8 keys) =====
         config_map["led.enable"]                 = ConfigValue(true);

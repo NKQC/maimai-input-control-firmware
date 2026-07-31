@@ -96,6 +96,15 @@ public:
     // 将连续 count 个引脚（自 base 起）方向设为输出
     virtual void sm_set_pindirs_out(uint8_t sm, uint8_t base, uint8_t count) = 0;
 
+    // ---- 以下为 DMA 直连 FIFO（把 PIO 当内存搬运器用）所需 ----
+    // 取该状态机 FIFO 的【字节道】地址，供 8 位 DMA 直接对接内存字节流。
+    // is_tx=true → TX FIFO：RP2040 的窄写会把该字节复制到全部 4 个字节道，故左移(MSB first)
+    //   的 OSR 取高位仍能拿到这个字节；is_tx=false → RX FIFO：左移收满 8 bit 后字节落在 [7:0]，
+    //   取第 0 字节道即得。
+    virtual volatile void* sm_fifo_byte_addr(uint8_t sm, bool is_tx) = 0;
+    // 取该状态机 FIFO 的 DREQ 编号（DMA 由外设节流，收发各一条）
+    virtual uint8_t sm_dreq(uint8_t sm, bool is_tx) = 0;
+
     // 获取实例名称
     virtual std::string get_name() const = 0;
     
@@ -127,6 +136,8 @@ public:
     void sm_restart(uint8_t sm) override;
     void init_pin(uint8_t gpio) override;
     void sm_set_pindirs_out(uint8_t sm, uint8_t base, uint8_t count) override;
+    volatile void* sm_fifo_byte_addr(uint8_t sm, bool is_tx) override;
+    uint8_t sm_dreq(uint8_t sm, bool is_tx) override;
 
     std::string get_name() const override { return "PIO0"; }
     bool is_ready() const override { return initialized_; }
@@ -169,6 +180,8 @@ public:
     void sm_restart(uint8_t sm) override;
     void init_pin(uint8_t gpio) override;
     void sm_set_pindirs_out(uint8_t sm, uint8_t base, uint8_t count) override;
+    volatile void* sm_fifo_byte_addr(uint8_t sm, bool is_tx) override;
+    uint8_t sm_dreq(uint8_t sm, bool is_tx) override;
 
     std::string get_name() const override { return "PIO1"; }
     bool is_ready() const override { return initialized_; }

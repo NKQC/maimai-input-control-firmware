@@ -22,8 +22,7 @@ HAL_USB_Device* HAL_USB_Device::instance_ = nullptr;
 static uint16_t desc_str[32];
 
 // 调试计数器全局实例(经 vendor 控制请求 0x50 读取，见 usb_debug.h)。
-volatile UsbDebugCounters g_usb_dbg = { 0xDB01u, (uint16_t)sizeof(UsbDebugCounters),
-    0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u };
+volatile UsbDebugCounters g_usb_dbg = { 0xDB01u, (uint16_t)sizeof(UsbDebugCounters) };
 
 volatile uint8_t g_bootsel_request = 0u;
 volatile uint8_t g_psoc_reboot_request = 0u;
@@ -388,7 +387,7 @@ HAL_USB_Device* HAL_USB_Device::getInstance() {
 }
 
 HAL_USB_Device::HAL_USB_Device()
-    : initialized_(false), connected_(false), config_rx_head_(0), config_rx_tail_(0) {
+    : initialized_(false), connected_(false), _command_response_active(false), config_rx_head_(0), config_rx_tail_(0) {
     for (size_t i = 0; i < CDC_PORT_COUNT; i++) {
         cdc_rx_head_[i] = 0;
         cdc_rx_tail_[i] = 0;
@@ -433,6 +432,7 @@ bool HAL_USB_Device::is_ready() const {
 }
 
 bool HAL_USB_Device::config_write(const uint8_t* data, size_t length) {
+    if (_command_response_active) return false;
     if (!is_ready() || !data || length == 0) {
         return length == 0;
     }
@@ -469,9 +469,32 @@ bool HAL_USB_Device::config_write(const uint8_t* data, size_t length) {
             sleep_us(50);                       // 给 USB IRQ 完成 IN 传输的时间窗口
         }
     }
-    g_usb_dbg.vendor_tx_calls++;
-    g_usb_dbg.vendor_tx_bytes += (uint32_t)total_written;
+    if (total_written > 0) {
+        g_usb_dbg.vendor_tx_calls++;
+        g_usb_dbg.vendor_tx_bytes += (uint32_t)total_written;
+    }
     return total_written == length;
+}
+
+size_t HAL_USB_Device::config_write_some(const uint8_t* data, size_t length) {
+    if (!is_ready() || !data || length == 0) return 0;
+
+    const size_t chunk = std::min((size_t)tud_vendor_write_available(), length);
+    const size_t written = chunk > 0 ? tud_vendor_write(data, (uint32_t)chunk) : 0;
+    tud_vendor_write_flush();
+    if (written > 0) {
+        g_usb_dbg.vendor_tx_calls++;
+        g_usb_dbg.vendor_tx_bytes += (uint32_t)written;
+    }
+    return written;
+}
+
+void HAL_USB_Device::begin_command_response() {
+    _command_response_active = true;
+}
+
+void HAL_USB_Device::end_command_response() {
+    _command_response_active = false;
 }
 
 size_t HAL_USB_Device::config_write_available() const {
@@ -546,6 +569,7 @@ void HAL_USB_Device::_handle_vendor_rx(uint8_t const* buffer, uint16_t bufsize) 
     uint8_t tmp[64];
     uint32_t count;
     uint32_t drained = 0;
+    uint32_t dropped = 0;
     while ((count = tud_vendor_read(tmp, sizeof(tmp))) > 0) {
         drained += count;
         for (uint32_t i = 0; i < count; i++) {
@@ -553,11 +577,16 @@ void HAL_USB_Device::_handle_vendor_rx(uint8_t const* buffer, uint16_t bufsize) 
             if (next_head != config_rx_tail_) {
                 config_rx_buffer_[config_rx_head_] = tmp[i];
                 config_rx_head_ = next_head;
+            } else {
+                // ★溢出不再静默★: 环满意味着 core0 长时间没来取(重操作阻塞), 被丢掉的字节会让
+                // 主机的命令帧残缺 —— 这正是"设备莫名不响应/掉线"排障时最需要的证据。
+                dropped++;
             }
         }
     }
     g_usb_dbg.vendor_rx_cb_count++;
     g_usb_dbg.vendor_rx_bytes += drained;
+    g_usb_dbg.vendor_rx_dropped += dropped;
 }
 
 // TinyUSB回调函数实现：vendor 接收数据搬进 config 环形缓冲。

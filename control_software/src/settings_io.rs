@@ -48,7 +48,12 @@ impl Default for GroupSelection {
 
 impl GroupSelection {
     pub fn any(self) -> bool {
-        self.config || self.channel_params || self.globals || self.algo || self.keyboard || self.zones
+        self.config
+            || self.channel_params
+            || self.globals
+            || self.algo
+            || self.keyboard
+            || self.zones
     }
 }
 
@@ -65,7 +70,11 @@ pub struct GroupCounts {
 
 pub fn group_counts(ctrl: &AppController) -> GroupCounts {
     GroupCounts {
-        config: ctrl.config_entries().into_iter().filter(|e| _cfg_group_owns(&e.key)).count() as i32,
+        config: ctrl
+            .config_entries()
+            .into_iter()
+            .filter(|e| _cfg_group_owns(&e.key))
+            .count() as i32,
         channel_params: (36 * KNOWN_PARAM_IDS.len()) as i32,
         // gparam 1..8 + CSD 处理模式枚举。
         globals: 9,
@@ -148,20 +157,30 @@ impl ImportSummary {
         if self.absent_items > 0 {
             text.push_str(&format!(
                 " 文件中有 {} 项未带值(导出时设备尚未回读到)，这些项保持当前值不动。",
-                self.absent_items));
+                self.absent_items
+            ));
         }
         let grouped = self.skipped_by_reason();
         if !grouped.is_empty() {
             text.push_str(&format!(" 跳过 {} 项: ", self.skipped.len()));
-            let parts: Vec<String> = grouped.iter().map(|(reason, items)| {
-                let shown: Vec<&str> = items.iter().take(6).copied().collect();
-                let more = if items.len() > shown.len() {
-                    format!(" 等 {} 项", items.len())
-                } else {
-                    String::new()
-                };
-                format!("{}({} 项: {}{})", reason.label(), items.len(), shown.join(", "), more)
-            }).collect();
+            let parts: Vec<String> = grouped
+                .iter()
+                .map(|(reason, items)| {
+                    let shown: Vec<&str> = items.iter().take(6).copied().collect();
+                    let more = if items.len() > shown.len() {
+                        format!(" 等 {} 项", items.len())
+                    } else {
+                        String::new()
+                    };
+                    format!(
+                        "{}({} 项: {}{})",
+                        reason.label(),
+                        items.len(),
+                        shown.join(", "),
+                        more
+                    )
+                })
+                .collect();
             text.push_str(&parts.join("；"));
             text.push('。');
         }
@@ -177,14 +196,20 @@ pub fn export_settings(ctrl: &AppController, selected: GroupSelection) -> Result
     let mut root = BTreeMap::new();
     root.insert("format".to_string(), JsonValue::String(FORMAT.to_string()));
     root.insert("version".to_string(), JsonValue::Number(VERSION as f64));
-    root.insert("exported_at".to_string(), JsonValue::String(local_timestamp()));
+    root.insert(
+        "exported_at".to_string(),
+        JsonValue::String(local_timestamp()),
+    );
 
     let mut device = BTreeMap::new();
     let (fw_version, protocol) = ctrl
         .device_info()
         .map(|info| (info.fw_version, info.protocol_version))
         .unwrap_or((0, 0));
-    device.insert("fw_version".to_string(), JsonValue::Number(fw_version as f64));
+    device.insert(
+        "fw_version".to_string(),
+        JsonValue::Number(fw_version as f64),
+    );
     device.insert("protocol".to_string(), JsonValue::Number(protocol as f64));
     root.insert("device".to_string(), JsonValue::Object(device));
 
@@ -193,7 +218,10 @@ pub fn export_settings(ctrl: &AppController, selected: GroupSelection) -> Result
         groups.insert(GROUP_CONFIG.to_string(), _export_config(ctrl)?);
     }
     if selected.channel_params {
-        groups.insert(GROUP_CHANNEL_PARAMS.to_string(), _export_channel_params(ctrl));
+        groups.insert(
+            GROUP_CHANNEL_PARAMS.to_string(),
+            _export_channel_params(ctrl),
+        );
     }
     if selected.globals {
         groups.insert(GROUP_GLOBALS.to_string(), _export_globals(ctrl));
@@ -225,7 +253,11 @@ pub fn export_settings(ctrl: &AppController, selected: GroupSelection) -> Result
 /// 逐项容错: 未知键 / 类型不符 / 越界一律拒绝该项并计入摘要，不静默丢弃也不静默钳位；单项失败
 /// 不会中断其余项与其余组(旧实现 `bail!` 会让导入停在半途，是"覆盖不全"的直接原因)。
 /// 文件里没给值的项保持草稿现值，绝不用默认值覆盖设备真值。
-pub fn import_settings(ctrl: &mut AppController, text: &str, selected: GroupSelection) -> Result<ImportSummary> {
+pub fn import_settings(
+    ctrl: &mut AppController,
+    text: &str,
+    selected: GroupSelection,
+) -> Result<ImportSummary> {
     if !selected.any() {
         bail!("请至少选择一个设置组");
     }
@@ -247,14 +279,29 @@ pub fn import_settings(ctrl: &mut AppController, text: &str, selected: GroupSele
 
     // 组缺失属于文件级问题(选了却没有), 先全部检查再落任何草稿, 避免"部分应用"。
     let mut wanted: Vec<(&'static str, &JsonValue)> = Vec::new();
-    if selected.config { wanted.push((GROUP_CONFIG, _group(groups, GROUP_CONFIG)?)); }
-    if selected.channel_params { wanted.push((GROUP_CHANNEL_PARAMS, _group(groups, GROUP_CHANNEL_PARAMS)?)); }
-    if selected.globals { wanted.push((GROUP_GLOBALS, _group(groups, GROUP_GLOBALS)?)); }
-    if selected.algo { wanted.push((GROUP_ALGO, _group(groups, GROUP_ALGO)?)); }
-    if selected.keyboard { wanted.push((GROUP_KEYBOARD, _group(groups, GROUP_KEYBOARD)?)); }
-    if selected.zones { wanted.push((GROUP_ZONES, _group(groups, GROUP_ZONES)?)); }
+    if selected.config {
+        wanted.push((GROUP_CONFIG, _group(groups, GROUP_CONFIG)?));
+    }
+    if selected.channel_params {
+        wanted.push((GROUP_CHANNEL_PARAMS, _group(groups, GROUP_CHANNEL_PARAMS)?));
+    }
+    if selected.globals {
+        wanted.push((GROUP_GLOBALS, _group(groups, GROUP_GLOBALS)?));
+    }
+    if selected.algo {
+        wanted.push((GROUP_ALGO, _group(groups, GROUP_ALGO)?));
+    }
+    if selected.keyboard {
+        wanted.push((GROUP_KEYBOARD, _group(groups, GROUP_KEYBOARD)?));
+    }
+    if selected.zones {
+        wanted.push((GROUP_ZONES, _group(groups, GROUP_ZONES)?));
+    }
 
-    let mut summary = ImportSummary { dirty_before: ctrl.config_dirty_count(), ..Default::default() };
+    let mut summary = ImportSummary {
+        dirty_before: ctrl.config_dirty_count(),
+        ..Default::default()
+    };
     for (name, group) in wanted {
         match name {
             GROUP_CONFIG => _import_config(ctrl, group, &mut summary)?,
@@ -284,7 +331,10 @@ fn _export_config(ctrl: &AppController) -> Result<JsonValue> {
         }
         let mut item = BTreeMap::new();
         item.insert("key".to_string(), JsonValue::String(entry.key));
-        item.insert("type".to_string(), JsonValue::String(_cfg_type_name(&entry.value).to_string()));
+        item.insert(
+            "type".to_string(),
+            JsonValue::String(_cfg_type_name(&entry.value).to_string()),
+        );
         item.insert("value".to_string(), _cfg_to_json(&entry.value)?);
         if let Some((min, max)) = entry.range {
             let mut range = BTreeMap::new();
@@ -344,13 +394,22 @@ fn _export_globals(ctrl: &AppController) -> JsonValue {
 
 fn _export_algo(ctrl: &AppController) -> JsonValue {
     let mut group = BTreeMap::new();
-    group.insert("device_source".to_string(), JsonValue::String(ctrl.algo_device_src().to_string()));
-    group.insert("device_code_hex".to_string(), JsonValue::String(ctrl.algo_device_code_hex().to_string()));
+    group.insert(
+        "device_source".to_string(),
+        JsonValue::String(ctrl.algo_device_src().to_string()),
+    );
+    group.insert(
+        "device_code_hex".to_string(),
+        JsonValue::String(ctrl.algo_device_code_hex().to_string()),
+    );
     let mut cfg = Vec::with_capacity(8);
     for idx in 0..8u8 {
         let mut item = BTreeMap::new();
         item.insert("index".to_string(), JsonValue::Number(idx as f64));
-        item.insert("value".to_string(), JsonValue::Number(ctrl.algo_cfg(idx) as f64));
+        item.insert(
+            "value".to_string(),
+            JsonValue::Number(ctrl.algo_cfg(idx) as f64),
+        );
         cfg.push(JsonValue::Object(item));
     }
     group.insert("cfg".to_string(), JsonValue::Array(cfg));
@@ -363,12 +422,22 @@ fn _export_keyboard(ctrl: &AppController) -> JsonValue {
     let mut physical = Vec::with_capacity(12);
     for index in 0..12u8 {
         let hold = ctrl.kbd_hold_phys(index);
-        physical.push(_key_entry(index, ctrl.kbd_map(index), ctrl.kbd_keymod(index), hold));
+        physical.push(_key_entry(
+            index,
+            ctrl.kbd_map(index),
+            ctrl.kbd_keymod(index),
+            hold,
+        ));
     }
     let mut touch = Vec::with_capacity(34);
     for zone in 0..34u8 {
         let hold = ctrl.kbd_hold_zone(zone);
-        touch.push(_key_entry(zone, ctrl.kbd_touch_keycode(zone), ctrl.kbd_zone_mod(zone), hold));
+        touch.push(_key_entry(
+            zone,
+            ctrl.kbd_touch_keycode(zone),
+            ctrl.kbd_zone_mod(zone),
+            hold,
+        ));
     }
     let mut group = BTreeMap::new();
     group.insert("physical".to_string(), JsonValue::Array(physical));
@@ -394,7 +463,10 @@ fn _export_zones(ctrl: &AppController) -> JsonValue {
         let mut item = BTreeMap::new();
         item.insert("zone".to_string(), JsonValue::Number(zone as f64));
         item.insert("key".to_string(), JsonValue::String(zone_key(zone)));
-        item.insert("binding".to_string(), JsonValue::Number(ctrl.get_binding(zone) as f64));
+        item.insert(
+            "binding".to_string(),
+            JsonValue::Number(ctrl.get_binding(zone) as f64),
+        );
         bindings.push(JsonValue::Object(item));
     }
     let mut group = BTreeMap::new();
@@ -402,7 +474,11 @@ fn _export_zones(ctrl: &AppController) -> JsonValue {
     JsonValue::Object(group)
 }
 
-fn _import_config(ctrl: &mut AppController, group: &JsonValue, sum: &mut ImportSummary) -> Result<()> {
+fn _import_config(
+    ctrl: &mut AppController,
+    group: &JsonValue,
+    sum: &mut ImportSummary,
+) -> Result<()> {
     let group = _object(group, GROUP_CONFIG)?;
     let entries = _array(_required(group, "entries", GROUP_CONFIG)?, "config.entries")?;
     for item in entries {
@@ -421,7 +497,10 @@ fn _import_config(ctrl: &mut AppController, group: &JsonValue, sum: &mut ImportS
             sum.absent_items += 1;
             continue;
         };
-        let Ok(kind) = _string(_required(item, "type", "config entry")?, "config entry type") else {
+        let Ok(kind) = _string(
+            _required(item, "type", "config entry")?,
+            "config entry type",
+        ) else {
             sum._skip(&key, SkipReason::Malformed);
             continue;
         };
@@ -448,20 +527,36 @@ fn _import_config(ctrl: &mut AppController, group: &JsonValue, sum: &mut ImportS
     Ok(())
 }
 
-fn _import_channel_params(ctrl: &mut AppController, group: &JsonValue, sum: &mut ImportSummary) -> Result<()> {
+fn _import_channel_params(
+    ctrl: &mut AppController,
+    group: &JsonValue,
+    sum: &mut ImportSummary,
+) -> Result<()> {
     let group = _object(group, GROUP_CHANNEL_PARAMS)?;
-    let channels = _array(_required(group, "channels", GROUP_CHANNEL_PARAMS)?, "channel_params.channels")?;
+    let channels = _array(
+        _required(group, "channels", GROUP_CHANNEL_PARAMS)?,
+        "channel_params.channels",
+    )?;
     for channel_item in channels {
         let channel_item = _object(channel_item, "channel params item")?;
-        let channel = _u8(_required(channel_item, "channel", "channel params item")?, "channel")?;
+        let channel = _u8(
+            _required(channel_item, "channel", "channel params item")?,
+            "channel",
+        )?;
         if channel >= 36 {
             sum._skip(format!("channel {channel}"), SkipReason::OutOfRange);
             continue;
         }
-        let params = _array(_required(channel_item, "params", "channel params item")?, "channel params")?;
+        let params = _array(
+            _required(channel_item, "params", "channel params item")?,
+            "channel params",
+        )?;
         for param_item in params {
             let param_item = _object(param_item, "channel param")?;
-            let param_id = _u8(_required(param_item, "param_id", "channel param")?, "param_id")?;
+            let param_id = _u8(
+                _required(param_item, "param_id", "channel param")?,
+                "param_id",
+            )?;
             let name = format!("ch{channel}.param 0x{param_id:02X}");
             if !KNOWN_PARAM_IDS.contains(&param_id) {
                 sum._skip(name, SkipReason::UnknownKey);
@@ -487,7 +582,11 @@ fn _import_channel_params(ctrl: &mut AppController, group: &JsonValue, sum: &mut
     Ok(())
 }
 
-fn _import_globals(ctrl: &mut AppController, group: &JsonValue, sum: &mut ImportSummary) -> Result<()> {
+fn _import_globals(
+    ctrl: &mut AppController,
+    group: &JsonValue,
+    sum: &mut ImportSummary,
+) -> Result<()> {
     let group = _object(group, GROUP_GLOBALS)?;
     let values = _array(_required(group, "values", GROUP_GLOBALS)?, "globals.values")?;
     for item in values {
@@ -515,12 +614,10 @@ fn _import_globals(ctrl: &mut AppController, group: &JsonValue, sum: &mut Import
     match group.get("csd_mode") {
         None => sum.absent_items += 1,
         Some(raw) => match _u8(raw, "csd_mode") {
-            Ok(mode) if mode <= 1 => {
-                match ctrl.set_mode(mode) {
-                    Ok(()) => sum.applied_items += 1,
-                    Err(_) => sum._skip("csd_mode", SkipReason::OutOfRange),
-                }
-            }
+            Ok(mode) if mode <= 1 => match ctrl.set_mode(mode) {
+                Ok(()) => sum.applied_items += 1,
+                Err(_) => sum._skip("csd_mode", SkipReason::OutOfRange),
+            },
             Ok(_) => sum._skip("csd_mode", SkipReason::OutOfRange),
             Err(_) => sum._skip("csd_mode", SkipReason::TypeMismatch),
         },
@@ -528,13 +625,21 @@ fn _import_globals(ctrl: &mut AppController, group: &JsonValue, sum: &mut Import
     Ok(())
 }
 
-fn _import_algo(ctrl: &mut AppController, group: &JsonValue, sum: &mut ImportSummary) -> Result<()> {
+fn _import_algo(
+    ctrl: &mut AppController,
+    group: &JsonValue,
+    sum: &mut ImportSummary,
+) -> Result<()> {
     let group = _object(group, GROUP_ALGO)?;
     // ★算法 C 源与机器码不进草稿★: 它们的唯一下发通道是 ALGO_SET_SRC / ALGO_UPLOAD 即时命令,
     // 没有草稿层也不参与 save_config。导入必须零设备命令, 故这里只统计并告知, 由用户在算法页手动上传。
     for field in ["device_source", "device_code_hex"] {
-        let non_empty = group.get(field)
-            .and_then(|v| match v { JsonValue::String(s) => Some(!s.trim().is_empty()), _ => None })
+        let non_empty = group
+            .get(field)
+            .and_then(|v| match v {
+                JsonValue::String(s) => Some(!s.trim().is_empty()),
+                _ => None,
+            })
             .unwrap_or(false);
         if non_empty {
             sum._skip(format!("algo.{field}"), SkipReason::NotDraftable);
@@ -565,9 +670,16 @@ fn _import_algo(ctrl: &mut AppController, group: &JsonValue, sum: &mut ImportSum
     Ok(())
 }
 
-fn _import_keyboard(ctrl: &mut AppController, group: &JsonValue, sum: &mut ImportSummary) -> Result<()> {
+fn _import_keyboard(
+    ctrl: &mut AppController,
+    group: &JsonValue,
+    sum: &mut ImportSummary,
+) -> Result<()> {
     let group = _object(group, GROUP_KEYBOARD)?;
-    let physical = _array(_required(group, "physical", GROUP_KEYBOARD)?, "keyboard.physical")?;
+    let physical = _array(
+        _required(group, "physical", GROUP_KEYBOARD)?,
+        "keyboard.physical",
+    )?;
     for item in physical {
         _import_key_entry(ctrl, item, KBD_HOLD_KIND_PHYS, 12, sum)?;
     }
@@ -587,9 +699,20 @@ fn _import_key_entry(
     sum: &mut ImportSummary,
 ) -> Result<()> {
     let zone_kind = kind == KBD_HOLD_KIND_ZONE;
-    let item = _object(item, if zone_kind { "touch key" } else { "physical key" })?;
+    let item = _object(
+        item,
+        if zone_kind {
+            "touch key"
+        } else {
+            "physical key"
+        },
+    )?;
     let index = _u8(_required(item, "index", "key entry")?, "key entry index")?;
-    let name = if zone_kind { format!("kbd.zone{index:02}") } else { format!("kbd.key{index:02}") };
+    let name = if zone_kind {
+        format!("kbd.zone{index:02}")
+    } else {
+        format!("kbd.key{index:02}")
+    };
     if index >= limit {
         sum._skip(name, SkipReason::OutOfRange);
         return Ok(());
@@ -614,21 +737,27 @@ fn _import_key_entry(
     }
     // 长按参数(毫秒)是同一按键项的独立字段; 旧版导出文件没有这两项, 按缺键保持现值。
     match (item.get("delay_ms"), item.get("max_hold_ms")) {
-        (Some(delay), Some(max_hold)) => match (_u16(delay, "delay_ms"), _u16(max_hold, "max_hold_ms")) {
-            (Ok(delay), Ok(max_hold)) => {
-                match ctrl.stage_kbd_hold(kind, index, delay, max_hold) {
-                    Ok(()) => sum.applied_items += 1,
-                    Err(_) => sum._skip(format!("{name}.hold"), SkipReason::OutOfRange),
+        (Some(delay), Some(max_hold)) => {
+            match (_u16(delay, "delay_ms"), _u16(max_hold, "max_hold_ms")) {
+                (Ok(delay), Ok(max_hold)) => {
+                    match ctrl.stage_kbd_hold(kind, index, delay, max_hold) {
+                        Ok(()) => sum.applied_items += 1,
+                        Err(_) => sum._skip(format!("{name}.hold"), SkipReason::OutOfRange),
+                    }
                 }
+                _ => sum._skip(format!("{name}.hold"), SkipReason::TypeMismatch),
             }
-            _ => sum._skip(format!("{name}.hold"), SkipReason::TypeMismatch),
-        },
+        }
         _ => sum.absent_items += 1,
     }
     Ok(())
 }
 
-fn _import_zones(ctrl: &mut AppController, group: &JsonValue, sum: &mut ImportSummary) -> Result<()> {
+fn _import_zones(
+    ctrl: &mut AppController,
+    group: &JsonValue,
+    sum: &mut ImportSummary,
+) -> Result<()> {
     let group = _object(group, GROUP_ZONES)?;
     let bindings = _array(_required(group, "bindings", GROUP_ZONES)?, "zones.bindings")?;
     for item in bindings {
@@ -661,7 +790,9 @@ fn _import_zones(ctrl: &mut AppController, group: &JsonValue, sum: &mut ImportSu
 }
 
 fn _group<'a>(groups: &'a BTreeMap<String, JsonValue>, name: &str) -> Result<&'a JsonValue> {
-    groups.get(name).ok_or_else(|| anyhow!("JSON 不包含 {name:?} 组；请取消该选择或使用完整导出文件"))
+    groups
+        .get(name)
+        .ok_or_else(|| anyhow!("JSON 不包含 {name:?} 组；请取消该选择或使用完整导出文件"))
 }
 
 /// `<prefix><两位十进制>` 形式的键，索引须小于 `limit`。
@@ -694,23 +825,29 @@ fn _cfg_group_owns(key: &str) -> bool {
 /// ★不做钳位★: 越界必须让用户知道，而不是写进一个他没选的值。
 fn _retype_cfg(truth: &CfgValue, value: &CfgValue) -> Option<CfgValue> {
     match truth {
-        CfgValue::Str(_) => return match value {
-            CfgValue::Str(v) => Some(CfgValue::Str(v.clone())),
-            _ => None,
-        },
-        CfgValue::Bool(_) => return match value {
-            CfgValue::Bool(v) => Some(CfgValue::Bool(*v)),
-            _ => match _cfg_as_i64(value)? {
-                0 => Some(CfgValue::Bool(false)),
-                1 => Some(CfgValue::Bool(true)),
+        CfgValue::Str(_) => {
+            return match value {
+                CfgValue::Str(v) => Some(CfgValue::Str(v.clone())),
                 _ => None,
-            },
-        },
-        CfgValue::F32(_) => return match value {
-            CfgValue::F32(v) if v.is_finite() => Some(CfgValue::F32(*v)),
-            CfgValue::F32(_) | CfgValue::Str(_) => None,
-            _ => Some(CfgValue::F32(_cfg_as_i64(value)? as f32)),
-        },
+            };
+        }
+        CfgValue::Bool(_) => {
+            return match value {
+                CfgValue::Bool(v) => Some(CfgValue::Bool(*v)),
+                _ => match _cfg_as_i64(value)? {
+                    0 => Some(CfgValue::Bool(false)),
+                    1 => Some(CfgValue::Bool(true)),
+                    _ => None,
+                },
+            };
+        }
+        CfgValue::F32(_) => {
+            return match value {
+                CfgValue::F32(v) if v.is_finite() => Some(CfgValue::F32(*v)),
+                CfgValue::F32(_) | CfgValue::Str(_) => None,
+                _ => Some(CfgValue::F32(_cfg_as_i64(value)? as f32)),
+            };
+        }
         _ => {}
     }
     if matches!(value, CfgValue::Str(_)) {
@@ -748,7 +885,8 @@ fn _cfg_as_f64(value: &CfgValue) -> Option<f64> {
 
 /// 是否落在设备声明的 [min, max] 内。min/max 无法数值化(字符串项)时视为无范围约束。
 fn _cfg_in_range(value: &CfgValue, min: &CfgValue, max: &CfgValue) -> bool {
-    let (Some(v), Some(lo), Some(hi)) = (_cfg_as_f64(value), _cfg_as_f64(min), _cfg_as_f64(max)) else {
+    let (Some(v), Some(lo), Some(hi)) = (_cfg_as_f64(value), _cfg_as_f64(min), _cfg_as_f64(max))
+    else {
         return true;
     };
     v >= lo && v <= hi
@@ -781,7 +919,10 @@ fn _cfg_to_json(value: &CfgValue) -> Result<JsonValue> {
 
 fn _cfg_from_json(kind: &str, value: &JsonValue) -> Result<CfgValue> {
     match kind {
-        "bool" => match value { JsonValue::Bool(v) => Ok(CfgValue::Bool(*v)), _ => bail!("bool 配置值必须是 JSON bool") },
+        "bool" => match value {
+            JsonValue::Bool(v) => Ok(CfgValue::Bool(*v)),
+            _ => bail!("bool 配置值必须是 JSON bool"),
+        },
         "i8" => Ok(CfgValue::I8(_i8(value, "i8 config value")?)),
         "u8" => Ok(CfgValue::U8(_u8(value, "u8 config value")?)),
         "u16" => Ok(CfgValue::U16(_u16(value, "u16 config value")?)),
@@ -793,30 +934,52 @@ fn _cfg_from_json(kind: &str, value: &JsonValue) -> Result<CfgValue> {
             }
             Ok(CfgValue::F32(n as f32))
         }
-        "string" => Ok(CfgValue::Str(_string(value, "string config value")?.to_string())),
+        "string" => Ok(CfgValue::Str(
+            _string(value, "string config value")?.to_string(),
+        )),
         _ => bail!("未知配置类型 {kind:?}"),
     }
 }
 
-fn _required<'a>(object: &'a BTreeMap<String, JsonValue>, key: &str, context: &str) -> Result<&'a JsonValue> {
-    object.get(key).ok_or_else(|| anyhow!("{context} 缺少必填字段 {key:?}"))
+fn _required<'a>(
+    object: &'a BTreeMap<String, JsonValue>,
+    key: &str,
+    context: &str,
+) -> Result<&'a JsonValue> {
+    object
+        .get(key)
+        .ok_or_else(|| anyhow!("{context} 缺少必填字段 {key:?}"))
 }
 
 fn _object<'a>(value: &'a JsonValue, context: &str) -> Result<&'a BTreeMap<String, JsonValue>> {
-    match value { JsonValue::Object(v) => Ok(v), _ => bail!("{context} 必须是 JSON object") }
+    match value {
+        JsonValue::Object(v) => Ok(v),
+        _ => bail!("{context} 必须是 JSON object"),
+    }
 }
 fn _array<'a>(value: &'a JsonValue, context: &str) -> Result<&'a [JsonValue]> {
-    match value { JsonValue::Array(v) => Ok(v), _ => bail!("{context} 必须是 JSON array") }
+    match value {
+        JsonValue::Array(v) => Ok(v),
+        _ => bail!("{context} 必须是 JSON array"),
+    }
 }
 fn _string<'a>(value: &'a JsonValue, context: &str) -> Result<&'a str> {
-    match value { JsonValue::String(v) => Ok(v), _ => bail!("{context} 必须是 JSON string") }
+    match value {
+        JsonValue::String(v) => Ok(v),
+        _ => bail!("{context} 必须是 JSON string"),
+    }
 }
 fn _number(value: &JsonValue, context: &str) -> Result<f64> {
-    match value { JsonValue::Number(v) if v.is_finite() => Ok(*v), _ => bail!("{context} 必须是有限 JSON number") }
+    match value {
+        JsonValue::Number(v) if v.is_finite() => Ok(*v),
+        _ => bail!("{context} 必须是有限 JSON number"),
+    }
 }
 fn _u32(value: &JsonValue, context: &str) -> Result<u32> {
     let n = _number(value, context)?;
-    if n.fract() != 0.0 || !(0.0..=u32::MAX as f64).contains(&n) { bail!("{context} 必须是 u32 整数") }
+    if n.fract() != 0.0 || !(0.0..=u32::MAX as f64).contains(&n) {
+        bail!("{context} 必须是 u32 整数")
+    }
     Ok(n as u32)
 }
 fn _u16(value: &JsonValue, context: &str) -> Result<u16> {
@@ -829,7 +992,9 @@ fn _u8(value: &JsonValue, context: &str) -> Result<u8> {
 }
 fn _i8(value: &JsonValue, context: &str) -> Result<i8> {
     let n = _number(value, context)?;
-    if n.fract() != 0.0 || n < i8::MIN as f64 || n > i8::MAX as f64 { bail!("{context} 必须是 i8 整数") }
+    if n.fract() != 0.0 || n < i8::MIN as f64 || n > i8::MAX as f64 {
+        bail!("{context} 必须是 i8 整数")
+    }
     Ok(n as i8)
 }
 
@@ -854,7 +1019,9 @@ fn _write_json(value: &JsonValue, out: &mut String, indent: usize) -> Result<()>
                     _write_string(key, out);
                     out.push_str(": ");
                     _write_json(child, out, indent + 1)?;
-                    if index + 1 < map.len() { out.push(','); }
+                    if index + 1 < map.len() {
+                        out.push(',');
+                    }
                 }
                 out.push('\n');
                 _indent(out, indent);
@@ -868,7 +1035,9 @@ fn _write_json(value: &JsonValue, out: &mut String, indent: usize) -> Result<()>
                     out.push('\n');
                     _indent(out, indent + 1);
                     _write_json(child, out, indent + 1)?;
-                    if index + 1 < values.len() { out.push(','); }
+                    if index + 1 < values.len() {
+                        out.push(',');
+                    }
                 }
                 out.push('\n');
                 _indent(out, indent);
@@ -885,7 +1054,9 @@ fn _write_json(value: &JsonValue, out: &mut String, indent: usize) -> Result<()>
 }
 
 fn _indent(out: &mut String, level: usize) {
-    for _ in 0..level { out.push_str("  "); }
+    for _ in 0..level {
+        out.push_str("  ");
+    }
 }
 
 /// 只转义 JSON 必需字符及控制字符，UTF-8 可直接保留以提高文件可读性。
@@ -911,13 +1082,17 @@ struct JsonParser<'a> {
 }
 
 impl<'a> JsonParser<'a> {
-    fn new(text: &'a str) -> Self { Self { text, pos: 0 } }
+    fn new(text: &'a str) -> Self {
+        Self { text, pos: 0 }
+    }
 
     fn parse(mut self) -> Result<JsonValue> {
         self._whitespace();
         let value = self._value()?;
         self._whitespace();
-        if self.pos != self.text.len() { return self._error("根值后有额外内容"); }
+        if self.pos != self.text.len() {
+            return self._error("根值后有额外内容");
+        }
         Ok(value)
     }
 
@@ -927,9 +1102,18 @@ impl<'a> JsonParser<'a> {
             Some(b'{') => self._object_value(),
             Some(b'[') => self._array_value(),
             Some(b'"') => Ok(JsonValue::String(self._string_value()?)),
-            Some(b't') => { self._literal("true")?; Ok(JsonValue::Bool(true)) }
-            Some(b'f') => { self._literal("false")?; Ok(JsonValue::Bool(false)) }
-            Some(b'n') => { self._literal("null")?; Ok(JsonValue::Null) }
+            Some(b't') => {
+                self._literal("true")?;
+                Ok(JsonValue::Bool(true))
+            }
+            Some(b'f') => {
+                self._literal("false")?;
+                Ok(JsonValue::Bool(false))
+            }
+            Some(b'n') => {
+                self._literal("null")?;
+                Ok(JsonValue::Null)
+            }
             Some(b'-' | b'0'..=b'9') => Ok(JsonValue::Number(self._number_value()?)),
             Some(_) => self._error("此处期待 object、array、string、number、bool 或 null"),
             None => self._error("意外到达文件末尾"),
@@ -940,10 +1124,14 @@ impl<'a> JsonParser<'a> {
         self._take(b'{')?;
         self._whitespace();
         let mut map = BTreeMap::new();
-        if self._consume(b'}') { return Ok(JsonValue::Object(map)); }
+        if self._consume(b'}') {
+            return Ok(JsonValue::Object(map));
+        }
         loop {
             self._whitespace();
-            if self._peek() != Some(b'"') { return self._error("object key 必须是 string"); }
+            if self._peek() != Some(b'"') {
+                return self._error("object key 必须是 string");
+            }
             let key = self._string_value()?;
             self._whitespace();
             self._take(b':')?;
@@ -952,7 +1140,9 @@ impl<'a> JsonParser<'a> {
                 return self._error(&format!("object key {key:?} 重复"));
             }
             self._whitespace();
-            if self._consume(b'}') { break; }
+            if self._consume(b'}') {
+                break;
+            }
             self._take(b',')?;
         }
         Ok(JsonValue::Object(map))
@@ -962,11 +1152,15 @@ impl<'a> JsonParser<'a> {
         self._take(b'[')?;
         self._whitespace();
         let mut values = Vec::new();
-        if self._consume(b']') { return Ok(JsonValue::Array(values)); }
+        if self._consume(b']') {
+            return Ok(JsonValue::Array(values));
+        }
         loop {
             values.push(self._value()?);
             self._whitespace();
-            if self._consume(b']') { break; }
+            if self._consume(b']') {
+                break;
+            }
             self._take(b',')?;
         }
         Ok(JsonValue::Array(values))
@@ -976,23 +1170,39 @@ impl<'a> JsonParser<'a> {
         self._take(b'"')?;
         let mut out = String::new();
         loop {
-            let Some(byte) = self._peek() else { return self._error("string 未闭合"); };
-            if byte == b'"' { self.pos += 1; return Ok(out); }
-            if byte < 0x20 { return self._error("string 含未转义控制字符"); }
+            let Some(byte) = self._peek() else {
+                return self._error("string 未闭合");
+            };
+            if byte == b'"' {
+                self.pos += 1;
+                return Ok(out);
+            }
+            if byte < 0x20 {
+                return self._error("string 含未转义控制字符");
+            }
             if byte != b'\\' {
-                let Some(ch) = self.text[self.pos..].chars().next() else { return self._error("无效 UTF-8 string"); };
+                let Some(ch) = self.text[self.pos..].chars().next() else {
+                    return self._error("无效 UTF-8 string");
+                };
                 out.push(ch);
                 self.pos += ch.len_utf8();
                 continue;
             }
             self.pos += 1;
             let escape_pos = self.pos;
-            let Some(escape) = self._peek() else { return self._error("string 转义未完成"); };
+            let Some(escape) = self._peek() else {
+                return self._error("string 转义未完成");
+            };
             self.pos += 1;
             match escape {
-                b'"' => out.push('"'), b'\\' => out.push('\\'), b'/' => out.push('/'),
-                b'b' => out.push('\u{0008}'), b'f' => out.push('\u{000C}'), b'n' => out.push('\n'),
-                b'r' => out.push('\r'), b't' => out.push('\t'),
+                b'"' => out.push('"'),
+                b'\\' => out.push('\\'),
+                b'/' => out.push('/'),
+                b'b' => out.push('\u{0008}'),
+                b'f' => out.push('\u{000C}'),
+                b'n' => out.push('\n'),
+                b'r' => out.push('\r'),
+                b't' => out.push('\t'),
                 b'u' => {
                     let code = self._unicode_escape()?;
                     let Some(ch) = char::from_u32(code) else {
@@ -1001,13 +1211,18 @@ impl<'a> JsonParser<'a> {
                     };
                     out.push(ch);
                 }
-                _ => { self.pos = escape_pos; return self._error("未知 string 转义"); }
+                _ => {
+                    self.pos = escape_pos;
+                    return self._error("未知 string 转义");
+                }
             }
         }
     }
 
     fn _unicode_escape(&mut self) -> Result<u32> {
-        if self.pos + 4 > self.text.len() { return self._error("Unicode 转义不足四个十六进制字符"); }
+        if self.pos + 4 > self.text.len() {
+            return self._error("Unicode 转义不足四个十六进制字符");
+        }
         let mut value = 0u32;
         for _ in 0..4 {
             let byte = self.text.as_bytes()[self.pos];
@@ -1028,36 +1243,80 @@ impl<'a> JsonParser<'a> {
         self._consume(b'-');
         match self._peek() {
             Some(b'0') => self.pos += 1,
-            Some(b'1'..=b'9') => { self.pos += 1; while matches!(self._peek(), Some(b'0'..=b'9')) { self.pos += 1; } }
+            Some(b'1'..=b'9') => {
+                self.pos += 1;
+                while matches!(self._peek(), Some(b'0'..=b'9')) {
+                    self.pos += 1;
+                }
+            }
             _ => return self._error("number 整数部分非法"),
         }
         if self._consume(b'.') {
             let decimal_start = self.pos;
-            while matches!(self._peek(), Some(b'0'..=b'9')) { self.pos += 1; }
-            if self.pos == decimal_start { return self._error("number 小数部分缺少数字"); }
+            while matches!(self._peek(), Some(b'0'..=b'9')) {
+                self.pos += 1;
+            }
+            if self.pos == decimal_start {
+                return self._error("number 小数部分缺少数字");
+            }
         }
         if matches!(self._peek(), Some(b'e' | b'E')) {
             self.pos += 1;
-            if matches!(self._peek(), Some(b'+' | b'-')) { self.pos += 1; }
+            if matches!(self._peek(), Some(b'+' | b'-')) {
+                self.pos += 1;
+            }
             let exponent_start = self.pos;
-            while matches!(self._peek(), Some(b'0'..=b'9')) { self.pos += 1; }
-            if self.pos == exponent_start { return self._error("number 指数部分缺少数字"); }
+            while matches!(self._peek(), Some(b'0'..=b'9')) {
+                self.pos += 1;
+            }
+            if self.pos == exponent_start {
+                return self._error("number 指数部分缺少数字");
+            }
         }
         let raw = &self.text[start..self.pos];
-        let value = raw.parse::<f64>().map_err(|_| anyhow!("JSON 第 {} 字节: 无法解析 number", start))?;
-        if !value.is_finite() { return self._error("number 超出有限范围"); }
+        let value = raw
+            .parse::<f64>()
+            .map_err(|_| anyhow!("JSON 第 {} 字节: 无法解析 number", start))?;
+        if !value.is_finite() {
+            return self._error("number 超出有限范围");
+        }
         Ok(value)
     }
 
     fn _literal(&mut self, literal: &str) -> Result<()> {
-        if self.text[self.pos..].starts_with(literal) { self.pos += literal.len(); Ok(()) }
-        else { self._error(&format!("期待 {literal}")) }
+        if self.text[self.pos..].starts_with(literal) {
+            self.pos += literal.len();
+            Ok(())
+        } else {
+            self._error(&format!("期待 {literal}"))
+        }
     }
-    fn _whitespace(&mut self) { while matches!(self._peek(), Some(b' ' | b'\n' | b'\r' | b'\t')) { self.pos += 1; } }
-    fn _peek(&self) -> Option<u8> { self.text.as_bytes().get(self.pos).copied() }
-    fn _consume(&mut self, expected: u8) -> bool { if self._peek() == Some(expected) { self.pos += 1; true } else { false } }
-    fn _take(&mut self, expected: u8) -> Result<()> { if self._consume(expected) { Ok(()) } else { self._error(&format!("期待字符 {:?}", expected as char)) } }
-    fn _error<T>(&self, message: &str) -> Result<T> { Err(anyhow!("JSON 第 {} 字节: {message}", self.pos)) }
+    fn _whitespace(&mut self) {
+        while matches!(self._peek(), Some(b' ' | b'\n' | b'\r' | b'\t')) {
+            self.pos += 1;
+        }
+    }
+    fn _peek(&self) -> Option<u8> {
+        self.text.as_bytes().get(self.pos).copied()
+    }
+    fn _consume(&mut self, expected: u8) -> bool {
+        if self._peek() == Some(expected) {
+            self.pos += 1;
+            true
+        } else {
+            false
+        }
+    }
+    fn _take(&mut self, expected: u8) -> Result<()> {
+        if self._consume(expected) {
+            Ok(())
+        } else {
+            self._error(&format!("期待字符 {:?}", expected as char))
+        }
+    }
+    fn _error<T>(&self, message: &str) -> Result<T> {
+        Err(anyhow!("JSON 第 {} 字节: {message}", self.pos))
+    }
 }
 
 /// 默认导出名使用已有日志模块相同的 Win32 本地时间来源，不引入 chrono/time。
@@ -1067,10 +1326,15 @@ pub fn default_export_filename() -> String {
         use windows::Win32::System::SystemInformation::GetLocalTime;
         // SAFETY: GetLocalTime 仅写入返回的 SYSTEMTIME 值。
         let now = unsafe { GetLocalTime() };
-        return format!("mai2control-settings-{:04}{:02}{:02}-{:02}{:02}{:02}.json", now.wYear, now.wMonth, now.wDay, now.wHour, now.wMinute, now.wSecond);
+        return format!(
+            "mai2control-settings-{:04}{:02}{:02}-{:02}{:02}{:02}.json",
+            now.wYear, now.wMonth, now.wDay, now.wHour, now.wMinute, now.wSecond
+        );
     }
     #[cfg(not(windows))]
-    { "mai2control-settings.json".to_string() }
+    {
+        "mai2control-settings.json".to_string()
+    }
 }
 
 fn local_timestamp() -> String {
@@ -1079,24 +1343,38 @@ fn local_timestamp() -> String {
         use windows::Win32::System::SystemInformation::GetLocalTime;
         // SAFETY: GetLocalTime 仅写入返回的 SYSTEMTIME 值。
         let now = unsafe { GetLocalTime() };
-        return format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:03}", now.wYear, now.wMonth, now.wDay, now.wHour, now.wMinute, now.wSecond, now.wMilliseconds);
+        return format!(
+            "{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:03}",
+            now.wYear, now.wMonth, now.wDay, now.wHour, now.wMinute, now.wSecond, now.wMilliseconds
+        );
     }
     #[cfg(not(windows))]
-    { "0000-00-00 00:00:00.000".to_string() }
+    {
+        "0000-00-00 00:00:00.000".to_string()
+    }
 }
 
 /// 使用系统原生对话框选择导入/导出路径；取消选择返回 Ok(None)，其他对话框错误带错误码。
 #[cfg(windows)]
 pub fn choose_settings_path(save: bool) -> Result<Option<PathBuf>> {
-    use windows::Win32::UI::Controls::Dialogs::{CommDlgExtendedError, GetOpenFileNameW, GetSaveFileNameW, OPENFILENAMEW};
+    use windows::Win32::UI::Controls::Dialogs::{
+        CommDlgExtendedError, GetOpenFileNameW, GetSaveFileNameW, OPENFILENAMEW,
+    };
     use windows::core::{PCWSTR, PWSTR};
 
-    let initial_dir = std::env::current_exe().ok().and_then(|p| p.parent().map(|p| p.to_path_buf()))
-        .or_else(|| std::env::current_dir().ok()).unwrap_or_else(|| PathBuf::from("."));
+    let initial_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from("."));
     let filter = _wide("JSON 设置文件 (*.json)\0*.json\0\0");
     let initial_dir = _wide(&initial_dir.to_string_lossy());
     let default_ext = _wide("json");
-    let default_name = if save { default_export_filename() } else { String::new() };
+    let default_name = if save {
+        default_export_filename()
+    } else {
+        String::new()
+    };
     let mut file = _wide(&default_name);
     file.resize(32_768, 0);
     let mut dialog = OPENFILENAMEW {
@@ -1110,12 +1388,18 @@ pub fn choose_settings_path(save: bool) -> Result<Option<PathBuf>> {
     };
     // SAFETY: OPENFILENAMEW 和 UTF-16 缓冲在同步系统调用返回前始终有效。
     let selected = unsafe {
-        if save { GetSaveFileNameW(&mut dialog).as_bool() } else { GetOpenFileNameW(&mut dialog).as_bool() }
+        if save {
+            GetSaveFileNameW(&mut dialog).as_bool()
+        } else {
+            GetOpenFileNameW(&mut dialog).as_bool()
+        }
     };
     if !selected {
         // 0 表示用户取消；非零才是需要展示的系统对话框错误。
         let error = unsafe { CommDlgExtendedError().0 };
-        if error == 0 { return Ok(None); }
+        if error == 0 {
+            return Ok(None);
+        }
         bail!("系统文件对话框失败，错误码 0x{error:08X}");
     }
     let end = file.iter().position(|&ch| ch == 0).unwrap_or(file.len());
@@ -1128,4 +1412,6 @@ pub fn choose_settings_path(_save: bool) -> Result<Option<PathBuf>> {
 }
 
 #[cfg(windows)]
-fn _wide(value: &str) -> Vec<u16> { value.encode_utf16().chain(std::iter::once(0)).collect() }
+fn _wide(value: &str) -> Vec<u16> {
+    value.encode_utf16().chain(std::iter::once(0)).collect()
+}

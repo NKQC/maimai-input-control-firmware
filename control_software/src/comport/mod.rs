@@ -23,7 +23,7 @@
 //!
 //! 若固件描述符顺序变化,只需改 [`mi_to_function`] 一处。
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 
 // ============================================================================
 // 公开数据结构(跨平台可见,便于上层无条件引用类型)
@@ -194,24 +194,24 @@ mod windows_impl {
     use super::*;
     use std::os::raw::c_void;
 
-    use windows::core::{GUID, PCWSTR, PWSTR};
     use windows::Win32::Devices::DeviceAndDriverInstallation::{
-        SetupDiCallClassInstaller, SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInfo,
-        SetupDiGetClassDevsW, SetupDiGetDeviceInstanceIdW, SetupDiGetDeviceRegistryPropertyW,
-        SetupDiOpenDevRegKey, SetupDiSetClassInstallParamsW, SetupDiSetDeviceRegistryPropertyW,
         DICS_FLAG_CONFIGSPECIFIC, DICS_FLAG_GLOBAL, DICS_PROPCHANGE, DIF_PROPERTYCHANGE,
         DIGCF_PRESENT, DIREG_DEV, HDEVINFO, SP_CLASSINSTALL_HEADER, SP_DEVINFO_DATA,
-        SP_PROPCHANGE_PARAMS, SPDRP_FRIENDLYNAME,
+        SP_PROPCHANGE_PARAMS, SPDRP_FRIENDLYNAME, SetupDiCallClassInstaller,
+        SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInfo, SetupDiGetClassDevsW,
+        SetupDiGetDeviceInstanceIdW, SetupDiGetDeviceRegistryPropertyW, SetupDiOpenDevRegKey,
+        SetupDiSetClassInstallParamsW, SetupDiSetDeviceRegistryPropertyW,
     };
     use windows::Win32::Foundation::{CloseHandle, ERROR_NO_MORE_ITEMS};
     use windows::Win32::Security::{
-        GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
+        GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation,
     };
     use windows::Win32::System::Registry::{
-        RegCloseKey, RegEnumValueW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW, HKEY,
-        HKEY_LOCAL_MACHINE, KEY_READ, KEY_SET_VALUE, REG_BINARY, REG_SZ,
+        HKEY, HKEY_LOCAL_MACHINE, KEY_READ, KEY_SET_VALUE, REG_BINARY, REG_SZ, RegCloseKey,
+        RegEnumValueW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW,
     };
     use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    use windows::core::{GUID, PCWSTR, PWSTR};
 
     /// Ports 设备安装类 GUID:{4D36E978-E325-11CE-BFC1-08002BE10318}
     const GUID_DEVCLASS_PORTS: GUID = GUID::from_u128(0x4D36E978_E325_11CE_BFC1_08002BE10318);
@@ -424,11 +424,17 @@ mod windows_impl {
                     match apply_one_action(&action, false) {
                         Ok(outcome) => items.push(AutoAssignItem {
                             function,
-                            message: format!("{}: 已是 {}，{}", label, target_name, outcome.message),
+                            message: format!(
+                                "{}: 已是 {}，{}",
+                                label, target_name, outcome.message
+                            ),
                         }),
                         Err(e) => items.push(AutoAssignItem {
                             function,
-                            message: format!("{}: PortName 为 {}，但 SERIALCOMM 核验失败: {}", label, target_name, e),
+                            message: format!(
+                                "{}: PortName 为 {}，但 SERIALCOMM 核验失败: {}",
+                                label, target_name, e
+                            ),
                         }),
                     }
                 }
@@ -469,7 +475,10 @@ mod windows_impl {
                     needs_replug = true;
                     items.push(AutoAssignItem {
                         function,
-                        message: format!("{}: {} -> {}，{}", label, port.port_name, target_name, outcome.message),
+                        message: format!(
+                            "{}: {} -> {}，{}",
+                            label, port.port_name, target_name, outcome.message
+                        ),
                     });
                 }
                 Err(e) => {
@@ -523,9 +532,8 @@ mod windows_impl {
     ) -> Option<String> {
         let mut buf = [0u16; 512];
         // SAFETY: h_devinfo/devinfo_data 有效,buf 为出参缓冲区,大小充足
-        let ok = unsafe {
-            SetupDiGetDeviceInstanceIdW(h_devinfo, devinfo_data, Some(&mut buf), None)
-        };
+        let ok =
+            unsafe { SetupDiGetDeviceInstanceIdW(h_devinfo, devinfo_data, Some(&mut buf), None) };
         if ok.is_err() {
             return None;
         }
@@ -563,7 +571,10 @@ mod windows_impl {
 
     /// 从已打开的注册表键读取一个 REG_SZ 字符串值。
     fn read_reg_sz(hkey: HKEY, value_name: &str) -> Option<String> {
-        let wide_name: Vec<u16> = value_name.encode_utf16().chain(std::iter::once(0)).collect();
+        let wide_name: Vec<u16> = value_name
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
         let mut buf = [0u8; 256];
         let mut buf_len: u32 = buf.len() as u32;
 
@@ -588,7 +599,10 @@ mod windows_impl {
             .chunks_exact(2)
             .map(|c| u16::from_le_bytes([c[0], c[1]]))
             .collect();
-        let end = u16_slice.iter().position(|&c| c == 0).unwrap_or(u16_slice.len());
+        let end = u16_slice
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or(u16_slice.len());
         Some(String::from_utf16_lossy(&u16_slice[..end]))
     }
 
@@ -615,7 +629,10 @@ mod windows_impl {
         message: String,
     }
 
-    fn apply_one_action(action: &AssignmentAction, rewrite_and_restart: bool) -> Result<ApplyOutcome> {
+    fn apply_one_action(
+        action: &AssignmentAction,
+        rewrite_and_restart: bool,
+    ) -> Result<ApplyOutcome> {
         let h_devinfo = unsafe {
             SetupDiGetClassDevsW(
                 Some(&GUID_DEVCLASS_PORTS as *const GUID),
@@ -691,10 +708,7 @@ mod windows_impl {
 
     /// 重新打开设备的 Device Parameters 键、读回**当前真实**的 PortName。
     /// 用于写入+重启后核对驱动是否真的接受了该端口号(而不是信任自己刚写进去的值)。
-    fn read_port_name_now(
-        h_devinfo: HDEVINFO,
-        devinfo_data: &SP_DEVINFO_DATA,
-    ) -> Option<String> {
+    fn read_port_name_now(h_devinfo: HDEVINFO, devinfo_data: &SP_DEVINFO_DATA) -> Option<String> {
         // SAFETY: h_devinfo/devinfo_data 在调用方枚举期间有效。
         let hkey = unsafe {
             SetupDiOpenDevRegKey(
@@ -760,14 +774,11 @@ mod windows_impl {
                 error
             ),
         };
-        let arbiter_status = match _update_com_name_arbiter(
-            target_port,
-            former_port,
-            &serialcomm_ports,
-        ) {
-            Ok(()) => format!("COM Name Arbiter 已登记 {}", target_port),
-            Err(error) => format!("COM Name Arbiter 登记警告: {}", error),
-        };
+        let arbiter_status =
+            match _update_com_name_arbiter(target_port, former_port, &serialcomm_ports) {
+                Ok(()) => format!("COM Name Arbiter 已登记 {}", target_port),
+                Err(error) => format!("COM Name Arbiter 登记警告: {}", error),
+            };
 
         Ok(ApplyOutcome {
             message: format!(
@@ -847,10 +858,7 @@ mod windows_impl {
     ) -> Result<String> {
         let original = _read_friendly_name(h_devinfo, devinfo_data)?;
         let updated = _replace_friendly_port(&original, target_port);
-        let wide: Vec<u16> = updated
-            .encode_utf16()
-            .chain(std::iter::once(0))
-            .collect();
+        let wide: Vec<u16> = updated.encode_utf16().chain(std::iter::once(0)).collect();
         let bytes: Vec<u8> = wide.iter().flat_map(|code| code.to_le_bytes()).collect();
         unsafe {
             SetupDiSetDeviceRegistryPropertyW(
@@ -945,10 +953,7 @@ mod windows_impl {
                     _set_comdb_bit(&mut comdb, former_number, false);
                 }
             }
-            let value_name: Vec<u16> = "ComDB"
-                .encode_utf16()
-                .chain(std::iter::once(0))
-                .collect();
+            let value_name: Vec<u16> = "ComDB".encode_utf16().chain(std::iter::once(0)).collect();
             let status = unsafe {
                 RegSetValueExW(
                     hkey,
@@ -971,7 +976,10 @@ mod windows_impl {
     }
 
     fn _read_reg_binary(hkey: HKEY, value_name: &str) -> Result<Vec<u8>> {
-        let wide_name: Vec<u16> = value_name.encode_utf16().chain(std::iter::once(0)).collect();
+        let wide_name: Vec<u16> = value_name
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
         let mut size = 0u32;
         // windows 0.62 的绑定要求这里是 REG_VALUE_TYPE 而不是裸 u32。
         let mut value_type = windows::Win32::System::Registry::REG_VALUE_TYPE(0);
@@ -1028,7 +1036,11 @@ mod windows_impl {
 
     fn _parse_com_number(port: &str) -> Option<u16> {
         let upper = port.trim().to_ascii_uppercase();
-        upper.strip_prefix("COM")?.parse::<u16>().ok().filter(|number| *number > 0)
+        upper
+            .strip_prefix("COM")?
+            .parse::<u16>()
+            .ok()
+            .filter(|number| *number > 0)
     }
 
     fn _decode_utf16le(bytes: &[u8]) -> Option<String> {
@@ -1039,7 +1051,10 @@ mod windows_impl {
             .chunks_exact(2)
             .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
             .collect();
-        let end = chars.iter().position(|code| *code == 0).unwrap_or(chars.len());
+        let end = chars
+            .iter()
+            .position(|code| *code == 0)
+            .unwrap_or(chars.len());
         Some(String::from_utf16_lossy(&chars[..end]))
     }
 
@@ -1051,8 +1066,8 @@ mod windows_impl {
                 cbSize: std::mem::size_of::<SP_CLASSINSTALL_HEADER>() as u32,
                 InstallFunction: DIF_PROPERTYCHANGE,
             },
-            StateChange: DICS_PROPCHANGE,          // 属性变更 → 触发设备重启(而非 enable/disable)
-            Scope: DICS_FLAG_CONFIGSPECIFIC,        // 仅当前配置(等价设备管理器默认行为)
+            StateChange: DICS_PROPCHANGE, // 属性变更 → 触发设备重启(而非 enable/disable)
+            Scope: DICS_FLAG_CONFIGSPECIFIC, // 仅当前配置(等价设备管理器默认行为)
             HwProfile: 0,
         };
         // SAFETY: h_devinfo/devinfo_data 有效; params 为合法 SP_PROPCHANGE_PARAMS。
@@ -1076,14 +1091,16 @@ mod windows_impl {
 
     /// 向已打开的注册表键写入一个 REG_SZ 字符串值(含 null 终止符)。
     fn write_reg_sz(hkey: HKEY, value_name: &str, value: &str) -> Result<()> {
-        let wide_name: Vec<u16> = value_name.encode_utf16().chain(std::iter::once(0)).collect();
+        let wide_name: Vec<u16> = value_name
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
         let wide_value: Vec<u16> = value.encode_utf16().chain(std::iter::once(0)).collect();
         let bytes: Vec<u8> = wide_value.iter().flat_map(|c| c.to_le_bytes()).collect();
 
         // SAFETY: hkey 有效(调用方持有可写句柄),bytes 为合法 REG_SZ 编码。
-        let status = unsafe {
-            RegSetValueExW(hkey, PCWSTR(wide_name.as_ptr()), None, REG_SZ, Some(&bytes))
-        };
+        let status =
+            unsafe { RegSetValueExW(hkey, PCWSTR(wide_name.as_ptr()), None, REG_SZ, Some(&bytes)) };
         if status.is_err() {
             return Err(anyhow!("RegSetValueExW 写入 PortName 失败: {:?}", status));
         }

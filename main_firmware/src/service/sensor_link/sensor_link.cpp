@@ -725,14 +725,18 @@ void SensorLink::_handle_global_set(const HostFrame& frame, uint8_t* response, u
                            (static_cast<uint32_t>(frame.payload[2]) << 8) |
                            (static_cast<uint32_t>(frame.payload[3]) << 16) |
                            (static_cast<uint32_t>(frame.payload[4]) << 24);
-    // 合法性防护(与 PSoC 端一致): INACTIVE_SNS∈{1,2,4}; IDAC_GAIN_INIT 0..7; IDAC_MIN 0..127;
-    // RAW_TARGET 1..99(0/≥100 会让自动校准发散→railed)。MFS 分频不额外限制。
+    // 合法性防护(与 PSoC 端一致): INACTIVE_SNS∈{1,2,4}; IDAC_GAIN_INIT 0..6; IDAC_MIN 0..127;
+    // RAW_TARGET 1..99(0/≥100 会让自动校准发散→railed); MFS 分频 0..255(PSoC 侧字段是 uint8_t)。
     bool glegal = true;
     switch (gid) {
         case 0x01: glegal = (value == 1u) || (value == 2u) || (value == 4u); break; // INACTIVE_SNS
         case 0x02: glegal = (value <= 6u);                                   break; // IDAC_GAIN_INIT(0..6, 索引7越界崩溃)
         case 0x03: glegal = (value <= 127u);                                 break; // IDAC_MIN
         case 0x04: glegal = (value >= 1u) && (value <= 99u);                 break; // RAW_TARGET
+        // ★补齐原先缺失的围栏★: MFS 偏移落在 PSoC 的 uint8_t 字段, 之前两端都不查, 写 300 会被
+        // 静默截断成 44 且回显送回请求值, 上位机毫无察觉。现在与其它项同口径, 超范围直接 NAK。
+        case 0x05:
+        case 0x06: glegal = (value <= 255u);                                 break; // MFS_DIV_F1/F2
         case 0x07: glegal = (value <= 1u);                                   break; // IDAC_SENSE_CONFIG(0=sourcing,1=sinking)
         case 0x08: glegal = (value <= 1u);                                   break; // AUTO_CALIBRATE_EN(0/1)
         default: break;
@@ -840,9 +844,18 @@ void SensorLink::_handle_algo_upload(const HostFrame& frame, uint8_t* response, 
     }
     // 下发已受理(异步, 重活在 core1)。真实结果经 ALGO_GET_INFO 的 psoc_valid/len 回读对账,
     // 失败则由主循环上报 SELF_HEAL_EVENT(SH_ALGO_FALLBACK, detail=1)。
+    // ★把失败原因分开, 不要都报成同一句 SENSOR_ERROR★
+    // download_to_psoc 只有三个失败出口: 链路不可用 / 存储为空 / 入队失败。原先一律回
+    // "algo download enqueue failed", 于是链路瞬断也被说成入队失败, 排查时完全指错方向(实测踩过)。
+    // 链路类是【可重试】的, 必须回 DEVICE_BUSY 让上位机自动重试, 而不是 SENSOR_ERROR 让用户以为算法坏了。
+    if (!Psoc::getInstance()->link_ok()) {
+        *response_length = HostCmdCodec::encode_nak(frame.seq, HostCmdError::DEVICE_BUSY,
+            "PSoC 链路暂时不可用(可能正在重初始化), 请稍后重试", response, 512);
+        return;
+    }
     if (!store->download_to_psoc(Psoc::getInstance())) {
-        *response_length = HostCmdCodec::encode_nak(frame.seq, HostCmdError::SENSOR_ERROR,
-            "algo download enqueue failed", response, 512);
+        *response_length = HostCmdCodec::encode_nak(frame.seq, HostCmdError::DEVICE_BUSY,
+            "算法下发入队失败(core1 正忙于重校准/重初始化), 请稍后重试", response, 512);
         return;
     }
     *response_length = HostCmdCodec::encode_ack(frame.seq, response, 512);
@@ -1000,36 +1013,64 @@ void SensorLink::_handle_algo_get_cfg(const HostFrame& frame, uint8_t* response,
 }
 
 void SensorLink::_handle_algo_get_src(const HostFrame& frame, uint8_t* response, uint16_t* response_length) {
-    // 空请求 → [len(u16 LE), src bytes] RP2040 存的算法 C 源(映射表), 供回读还原可编辑 C。
+    // 请求 [offset(u16 LE)](空 payload = offset 0) → 响应 [total(u16 LE), offset(u16 LE), chunk]。
+    // 源最大 32KB, 单帧 payload 只有 4096, 故按 HOST_CMD_ALGO_SRC_CHUNK 分片, 由上位机按响应续请求。
+    if (frame.len != 0u && frame.len != 2u) {
+        *response_length = HostCmdCodec::encode_nak(frame.seq, HostCmdError::INVALID_PARAM,
+            "algo_get_src payload must be offset", response, 512);
+        return;
+    }
     PsocAlgo* store = PsocAlgo::getInstance();
-    const uint16_t n = store->src_len();
+    const uint32_t total = store->src_len();
+    uint32_t offset = 0u;
+    if (frame.len >= 2u) {
+        offset = static_cast<uint32_t>(frame.payload[0]) |
+                 (static_cast<uint32_t>(frame.payload[1]) << 8);
+    }
+    if (offset > total) {
+        *response_length = HostCmdCodec::encode_nak(frame.seq, HostCmdError::INVALID_PARAM,
+            "algo_get_src offset past end", response, 512);
+        return;
+    }
+    uint32_t n = total - offset;
+    if (n > (uint32_t)HOST_CMD_ALGO_SRC_CHUNK) n = (uint32_t)HOST_CMD_ALGO_SRC_CHUNK;
     HostFrame resp;
     resp.clear();
     resp.cmd = static_cast<uint8_t>(HostCmd::ALGO_GET_SRC);
     resp.flags = HOST_CMD_FLAG_RESPONSE;
     resp.seq = frame.seq;
-    resp.payload[0] = static_cast<uint8_t>(n);
-    resp.payload[1] = static_cast<uint8_t>(n >> 8);
-    if (n > 0u) { memcpy(&resp.payload[2], store->src(), n); }
-    resp.len = static_cast<uint16_t>(2u + n);
+    resp.payload[0] = static_cast<uint8_t>(total);
+    resp.payload[1] = static_cast<uint8_t>(total >> 8);
+    resp.payload[2] = static_cast<uint8_t>(offset);
+    resp.payload[3] = static_cast<uint8_t>(offset >> 8);
+    if (n > 0u) { memcpy(&resp.payload[4], store->src() + offset, n); }
+    resp.len = static_cast<uint16_t>(4u + n);
     *response_length = HostCmdCodec::encode_frame(resp, response, HOST_CMD_RESP_BUF_MAX);
 }
 
 void SensorLink::_handle_algo_set_src(const HostFrame& frame, uint8_t* response, uint16_t* response_length) {
-    // payload = [len(u16 LE), src bytes]; 存算法 C 源(已由上位机滤注释)+持久化。
-    if (frame.len < 2u) {
+    // payload = [offset(u16 LE), total(u16 LE), chunk]; 存算法 C 源(已由上位机滤注释)+持久化。
+    // 严格连续分片: 只有最后一片才让新源生效, 中途断掉不会把半份源固化进 flash。
+    if (frame.len < 4u) {
         *response_length = HostCmdCodec::encode_nak(frame.seq, HostCmdError::INVALID_PARAM,
             "algo_set_src header too short", response, 512);
         return;
     }
-    const uint16_t n = static_cast<uint16_t>(frame.payload[0]) |
-                       (static_cast<uint16_t>(frame.payload[1]) << 8);
-    if (n > PSOC_ALGO_SRC_MAX || (uint32_t)frame.len < 2u + (uint32_t)n) {
+    const uint32_t offset = static_cast<uint32_t>(frame.payload[0]) |
+                            (static_cast<uint32_t>(frame.payload[1]) << 8);
+    const uint32_t total  = static_cast<uint32_t>(frame.payload[2]) |
+                            (static_cast<uint32_t>(frame.payload[3]) << 8);
+    const uint32_t n = static_cast<uint32_t>(frame.len) - 4u;
+    if (total > PSOC_ALGO_SRC_MAX || offset > total || n > total - offset) {
         *response_length = HostCmdCodec::encode_nak(frame.seq, HostCmdError::INVALID_PARAM,
-            "algo_set_src len invalid", response, 512);
+            "algo_set_src chunk range invalid", response, 512);
         return;
     }
-    PsocAlgo::getInstance()->set_src(&frame.payload[2], n);
+    if (!PsocAlgo::getInstance()->set_src_chunk(offset, total, &frame.payload[4], n)) {
+        *response_length = HostCmdCodec::encode_nak(frame.seq, HostCmdError::INVALID_PARAM,
+            "algo_set_src chunk not contiguous", response, 512);
+        return;
+    }
     *response_length = HostCmdCodec::encode_ack(frame.seq, response, 512);
 }
 

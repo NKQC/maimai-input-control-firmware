@@ -1,35 +1,160 @@
 // ============================================================================
-// 触控键盘映射 / 物理键盘 占位页 (Phase 1)
+// 触控键盘映射(组合语义) / 物理键盘
 // ============================================================================
 
-import { VerticalBox, HorizontalBox, CheckBox, SpinBox, ScrollView, Button } from "std-widgets.slint";
-import { KeyCaptureBox } from "../common/widgets.slint";
+import { VerticalBox, HorizontalBox, CheckBox, SpinBox, ScrollView, Button, ComboBox } from "std-widgets.slint";
+import { KeyCaptureBox, CollapsibleSection, PlotPath } from "../common/widgets.slint";
 import { Theme } from "../common/theme.slint";
+
+// 逻辑通道池里的一个分区块。选中 = 该分区进入"待新建映射"的分区集合。
+component ZoneChip inherits Rectangle {
+    in property <string> label;
+    in property <bool> picked: false;
+    in property <bool> used: false;   // 已被某条映射占用(仅提示, 不禁止复用)
+    callback toggled();
+
+    width: 52px;
+    height: 26px;
+    border-radius: 4px;
+    border-width: root.picked ? 2px : 1px;
+    border-color: root.picked ? #ffd166 : (root.used ? Theme.accent : Theme.border-light);
+    background: root.picked ? #3a3320 : (touch.has-hover ? #262d34 : #1e2429);
+
+    Text {
+        text: root.label;
+        font-size: Theme.fs-small;
+        font-weight: root.picked ? 700 : 400;
+        color: root.picked ? #ffd166 : (root.used ? Theme.accent : Theme.text-sub);
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        width: parent.width;
+        height: parent.height;
+    }
+
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.toggled(); }
+    }
+}
+
+// 已保存的一条组合映射。分区集合与键组合只读展示(要改就删了重建, 保持单一编辑路径),
+// 两个时间参数可就地改。
+component ComboRow inherits Rectangle {
+    in property <int> index;
+    in property <string> zones_text;
+    in property <string> keys_text;
+    in property <int> delay_ms;
+    in property <int> max_hold_ms;
+    callback hold_edited(int, int);   // delay, maxhold
+    callback removed();
+
+    height: 62px;
+    border-radius: 5px;
+    border-width: 1px;
+    border-color: Theme.border-light;
+    background: #1c2126;
+
+    VerticalLayout {
+        padding: 5px;
+        spacing: 2px;
+        HorizontalLayout {
+            spacing: 8px;
+            Text {
+                text: "#" + (root.index + 1);
+                width: 26px;
+                font-weight: 700;
+                color: Theme.text-sub;
+                font-size: Theme.fs-small;
+                vertical-alignment: center;
+            }
+            Text {
+                text: root.zones_text;
+                color: Theme.accent;
+                font-size: Theme.fs-small;
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+                overflow: elide;
+            }
+            Text {
+                text: "→ " + root.keys_text;
+                width: 150px;
+                color: Theme.text-title;
+                font-size: Theme.fs-small;
+                vertical-alignment: center;
+                overflow: elide;
+            }
+            Button {
+                text: @tr("删除");
+                clicked => { root.removed(); }
+            }
+        }
+        HorizontalLayout {
+            spacing: 6px;
+            Text {
+                text: @tr("触发延时(ms)");
+                font-size: Theme.fs-small;
+                color: Theme.text-sub;
+                vertical-alignment: center;
+            }
+            SpinBox {
+                width: 112px;
+                minimum: 0;
+                maximum: 65535;
+                value: root.delay_ms;
+                edited(v) => { root.hold_edited(v, root.max_hold_ms); }
+            }
+            Text {
+                text: @tr("自动抬起(ms)");
+                font-size: Theme.fs-small;
+                color: Theme.text-sub;
+                vertical-alignment: center;
+            }
+            SpinBox {
+                width: 112px;
+                minimum: 0;
+                maximum: 65535;
+                value: root.max_hold_ms;
+                edited(v) => { root.hold_edited(root.delay_ms, v); }
+            }
+            Rectangle { horizontal-stretch: 1; }
+        }
+    }
+}
 
 export component KeyMapPage inherits Rectangle {
     in property <bool> keyboard_map_en: false;
-    // 34 分区当前选择的键码下拉索引(由 main.rs 从 kbd_touch_keycode 换算), 共享键名表。
-    in property <[string]> zone_display: []; // 34 分区当前组合键显示
-    in property <[string]> zone_names: []; // 34 分区名 A1-E8
-    // 数值单位为毫秒：0..65535，与设备 kbd.zhdNN/kbd.zmhNN KV 完全一致。
-    in property <[int]> zone_hold_delay: [];
-    in property <[int]> zone_hold_max: [];
+    in property <[string]> zone_names: [];   // 34 分区名 A1-E8
+    // ---- 组合映射(多分区 → 多键) ----
+    // 真相源在 AppController::kbd_combo_*; 本页只展示与转发事件。
+    in property <[string]> combo_zones_text: [];   // 每条的分区集合可读文本
+    in property <[string]> combo_keys_text: [];    // 每条的键组合可读文本
+    in property <[int]> combo_delay: [];
+    in property <[int]> combo_max_hold: [];
+    in property <[bool]> zone_used: [];            // 34 位: 该分区是否已被某条映射用到
+    in property <[bool]> zone_picked: [];          // 34 位: 该分区是否在"待新建"集合里
+    in property <string> pending_keys_text: "";    // 待新建映射已抓到的键组合
+    in property <string> combo_status: "";         // 设备支持性/条数等提示
+    in property <int> combo_count: 0;
 
     callback set_keyboard_map_en(bool);
-    callback zone_captured(int, string, bool, bool, bool, bool);  // zone, text, ctrl,shift,alt,gui
-    callback zone_cleared(int);
-    callback zone_hold_set(int, int, int);
     callback refresh_kbd();
+    callback combo_zone_toggled(int);
+    callback combo_zones_clear();
+    callback combo_captured(string, bool, bool, bool, bool);  // text, ctrl,shift,alt,gui
+    callback combo_keys_clear();
+    callback combo_add();
+    callback combo_removed(int);
+    callback combo_hold_set(int, int, int);
 
     VerticalBox {
         padding: 8px;
-        spacing: 8px;
+        spacing: 6px;
 
         HorizontalBox {
             padding: 0px;
             spacing: 8px;
             Text {
-                text: @tr("触控分区触发时输出所选 HID 键。长按 X 毫秒后才触发：按住达到该时长才真正输出按键，中途松开则不输出；0=立即触发；最长按住 X 毫秒自动抬起：已输出的按键最长保持该时长后自动松开；0=不自动抬起。数值单位毫秒。");
+                text: @tr("组合映射：一条映射 = 选定的若干触控分区【全部同时按下】才触发，输出选定的若干按键【同时按下】。触发延时从“全部分区都按住”起算，其中任一分区松开即视为松开。只要分区集合不完全相同，就可以再加一条。改动进草稿，需点左下角“保存到设备”才下发。");
                 color: Theme.text-sub;
                 wrap: word-wrap;
                 horizontal-stretch: 1;
@@ -38,84 +163,337 @@ export component KeyMapPage inherits Rectangle {
             Button { text: @tr("刷新"); clicked => { root.refresh_kbd(); } }
         }
 
-        CheckBox {
-            text: @tr("启用触控键盘映射");
-            checked: root.keyboard_map_en;
-            toggled => { root.set_keyboard_map_en(self.checked); }
+        HorizontalBox {
+            padding: 0px;
+            spacing: 10px;
+            CheckBox {
+                text: @tr("启用触控键盘映射");
+                checked: root.keyboard_map_en;
+                toggled => { root.set_keyboard_map_en(self.checked); }
+            }
+            Text {
+                text: root.combo_status;
+                color: Theme.text-sub;
+                font-size: Theme.fs-small;
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+                overflow: elide;
+            }
         }
 
+        // 逻辑通道池: 34 个分区块。点一下进/出"待新建"集合。
+        Text {
+            text: @tr("逻辑通道池（点选参与本条映射的分区）");
+            font-size: Theme.fs-small;
+            color: Theme.text-title;
+        }
+        // 分区池用绝对定位网格, 列数按本页宽度自适应 —— 与全通道页同一套已验证的做法。
+        // ★不要用 HorizontalLayout 逐行摆★: 原先写成"前 17 个一行、其余一行", 窄窗口必然横向溢出被裁;
+        // 而且用 width:0 的占位块隐藏另一半时, 占位块仍然吃 HorizontalLayout 的 spacing, 第二行会被
+        // 整体右推(34 × 4px)。绝对定位没有这两个问题。
+        // ★依赖链安全★: height ← rows ← cols ← root.width(本页宽度, 由 TabWidget 给),
+        // 全程不碰自身高度也不碰滚动条的 visible-width, 因此不会形成布局环。
+        pool := Rectangle {
+            property <float> cols: Math.max(1, Math.floor((root.width - 24px) / 56px));
+            property <float> rows: Math.ceil(root.zone_names.length / self.cols);
+            height: self.rows * 30px;
+            for name[i] in root.zone_names: ZoneChip {
+                x: Math.mod(i, pool.cols) * 56px;
+                y: Math.floor(i / pool.cols) * 30px;
+                label: name;
+                picked: i < root.zone_picked.length ? root.zone_picked[i] : false;
+                used: i < root.zone_used.length ? root.zone_used[i] : false;
+                toggled => { root.combo_zone_toggled(i); }
+            }
+        }
+
+        // 新建条: 已选分区 + 抓键 + 添加。
+        Rectangle {
+            height: 76px;
+            border-radius: 5px;
+            border-width: 1px;
+            border-color: #ffd166;
+            background: #241f14;
+            VerticalLayout {
+                padding: 6px;
+                spacing: 6px;
+                HorizontalLayout {
+                    spacing: 8px;
+                    Text {
+                        text: @tr("新建映射 · 按键组合:");
+                        font-size: Theme.fs-small;
+                        color: #ffd166;
+                        vertical-alignment: center;
+                        width: 150px;
+                    }
+                    KeyCaptureBox {
+                        horizontal-stretch: 1;
+                        display: root.pending_keys_text;
+                        captured(t, c, s, a, g) => { root.combo_captured(t, c, s, a, g); }
+                    }
+                    Button {
+                        text: @tr("清空按键");
+                        clicked => { root.combo_keys_clear(); }
+                    }
+                }
+                HorizontalLayout {
+                    spacing: 8px;
+                    Button {
+                        text: @tr("清空已选分区");
+                        clicked => { root.combo_zones_clear(); }
+                    }
+                    Button {
+                        text: @tr("添加为一条映射");
+                        primary: true;
+                        clicked => { root.combo_add(); }
+                    }
+                    Rectangle { horizontal-stretch: 1; }
+                }
+            }
+        }
+
+        Text {
+            text: @tr("已有映射（") + root.combo_count + @tr(" 条）");
+            font-size: Theme.fs-small;
+            color: Theme.text-title;
+        }
         ScrollView {
             vertical-stretch: 1;
-            VerticalBox {
+            VerticalLayout {
                 padding: 0px;
                 spacing: 4px;
-                for z in 34: VerticalBox {
-                    padding: 2px;
-                    spacing: 2px;
-                    HorizontalBox {
-                        spacing: Theme.gap;
-                        Text {
-                            text: root.zone_names[z];
-                            color: Theme.text-sub;
-                            vertical-alignment: center;
-                            min-width: 56px;
-                        }
-                        KeyCaptureBox {
-                            horizontal-stretch: 1;
-                            display: z < root.zone_display.length ? root.zone_display[z] : "";
-                            captured(t, c, s, a, g) => { root.zone_captured(z, t, c, s, a, g); }
-                        }
-                        Button {
-                            text: @tr("清除");
-                            clicked => { root.zone_cleared(z); }
-                        }
-                    }
-                    HorizontalBox {
-                        spacing: Theme.gap;
-                        Text { text: @tr("触发延时(ms)"); font-size: Theme.fs-small; vertical-alignment: center; }
-                        SpinBox {
-                            width: 112px;
-                            minimum: 0;
-                            maximum: 65535;
-                            value: z < root.zone_hold_delay.length ? root.zone_hold_delay[z] : 0;
-                            edited(v) => { root.zone_hold_set(z, v, z < root.zone_hold_max.length ? root.zone_hold_max[z] : 0); }
-                        }
-                        Text { text: @tr("自动抬起(ms)"); font-size: Theme.fs-small; vertical-alignment: center; }
-                        SpinBox {
-                            width: 112px;
-                            minimum: 0;
-                            maximum: 65535;
-                            value: z < root.zone_hold_max.length ? root.zone_hold_max[z] : 0;
-                            edited(v) => { root.zone_hold_set(z, z < root.zone_hold_delay.length ? root.zone_hold_delay[z] : 0, v); }
-                        }
-                    }
+                alignment: start;
+                for zt[i] in root.combo_zones_text: ComboRow {
+                    index: i;
+                    zones_text: zt;
+                    keys_text: i < root.combo_keys_text.length ? root.combo_keys_text[i] : "";
+                    delay_ms: i < root.combo_delay.length ? root.combo_delay[i] : 0;
+                    max_hold_ms: i < root.combo_max_hold.length ? root.combo_max_hold[i] : 0;
+                    hold_edited(d, m) => { root.combo_hold_set(i, d, m); }
+                    removed => { root.combo_removed(i); }
                 }
             }
         }
     }
 }
 
+// 逻辑分析仪的一个通道泳道: 左侧通道名 + 中间波形(原始/去抖后/实际输出三条) + 右侧本通道触发读数。
+// 12 条泳道共用同一横轴(时间), 因此触发标记的 x 语义在所有泳道之间可直接比较。
+component LaneRow inherits Rectangle {
+    in property <string> label;
+    in property <string> raw_path;    // 去抖前阶梯波形(viewbox 1000×100)
+    in property <string> deb_path;    // 仅去抖后阶梯波形
+    in property <string> out_path;    // 实际输出 HID 阶梯波形
+    in property <float> trig_x: -1;   // 本通道去抖后首个上升沿(0..1000); <0 = 窗口内无触发
+    in property <string> trig_text;
+    in property <bool> raw_on: false;
+    in property <bool> deb_on: false;
+    in property <bool> out_on: false;
+
+    height: 26px;
+    HorizontalLayout {
+        spacing: 4px;
+        Text {
+            text: root.label;
+            width: 58px;
+            font-size: Theme.fs-small;
+            color: Theme.text-sub;
+            vertical-alignment: center;
+        }
+        // 原始/去抖后/输出三个即时状态点: 波形之外还要能一眼看出"现在"是什么状态。
+        Rectangle {
+            width: 10px; height: 10px; y: 8px;
+            border-radius: 5px;
+            background: root.raw_on ? #6a9ec9 : #2a3138;
+        }
+        Rectangle {
+            width: 10px; height: 10px; y: 8px;
+            border-radius: 5px;
+            background: root.deb_on ? Theme.accent : #2a3138;
+        }
+        Rectangle {
+            width: 10px; height: 10px; y: 8px;
+            border-radius: 5px;
+            background: root.out_on ? Theme.ok : #2a3138;
+        }
+        plot := Rectangle {
+            horizontal-stretch: 1;
+            background: #14181c;
+            border-width: 1px;
+            border-color: Theme.border-light;
+            clip: true;
+            PlotPath {
+                vh: 100;
+                commands: root.raw_path;
+                stroke: #6a9ec9;
+                stroke-width: 1px;
+            }
+            PlotPath {
+                vh: 100;
+                commands: root.deb_path;
+                stroke: Theme.accent;
+                stroke-width: 1px;
+            }
+            PlotPath {
+                vh: 100;
+                commands: root.out_path;
+                stroke: Theme.ok;
+                stroke-width: 1px;
+            }
+            // 触发标记: 本通道在窗口内去抖后态的第一个上升沿。逐通道独立, 互不影响。
+            if root.trig_x >= 0: Rectangle {
+                x: parent.width * (root.trig_x / 1000);
+                width: 1px;
+                height: parent.height;
+                background: #ffd166;
+            }
+        }
+        Text {
+            text: root.trig_text;
+            width: 104px;
+            font-size: Theme.fs-small;
+            color: root.trig_x >= 0 ? #ffd166 : Theme.muted;
+            vertical-alignment: center;
+            horizontal-alignment: right;
+            overflow: elide;
+        }
+    }
+}
+
+// 单个物理键的全部参数(极性 / 防抖 / 长按)收在一行两栏里 —— 不让用户在两个页面之间来回找。
+component PhysKeyRow inherits Rectangle {
+    in property <int> index;
+    in property <bool> pressed: false;
+    in property <bool> raw_on: false;
+    in property <string> display;
+    in property <bool> pol_high: false;
+    in property <int> debounce_us: 0;
+    in property <int> hold_delay: 0;
+    in property <int> hold_max: 0;
+    callback captured(string, bool, bool, bool, bool);
+    callback cleared();
+    callback keycfg_set(bool, int);
+    callback hold_set(int, int);
+
+    height: 66px;
+    border-radius: 5px;
+    border-width: 1px;
+    border-color: Theme.border-light;
+    background: #1c2126;
+
+    VerticalLayout {
+        padding: 4px;
+        spacing: 3px;
+        HorizontalLayout {
+            spacing: Theme.gap;
+            Rectangle {
+                width: 16px;
+                height: 16px;
+                y: 6px;
+                border-radius: 4px;
+                border-width: 1px;
+                border-color: Theme.border-light;
+                background: root.pressed ? Theme.ok : (root.raw_on ? #3d5871 : #262b31);
+            }
+            Text {
+                text: @tr("键 ") + (root.index + 1) + " (GPIO" + (root.index + 1) + ")";
+                color: #d0d6dd;
+                font-size: Theme.fs-small;
+                vertical-alignment: center;
+                min-width: 92px;
+            }
+            KeyCaptureBox {
+                horizontal-stretch: 1;
+                display: root.display;
+                captured(t, c, s, a, g) => { root.captured(t, c, s, a, g); }
+            }
+            Button {
+                text: @tr("清除");
+                clicked => { root.cleared(); }
+            }
+        }
+        HorizontalLayout {
+            spacing: Theme.gap;
+            CheckBox {
+                text: @tr("高电平触发");
+                checked: root.pol_high;
+                toggled => { root.keycfg_set(self.checked, root.debounce_us); }
+            }
+            Text { text: @tr("防抖(us)"); font-size: Theme.fs-small; vertical-alignment: center; }
+            SpinBox {
+                width: 96px;
+                minimum: 0;
+                // 上限与固件 KeyboardService::DEBOUNCE_US_MAX 同源: 越界固件会 NAK, 不给用户设的机会。
+                maximum: 10000;
+                value: root.debounce_us;
+                edited(v) => { root.keycfg_set(root.pol_high, v); }
+            }
+            Text { text: @tr("触发延时(ms)"); font-size: Theme.fs-small; vertical-alignment: center; }
+            SpinBox {
+                width: 96px;
+                minimum: 0;
+                maximum: 65535;
+                value: root.hold_delay;
+                edited(v) => { root.hold_set(v, root.hold_max); }
+            }
+            Text { text: @tr("自动抬起(ms)"); font-size: Theme.fs-small; vertical-alignment: center; }
+            SpinBox {
+                width: 96px;
+                minimum: 0;
+                maximum: 65535;
+                value: root.hold_max;
+                edited(v) => { root.hold_set(root.hold_delay, v); }
+            }
+            Rectangle { horizontal-stretch: 1; }
+        }
+    }
+}
+
 export component PhysKbdPage inherits Rectangle {
-    in property <[bool]> phys_pressed: [];   // 12 键实时按下态
+    in property <[bool]> phys_pressed: [];   // 12 键去抖后按下态
+    in property <[bool]> phys_raw: [];       // 12 键去抖前(已按极性归一)
+    in property <[bool]> phys_out: [];       // 12 键实际输出 HID(经长按状态机)
     in property <[string]> phys_display: []; // 12 键当前组合键显示
     // 数值单位为毫秒：0..65535，与设备 kbd.hdNN/kbd.mhNN KV 完全一致。
     in property <[int]> phys_hold_delay: [];
     in property <[int]> phys_hold_max: [];
+    // 每键触发极性(true=高电平触发)与防抖窗(us, 0..10000)。设备 kbd.plNN / kbd.dbNN。
+    in property <[bool]> phys_pol_high: [];
+    in property <[int]> phys_debounce: [];
+    in property <string> keycfg_status: "";
+    // ---- 逻辑分析仪(12 通道共用一张图) ----
+    in property <[string]> la_raw_paths: [];
+    in property <[string]> la_deb_paths: [];
+    in property <[string]> la_out_paths: [];
+    in property <[string]> la_trig_text: [];
+    in property <[float]> la_trig_x: [];
+    in property <[string]> la_time_labels: [];   // 横轴 5 个刻度(左=窗口起点, 右=最新)
+    in property <string> la_status: "";
+    in property <string> la_span_text: "";
+    in property <[string]> la_window_names: [];
+    in property <int> la_window_index: 0;
+    // 折叠态。三个抽屉各自独立, 默认只展开"当前按键触发状态"(进页即可看到实时态)。
+    in-out property <bool> live_expanded: true;
+    in-out property <bool> keys_expanded: false;
+    in-out property <bool> la_expanded: false;
 
     callback phys_captured(int, string, bool, bool, bool, bool);  // idx, text, ctrl,shift,alt,gui
     callback phys_cleared(int);
     callback phys_hold_set(int, int, int);
+    callback phys_keycfg_set(int, bool, int);   // idx, 高电平触发, 防抖 us
+    callback la_window_set(int);
+    callback la_clear();
     callback refresh_kbd();
 
     VerticalBox {
         padding: 8px;
-        spacing: 8px;
+        spacing: 6px;
 
         HorizontalBox {
             padding: 0px;
             spacing: 8px;
             Text {
-                text: @tr("为 GPIO1–12 物理键设置输出 HID 键。长按 X 毫秒后才触发：按住达到该时长才真正输出按键，中途松开则不输出；0=立即触发；最长按住 X 毫秒自动抬起：已输出的按键最长保持该时长后自动松开；0=不自动抬起。数值单位毫秒。");
+                text: @tr("GPIO1–12 物理键。触发极性默认低电平触发（按下=接地）；防抖 0–10000us，0=不去抖，每键各自独立计时。触发延时=按住达到该时长才真正输出；自动抬起=输出后最长保持该时长即自动松开；两者 0 表示禁用。极性/防抖/长按改动均进草稿，需点左下角“保存到设备”才下发。");
                 color: Theme.text-sub;
                 wrap: word-wrap;
                 horizontal-stretch: 1;
@@ -126,56 +504,201 @@ export component PhysKbdPage inherits Rectangle {
 
         ScrollView {
             vertical-stretch: 1;
-            VerticalBox {
+            VerticalLayout {
                 padding: 0px;
-                spacing: 5px;
-                for i in 12: VerticalBox {
-                    padding: 2px;
+                spacing: 6px;
+                alignment: start;
+
+                // ---- 抽屉 1: 当前按键触发状态 ----
+                CollapsibleSection {
+                    title: @tr("当前按键触发状态");
+                    summary: root.keycfg_status;
+                    expanded <=> root.live_expanded;
+                    Text {
+                        text: @tr("原始=去抖前的电平(已按极性归一)，去抖后=防抖判定后的按下态，输出=再经过长按状态机后真正发给主机的按键。原始→去抖后显示防抖耗时，去抖后→输出显示长按延迟。");
+                        color: Theme.text-sub;
+                        font-size: Theme.fs-small;
+                        wrap: word-wrap;
+                    }
+                    VerticalLayout {
+                    padding: 0px;
                     spacing: 2px;
-                    HorizontalBox {
+                    for i in 12: HorizontalLayout {
                         spacing: Theme.gap;
+                        height: 22px;
+                        Text {
+                            text: @tr("键 ") + (i + 1) + " (GPIO" + (i + 1) + ")";
+                            width: 108px;
+                            font-size: Theme.fs-small;
+                            color: Theme.text-sub;
+                            vertical-alignment: center;
+                        }
+                        Text {
+                            text: @tr("原始");
+                            width: 30px;
+                            font-size: Theme.fs-small;
+                            color: Theme.muted;
+                            vertical-alignment: center;
+                        }
                         Rectangle {
-                            width: 18px;
-                            height: 18px;
+                            width: 16px; height: 16px; y: 3px;
                             border-radius: 4px;
                             border-width: 1px;
                             border-color: Theme.border-light;
-                            background: (i < root.phys_pressed.length && root.phys_pressed[i]) ? Theme.ok : #262b31;
+                            background: (i < root.phys_raw.length && root.phys_raw[i]) ? #6a9ec9 : #262b31;
                         }
                         Text {
-                            text: @tr("键 ") + (i + 1) + " (GPIO" + (i + 1) + ")";
-                            color: #d0d6dd;
+                            text: @tr("去抖后");
+                            width: 42px;
+                            font-size: Theme.fs-small;
+                            color: Theme.muted;
                             vertical-alignment: center;
-                            min-width: 96px;
                         }
-                        KeyCaptureBox {
+                        Rectangle {
+                            width: 16px; height: 16px; y: 3px;
+                            border-radius: 4px;
+                            border-width: 1px;
+                            border-color: Theme.border-light;
+                            background: (i < root.phys_pressed.length && root.phys_pressed[i]) ? Theme.accent : #262b31;
+                        }
+                        Text {
+                            text: @tr("输出");
+                            width: 30px;
+                            font-size: Theme.fs-small;
+                            color: Theme.muted;
+                            vertical-alignment: center;
+                        }
+                        Rectangle {
+                            width: 16px; height: 16px; y: 3px;
+                            border-radius: 4px;
+                            border-width: 1px;
+                            border-color: Theme.border-light;
+                            background: (i < root.phys_out.length && root.phys_out[i]) ? Theme.ok : #262b31;
+                        }
+                        Text {
+                            text: (i < root.phys_pol_high.length && root.phys_pol_high[i])
+                                ? @tr("高电平触发") : @tr("低电平触发");
+                            width: 84px;
+                            font-size: Theme.fs-small;
+                            color: Theme.text-sub;
+                            vertical-alignment: center;
+                        }
+                        Text {
+                            text: (i < root.phys_debounce.length ? root.phys_debounce[i] : 0) + "us";
+                            width: 64px;
+                            font-size: Theme.fs-small;
+                            color: Theme.text-sub;
+                            vertical-alignment: center;
+                        }
+                        Text {
+                            text: i < root.phys_display.length ? root.phys_display[i] : "";
+                            font-size: Theme.fs-small;
+                            color: #d0d6dd;
                             horizontal-stretch: 1;
-                            display: i < root.phys_display.length ? root.phys_display[i] : "";
-                            captured(t, c, s, a, g) => { root.phys_captured(i, t, c, s, a, g); }
-                        }
-                        Button {
-                            text: @tr("清除");
-                            clicked => { root.phys_cleared(i); }
+                            overflow: elide;
+                            vertical-alignment: center;
                         }
                     }
-                    HorizontalBox {
+                    }
+                }
+
+                // ---- 抽屉 2: 每键参数(极性 / 防抖 / 长按 / 键码) ----
+                CollapsibleSection {
+                    title: @tr("每键参数（极性 · 防抖 · 长按 · 键码）");
+                    summary: root.keycfg_status;
+                    expanded <=> root.keys_expanded;
+                    VerticalLayout {
+                    padding: 0px;
+                    spacing: 4px;
+                    for i in 12: PhysKeyRow {
+                        index: i;
+                        pressed: i < root.phys_pressed.length ? root.phys_pressed[i] : false;
+                        raw_on: i < root.phys_raw.length ? root.phys_raw[i] : false;
+                        display: i < root.phys_display.length ? root.phys_display[i] : "";
+                        pol_high: i < root.phys_pol_high.length ? root.phys_pol_high[i] : false;
+                        debounce_us: i < root.phys_debounce.length ? root.phys_debounce[i] : 0;
+                        hold_delay: i < root.phys_hold_delay.length ? root.phys_hold_delay[i] : 0;
+                        hold_max: i < root.phys_hold_max.length ? root.phys_hold_max[i] : 0;
+                        captured(t, c, s, a, g) => { root.phys_captured(i, t, c, s, a, g); }
+                        cleared => { root.phys_cleared(i); }
+                        keycfg_set(pol, db) => { root.phys_keycfg_set(i, pol, db); }
+                        hold_set(d, m) => { root.phys_hold_set(i, d, m); }
+                    }
+                    }
+                }
+
+                // ---- 抽屉 3: 逻辑分析仪(12 通道共用一张图, 横轴为设备时间戳) ----
+                CollapsibleSection {
+                    title: @tr("逻辑分析仪（12 通道时序：原始 / 去抖后 / 实际输出）");
+                    summary: root.la_status;
+                    expanded <=> root.la_expanded;
+                    HorizontalLayout {
                         spacing: Theme.gap;
-                        Text { text: @tr("触发延时(ms)"); font-size: Theme.fs-small; vertical-alignment: center; }
-                        SpinBox {
-                            width: 112px;
-                            minimum: 0;
-                            maximum: 65535;
-                            value: i < root.phys_hold_delay.length ? root.phys_hold_delay[i] : 0;
-                            edited(v) => { root.phys_hold_set(i, v, i < root.phys_hold_max.length ? root.phys_hold_max[i] : 0); }
+                        height: 28px;
+                        Text {
+                            text: @tr("时间窗");
+                            font-size: Theme.fs-small;
+                            color: Theme.text-sub;
+                            vertical-alignment: center;
                         }
-                        Text { text: @tr("自动抬起(ms)"); font-size: Theme.fs-small; vertical-alignment: center; }
-                        SpinBox {
-                            width: 112px;
-                            minimum: 0;
-                            maximum: 65535;
-                            value: i < root.phys_hold_max.length ? root.phys_hold_max[i] : 0;
-                            edited(v) => { root.phys_hold_set(i, i < root.phys_hold_delay.length ? root.phys_hold_delay[i] : 0, v); }
+                        ComboBox {
+                            width: 120px;
+                            model: root.la_window_names;
+                            current-index: root.la_window_index;
+                            selected => { root.la_window_set(self.current-index); }
                         }
+                        Text {
+                            text: root.la_span_text;
+                            font-size: Theme.fs-small;
+                            color: Theme.text-sub;
+                            vertical-alignment: center;
+                            horizontal-stretch: 1;
+                            overflow: elide;
+                        }
+                        Button { text: @tr("清空波形"); clicked => { root.la_clear(); } }
+                    }
+                    Text {
+                        text: root.la_status;
+                        font-size: Theme.fs-small;
+                        color: Theme.warn;
+                        wrap: word-wrap;
+                    }
+                    // 12 条泳道纵向排列, 共用同一横轴; 每条右侧是该通道自己的触发读数。
+                    VerticalLayout {
+                    padding: 0px;
+                    spacing: 1px;
+                    for i in 12: LaneRow {
+                        label: @tr("键") + (i + 1);
+                        raw_path: i < root.la_raw_paths.length ? root.la_raw_paths[i] : "";
+                        deb_path: i < root.la_deb_paths.length ? root.la_deb_paths[i] : "";
+                        out_path: i < root.la_out_paths.length ? root.la_out_paths[i] : "";
+                        trig_x: i < root.la_trig_x.length ? root.la_trig_x[i] : -1;
+                        trig_text: i < root.la_trig_text.length ? root.la_trig_text[i] : "";
+                        raw_on: i < root.phys_raw.length ? root.phys_raw[i] : false;
+                        deb_on: i < root.phys_pressed.length ? root.phys_pressed[i] : false;
+                        out_on: i < root.phys_out.length ? root.phys_out[i] : false;
+                    }
+                    }
+                    // 横轴刻度: 与泳道波形区左右边界严格对齐(左侧占位 = 通道名 + 三个状态点 + spacing)。
+                    HorizontalLayout {
+                        spacing: 4px;
+                        height: 16px;
+                        Rectangle { width: 58px; }
+                        Rectangle { width: 10px; }
+                        Rectangle { width: 10px; }
+                        Rectangle { width: 10px; }
+                        HorizontalLayout {
+                            horizontal-stretch: 1;
+                            spacing: 0px;
+                            for lbl[k] in root.la_time_labels: Text {
+                                text: lbl;
+                                font-size: Theme.fs-small;
+                                color: Theme.muted;
+                                horizontal-stretch: 1;
+                                horizontal-alignment: k == 0 ? left : (k == root.la_time_labels.length - 1 ? right : center);
+                            }
+                        }
+                        Rectangle { width: 104px; }
                     }
                 }
             }

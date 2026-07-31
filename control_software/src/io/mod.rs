@@ -7,16 +7,16 @@
 use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use log::{debug, error, info, warn};
-use nusb::transfer::{Bulk, ControlIn, ControlOut, ControlType, In, Out, Recipient};
 use nusb::MaybeFuture;
+use nusb::transfer::{Bulk, ControlIn, ControlOut, ControlType, In, Out, Recipient};
 
-use crate::proto::{encode, Decoder, Frame};
+use crate::proto::{Decoder, Frame, encode};
 
 const TARGET_VID: u16 = 0x2E8A;
 const TARGET_PID: u16 = 0x000A;
@@ -154,9 +154,9 @@ fn is_target(info: &nusb::DeviceInfo) -> bool {
     info.vendor_id() == TARGET_VID
         && info.product_id() == TARGET_PID
         && info.device_version() == TARGET_BCD_DEVICE
-        && info.interfaces().any(|itf| {
-            itf.interface_number() == CONFIG_INTERFACE && itf.class() == 0xFF
-        })
+        && info
+            .interfaces()
+            .any(|itf| itf.interface_number() == CONFIG_INTERFACE && itf.class() == 0xFF)
 }
 
 fn selector(info: &nusb::DeviceInfo) -> String {
@@ -183,7 +183,10 @@ pub fn list_devices() -> Vec<DeviceCandidate> {
         })
         .collect();
 
-    info!("Enumerated {} mai2 config WinUSB device(s)", candidates.len());
+    info!(
+        "Enumerated {} mai2 config WinUSB device(s)",
+        candidates.len()
+    );
     candidates
 }
 
@@ -212,7 +215,9 @@ fn read_debug_from_interface(interface: &nusb::Interface) -> Result<Vec<u8>> {
                 request: 0x50,
                 value: 0,
                 index: 0,
-                length: 64,
+                // 必须 >= 固件 UsbDebugCounters 的实际大小(现 67B, 且只会在末尾追加字段)。
+                // 原来固定 64 会把新追加的 NvStore 落盘诊断字段整段截掉, 读出来看不到但也不报错。
+                length: 192,
             },
             Duration::from_millis(500),
         )
@@ -288,7 +293,9 @@ fn enqueue_frame(
         pending.retain(|queued| queued.cmd != frame.cmd);
         let replaced = old_len - pending.len();
         if replaced != 0 {
-            stats.queue_dropped.fetch_add(replaced as u64, Ordering::Relaxed);
+            stats
+                .queue_dropped
+                .fetch_add(replaced as u64, Ordering::Relaxed);
             *dropped_since_log += replaced as u64;
         }
     }
@@ -346,7 +353,9 @@ where
         match reopen_with_backoff(label, &mut open) {
             Ok(endpoint) => return Ok(endpoint),
             Err(error) => match selected_device_present(device_selector) {
-                Ok(false) => return Err(error.context("device disappeared after endpoint recovery retries")),
+                Ok(false) => {
+                    return Err(error.context("device disappeared after endpoint recovery retries"));
+                }
                 Ok(true) => {
                     debug!(
                         "{} remains enumerated but endpoint is temporarily unavailable; keeping session alive for another bounded retry cycle",
@@ -393,7 +402,10 @@ fn log_link_diagnostics(interface: &nusb::Interface, phase: &str, stats: &IoStat
             session.stall_recoveries,
             session.queue_dropped,
         ),
-        Ok(raw) => debug!("WinUSB link diagnostic ({phase}) returned short {} byte response", raw.len()),
+        Ok(raw) => debug!(
+            "WinUSB link diagnostic ({phase}) returned short {} byte response",
+            raw.len()
+        ),
         Err(error) => debug!("WinUSB link diagnostic ({phase}) unavailable: {error}"),
     }
 }
@@ -449,7 +461,9 @@ pub fn spawn(device_selector: &str) -> Result<IoHandle> {
         while thread_running.load(Ordering::Acquire) {
             while pending.len() < COMMAND_QUEUE_CAPACITY {
                 match cmd_rx.try_recv() {
-                    Ok(frame) => enqueue_frame(&mut pending, frame, &thread_stats, &mut dropped_since_log),
+                    Ok(frame) => {
+                        enqueue_frame(&mut pending, frame, &thread_stats, &mut dropped_since_log)
+                    }
                     Err(mpsc::TryRecvError::Empty) => break,
                     Err(mpsc::TryRecvError::Disconnected) => return,
                 }
@@ -471,18 +485,35 @@ pub fn spawn(device_selector: &str) -> Result<IoHandle> {
                 let mut rebuild_streak: u32 = 0;
                 let write_start = Instant::now();
                 while thread_running.load(Ordering::Acquire) {
-                    let result = writer.as_mut().expect("writer present while sending")
+                    let result = writer
+                        .as_mut()
+                        .expect("writer present while sending")
                         .write_all(&bytes)
-                        .and_then(|_| writer.as_mut().expect("writer present while flushing").flush());
+                        .and_then(|_| {
+                            writer
+                                .as_mut()
+                                .expect("writer present while flushing")
+                                .flush()
+                        });
                     match result {
                         Ok(()) => {
-                            thread_stats.bytes_written.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+                            thread_stats
+                                .bytes_written
+                                .fetch_add(bytes.len() as u64, Ordering::Relaxed);
                             sent = true;
                             break;
                         }
-                        Err(error) if matches!(error.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock) => {
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                            ) =>
+                        {
                             if write_start.elapsed() > WRITE_BUSY_BUDGET {
-                                error!("WinUSB write remained busy beyond {:?}; checking link", WRITE_BUSY_BUDGET);
+                                error!(
+                                    "WinUSB write remained busy beyond {:?}; checking link",
+                                    WRITE_BUSY_BUDGET
+                                );
                                 break;
                             }
                             thread::sleep(Duration::from_millis(4));
@@ -493,14 +524,17 @@ pub fn spawn(device_selector: &str) -> Result<IoHandle> {
                             if rebuild_streak >= WRITE_MAX_REBUILDS {
                                 error!(
                                     "WinUSB write failed after {} endpoint errors (recovery budget exhausted): {error} (kind={:?})",
-                                    rebuild_streak, error.kind()
+                                    rebuild_streak,
+                                    error.kind()
                                 );
                                 break;
                             }
                             // 同一次故障只在最终失败时报一次 ERROR；中间重试全部走 debug，不刷屏。
                             debug!(
                                 "WinUSB write error: {error} (kind={:?}), endpoint recovery {}/{}",
-                                error.kind(), rebuild_streak, WRITE_MAX_REBUILDS
+                                error.kind(),
+                                rebuild_streak,
+                                WRITE_MAX_REBUILDS
                             );
                             // 递增退避: 首次立即重试(瞬时 stall 常能立刻恢复), 其后 120/240/480/960ms
                             // 递增, 使"设备重新枚举约 2s"这种真实窗口有机会在不断开会话的前提下恢复。
@@ -511,13 +545,21 @@ pub fn spawn(device_selector: &str) -> Result<IoHandle> {
                                 thread::sleep(backoff);
                             }
                             drop(writer.take());
-                            match recover_endpoint("OUT endpoint", &thread_selector, || open_writer(&interface)) {
+                            match recover_endpoint("OUT endpoint", &thread_selector, || {
+                                open_writer(&interface)
+                            }) {
                                 Ok(reopened) => {
                                     writer = Some(reopened);
                                 }
                                 Err(reopen_error) => {
-                                    error!("OUT endpoint recovery confirmed device removal: {reopen_error}");
-                                    log_link_diagnostics(&interface, "before disconnect after OUT recovery", &thread_stats);
+                                    error!(
+                                        "OUT endpoint recovery confirmed device removal: {reopen_error}"
+                                    );
+                                    log_link_diagnostics(
+                                        &interface,
+                                        "before disconnect after OUT recovery",
+                                        &thread_stats,
+                                    );
                                     let _ = evt_tx.send(IoEvent::Error(reopen_error.to_string()));
                                     let _ = evt_tx.send(IoEvent::Disconnected);
                                     return;
@@ -527,28 +569,57 @@ pub fn spawn(device_selector: &str) -> Result<IoHandle> {
                     }
                 }
                 if !sent {
-                    log_link_diagnostics(&interface, "before disconnect after write failure", &thread_stats);
+                    log_link_diagnostics(
+                        &interface,
+                        "before disconnect after write failure",
+                        &thread_stats,
+                    );
                     let _ = evt_tx.send(IoEvent::Error("write failed".into()));
                     let _ = evt_tx.send(IoEvent::Disconnected);
                     return;
                 }
-                debug!("Sent WinUSB frame cmd=0x{:02X} seq={} len={}", frame.cmd, frame.seq, bytes.len());
+                debug!(
+                    "Sent WinUSB frame cmd=0x{:02X} seq={} len={}",
+                    frame.cmd,
+                    frame.seq,
+                    bytes.len()
+                );
             }
 
-            let read_result = reader.as_mut().expect("reader present while reading").read(&mut read_buf);
+            let read_result = reader
+                .as_mut()
+                .expect("reader present while reading")
+                .read(&mut read_buf);
             match read_result {
                 Ok(0) => thread::sleep(IDLE_SLEEP),
                 Ok(count) => {
-                    thread_stats.bytes_read.fetch_add(count as u64, Ordering::Relaxed);
-                    debug!("Received {} WinUSB byte(s): {:02X?}", count, &read_buf[..count.min(64)]);
+                    thread_stats
+                        .bytes_read
+                        .fetch_add(count as u64, Ordering::Relaxed);
+                    debug!(
+                        "Received {} WinUSB byte(s): {:02X?}",
+                        count,
+                        &read_buf[..count.min(64)]
+                    );
                     for frame in decoder.feed_bytes(&read_buf[..count]) {
-                        debug!("Decoded frame cmd=0x{:02X} flags=0x{:02X} seq={} len={}", frame.cmd, frame.flags, frame.seq, frame.payload.len());
+                        debug!(
+                            "Decoded frame cmd=0x{:02X} flags=0x{:02X} seq={} len={}",
+                            frame.cmd,
+                            frame.flags,
+                            frame.seq,
+                            frame.payload.len()
+                        );
                         if evt_tx.send(IoEvent::Frame(frame)).is_err() {
                             return;
                         }
                     }
                 }
-                Err(error) if matches!(error.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock) => {
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                    ) =>
+                {
                     thread::sleep(IDLE_SLEEP)
                 }
                 Err(error) => {
@@ -557,24 +628,34 @@ pub fn spawn(device_selector: &str) -> Result<IoHandle> {
                         stall_recoveries = 0;
                     }
                     stall_recoveries += 1;
-                    thread_stats.stall_recoveries.fetch_add(1, Ordering::Relaxed);
+                    thread_stats
+                        .stall_recoveries
+                        .fetch_add(1, Ordering::Relaxed);
                     // 重试过程走 debug: 同一次故障只在最终判定断开时报一次 ERROR。
                     debug!(
                         "WinUSB read error: {error} (kind={:?}), recovery {}/{}",
-                        error.kind(), stall_recoveries, MAX_STALL_RECOVERIES
+                        error.kind(),
+                        stall_recoveries,
+                        MAX_STALL_RECOVERIES
                     );
                     if stall_recoveries >= MAX_STALL_RECOVERIES {
                         error!(
                             "WinUSB read failed after {} short-window recoveries: {error}",
                             stall_recoveries
                         );
-                        log_link_diagnostics(&interface, "before disconnect after read recovery limit", &thread_stats);
+                        log_link_diagnostics(
+                            &interface,
+                            "before disconnect after read recovery limit",
+                            &thread_stats,
+                        );
                         let _ = evt_tx.send(IoEvent::Error(error.to_string()));
                         let _ = evt_tx.send(IoEvent::Disconnected);
                         return;
                     }
                     drop(reader.take());
-                    match recover_endpoint("IN endpoint", &thread_selector, || open_reader(&interface)) {
+                    match recover_endpoint("IN endpoint", &thread_selector, || {
+                        open_reader(&interface)
+                    }) {
                         Ok(reopened) => {
                             reader = Some(reopened);
                             decoder = Decoder::new();
@@ -582,7 +663,11 @@ pub fn spawn(device_selector: &str) -> Result<IoHandle> {
                         }
                         Err(reopen_error) => {
                             error!("IN endpoint recovery confirmed device removal: {reopen_error}");
-                            log_link_diagnostics(&interface, "before disconnect after IN recovery", &thread_stats);
+                            log_link_diagnostics(
+                                &interface,
+                                "before disconnect after IN recovery",
+                                &thread_stats,
+                            );
                             let _ = evt_tx.send(IoEvent::Error(reopen_error.to_string()));
                             let _ = evt_tx.send(IoEvent::Disconnected);
                             return;

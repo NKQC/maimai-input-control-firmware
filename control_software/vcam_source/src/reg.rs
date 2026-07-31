@@ -13,7 +13,7 @@ use windows::Win32::System::Registry::{
 };
 use windows::core::{PCWSTR, Result};
 
-use crate::{CLSID_TEXT, FRIENDLY_NAME, _hresult_from_win32};
+use crate::{_hresult_from_win32, CLSID_TEXT, FRIENDLY_NAME};
 
 /// CLSID 键相对 HKLM 的路径。
 fn _clsid_key() -> Vec<u16> {
@@ -56,7 +56,11 @@ fn _module_path() -> Result<Vec<u16>> {
 }
 
 /// 创建子键并写默认值(可选再写一个命名值)。
-fn _write_key(subkey: &[u16], default_value: &[u16], named: Option<(&[u16], &[u16])>) -> Result<()> {
+fn _write_key(
+    subkey: &[u16],
+    default_value: &[u16],
+    named: Option<(&[u16], &[u16])>,
+) -> Result<()> {
     let mut key = HKEY::default();
     let status = unsafe {
         RegCreateKeyExW(
@@ -84,7 +88,13 @@ fn _write_key(subkey: &[u16], default_value: &[u16], named: Option<(&[u16], &[u1
         if let Some((name, value)) = named {
             let data = _sz_bytes(value);
             let status = unsafe {
-                RegSetValueExW(key, PCWSTR(name.as_ptr()), None, REG_SZ, Some(data.as_slice()))
+                RegSetValueExW(
+                    key,
+                    PCWSTR(name.as_ptr()),
+                    None,
+                    REG_SZ,
+                    Some(data.as_slice()),
+                )
             };
             if status != ERROR_SUCCESS {
                 return Err(_hresult_from_win32(status.0).into());

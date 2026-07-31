@@ -104,12 +104,20 @@ export component ParamEditorRow inherits HorizontalBox {
         horizontal-alignment: center;
         vertical-alignment: center;
     }
+    // 围栏依据固件 sensor_link.cpp::_handle_param_set 与 psoc main.c::_param_value_legal 的合法性校验:
+    // 0x08 SNS_CLK_DIV 1..255 / 0x09 IDAC_MOD 0..127 / 0x0A SNS_CLK_SOURCE 0..6 / 0x0B IDAC_GAIN 0..6;
+    // 0x05 ON_DEBOUNCE 落在 uint8_t 字段(越界会被静默截断); 其余阈值类为 16 位无额外限制。
+    // 按 entry.param_id 派生而非在调用处传: 调用方是 for row in params 的整表循环, 逐行范围只能由行自身的
+    // param_id 决定; 本组件语义即"单通道 CSD 参数行", 该表就是它的对外契约, 不会波及其它页。
     param_value := SpinBox {
         visible: root.mode_known && !root.auto_mode;
         horizontal-stretch: 0;
         min-width: Theme.spin-width;
-        minimum: 0;
-        maximum: 65535;
+        minimum: root.entry.param_id == 8 ? 1 : 0;
+        maximum: root.entry.param_id == 8 ? 255
+            : (root.entry.param_id == 9 ? 127
+            : ((root.entry.param_id == 10 || root.entry.param_id == 11) ? 6
+            : (root.entry.param_id == 5 ? 255 : 65535)));
         value: root.entry.value;
         edited(v) => { root.edited(root.entry.param_id, v); }
     }
@@ -227,11 +235,17 @@ export component SeriesRow inherits HorizontalLayout {
     }
 }
 
-// 组合键捕获输入框: 转交焦点后在 0.5 秒无新按键时自动退出录制。
+// 组合键捕获输入框。
+// ★超时语义★: 进入录制态后**不限时**等待第一个按键 —— 0.5s 空闲计时只从"收到第一个动作"起算,
+// 此后每个新按键重新起算 0.5s, 静默 0.5s 才退出录制。
+// 原实现是点击即开始计时, 于是"点进去想一下再按"就已经被踢出录制态(表现为按了没反应),
+// 用户根本无法判断是没抓到还是没进录制。现在只要没动过就一直等着, 语义与用户预期一致。
 export component KeyCaptureBox inherits Rectangle {
     in property <string> display;
     callback captured(string, bool, bool, bool, bool);  // text, ctrl, shift, alt, gui
     property <bool> _recording: false;
+    // 已收到过至少一个按键动作 ⇒ 空闲计时才有意义(Timer 的 running 由它门控)。
+    property <bool> _acted: false;
     property <duration> _capture_idle_timeout: 500ms;
     forward-focus: fs;
     height: 28px;
@@ -246,8 +260,10 @@ export component KeyCaptureBox inherits Rectangle {
         width: parent.width;
         height: parent.height;
         key-pressed(e) => {
-            root._recording = false;
             root._recording = true;
+            // 置 false 再置 true 让 Timer 的 running 边沿变化 → 空闲计时从本次按键重新起算。
+            root._acted = false;
+            root._acted = true;
             root.captured(e.text, e.modifiers.control, e.modifiers.shift, e.modifiers.alt, e.modifiers.meta);
             return accept;
         }
@@ -256,16 +272,18 @@ export component KeyCaptureBox inherits Rectangle {
             // clicked 不会在 ScrollView 的滚动拖拽结束后触发，避免滚动误进录制态。
             clicked => {
                 fs.focus();
-                root._recording = false;
+                // 进入录制态但**不启动**空闲计时: 第一个动作到来前一直等待。
+                root._acted = false;
                 root._recording = true;
             }
         }
     }
     key_idle := Timer {
         interval: root._capture_idle_timeout;
-        running: root._recording;
+        running: root._recording && root._acted;
         triggered => {
             root._recording = false;
+            root._acted = false;
             idle_focus.focus();
         }
     }

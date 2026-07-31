@@ -33,7 +33,11 @@ pub struct LedRegion {
 
 impl Default for LedRegion {
     fn default() -> Self {
-        Self { ch: LED_CH_UNMAPPED, start: 0, count: 0 }
+        Self {
+            ch: LED_CH_UNMAPPED,
+            start: 0,
+            count: 0,
+        }
     }
 }
 
@@ -124,11 +128,19 @@ pub fn encode_led_get() -> Vec<u8> {
 pub fn decode_led_get(payload: &[u8]) -> Result<LedState, String> {
     if payload.len() < LED_GET_LEN {
         return Err(format!(
-            "LED_GET 响应过短: {} 字节 (需 >= {})", payload.len(), LED_GET_LEN));
+            "LED_GET 响应过短: {} 字节 (需 >= {})",
+            payload.len(),
+            LED_GET_LEN
+        ));
     }
     let u16_at = |off: usize| u16::from_le_bytes([payload[off], payload[off + 1]]);
     let u32_at = |off: usize| {
-        u32::from_le_bytes([payload[off], payload[off + 1], payload[off + 2], payload[off + 3]])
+        u32::from_le_bytes([
+            payload[off],
+            payload[off + 1],
+            payload[off + 2],
+            payload[off + 3],
+        ])
     };
     // byte0 是复合状态字(96B 定长不变, 高位复用): bit0..3 灯板状态机, bit4/5 两链就绪,
     // bit6..7 初始化故障分档。旧固件这些高位恒 0, 解出来就是"未就绪且无故障", 不会误报。
@@ -190,7 +202,10 @@ pub fn encode_led_preview(items: &[(u8, [u8; 3])]) -> Vec<u8> {
 ///
 /// 与固件同口径先在上位机拦一道,避免明知会 NAK 还发(整批原子失败对用户是"什么都没变",
 /// 更难定位)。校验项: 通道号合法、区段不越界(以设备回报的 ws_count 为准)、同通道区段不重叠。
-pub fn validate_led_regions(regions: &[LedRegion; LED_UNIT_COUNT], ws_count: [u16; 2]) -> Option<String> {
+pub fn validate_led_regions(
+    regions: &[LedRegion; LED_UNIT_COUNT],
+    ws_count: [u16; 2],
+) -> Option<String> {
     for (unit, region) in regions.iter().enumerate() {
         if region.ch == LED_CH_UNMAPPED {
             continue;
@@ -206,7 +221,9 @@ pub fn validate_led_regions(regions: &[LedRegion; LED_UNIT_COUNT], ws_count: [u1
         // ws_count 为 0 说明尚未回读到设备真值, 此时不做越界判断(否则会误报全部冲突)。
         if limit > 0 && end > limit {
             return Some(format!(
-                "单元 {} 越界: ch{} {}..{} 超出灯链长度 {}", unit, region.ch, region.start, end, limit));
+                "单元 {} 越界: ch{} {}..{} 超出灯链长度 {}",
+                unit, region.ch, region.start, end, limit
+            ));
         }
     }
     for a in 0..LED_UNIT_COUNT {

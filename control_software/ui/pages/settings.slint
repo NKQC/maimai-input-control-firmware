@@ -57,6 +57,8 @@ export component SettingsPage inherits Rectangle {
     in property <int> calib_pref: 4;
     // 阻塞类操作状态(透传): 供各页锁定按钮/显示运行标识。
     in property <bool> op_busy: false;
+    /// 串行下发队列剩余项数(含在途)。>0 = 正在逐条下发, 锁住保存按钮并显示进度。
+    in property <int> save_pending: 0;
     in property <string> op_label: "";
     in property <string> auto_tune_status: "";
 
@@ -164,6 +166,23 @@ export component SettingsPage inherits Rectangle {
     in property <[ChannelStatus]> all_channels: [];
     in property <int> sample_rate_hz: 0;
     in property <string> curve_threshold_warning: "";
+    // 触控组合映射(多分区 → 多键)
+    in property <[string]> combo_zones_text: [];
+    in property <[string]> combo_keys_text: [];
+    in property <[int]> combo_delay: [];
+    in property <[int]> combo_max_hold: [];
+    in property <[bool]> combo_zone_used: [];
+    in property <[bool]> combo_zone_picked: [];
+    in property <string> combo_pending_keys_text: "";
+    in property <string> combo_status: "";
+    in property <int> combo_count: 0;
+    callback combo_zone_toggled(int);
+    callback combo_zones_clear();
+    callback combo_captured(string, bool, bool, bool, bool);
+    callback combo_keys_clear();
+    callback combo_add();
+    callback combo_removed(int);
+    callback combo_hold_set(int, int, int);
     // 全通道页"批量应用"抽屉: 勾选状态与参数名/源值由 main.rs 回填, 真相源在 AppController。
     in property <[bool]> batch_ch_selected: [];
     in property <[bool]> batch_param_selected: [];
@@ -177,6 +196,8 @@ export component SettingsPage inherits Rectangle {
     callback batch_params_invert();
     callback batch_clear();
     callback batch_apply(int);
+    callback batch_set_source(int);
+    in property <int> batch_source: 0;
     in property <float> scan_period_ms: 0;
     in property <int> scan_period_us: 0;
     in property <int> scan_period_expected_us: 0;
@@ -199,6 +220,30 @@ export component SettingsPage inherits Rectangle {
     in property <[int]> kbd_phys_hold_max: [];
     in property <[int]> kbd_zone_hold_delay: [];
     in property <[int]> kbd_zone_hold_max: [];
+    // 物理键盘页: 实时三态 + 每键极性/防抖 + 逻辑分析仪视图, 全部由 main.rs 回填(真相源在 AppController)。
+    in property <[bool]> kbd_phys_raw: [];
+    in property <[bool]> kbd_phys_out: [];
+    in property <[bool]> kbd_phys_pol_high: [];
+    in property <[int]> kbd_phys_debounce: [];
+    in property <string> kbd_keycfg_status: "";
+    in property <[string]> la_raw_paths: [];
+    // 仅去抖后的那一路: 它才是"被判定为按下"的时刻, 与 raw 对比即可看出防抖吃掉多少,
+    // 与 out 对比即可看出长按延迟推后多少 —— 两者混在一条线上时防抖没法调。
+    in property <[string]> la_deb_paths: [];
+    in property <[string]> la_out_paths: [];
+    in property <[string]> la_trig_text: [];
+    in property <[float]> la_trig_x: [];
+    in property <[string]> la_time_labels: [];
+    in property <string> la_status: "";
+    in property <string> la_span_text: "";
+    in property <[string]> la_window_names: [];
+    in property <int> la_window_index: 0;
+    in-out property <bool> phys_live_expanded: true;
+    in-out property <bool> phys_keys_expanded: false;
+    in-out property <bool> phys_la_expanded: false;
+    callback kbd_set_keycfg(int, bool, int);
+    callback la_window_set(int);
+    callback la_clear();
     callback kbd_set_phys(int, int, int);
     callback kbd_set_zone(int, int, int);
     callback kbd_set_hold_phys(int, int, int);
@@ -220,6 +265,8 @@ export component SettingsPage inherits Rectangle {
     in property <string> algo_asm: "";
     in property <int> algo_asm_bytes: 0;
     in property <int> algo_asm_capacity: 1024;
+    in property <int> algo_c_bytes: 0;
+    in property <int> algo_c_capacity: 32768;
     // 算法上报(report[]折线+触发判定追踪) + 可调变量(cfg[8])
     in property <int> algo_sel_channel: 0;
     in property <[AlgoReportLine]> algo_report_lines: [];
@@ -369,6 +416,8 @@ export component SettingsPage inherits Rectangle {
                 batch_params_invert() => { root.batch_params_invert(); }
                 batch_clear() => { root.batch_clear(); }
                 batch_apply(src) => { root.batch_apply(src); }
+                batch_set_source(ch) => { root.batch_set_source(ch); }
+                batch_source: root.batch_source;
                 telem_start() => { root.telem_start(); }
                 telem_stop() => { root.telem_stop(); }
                 channel_selected(ch) => {
@@ -492,15 +541,25 @@ export component SettingsPage inherits Rectangle {
 
             KeyMapPage {
                 keyboard_map_en: root.keyboard_map_en;
-                zone_display: root.kbd_zone_display;
                 zone_names: root.kbd_zone_names;
-                zone_hold_delay: root.kbd_zone_hold_delay;
-                zone_hold_max: root.kbd_zone_hold_max;
+                combo_zones_text: root.combo_zones_text;
+                combo_keys_text: root.combo_keys_text;
+                combo_delay: root.combo_delay;
+                combo_max_hold: root.combo_max_hold;
+                zone_used: root.combo_zone_used;
+                zone_picked: root.combo_zone_picked;
+                pending_keys_text: root.combo_pending_keys_text;
+                combo_status: root.combo_status;
+                combo_count: root.combo_count;
                 set_keyboard_map_en(v) => { root.set_keyboard_map_en(v); }
-                zone_captured(z, t, c, s, a, g) => { root.kbd_capture_zone(z, t, c, s, a, g); }
-                zone_cleared(z) => { root.kbd_clear_zone(z); }
-                zone_hold_set(z, delay, max_hold) => { root.kbd_set_hold_zone(z, delay, max_hold); }
                 refresh_kbd() => { root.kbd_refresh(); }
+                combo_zone_toggled(z) => { root.combo_zone_toggled(z); }
+                combo_zones_clear() => { root.combo_zones_clear(); }
+                combo_captured(t, c, s, a, g) => { root.combo_captured(t, c, s, a, g); }
+                combo_keys_clear() => { root.combo_keys_clear(); }
+                combo_add() => { root.combo_add(); }
+                combo_removed(i) => { root.combo_removed(i); }
+                combo_hold_set(i, d, m) => { root.combo_hold_set(i, d, m); }
             }
         }
 
@@ -512,9 +571,30 @@ export component SettingsPage inherits Rectangle {
                 phys_display: root.kbd_phys_display;
                 phys_hold_delay: root.kbd_phys_hold_delay;
                 phys_hold_max: root.kbd_phys_hold_max;
+                phys_raw: root.kbd_phys_raw;
+                phys_out: root.kbd_phys_out;
+                phys_pol_high: root.kbd_phys_pol_high;
+                phys_debounce: root.kbd_phys_debounce;
+                keycfg_status: root.kbd_keycfg_status;
+                la_raw_paths: root.la_raw_paths;
+                la_deb_paths: root.la_deb_paths;
+                la_out_paths: root.la_out_paths;
+                la_trig_text: root.la_trig_text;
+                la_trig_x: root.la_trig_x;
+                la_time_labels: root.la_time_labels;
+                la_status: root.la_status;
+                la_span_text: root.la_span_text;
+                la_window_names: root.la_window_names;
+                la_window_index: root.la_window_index;
+                live_expanded <=> root.phys_live_expanded;
+                keys_expanded <=> root.phys_keys_expanded;
+                la_expanded <=> root.phys_la_expanded;
                 phys_captured(i, t, c, s, a, g) => { root.kbd_capture_phys(i, t, c, s, a, g); }
                 phys_cleared(i) => { root.kbd_clear_phys(i); }
                 phys_hold_set(i, delay, max_hold) => { root.kbd_set_hold_phys(i, delay, max_hold); }
+                phys_keycfg_set(i, pol, db) => { root.kbd_set_keycfg(i, pol, db); }
+                la_window_set(i) => { root.la_window_set(i); }
+                la_clear() => { root.la_clear(); }
                 refresh_kbd() => { root.kbd_refresh(); }
             }
         }
@@ -550,6 +630,8 @@ export component SettingsPage inherits Rectangle {
                 algo_asm: root.algo_asm;
                 algo_asm_bytes: root.algo_asm_bytes;
                 algo_asm_capacity: root.algo_asm_capacity;
+                algo_c_bytes: root.algo_c_bytes;
+                algo_c_capacity: root.algo_c_capacity;
                 algo_sel_channel: root.algo_sel_channel;
                 algo_report_lines: root.algo_report_lines;
                 algo_active_path: root.algo_active_path;
@@ -577,8 +659,10 @@ export component SettingsPage inherits Rectangle {
             padding-right: 12px;
             spacing: 10px;
             Button {
-                text: "保存到设备";
-                enabled: root.config_dirty;
+                // 下发是**串行**的(每帧等设备 ACK 才发下一帧), 期间必须锁住按钮:
+                // 重复点击会把同一批草稿再排一遍队, 设备侧收到重复写入。
+                text: root.save_pending > 0 ? ("⏳ 下发中 " + root.save_pending + " 项") : "保存到设备";
+                enabled: root.config_dirty && root.save_pending == 0;
                 clicked => { root.cfg_save(); }
             }
             // 设置文件始终可操作：导出可离线保存当前缓存，导入的连接校验由 Rust 给出明确原因。
@@ -603,13 +687,17 @@ export component SettingsPage inherits Rectangle {
                 }
             }
             Text {
-                text: root.mode_change_needs_reboot
+                // 下发进行中优先显示进度: 串行下发一批上百项要几秒, 没有进度的话界面看着像卡住。
+                text: root.save_pending > 0
+                    ? ("正在串行下发到设备… 剩余 " + root.save_pending + " 项（逐条等设备回执，请勿断开）")
+                    : (root.mode_change_needs_reboot
                     ? (root.config_dirty_count + " 项未保存 — 含 Serial/HID 模式切换, 保存后将自动重启设备生效")
                     : (root.config_dirty
                         ? (root.config_dirty_count + " 项改动未保存 — 点击保存写入设备 flash")
-                        : "无改动 (已与设备 flash 同步)");
-                color: root.mode_change_needs_reboot ? #f5a623
-                    : (root.config_dirty ? #f5a623 : #2b8a3e);
+                        : "无改动 (已与设备 flash 同步)"));
+                color: root.save_pending > 0 ? #8fd6ff
+                    : (root.mode_change_needs_reboot ? #f5a623
+                    : (root.config_dirty ? #f5a623 : #2b8a3e));
                 vertical-alignment: center;
                 horizontal-stretch: 1;
                 // 无 elide 的单行 Text 会把整句话的宽度当作 min-width(见 Slint text_layout_info),

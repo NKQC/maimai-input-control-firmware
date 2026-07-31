@@ -10,7 +10,7 @@
 //!
 //! 注意: Windows 不允许给已运行的进程提权, 只能新起一个提升的进程 —— 因此必须重启, 无法原地提权。
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 
 /// 当前进程是否已是管理员(UAC 已提升)。复用 comport 里已有的令牌查询, 不重复实现。
 pub fn is_elevated() -> bool {
@@ -21,9 +21,9 @@ pub fn is_elevated() -> bool {
 /// 否则会出现两个实例同时抢 WinUSB 句柄。
 #[cfg(windows)]
 pub fn relaunch_as_admin() -> Result<()> {
-    use windows::core::{w, HSTRING, PCWSTR};
     use windows::Win32::UI::Shell::ShellExecuteW;
     use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    use windows::core::{HSTRING, PCWSTR, w};
 
     if is_elevated() {
         return Err(anyhow!("当前已是管理员权限, 无需重启"));
@@ -33,7 +33,13 @@ pub fn relaunch_as_admin() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let params = args
         .iter()
-        .map(|a| if a.contains(' ') { format!("\"{}\"", a) } else { a.clone() })
+        .map(|a| {
+            if a.contains(' ') {
+                format!("\"{}\"", a)
+            } else {
+                a.clone()
+            }
+        })
         .collect::<Vec<_>>()
         .join(" ");
     let exe_w = HSTRING::from(exe.as_os_str());

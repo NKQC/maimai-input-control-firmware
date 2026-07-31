@@ -21,12 +21,31 @@ class CsdConfig {
 public:
     static CsdConfig* getInstance();
 
-    void init();                       // LittleFS 挂载后从 flash 载入(若有)
+    /// ★落盘镜像★: 与 flash 中该区的字节布局完全一致。本类不再自己碰 flash, 只维护这份镜像,
+    /// 由 NvStore 单点负责 load/commit(见 register_storage)。
+    /// 放在 .h 是因为要作为成员常驻 RAM 供 NvStore 注册; 原来它是 save() 里的临时变量。
+    #pragma pack(push, 1)
+    struct Mirror {
+        uint32_t magic;
+        uint8_t  mode;
+        uint8_t  valid;
+        uint8_t  global_valid;
+        uint8_t  reserved;
+        uint16_t param[CSD_CHANNELS][CSD_PARAM_COUNT];
+        uint16_t global[CSD_GLOBAL_COUNT];
+        uint32_t crc32;   // 覆盖前面全部字节
+    };
+    #pragma pack(pop)
+
+    /// 把镜像注册给 NvStore。必须在 NvStore::load() 之前调用。
+    void register_storage();
+
+    void init();                       // NvStore::load() 之后从镜像解出运行值
     bool valid() const { return _valid; }
     uint8_t mode() const { return _mode; }
 
     // 写穿：host_cmd 处理器在改 PSoC 的同时更新本 store，使其为真相源。
-    void note_mode(uint8_t mode) { _mode = (mode != 0u) ? CSD_MODE_SEMI : CSD_MODE_AUTO; }
+    void note_mode(uint8_t mode);
     void note_param(uint8_t ch, uint8_t param_id, uint32_t value);
     void note_global(uint8_t gparam_id, uint32_t value);   // 写穿全局配置真相源(host 改 PSoC 同时更新)
 
@@ -62,6 +81,10 @@ private:
     CsdConfig();
     CsdConfig(const CsdConfig&) = delete;
     CsdConfig& operator=(const CsdConfig&) = delete;
+
+    Mirror   _mirror = {};       // NvStore 注册的落盘镜像(快照层)
+    uint32_t _mirror_len = 0;    // 实际有效长度(由 NvStore 读回时回填)
+    void _sync_storage();
 
     // 这些参数取 0 没有任何合法含义(分辨率 0 = 不扫描, 分频 0 = 除零, IDAC 0 = 无补偿电流→满量程),
     // store 里出现 0 只能理解为"该项无有效值", 下发时必须跳过, 保留 PSoC 侧校准/自适应的结果。

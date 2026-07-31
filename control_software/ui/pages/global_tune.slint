@@ -318,7 +318,7 @@ export component GlobalTunePage inherits Rectangle {
                     HorizontalBox {
                         spacing: 8px;
                         Text { text: "校准频率偏好:"; color: #b0b8c0; vertical-alignment: center; }
-                        Slider {
+                        pref_slider := Slider {
                             minimum: 1;
                             maximum: 7;
                             value: root.calib_pref;
@@ -326,11 +326,16 @@ export component GlobalTunePage inherits Rectangle {
                             changed(v) => { root.calib_pref_set(Math.round(v)); }
                         }
                         Text {
-                            text: root.calib_pref + " 档 · " + (root.calib_pref == 1
+                            // ★读滑块自身的值, 不读 root.calib_pref★
+                            // calib_pref 是设备真值回填口, 而草稿写入按工程约定**不 bump version**
+                            // (控件自身已显示新值, 重建模型会打断输入) ⇒ 拖动时它不变, 文字就永远
+                            // 停在"4 档 · 居中(默认)"。滑块的 value 在拖动中实时变化, 绑它才跟手;
+                            // 设备回填仍通过上面的 value 绑定进来, 两者不冲突。
+                            text: Math.round(pref_slider.value) + " 档 · " + (Math.round(pref_slider.value) == 1
                                 ? "最不灵敏(临界最高频)"
-                                : (root.calib_pref <= 3 ? "偏保守(靠近临界)"
-                                : (root.calib_pref == 4 ? "居中(默认)"
-                                : (root.calib_pref <= 6 ? "偏灵敏(明显低频)"
+                                : (Math.round(pref_slider.value) <= 3 ? "偏保守(靠近临界)"
+                                : (Math.round(pref_slider.value) == 4 ? "居中(默认)"
+                                : (Math.round(pref_slider.value) <= 6 ? "偏灵敏(明显低频)"
                                 : "最灵敏(过充近场)"))));
                             color: #8fd6ff;
                             vertical-alignment: center;
@@ -391,12 +396,13 @@ export component GlobalTunePage inherits Rectangle {
                                 HorizontalBox {
                                     padding: 0px;
                                     spacing: 6px;
+                                    // 围栏依据固件 psoc main.c::cmd_set_global 把 MFS 偏移写入 uint8_t 字段(>255 会被静默截断)。
                                     SpinBox {
                                         horizontal-stretch: 1;
                                         min-width: 130px;
                                         value: root.g_mfs_div_f1;
                                         minimum: 0;
-                                        maximum: 65535;
+                                        maximum: 255;
                                         edited(v) => { root.algo_global_set(5, v); }
                                     }
                                     SpinBox {
@@ -404,7 +410,7 @@ export component GlobalTunePage inherits Rectangle {
                                         min-width: 130px;
                                         value: root.g_mfs_div_f2;
                                         minimum: 0;
-                                        maximum: 65535;
+                                        maximum: 255;
                                         edited(v) => { root.algo_global_set(6, v); }
                                     }
                                 }
@@ -533,7 +539,8 @@ export component GlobalTunePage inherits Rectangle {
                                 if root.mode_known && root.scan_mode == 1: SpinBox {
                                     value: root.csd_sns_clk_source;
                                     minimum: 0;
-                                    maximum: 255;
+                                    // 围栏依据固件 sensor_link.cpp::_handle_param_set 对 0x0A 的校验(低7位 0..6)。
+                                    maximum: 6;
                                     edited(v) => { root.csd_param_set(10, v); }
                                 }
                                 // 非频率: 选择直连/PRS/SSC 展频方式(bit7=自动)。

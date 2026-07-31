@@ -23,24 +23,54 @@ pub mod config;
 pub mod led;
 pub mod telemetry;
 
-use std::convert::TryFrom;
-pub use led::{
-    LedRegion, LedState, LED_CH_UNMAPPED, LED_PREVIEW_ALL, LED_UNIT_COUNT,
-    decode_led_get, encode_led_get, encode_led_preview, encode_led_set_region, validate_led_regions,
+pub use config::{
+    CfgValue, ConfigEntry, ConfigValueType, decode_entries, decode_entry, encode_entries,
+    encode_entry,
 };
-pub use config::{CfgValue, ConfigEntry, ConfigValueType, decode_entries, decode_entry, encode_entry, encode_entries};
+pub use led::{
+    LED_CH_UNMAPPED, LED_PREVIEW_ALL, LED_UNIT_COUNT, LedRegion, LedState, decode_led_get,
+    encode_led_get, encode_led_preview, encode_led_set_region, validate_led_regions,
+};
+use std::convert::TryFrom;
 pub use telemetry::{
-    AutoTuneProgress, decode_auto_tune_progress,
-    PsocRescueProgress, decode_psoc_rescue_progress,
-    ChannelSample, FIELD_RAW, FIELD_BASELINE, FIELD_DIFF, FIELD_STATUS, FIELD_STATS, FIELD_LATENCY,
-    KNOWN_PARAM_IDS, PARAM_FINGER_TH, PARAM_NOISE_TH, PARAM_NEG_NOISE_TH,
-    PARAM_HYSTERESIS, PARAM_ON_DEBOUNCE, PARAM_LOW_BSLN_RST, PARAM_RESOLUTION,
-    PARAM_SNS_CLK_DIV, PARAM_IDAC_MOD, PARAM_SNS_CLK_SOURCE, PARAM_IDAC_GAIN,
-    encode_telem_start, encode_param_get, encode_param_set, encode_cp_measure, encode_cp_get,
-    encode_param_get_all, encode_ch_mask, decode_telem_data, decode_param_get, decode_param_get_all,
-    decode_cp_get,
+    AutoTuneProgress,
+    ChannelSample,
+    FIELD_BASELINE,
+    FIELD_DIFF,
+    FIELD_LATENCY,
+    FIELD_RAW,
+    FIELD_STATS,
+    FIELD_STATUS,
+    KNOWN_PARAM_IDS,
     // PARAM_GET_ALL 的"全通道单参数"批量变体(替代 36 条单发)
-    PARAM_ALL_CHANNELS, encode_param_get_all_channels, decode_param_get_all_channels,
+    PARAM_ALL_CHANNELS,
+    PARAM_FINGER_TH,
+    PARAM_HYSTERESIS,
+    PARAM_IDAC_GAIN,
+    PARAM_IDAC_MOD,
+    PARAM_LOW_BSLN_RST,
+    PARAM_NEG_NOISE_TH,
+    PARAM_NOISE_TH,
+    PARAM_ON_DEBOUNCE,
+    PARAM_RESOLUTION,
+    PARAM_SNS_CLK_DIV,
+    PARAM_SNS_CLK_SOURCE,
+    PsocRescueProgress,
+    decode_auto_tune_progress,
+    decode_cp_get,
+    decode_param_get,
+    decode_param_get_all,
+    decode_param_get_all_channels,
+    decode_psoc_rescue_progress,
+    decode_telem_data,
+    encode_ch_mask,
+    encode_cp_get,
+    encode_cp_measure,
+    encode_param_get,
+    encode_param_get_all,
+    encode_param_get_all_channels,
+    encode_param_set,
+    encode_telem_start,
 };
 
 // ============================================================================
@@ -59,9 +89,9 @@ const CRC_POLY: u16 = 0x1021;
 const CRC_INIT: u16 = 0xFFFF;
 
 // Flags bits
-const FLAG_RESPONSE: u8 = 0x01;  // bit0=1: response frame
-const FLAG_STREAM: u8 = 0x02;    // bit1=1: stream data frame
-const FLAG_NAK_ERR: u8 = 0x04;   // bit2=1: NAK (error)
+const FLAG_RESPONSE: u8 = 0x01; // bit0=1: response frame
+const FLAG_STREAM: u8 = 0x02; // bit1=1: stream data frame
+const FLAG_NAK_ERR: u8 = 0x04; // bit2=1: NAK (error)
 
 // ============================================================================
 // HostCmd Enumeration (mirrors firmware host_cmd.h)
@@ -157,6 +187,16 @@ pub enum HostCmd {
     KbdGetHold = 0x75,
     /// 长按参数下发: n×[kind, idx, delay_ms(u16 LE), max_hold_ms(u16 LE)]。
     KbdSetHold = 0x76,
+    /// 逻辑分析仪边沿记录拉取: [max(u8) 可选] → 见 `decode_kbd_get_edges`。
+    KbdGetEdges = 0x77,
+    /// 每键触发极性 + 独立防抖回读: 空 → [count, 12×(pol, debounce_us u16 LE)]。
+    KbdGetKeycfg = 0x7C,
+    /// 每键触发极性 + 独立防抖下发: n×[idx, pol, debounce_us(u16 LE)]。
+    KbdSetKeycfg = 0x7D,
+    /// 触控组合映射回读: 空 payload → [combo_count, key_count, count×16B]。
+    KbdGetCombo = 0x7A,
+    /// 触控组合映射下发(整表替换): [count] + count×16B。
+    KbdSetCombo = 0x7B,
     /// mai2 串口(游戏触控上报)运行态回读: [send_en, status, baud(u32 LE)]。
     Mai2GetState = 0x78,
     /// mai2 串口发送使能: [en]。
@@ -236,6 +276,11 @@ impl TryFrom<u8> for HostCmd {
             0x74 => Ok(KbdSetTouchmap),
             0x75 => Ok(KbdGetHold),
             0x76 => Ok(KbdSetHold),
+            0x77 => Ok(KbdGetEdges),
+            0x7C => Ok(KbdGetKeycfg),
+            0x7D => Ok(KbdSetKeycfg),
+            0x7A => Ok(KbdGetCombo),
+            0x7B => Ok(KbdSetCombo),
             0x78 => Ok(Mai2GetState),
             0x79 => Ok(Mai2SetSendEn),
             0x7E => Ok(Ack),
@@ -306,7 +351,12 @@ pub struct Frame {
 impl Frame {
     /// Create a new frame
     pub fn new(cmd: u8, flags: u8, seq: u8, payload: Vec<u8>) -> Self {
-        Frame { cmd, flags, seq, payload }
+        Frame {
+            cmd,
+            flags,
+            seq,
+            payload,
+        }
     }
 
     /// Create a HELLO frame
@@ -338,7 +388,12 @@ impl Frame {
     pub fn nak(seq: u8, err: HostCmdError, msg: &[u8]) -> Self {
         let mut payload = vec![err as u8];
         payload.extend_from_slice(msg);
-        Frame::new(HostCmd::Nak as u8, FLAG_RESPONSE | FLAG_NAK_ERR, seq, payload)
+        Frame::new(
+            HostCmd::Nak as u8,
+            FLAG_RESPONSE | FLAG_NAK_ERR,
+            seq,
+            payload,
+        )
     }
 }
 
@@ -395,7 +450,7 @@ pub fn encode(frame: &Frame) -> Vec<u8> {
     buf.extend_from_slice(&frame.payload);
 
     // CRC-16 over cmd..payload (skipping SOF bytes)
-    let crc_data = &buf[2..];  // start from cmd
+    let crc_data = &buf[2..]; // start from cmd
     let crc = crc16(crc_data);
     buf.push((crc & 0xFF) as u8);
     buf.push((crc >> 8) as u8);
@@ -411,7 +466,7 @@ pub fn encode(frame: &Frame) -> Vec<u8> {
 #[derive(Debug)]
 pub struct Decoder {
     state: DecoderState,
-    header: [u8; 5],  // cmd, flags, seq, len_lo, len_hi
+    header: [u8; 5], // cmd, flags, seq, len_lo, len_hi
     header_pos: usize,
     payload_len: usize,
     payload: Vec<u8>,
@@ -590,6 +645,20 @@ pub struct EraseFailureDiagnostics {
 }
 
 #[derive(Debug, Clone)]
+pub struct SpiDebugCounters {
+    pub status: u8,
+    pub block_addr: u32,
+    pub rx_frames: u32,
+    pub scan_count: u32,
+    pub ms_tick: u32,
+    pub stage: u32,
+    pub apply_cmd: u32,
+    pub apply_last_ms: u32,
+    pub apply_dirty: u32,
+    pub setparam_cmd: u32,
+}
+
+#[derive(Debug, Clone)]
 pub struct PsocBringupDiagnostics {
     pub report_version: u8,
     pub report_length: u8,
@@ -625,6 +694,8 @@ pub struct PsocBringupDiagnostics {
     pub self_heal_pending: bool,
     /// RP2040 store 持有的真实 CSD 模式(报告尾部追加；旧固件缺失时按 AUTO=0 处理)。
     pub csd_mode: u8,
+    /// PSoC 运行态 SWD 读取的 spi_dbg 计数；旧报告无此固定尾部时为 None。
+    pub spi_debug: Option<SpiDebugCounters>,
 }
 
 /// `PsocBringupDiagnostics::csd_flags` 位: 恢复默认未获得可信基线。
@@ -657,8 +728,11 @@ impl PsocBringupDiagnostics {
     }
 
     pub fn flash_ok(&self) -> bool {
-        let required = BRINGUP_FLAG_ACQUIRED | BRINGUP_FLAG_SILICON_ID |
-            BRINGUP_FLAG_ERASE | BRINGUP_FLAG_PROGRAM | BRINGUP_FLAG_VERIFY;
+        let required = BRINGUP_FLAG_ACQUIRED
+            | BRINGUP_FLAG_SILICON_ID
+            | BRINGUP_FLAG_ERASE
+            | BRINGUP_FLAG_PROGRAM
+            | BRINGUP_FLAG_VERIFY;
         self.flags & required == required
     }
 }
@@ -678,13 +752,15 @@ pub struct DeviceInfo {
 }
 
 fn read_u16_le(payload: &[u8], offset: usize) -> Result<u16, String> {
-    let bytes = payload.get(offset..offset + 2)
+    let bytes = payload
+        .get(offset..offset + 2)
         .ok_or_else(|| format!("DEVICE_INFO missing u16 at {}", offset))?;
     Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
 }
 
 fn read_u32_le(payload: &[u8], offset: usize) -> Result<u32, String> {
-    let bytes = payload.get(offset..offset + 4)
+    let bytes = payload
+        .get(offset..offset + 4)
         .ok_or_else(|| format!("DEVICE_INFO missing u32 at {}", offset))?;
     Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
 }
@@ -692,7 +768,10 @@ fn read_u32_le(payload: &[u8], offset: usize) -> Result<u32, String> {
 impl DeviceInfo {
     pub fn from_payload(payload: &[u8]) -> Result<Self, String> {
         if payload.len() < 8 {
-            return Err(format!("DEVICE_INFO payload too short: {} bytes", payload.len()));
+            return Err(format!(
+                "DEVICE_INFO payload too short: {} bytes",
+                payload.len()
+            ));
         }
 
         let protocol_version = read_u16_le(payload, 0)?;
@@ -711,12 +790,16 @@ impl DeviceInfo {
             let report_version = payload[15];
             let report_length = payload[16];
             if report_version != 1 {
-                return Err(format!("unsupported PSoC report version {}", report_version));
+                return Err(format!(
+                    "unsupported PSoC report version {}",
+                    report_version
+                ));
             }
             if report_length < 69 || payload.len() < 15 + report_length as usize {
                 return Err(format!(
                     "truncated PSoC report: declared {} bytes, payload {} bytes",
-                    report_length, payload.len()
+                    report_length,
+                    payload.len()
                 ));
             }
             let erase_failure = if report_length >= 109 {
@@ -760,7 +843,11 @@ impl DeviceInfo {
                 checksum_value: read_u32_le(payload, 80)?,
                 erase_failure,
                 // 报告尾部追加字段: 声明长度不足(旧固件)时按 0 处理, 保持向后兼容。
-                csd_flags: if report_length >= 110 { payload[124] } else { 0 },
+                csd_flags: if report_length >= 110 {
+                    payload[124]
+                } else {
+                    0
+                },
                 // 自持恢复事件计数(再往后 5 字节): 累计 / 被丢弃 / 是否还有待发。
                 // 供上位机与"自己实际收到的条数"核对, 漏帧要能被发现而不是当作没发生。
                 self_heal_total: if report_length >= 115 {
@@ -775,7 +862,28 @@ impl DeviceInfo {
                 },
                 self_heal_pending: report_length >= 115 && payload[129] != 0,
                 // CSD 模式紧跟自持恢复计数；旧固件报告长度不足时保持 AUTO 默认值。
-                csd_mode: if report_length >= 116 { payload[130] } else { 0 },
+                csd_mode: if report_length >= 116 {
+                    payload[130]
+                } else {
+                    0
+                },
+                // 固定 37B 的运行态 SWD 诊断尾部；旧报告无此尾部时不解析。
+                spi_debug: if report_length >= 153 {
+                    Some(SpiDebugCounters {
+                        status: payload[131],
+                        block_addr: read_u32_le(payload, 132)?,
+                        rx_frames: read_u32_le(payload, 136)?,
+                        scan_count: read_u32_le(payload, 140)?,
+                        ms_tick: read_u32_le(payload, 144)?,
+                        stage: read_u32_le(payload, 148)?,
+                        apply_cmd: read_u32_le(payload, 152)?,
+                        apply_last_ms: read_u32_le(payload, 156)?,
+                        apply_dirty: read_u32_le(payload, 160)?,
+                        setparam_cmd: read_u32_le(payload, 164)?,
+                    })
+                } else {
+                    None
+                },
             })
         } else {
             None
@@ -804,6 +912,7 @@ impl DeviceInfo {
         payload.push(self.psoc_snapshot_valid as u8);
         if let Some(report) = &self.diagnostics {
             payload.push(report.report_version);
+            let report_length_offset = payload.len();
             payload.push(report.report_length);
             payload.extend_from_slice(&report.rp_build_id.to_le_bytes());
             payload.extend_from_slice(&report.embedded_psoc_version.to_le_bytes());
@@ -825,7 +934,20 @@ impl DeviceInfo {
             payload.extend_from_slice(&report.program_status.to_le_bytes());
             payload.extend_from_slice(&report.checksum_srom.to_le_bytes());
             payload.extend_from_slice(&report.checksum_value.to_le_bytes());
-            if let Some(erase) = &report.erase_failure {
+            if report.erase_failure.is_some() || report.spi_debug.is_some() {
+                let empty_erase = EraseFailureDiagnostics {
+                    clock_select: 0,
+                    clock_imo_select: 0,
+                    clock_trim1: 0,
+                    clock_trim2: 0,
+                    clock_trim3: 0,
+                    flash_byte_sum: 0,
+                    flash_word_or: 0,
+                    first_nonzero_addr: 0,
+                    first_nonzero_value: 0,
+                    words_read: 0,
+                };
+                let erase = report.erase_failure.as_ref().unwrap_or(&empty_erase);
                 payload.extend_from_slice(&erase.clock_select.to_le_bytes());
                 payload.extend_from_slice(&erase.clock_imo_select.to_le_bytes());
                 payload.extend_from_slice(&erase.clock_trim1.to_le_bytes());
@@ -836,12 +958,25 @@ impl DeviceInfo {
                 payload.extend_from_slice(&erase.first_nonzero_addr.to_le_bytes());
                 payload.extend_from_slice(&erase.first_nonzero_value.to_le_bytes());
                 payload.extend_from_slice(&erase.words_read.to_le_bytes());
-                payload.push(report.csd_flags);   // 尾部 CSD 标志(仅在完整报告后存在)
+                payload.push(report.csd_flags); // 尾部 CSD 标志(仅在完整报告后存在)
                 payload.extend_from_slice(&report.self_heal_total.to_le_bytes());
                 payload.extend_from_slice(&report.self_heal_dropped.to_le_bytes());
                 payload.push(u8::from(report.self_heal_pending));
-                payload.push(report.csd_mode);      // 诊断尾部真实 CSD 模式
+                payload.push(report.csd_mode); // 诊断尾部真实 CSD 模式
+                if let Some(spi_debug) = &report.spi_debug {
+                    payload.push(spi_debug.status);
+                    payload.extend_from_slice(&spi_debug.block_addr.to_le_bytes());
+                    payload.extend_from_slice(&spi_debug.rx_frames.to_le_bytes());
+                    payload.extend_from_slice(&spi_debug.scan_count.to_le_bytes());
+                    payload.extend_from_slice(&spi_debug.ms_tick.to_le_bytes());
+                    payload.extend_from_slice(&spi_debug.stage.to_le_bytes());
+                    payload.extend_from_slice(&spi_debug.apply_cmd.to_le_bytes());
+                    payload.extend_from_slice(&spi_debug.apply_last_ms.to_le_bytes());
+                    payload.extend_from_slice(&spi_debug.apply_dirty.to_le_bytes());
+                    payload.extend_from_slice(&spi_debug.setparam_cmd.to_le_bytes());
+                }
             }
+            payload[report_length_offset] = (payload.len() - 15) as u8;
         }
         payload
     }
@@ -888,6 +1023,103 @@ pub struct KbdHoldTable {
     pub zone: Vec<HoldParam>,
 }
 
+/// 触控组合映射的一条: "zone_mask 内的分区全部同时按下" → "keycodes 全部同时输出"。
+/// 与固件 `KeyboardService::ComboMap` 一一对应, 单条协议编码 16 字节。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct KbdComboItem {
+    /// 参与判定的分区集合(34 位); 0 = 空条目(固件会丢弃)。
+    pub zone_mask: u64,
+    /// 同时按下的 HID 键码, 0 = 空位。
+    pub keycodes: [u8; KBD_COMBO_KEY_COUNT],
+    /// 修饰位 bit0=LCtrl bit1=LShift bit2=LAlt bit3=LGui。
+    pub modifiers: u8,
+    /// 全部分区按住需持续该时长才输出(ms, 0=立即)。
+    pub delay_ms: u16,
+    /// 输出后最长保持该时长即自动抬起(ms, 0=不自动抬起)。
+    pub max_hold_ms: u16,
+}
+
+/// 固件 `COMBO_KEY_COUNT`: 单条最多同时输出的键数。
+pub const KBD_COMBO_KEY_COUNT: usize = 4;
+/// 固件 `COMBO_COUNT`: 组合映射条数上限。
+pub const KBD_COMBO_COUNT: usize = 16;
+/// 单条协议字节数(固件 `COMBO_ENTRY_BYTES`) = zone_mask(8) + keycodes(4) + mod(1) + delay(2) + maxhold(2)。
+/// 两端都曾写成 16, 与实际逐字段布局差 1 字节, 于是固件的整表长度校验永远失败并 NAK ——
+/// 组合映射写不进设备。此处按字段和推导, 不再写字面量。
+const KBD_COMBO_ENTRY_BYTES: usize = 8 + KBD_COMBO_KEY_COUNT + 1 + 2 + 2;
+
+/// 编码 KBD_SET_COMBO 请求载荷: [count(u8)] + count×16B。**整表替换**语义。
+pub fn encode_kbd_set_combo(items: &[KbdComboItem]) -> Vec<u8> {
+    let n = items.len().min(KBD_COMBO_COUNT);
+    let mut payload = Vec::with_capacity(1 + n * KBD_COMBO_ENTRY_BYTES);
+    payload.push(n as u8);
+    for item in items.iter().take(n) {
+        payload.extend_from_slice(&item.zone_mask.to_le_bytes());
+        payload.extend_from_slice(&item.keycodes);
+        payload.push(item.modifiers);
+        payload.extend_from_slice(&item.delay_ms.to_le_bytes());
+        payload.extend_from_slice(&item.max_hold_ms.to_le_bytes());
+    }
+    payload
+}
+
+/// 解码 KBD_GET_COMBO 响应: [combo_count(u8), key_count(u8)] + combo_count×16B。
+/// 只返回非空条目(zone_mask != 0) —— 空槽位对上位机没有意义, 表长由 UI 自己按上限约束。
+/// key_count 与本地常量不一致时报错而不是猜: 那是固件与上位机版本不匹配, 静默截断会写出错误的键。
+pub fn decode_kbd_get_combo(payload: &[u8]) -> Result<Vec<KbdComboItem>, String> {
+    if payload.len() < 2 {
+        return Err(format!(
+            "KBD_GET_COMBO 响应过短: {} 字节 (需 >= 2)",
+            payload.len()
+        ));
+    }
+    let count = payload[0] as usize;
+    let key_count = payload[1] as usize;
+    if key_count != KBD_COMBO_KEY_COUNT {
+        return Err(format!(
+            "KBD_GET_COMBO key_count={} 与上位机常量 {} 不一致(固件/上位机版本不匹配)",
+            key_count, KBD_COMBO_KEY_COUNT
+        ));
+    }
+    let need = 2 + count * KBD_COMBO_ENTRY_BYTES;
+    if payload.len() < need {
+        return Err(format!(
+            "KBD_GET_COMBO 响应长度 {} 不足 count={} 所需的 {}",
+            payload.len(),
+            count,
+            need
+        ));
+    }
+    let mut out = Vec::new();
+    for i in 0..count {
+        let b = 2 + i * KBD_COMBO_ENTRY_BYTES;
+        let zone_mask = u64::from_le_bytes([
+            payload[b],
+            payload[b + 1],
+            payload[b + 2],
+            payload[b + 3],
+            payload[b + 4],
+            payload[b + 5],
+            payload[b + 6],
+            payload[b + 7],
+        ]);
+        if zone_mask == 0 {
+            continue;
+        }
+        let mut keycodes = [0u8; KBD_COMBO_KEY_COUNT];
+        keycodes.copy_from_slice(&payload[b + 8..b + 8 + KBD_COMBO_KEY_COUNT]);
+        let m = b + 8 + KBD_COMBO_KEY_COUNT;
+        out.push(KbdComboItem {
+            zone_mask,
+            keycodes,
+            modifiers: payload[m],
+            delay_ms: u16::from_le_bytes([payload[m + 1], payload[m + 2]]),
+            max_hold_ms: u16::from_le_bytes([payload[m + 3], payload[m + 4]]),
+        });
+    }
+    Ok(out)
+}
+
 /// 编码 KBD_SET_HOLD 请求载荷。
 /// payload = n×[kind(u8), idx(u8), delay_ms(u16 LE), max_hold_ms(u16 LE)]
 pub fn encode_kbd_set_hold(items: &[KbdHoldItem]) -> Vec<u8> {
@@ -906,7 +1138,10 @@ pub fn encode_kbd_set_hold(items: &[KbdHoldItem]) -> Vec<u8> {
 /// 长度不足一律返回错误(不 panic, 不用默认值糊过去)。
 pub fn decode_kbd_get_hold(payload: &[u8]) -> Result<KbdHoldTable, String> {
     if payload.len() < 2 {
-        return Err(format!("KBD_GET_HOLD 响应过短: {} 字节 (需 >= 2)", payload.len()));
+        return Err(format!(
+            "KBD_GET_HOLD 响应过短: {} 字节 (需 >= 2)",
+            payload.len()
+        ));
     }
     let phys_count = payload[0] as usize;
     let zone_count = payload[1] as usize;
@@ -914,7 +1149,10 @@ pub fn decode_kbd_get_hold(payload: &[u8]) -> Result<KbdHoldTable, String> {
     if payload.len() < need {
         return Err(format!(
             "KBD_GET_HOLD 响应截断: 声明 {} 物理键 + {} 分区需 {} 字节, 实收 {} 字节",
-            phys_count, zone_count, need, payload.len()
+            phys_count,
+            zone_count,
+            need,
+            payload.len()
         ));
     }
     let read_at = |pos: usize| HoldParam {
@@ -933,6 +1171,141 @@ pub fn decode_kbd_get_hold(payload: &[u8]) -> Result<KbdHoldTable, String> {
         table.zone.push(read_at(zone_base + i * 4));
     }
     Ok(table)
+}
+
+// ============================================================================
+// 物理键每键配置 (KBD_GET_KEYCFG 0x7C / KBD_SET_KEYCFG 0x7D)
+// 与逻辑分析仪边沿记录 (KBD_GET_EDGES 0x77)
+// ============================================================================
+
+/// 每键防抖窗上限(us)。与固件 `KeyboardService::DEBOUNCE_US_MAX` 同源: UI 围栏必须取同一个数,
+/// 否则用户能设出一个必然被 NAK 的值。
+pub const KBD_DEBOUNCE_US_MAX: u16 = 10000;
+/// 每键防抖默认值(= 改造前的全局 DEBOUNCE_US)。
+pub const KBD_DEBOUNCE_US_DEFAULT: u16 = 3000;
+
+/// 单个物理键的触发极性与防抖窗。
+///
+/// - `active_high`: true = 高电平触发; false = 低电平触发(默认, 与旧固件全局 active-low 一致)。
+/// - `debounce_us`: 0..=`KBD_DEBOUNCE_US_MAX`, 0 = 不去抖。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KbdKeyCfg {
+    pub active_high: bool,
+    pub debounce_us: u16,
+}
+
+impl Default for KbdKeyCfg {
+    fn default() -> Self {
+        KbdKeyCfg {
+            active_high: false,
+            debounce_us: KBD_DEBOUNCE_US_DEFAULT,
+        }
+    }
+}
+
+/// 一条边沿记录: 12 位掩码发生变化的时刻 + 去抖前/仅去抖后/实际输出三态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct KbdEdgeRec {
+    /// 设备 `time_us_32()` 原始时间戳(微秒, 会 32 位回绕)。
+    pub t_us: u32,
+    /// 去抖前的 12 位按下态。
+    pub raw: u16,
+    /// 仅经去抖后的 12 位按下态。
+    pub deb: u16,
+    /// 经去抖 + 长按状态机后实际输出 HID 的 12 位。
+    pub out: u16,
+}
+
+/// KBD_GET_EDGES 一次拉取的结果。
+#[derive(Debug, Clone, Default)]
+pub struct KbdEdgeBatch {
+    /// 固件环形缓冲容量(条)。
+    pub cap: u16,
+    /// 固件累计因环满丢弃的条数(只增)。主机取差值即可诚实显示"有事件丢失"。
+    pub overflow: u32,
+    /// 本次取完后固件侧还剩的条数(>0 说明该提高拉取频率)。
+    pub remaining: u16,
+    pub recs: Vec<KbdEdgeRec>,
+}
+
+/// 编码 KBD_SET_KEYCFG 请求载荷: n×[idx(u8), pol(u8), debounce_us(u16 LE)]。
+/// 越界值不在这里夹取 —— 固件会 NAK, 静默夹取只会让界面与设备不一致。
+pub fn encode_kbd_set_keycfg(items: &[(u8, KbdKeyCfg)]) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(items.len() * 4);
+    for (idx, cfg) in items {
+        payload.push(*idx);
+        payload.push(u8::from(cfg.active_high));
+        payload.extend_from_slice(&cfg.debounce_us.to_le_bytes());
+    }
+    payload
+}
+
+/// 解码 KBD_GET_KEYCFG 响应: [count(u8)] + count×(pol(u8), debounce_us(u16 LE))。
+pub fn decode_kbd_get_keycfg(payload: &[u8]) -> Result<Vec<KbdKeyCfg>, String> {
+    if payload.is_empty() {
+        return Err("KBD_GET_KEYCFG 响应为空".to_string());
+    }
+    let count = payload[0] as usize;
+    let need = 1 + count * 3;
+    if payload.len() < need {
+        return Err(format!(
+            "KBD_GET_KEYCFG 响应截断: 声明 {} 键需 {} 字节, 实收 {}",
+            count,
+            need,
+            payload.len()
+        ));
+    }
+    let mut out = Vec::with_capacity(count);
+    for i in 0..count {
+        let b = 1 + i * 3;
+        out.push(KbdKeyCfg {
+            active_high: payload[b] != 0,
+            debounce_us: u16::from_le_bytes([payload[b + 1], payload[b + 2]]),
+        });
+    }
+    Ok(out)
+}
+
+/// 编码 KBD_GET_EDGES 请求载荷: [max(u8)]; 0 = 用固件默认上限。
+pub fn encode_kbd_get_edges(max: u8) -> Vec<u8> {
+    vec![max]
+}
+
+/// 解码 KBD_GET_EDGES 响应:
+/// [cap(u16 LE), overflow(u32 LE), remaining(u16 LE), count(u8)] + count×(t_us u32 LE, raw u16, deb u16, out u16)
+pub fn decode_kbd_get_edges(payload: &[u8]) -> Result<KbdEdgeBatch, String> {
+    if payload.len() < 9 {
+        return Err(format!(
+            "KBD_GET_EDGES 响应过短: {} 字节 (需 >= 9)",
+            payload.len()
+        ));
+    }
+    let count = payload[8] as usize;
+    let need = 9 + count * 10;
+    if payload.len() < need {
+        return Err(format!(
+            "KBD_GET_EDGES 响应截断: 声明 {} 条需 {} 字节, 实收 {}",
+            count,
+            need,
+            payload.len()
+        ));
+    }
+    let mut recs = Vec::with_capacity(count);
+    for i in 0..count {
+        let b = 9 + i * 10;
+        recs.push(KbdEdgeRec {
+            t_us: u32::from_le_bytes([payload[b], payload[b + 1], payload[b + 2], payload[b + 3]]),
+            raw: u16::from_le_bytes([payload[b + 4], payload[b + 5]]),
+            deb: u16::from_le_bytes([payload[b + 6], payload[b + 7]]),
+            out: u16::from_le_bytes([payload[b + 8], payload[b + 9]]),
+        });
+    }
+    Ok(KbdEdgeBatch {
+        cap: u16::from_le_bytes([payload[0], payload[1]]),
+        overflow: u32::from_le_bytes([payload[2], payload[3], payload[4], payload[5]]),
+        remaining: u16::from_le_bytes([payload[6], payload[7]]),
+        recs,
+    })
 }
 
 // ============================================================================
@@ -956,7 +1329,10 @@ pub fn encode_mai2_set_send_en(en: bool) -> Vec<u8> {
 /// payload = send_en(u8) + status(u8) + baud(u32 LE)
 pub fn decode_mai2_get_state(payload: &[u8]) -> Result<Mai2State, String> {
     if payload.len() < 6 {
-        return Err(format!("MAI2_GET_STATE 响应过短: {} 字节 (需 >= 6)", payload.len()));
+        return Err(format!(
+            "MAI2_GET_STATE 响应过短: {} 字节 (需 >= 6)",
+            payload.len()
+        ));
     }
     Ok(Mai2State {
         send_en: payload[0] != 0,
@@ -976,7 +1352,10 @@ mod tests {
     #[test]
     fn test_crc16_checksum() {
         // Test vector: "123456789" should yield 0x29B1
-        assert!(verify_crc_checksum(), "CRC-16/CCITT-FALSE test vector failed");
+        assert!(
+            verify_crc_checksum(),
+            "CRC-16/CCITT-FALSE test vector failed"
+        );
     }
 
     #[test]
@@ -1043,7 +1422,10 @@ mod tests {
 
         let nak = Frame::nak(11, HostCmdError::InvalidParam, b"test error");
         assert_eq!(nak.cmd, HostCmd::Nak as u8);
-        assert_eq!(nak.flags & (FLAG_RESPONSE | FLAG_NAK_ERR), FLAG_RESPONSE | FLAG_NAK_ERR);
+        assert_eq!(
+            nak.flags & (FLAG_RESPONSE | FLAG_NAK_ERR),
+            FLAG_RESPONSE | FLAG_NAK_ERR
+        );
         assert_eq!(nak.seq, 11);
         assert_eq!(nak.payload[0], HostCmdError::InvalidParam as u8);
     }

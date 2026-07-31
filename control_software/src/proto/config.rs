@@ -212,12 +212,20 @@ pub struct ConfigEntry {
 impl ConfigEntry {
     /// Create a new entry without range
     pub fn new(key: String, value: CfgValue) -> Self {
-        ConfigEntry { key, value, range: None }
+        ConfigEntry {
+            key,
+            value,
+            range: None,
+        }
     }
 
     /// Create a new entry with range
     pub fn with_range(key: String, value: CfgValue, min: CfgValue, max: CfgValue) -> Self {
-        ConfigEntry { key, value, range: Some((min, max)) }
+        ConfigEntry {
+            key,
+            value,
+            range: Some((min, max)),
+        }
     }
 }
 
@@ -248,7 +256,8 @@ pub fn encode_entry(entry: &ConfigEntry) -> Result<Vec<u8>, String> {
     // min/max if has_range
     if let Some((min, max)) = &entry.range {
         // Verify type consistency
-        if min.type_code() != entry.value.type_code() || max.type_code() != entry.value.type_code() {
+        if min.type_code() != entry.value.type_code() || max.type_code() != entry.value.type_code()
+        {
             return Err("Range min/max type mismatch with value type".to_string());
         }
         min.encode_value(&mut out)?;
@@ -419,8 +428,7 @@ mod tests {
 
     #[test]
     fn test_encode_decode_f32() {
-        let entry =
-            ConfigEntry::new("touch.sensitivity".to_string(), CfgValue::F32(3.14159));
+        let entry = ConfigEntry::new("touch.sensitivity".to_string(), CfgValue::F32(3.14159));
         let encoded = encode_entry(&entry).unwrap();
         let (decoded, _consumed) = decode_entry(&encoded).unwrap();
 
@@ -433,8 +441,7 @@ mod tests {
 
     #[test]
     fn test_encode_decode_u32() {
-        let entry =
-            ConfigEntry::new("led.count".to_string(), CfgValue::U32(0xFFFFFFFF));
+        let entry = ConfigEntry::new("led.count".to_string(), CfgValue::U32(0xFFFFFFFF));
         let encoded = encode_entry(&entry).unwrap();
         let (decoded, _consumed) = decode_entry(&encoded).unwrap();
 

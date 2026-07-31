@@ -17,22 +17,22 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
-use windows::core::w;
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, GetKeyboardState, ToUnicode, VK_RETURN, VK_SHIFT,
 };
 use windows::Win32::UI::Input::{
-    GetRawInputData, GetRawInputDeviceInfoW, GetRawInputDeviceList, RegisterRawInputDevices,
-    HRAWINPUT, RAWINPUT, RAWINPUTDEVICE, RAWINPUTDEVICELIST, RAWINPUTHEADER,
-    RIDEV_INPUTSINK, RIDEV_REMOVE, RIDI_DEVICENAME, RID_INPUT, RIM_TYPEKEYBOARD,
+    GetRawInputData, GetRawInputDeviceInfoW, GetRawInputDeviceList, HRAWINPUT, RAWINPUT,
+    RAWINPUTDEVICE, RAWINPUTDEVICELIST, RAWINPUTHEADER, RID_INPUT, RIDEV_INPUTSINK, RIDEV_REMOVE,
+    RIDI_DEVICENAME, RIM_TYPEKEYBOARD, RegisterRawInputDevices,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, PeekMessageW, RegisterClassW,
-    TranslateMessage, HWND_MESSAGE, MSG, PM_REMOVE, WINDOW_EX_STYLE, WINDOW_STYLE, WM_INPUT,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, HWND_MESSAGE, MSG, PM_REMOVE,
+    PeekMessageW, RegisterClassW, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_INPUT,
     WM_KEYDOWN, WM_SYSKEYDOWN, WNDCLASSW,
 };
+use windows::core::w;
 
 /// HID 键盘设备的 Usage Page / Usage(HID 规范: 1/6 = 通用桌面/键盘)。
 const HID_USAGE_PAGE_GENERIC: u16 = 0x01;
@@ -238,7 +238,10 @@ fn describe_device(path: String) -> KeyboardDevice {
 
     // 集合行文案: 同一物理设备常有多个键盘集合(MI_xx/Colxx), 必须能分辨是哪一个。
     let collection = collection_label(&path);
-    let label = match (collection.is_empty(), me.bus.is_empty() || is_generic_name(&me.bus)) {
+    let label = match (
+        collection.is_empty(),
+        me.bus.is_empty() || is_generic_name(&me.bus),
+    ) {
         (true, true) => product.clone(),
         (true, false) => me.bus.clone(),
         (false, true) => collection.clone(),
@@ -328,7 +331,9 @@ fn instance_tail(path: &str) -> Option<String> {
 /// Raw Input 路径 → 设备实例 ID。
 /// `\\?\HID#VID_1A2C&PID_0E24#7&abc&0&0000#{guid}` → `HID\VID_1A2C&PID_0E24\7&abc&0&0000`
 fn instance_id_from_path(path: &str) -> Option<String> {
-    let body = path.strip_prefix(r"\\?\").or_else(|| path.strip_prefix(r"\\.\"))?;
+    let body = path
+        .strip_prefix(r"\\?\")
+        .or_else(|| path.strip_prefix(r"\\.\"))?;
     // 尾部的接口类 GUID 不属于实例 ID, 去掉。
     let body = match body.find("#{") {
         Some(at) => &body[..at],
@@ -358,8 +363,8 @@ fn vid_pid_of(path: &str) -> String {
 /// 查一个设备节点的各路文案 + 其父设备实例 ID。查不到返回 None(枚举照常继续)。
 fn query_node(instance_id: &str) -> Option<(NodeText, Option<String>)> {
     use windows::Win32::Devices::DeviceAndDriverInstallation::{
-        SetupDiCreateDeviceInfoList, SetupDiDestroyDeviceInfoList, SetupDiOpenDeviceInfoW,
-        SP_DEVINFO_DATA,
+        SP_DEVINFO_DATA, SetupDiCreateDeviceInfoList, SetupDiDestroyDeviceInfoList,
+        SetupDiOpenDeviceInfoW,
     };
     // SAFETY: 空 devinfo 集合 + 按实例 ID 打开单个设备; 出口统一 Destroy。
     unsafe {
@@ -408,16 +413,8 @@ fn dev_prop(
         let mut buf = [0u8; 512];
         let mut ty = DEVPROPTYPE::default();
         let mut needed: u32 = 0;
-        SetupDiGetDevicePropertyW(
-            h,
-            data,
-            key,
-            &mut ty,
-            Some(&mut buf),
-            Some(&mut needed),
-            0,
-        )
-        .ok()?;
+        SetupDiGetDevicePropertyW(h, data, key, &mut ty, Some(&mut buf), Some(&mut needed), 0)
+            .ok()?;
         Some(decode_wide(&buf, needed)).filter(|s| !s.is_empty())
     }
 }
@@ -451,15 +448,8 @@ fn reg_prop(
     unsafe {
         let mut buf = [0u8; 512];
         let mut needed: u32 = 0;
-        SetupDiGetDeviceRegistryPropertyW(
-            h,
-            data,
-            prop,
-            None,
-            Some(&mut buf),
-            Some(&mut needed),
-        )
-        .ok()?;
+        SetupDiGetDeviceRegistryPropertyW(h, data, prop, None, Some(&mut buf), Some(&mut needed))
+            .ok()?;
         let s = decode_wide(&buf, needed);
         (!s.is_empty()).then_some(s)
     }
@@ -560,10 +550,9 @@ pub fn start(state: Arc<VcamState>) {
                 dwFlags: RIDEV_INPUTSINK, // 后台也收(扫码时焦点在游戏上)
                 hwndTarget: hwnd,
             }];
-            if let Err(e) = RegisterRawInputDevices(
-                &devices,
-                std::mem::size_of::<RAWINPUTDEVICE>() as u32,
-            ) {
+            if let Err(e) =
+                RegisterRawInputDevices(&devices, std::mem::size_of::<RAWINPUTDEVICE>() as u32)
+            {
                 log::error!("虚拟摄像头: 注册 Raw Input 键盘失败: {:?}", e);
                 let _ = DestroyWindow(hwnd);
                 RUNNING.store(false, Ordering::SeqCst);

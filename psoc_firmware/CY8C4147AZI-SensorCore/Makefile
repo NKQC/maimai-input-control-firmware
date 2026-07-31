@@ -134,7 +134,12 @@ LDLIBS=
 LINKER_SCRIPT=
 
 # Custom pre-build commands to run.
-PREBUILD=
+#
+# 无条件重新生成编译时间戳版本头 fw_build_stamp.h(main.c 的 FW_VERSION 取自它)。
+# prebuild 在 ninja 文件生成之前跑(core-make main.mk: $(NINJA_FILE): FORCE prebuild),
+# 之后 ninja 靠 depfile 发现头变化重编 main.c, 所以"make build"自身即可保证版本不过期。
+# 生成脚本与 RP2040 侧共用同一份编码实现, 免得两端各算一套。
+PREBUILD=$(if $(CY_PYTHON_PATH),$(CY_PYTHON_PATH),python) ../../main_firmware/tools/build_stamp_header.py fw_build_stamp.h FW_BUILD_STAMP
 
 # Custom post-build commands to run.
 POSTBUILD=

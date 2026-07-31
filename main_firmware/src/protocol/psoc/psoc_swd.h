@@ -23,6 +23,17 @@ public:
         ACK_PARITY = 0x7   // 本地扩展：读数据奇偶校验错
     };
 
+    // 运行态带外 SWD 诊断结果。
+    enum DebugStatus : uint32_t {
+        DEBUG_OK = 0,
+        DEBUG_PIO_NOT_READY = 1,
+        DEBUG_IDCODE_FAILED = 2,
+        DEBUG_DP_POWER_FAILED = 3,
+        DEBUG_CSW_CONFIG_FAILED = 4,
+        DEBUG_MAGIC_NOT_FOUND = 5,
+        DEBUG_BLOCK_READ_FAILED = 6,
+    };
+
     SwdProgrammer(uint8_t io_pin, uint8_t clk_pin, uint8_t rst_pin);
 
     // 初始化 PIO(HAL_PIO0) + SWD 引脚(SWDIO/SWDCLK) + RST(XRES) GPIO。
@@ -87,6 +98,14 @@ public:
     // 单独读取调试口 IDCODE（需先 line reset）。ack 可选输出。
     uint32_t read_idcode(uint8_t* ack_out = nullptr);
 
+    // 带外调试读：不停核、不复位，经 AHB-AP 读取 PSoC 运行态 SRAM 的 spi_dbg 计数块。
+    // 首次调用扫描并缓存 magic 块地址；out_words 依次为 rx_frames、scan_count、
+    // ms_tick、stage、apply_cmd、apply_last_ms、apply_dirty、setparam_cmd。
+    static constexpr uint8_t DEBUG_COUNTER_WORDS = 8;
+    bool debug_read_spi_counters(uint32_t out_words[DEBUG_COUNTER_WORDS]);
+    uint32_t debug_last_status() const { return _dbg_status; }
+    uint32_t debug_block_addr() const { return _dbg_block_addr; }
+
     // Step 2：经 SROM GET_SILICON_ID 读取 4 字节硅 ID。
     // out_id 打包为 [31:24]=Hi [23:16]=Lo [15:8]=Rev [7:0]=Family。需先 acquire() 成功。
     // 同时刷新 _last_chip_prot（保护值 = CPUSS_SYSREQ[15:12]）。
@@ -137,6 +156,11 @@ private:
     bool _write_io(uint32_t addr, uint32_t data);
     bool _read_io(uint32_t addr, uint32_t* data);
 
+    // ---------- 运行态带外 SWD 诊断 ----------
+    bool _debug_reclaim_pio();
+    bool _debug_attach();
+    bool _debug_scan(uint32_t deadline_us);
+
     // ---------- SROM ----------
     // OpenOCD psoc4.c 逐字复刻的 halt+bkpt-run 机制：core 须已 halt（acquire() 完成）。
     // 写 bkpt 到 SRAM → 设 SP/PC/xPSR → 写 CPUSS_SYSREQ=SYSREQ_BIT|HMASTER_BIT|cmd →
@@ -185,6 +209,8 @@ private:
     // 故运行时 REBOOT_PSOC 仍可脉冲复位; 仅 SWD_RELEASE_TO_EXTERNAL(从未 init)时保持 false 不驱动。
     bool _rst_ready = false;
     uint32_t _last_idcode;
+    uint32_t _dbg_status;
+    uint32_t _dbg_block_addr;
 
     // 诊断
     uint32_t _last_srom_status;

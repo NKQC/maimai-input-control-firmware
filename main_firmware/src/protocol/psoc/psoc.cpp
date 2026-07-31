@@ -6,6 +6,7 @@
 #include <pico/stdlib.h>
 #include <hardware/sync.h>   // __dmb() / __sev() 跨核内存屏障
 #include <hardware/watchdog.h>   // watchdog_update(): 重操作阻塞等待期间喂狗
+#include "../../service/usb_debug.h"   // crash_stage_set(): 阻塞等待期间记录阶段码
 
 namespace {
 constexpr uint32_t CORE1_CYCLE_US = 1000;        // core1 固定周期 1ms(1kHz), 保证传感器时序恒定
@@ -21,6 +22,12 @@ constexpr uint32_t HANG_STATS_INTERVALS   = 8;
 // 远超 LINK_FAIL_RESET_CYCLES(200ms)。若不设宽限, 兜底会在 PSoC 启动完成前又发 XRES →
 // 永久复位死循环 → 链路永不恢复(表现: 重启后 link 掉、需重烧)。宽限期内不累计失败/不再触发复位。
 constexpr uint32_t RESET_BOOT_GRACE_MS    = 1500;
+// ★重操作执行宽限★: APPLY/CALIBRATE/GLOBAL_COMMIT/BASELINE_RESET 由 PSoC 主循环同步执行,
+// 实测 provision 后的 APPLY(36 通道逐个重校准)达 12.4s。期间 CapSense 内部临界区推迟 SPI DMA 中断,
+// read_touch 会成批失败 —— 那不是掉线, 不得据此 XRES 或重新下发配置。给足余量到 30s。
+// AUTO_TUNE 更长(逐通道最坏数十秒), 与其 SPI 层 45s 超时对齐并留余量。
+constexpr uint32_t HEAVY_OP_GRACE_MS      = 30000;
+constexpr uint32_t AUTOTUNE_GRACE_MS      = 60000;
 }
 
 Psoc* Psoc::_instance = nullptr;
@@ -60,6 +67,13 @@ void Psoc::_spi_service() {
         if (_cmd_tail == _cmd_head) break;          // 队空
         SpiCmd& c = _cmd_ring[_cmd_tail];
         uint32_t r = 0;
+        // ★in_cmd 必须包住整条执行★: core0 侧的 flash 落地要 multicore_lockout core1, 而重操作
+        // (PSoC 重初始化 / CalibrateAllWidgets)在 _wait_op_done 里轮询数秒, 期间 core1 不进 wfe
+        // 也就响应不了 lockout ⇒ core0 死等且不喂狗 ⇒ 5s 看门狗复位整机(实测: 保存后约 8.5s 掉线,
+        // 设备重新枚举、LED 重启)。core0 据此标志避开这个窗口落盘。
+        _core1_in_cmd = 1u;
+        crash_stage_set(CRASH_STAGE_CORE1_CMD);
+        __dmb();
         const bool ok = _exec_cmd(c.op, c.ch, c.pid, c.val, &r, c.data);
         c.result = r;
         c.ok = ok;
@@ -67,6 +81,8 @@ void Psoc::_spi_service() {
         c.done = true;                              // 发布结果(读类 core0 在等)
         __dmb();
         _cmd_tail = (_cmd_tail + 1) % CMD_RING_SIZE; // 消费者推进 tail, 释放槽位
+        __dmb();
+        _core1_in_cmd = 0u;
     }
 
     // 2) 触控快路: 单次 7 字节事务读 36 区位图, 实测耗时。seqlock 发布防 u64 撕裂。
@@ -132,7 +148,8 @@ void Psoc::_spi_service() {
             return;
         }
         uint32_t sc = 0;
-        if (ok && _spi.get_stats(&sc)) {
+        uint8_t psoc_busy = 0;
+        if (ok && _spi.get_stats(&sc, &psoc_busy)) {
             if (_stats_primed) {
                 const uint32_t dt = stats_now_us - _stats_last_us;
                 const uint32_t dcount = sc - _stats_last_scan;
@@ -140,8 +157,15 @@ void Psoc::_spi_service() {
                 _scan_period_us = (_samples_per_sec > 0u) ? (1000000u / _samples_per_sec) : 0u;
                 // 失效兜底(主循环卡死): scan_count 长时间不推进 = PSoC 主循环卡死(疑似坏算法死循环)。
                 // 注意 read_touch 仍由 PSoC SPI ISR 应答, 故 link_ok 不掉, 只能靠 scan_count 检测。
+                // ★"忙"不等于"卡死": PSoC 报告 busy 时不得累计卡死计数★
+                // APPLY/CALIBRATE/GLOBAL_COMMIT/AUTO_TUNE 由 PSoC 主循环同步执行, 期间 scan_count
+                // 天然不推进(逐通道 CalibrateWidget 在 36 通道上可远超 4s, 尤其 provision 期 SPI
+                // 中断负载很高时)。此前把它误判为"主循环卡死"→ XRES 复位 → 复位又触发 provision
+                // 重发 APPLY → 永久复位循环(实测: 每轮 boot→APPLY→约 3s 后被复位, scan_count 恒 1,
+                // raw 全 0, SelfHeal 累计上百次)。真正的卡死(坏算法死循环)不会置 busy, 仍能被抓到;
+                // 重操作本身另有 _wait_op_done 的超时兜底, 不依赖这里。
                 if (_link_established) {
-                    if (dcount == 0u) {
+                    if (dcount == 0u && psoc_busy == 0u) {
                         if (++_hang_intervals >= HANG_STATS_INTERVALS && _pub_reset_reason == 0) {
                             _pub_reset_reason = 2;
                         }
@@ -179,6 +203,23 @@ void Psoc::update() {
 
 // 实际 SPI 指令执行体: core1 处理信箱时调用, 或 setup 阶段(_core1_running=false)由 _submit 直调。
 bool Psoc::_exec_cmd(SpiOp op, uint8_t ch, uint8_t pid, uint32_t val, uint32_t* out, const uint8_t* data) {
+    // ★派发重操作前先开宽限窗★: 这些操作让 PSoC 主循环忙数秒到数十秒, 期间链路必然抖动。
+    // 不开窗就会被失效兜底判成"PSoC 掉线"→ XRES + 清 provisioned → 重新下发又触发一次重操作,
+    // 形成永久 provision 风暴。宽限只影响"是否判定 PSoC 已死", 不影响任何真实完成判据。
+    switch (op) {
+        case SpiOp::APPLY:
+        case SpiOp::CALIBRATE:
+        case SpiOp::BASELINE_RESET:
+        case SpiOp::GLOBAL_COMMIT:
+            _reset_grace_until_ms = millis() + HEAVY_OP_GRACE_MS;
+            break;
+        case SpiOp::AUTO_TUNE:
+            _reset_grace_until_ms = millis() + AUTOTUNE_GRACE_MS;
+            break;
+        default:
+            break;
+    }
+
     switch (op) {
         case SpiOp::SET_PARAM:
             return _spi.set_param(ch, pid, val);
@@ -298,18 +339,26 @@ bool Psoc::_submit(SpiOp op, uint8_t ch, uint8_t pid, uint32_t val, uint32_t* ou
     }
 
     const bool wait = (out != nullptr);   // 读类需返回值
+    // ★入队自旋也要用调用方给的预算★
+    // 原先这里硬编码 SPI_CMD_TIMEOUT_US(100ms), 但 core1 执行重操作时(APPLY 实测 12s、CALIBRATE、
+    // GLOBAL_COMMIT)整段时间不消费命令环, 环一满 100ms 就放弃入队 —— 于是"刚保存完配置就点算法上传"
+    // 必然失败, 上位机看到的是 `algo download enqueue failed`(实测复现)。调用方明知自己是长操作时
+    // 给更长 timeout_us, 这里就该照办; 自旋期间已经在泵 USB + 喂狗, 等下去是安全的。
+    const uint32_t eff_timeout = (timeout_us != 0u) ? timeout_us : SPI_CMD_TIMEOUT_US;
 
     // 等待队列有空位(仅当被 core1 拖慢时短暂自旋; 长期满=core1 卡死则超时放弃)。
     const uint32_t enq_start = time_us_32();
     while (((_cmd_head + 1u) % CMD_RING_SIZE) == _cmd_tail) {
-        if (time_us_32() - enq_start > SPI_CMD_TIMEOUT_US) return false;
+        if (time_us_32() - enq_start > eff_timeout) return false;
         // ★保活 USB★: core1 执行重操作(如 CALIBRATE _wait_op_done ~1.5s)期间不消费命令环,
         // 高频连发(如探针单轮 38 条 > 环深 32)会让 core0 卡在此入队自旋。与下方"等结果"环一致,
         // 必须在此泵 tud_task 否则 TinyUSB 得不到服务 → 主机写超时拆端点掉线。
+        crash_stage_set(CRASH_STAGE_PSOC_ENQUEUE);
         watchdog_update();
         HAL_USB_Device::getInstance()->task();
         tight_loop_contents();
     }
+    crash_stage_set(CRASH_STAGE_NONE);
 
     const uint32_t slot = _cmd_head;
     SpiCmd& c = _cmd_ring[slot];
@@ -329,15 +378,16 @@ bool Psoc::_submit(SpiOp op, uint8_t ch, uint8_t pid, uint32_t val, uint32_t* ou
 
     // 读类/需等真实完成类: 单生产者, 入队后本条槽位在读到 done 前不会被复用, 阻塞等结果。
     // 重操作(校准/apply/基线复位)在 core1 内轮询 PSoC busy 至真实完成, 耗时可达 ~1.5s,
-    // 故允许调用方给更长 timeout_us(默认 SPI_CMD_TIMEOUT_US)。
-    const uint32_t eff_timeout = (timeout_us != 0u) ? timeout_us : SPI_CMD_TIMEOUT_US;
+    // 故允许调用方给更长 timeout_us(默认 SPI_CMD_TIMEOUT_US); eff_timeout 已在入队前算好。
     const uint32_t start = time_us_32();
     while (!c.done) {
         if (time_us_32() - start > eff_timeout) return false;   // 超时
+        crash_stage_set(CRASH_STAGE_PSOC_SUBMIT);
         watchdog_update();   // 重操作阻塞等待可达~1.5s, 期间喂狗防 5s 看门狗误复位
         HAL_USB_Device::getInstance()->task();
         tight_loop_contents();
     }
+    crash_stage_set(CRASH_STAGE_NONE);
     __dmb();
     if (out) *out = c.result;
     return c.ok;
@@ -464,7 +514,10 @@ bool Psoc::upload_algo(const uint8_t* data, uint16_t len, uint16_t crc16) {
     __dmb();
     // val 打包 crc16<<16 | len; 写类入队(out 为空)即返回, 重活全在 core1, core0 继续服务 USB。
     const uint32_t packed = ((uint32_t)crc16 << 16) | (uint32_t)len;
-    if (!_submit(SpiOp::UPLOAD_ALGO, 0, 0, packed, nullptr, data)) {
+    // ★入队预算给足 15s★: 算法上传是用户显式动作, 且常紧跟在"保存到设备"之后 —— 那时 core1 可能正在
+    // 跑 GLOBAL_COMMIT/APPLY(逐通道重校准实测 12s), 整段不消费命令环。默认 100ms 会让上传必然失败,
+    // 表现为 `algo download enqueue failed`。等下去是安全的: 自旋内已泵 USB + 喂狗。
+    if (!_submit(SpiOp::UPLOAD_ALGO, 0, 0, packed, nullptr, data, 15000000u)) {
         _algo_dl.busy = 0u;   // 入队都没成功: 立刻释放, 否则永久锁死上传通道
         return false;
     }
@@ -535,7 +588,19 @@ bool Psoc::get_global(uint8_t gparam_id, uint32_t* out_value) {
 }
 
 bool Psoc::global_commit() {
-    return _submit(SpiOp::GLOBAL_COMMIT, 0, 0, 0, nullptr);   // 非阻塞: core1 执行完整重初始化, 不阻塞 USB
+    // ★写类异步入队, 完成屏障放在 core1 内★
+    // GLOBAL_COMMIT 会让 PSoC 主循环跑 Init/Initialize。要防的是"Init 与随后的 PARAM_SET 交错"
+    // (实测表现: CH0/3/17/35 的 0x08/0x0A/0x0B 在重启 provision 后被 Init 重置回生成配置)。
+    // 该屏障由 PsocSpi::global_commit 内的 _wait_op_done 提供 —— 命令环是 FIFO 且由 core1 顺序
+    // 执行, 后续 PARAM_SET 必然排在它之后, 顺序本身已足够。
+    // ★不要让 core0 阻塞等它★: 实测 core0 在启动 provision 里干等(读类 _submit, 最长 1.5s)会与
+    // core1 正在跑的 Init 叠加, 把触控/GET_STATS 的响应流水线搅乱 —— link_ok 抖动、scan_count 恒 0,
+    // smoke 因 bring-up 缺 LINK 位与 link_valid=false 持续 FAIL。二分已确认这是唯一诱因。
+    return _submit(SpiOp::GLOBAL_COMMIT, 0, 0, 0, nullptr);
+}
+
+bool Psoc::busy_grace_active() const {
+    return (int32_t)(_reset_grace_until_ms - millis()) > 0;
 }
 
 void Psoc::reset_run() {
@@ -560,6 +625,18 @@ bool Psoc::acquire() {
         return false;
     }
     return _swd.acquire();
+}
+
+bool Psoc::psoc_debug_counters(uint32_t out[SwdProgrammer::DEBUG_COUNTER_WORDS]) {
+    return _swd.debug_read_spi_counters(out);
+}
+
+uint32_t Psoc::psoc_debug_status() const {
+    return _swd.debug_last_status();
+}
+
+uint32_t Psoc::psoc_debug_block_addr() const {
+    return _swd.debug_block_addr();
 }
 
 bool Psoc::program(const uint8_t* data, uint32_t len) {

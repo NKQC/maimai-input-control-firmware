@@ -207,6 +207,16 @@ void HAL_PIO0::sm_set_pindirs_out(uint8_t sm, uint8_t base, uint8_t count) {
     }
 }
 
+volatile void* HAL_PIO0::sm_fifo_byte_addr(uint8_t sm, bool is_tx) {
+    if (sm >= 4) return nullptr;
+    return is_tx ? (volatile void*)&pio0->txf[sm] : (volatile void*)&pio0->rxf[sm];
+}
+
+uint8_t HAL_PIO0::sm_dreq(uint8_t sm, bool is_tx) {
+    if (sm >= 4) return 0;
+    return (uint8_t)pio_get_dreq(pio0, sm, is_tx);
+}
+
 
 
 // HAL_PIO1 静态成员初始化
@@ -414,4 +424,14 @@ void HAL_PIO1::sm_set_pindirs_out(uint8_t sm, uint8_t base, uint8_t count) {
     if (initialized_ && sm < 4) {
         pio_sm_set_consecutive_pindirs(pio1, sm, base, count, true);
     }
+}
+
+volatile void* HAL_PIO1::sm_fifo_byte_addr(uint8_t sm, bool is_tx) {
+    if (sm >= 4) return nullptr;
+    return is_tx ? (volatile void*)&pio1->txf[sm] : (volatile void*)&pio1->rxf[sm];
+}
+
+uint8_t HAL_PIO1::sm_dreq(uint8_t sm, bool is_tx) {
+    if (sm >= 4) return 0;
+    return (uint8_t)pio_get_dreq(pio1, sm, is_tx);
 }

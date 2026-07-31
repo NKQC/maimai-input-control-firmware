@@ -1,4 +1,4 @@
-# mai2control-v4 固定开发/烧录/诊断脚本
+﻿# mai2control-v4 固定开发/烧录/诊断脚本
 # 用法: powershell -ExecutionPolicy Bypass -File dev.ps1 <action>
 # 目的: 所有 RP2040/PSoC/上位机 操作统一走此固定文件, 避免每次不同命令触发鉴权。
 #
@@ -29,6 +29,7 @@ $fw       = Join-Path $root 'main_firmware'
 $cs       = Join-Path $root 'control_software'
 $psoc     = Join-Path $root 'psoc_firmware\CY8C4147AZI-SensorCore'
 $psocMain = Join-Path $psoc 'main.c'
+$psocStampHdr = Join-Path $psoc 'fw_build_stamp.h'
 $psocHexDir = Join-Path $psoc 'build\last_config'
 $psocConverter = Join-Path $fw 'tools\psoc_hex_to_c.py'
 $psocImage = Join-Path $fw 'src\protocol\psoc\psoc_fw_image.h'
@@ -82,19 +83,27 @@ function Invoke-NativeTail(
     }
 }
 
-function Get-PsocVersionHex {
-    $source = Get-Content -LiteralPath $psocMain -Raw
-    $major = [regex]::Match($source, '#define\s+FW_VERSION_MAJOR\s+\((\d+)u\)')
-    $minor = [regex]::Match($source, '#define\s+FW_VERSION_MINOR\s+\((\d+)u\)')
-    $patch = [regex]::Match($source, '#define\s+FW_VERSION_PATCH\s+\((\d+)u\)')
-    if (-not ($major.Success -and $minor.Success -and $patch.Success)) {
-        Write-Error "Unable to parse PSoC version from $psocMain"
+# PSoC 版本 = 编译时间戳(十进制 YYMMDDHHMM), 由 make build 的 PREBUILD 生成到 fw_build_stamp.h。
+# 这里读生成头而不是 main.c: 它就是上一次 make build 真正编进 HEX 的那个值。
+function Get-PsocStamp {
+    if (-not (Test-Path -LiteralPath $psocStampHdr)) {
+        Write-Error "PSoC build stamp header missing: $psocStampHdr (run 'build-psoc' first)"
         exit 1
     }
-    $value = ([int]$major.Groups[1].Value -shl 16) -bor
-             ([int]$minor.Groups[1].Value -shl 8) -bor
-             [int]$patch.Groups[1].Value
-    return '0x{0:X8}' -f $value
+    $source = Get-Content -LiteralPath $psocStampHdr -Raw
+    $m = [regex]::Match($source, '#define\s+FW_BUILD_STAMP\s+\((\d+)u\)')
+    if (-not $m.Success) {
+        Write-Error "Unable to parse FW_BUILD_STAMP from $psocStampHdr"
+        exit 1
+    }
+    return [uint32]$m.Groups[1].Value
+}
+
+# 2607310427 -> "2026-07-31 04:27"
+function Format-BuildStamp([uint32]$stamp) {
+    $s = '{0:D10}' -f $stamp
+    return '20{0}-{1}-{2} {3}:{4}' -f $s.Substring(0,2), $s.Substring(2,2), $s.Substring(4,2),
+                                      $s.Substring(6,2), $s.Substring(8,2)
 }
 
 function Wait-Bootsel([int]$timeoutSec = 10) {
@@ -243,7 +252,10 @@ switch ($Action) {
             Write-Error "Expected exactly one PSoC HEX in $psocHexDir, found $($hexFiles.Count)"
             exit 1
         }
-        $sourceVersion = Get-PsocVersionHex
+        $stamp = Get-PsocStamp
+        $sourceVersion = '0x{0:X8}' -f $stamp
+        Write-Output ("PSoC build stamp: {0} ({1}) -> {2}" -f
+            $stamp, (Format-BuildStamp $stamp), $sourceVersion)
         Invoke-NativeTail 'embed-psoc' $fw 'python' @(
             $psocConverter, $hexFiles[0].FullName, $psocImage, $sourceVersion
         ) 20

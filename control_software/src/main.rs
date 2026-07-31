@@ -14,16 +14,20 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use log::info;
 use anyhow::Result;
+use log::info;
 
-use slint::Model;
 use mai2control_ui::app_state::{AppController, CompiledAlgo, ConnState, zone_label};
-use mai2control_ui::proto::{ConfigEntry, CfgValue, FIELD_RAW, FIELD_BASELINE, FIELD_DIFF, FIELD_STATUS, FIELD_STATS, FIELD_LATENCY, PARAM_FINGER_TH, PARAM_NOISE_TH, PARAM_RESOLUTION, PARAM_SNS_CLK_DIV, PARAM_SNS_CLK_SOURCE};
+use mai2control_ui::proto::{
+    CfgValue, ConfigEntry, FIELD_BASELINE, FIELD_DIFF, FIELD_LATENCY, FIELD_RAW, FIELD_STATS,
+    FIELD_STATUS, PARAM_FINGER_TH, PARAM_NOISE_TH, PARAM_RESOLUTION, PARAM_SNS_CLK_DIV,
+    PARAM_SNS_CLK_SOURCE,
+};
 use mai2control_ui::proto::{LED_CH_UNMAPPED, LED_PREVIEW_ALL, LED_UNIT_COUNT};
 use mai2control_ui::touch_geometry;
-use mai2control_ui::vcam::{self, VcamState, FRAME_W, FRAME_H};
+use mai2control_ui::vcam::{self, FRAME_H, FRAME_W, VcamState};
 use mai2control_ui::vcam::{backend as vcam_backend, share::FramePublisher};
+use slint::Model;
 
 slint::include_modules!();
 
@@ -50,7 +54,7 @@ const ALL_CHANNELS_MASK: u64 = (1u64 << 36) - 1;
 /// 后台算法编译任务。
 /// ★为什么要有这东西★: 编译一次要顺序阻塞跑 gcc/objcopy/nm/objdump 四个子进程, 首次还要解压
 /// 18MB 内置工具链, 以前在 UI 线程里直接做 → 整个界面冻住数秒(点不动、不重绘)。现在只把 C 源
-/// 这类纯数据搬进 std::thread, 产物经 channel 回到 UI 线程(16ms tick 取回)再写入 AppController —— 
+/// 这类纯数据搬进 std::thread, 产物经 channel 回到 UI 线程(16ms tick 取回)再写入 AppController ——
 /// `Rc<RefCell<AppController>>` 不是 Send, 绝不能进后台线程。
 struct AlgoCompileJob {
     rx: std::sync::mpsc::Receiver<Result<CompiledAlgo>>,
@@ -68,7 +72,11 @@ fn spawn_algo_compile(slot: &Rc<RefCell<Option<AlgoCompileJob>>>, src: String, u
         // 发送失败只可能是 UI 已退出, 此时无人关心结果, 忽略即可。
         let _ = tx.send(AppController::compile_blob(&src_for_thread));
     });
-    *slot.borrow_mut() = Some(AlgoCompileJob { rx, src, upload_after });
+    *slot.borrow_mut() = Some(AlgoCompileJob {
+        rx,
+        src,
+        upload_after,
+    });
 }
 
 /// 生成与源码行数一致的行号列字符串("1\n2\n...\nN"), 供算法页行号 gutter。
@@ -136,7 +144,8 @@ fn main() -> Result<()> {
     // 表现为 UI 永不处理 DEVICE_INFO/遥测(连不上、无数据、功能全失效)。
     let _timer = setup_ui_callbacks(&ui, controller.clone());
 
-    ui.run().map_err(|e| anyhow::anyhow!("UI run failed: {}", e))?;
+    ui.run()
+        .map_err(|e| anyhow::anyhow!("UI run failed: {}", e))?;
 
     info!("mai2control-ui exiting");
     mai2control_ui::logging::hub().flush();
@@ -259,7 +268,12 @@ fn refresh_vcam_devices(
     for d in &devices {
         log::debug!(
             "虚拟摄像头设备树: [{}] 产品={} 厂商={} 项={} ({}) parent={}",
-            d.category, d.product, d.vendor, d.label, d.detail, d.parent_key
+            d.category,
+            d.product,
+            d.vendor,
+            d.label,
+            d.detail,
+            d.parent_key
         );
     }
     log::info!(
@@ -286,11 +300,8 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
     let (auto_port_enabled, serial_com, light_com, port_status) = {
         let mut ctrl = controller.borrow_mut();
         ctrl.refresh_devices();
-        let labels: Vec<slint::SharedString> = ctrl
-            .device_labels()
-            .into_iter()
-            .map(|s| s.into())
-            .collect();
+        let labels: Vec<slint::SharedString> =
+            ctrl.device_labels().into_iter().map(|s| s.into()).collect();
         ui.set_device_labels(slint::ModelRc::new(slint::VecModel::from(labels)));
         // 自动连接:检测到设备即连第一个,用户无需手动点连接。
         if ctrl.device_count() > 0 {
@@ -329,7 +340,12 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
     let share_runtime_status = frame_publisher
         .borrow()
         .as_ref()
-        .map(|publisher| format!("未运行 · 共享内存命名空间 {}", publisher.namespace().label()))
+        .map(|publisher| {
+            format!(
+                "未运行 · 共享内存命名空间 {}",
+                publisher.namespace().label()
+            )
+        })
         .unwrap_or_else(|| "未运行 · 共享内存创建失败".to_string());
     ui.set_vcam_runtime_status(share_runtime_status.into());
     // 权限状态 + 一键提权重启: Windows 不能给已运行进程提权, 只能以管理员重开自身。
@@ -381,11 +397,8 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
         let ui = ui_refresh.upgrade().unwrap();
         let mut ctrl = ctrl_clone.borrow_mut();
         ctrl.refresh_devices();
-        let labels: Vec<slint::SharedString> = ctrl
-            .device_labels()
-            .into_iter()
-            .map(|s| s.into())
-            .collect();
+        let labels: Vec<slint::SharedString> =
+            ctrl.device_labels().into_iter().map(|s| s.into()).collect();
         ui.set_device_labels(slint::ModelRc::new(slint::VecModel::from(labels)));
     });
 
@@ -490,6 +503,63 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
         let _ = ctrl.reset_defaults();
     });
 
+    // 触控组合映射(多分区 → 多键): 编辑全部落在 AppController(草稿), 由"保存到设备"整表下发。
+    let ctrl_clone = controller.clone();
+    ui.on_combo_zone_toggled(move |zone| {
+        if !(0..34).contains(&zone) {
+            return;
+        }
+        ctrl_clone.borrow_mut().kbd_combo_toggle_zone(zone as u8);
+    });
+
+    let ctrl_clone = controller.clone();
+    ui.on_combo_zones_clear(move || {
+        ctrl_clone.borrow_mut().kbd_combo_clear_zones();
+    });
+
+    let ctrl_clone = controller.clone();
+    ui.on_combo_captured(move |text, ctrl_k, shift, alt, gui| {
+        let code = char_to_hid(text.as_str());
+        let mods = (ctrl_k as u8) | ((shift as u8) << 1) | ((alt as u8) << 2) | ((gui as u8) << 3);
+        if code == 0 && mods == 0 {
+            ctrl_clone
+                .borrow_mut()
+                .push_log("组合映射: 该按键无法识别为 HID 键码".to_string());
+            return;
+        }
+        ctrl_clone.borrow_mut().kbd_combo_capture_key(code, mods);
+    });
+
+    let ctrl_clone = controller.clone();
+    ui.on_combo_keys_clear(move || {
+        ctrl_clone.borrow_mut().kbd_combo_clear_keys();
+    });
+
+    let ctrl_clone = controller.clone();
+    ui.on_combo_add(move || {
+        ctrl_clone.borrow_mut().kbd_combo_commit_pending();
+    });
+
+    let ctrl_clone = controller.clone();
+    ui.on_combo_removed(move |index| {
+        if index < 0 {
+            return;
+        }
+        ctrl_clone.borrow_mut().kbd_combo_remove(index as usize);
+    });
+
+    let ctrl_clone = controller.clone();
+    ui.on_combo_hold_set(move |index, delay, max_hold| {
+        if index < 0 {
+            return;
+        }
+        ctrl_clone.borrow_mut().kbd_combo_set_hold(
+            index as usize,
+            delay.clamp(0, u16::MAX as i32) as u16,
+            max_hold.clamp(0, u16::MAX as i32) as u16,
+        );
+    });
+
     // 全通道页"批量应用": 勾选态与应用动作全部落在 AppController, UI 只转发事件。
     // 应用走 set_param(草稿), 与手工编辑同路径, 由"保存到设备"统一下发。
     let ctrl_clone = controller.clone();
@@ -534,6 +604,14 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
     });
 
     let ctrl_clone = controller.clone();
+    ui.on_batch_set_source(move |ch| {
+        if !(0..36).contains(&ch) {
+            return;
+        }
+        ctrl_clone.borrow_mut().batch_set_source(ch as u8);
+    });
+
+    let ctrl_clone = controller.clone();
     ui.on_batch_apply(move |src| {
         if !(0..36).contains(&src) {
             return;
@@ -543,56 +621,80 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
 
     // JSON 导出：范围先由 Slint 弹窗确认，再使用系统原生保存对话框，失败只写日志不阻塞 UI。
     let ctrl_clone = controller.clone();
-    ui.on_settings_export(move |config, channel_params, globals, algo, keyboard, zones| {
-        let selected = mai2control_ui::settings_io::GroupSelection {
-            config, channel_params, globals, algo, keyboard, zones,
-        };
-        match mai2control_ui::settings_io::choose_settings_path(true) {
-            Ok(Some(path)) => match mai2control_ui::settings_io::export_settings(&ctrl_clone.borrow(), selected) {
-                Ok(text) => match std::fs::write(&path, text) {
-                    Ok(()) => log::info!("设置 JSON 已导出: {}", path.display()),
-                    Err(e) => log::warn!("设置 JSON 导出失败，无法写入 {}: {}", path.display(), e),
+    ui.on_settings_export(
+        move |config, channel_params, globals, algo, keyboard, zones| {
+            let selected = mai2control_ui::settings_io::GroupSelection {
+                config,
+                channel_params,
+                globals,
+                algo,
+                keyboard,
+                zones,
+            };
+            match mai2control_ui::settings_io::choose_settings_path(true) {
+                Ok(Some(path)) => match mai2control_ui::settings_io::export_settings(
+                    &ctrl_clone.borrow(),
+                    selected,
+                ) {
+                    Ok(text) => match std::fs::write(&path, text) {
+                        Ok(()) => log::info!("设置 JSON 已导出: {}", path.display()),
+                        Err(e) => {
+                            log::warn!("设置 JSON 导出失败，无法写入 {}: {}", path.display(), e)
+                        }
+                    },
+                    Err(e) => log::warn!("设置 JSON 导出失败: {}", e),
                 },
-                Err(e) => log::warn!("设置 JSON 导出失败: {}", e),
-            },
-            Ok(None) => log::info!("设置 JSON 导出已取消"),
-            Err(e) => log::warn!("无法打开设置 JSON 保存对话框: {}", e),
-        }
-    });
+                Ok(None) => log::info!("设置 JSON 导出已取消"),
+                Err(e) => log::warn!("无法打开设置 JSON 保存对话框: {}", e),
+            }
+        },
+    );
 
     // JSON 导入：只写 UI 草稿并置脏，不下发、不写 flash、不回读；结果(覆盖/跳过/未保存态)写进日志页。
     let ctrl_clone = controller.clone();
-    ui.on_settings_import(move |config, channel_params, globals, algo, keyboard, zones| {
-        let selected = mai2control_ui::settings_io::GroupSelection {
-            config, channel_params, globals, algo, keyboard, zones,
-        };
-        match mai2control_ui::settings_io::choose_settings_path(false) {
-            Ok(Some(path)) => match std::fs::read_to_string(&path) {
-                Ok(text) => {
-                    let mut ctrl = ctrl_clone.borrow_mut();
-                    match mai2control_ui::settings_io::import_settings(&mut ctrl, &text, selected) {
-                        Ok(summary) => {
-                            let report = summary.report_text();
-                            // 跳过项必须显眼: 走 Warn 等级, 默认过滤下也能看到, 不静默丢弃。
-                            if summary.skipped.is_empty() {
-                                ctrl.push_log(format!("{}（{}）", report, path.display()));
-                            } else {
-                                ctrl.push_log_warn(format!("{}（{}）", report, path.display()));
+    ui.on_settings_import(
+        move |config, channel_params, globals, algo, keyboard, zones| {
+            let selected = mai2control_ui::settings_io::GroupSelection {
+                config,
+                channel_params,
+                globals,
+                algo,
+                keyboard,
+                zones,
+            };
+            match mai2control_ui::settings_io::choose_settings_path(false) {
+                Ok(Some(path)) => match std::fs::read_to_string(&path) {
+                    Ok(text) => {
+                        let mut ctrl = ctrl_clone.borrow_mut();
+                        match mai2control_ui::settings_io::import_settings(
+                            &mut ctrl, &text, selected,
+                        ) {
+                            Ok(summary) => {
+                                let report = summary.report_text();
+                                // 跳过项必须显眼: 走 Warn 等级, 默认过滤下也能看到, 不静默丢弃。
+                                if summary.skipped.is_empty() {
+                                    ctrl.push_log(format!("{}（{}）", report, path.display()));
+                                } else {
+                                    ctrl.push_log_warn(format!("{}（{}）", report, path.display()));
+                                }
+                                log::info!("设置 JSON 已导入: {}", path.display());
                             }
-                            log::info!("设置 JSON 已导入: {}", path.display());
-                        }
-                        Err(e) => {
-                            ctrl.push_log_warn(format!("设置 JSON 导入失败, 草稿未改动: {}", e));
-                            log::warn!("设置 JSON 导入失败 {}: {}", path.display(), e);
+                            Err(e) => {
+                                ctrl.push_log_warn(format!(
+                                    "设置 JSON 导入失败, 草稿未改动: {}",
+                                    e
+                                ));
+                                log::warn!("设置 JSON 导入失败 {}: {}", path.display(), e);
+                            }
                         }
                     }
-                }
-                Err(e) => log::warn!("设置 JSON 导入失败，无法读取 {}: {}", path.display(), e),
-            },
-            Ok(None) => log::info!("设置 JSON 导入已取消"),
-            Err(e) => log::warn!("无法打开设置 JSON 导入对话框: {}", e),
-        }
-    });
+                    Err(e) => log::warn!("设置 JSON 导入失败，无法读取 {}: {}", path.display(), e),
+                },
+                Ok(None) => log::info!("设置 JSON 导入已取消"),
+                Err(e) => log::warn!("无法打开设置 JSON 导入对话框: {}", e),
+            }
+        },
+    );
 
     // 撤销全部未保存草稿(CSD 安全操作 / 配置页): 恢复到设备当前运行态。
     let ctrl_clone = controller.clone();
@@ -629,7 +731,10 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
     let ctrl_clone = controller.clone();
     ui.on_cfg_set_string(move |key, value| {
         let mut ctrl = ctrl_clone.borrow_mut();
-        let _ = ctrl.set_config(ConfigEntry::new(key.to_string(), CfgValue::Str(value.to_string())));
+        let _ = ctrl.set_config(ConfigEntry::new(
+            key.to_string(),
+            CfgValue::Str(value.to_string()),
+        ));
     });
 
     // ---- 算法页 (JIT 触控算法 + C→ASM 编译器 + 全局设置) ----
@@ -637,14 +742,17 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
     let algo_default_src = "#include <stddef.h>\n#include \"psoc_algo_abi.h\"\n\n// 入口: 每通道调用一次, 读写 io 固定字段。\n// 禁: libc / '/' '%' / 64位。辅助请 static inline。\nvoid algo(algo_io_t* io)\n{\n    // 示例: 直接沿用中间件基础激活判定。\n    // io->diff/baseline/finger_th/now_ms/rom 等可用于自定义高动态逻辑。\n    io->out_active = (io->base_active != 0u) ? 1u : 0u;\n}\n";
     ui.set_algo_c_source(algo_default_src.into());
     ui.set_algo_line_numbers(line_numbers_for(algo_default_src).into());
+    // C 源容量条: 容量一次性回填, 占用随编辑器内容刷新(去注释后的字节数 = 编译器有效内容)。
+    ui.set_algo_c_capacity(AppController::algo_src_capacity() as i32);
+    ui.set_algo_c_bytes(AppController::algo_src_used(algo_default_src) as i32);
 
     let ctrl_clone = controller.clone();
     ui.on_algo_refresh(move || {
         let mut ctrl = ctrl_clone.borrow_mut();
         let _ = ctrl.algo_get_info();
         let _ = ctrl.algo_get_rom();
-        let _ = ctrl.request_algo_src();   // 回读设备映射表 C 源 → 还原可编辑算法
-        let _ = ctrl.request_algo_code();  // 回读设备算法机器码 → 无本地编译时反汇编页看真实 ASM
+        let _ = ctrl.request_algo_src(); // 回读设备映射表 C 源 → 还原可编辑算法
+        let _ = ctrl.request_algo_code(); // 回读设备算法机器码 → 无本地编译时反汇编页看真实 ASM
         let _ = ctrl.global_get_all();
     });
 
@@ -663,17 +771,23 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
     let ui_tpl = ui_weak.clone();
     ui.on_algo_load_template(move |idx| {
         // idx: 0 = v3.1 HDR 默认(完整触发算法), 1 = 纯白灯演示(触摸点亮白灯, 展示算法可控性)。
-        let tpl = if idx == 1 { ALGO_LED_DEMO_TEMPLATE } else { ALGO_V31_TEMPLATE };
+        let tpl = if idx == 1 {
+            ALGO_LED_DEMO_TEMPLATE
+        } else {
+            ALGO_V31_TEMPLATE
+        };
         let ui = ui_tpl.upgrade().unwrap();
         ui.set_algo_c_source(tpl.into());
         ui.set_algo_line_numbers(line_numbers_for(tpl).into());
+        ui.set_algo_c_bytes(AppController::algo_src_used(tpl) as i32);
     });
 
-    // 编辑器内容变化 → 刷新行号列。
+    // 编辑器内容变化 → 刷新行号列 + C 源占用(容量条)。
     let ui_edit = ui_weak.clone();
     ui.on_algo_source_edited(move |text| {
         let ui = ui_edit.upgrade().unwrap();
         ui.set_algo_line_numbers(line_numbers_for(text.as_str()).into());
+        ui.set_algo_c_bytes(AppController::algo_src_used(text.as_str()) as i32);
     });
 
     // 键盘: 物理键/触控分区键码设置 + 刷新
@@ -694,7 +808,9 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
     ui.on_kbd_capture_phys(move |idx, text, c, s, a, g| {
         let code = char_to_hid(text.as_str());
         if code == 0 {
-            ctrl_clone.borrow_mut().push_log("物理键盘映射: 该按键无法识别为 HID 键码".to_string());
+            ctrl_clone
+                .borrow_mut()
+                .push_log("物理键盘映射: 该按键无法识别为 HID 键码".to_string());
             return;
         }
         let m = (c as u8) | ((s as u8) << 1) | ((a as u8) << 2) | ((g as u8) << 3);
@@ -705,7 +821,9 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
     ui.on_kbd_capture_zone(move |zone, text, c, s, a, g| {
         let code = char_to_hid(text.as_str());
         if code == 0 {
-            ctrl_clone.borrow_mut().push_log("触控分区映射: 该按键无法识别为 HID 键码".to_string());
+            ctrl_clone
+                .borrow_mut()
+                .push_log("触控分区映射: 该按键无法识别为 HID 键码".to_string());
             return;
         }
         let m = (c as u8) | ((s as u8) << 1) | ((a as u8) << 2) | ((g as u8) << 3);
@@ -749,12 +867,46 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
         );
     });
 
+    // 每键触发极性 + 独立防抖: 写草稿(与长按参数同一条路径), 由"保存到设备"统一下发。
+    // 越界(>10000us)由 AppController 直接拒绝并落日志 —— UI 围栏已同源, 走到这里说明是非 UI 路径。
+    let ctrl_clone = controller.clone();
+    ui.on_kbd_set_keycfg(move |idx, pol_high, debounce_us| {
+        if !(0..12).contains(&idx) {
+            return;
+        }
+        let mut ctrl = ctrl_clone.borrow_mut();
+        if let Err(e) = ctrl.kbd_set_keycfg(
+            idx as u8,
+            pol_high,
+            debounce_us.clamp(0, u16::MAX as i32) as u16,
+        ) {
+            ctrl.push_log_warn(format!("物理键每键配置: {}", e));
+        }
+    });
+
+    // 逻辑分析仪时间窗切换/清空。时间窗是纯视图状态(不影响设备), 故只存在 UI 侧。
+    let la_window_idx = Rc::new(Cell::new(LA_WINDOW_DEFAULT));
+    let la_window_set = la_window_idx.clone();
+    let ui_la = ui_weak.clone();
+    ui.on_la_window_set(move |idx| {
+        let i = (idx.max(0) as usize).min(LA_WINDOWS_US.len() - 1);
+        la_window_set.set(i);
+        if let Some(ui) = ui_la.upgrade() {
+            ui.set_la_window_index(i as i32);
+        }
+    });
+    let ctrl_clone = controller.clone();
+    ui.on_la_clear(move || {
+        ctrl_clone.borrow_mut().kbd_edges_clear();
+    });
+
     let ctrl_clone = controller.clone();
     ui.on_kbd_refresh(move || {
         let mut ctrl = ctrl_clone.borrow_mut();
         let _ = ctrl.kbd_request_map();
         let _ = ctrl.kbd_request_touchmap();
         let _ = ctrl.kbd_request_hold();
+        let _ = ctrl.kbd_request_keycfg();
         let _ = ctrl.kbd_request_state();
     });
 
@@ -780,7 +932,9 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
     let algo_busy_compile = algo_busy.clone();
     let algo_job_compile = algo_job.clone();
     ui.on_algo_compile(move |src| {
-        let Some(ui) = ui_algo.upgrade() else { return; };
+        let Some(ui) = ui_algo.upgrade() else {
+            return;
+        };
         if algo_busy_compile.get() {
             if algo_job_compile.borrow().is_some() {
                 ui.set_algo_status("正在编译中，请等待完成".into());
@@ -789,6 +943,20 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
             // busy 与 job 槽必须同生同灭；仅 busy 悬挂说明上次任务已丢失，解锁后接受本次点击。
             algo_busy_compile.set(false);
             ui.set_algo_busy(false);
+        }
+        // C 源容量闸门: 超上限就地拒绝, 连工具链线程都不起(设备存不下, 编译出来也没法完整上传)。
+        let used = AppController::algo_src_used(src.as_str());
+        let cap = AppController::algo_src_capacity();
+        ui.set_algo_c_bytes(used as i32);
+        if used > cap {
+            ui.set_algo_status(
+                format!(
+                    "C 源(去注释){} 字节, 超出设备存储上限 {} 字节: 已阻止编译",
+                    used, cap
+                )
+                .into(),
+            );
+            return;
         }
         algo_busy_compile.set(true);
         ui.set_algo_busy(true);
@@ -803,7 +971,9 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
     let algo_busy_upload = algo_busy.clone();
     let algo_job_upload = algo_job.clone();
     ui.on_algo_upload(move || {
-        let Some(ui) = ui_algo.upgrade() else { return; };
+        let Some(ui) = ui_algo.upgrade() else {
+            return;
+        };
         if algo_busy_upload.get() {
             if algo_job_upload.borrow().is_some() {
                 ui.set_algo_status("正在编译中，请等待完成".into());
@@ -826,7 +996,9 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
     let algo_busy_build = algo_busy.clone();
     let algo_job_build = algo_job.clone();
     ui.on_algo_build_upload(move |src| {
-        let Some(ui) = ui_algo.upgrade() else { return; };
+        let Some(ui) = ui_algo.upgrade() else {
+            return;
+        };
         if algo_busy_build.get() {
             if algo_job_build.borrow().is_some() {
                 ui.set_algo_status("正在编译中，请等待完成".into());
@@ -835,6 +1007,20 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
             // busy 与 job 槽失步时，上次任务已不可回收；先恢复不忙状态再启动新任务。
             algo_busy_build.set(false);
             ui.set_algo_busy(false);
+        }
+        // 同 on_algo_compile: 先过容量闸门, 超限直接拒, 不编译也不上传。
+        let used = AppController::algo_src_used(src.as_str());
+        let cap = AppController::algo_src_capacity();
+        ui.set_algo_c_bytes(used as i32);
+        if used > cap {
+            ui.set_algo_status(
+                format!(
+                    "C 源(去注释){} 字节, 超出设备存储上限 {} 字节: 已阻止编译并上传",
+                    used, cap
+                )
+                .into(),
+            );
+            return;
         }
         algo_busy_build.set(true);
         ui.set_algo_busy(true);
@@ -934,9 +1120,17 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
         if !(0..11).contains(&unit) {
             return;
         }
-        let ch = if ch_choice <= 0 { LED_CH_UNMAPPED } else { (ch_choice - 1) as u8 };
+        let ch = if ch_choice <= 0 {
+            LED_CH_UNMAPPED
+        } else {
+            (ch_choice - 1) as u8
+        };
         ctrl_clone.borrow_mut().led_set_region(
-            unit as usize, ch, start.clamp(0, u16::MAX as i32) as u16, count.clamp(0, 255) as u8);
+            unit as usize,
+            ch,
+            start.clamp(0, u16::MAX as i32) as u16,
+            count.clamp(0, 255) as u8,
+        );
     });
 
     let ctrl_clone = controller.clone();
@@ -947,15 +1141,27 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
     // unit < 0 → 全部单元(LED_PREVIEW_ALL)。
     let ctrl_clone = controller.clone();
     ui.on_light_preview(move |unit, r, g, b| {
-        let target = if unit < 0 || unit > 10 { LED_PREVIEW_ALL } else { unit as u8 };
-        let rgb = [r.clamp(0, 255) as u8, g.clamp(0, 255) as u8, b.clamp(0, 255) as u8];
+        let target = if unit < 0 || unit > 10 {
+            LED_PREVIEW_ALL
+        } else {
+            unit as u8
+        };
+        let rgb = [
+            r.clamp(0, 255) as u8,
+            g.clamp(0, 255) as u8,
+            b.clamp(0, 255) as u8,
+        ];
         let _ = ctrl_clone.borrow_mut().led_preview(target, rgb);
     });
 
     // 灯链长度/亮度是配置 KV, 复用既有草稿写入路径(随"保存到设备"落 flash), 不另造协议。
     let ctrl_clone = controller.clone();
     ui.on_light_ws_count_set(move |chain, value| {
-        let key = if chain == 0 { "led.ws_count0" } else { "led.ws_count1" };
+        let key = if chain == 0 {
+            "led.ws_count0"
+        } else {
+            "led.ws_count1"
+        };
         let _ = ctrl_clone
             .borrow_mut()
             .set_config_number(key, value.clamp(1, 1000) as f64);
@@ -1039,7 +1245,9 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
     // 精确命中检测: 画布把点击像素换算到 SCREEN 坐标系后调用, 返回分区 index(未命中 -1)。
     // 用 point-in-polygon 取代旧 34 个重叠 bbox, 消除 A/D/E 等相邻区误选。
     ui.on_zone_hit_test(move |x, y| {
-        touch_geometry::hit_test(x, y).map(|i| i as i32).unwrap_or(-1)
+        touch_geometry::hit_test(x, y)
+            .map(|i| i as i32)
+            .unwrap_or(-1)
     });
 
     // "清除":写回未映射(0xFF -> 0xFFFFFFFF)。
@@ -1056,7 +1264,11 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
     let ctrl_clone = controller.clone();
     ui.on_telem_start(move || {
         let mut ctrl = ctrl_clone.borrow_mut();
-        let _ = ctrl.start_telemetry(100, FIELD_RAW | FIELD_BASELINE | FIELD_DIFF | FIELD_STATUS, 0xFFFFFFFF_FFFFFFFFu64);
+        let _ = ctrl.start_telemetry(
+            100,
+            FIELD_RAW | FIELD_BASELINE | FIELD_DIFF | FIELD_STATUS,
+            0xFFFFFFFF_FFFFFFFFu64,
+        );
     });
 
     let ctrl_clone = controller.clone();
@@ -1158,7 +1370,10 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
     let ctrl_clone = controller.clone();
     ui.on_set_keyboard_map_en(move |value| {
         let mut ctrl = ctrl_clone.borrow_mut();
-        let _ = ctrl.set_config(ConfigEntry::new("comm.keyboard_map_en".to_string(), CfgValue::Bool(value)));
+        let _ = ctrl.set_config(ConfigEntry::new(
+            "comm.keyboard_map_en".to_string(),
+            CfgValue::Bool(value),
+        ));
     });
 
     // 工具箱端口设置:编辑后立即写入本地 toolbox.cfg，应用时回填状态文本。
@@ -1253,7 +1468,11 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
             return;
         }
         let row = idx as usize;
-        let amp = if value.is_finite() { value.clamp(ALGO_BIN_AMP_MIN, ALGO_BIN_AMP_MAX) } else { 1.0 };
+        let amp = if value.is_finite() {
+            value.clamp(ALGO_BIN_AMP_MIN, ALGO_BIN_AMP_MAX)
+        } else {
+            1.0
+        };
         report_norm_cb.borrow_mut()[row] = amp;
         ui_cfg_norm
             .borrow_mut()
@@ -1298,8 +1517,8 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
     let ctrl_copy2 = controller.clone();
     ui.on_copy_log_all(move || {
         let filter = ctrl_copy2.borrow().log_filter();
-        let text = mai2control_ui::logging::hub()
-            .text_for_copy(filter, mai2control_ui::logging::VIEW_MAX);
+        let text =
+            mai2control_ui::logging::hub().text_for_copy(filter, mai2control_ui::logging::VIEW_MAX);
         let lines = text.lines().count();
         match mai2control_ui::logging::copy_to_clipboard(&text) {
             Ok(()) => log::info!("已复制当前视图 {} 行到剪贴板", lines),
@@ -1316,10 +1535,12 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
     // 关于页: 上位机版本与仓库地址都是编译期常量, 一次性回填(不进 16ms tick)。
     ui.set_about_app_version(env!("CARGO_PKG_VERSION").into());
     ui.set_about_repo_url(REPO_URL.into());
-    ui.on_copy_repo_url(move || match mai2control_ui::logging::copy_to_clipboard(REPO_URL) {
-        Ok(()) => log::info!("已复制仓库地址到剪贴板: {}", REPO_URL),
-        Err(e) => log::warn!("复制仓库地址失败: {}", e),
-    });
+    ui.on_copy_repo_url(
+        move || match mai2control_ui::logging::copy_to_clipboard(REPO_URL) {
+            Ok(()) => log::info!("已复制仓库地址到剪贴板: {}", REPO_URL),
+            Err(e) => log::warn!("复制仓库地址失败: {}", e),
+        },
+    );
 
     let ui_logfile = ui_weak.clone();
     ui.on_set_log_file_enabled(move |on| {
@@ -1355,7 +1576,10 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
                 }
             }
         } else {
-            publisher_cb.borrow().as_ref().map(|publisher| publisher.namespace())
+            publisher_cb
+                .borrow()
+                .as_ref()
+                .map(|publisher| publisher.namespace())
         };
         let Some(namespace) = namespace else { return };
         if on {
@@ -1367,7 +1591,8 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
                     ui.set_vcam_enabled(false);
                     ui.set_vcam_install_status(vcam_backend::registration_status().into());
                     ui.set_vcam_runtime_status(
-                        format!("未运行 · 共享内存命名空间 {} · 需先安装", namespace.label()).into(),
+                        format!("未运行 · 共享内存命名空间 {} · 需先安装", namespace.label())
+                            .into(),
                     );
                     return;
                 }
@@ -1387,17 +1612,27 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
                         vcam_cb.set_enabled(false);
                         ui.set_vcam_enabled(false);
                         ui.set_vcam_runtime_status(
-                            format!("未运行 · 共享内存命名空间 {} · 启动失败", namespace.label()).into(),
+                            format!("未运行 · 共享内存命名空间 {} · 启动失败", namespace.label())
+                                .into(),
                         );
                         return;
                     }
                 }
             }
-            let access = camera_cb.borrow().as_ref().map(|camera| camera.access_name()).unwrap_or("未知");
+            let access = camera_cb
+                .borrow()
+                .as_ref()
+                .map(|camera| camera.access_name())
+                .unwrap_or("未知");
             vcam_cb.set_enabled(true);
             vcam::keyboard::start(vcam_cb.clone());
             ui.set_vcam_runtime_status(
-                format!("运行中 ({}) · 共享内存命名空间 {}", access, namespace.label()).into(),
+                format!(
+                    "运行中 ({}) · 共享内存命名空间 {}",
+                    access,
+                    namespace.label()
+                )
+                .into(),
             );
         } else {
             vcam_cb.set_enabled(false);
@@ -1443,7 +1678,9 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
     let camera_uninstall = virtual_camera.clone();
     let vcam_uninstall = vcam.clone();
     ui.on_uninstall_vcam(move || {
-        let Some(ui) = ui_vcam_uninstall.upgrade() else { return };
+        let Some(ui) = ui_vcam_uninstall.upgrade() else {
+            return;
+        };
         vcam_uninstall.set_enabled(false);
         vcam::keyboard::stop();
         if let Some(camera) = camera_uninstall.borrow_mut().take() {
@@ -1490,7 +1727,10 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
     ui.on_set_vcam_device(move |index| {
         let list = kbd_list_sel.borrow();
         let picked = (index > 0)
-            .then(|| list.get((index - 1) as usize).map(|d: &vcam::keyboard::KeyboardDevice| d.path.clone()))
+            .then(|| {
+                list.get((index - 1) as usize)
+                    .map(|d: &vcam::keyboard::KeyboardDevice| d.path.clone())
+            })
             .flatten();
         vcam::keyboard::set_target_device(picked.clone());
         // 选中行高亮靠 dev_index 比较, 不重建整棵树。
@@ -1502,7 +1742,9 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
         match picked {
             Some(_) => ctrl.push_log(format!(
                 "虚拟摄像头: 输入源已限定为 {}",
-                list.get((index - 1) as usize).map(|d| d.label.clone()).unwrap_or_default()
+                list.get((index - 1) as usize)
+                    .map(|d| d.label.clone())
+                    .unwrap_or_default()
             )),
             None => ctrl.push_log("虚拟摄像头: 输入源为所有键盘(未限定设备)".to_string()),
         }
@@ -1538,6 +1780,7 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
     let mut last_cp_version_all = u64::MAX;
     let mut last_param_version = 0u64;
     let mut last_batch_sel_version = u64::MAX;
+    let mut last_combo_version = u64::MAX;
     let mut last_channel = -1i32;
     let mut last_curve_visibility = (false, false, false);
     // 算法叠加脏标记: 它会改变主图 path, 与遥测版本一起做门控(绘图区尺寸已不再参与, 见 fit: fill)。
@@ -1546,6 +1789,8 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
     let mut was_connected = false;
     // mode.work 保存后自动重启倒计时(tick): 给 SAVE_CONFIG 的 flash 写留出完成窗口再重启重枚举。
     let mut reboot_countdown: Option<u32> = None;
+    // "正在等待下发完成再重启"只提示一次, 避免每 tick 刷日志。
+    let mut reboot_wait_logged = false;
     let mut last_log_ver = u64::MAX;
     let ui_cfg_tick = ui_cfg.clone();
     let mut last_algo_version = u64::MAX;
@@ -1582,11 +1827,13 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
     ui.set_all_channels(slint::ModelRc::from(all_channels_model.clone()));
 
     // 这三组可交互行模型在整个 UI 生命周期内保持同一实例；tick 只原地更新变化行。
-    let zones_model: Rc<slint::VecModel<ZoneCell>> =
-        Rc::new(slint::VecModel::from(build_zone_cells(&controller.borrow())));
+    let zones_model: Rc<slint::VecModel<ZoneCell>> = Rc::new(slint::VecModel::from(
+        build_zone_cells(&controller.borrow()),
+    ));
     ui.set_zones(slint::ModelRc::from(zones_model.clone()));
-    let curve_params_model: Rc<slint::VecModel<ParamRow>> =
-        Rc::new(slint::VecModel::from(build_param_rows(&controller.borrow().params_of(0))));
+    let curve_params_model: Rc<slint::VecModel<ParamRow>> = Rc::new(slint::VecModel::from(
+        build_param_rows(&controller.borrow().params_of(0)),
+    ));
     ui.set_curve_params(slint::ModelRc::from(curve_params_model.clone()));
 
     // 键盘键码下拉的共享键名表(一次性设置)。
@@ -1596,12 +1843,28 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
     // 触控分区名 A1-E8(一次性设置), 供触控键盘映射页每行标签。
     let kbd_zone_name_list: Vec<slint::SharedString> =
         (0..34u8).map(|z| zone_label(z as usize).into()).collect();
-    ui.set_kbd_zone_names(slint::ModelRc::new(slint::VecModel::from(kbd_zone_name_list)));
+    ui.set_kbd_zone_names(slint::ModelRc::new(slint::VecModel::from(
+        kbd_zone_name_list,
+    )));
 
     let mut last_kbd_state_version = u64::MAX;
     let mut last_kbd_map_version = u64::MAX;
     let mut last_kbd_touchmap_version = u64::MAX;
     let mut last_kbd_hold_version = u64::MAX;
+    let mut last_kbd_keycfg_version = u64::MAX;
+    let mut last_la_version = u64::MAX;
+    let mut last_la_window = usize::MAX;
+    let mut last_phys_kbd_visible = false;
+
+    // 逻辑分析仪时间窗下拉项(一次性回填, 与 LA_WINDOWS_US 同序)。
+    {
+        let names: Vec<slint::SharedString> = LA_WINDOWS_US
+            .iter()
+            .map(|us| slint::SharedString::from(fmt_time_us(*us as f64)))
+            .collect();
+        ui.set_la_window_names(slint::ModelRc::new(slint::VecModel::from(names)));
+        ui.set_la_window_index(LA_WINDOW_DEFAULT as i32);
+    }
     let mut last_mai2_version = u64::MAX;
     let mut last_led_version = u64::MAX;
     // 协议页驻留门控: 进页边沿请求一次, 离页停止轮询(见下方 protocol_visible)。
@@ -1856,6 +2119,7 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
                 if editor_untouched {
                     ui.set_algo_c_source(dev_src.clone().into());
                     ui.set_algo_line_numbers(line_numbers_for(&dev_src).into());
+                    ui.set_algo_c_bytes(AppController::algo_src_used(&dev_src) as i32);
                     editor_autoload_mark = dev_src.clone();
                     ui.set_algo_status("已从设备映射表载入当前算法 C 源(可直接修改后重新编译上传)".into());
                 } else {
@@ -1869,6 +2133,7 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
                 if editor_untouched {
                     ui.set_algo_c_source(default_src.clone().into());
                     ui.set_algo_line_numbers(line_numbers_for(&default_src).into());
+                    ui.set_algo_c_bytes(AppController::algo_src_used(&default_src) as i32);
                     editor_autoload_mark = default_src.clone();
                 }
                 if !default_src_synced {
@@ -1979,8 +2244,10 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
             }
             let _ = ctrl.global_get_all();
             let _ = ctrl.kbd_request_map();
+            let _ = ctrl.kbd_request_combo();
             let _ = ctrl.kbd_request_touchmap();
             let _ = ctrl.kbd_request_hold();
+            let _ = ctrl.kbd_request_keycfg();
             let _ = ctrl.kbd_request_state();
             let _ = ctrl.mai2_request_state();
             let _ = ctrl.led_request_state();
@@ -1997,6 +2264,15 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
             ui.set_cp_text(cp_state.status.clone().into());
         }
         // 仅在真正进入已连接的“触控全局调整”页(索引 3)时拉取一次 CH0，避免 16ms tick 洪泛。
+        // 逐通道遥测的推流范围 = **整个设置页**, 不再细分到具体 Tab。
+        // ★为什么不按 Tab 细分★: 先前收成"只有触控通道调整(2)与单通道精调(4)"两页, 结果
+        //  - 分区绑定页的实时触摸态(绿色分区)没数据可用;
+        //  - 在设置页内来回切 Tab 会反复 TELEM_START/切档, 单通道精调的曲线与读数出现空档、更新不及时。
+        // 通道数据是整个设置页的共同底座, 粒度就该是"在不在设置页"。离开设置页(主页/工具箱/日志/关于)
+        // 才收回轻档(仅采样率+延迟), 主页延迟卡照常有数据。
+        let want_channel_stream = connected && ui.get_current_view() == 1;
+        ctrl.telem_set_scope(want_channel_stream);
+
         let global_tune_visible = connected && ui.get_current_view() == 1 && ui.get_settings_tab() == 3;
         if global_tune_visible && !last_global_tune_visible && was_connected {
             let _ = ctrl.request_params(0);
@@ -2027,6 +2303,24 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
         if connected && reconnect_tick % 20 == 0 {
             let _ = ctrl.kbd_request_state();
         }
+        // 物理键盘页驻留期: 实时三态提到 ~15Hz(要看得出防抖/长按的差别),
+        // 边沿记录只在"逻辑分析仪"抽屉展开时才拉(~31Hz, 窗口=1)。
+        // ★不放到每 tick★: 全设备共用一对 bulk 端点, 遥测已占 30Hz; 边沿是设备侧缓冲的(192 条),
+        // 32ms 拉一次不会丢数据, 却能把这条新增流量压到与既有轮询同量级。
+        let phys_kbd_visible =
+            connected && ui.get_current_view() == 1 && ui.get_settings_tab() == 6;
+        if phys_kbd_visible {
+            if !last_phys_kbd_visible {
+                let _ = ctrl.kbd_request_keycfg();
+            }
+            if reconnect_tick % 4 == 0 {
+                let _ = ctrl.kbd_request_state();
+            }
+            if ui.get_phys_la_expanded() && reconnect_tick % 2 == 0 {
+                let _ = ctrl.kbd_request_edges();
+            }
+        }
+        last_phys_kbd_visible = phys_kbd_visible;
 
         // ★已删除周期性 Cp 轮询★: 原"每 5 tick 轮询一个通道"与用户是否测量无关, 实测把 vendor 端点
         // 打满并与校准/自适应抢链路(NAK 每秒 8~12 条 → endpoint stall → 掉线)。
@@ -2059,13 +2353,28 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
         // 离开设置页不再自动保存, 未保存的草稿保持有效直到用户保存或撤销。
         ui.set_config_dirty(ctrl.is_config_dirty());
         ui.set_config_dirty_count(ctrl.config_dirty_count());
+        // 串行下发进度: 保存是逐条等设备回执推进的, 没有这个数界面看着像卡住, 用户还会重复点保存。
+        ui.set_save_pending(ctrl.cfg_tx_pending() as i32);
         // mode.work(Serial/HID)草稿存在时提示"需重启生效"; 保存提交后延时自动重启设备重枚举。
         ui.set_mode_change_needs_reboot(ctrl.draft_needs_reboot());
+        // ★必须等串行下发队列排空后才开始倒计时★
+        // 原实现在 pending_reboot 一置起就开 50 tick(≈800ms), 但那一刻整批草稿(实测 301 项)刚排进
+        // 队列, 而队列是"每 tick 推进一帧、逐条等设备回执", 排空需数秒 —— 于是重启落在下发中途,
+        // 设备重枚举把在途传输打断: 实测 `保存队列: cmd=0x11 seq=158 超过 2s 无 ACK/NAK 已跳过`
+        // + `WinUSB write failed ... device disconnected`, 余下几十项配置永远没送到, 随后固件
+        // 重新 provision 又报"算法未通过校验"。SAVE_CONFIG 是这批的最后一帧, 故 pending==0
+        // 等价于"全部配置含写 flash 请求都已被设备回执", 此时再等 800ms 静默让固件的落盘窗口
+        // (core1 空闲 + 200ms 无主机命令)完成, 才是安全的重启点。
         if reboot_countdown.is_none() && ctrl.pending_reboot() {
-            // 约 800ms(50 tick)后重启, 让固件安全窗口完成 flash 写。
-            reboot_countdown = Some(50);
-            ctrl.clear_pending_reboot();
-            ctrl.push_log("保存: mode.work 拓扑切换将在约 0.8s 后自动重启设备生效");
+            if ctrl.cfg_tx_pending() == 0 {
+                reboot_countdown = Some(50);
+                reboot_wait_logged = false;
+                ctrl.clear_pending_reboot();
+                ctrl.push_log("保存: 配置已全部下发完毕, mode.work 拓扑切换将在约 0.8s 后自动重启设备生效");
+            } else if !reboot_wait_logged {
+                reboot_wait_logged = true;
+                ctrl.push_log("保存: mode.work 需重启生效 —— 正在等待剩余配置下发完成后再重启, 以免打断在途传输");
+            }
         }
         if let Some(n) = reboot_countdown {
             if n == 0 {
@@ -2300,6 +2609,65 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
             ui.set_curve_readout(readout.into());
         }
 
+        // 触控组合映射回填(version 门控)。
+        let current_combo_version = ctrl.kbd_combo_version();
+        if current_combo_version != last_combo_version {
+            last_combo_version = current_combo_version;
+            let table = ctrl.kbd_combos();
+            let zone_names: Vec<String> = (0..34usize).map(zone_label).collect();
+            let zones_text: Vec<slint::SharedString> = table.iter()
+                .map(|c| {
+                    let names: Vec<&str> = (0..34usize)
+                        .filter(|z| (c.zone_mask & (1u64 << z)) != 0)
+                        .map(|z| zone_names[z].as_str())
+                        .collect();
+                    slint::SharedString::from(names.join(" + "))
+                })
+                .collect();
+            let keys_text: Vec<slint::SharedString> = table.iter()
+                .map(|c| {
+                    let mut parts: Vec<String> = Vec::new();
+                    // 修饰位单独成段, 再列具体键 —— 与 kbd_display 的口径一致。
+                    for code in c.keycodes.iter().filter(|k| **k != 0) {
+                        parts.push(kbd_display(*code, 0));
+                    }
+                    let base = if parts.is_empty() { "(仅修饰键)".to_string() } else { parts.join(" + ") };
+                    if c.modifiers != 0 {
+                        slint::SharedString::from(format!("{} [{}]", base, kbd_display(0, c.modifiers)))
+                    } else {
+                        slint::SharedString::from(base)
+                    }
+                })
+                .collect();
+            let delays: Vec<i32> = table.iter().map(|c| c.delay_ms as i32).collect();
+            let maxes: Vec<i32> = table.iter().map(|c| c.max_hold_ms as i32).collect();
+            ui.set_combo_count(table.len() as i32);
+            ui.set_combo_zones_text(slint::ModelRc::new(slint::VecModel::from(zones_text)));
+            ui.set_combo_keys_text(slint::ModelRc::new(slint::VecModel::from(keys_text)));
+            ui.set_combo_delay(slint::ModelRc::new(slint::VecModel::from(delays)));
+            ui.set_combo_max_hold(slint::ModelRc::new(slint::VecModel::from(maxes)));
+            ui.set_combo_zone_used(slint::ModelRc::new(slint::VecModel::from(
+                ctrl.kbd_combo_zone_used())));
+            ui.set_combo_zone_picked(slint::ModelRc::new(slint::VecModel::from(
+                ctrl.kbd_combo_pending_zones())));
+            let (pk, pm) = ctrl.kbd_combo_pending_keys();
+            let mut pending: Vec<String> = pk.iter().filter(|k| **k != 0)
+                .map(|k| kbd_display(*k, 0)).collect();
+            if pm != 0 {
+                pending.push(format!("[{}]", kbd_display(0, pm)));
+            }
+            ui.set_combo_pending_keys_text(pending.join(" + ").into());
+            // 设备支持性显式区分"旧固件不支持"与"支持但一条都没配", 不让前者被误读成配置丢了。
+            let status = match ctrl.kbd_combo_supported() {
+                Some(false) => "设备固件不支持组合映射(请更新固件)".to_string(),
+                None => "尚未回读设备组合映射".to_string(),
+                Some(true) => format!("上限 {} 条 · 单条最多 {} 键",
+                    mai2control_ui::proto::KBD_COMBO_COUNT,
+                    mai2control_ui::proto::KBD_COMBO_KEY_COUNT),
+            };
+            ui.set_combo_status(status.into());
+        }
+
         // 批量应用抽屉回填: 勾选态走自己的 version, 源通道参数值随 param_version/换通道刷新。
         // 两者都并入既有 16ms tick 门控, 不新增定时器、不提高频率。
         let current_batch_sel_version = ctrl.batch_sel_version();
@@ -2308,6 +2676,8 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
             || channel_changed
         {
             last_batch_sel_version = current_batch_sel_version;
+            let batch_src = ctrl.batch_source();
+            ui.set_batch_source(batch_src as i32);
             ui.set_batch_ch_selected(slint::ModelRc::new(slint::VecModel::from(
                 ctrl.batch_ch_selected())));
             ui.set_batch_param_selected(slint::ModelRc::new(slint::VecModel::from(
@@ -2316,9 +2686,10 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
                 .map(|id| param_display_name(id).into())
                 .collect();
             ui.set_batch_param_names(slint::ModelRc::new(slint::VecModel::from(names)));
-            // 源通道该参数无真值时显示"—", 明确区别于"值为 0"。
+            // 源通道该参数无真值时显示"—", 明确区别于"值为 0"。取的是 batch_source 而不是当前精调
+            // 通道: 抽屉里勾目标通道时不应把"源值"一列跟着改掉。
             let values: Vec<slint::SharedString> = (0x01u8..=0x0Bu8)
-                .map(|id| match ctrl.param(current_channel as u8, id) {
+                .map(|id| match ctrl.param(batch_src, id) {
                     Some(v) => slint::SharedString::from(v.to_string()),
                     None => slint::SharedString::from("—"),
                 })
@@ -2393,12 +2764,73 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
             ui.set_lat_point_count(series.len() as i32);
         }
 
-        // 物理键盘实时按下态(version 门控)。
+        // 物理键盘实时三态(version 门控): 去抖后 / 去抖前 / 实际输出 HID。
         if ctrl.kbd_state_version() != last_kbd_state_version {
             last_kbd_state_version = ctrl.kbd_state_version();
             let st = ctrl.kbd_state();
+            let raw = ctrl.kbd_state_raw();
+            let out = ctrl.kbd_state_out();
             let pressed: Vec<bool> = (0..12u8).map(|i| (st >> i) & 1 != 0).collect();
             ui.set_kbd_phys_pressed(slint::ModelRc::new(slint::VecModel::from(pressed)));
+            let raw_bits: Vec<bool> = (0..12u8).map(|i| (raw >> i) & 1 != 0).collect();
+            ui.set_kbd_phys_raw(slint::ModelRc::new(slint::VecModel::from(raw_bits)));
+            let out_bits: Vec<bool> = (0..12u8).map(|i| (out >> i) & 1 != 0).collect();
+            ui.set_kbd_phys_out(slint::ModelRc::new(slint::VecModel::from(out_bits)));
+        }
+        // 每键触发极性 + 防抖(version 门控, 草稿优先值)。
+        if ctrl.kbd_keycfg_version() != last_kbd_keycfg_version {
+            last_kbd_keycfg_version = ctrl.kbd_keycfg_version();
+            let pol: Vec<bool> = (0..12u8).map(|i| ctrl.kbd_keycfg(i).active_high).collect();
+            let db: Vec<i32> = (0..12u8)
+                .map(|i| ctrl.kbd_keycfg(i).debounce_us as i32)
+                .collect();
+            ui.set_kbd_phys_pol_high(slint::ModelRc::new(slint::VecModel::from(pol)));
+            ui.set_kbd_phys_debounce(slint::ModelRc::new(slint::VecModel::from(db)));
+            // 旧固件没有这两条命令: 明说"不支持"而不是显示一份看起来能改的假默认值。
+            let status = match ctrl.kbd_keycfg_supported() {
+                Some(false) => "设备固件不支持每键极性/防抖(需升级固件)".to_string(),
+                None => "每键极性/防抖: 未回读".to_string(),
+                Some(true) => {
+                    let high = (0..12u8).filter(|i| ctrl.kbd_keycfg(*i).active_high).count();
+                    format!("{} 键高电平触发 · 其余低电平触发", high)
+                }
+            };
+            ui.set_kbd_keycfg_status(status.into());
+        }
+        // 逻辑分析仪: 有新边沿或时间窗变化时重建 12 通道时序图(抽屉收起时不重建, 省 CPU)。
+        {
+            let win_idx = la_window_idx.get();
+            let edges_changed = ctrl.kbd_edges_version() != last_la_version;
+            if ui.get_phys_la_expanded() && (edges_changed || win_idx != last_la_window) {
+                last_la_version = ctrl.kbd_edges_version();
+                last_la_window = win_idx;
+                let view = build_logic_analyzer(ctrl.kbd_edges(), LA_WINDOWS_US[win_idx]);
+                ui.set_la_raw_paths(slint::ModelRc::new(slint::VecModel::from(view.raw_paths)));
+                ui.set_la_deb_paths(slint::ModelRc::new(slint::VecModel::from(view.deb_paths)));
+                ui.set_la_out_paths(slint::ModelRc::new(slint::VecModel::from(view.out_paths)));
+                ui.set_la_trig_text(slint::ModelRc::new(slint::VecModel::from(view.trig_text)));
+                ui.set_la_trig_x(slint::ModelRc::new(slint::VecModel::from(view.trig_x)));
+                ui.set_la_time_labels(slint::ModelRc::new(slint::VecModel::from(view.time_labels)));
+                ui.set_la_span_text(view.span_text);
+                // ★丢失必须显式告知★: 环满丢最旧时波形会"缺一段", 不提示就等于给出连续的假象。
+                let status = match ctrl.kbd_edges_supported() {
+                    Some(false) => "设备固件不支持边沿记录(需升级固件)".to_string(),
+                    None => String::new(),
+                    Some(true) => {
+                        let lost = ctrl.kbd_edge_lost();
+                        let remain = ctrl.kbd_edge_remaining();
+                        let mut s = String::new();
+                        if lost > 0 {
+                            s.push_str(&format!("⚠ 设备缓冲溢出, 已丢失 {} 条边沿事件; ", lost));
+                        }
+                        if remain > 0 {
+                            s.push_str(&format!("设备侧仍有 {} 条待取; ", remain));
+                        }
+                        s
+                    }
+                };
+                ui.set_la_status(status.into());
+            }
         }
         // 物理键 HID 键码 → 下拉索引 + 修饰位(version 门控, 避免覆盖用户编辑)。
         if ctrl.kbd_map_version() != last_kbd_map_version {
@@ -2589,7 +3021,7 @@ fn expected_scan_period_us(ctrl: &AppController) -> i32 {
     if res < 1 || res > 20 {
         return 0;
     }
-    let conv_us = (1u64 << res) / MOD_CLK_MHZ;            // 换能: 2^res / ModClk(µs), 与 snsClkDiv 无关
+    let conv_us = (1u64 << res) / MOD_CLK_MHZ; // 换能: 2^res / ModClk(µs), 与 snsClkDiv 无关
     (CHANNELS * (FIXED_OVERHEAD_US_PER_CH + conv_us)).min(i32::MAX as u64) as i32
 }
 
@@ -2610,12 +3042,52 @@ fn build_config_rows(entries: &[ConfigEntry]) -> Vec<ConfigRow> {
                 && !matches!(k, "led.ws_count0" | "led.ws_count1" | "led.ws_brightness")
         })
         .map(|entry| {
-            let (mut kind, type_code, bool_val, num_val, min_val, max_val, has_range, mut enum_index, str_val) = match &entry.value {
+            let (
+                mut kind,
+                type_code,
+                bool_val,
+                num_val,
+                min_val,
+                max_val,
+                has_range,
+                mut enum_index,
+                str_val,
+            ) = match &entry.value {
                 CfgValue::Bool(v) => (0, 0, *v, 0.0, 0.0, 1.0, false, 0, "".to_string()),
                 CfgValue::U8(v) => (1, 2, false, *v as f32, 0.0, 255.0, true, 0, "".to_string()),
-                CfgValue::U16(v) => (1, 3, false, *v as f32, 0.0, 65535.0, true, 0, "".to_string()),
-                CfgValue::U32(v) => (1, 4, false, *v as f32, 0.0, 4294967295.0, true, 0, "".to_string()),
-                CfgValue::I8(v) => (1, 1, false, *v as f32, -128.0, 127.0, true, 0, "".to_string()),
+                CfgValue::U16(v) => (
+                    1,
+                    3,
+                    false,
+                    *v as f32,
+                    0.0,
+                    65535.0,
+                    true,
+                    0,
+                    "".to_string(),
+                ),
+                CfgValue::U32(v) => (
+                    1,
+                    4,
+                    false,
+                    *v as f32,
+                    0.0,
+                    4294967295.0,
+                    true,
+                    0,
+                    "".to_string(),
+                ),
+                CfgValue::I8(v) => (
+                    1,
+                    1,
+                    false,
+                    *v as f32,
+                    -128.0,
+                    127.0,
+                    true,
+                    0,
+                    "".to_string(),
+                ),
                 CfgValue::F32(v) => (1, 5, false, *v, 0.0, 1.0, false, 0, "".to_string()),
                 CfgValue::Str(v) => (3, 6, false, 0.0, 0.0, 0.0, false, 0, v.clone()),
             };
@@ -2698,8 +3170,12 @@ fn parse_config_label(key: &str) -> (String, String, String) {
         // 触控 → 键盘映射: 虽在 comm. 前缀下, 语义与协议无关
         "comm.keyboard_map_en" | "comm.keyboard_delay_100us" => "键盘映射",
         // 板载状态指示灯(main.cpp 心跳灯消费), 与灯板协议无关
-        "led.enable" | "led.status_brightness" | "led.color_connected" | "led.color_flash_error"
-        | "led.color_link_error" | "led.color_healthy" => "状态指示灯",
+        "led.enable"
+        | "led.status_brightness"
+        | "led.color_connected"
+        | "led.color_flash_error"
+        | "led.color_link_error"
+        | "led.color_healthy" => "状态指示灯",
         "mode.work" => "工作模式",
         // 未收录 key 的兜底: 按前缀落到通信系统 Tab 的"其他"组, 不会凭空消失。
         _ => match parts.first().copied().unwrap_or("") {
@@ -2718,8 +3194,14 @@ fn parse_config_label(key: &str) -> (String, String, String) {
         "comm.rate_limit_hz" => ("速率上限 (Hz)", "遥测上报帧率的上限"),
         "comm.keyboard_map_en" => ("启用触摸→键盘", "把触摸分区映射为键盘按键输出"),
         "comm.serial_baud" => ("触控串口波特率", "游戏触控串口 (COM) 的波特率"),
-        "comm.serial_reset_calibrate" => ("串口重启后自动 IDAC 校准", "收到 mai2serial 重启指令({E} RSET)后，自动执行一次全通道 IDAC 校准"),
-        "comm.serial_reset_baseline" => ("串口重启后自动基线复位", "收到 mai2serial 重启指令({E} RSET)后，自动执行一次全通道基线复位"),
+        "comm.serial_reset_calibrate" => (
+            "串口重启后自动 IDAC 校准",
+            "收到 mai2serial 重启指令({E} RSET)后，自动执行一次全通道 IDAC 校准",
+        ),
+        "comm.serial_reset_baseline" => (
+            "串口重启后自动基线复位",
+            "收到 mai2serial 重启指令({E} RSET)后，自动执行一次全通道基线复位",
+        ),
         "comm.light_baud" => ("灯板串口波特率", "灯板通信串口的波特率"),
         "comm.touch_delay_100us" => ("触控延迟 (×100µs)", "触控串口上报延迟线, 0..100ms"),
         "comm.keyboard_delay_100us" => ("键盘延迟 (×100µs)", "触摸→键盘输出的附加延迟"),
@@ -2758,7 +3240,9 @@ fn cp_display_text(cp: Option<u32>) -> String {
 /// 绑区页 34 分区静态几何 + 实时绑定/触摸/Cp 状态，几何来自 DXF 生成的
 /// [`touch_geometry::ZONE_GEOMETRY`]，坐标系固定为 SCREEN_W x SCREEN_H。
 fn build_zone_cells(ctrl: &AppController) -> Vec<ZoneCell> {
-    let waiting_zone = ctrl.bind_progress().and_then(|(zone, status)| (status == 0).then_some(zone));
+    let waiting_zone = ctrl
+        .bind_progress()
+        .and_then(|(zone, status)| (status == 0).then_some(zone));
     let mut cells = Vec::with_capacity(34);
     for i in 0..34usize {
         let label = zone_label(i);
@@ -2783,7 +3267,11 @@ fn build_zone_cells(ctrl: &AppController) -> Vec<ZoneCell> {
             label: label.into(),
             ring: ring.into(),
             channel,
-            binding_text: if channel >= 0 { format!("CH{}", channel).into() } else { "未绑定".into() },
+            binding_text: if channel >= 0 {
+                format!("CH{}", channel).into()
+            } else {
+                "未绑定".into()
+            },
             cp_text: cp_text.into(),
             touched,
             binding_active: waiting_zone == Some(i as u8),
@@ -2819,8 +3307,7 @@ impl CurvePaths {
         if self.point_count == 0 {
             return 500.0;
         }
-        (1000.0 - (value - self.y_min) / (self.y_max - self.y_min) * 1000.0)
-            .clamp(0.0, 1000.0)
+        (1000.0 - (value - self.y_min) / (self.y_max - self.y_min) * 1000.0).clamp(0.0, 1000.0)
     }
     /// 全量时间跨度(ms), 供 UI 把 viewbox 横坐标换算成真实时刻。
     fn t_span_ms(&self) -> f32 {
@@ -2831,7 +3318,11 @@ impl CurvePaths {
 /// 采样间隔超过多少视为"时间缺口"(暂停/掉帧): 取标称周期的若干倍, 并给一个绝对下限,
 /// 免得采样率未知(sps=0)或抖动时误判。缺口两侧不连线, 见 `points_to_svg_path`。
 fn gap_threshold_us(sample_rate_hz: u32, period_mult: u32, floor_us: u64) -> u64 {
-    let nominal = if sample_rate_hz > 0 { 1_000_000 / sample_rate_hz as u64 } else { 33_333 };
+    let nominal = if sample_rate_hz > 0 {
+        1_000_000 / sample_rate_hz as u64
+    } else {
+        33_333
+    };
     (nominal * period_mult as u64).max(floor_us)
 }
 
@@ -2864,7 +3355,12 @@ fn points_to_svg_path(
         if path.is_empty() {
             path.push_str(&format!("M {} {}", x as i32, y as i32));
         } else {
-            path.push_str(&format!(" {} {} {}", if broken { "M" } else { "L" }, x as i32, y as i32));
+            path.push_str(&format!(
+                " {} {} {}",
+                if broken { "M" } else { "L" },
+                x as i32,
+                y as i32
+            ));
         }
         prev_t = Some(t);
     }
@@ -2878,9 +3374,21 @@ fn build_curve_paths(
     show_bsln: bool,
     show_diff: bool,
 ) -> CurvePaths {
-    let raw_pts = if show_raw { ctrl.telem_points(ch, FIELD_RAW) } else { vec![] };
-    let bsln_pts = if show_bsln { ctrl.telem_points(ch, FIELD_BASELINE) } else { vec![] };
-    let diff_pts = if show_diff { ctrl.telem_points(ch, FIELD_DIFF) } else { vec![] };
+    let raw_pts = if show_raw {
+        ctrl.telem_points(ch, FIELD_RAW)
+    } else {
+        vec![]
+    };
+    let bsln_pts = if show_bsln {
+        ctrl.telem_points(ch, FIELD_BASELINE)
+    } else {
+        vec![]
+    };
+    let diff_pts = if show_diff {
+        ctrl.telem_points(ch, FIELD_DIFF)
+    } else {
+        vec![]
+    };
     let all_pts = [&raw_pts[..], &bsln_pts[..], &diff_pts[..]];
 
     let mut min = f32::INFINITY;
@@ -3005,7 +3513,11 @@ fn build_algo_overlay(
         let raw = ctrl.algo_trace_report_points(idx as u8);
         report_has_data[idx] = !raw.is_empty();
         report_binary[idx] = points_are_binary(&raw);
-        let norm = if report_binary[idx] { normalize_binary(&raw, amps[idx]) } else { raw };
+        let norm = if report_binary[idx] {
+            normalize_binary(&raw, amps[idx])
+        } else {
+            raw
+        };
         if wanted[idx] && report_has_data[idx] {
             let (lo, hi) = track(&norm);
             r_min = r_min.min(lo);
@@ -3024,7 +3536,11 @@ fn build_algo_overlay(
         r_max = 1.0;
     }
     let span = r_max - r_min;
-    let padding = if span.abs() < f32::EPSILON { (r_max.abs() * 0.05).max(0.5) } else { span * 0.05 };
+    let padding = if span.abs() < f32::EPSILON {
+        (r_max.abs() * 0.05).max(0.5)
+    } else {
+        span * 0.05
+    };
     let r_min = r_min - padding;
     let r_max = r_max + padding;
     let mut report_paths = [String::new(), String::new(), String::new(), String::new()];
@@ -3048,7 +3564,13 @@ fn dev_time_text(t_us: u64) -> String {
     let total_ms = t_us / 1000;
     let ms = total_ms % 1000;
     let total_s = total_ms / 1000;
-    format!("{:02}:{:02}:{:02}.{:03}", total_s / 3600, (total_s / 60) % 60, total_s % 60, ms)
+    format!(
+        "{:02}:{:02}:{:02}.{:03}",
+        total_s / 3600,
+        (total_s / 60) % 60,
+        total_s % 60,
+        ms
+    )
 }
 
 fn series_to_svg_path(series: &[f32], min: f32, max: f32, x_scale: f32) -> String {
@@ -3076,6 +3598,177 @@ fn series_to_svg_path(series: &[f32], min: f32, max: f32, x_scale: f32) -> Strin
     path
 }
 
+/// 逻辑分析仪可选时间窗(微秒)。最小 500us 用于看清机械抖动的微秒级间隔,
+/// 最大 5s 用于看整段按压序列。索引与 UI 下拉一一对应。
+const LA_WINDOWS_US: [u32; 7] = [500, 2_000, 10_000, 50_000, 200_000, 1_000_000, 5_000_000];
+/// 默认 50ms: 一次按下的抖动全景 + 3ms 级防抖窗仍清晰可辨。
+const LA_WINDOW_DEFAULT: usize = 3;
+
+/// 把微秒数格式化成可读时间(自动切 us/ms/s), 供逻辑分析仪的横轴刻度与触发读数使用。
+fn fmt_time_us(us: f64) -> String {
+    let a = us.abs();
+    if a < 1000.0 {
+        format!("{:.1}us", us)
+    } else if a < 1_000_000.0 {
+        format!("{:.3}ms", us / 1000.0)
+    } else {
+        format!("{:.3}s", us / 1_000_000.0)
+    }
+}
+
+/// 逻辑分析仪一屏视图: 12 通道阶梯波形(去抖前/仅去抖后/实际输出各一条)+ 每通道触发标记 + 横轴刻度。
+struct LogicAnalyzerView {
+    raw_paths: Vec<slint::SharedString>,
+    deb_paths: Vec<slint::SharedString>,
+    out_paths: Vec<slint::SharedString>,
+    trig_text: Vec<slint::SharedString>,
+    trig_x: Vec<f32>,
+    time_labels: Vec<slint::SharedString>,
+    span_text: slint::SharedString,
+}
+
+/// 从边沿记录构建 12 通道时序图。
+///
+/// - 窗口右缘 = 缓冲里最新一条记录的时间戳, 向左展开 `window_us`; 全部通道共用这一条时间轴,
+///   所以泳道之间的触发标记 x 可以直接横向比较(这正是"逻辑分析仪"的意义)。
+/// - 设备时间戳是 `time_us_32()`, 32 位会回绕: 一律用 `wrapping_sub` 求相对偏移,
+///   窗口外的旧记录其无符号差会变成巨大值, 天然被 `> window_us` 过滤掉。
+/// - 窗口起点的电平取"窗口之前最后一条记录"的状态, 否则每次滚动窗口都会凭空多出一个假边沿。
+fn build_logic_analyzer(
+    edges: &std::collections::VecDeque<mai2control_ui::proto::KbdEdgeRec>,
+    window_us: u32,
+) -> LogicAnalyzerView {
+    const KEYS: usize = 12;
+    const Y_ON: i32 = 16; // 按下
+    const Y_OFF: i32 = 84; // 松开
+    let mut view = LogicAnalyzerView {
+        raw_paths: vec![slint::SharedString::new(); KEYS],
+        deb_paths: vec![slint::SharedString::new(); KEYS],
+        out_paths: vec![slint::SharedString::new(); KEYS],
+        trig_text: vec![slint::SharedString::new(); KEYS],
+        trig_x: vec![-1.0; KEYS],
+        time_labels: Vec::new(),
+        span_text: slint::SharedString::new(),
+    };
+    // 横轴刻度先建好: 即使无数据也要有刻度, 免得空图看起来像"坏了"。
+    for i in 0..5 {
+        let back_us = window_us as f64 * (4 - i) as f64 / 4.0;
+        view.time_labels.push(
+            if i == 4 {
+                "0".to_string()
+            } else {
+                format!("-{}", fmt_time_us(back_us))
+            }
+            .into(),
+        );
+    }
+    let window_us = window_us.max(1);
+    let Some(last) = edges.back() else {
+        view.span_text = format!("窗口 {} · 无边沿记录", fmt_time_us(window_us as f64)).into();
+        for k in 0..KEYS {
+            view.trig_text[k] = "无数据".into();
+        }
+        return view;
+    };
+    let t_start = last.t_us.wrapping_sub(window_us);
+    // 窗口内记录 + 窗口起点前的最后一个状态(作为初始电平)。
+    let mut before: Option<(u16, u16, u16)> = None;
+    let mut visible: Vec<&mai2control_ui::proto::KbdEdgeRec> = Vec::new();
+    for rec in edges.iter() {
+        if rec.t_us.wrapping_sub(t_start) <= window_us {
+            visible.push(rec);
+        } else {
+            before = Some((rec.raw, rec.deb, rec.out));
+        }
+    }
+    let x_of = |t: u32| -> f32 { t.wrapping_sub(t_start) as f32 / window_us as f32 * 1000.0 };
+    for k in 0..KEYS {
+        let bit = 1u16 << k;
+        let (mut raw_on, mut deb_on, mut out_on) = match before {
+            Some((r, d, o)) => ((r & bit) != 0, (d & bit) != 0, (o & bit) != 0),
+            // 窗口前没有任何记录时, 用窗口内第一条的状态当起点(它就是该键进入窗口时的电平)。
+            None => visible
+                .first()
+                .map(|r| ((r.raw & bit) != 0, (r.deb & bit) != 0, (r.out & bit) != 0))
+                .unwrap_or((false, false, false)),
+        };
+        let mut raw_p = format!("M 0 {}", if raw_on { Y_ON } else { Y_OFF });
+        let mut deb_p = format!("M 0 {}", if deb_on { Y_ON } else { Y_OFF });
+        let mut out_p = format!("M 0 {}", if out_on { Y_ON } else { Y_OFF });
+        let mut edge_count = 0u32;
+        let mut trig_at: Option<u32> = None;
+        for rec in &visible {
+            let x = x_of(rec.t_us);
+            let r = (rec.raw & bit) != 0;
+            let d = (rec.deb & bit) != 0;
+            let o = (rec.out & bit) != 0;
+            if r != raw_on {
+                // 阶梯: 先水平走到该时刻, 再垂直跳变 —— 电平信号不能画成斜线。
+                raw_p.push_str(&format!(
+                    " L {:.1} {} L {:.1} {}",
+                    x,
+                    if raw_on { Y_ON } else { Y_OFF },
+                    x,
+                    if r { Y_ON } else { Y_OFF }
+                ));
+                raw_on = r;
+                edge_count += 1;
+            }
+            if d != deb_on {
+                deb_p.push_str(&format!(
+                    " L {:.1} {} L {:.1} {}",
+                    x,
+                    if deb_on { Y_ON } else { Y_OFF },
+                    x,
+                    if d { Y_ON } else { Y_OFF }
+                ));
+                deb_on = d;
+                if d && trig_at.is_none() {
+                    trig_at = Some(rec.t_us);
+                }
+            }
+            if o != out_on {
+                out_p.push_str(&format!(
+                    " L {:.1} {} L {:.1} {}",
+                    x,
+                    if out_on { Y_ON } else { Y_OFF },
+                    x,
+                    if o { Y_ON } else { Y_OFF }
+                ));
+                out_on = o;
+            }
+        }
+        raw_p.push_str(&format!(" L 1000 {}", if raw_on { Y_ON } else { Y_OFF }));
+        deb_p.push_str(&format!(" L 1000 {}", if deb_on { Y_ON } else { Y_OFF }));
+        out_p.push_str(&format!(" L 1000 {}", if out_on { Y_ON } else { Y_OFF }));
+        view.raw_paths[k] = raw_p.into();
+        view.deb_paths[k] = deb_p.into();
+        view.out_paths[k] = out_p.into();
+        view.trig_text[k] = match trig_at {
+            Some(t) => {
+                view.trig_x[k] = x_of(t);
+                format!(
+                    "+{} ·{}沿",
+                    fmt_time_us(t.wrapping_sub(t_start) as f64),
+                    edge_count
+                )
+                .into()
+            }
+            None if edge_count > 0 => format!("无上升沿 ·{}沿", edge_count).into(),
+            None => "静默".into(),
+        };
+    }
+    view.span_text = format!(
+        "窗口 {} · 窗口内 {} 条 / 缓冲 {} 条 · 右缘 t={}us",
+        fmt_time_us(window_us as f64),
+        visible.len(),
+        edges.len(),
+        last.t_us
+    )
+    .into();
+    view
+}
+
 /// 生成延迟历史折线 path + 自适应纵向量程 (lo, hi)。x 固定映射到 [0,1000]，由 PlotPath 的 fit: fill 拉满绘图区。
 /// 不能用 aspect 修正：等比 contain 无法铺满任意矩形，宽高比变化后会重新产生空白带。
 /// 纵向量程按数据 min/max 自适应(带 10% 余量), 否则接近常数的延迟会被压成一条线。
@@ -3098,13 +3791,13 @@ fn build_lat_path(series: &[f32]) -> (String, f32, f32) {
 fn kbd_key_choices() -> Vec<(&'static str, u8)> {
     let mut v: Vec<(&'static str, u8)> = vec![("不映射", 0x00)];
     const LETTERS: [&str; 26] = [
-        "A","B","C","D","E","F","G","H","I","J","K","L","M",
-        "N","O","P","Q","R","S","T","U","V","W","X","Y","Z",
+        "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q", "R",
+        "S", "T", "U", "V", "W", "X", "Y", "Z",
     ];
     for (i, name) in LETTERS.iter().enumerate() {
         v.push((name, 0x04 + i as u8));
     }
-    const DIGITS: [&str; 10] = ["1","2","3","4","5","6","7","8","9","0"];
+    const DIGITS: [&str; 10] = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "0"];
     for (i, name) in DIGITS.iter().enumerate() {
         v.push((name, 0x1E + i as u8));
     }
@@ -3113,7 +3806,9 @@ fn kbd_key_choices() -> Vec<(&'static str, u8)> {
     v.push(("Backspace", 0x2A));
     v.push(("Tab", 0x2B));
     v.push(("Space", 0x2C));
-    const FKEYS: [&str; 12] = ["F1","F2","F3","F4","F5","F6","F7","F8","F9","F10","F11","F12"];
+    const FKEYS: [&str; 12] = [
+        "F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10", "F11", "F12",
+    ];
     for (i, name) in FKEYS.iter().enumerate() {
         v.push((name, 0x3A + i as u8));
     }
@@ -3170,10 +3865,18 @@ fn kbd_display(code: u8, modifier: u8) -> String {
         return "未设置(点击后按键)".to_string();
     }
     let mut s = String::new();
-    if modifier & 1 != 0 { s.push_str("Ctrl+"); }
-    if modifier & 2 != 0 { s.push_str("Shift+"); }
-    if modifier & 4 != 0 { s.push_str("Alt+"); }
-    if modifier & 8 != 0 { s.push_str("Gui+"); }
+    if modifier & 1 != 0 {
+        s.push_str("Ctrl+");
+    }
+    if modifier & 2 != 0 {
+        s.push_str("Shift+");
+    }
+    if modifier & 4 != 0 {
+        s.push_str("Alt+");
+    }
+    if modifier & 8 != 0 {
+        s.push_str("Gui+");
+    }
     if code != 0 {
         s.push_str(kbd_hid_name(code));
     } else {
@@ -3187,14 +3890,14 @@ fn kbd_display(code: u8, modifier: u8) -> String {
 fn char_to_hid(text: &str) -> u8 {
     match text {
         "\u{000a}" | "\r" => return 0x28, // Enter
-        "\u{001b}" => return 0x29,               // Escape
-        "\u{0008}" => return 0x2A,               // Backspace
-        "\u{0009}" => return 0x2B,               // Tab
-        " " => return 0x2C,                       // Space
-        "\u{f700}" => return 0x52,               // Up
-        "\u{f701}" => return 0x51,               // Down
-        "\u{f702}" => return 0x50,               // Left
-        "\u{f703}" => return 0x4F,               // Right
+        "\u{001b}" => return 0x29,        // Escape
+        "\u{0008}" => return 0x2A,        // Backspace
+        "\u{0009}" => return 0x2B,        // Tab
+        " " => return 0x2C,               // Space
+        "\u{f700}" => return 0x52,        // Up
+        "\u{f701}" => return 0x51,        // Down
+        "\u{f702}" => return 0x50,        // Left
+        "\u{f703}" => return 0x4F,        // Right
         _ => {}
     }
     if let Some(ch) = text.chars().next() {
@@ -3337,7 +4040,11 @@ fn build_led_unit_rows(ctrl: &AppController) -> Vec<LedUnitRow> {
                 label: led_unit_label(unit).into(),
                 sample: slint::Color::from_rgb_u8(rgb[0], rgb[1], rgb[2]),
                 rgb_text: format!("R{} G{} B{}", rgb[0], rgb[1], rgb[2]).into(),
-                ch_choice: if region.ch > 1 { 0 } else { region.ch as i32 + 1 },
+                ch_choice: if region.ch > 1 {
+                    0
+                } else {
+                    region.ch as i32 + 1
+                },
                 start: region.start as i32,
                 count: region.count as i32,
             }

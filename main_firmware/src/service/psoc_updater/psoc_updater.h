@@ -2,9 +2,12 @@
 
 #include <stdint.h>
 
+// RP_FIRMWARE_VERSION = 编译时间戳(十进制 YYMMDDHHMM, 本地时间), 每次 pio run 由
+// pre:gen_build_stamp.py 重新生成; 线上仍是 u32, 诊断结构与帧格式不变。
+#include "rp_build_stamp.h"
+
 class Psoc;
 
-static constexpr uint32_t RP_FIRMWARE_VERSION = 0x00000402u;
 static constexpr uint32_t RP_BUILD_ID = 0x4D324401u;  // "M2D" diagnostic image v1
 static constexpr uint8_t PSOC_BRINGUP_REPORT_VERSION = 1u;
 

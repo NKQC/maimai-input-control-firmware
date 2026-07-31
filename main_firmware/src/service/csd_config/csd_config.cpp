@@ -1,4 +1,4 @@
-#include "csd_config.h"
+﻿#include "csd_config.h"
 #include "../../protocol/psoc/psoc.h"
 #include "../config_manager/config_crc.h"
 #include "../../flash_guard.h"
@@ -10,24 +10,13 @@
 #include "LittleFS.h"
 #include "pico/multicore.h"
 #include "hardware/sync.h"
+#include "../nv_store/nv_store.h"   // 自管理 flash blob(替代 LittleFS 文件)
 #endif
 
 namespace {
 constexpr uint32_t CSD_BLOB_MAGIC = 0x31445343u;  // "CSD1"
 constexpr const char* CSD_BLOB_PATH = "/csd.bin";
 
-#pragma pack(push, 1)
-struct CsdBlob {
-    uint32_t magic;
-    uint8_t  mode;
-    uint8_t  valid;
-    uint8_t  global_valid;
-    uint8_t  reserved;
-    uint16_t param[CSD_CHANNELS][CSD_PARAM_COUNT];
-    uint16_t global[CSD_GLOBAL_COUNT];
-    uint32_t crc32;   // 覆盖前面全部字节
-};
-#pragma pack(pop)
 }  // namespace
 
 CsdConfig* CsdConfig::_instance = nullptr;
@@ -37,10 +26,16 @@ CsdConfig::CsdConfig() : _mode(CSD_MODE_SEMI), _valid(false) {
     std::memset(_global, 0, sizeof(_global));
 }
 
+void CsdConfig::note_mode(uint8_t mode) {
+    _mode = (mode != 0u) ? CSD_MODE_SEMI : CSD_MODE_AUTO;
+    _sync_storage();
+}
+
 void CsdConfig::note_global(uint8_t gparam_id, uint32_t value) {
     if (!_global_id_ok(gparam_id)) return;
     _global[gparam_id - CSD_GLOBAL_ID_MIN] = (uint16_t)value;
     _global_valid = true;
+    _sync_storage();
 }
 
 CsdConfig* CsdConfig::getInstance() {
@@ -51,9 +46,8 @@ CsdConfig* CsdConfig::getInstance() {
 void CsdConfig::note_param(uint8_t ch, uint8_t param_id, uint32_t value) {
     if (ch >= CSD_CHANNELS || !_param_id_ok(param_id)) return;
     _param[ch][_param_index(param_id)] = (uint16_t)value;
-    // 置有效: 否则 SAVE_CONFIG 落盘的 blob 里 _valid=false, 重启 download_to_psoc 会跳过逐通道
-    // 参数下发 → 分辨率/snsClk/idac 等每通道参数保存后重启仍丢失(半自动模式下不恢复)。
     _valid = true;
+    _sync_storage();
 }
 
 void CsdConfig::clear() {
@@ -61,62 +55,59 @@ void CsdConfig::clear() {
     std::memset(_global, 0, sizeof(_global));
     _valid = false;
     _global_valid = false;
-    _mode = CSD_MODE_AUTO;   // 回到自动校准, PSoC 用生成默认跑标准处理链
+    _mode = CSD_MODE_AUTO;
+    _sync_storage();
     request_save();
+}
+
+// ★落盘由 NvStore 单点负责★
+// 本类不再自己碰 flash: 只把 _mirror(与 flash 布局等价的镜像)注册给 NvStore, 由它 load/commit。
+// 必须在 NvStore::load() 之前调用。
+void CsdConfig::register_storage() {
+#ifdef PICO_PLATFORM
+    static_assert(sizeof(Mirror) <= NvStore::payload_capacity(NvStore::Region::CSD),
+                  "CSD 镜像超出该区一份的负载容量");
+    _mirror_len = sizeof(_mirror);
+    NvStore::getInstance()->register_blob(
+        NvStore::Region::CSD, (uint8_t*)&_mirror, &_mirror_len, sizeof(_mirror));
+#endif
 }
 
 void CsdConfig::init() {
 #ifdef PICO_PLATFORM
-    File f = LittleFS.open(CSD_BLOB_PATH, "r");
-    if (!f) return;
-    CsdBlob blob;
-    size_t n = f.read((uint8_t*)&blob, sizeof(blob));
-    f.close();
-    if (n != sizeof(blob) || blob.magic != CSD_BLOB_MAGIC) return;
-    uint32_t crc = ConfigCRC::calculate_crc32((const uint8_t*)&blob, sizeof(blob) - sizeof(uint32_t));
-    if (crc != blob.crc32) return;
-    _mode = (blob.mode != 0u) ? CSD_MODE_SEMI : CSD_MODE_AUTO;
-    _valid = (blob.valid != 0u);
-    _global_valid = (blob.global_valid != 0u);
-    std::memcpy(_param, blob.param, sizeof(_param));
-    std::memcpy(_global, blob.global, sizeof(_global));
+    // NvStore::load() 已把 flash 内容摊进 _mirror(带 len+CRC 校验), 这里只做本类自己的语义校验。
+    // 旧实现在这里直接读文件, 是三条互不知情的落盘路径之一 —— 现在读路径也收敛到 NvStore。
+    if (_mirror_len != sizeof(_mirror) || _mirror.magic != CSD_BLOB_MAGIC) return;
+    uint32_t crc = ConfigCRC::calculate_crc32((const uint8_t*)&_mirror, sizeof(_mirror) - sizeof(uint32_t));
+    if (crc != _mirror.crc32) return;
+    _mode = (_mirror.mode != 0u) ? CSD_MODE_SEMI : CSD_MODE_AUTO;
+    _valid = (_mirror.valid != 0u);
+    _global_valid = (_mirror.global_valid != 0u);
+    std::memcpy(_param, _mirror.param, sizeof(_param));
+    std::memcpy(_global, _mirror.global, sizeof(_global));
+#endif
+}
+
+void CsdConfig::_sync_storage() {
+#ifdef PICO_PLATFORM
+    std::memset(&_mirror, 0, sizeof(_mirror));
+    _mirror.magic = CSD_BLOB_MAGIC;
+    _mirror.mode = _mode;
+    _mirror.valid = _valid ? 1u : 0u;
+    _mirror.global_valid = _global_valid ? 1u : 0u;
+    std::memcpy(_mirror.param, _param, sizeof(_param));
+    std::memcpy(_mirror.global, _global, sizeof(_global));
+    _mirror.crc32 = ConfigCRC::calculate_crc32((const uint8_t*)&_mirror, sizeof(_mirror) - sizeof(uint32_t));
+    _mirror_len = sizeof(_mirror);
+    NvStore::getInstance()->mark_dirty(NvStore::Region::CSD);
 #endif
 }
 
 bool CsdConfig::save() {
-    _save_pending = false;   // 落地即清信号
+    _save_pending = false;
+    _sync_storage();
 #ifdef PICO_PLATFORM
-    CsdBlob blob;
-    std::memset(&blob, 0, sizeof(blob));
-    blob.magic = CSD_BLOB_MAGIC;
-    blob.mode = _mode;
-    blob.valid = _valid ? 1u : 0u;
-    blob.global_valid = _global_valid ? 1u : 0u;
-    std::memcpy(blob.param, _param, sizeof(_param));
-    std::memcpy(blob.global, _global, sizeof(_global));
-    blob.crc32 = ConfigCRC::calculate_crc32((const uint8_t*)&blob, sizeof(blob) - sizeof(uint32_t));
-
-    // LittleFS 擦写期间 XIP 不可执行，当前 API 无安全分片点；忙标记先阻止推送，再在临界区两端泵 USB，
-    // 避免 telemetry/进度帧把共享的 64B vendor IN FIFO 塞满。阈值效果由 host soak 的调试计数器实测。
-    size_t n = 0;
-    {
-        FlashWriteGuard flash_guard;
-        HAL_USB_Device::getInstance()->task();
-        uint32_t _irq = save_and_disable_interrupts();
-        multicore_lockout_start_blocking();
-        File f = LittleFS.open(CSD_BLOB_PATH, "w");
-        if (f) {
-            n = f.write((const uint8_t*)&blob, sizeof(blob));
-            f.close();
-        }
-        multicore_lockout_end_blocking();
-        restore_interrupts(_irq);
-    }
-    // 忙标记已撤销后立即 pump，先恢复 vendor 端点再允许下一轮调度器产生推送。
-    HAL_USB_Device::getInstance()->task();
-    g_usb_dbg.flash_write_count++;
-    g_usb_dbg.loop_at_last_flash = g_usb_dbg.loop_count;
-    return n == sizeof(blob);
+    return true;
 #else
     return false;
 #endif
@@ -190,6 +181,12 @@ bool CsdConfig::capture_from_psoc(Psoc* psoc) {
     // 需要防的是**自动路径**的静默固化(掉线恢复/恢复默认后自行回读), 那个卡在调用方 main.cpp 的
     // recapture 分支里 —— 静默固化会把用户手动阈值/snsClk 无声覆盖, 而显式捕获是用户自己要的。
     if (psoc == nullptr || !psoc->link_ok()) return false;
+    // ★不固化坏采样★: 显式捕获的语义是"把设备当前这套值收作我的基线", 前提是这套值【真的在工作】。
+    // PSoC 处于 railed(raw 卡满量程 4095)/扫描停滞时, 读回来的是一套自毁配置, 一旦固化就会在每次
+    // 开机 provision 时被重新下发, 把面板永久钉死在不可用状态 —— 实测正是这条路把 snsClk=8 +
+    // IDAC_MOD=127 反复写回 store(恢复默认清掉后, 一跑显式捕获又被写回来), 即"DIV 异常固化"。
+    // 这不是按模式设卡(用户想在 AUTO 下收种子仍然允许), 而是数据有效性门禁: 明知是坏值就不该存。
+    if (!sampling_trustworthy(psoc)) return false;
     for (uint8_t ch = 0; ch < CSD_CHANNELS; ch++) {
         for (uint8_t i = 0; i < CSD_PARAM_COUNT; i++) {
             uint32_t v = 0;
@@ -207,5 +204,6 @@ bool CsdConfig::capture_from_psoc(Psoc* psoc) {
     }
     _valid = true;
     _global_valid = true;
+    _sync_storage();
     return true;
 }

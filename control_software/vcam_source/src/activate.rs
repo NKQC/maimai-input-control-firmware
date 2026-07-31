@@ -9,8 +9,9 @@ use std::sync::{Mutex, MutexGuard};
 use windows::Win32::Foundation::E_POINTER;
 use windows::Win32::Media::MediaFoundation::{
     IMFActivate, IMFActivate_Impl, IMFAttributes, IMFAttributes_Impl, IMFMediaSource,
-    IMFMediaSourceEx, MFT_TRANSFORM_CLSID_Attribute, MF_ATTRIBUTES_MATCH_TYPE, MF_ATTRIBUTE_TYPE,
-    MFCreateAttributes, MF_VIRTUALCAMERA_PROVIDE_ASSOCIATED_CAMERA_SOURCES,
+    IMFMediaSourceEx, MF_ATTRIBUTE_TYPE, MF_ATTRIBUTES_MATCH_TYPE,
+    MF_VIRTUALCAMERA_PROVIDE_ASSOCIATED_CAMERA_SOURCES, MFCreateAttributes,
+    MFT_TRANSFORM_CLSID_Attribute,
 };
 use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
 use windows::core::{
@@ -23,7 +24,14 @@ use crate::{_object_created, _object_released, _trace_guid, _trace_result};
 macro_rules! _trace_attr {
     ($method:literal, $key:expr, $details:expr, $result:expr) => {{
         _trace_result(
-            || format!("IMFAttributes::{} key={} {}", $method, _trace_guid($key), $details),
+            || {
+                format!(
+                    "IMFAttributes::{} key={} {}",
+                    $method,
+                    _trace_guid($key),
+                    $details
+                )
+            },
             $result,
         )
     }};
@@ -72,23 +80,33 @@ impl Drop for VcamActivate {
 
 impl IMFAttributes_Impl for VcamActivate_Impl {
     fn GetItem(&self, guidkey: *const GUID, pvalue: *mut PROPVARIANT) -> Result<()> {
-        _trace_attr!("GetItem", guidkey, format!("pvalue_null={}", pvalue.is_null()), {
-            // ★pvalue 允许为 NULL★: 调用方(包括 MF 平台自身的 MFGetAttribute* 辅助函数)常用
-            // GetItem(key, NULL) 仅探测某属性是否存在。无条件当成 Some(ptr) 转发会让内层返回
-            // E_POINTER, 帧服务器就是在这里失败的(Start 返回 0x80004003)。
-            let value = if pvalue.is_null() { None } else { Some(pvalue) };
-            unsafe { self._attrs.GetItem(guidkey, value) }
-        })
+        _trace_attr!(
+            "GetItem",
+            guidkey,
+            format!("pvalue_null={}", pvalue.is_null()),
+            {
+                // ★pvalue 允许为 NULL★: 调用方(包括 MF 平台自身的 MFGetAttribute* 辅助函数)常用
+                // GetItem(key, NULL) 仅探测某属性是否存在。无条件当成 Some(ptr) 转发会让内层返回
+                // E_POINTER, 帧服务器就是在这里失败的(Start 返回 0x80004003)。
+                let value = if pvalue.is_null() { None } else { Some(pvalue) };
+                unsafe { self._attrs.GetItem(guidkey, value) }
+            }
+        )
     }
 
     fn GetItemType(&self, guidkey: *const GUID) -> Result<MF_ATTRIBUTE_TYPE> {
-        _trace_attr!("GetItemType", guidkey, "", unsafe { self._attrs.GetItemType(guidkey) })
+        _trace_attr!("GetItemType", guidkey, "", unsafe {
+            self._attrs.GetItemType(guidkey)
+        })
     }
 
     fn CompareItem(&self, guidkey: *const GUID, value: *const PROPVARIANT) -> Result<BOOL> {
-        _trace_attr!("CompareItem", guidkey, format!("value_null={}", value.is_null()), unsafe {
-            self._attrs.CompareItem(guidkey, value)
-        })
+        _trace_attr!(
+            "CompareItem",
+            guidkey,
+            format!("value_null={}", value.is_null()),
+            unsafe { self._attrs.CompareItem(guidkey, value) }
+        )
     }
 
     fn Compare(
@@ -99,25 +117,37 @@ impl IMFAttributes_Impl for VcamActivate_Impl {
         _trace_attr!(
             "Compare",
             std::ptr::null::<GUID>(),
-            format!("attributes_null={} match_type={}", pattributes.is_null(), matchtype.0),
+            format!(
+                "attributes_null={} match_type={}",
+                pattributes.is_null(),
+                matchtype.0
+            ),
             unsafe { self._attrs.Compare(pattributes.ok()?, matchtype) }
         )
     }
 
     fn GetUINT32(&self, guidkey: *const GUID) -> Result<u32> {
-        _trace_attr!("GetUINT32", guidkey, "", unsafe { self._attrs.GetUINT32(guidkey) })
+        _trace_attr!("GetUINT32", guidkey, "", unsafe {
+            self._attrs.GetUINT32(guidkey)
+        })
     }
 
     fn GetUINT64(&self, guidkey: *const GUID) -> Result<u64> {
-        _trace_attr!("GetUINT64", guidkey, "", unsafe { self._attrs.GetUINT64(guidkey) })
+        _trace_attr!("GetUINT64", guidkey, "", unsafe {
+            self._attrs.GetUINT64(guidkey)
+        })
     }
 
     fn GetDouble(&self, guidkey: *const GUID) -> Result<f64> {
-        _trace_attr!("GetDouble", guidkey, "", unsafe { self._attrs.GetDouble(guidkey) })
+        _trace_attr!("GetDouble", guidkey, "", unsafe {
+            self._attrs.GetDouble(guidkey)
+        })
     }
 
     fn GetGUID(&self, guidkey: *const GUID) -> Result<GUID> {
-        _trace_attr!("GetGUID", guidkey, "", unsafe { self._attrs.GetGUID(guidkey) })
+        _trace_attr!("GetGUID", guidkey, "", unsafe {
+            self._attrs.GetGUID(guidkey)
+        })
     }
 
     fn GetStringLength(&self, guidkey: *const GUID) -> Result<u32> {
@@ -136,7 +166,12 @@ impl IMFAttributes_Impl for VcamActivate_Impl {
         _trace_attr!(
             "GetString",
             guidkey,
-            format!("value_null={} buffer_size={} length_null={}", pwszvalue.0.is_null(), cchbufsize, pcchlength.is_null()),
+            format!(
+                "value_null={} buffer_size={} length_null={}",
+                pwszvalue.0.is_null(),
+                cchbufsize,
+                pcchlength.is_null()
+            ),
             {
                 let value = if cchbufsize == 0 {
                     &mut []
@@ -144,7 +179,11 @@ impl IMFAttributes_Impl for VcamActivate_Impl {
                     unsafe { std::slice::from_raw_parts_mut(pwszvalue.0, cchbufsize as usize) }
                 };
                 // pcchlength 是可选出参, NULL 合法。
-                let length = if pcchlength.is_null() { None } else { Some(pcchlength) };
+                let length = if pcchlength.is_null() {
+                    None
+                } else {
+                    Some(pcchlength)
+                };
                 unsafe { self._attrs.GetString(guidkey, value, length) }
             }
         )
@@ -159,13 +198,22 @@ impl IMFAttributes_Impl for VcamActivate_Impl {
         _trace_attr!(
             "GetAllocatedString",
             guidkey,
-            format!("value_out_null={} length_out_null={}", ppwszvalue.is_null(), pcchlength.is_null()),
-            unsafe { self._attrs.GetAllocatedString(guidkey, ppwszvalue, pcchlength) }
+            format!(
+                "value_out_null={} length_out_null={}",
+                ppwszvalue.is_null(),
+                pcchlength.is_null()
+            ),
+            unsafe {
+                self._attrs
+                    .GetAllocatedString(guidkey, ppwszvalue, pcchlength)
+            }
         )
     }
 
     fn GetBlobSize(&self, guidkey: *const GUID) -> Result<u32> {
-        _trace_attr!("GetBlobSize", guidkey, "", unsafe { self._attrs.GetBlobSize(guidkey) })
+        _trace_attr!("GetBlobSize", guidkey, "", unsafe {
+            self._attrs.GetBlobSize(guidkey)
+        })
     }
 
     fn GetBlob(
@@ -178,7 +226,12 @@ impl IMFAttributes_Impl for VcamActivate_Impl {
         _trace_attr!(
             "GetBlob",
             guidkey,
-            format!("buffer_null={} buffer_size={} size_out_null={}", pbuf.is_null(), cbbufsize, pcbblobsize.is_null()),
+            format!(
+                "buffer_null={} buffer_size={} size_out_null={}",
+                pbuf.is_null(),
+                cbbufsize,
+                pcbblobsize.is_null()
+            ),
             {
                 let value = if cbbufsize == 0 {
                     &mut []
@@ -186,7 +239,11 @@ impl IMFAttributes_Impl for VcamActivate_Impl {
                     unsafe { std::slice::from_raw_parts_mut(pbuf, cbbufsize as usize) }
                 };
                 // pcbblobsize 同为可选出参。
-                let size = if pcbblobsize.is_null() { None } else { Some(pcbblobsize) };
+                let size = if pcbblobsize.is_null() {
+                    None
+                } else {
+                    Some(pcbblobsize)
+                };
                 unsafe { self._attrs.GetBlob(guidkey, value, size) }
             }
         )
@@ -201,7 +258,11 @@ impl IMFAttributes_Impl for VcamActivate_Impl {
         _trace_attr!(
             "GetAllocatedBlob",
             guidkey,
-            format!("buffer_out_null={} size_out_null={}", ppbuf.is_null(), pcbsize.is_null()),
+            format!(
+                "buffer_out_null={} size_out_null={}",
+                ppbuf.is_null(),
+                pcbsize.is_null()
+            ),
             unsafe { self._attrs.GetAllocatedBlob(guidkey, ppbuf, pcbsize) }
         )
     }
@@ -229,13 +290,18 @@ impl IMFAttributes_Impl for VcamActivate_Impl {
     }
 
     fn SetItem(&self, guidkey: *const GUID, value: *const PROPVARIANT) -> Result<()> {
-        _trace_attr!("SetItem", guidkey, format!("value_null={}", value.is_null()), unsafe {
-            self._attrs.SetItem(guidkey, value)
-        })
+        _trace_attr!(
+            "SetItem",
+            guidkey,
+            format!("value_null={}", value.is_null()),
+            unsafe { self._attrs.SetItem(guidkey, value) }
+        )
     }
 
     fn DeleteItem(&self, guidkey: *const GUID) -> Result<()> {
-        _trace_attr!("DeleteItem", guidkey, "", unsafe { self._attrs.DeleteItem(guidkey) })
+        _trace_attr!("DeleteItem", guidkey, "", unsafe {
+            self._attrs.DeleteItem(guidkey)
+        })
     }
 
     fn DeleteAllItems(&self) -> Result<()> {
@@ -263,15 +329,21 @@ impl IMFAttributes_Impl for VcamActivate_Impl {
     }
 
     fn SetGUID(&self, guidkey: *const GUID, guidvalue: *const GUID) -> Result<()> {
-        _trace_attr!("SetGUID", guidkey, format!("value={}", _trace_guid(guidvalue)), unsafe {
-            self._attrs.SetGUID(guidkey, guidvalue)
-        })
+        _trace_attr!(
+            "SetGUID",
+            guidkey,
+            format!("value={}", _trace_guid(guidvalue)),
+            unsafe { self._attrs.SetGUID(guidkey, guidvalue) }
+        )
     }
 
     fn SetString(&self, guidkey: *const GUID, wszvalue: &PCWSTR) -> Result<()> {
-        _trace_attr!("SetString", guidkey, format!("value_null={}", wszvalue.0.is_null()), unsafe {
-            self._attrs.SetString(guidkey, *wszvalue)
-        })
+        _trace_attr!(
+            "SetString",
+            guidkey,
+            format!("value_null={}", wszvalue.0.is_null()),
+            unsafe { self._attrs.SetString(guidkey, *wszvalue) }
+        )
     }
 
     fn SetBlob(&self, guidkey: *const GUID, pbuf: *const u8, cbsize: u32) -> Result<()> {
@@ -291,21 +363,30 @@ impl IMFAttributes_Impl for VcamActivate_Impl {
     }
 
     fn SetUnknown(&self, guidkey: *const GUID, punkunknown: Ref<IUnknown>) -> Result<()> {
-        _trace_attr!("SetUnknown", guidkey, format!("unknown_null={}", punkunknown.is_null()), unsafe {
-            self._attrs.SetUnknown(guidkey, punkunknown.ok()?)
-        })
+        _trace_attr!(
+            "SetUnknown",
+            guidkey,
+            format!("unknown_null={}", punkunknown.is_null()),
+            unsafe { self._attrs.SetUnknown(guidkey, punkunknown.ok()?) }
+        )
     }
 
     fn LockStore(&self) -> Result<()> {
-        _trace_attr!("LockStore", std::ptr::null::<GUID>(), "", unsafe { self._attrs.LockStore() })
+        _trace_attr!("LockStore", std::ptr::null::<GUID>(), "", unsafe {
+            self._attrs.LockStore()
+        })
     }
 
     fn UnlockStore(&self) -> Result<()> {
-        _trace_attr!("UnlockStore", std::ptr::null::<GUID>(), "", unsafe { self._attrs.UnlockStore() })
+        _trace_attr!("UnlockStore", std::ptr::null::<GUID>(), "", unsafe {
+            self._attrs.UnlockStore()
+        })
     }
 
     fn GetCount(&self) -> Result<u32> {
-        _trace_attr!("GetCount", std::ptr::null::<GUID>(), "", unsafe { self._attrs.GetCount() })
+        _trace_attr!("GetCount", std::ptr::null::<GUID>(), "", unsafe {
+            self._attrs.GetCount()
+        })
     }
 
     fn GetItemByIndex(
@@ -317,7 +398,12 @@ impl IMFAttributes_Impl for VcamActivate_Impl {
         _trace_attr!(
             "GetItemByIndex",
             std::ptr::null::<GUID>(),
-            format!("index={} key_out_null={} value_out_null={}", unindex, pguidkey.is_null(), pvalue.is_null()),
+            format!(
+                "index={} key_out_null={} value_out_null={}",
+                unindex,
+                pguidkey.is_null(),
+                pvalue.is_null()
+            ),
             {
                 // 同 GetItem: pvalue 可为 NULL(只取键名时)。
                 let value = if pvalue.is_null() { None } else { Some(pvalue) };
@@ -357,7 +443,14 @@ impl IMFActivate_Impl for VcamActivate_Impl {
             unsafe { source.query(riid, ppv).ok() }
         })();
         _trace_result(
-            || format!("IMFActivate::ActivateObject riid={} ppv_null={} cache_hit={}", _trace_guid(riid), ppv.is_null(), cache_hit),
+            || {
+                format!(
+                    "IMFActivate::ActivateObject riid={} ppv_null={} cache_hit={}",
+                    _trace_guid(riid),
+                    ppv.is_null(),
+                    cache_hit
+                )
+            },
             result,
         )
     }
