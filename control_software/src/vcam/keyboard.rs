@@ -13,8 +13,9 @@
 
 use super::VcamState;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::thread::JoinHandle;
 use std::time::Instant;
 
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, WPARAM};
@@ -75,8 +76,37 @@ struct Capture {
     state: Arc<VcamState>,
 }
 
+/// 捕获线程的**唯一所有者**。
+///
+/// ★为什么不能只用一个 `AtomicBool`★: 旧实现 `stop()` 只把标志置 false 就返回, 紧接着的
+/// `start()` 又把它置 true —— 旧线程下一轮循环看到 true 于是继续跑, 新线程也起来了, 两个线程
+/// 各建一个 message-only 窗口、各注册一次 Raw Input, 于是每个按键被计两次(缓冲里全是重复字符)。
+/// 现在由这把互斥体持有 generation + JoinHandle: `stop()` 在**持锁**状态下 join 旧线程,
+/// `start()` 取同一把锁 ⇒ 快速切换开关时不可能出现第二个线程/窗口。
+struct Manager {
+    /// 已分配的最大代号(单调递增, 只用于给线程一个唯一身份)。
+    _generation: u64,
+    /// 当前在跑的线程句柄; None = 没有线程。
+    _worker: Option<JoinHandle<()>>,
+}
+
+static MANAGER: OnceLock<Mutex<Manager>> = OnceLock::new();
+/// 当前**应当运行**的代号; 0 = 应当停止。线程每轮比对自己的代号, 不等即退出。
+static ACTIVE_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+fn manager_lock() -> MutexGuard<'static, Manager> {
+    MANAGER
+        .get_or_init(|| {
+            Mutex::new(Manager {
+                _generation: 0,
+                _worker: None,
+            })
+        })
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 static CAPTURE: OnceLock<Mutex<Capture>> = OnceLock::new();
-static RUNNING: AtomicBool = AtomicBool::new(false);
 /// 目标设备路径(None = 接收所有键盘)。
 static TARGET: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 /// hDevice → 是否接受, 避免每次按键都去查设备名(每击一次注册表/驱动查询太重)。
@@ -518,11 +548,9 @@ fn device_accepted(h_device: HANDLE) -> bool {
     accepted
 }
 
-/// 启动键盘捕获线程(幂等: 已启动则忽略)。传入共享状态用于提交数据。
+/// 启动键盘捕获线程(幂等: 已在跑则只刷新 state 引用)。传入共享状态用于提交数据。
 pub fn start(state: Arc<VcamState>) {
-    if RUNNING.swap(true, Ordering::SeqCst) {
-        return;
-    }
+    let mut manager = manager_lock();
     CAPTURE.get_or_init(|| {
         Mutex::new(Capture {
             buffer: String::new(),
@@ -534,73 +562,107 @@ pub fn start(state: Arc<VcamState>) {
     if let Some(m) = CAPTURE.get() {
         m.lock().unwrap().state = state;
     }
+    // 上一轮线程可能自己退了(建窗/注册失败): 回收它的句柄, 否则这里会误判成"还在跑"而永不重启。
+    if manager
+        ._worker
+        .as_ref()
+        .is_some_and(|worker| worker.is_finished())
+    {
+        if let Some(worker) = manager._worker.take() {
+            let _ = worker.join();
+        }
+        ACTIVE_GENERATION.store(0, Ordering::SeqCst);
+    }
+    if manager._worker.is_some() {
+        return;
+    }
 
-    std::thread::Builder::new()
+    manager._generation += 1;
+    let generation = manager._generation;
+    ACTIVE_GENERATION.store(generation, Ordering::SeqCst);
+    match std::thread::Builder::new()
         .name("vcam-rawinput".into())
-        .spawn(move || unsafe {
-            // Raw Input 必须绑定一个窗口来收 WM_INPUT; 用 message-only 窗口(HWND_MESSAGE),
-            // 无界面、不进任务栏、不抢焦点。
-            let Some(hwnd) = create_sink_window() else {
-                RUNNING.store(false, Ordering::SeqCst);
-                return;
-            };
-            let devices = [RAWINPUTDEVICE {
-                usUsagePage: HID_USAGE_PAGE_GENERIC,
-                usUsage: HID_USAGE_GENERIC_KEYBOARD,
-                dwFlags: RIDEV_INPUTSINK, // 后台也收(扫码时焦点在游戏上)
-                hwndTarget: hwnd,
-            }];
-            if let Err(e) =
-                RegisterRawInputDevices(&devices, std::mem::size_of::<RAWINPUTDEVICE>() as u32)
-            {
-                log::error!("虚拟摄像头: 注册 Raw Input 键盘失败: {:?}", e);
-                let _ = DestroyWindow(hwnd);
-                RUNNING.store(false, Ordering::SeqCst);
-                return;
-            }
-            log::info!(
-                "虚拟摄像头: 键盘捕获已启动(Raw Input, 源={})",
-                target_device().unwrap_or_else(|| "所有键盘".into())
-            );
-
-            let mut msg = MSG::default();
-            while RUNNING.load(Ordering::SeqCst) {
-                while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
-                    let _ = TranslateMessage(&msg);
-                    DispatchMessageW(&msg);
-                }
-                // 停顿超时提交: 缓冲非空且距上次按键超过阈值 → 提交并清空。
-                if let Some(m) = CAPTURE.get() {
-                    let mut cap = m.lock().unwrap();
-                    if !cap.buffer.is_empty() {
-                        let timeout = cap.state.submit_timeout_ms() as u128;
-                        if cap.last_key.elapsed().as_millis() >= timeout {
-                            let data = std::mem::take(&mut cap.buffer);
-                            cap.state.submit_data(&data);
-                        }
-                    }
-                }
-                std::thread::sleep(std::time::Duration::from_millis(20));
-            }
-
-            // 注销: RIDEV_REMOVE 要求 hwndTarget 为空。
-            let remove = [RAWINPUTDEVICE {
-                usUsagePage: HID_USAGE_PAGE_GENERIC,
-                usUsage: HID_USAGE_GENERIC_KEYBOARD,
-                dwFlags: RIDEV_REMOVE,
-                hwndTarget: HWND(std::ptr::null_mut()),
-            }];
-            let _ = RegisterRawInputDevices(&remove, std::mem::size_of::<RAWINPUTDEVICE>() as u32);
-            let _ = DestroyWindow(hwnd);
-            accept_cache().lock().unwrap().clear();
-            log::info!("虚拟摄像头: 键盘捕获已停止");
-        })
-        .ok();
+        .spawn(move || pump(generation))
+    {
+        Ok(worker) => manager._worker = Some(worker),
+        Err(error) => {
+            ACTIVE_GENERATION.store(0, Ordering::SeqCst);
+            log::error!("虚拟摄像头: 无法创建键盘捕获线程: {}", error);
+        }
+    }
 }
 
-/// 停止键盘捕获(下一轮消息泵循环退出并注销 Raw Input)。
+/// 停止键盘捕获: **等旧线程真正注销 Raw Input、销毁窗口并退出**才返回。
+/// 持锁 join 是关键 —— 它让紧随其后的 `start()` 不可能与旧线程并存。
 pub fn stop() {
-    RUNNING.store(false, Ordering::SeqCst);
+    let mut manager = manager_lock();
+    ACTIVE_GENERATION.store(0, Ordering::SeqCst);
+    if let Some(worker) = manager._worker.take() {
+        let _ = worker.join();
+    }
+}
+
+/// 捕获线程主体: 建 message-only 窗口 → 注册 Raw Input → 泵消息 → 注销并销毁窗口。
+/// 只要 `ACTIVE_GENERATION` 不再等于自己的代号就收尾退出。
+fn pump(generation: u64) {
+    let still_mine = || ACTIVE_GENERATION.load(Ordering::SeqCst) == generation;
+    // SAFETY: 窗口、Raw Input 注册与消息泵全在本线程内成对完成; 出口统一注销 + DestroyWindow。
+    unsafe {
+        // Raw Input 必须绑定一个窗口来收 WM_INPUT; 用 message-only 窗口(HWND_MESSAGE),
+        // 无界面、不进任务栏、不抢焦点。
+        let Some(hwnd) = create_sink_window() else {
+            return;
+        };
+        let devices = [RAWINPUTDEVICE {
+            usUsagePage: HID_USAGE_PAGE_GENERIC,
+            usUsage: HID_USAGE_GENERIC_KEYBOARD,
+            dwFlags: RIDEV_INPUTSINK, // 后台也收(扫码时焦点在游戏上)
+            hwndTarget: hwnd,
+        }];
+        if let Err(e) =
+            RegisterRawInputDevices(&devices, std::mem::size_of::<RAWINPUTDEVICE>() as u32)
+        {
+            log::error!("虚拟摄像头: 注册 Raw Input 键盘失败: {:?}", e);
+            let _ = DestroyWindow(hwnd);
+            return;
+        }
+        log::info!(
+            "虚拟摄像头: 键盘捕获已启动(Raw Input, 源={})",
+            target_device().unwrap_or_else(|| "所有键盘".into())
+        );
+
+        let mut msg = MSG::default();
+        while still_mine() {
+            while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                let _ = TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+            // 停顿超时提交: 缓冲非空且距上次按键超过阈值 → 提交并清空。
+            if let Some(m) = CAPTURE.get() {
+                let mut cap = m.lock().unwrap();
+                if !cap.buffer.is_empty() {
+                    let timeout = cap.state.submit_timeout_ms() as u128;
+                    if cap.last_key.elapsed().as_millis() >= timeout {
+                        let data = std::mem::take(&mut cap.buffer);
+                        cap.state.submit_data(&data);
+                    }
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        // 注销: RIDEV_REMOVE 要求 hwndTarget 为空。
+        let remove = [RAWINPUTDEVICE {
+            usUsagePage: HID_USAGE_PAGE_GENERIC,
+            usUsage: HID_USAGE_GENERIC_KEYBOARD,
+            dwFlags: RIDEV_REMOVE,
+            hwndTarget: HWND(std::ptr::null_mut()),
+        }];
+        let _ = RegisterRawInputDevices(&remove, std::mem::size_of::<RAWINPUTDEVICE>() as u32);
+        let _ = DestroyWindow(hwnd);
+        accept_cache().lock().unwrap().clear();
+        log::info!("虚拟摄像头: 键盘捕获已停止");
+    }
 }
 
 /// 创建 message-only 窗口作为 WM_INPUT 接收端。类名重复注册会失败, 直接忽略

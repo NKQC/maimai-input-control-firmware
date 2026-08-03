@@ -103,6 +103,8 @@ public:
     // ms_tick、stage、apply_cmd、apply_last_ms、apply_dirty、setparam_cmd。
     static constexpr uint8_t DEBUG_COUNTER_WORDS = 8;
     bool debug_read_spi_counters(uint32_t out_words[DEBUG_COUNTER_WORDS]);
+    // 运行态带外 SWD 绝对地址批读：单次 attach 后按地址表连续 _read_io，不停核/不复位。
+    bool debug_read_words(const uint32_t* addresses, uint32_t* out_words, uint8_t word_count);
     uint32_t debug_last_status() const { return _dbg_status; }
     uint32_t debug_block_addr() const { return _dbg_block_addr; }
 

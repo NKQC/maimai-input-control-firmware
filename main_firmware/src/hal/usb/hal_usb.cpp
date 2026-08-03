@@ -13,6 +13,7 @@
 #include <hardware/sync.h>
 #include <cstring>
 #include "../../service/usb_debug.h"
+#include "../../protocol/psoc/psoc.h"
 
 
 // ★我们自己发起的 tud_* 端点调用必须与 USB IRQ 互斥★
@@ -346,14 +347,37 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_requ
         return true;
     }
 
-    // 调试读(bRequest=0x50)：经 EP0 返回诊断计数器；0x51=SET_DEBUG 开关(默认关)。
+    // 调试读(bRequest=0x50)：经 EP0 返回计数器前缀及固定 GPIO/HSIOM 尾部；0x51=SET_DEBUG 开关(默认关)。
     if (request->bmRequestType_bit.type == TUSB_REQ_TYPE_VENDOR && request->bRequest == 0x50) {
+        static UsbDebugReport report;
+        static const uint32_t gpio_addresses[16] = {
+            0x40040008u, 0x40040108u, 0x40040208u, 0x40040308u,
+            0x40040408u, 0x40040508u, 0x40040608u, 0x40040708u,
+            0x40020000u, 0x40020100u, 0x40020200u, 0x40020300u,
+            0x40020400u, 0x40020500u, 0x40020600u, 0x40020700u,
+        };
         g_usb_dbg.mounted = tud_mounted() ? 1u : 0u;
         g_usb_dbg.out_busy = usbd_edpt_busy(BOARD_TUD_RHPORT, 0x01) ? 1u : 0u;
         g_usb_dbg.out_stalled = usbd_edpt_stalled(BOARD_TUD_RHPORT, 0x01) ? 1u : 0u;
-        uint16_t len = (uint16_t)sizeof(UsbDebugCounters);
+        const volatile uint8_t* source = reinterpret_cast<const volatile uint8_t*>(&g_usb_dbg);
+        uint8_t* destination = reinterpret_cast<uint8_t*>(&report.counters);
+        for (size_t i = 0; i < sizeof(report.counters); ++i) destination[i] = source[i];
+        report.counters.struct_len = static_cast<uint16_t>(sizeof(report));
+        std::memset(&report.gpio, 0, sizeof(report.gpio));
+        uint32_t gpio_words[16] = {0};
+        const bool gpio_ok = Psoc::getInstance()->psoc_debug_read_words(
+            gpio_addresses, gpio_words, 16u);
+        if (gpio_ok) {
+            for (uint8_t i = 0; i < 8u; ++i) {
+                report.gpio.gpio_pc[i] = gpio_words[i];
+                report.gpio.hsiom_port_sel[i] = gpio_words[8u + i];
+            }
+            report.gpio.read_ok = 1u;
+        }
+        report.gpio.swd_status = Psoc::getInstance()->psoc_debug_status();
+        uint16_t len = static_cast<uint16_t>(sizeof(report));
         if (request->wLength < len) len = request->wLength;
-        return tud_control_xfer(rhport, request, (void*)&g_usb_dbg, len);
+        return tud_control_xfer(rhport, request, &report, len);
     }
     if (request->bmRequestType_bit.type == TUSB_REQ_TYPE_VENDOR && request->bRequest == 0x51) {
         g_usb_dbg.debug_enabled = (request->wValue != 0u) ? 1u : 0u;

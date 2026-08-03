@@ -2,9 +2,11 @@
 // 绑区页 (#6f)
 // ============================================================================
 
-import { GroupBox, VerticalBox, HorizontalBox, SpinBox, ScrollView, Button } from "std-widgets.slint";
+import { VerticalBox, HorizontalBox, SpinBox, ScrollView, Button } from "std-widgets.slint";
 import { ZoneCell } from "../common/types.slint";
 import { Theme } from "../common/theme.slint";
+// 分区一律用 SectionCard: std GroupBox 只画一行标题, 左右两栏的边界看不出来。
+import { GuardedSpinBox, SectionCard } from "../common/widgets.slint";
 
 // 真实 34 区路径画布。所有 Path 共用同一个 SCREEN_FRAME viewbox(见
 // touch_geometry::SCREEN_W/SCREEN_H, 1000x562.5, 16:9)绘制精确 DXF 几何
@@ -172,11 +174,11 @@ component ZoneListRow inherits Rectangle {
             min-width: 54px;
         }
         // 三操作: 更改通道(SpinBox) / 侦听绑定 / 移除
-        SpinBox {
+        GuardedSpinBox {
             width: 72px;
             minimum: 0;
             maximum: 35;
-            value: root.entry.channel >= 0 ? root.entry.channel : 0;
+            model_value: root.entry.channel >= 0 ? root.entry.channel : 0;
             edited(v) => { root.channel_set(v); }
         }
         Button {
@@ -221,7 +223,7 @@ component ZoneList inherits Rectangle {
     }
 }
 
-component BindingDetail inherits GroupBox {
+component BindingDetail inherits SectionCard {
     in property <int> selected_zone: -1;
     in property <string> selected_zone_label: "";
     in property <int> selected_channel: -1;
@@ -253,29 +255,40 @@ component BindingDetail inherits GroupBox {
                     text: @tr("通道:");
                     vertical-alignment: center;
                 }
-                SpinBox {
+                GuardedSpinBox {
+                    width: Theme.spin-width;
+                    horizontal-stretch: 0;
                     minimum: 0;
                     maximum: 35;
-                    value: root.selected_channel >= 0 ? root.selected_channel : 0;
+                    model_value: root.selected_channel >= 0 ? root.selected_channel : 0;
                     edited(v) => { root.channel_set(v); }
                 }
+                Rectangle { horizontal-stretch: 1; }
             }
 
             HorizontalBox {
                 padding: 0px;
-                spacing: 8px;
+                spacing: Theme.gap;
                 Button {
+                    min-width: Theme.button-min-width;
+                    horizontal-stretch: 0;
                     text: @tr("侦听绑定");
                     clicked => { root.touch_start(); }
                 }
                 Button {
+                    min-width: Theme.button-min-width;
+                    horizontal-stretch: 0;
                     text: @tr("取消侦听");
                     clicked => { root.listen_cancel(); }
                 }
                 Button {
+                    min-width: Theme.button-min-width;
+                    horizontal-stretch: 0;
                     text: @tr("清除");
                     clicked => { root.unbind(); }
                 }
+                // 行尾弹性空白: 三个按钮才不会各被摊成一大块(Slint 在全部子项 stretch=0 时平分余量)。
+                Rectangle { horizontal-stretch: 1; }
             }
             Text {
                 text: @tr("侦听绑定：触摸目标分区暂存通道，保存后生效。");
@@ -379,13 +392,13 @@ export component BindingPage inherits Rectangle {
             }
 
             // 右栏: 详情/列表 两个子标签互相切换, 各自占满高度, 不再上下挤占。
-            // ★固定 min-width★: 详情/列表两个 GroupBox 标题长短不同(首选宽度不同), 若不钉死,
+            // ★固定 min-width★: 详情/列表两张分区卡片标题长短不同(首选宽度不同), 若不钉死,
             // 切换子标签时右栏 min-width 跳变 → 与左侧画布的分界随之左右偏移。固定后切换不再抖。
             VerticalBox {
                 padding: 0px;
                 spacing: Theme.gap;
                 horizontal-stretch: 2;
-                // 300px 仍大于"详情"/"列表"两个 GroupBox 各自的首选宽度 → 切子标签不抖(原意保留);
+                // 300px 仍大于"详情"/"列表"两张卡片各自的首选宽度 → 切子标签不抖(原意保留);
                 // 同时把总 min-width 压到 720px 窗口放得下。列表行更宽的部分由其自带 ScrollView 横滚。
                 min-width: 300px;
 
@@ -419,9 +432,11 @@ export component BindingPage inherits Rectangle {
                     unbind() => { root.zone_unbind(root.selected_zone); }
                 }
 
-                if root.right_tab == 1: GroupBox {
-                    // 标题精简(原长标题使该 GroupBox 首选宽度远大于"详情"页, 是切换偏移的主因之一)。
+                if root.right_tab == 1: SectionCard {
+                    // 标题精简(原长标题使该卡片首选宽度远大于"详情"页, 是切换偏移的主因之一)。
                     title: @tr("全部绑定");
+                    // ★这一张要吃满右栏高度★: 里面是 34 行的列表, 需要占据整栏才有滚动余地,
+                    // 故显式覆盖 SectionCard 默认的 vertical-stretch: 0。
                     vertical-stretch: 1;
 
                     ZoneList {

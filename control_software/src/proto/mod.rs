@@ -34,6 +34,7 @@ pub use led::{
 use std::convert::TryFrom;
 pub use telemetry::{
     AutoTuneProgress,
+    BATCH_PARAM_IDS,
     ChannelSample,
     FIELD_BASELINE,
     FIELD_DIFF,
@@ -41,9 +42,14 @@ pub use telemetry::{
     FIELD_RAW,
     FIELD_STATS,
     FIELD_STATUS,
+    // IDAC 增益档 → 每 LSB 电流(pA)真值表 + 按电流升序的档号次序(档号非单调, 见 telemetry.rs)
+    IDAC_GAIN_BY_CURRENT,
+    IDAC_GAIN_PA,
     KNOWN_PARAM_IDS,
     // PARAM_GET_ALL 的"全通道单参数"批量变体(替代 36 条单发)
     PARAM_ALL_CHANNELS,
+    // 通道启用开关(硬件级, 0=电极保持高阻)
+    PARAM_ENABLED,
     PARAM_FINGER_TH,
     PARAM_HYSTERESIS,
     PARAM_IDAC_GAIN,
@@ -56,6 +62,7 @@ pub use telemetry::{
     PARAM_SNS_CLK_DIV,
     PARAM_SNS_CLK_SOURCE,
     ParamFence,
+    ParamScope,
     PsocRescueProgress,
     decode_auto_tune_progress,
     decode_cp_get,
@@ -606,9 +613,8 @@ impl Decoder {
                             let mut device_t_us = None;
                             if (self.header[1] & FLAG_TS) != 0 && payload.len() >= TS_SIZE {
                                 let tail = payload.split_off(payload.len() - TS_SIZE);
-                                device_t_us = Some(u32::from_le_bytes([
-                                    tail[0], tail[1], tail[2], tail[3],
-                                ]));
+                                device_t_us =
+                                    Some(u32::from_le_bytes([tail[0], tail[1], tail[2], tail[3]]));
                             }
                             let frame = Frame {
                                 cmd: self.header[0],

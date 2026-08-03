@@ -68,6 +68,21 @@ struct UsbDebugCounters {
     uint8_t  nv_valid_mask;
 };
 
+// EP0 DEBUG_READ 固定尾部：P0..P7 的 GPIO drive mode(PC) 与 HSIOM PORT_SEL 快照。
+// 旧主机只按返回 report_length 解析前缀；新主机仅在完整尾部存在且 read_ok=1 时采信这些寄存器值。
+struct UsbDebugGpioTail {
+    uint32_t gpio_pc[8];
+    uint32_t hsiom_port_sel[8];
+    uint32_t swd_status;
+    uint8_t read_ok;
+    uint8_t _reserved[3];
+};
+
+struct UsbDebugReport {
+    UsbDebugCounters counters;
+    UsbDebugGpioTail gpio;
+};
+
 /// core0 阶段码, 写入 watchdog scratch[5]。看门狗复位后由 setup() 取出上报。
 enum CrashStage : uint8_t {
     CRASH_STAGE_NONE          = 0,

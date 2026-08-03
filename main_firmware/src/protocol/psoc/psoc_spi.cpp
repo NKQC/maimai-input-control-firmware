@@ -284,10 +284,12 @@ bool PsocSpi::get_stats(uint32_t* out_scan_count, uint8_t* out_busy) {
 }
 
 bool PsocSpi::measure_cp() {
-    // 命令发送后等待并校验 PSoC SPI ACK；实际逐电极测量仍由 PSoC 主循环异步执行。
+    // BIST is a full CSD mode transition. Do not return completion until firmware has restored
+    // normal sensing and dropped GET_STATS.busy; callers can then verify fresh telemetry without XRES.
     uint8_t resp[7];
     if (!_cmd_txn((uint8_t)psoc::Cmd::MEASURE_CP, 0, 0, 0, resp)) return false;
-    return resp[1] == (uint8_t)psoc::Cmd::MEASURE_CP;
+    if (resp[1] != (uint8_t)psoc::Cmd::MEASURE_CP) return false;
+    return _wait_op_done(10000);
 }
 
 bool PsocSpi::get_cp(uint8_t ch, uint32_t* out_cp) {
@@ -313,7 +315,8 @@ void PsocSpi::_restore_touch_response() {
     transfer(tx, discard, sizeof(tx));
 }
 
-bool PsocSpi::_wait_op_done(uint32_t timeout_ms, psoc::AutoTuneProgressFn on_progress, void* progress_ctx) {
+bool PsocSpi::_wait_op_done(uint32_t timeout_ms, psoc::AutoTuneProgressFn on_progress,
+                            void* progress_ctx, uint8_t progress_tag) {
     uint8_t resp[7];
     // 阶段1: 等 busy=1
     absolute_time_t d1 = make_timeout_time_ms(40);
@@ -345,64 +348,128 @@ bool PsocSpi::_wait_op_done(uint32_t timeout_ms, psoc::AutoTuneProgressFn on_pro
             uint8_t pr[7];
             if (_cmd_txn((uint8_t)psoc::Cmd::GET_AUTO_TUNE, 0, 0, 0, pr) &&
                 pr[1] == (uint8_t)psoc::Cmd::GET_AUTO_TUNE) {
-                psoc::AutoTuneProgress p;
-                p.state = 1;
-                p.result = pr[2];
-                p.ch = pr[3];
-                p.cur_div = (uint16_t)((uint16_t)pr[4] | ((uint16_t)pr[5] << 8));
-                p.phase = (uint8_t)(pr[6] & 0x07u);
-                p.step = (uint8_t)((pr[6] >> 3) & 0x1Fu);
-                on_progress(progress_ctx, p);
+                // resp[2] = result(低 2 位) | 本轮请求标签(高 6 位, PSoC 回显)。
+                const uint8_t echo_tag = (uint8_t)((pr[2] >> 2) & psoc::AUTOTUNE_TAG_MASK);
+                // 标签不匹配 = 这是上一轮的进度(命令尚未被 PSoC 收下): 不回吐, 免得把旧阶段当本轮显示。
+                // echo_tag==0 ⇒ 旧 PSoC 固件不带标签, 按原行为放行。
+                if (progress_tag == 0u || echo_tag == 0u || echo_tag == progress_tag) {
+                    psoc::AutoTuneProgress p;
+                    p.state = 1;
+                    p.result = (uint8_t)(pr[2] & psoc::AUTOTUNE_RESULT_MASK);
+                    p.tag = echo_tag;
+                    p.ch = pr[3];
+                    p.cur_div = (uint16_t)((uint16_t)pr[4] | ((uint16_t)pr[5] << 8));
+                    p.phase = (uint8_t)(pr[6] & 0x07u);
+                    p.step = (uint8_t)((pr[6] >> 3) & 0x1Fu);
+                    on_progress(progress_ctx, p);
+                }
             }
         }
         sleep_ms(3);
     }
 }
 
+// 直发重操作命令并确认 PSoC 已受理。
+// ★为什么必须确认(修"点了没反应 / 偶发无数据")★
+// 原实现是 `transfer(cmd)` 一次、不看回显就进 _wait_op_done。而 _wait_op_done 的阶段1 只等 40ms
+// busy 置起, 等不到就**默认"操作可能极快已完成"**落到阶段2, 阶段2 首轮读到 busy=0 立刻返回 true ——
+// 于是"命令在 SPI 上丢了(PSoC 从未收到)"与"已完成"这两件事产生了完全相同的返回值。上位机拿到
+// ACK 却什么也没发生, 而且此后 PSoC 的 TX FIFO 里停着的是别的响应(残帧), read_touch / get_stats
+// 跟着错位。
+// 现在: 与 _cmd_txn 同口径按 cmd 回显收割; 回显被顶掉时先看 busy —— busy 非 0 证明命令确实落了地,
+// 此时**不重发**(重发 AUTO_TUNE 会让 36 通道自适应跑两遍)。收尾以 TOUCH 占位帧取响应, 顺带把
+// PSoC 的默认响应换回实时触控帧, 帧边界与 _cmd_txn 完全一致。
+bool PsocSpi::_send_heavy(uint8_t cmd, uint8_t b2, uint8_t b3, uint8_t b4) {
+    if (!_ready) return false;
+    const bool is_auto_tune = cmd == static_cast<uint8_t>(psoc::Cmd::AUTO_TUNE);
+    const uint8_t wanted_tag = static_cast<uint8_t>(b4 & psoc::AUTOTUNE_TAG_MASK);
+    uint8_t tx[7] = { psoc::FRAME_MAGIC, cmd, b2, b3, b4, 0, 0 };
+    uint8_t tx2[7] = { psoc::FRAME_MAGIC, (uint8_t)psoc::Cmd::TOUCH, 0, 0, 0, 0, 0 };
+    uint8_t resp[7] = {0};
+
+    // AUTO_TUNE 是唯一带请求身份的重操作。不能以 generic busy 证明它已受理：busy 可能属于
+    // 上一条重操作，若本命令丢失则会把旧结果冒充当前请求。只发一次命令；若响应错位，随后只读
+    // GET_AUTO_TUNE 查当前 channel/tag，绝不盲目重发产生第二次自适应。
+    transfer(tx, resp, 7);
+    busy_wait_us_32(PSOC_ISR_FRAME_US);
+    transfer(tx2, resp, 7);
+    if (resp[0] != psoc::FRAME_MAGIC) return false;
+    if (resp[1] == cmd) {
+        if (!is_auto_tune) return true;
+        const uint8_t echo_tag = static_cast<uint8_t>(resp[3] & psoc::AUTOTUNE_TAG_MASK);
+        // 旧固件未实现 tag 时只有「同命令 + 同通道」这一可靠受理回显，允许此唯一兼容退化。
+        if (resp[2] == b2 && (echo_tag == wanted_tag || echo_tag == 0u)) return true;
+    }
+    if (is_auto_tune) {
+        for (uint8_t attempt = 0; attempt < 3; attempt++) {
+            uint8_t status[7] = {0};
+            if (_cmd_txn(static_cast<uint8_t>(psoc::Cmd::GET_AUTO_TUNE), 0, 0, 0, status) &&
+                status[1] == static_cast<uint8_t>(psoc::Cmd::GET_AUTO_TUNE)) {
+                const uint8_t echo_tag = static_cast<uint8_t>((status[2] >> 2) & psoc::AUTOTUNE_TAG_MASK);
+                if (status[3] == b2 && echo_tag == wanted_tag) return true;
+            }
+            sleep_ms(2);
+        }
+        return false;
+    }
+
+    // 其它重操作没有可回显的请求身份，保留既有「busy 表明已在执行」兼容逻辑。
+    for (uint8_t attempt = 0; attempt < 2; attempt++) {
+        uint8_t busy = 0;
+        if (get_stats(nullptr, &busy) && busy != 0u) return true;
+        transfer(tx, resp, 7);
+        busy_wait_us_32(PSOC_ISR_FRAME_US);
+        transfer(tx2, resp, 7);
+        if (resp[0] != psoc::FRAME_MAGIC) return false;
+        if (resp[1] == cmd) return true;
+    }
+    return false;
+}
+
 bool PsocSpi::apply() {
     if (!_ready) return false;
     // 发 APPLY（PSoC 主循环异步重扫/重初始化）；轮询 busy 至真实完成而非盲等固定时间。
-    uint8_t tx[7] = { psoc::FRAME_MAGIC, (uint8_t)psoc::Cmd::APPLY, 0, 0, 0, 0, 0 };
-    uint8_t rx1[7] = {0};
-    transfer(tx, rx1, 7);
+    if (!_send_heavy((uint8_t)psoc::Cmd::APPLY, 0, 0)) return false;
     return _wait_op_done(800);   // 真实完成反馈(重初始化+首扫), 超时上限 800ms
 }
 
-bool PsocSpi::calibrate() {
+bool PsocSpi::calibrate(uint8_t ch) {
     if (!_ready) return false;
-    // CALIBRATE: PSoC 主循环执行 CalibrateAllWidgets(重算 IDAC, 全通道耗时) + 基线复位。
-    uint8_t tx[7] = { psoc::FRAME_MAGIC, (uint8_t)psoc::Cmd::CALIBRATE, 0, 0, 0, 0, 0 };
-    uint8_t rx1[7] = {0};
-    transfer(tx, rx1, 7);
-    return _wait_op_done(1500);  // 全通道 IDAC 校准更慢, 给足真实完成窗口
+    // CALIBRATE: PSoC 主循环逐通道 CalibrateWidget(重算 IDAC) + 基线复位。
+    // ch=0..35 时 PSoC 只做该 widget(约全通道的 1/36) → 窗口收到 500ms; 0xFF 仍给 1500ms。
+    if (!_send_heavy((uint8_t)psoc::Cmd::CALIBRATE, ch, 0)) return false;
+    return _wait_op_done((ch < 36u) ? 500u : 1500u);
 }
 
-bool PsocSpi::baseline_reset() {
+bool PsocSpi::baseline_reset(uint8_t ch) {
     if (!_ready) return false;
-    // BASELINE_RESET: PSoC 主循环执行 InitializeAllBaselines。
-    uint8_t tx[7] = { psoc::FRAME_MAGIC, (uint8_t)psoc::Cmd::BASELINE_RESET, 0, 0, 0, 0, 0 };
-    uint8_t rx1[7] = {0};
-    transfer(tx, rx1, 7);
+    // BASELINE_RESET: 单通道 = InitializeWidgetBaseline(ch), 0xFF = InitializeAllBaselines。
+    if (!_send_heavy((uint8_t)psoc::Cmd::BASELINE_RESET, ch, 0)) return false;
     return _wait_op_done(500);
 }
 
-bool PsocSpi::auto_tune(uint8_t ch, uint8_t pref, uint8_t* out_result, uint16_t* out_div,
+bool PsocSpi::auto_tune(uint8_t ch, uint8_t pref, uint8_t tag, uint8_t* out_result, uint16_t* out_div,
                         psoc::AutoTuneProgressFn on_progress, void* progress_ctx) {
     if (!_ready) return false;
     // 触发自适应: 粗表定位 + 1 步进上探临界 + 按 pref 落档, 每次校准数百 ms → 10s 真实完成窗口。
-    // 字节2 = 目标通道(0..35 单通道 / 0xFF 全通道); 字节3 = 灵敏度档位 1..7(非法值 PSoC 侧退化为 4)。
-    uint8_t tx[7] = { psoc::FRAME_MAGIC, (uint8_t)psoc::Cmd::AUTO_TUNE, ch, pref, 0, 0, 0 };
-    uint8_t rx1[7] = {0};
-    transfer(tx, rx1, 7);
+    // 字节2 = 目标通道(0..35 单通道 / 0xFF 全通道); 字节3 = 灵敏度档位 1..7(非法值 PSoC 侧退化为 4);
+    // 字节4 = 本轮请求标签(6 bit), PSoC 存下并在 GET_AUTO_TUNE 的 result 高 6 位回显。
+    tag = (uint8_t)(tag & psoc::AUTOTUNE_TAG_MASK);
+    if (!_send_heavy((uint8_t)psoc::Cmd::AUTO_TUNE, ch, pref, tag)) return false;
     // 单通道三步算法最坏约 24(粗定位+细搜, 二者互斥性使其不叠满) + 13(落档回退) 次单 widget 校准
     // ≈ 300-650ms。★全通道(0xFF)已改为逐通道各自校准★: 36 × 单通道 ≈ 11-23s(最坏更长) →
     // 窗口放宽到 45s, 且必须小于上位机卡死阈值(csd_diag_tick 3200 tick ≈ 51s), 否则上位机会先误报。
-    if (!_wait_op_done(45000, on_progress, progress_ctx)) return false;   // busy 未在窗口内清 = 超时
-    // 读结果: [magic, GET_AUTO_TUNE, result, ch, div_lo, div_hi, progress]; 完成时 div 为最终分频。
+    if (!_wait_op_done(45000, on_progress, progress_ctx, tag)) return false;   // busy 未在窗口内清 = 超时
+    // 读结果: [magic, GET_AUTO_TUNE, result|tag<<2, ch, div_lo, div_hi, progress]; 完成时 div 为最终分频。
     uint8_t resp[7];
     if (!_cmd_txn((uint8_t)psoc::Cmd::GET_AUTO_TUNE, 0, 0, 0, resp)) return false;
     if (resp[1] != (uint8_t)psoc::Cmd::GET_AUTO_TUNE) return false;
-    if (out_result) *out_result = resp[2];
+    // ★标签校验: 陈旧结果绝不冒充本轮成功★ 本条 AUTO_TUNE 若其实没被 PSoC 收到(SPI 丢帧, 而 busy
+    // 恰好因上一条重操作为 1 让 _wait_op_done 立刻返回), 这里读到的 result/div 属于上一轮。
+    // 标签对不上就当"未完成"返回 false, 由上层如实上报失败(旧 PSoC 固件回显 0 ⇒ 放行, 行为不变)。
+    const uint8_t echo_tag = (uint8_t)((resp[2] >> 2) & psoc::AUTOTUNE_TAG_MASK);
+    if (tag != 0u && echo_tag != 0u && echo_tag != tag) return false;
+    if (out_result) *out_result = (uint8_t)(resp[2] & psoc::AUTOTUNE_RESULT_MASK);
     if (out_div) *out_div = (uint16_t)((uint32_t)resp[4] | ((uint32_t)resp[5] << 8));
     return true;
 }

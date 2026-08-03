@@ -1,6 +1,7 @@
 import { Button, ComboBox, VerticalBox, HorizontalBox, ScrollView, TextEdit } from "std-widgets.slint";
 import { AlgoReportLine, AlgoSettingRow } from "../common/types.slint";
 import { AlgoSettingEditorRow } from "../common/widgets.slint";
+import { Theme } from "../common/theme.slint";
 
 
 // ============================================================================
@@ -52,17 +53,31 @@ export component AlgoPage inherits Rectangle {
             padding: 10px;
             spacing: 8px;
 
-            Text { text: "JIT 触控算法"; color: #e0e6ee; font-size: 16px; }
-            HorizontalBox {
-                spacing: 8px;
-                Button { text: "读取信息"; clicked => { root.algo_refresh(); } }
-                Text { text: "模板:"; color: #b0b8c0; vertical-alignment: center; }
+            Text { text: "JIT 触控算法"; color: Theme.text; font-size: Theme.fs-page; }
+            HorizontalLayout {
+                height: Theme.row-height;
+                spacing: Theme.gap;
+                Button {
+                    min-width: Theme.button-min-width;
+                    horizontal-stretch: 0;
+                    text: "读取信息";
+                    clicked => { root.algo_refresh(); }
+                }
+                Text { text: "模板:"; color: Theme.text-sub; vertical-alignment: center; }
                 tpl_sel := ComboBox {
+                    // 最长选项"纯白灯演示(触摸点亮)": 不给宽度时它会按剩余空间被摊开或被裁。
+                    width: Theme.combo-wide;
+                    horizontal-stretch: 0;
                     model: ["v3.1 HDR 默认", "纯白灯演示(触摸点亮)"];
                     current-index: 0;
                 }
-                Button { text: "加载模板"; clicked => { root.algo_load_template(tpl_sel.current-index); } }
-                Text { text: root.algo_info_text; color: #b0b8c0; wrap: word-wrap; horizontal-stretch: 1; vertical-alignment: center; }
+                Button {
+                    min-width: Theme.button-min-width;
+                    horizontal-stretch: 0;
+                    text: "加载模板";
+                    clicked => { root.algo_load_template(tpl_sel.current-index); }
+                }
+                Text { text: root.algo_info_text; color: Theme.text-sub; overflow: elide; horizontal-stretch: 1; vertical-alignment: center; }
             }
 
             // 右侧三子标签: 原生 / 算法上报 / 可调变量, 明确分界线与顶部工具栏分离。

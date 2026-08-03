@@ -1,122 +1,176 @@
-#include "pch.h"
-#include "Undocumented.h"
-#include "Tools.h"
-#include "EnumNames.h"
-#include "MFTools.h"
-#include "FrameReader.h"
-#include "MediaStream.h"
-#include "MediaSource.h"
-#include "Activator.h"
+// 进程内 COM 服务器入口 + 自注册。
+//
+// 注册做两件事(两者缺一, 摄像头就不会出现在应用的设备列表里):
+//   1. HKCR\CLSID\{clsid}\InprocServer32 → 本 DLL 路径, ThreadingModel=Both;
+//   2. IFilterMapper2::RegisterFilter 把过滤器登记到 CLSID_VideoInputDeviceCategory,
+//      即"视频输入设备"类别, 消费端通过 ICreateDevEnum 枚举该类别得到设备矩。
+// 32 位与 64 位 DLL 各自注册到各自的注册表视图: 64 位应用只看 64 位视图,
+// 32 位应用只看 WOW6432Node 视图, 所以两个位宽都要装。
 
-// b7c5f1a2-3d64-4e8b-9a11-2f6c8d0e4a73: 必须与 control_software/src/vcam/backend.rs 的 _CLSID 一致。
-GUID CLSID_Mai2Vcam = { 0xb7c5f1a2,0x3d64,0x4e8b,{0x9a,0x11,0x2f,0x6c,0x8d,0x0e,0x4a,0x73} };
-HMODULE _hModule;
+#include "vcam_filter.h"
 
-BOOL APIENTRY DllMain(HMODULE hModule, DWORD dwReason, LPVOID lpReserved)
-{
-	switch (dwReason)
-	{
-	case DLL_PROCESS_ATTACH:
-		_hModule = hModule;
-		WinTraceRegister();
-		WINTRACE(L"DllMain DLL_PROCESS_ATTACH '%s'", GetCommandLine());
-		DisableThreadLibraryCalls(hModule);
+#ifndef MERIT_DO_NOT_USE
+#define MERIT_DO_NOT_USE 0x200000
+#endif
 
-		wil::SetResultLoggingCallback([](wil::FailureInfo const& failure) noexcept
-			{
-				wchar_t str[2048];
-				if (SUCCEEDED(wil::GetFailureLogString(str, _countof(str), failure)))
-				{
-					WinTrace(2, 0, str); // 2 => error
-				}
-			});
-		break;
-
-	case DLL_PROCESS_DETACH:
-		WINTRACE(L"DllMain DLL_PROCESS_DETACH '%s'", GetCommandLine());
-		WinTraceUnregister();
-		break;
-	}
-	return TRUE;
+static HRESULT _ClsidText(WCHAR* buffer, int capacity) {
+    return StringFromGUID2(CLSID_Mai2VcamDshow, buffer, capacity) > 0 ? S_OK : E_FAIL;
 }
 
-struct ClassFactory : winrt::implements<ClassFactory, IClassFactory>
-{
-	STDMETHODIMP CreateInstance(IUnknown* outer, GUID const& riid, void** result) noexcept final
-	{
-		RETURN_HR_IF_NULL(E_POINTER, result);
-		*result = nullptr;
-		if (outer)
-			RETURN_HR(CLASS_E_NOAGGREGATION);
-
-		auto vcam = winrt::make_self<Activator>();
-		RETURN_IF_FAILED(vcam->Initialize());
-		auto hr = vcam->QueryInterface(riid, result);
-		if (FAILED(hr))
-		{
-			auto iid = GUID_ToStringW(riid);
-			WINTRACE(L"ClassFactory QueryInterface failed on IID %s", iid.c_str());
-		}
-		return hr;
-	}
-
-	STDMETHODIMP LockServer(BOOL) noexcept final
-	{
-		return S_OK;
-	}
-};
-
-__control_entrypoint(DllExport)
-STDAPI DllCanUnloadNow()
-{
-	if (winrt::get_module_lock())
-	{
-		WINTRACE(L"DllCanUnloadNow S_FALSE");
-		return S_FALSE;
-	}
-
-	winrt::clear_factory_cache();
-	WINTRACE(L"DllCanUnloadNow S_OK");
-	return S_OK;
+static HRESULT _WriteString(HKEY key, const WCHAR* name, const WCHAR* value) {
+    const DWORD bytes = (DWORD)((wcslen(value) + 1) * sizeof(WCHAR));
+    LSTATUS status = RegSetValueExW(key, name, 0, REG_SZ, (const BYTE*)value, bytes);
+    return status == ERROR_SUCCESS ? S_OK : HRESULT_FROM_WIN32(status);
 }
 
-_Check_return_
-STDAPI DllGetClassObject(_In_ REFCLSID rclsid, _In_ REFIID riid, _Outptr_ LPVOID FAR* ppv)
-{
-	WINTRACE(L"DllGetClassObject rclsid:%s riid:%s", GUID_ToStringW(rclsid).c_str(), GUID_ToStringW(riid).c_str());
-	RETURN_HR_IF_NULL(E_POINTER, ppv);
-	*ppv = nullptr;
+static HRESULT _RegisterClsid() {
+    WCHAR clsid[64] = {0};
+    HRESULT hr = _ClsidText(clsid, 64);
+    if (FAILED(hr)) {
+        return hr;
+    }
+    WCHAR module[MAX_PATH] = {0};
+    if (GetModuleFileNameW(g_mai2vcamModule, module, MAX_PATH) == 0) {
+        return HRESULT_FROM_WIN32(GetLastError());
+    }
+    WCHAR path[128] = {0};
+    swprintf_s(path, L"CLSID\\%s", clsid);
 
-	if (rclsid == CLSID_Mai2Vcam)
-		return winrt::make_self<ClassFactory>()->QueryInterface(riid, ppv);
-
-	RETURN_HR(E_NOINTERFACE);
+    HKEY key = nullptr;
+    LSTATUS status = RegCreateKeyExW(HKEY_CLASSES_ROOT, path, 0, nullptr, 0, KEY_WRITE, nullptr,
+                                     &key, nullptr);
+    if (status != ERROR_SUCCESS) {
+        return HRESULT_FROM_WIN32(status);
+    }
+    hr = _WriteString(key, nullptr, MAI2VCAM_FRIENDLY_NAME);
+    HKEY inproc = nullptr;
+    if (SUCCEEDED(hr)) {
+        status = RegCreateKeyExW(key, L"InprocServer32", 0, nullptr, 0, KEY_WRITE, nullptr, &inproc,
+                                 nullptr);
+        hr = status == ERROR_SUCCESS ? S_OK : HRESULT_FROM_WIN32(status);
+    }
+    if (SUCCEEDED(hr)) {
+        hr = _WriteString(inproc, nullptr, module);
+    }
+    if (SUCCEEDED(hr)) {
+        hr = _WriteString(inproc, L"ThreadingModel", L"Both");
+    }
+    if (inproc != nullptr) {
+        RegCloseKey(inproc);
+    }
+    RegCloseKey(key);
+    return hr;
 }
 
-using registry_key = winrt::handle_type<registry_traits>;
-
-STDAPI DllRegisterServer()
-{
-	std::wstring exePath = wil::GetModuleFileNameW(_hModule).get();
-	WINTRACE(L"DllRegisterServer '%s'", exePath.c_str());
-	auto clsid = GUID_ToStringW(CLSID_Mai2Vcam, false);
-	std::wstring path = L"Software\\Classes\\CLSID\\" + clsid + L"\\InprocServer32";
-
-	// note: a vcam *must* be registered in HKEY_LOCAL_MACHINE
-	// for the frame server to be able to talk with it.
-	registry_key key;
-	RETURN_IF_WIN32_ERROR(RegWriteKey(HKEY_LOCAL_MACHINE, path.c_str(), key.put()));
-	RETURN_IF_WIN32_ERROR(RegWriteValue(key.get(), nullptr, exePath));
-	RETURN_IF_WIN32_ERROR(RegWriteValue(key.get(), L"ThreadingModel", L"Both"));
-	return S_OK;
+static void _UnregisterClsid() {
+    WCHAR clsid[64] = {0};
+    if (FAILED(_ClsidText(clsid, 64))) {
+        return;
+    }
+    WCHAR path[128] = {0};
+    swprintf_s(path, L"CLSID\\%s", clsid);
+    HKEY key = nullptr;
+    if (RegOpenKeyExW(HKEY_CLASSES_ROOT, path, 0, KEY_WRITE, &key) == ERROR_SUCCESS) {
+        RegDeleteKeyW(key, L"InprocServer32");
+        RegCloseKey(key);
+    }
+    RegDeleteKeyW(HKEY_CLASSES_ROOT, path);
 }
 
-STDAPI DllUnregisterServer()
-{
-	std::wstring exePath = wil::GetModuleFileNameW(_hModule).get();
-	WINTRACE(L"DllUnregisterServer '%s'", exePath.c_str());
-	auto clsid = GUID_ToStringW(CLSID_Mai2Vcam, false);
-	std::wstring path = L"Software\\Classes\\CLSID\\" + clsid;
-	RETURN_IF_WIN32_ERROR(RegDeleteTree(HKEY_LOCAL_MACHINE, path.c_str()));
-	return S_OK;
+// 过滤器在类别里的登记信息: 单个输出针脚, 只报 NV12。
+static HRESULT _MapperRegister(bool add) {
+    IFilterMapper2* mapper = nullptr;
+    HRESULT hr = CoCreateInstance(CLSID_FilterMapper2, nullptr, CLSCTX_INPROC_SERVER,
+                                  IID_IFilterMapper2, (void**)&mapper);
+    if (FAILED(hr) || mapper == nullptr) {
+        return FAILED(hr) ? hr : E_NOINTERFACE;
+    }
+    if (add) {
+        REGPINTYPES types = {};
+        types.clsMajorType = &MEDIATYPE_Video;
+        types.clsMinorType = &MEDIASUBTYPE_NV12;
+
+        REGFILTERPINS pin = {};
+        pin.strName = const_cast<LPWSTR>(MAI2VCAM_PIN_NAME);
+        pin.bRendered = FALSE;
+        pin.bOutput = TRUE;
+        pin.bZero = FALSE;
+        pin.bMany = FALSE;
+        pin.clsConnectsToFilter = nullptr;
+        pin.strConnectsToPin = nullptr;
+        pin.nMediaTypes = 1;
+        pin.lpMediaType = &types;
+
+        REGFILTER2 filter = {};
+        filter.dwVersion = 1;
+        // 捕获源统一用 MERIT_DO_NOT_USE: 只应被显式枚举选中, 不参与智能连接的自动插入。
+        filter.dwMerit = MERIT_DO_NOT_USE;
+        filter.cPins = 1;
+        filter.rgPins = &pin;
+
+        hr = mapper->RegisterFilter(CLSID_Mai2VcamDshow, MAI2VCAM_FRIENDLY_NAME, nullptr,
+                                    &CLSID_VideoInputDeviceCategory, MAI2VCAM_FRIENDLY_NAME,
+                                    &filter);
+    } else {
+        hr = mapper->UnregisterFilter(&CLSID_VideoInputDeviceCategory, MAI2VCAM_FRIENDLY_NAME,
+                                      CLSID_Mai2VcamDshow);
+    }
+    mapper->Release();
+    return hr;
+}
+
+STDAPI DllGetClassObject(REFCLSID clsid, REFIID riid, void** object) {
+    if (object == nullptr) {
+        return E_POINTER;
+    }
+    *object = nullptr;
+    if (clsid != CLSID_Mai2VcamDshow) {
+        return CLASS_E_CLASSNOTAVAILABLE;
+    }
+    Mai2VcamClassFactory* factory = new Mai2VcamClassFactory();
+    if (factory == nullptr) {
+        return E_OUTOFMEMORY;
+    }
+    HRESULT hr = factory->QueryInterface(riid, object);
+    factory->Release();
+    return hr;
+}
+
+STDAPI DllCanUnloadNow() { return Mai2VcamModuleLocks() == 0 ? S_OK : S_FALSE; }
+
+STDAPI DllRegisterServer() {
+    HRESULT init = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    HRESULT hr = _RegisterClsid();
+    if (SUCCEEDED(hr)) {
+        hr = _MapperRegister(true);
+        if (FAILED(hr)) {
+            // 类别登记失败时不留下"半装"状态。
+            _UnregisterClsid();
+        }
+    }
+    Mai2VcamLog("DllRegisterServer hr=0x%08X", hr);
+    if (SUCCEEDED(init)) {
+        CoUninitialize();
+    }
+    return hr;
+}
+
+STDAPI DllUnregisterServer() {
+    HRESULT init = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    HRESULT hr = _MapperRegister(false);
+    _UnregisterClsid();
+    Mai2VcamLog("DllUnregisterServer hr=0x%08X", hr);
+    if (SUCCEEDED(init)) {
+        CoUninitialize();
+    }
+    // 类别项本来就不存在时不算失败: 卸载必须幂等。
+    return SUCCEEDED(hr) || hr == HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND) ? S_OK : hr;
+}
+
+BOOL WINAPI DllMain(HINSTANCE module, DWORD reason, LPVOID) {
+    if (reason == DLL_PROCESS_ATTACH) {
+        g_mai2vcamModule = module;
+        DisableThreadLibraryCalls(module);
+    }
+    return TRUE;
 }

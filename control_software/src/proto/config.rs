@@ -88,6 +88,20 @@ impl CfgValue {
         }
     }
 
+    /// 数值口径(字符串返回 None)。界面围栏要用设备**自报**的 min/max, 而不是按类型猜
+    /// (U16 猜出 0..65535, 而固件对"触控延迟"只收 0..1000 —— 界面比固件宽就等于放行必被 NAK 的值)。
+    pub fn as_f32(&self) -> Option<f32> {
+        match self {
+            CfgValue::Bool(v) => Some(if *v { 1.0 } else { 0.0 }),
+            CfgValue::I8(v) => Some(*v as f32),
+            CfgValue::U8(v) => Some(*v as f32),
+            CfgValue::U16(v) => Some(*v as f32),
+            CfgValue::U32(v) => Some(*v as f32),
+            CfgValue::F32(v) => Some(*v),
+            CfgValue::Str(_) => None,
+        }
+    }
+
     /// Encode value to bytes (LE), not including type/has_range/key
     fn encode_value(&self, out: &mut Vec<u8>) -> Result<(), String> {
         match self {

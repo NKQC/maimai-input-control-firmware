@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "vcam_source"]
+members = ["."]
 
 [package]
 name = "mai2control-ui"
@@ -26,30 +26,52 @@ nusb = "=0.2.4"
 serialport = "4.9.0"
 slint = "1.17.1"
 zip = { version = "2", default-features = false, features = ["deflate"] }
-# 虚拟摄像头: QR 码生成(纯 Rust, 无 C 依赖)。
+# 虚拟摄像头扫码输出: QR 码生成(纯 Rust, 无 C 依赖)。
 qrcode = { version = "0.14", default-features = false }
+windows-core = "=0.62.2"
 windows = { version = "0.62.2", default-features = false, features = [
     "Win32_Foundation",
     "Win32_Devices_DeviceAndDriverInstallation",
     "Win32_Devices_Properties",
     "Win32_System_Registry",
     "Win32_Security",
+    # 帧共享映射的 SDDL(ConvertStringSecurityDescriptorToSecurityDescriptorW)。
     "Win32_Security_Authorization",
     "Win32_UI_Shell",
+    # selftest --vcam-probe 走真实 COM 路径构造 DirectShow 过滤器(DllGetClassObject →
+    # IClassFactory → IBaseFilter/IMediaFilter), 不经 HKLM 注册。
+    "Win32_System_Com",
+    "Win32_Media_DirectShow",
+    # windows 0.62 把 DirectShow 的 AM_MEDIA_TYPE/IFilterGraph::ConnectDirect 绑定门控在该 feature 下,
+    # 同时也是 CLSID_SystemDeviceEnum/CLSID_VideoInputDeviceCategory 常量的来源。
+    "Win32_Media_MediaFoundation",
+    # selftest --vcam-probe 的系统枚举探针: ICreateDevEnum→IEnumMoniker→IPropertyBag(FriendlyName),
+    # 镜像消费端(OBS/游戏)真实枚举路径, 而不是硬编码 CLSID 直连。
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Ole",
+    "Win32_System_Variant",
     "Win32_System_Threading",
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Input",
     "Win32_UI_Input_KeyboardAndMouse",
     # GetOpenFileNameW/GetSaveFileNameW/OPENFILENAMEW 位于该模块（windows 0.62.2 已核实）。
     "Win32_UI_Controls_Dialogs",
-    "Win32_System_Com",
     "Win32_System_SystemInformation",
     "Win32_System_DataExchange",
     "Win32_System_Memory",
     "Win32_System_LibraryLoader",
-    "Win32_Media_MediaFoundation",
-    "Win32_Media_KernelStreaming",
 ] }
+
+# ★UI 流畅度的决定性开关★ 实测(main.rs 的 [PROF] gap = 16ms 定时器的实际到达间隔):
+# 未优化 dev 构建 gap avg≈140ms(≈7fps, 回调本身只占 4ms ⇒ 时间全在 Slint 渲染里),
+# release 构建 gap avg≈17ms(≈60fps)。日常调试跑的就是 dev 构建, 所以必须给它优化:
+# 依赖(slint/femtovg/rustybuzz/skrifa 等渲染栈)按 3 级优化, 只编一次;
+# 本 crate 用 1 级, 兼顾增量编译速度与可读的调试信息。
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
 
 [build-dependencies]
 slint-build = "1.17.1"

@@ -46,7 +46,7 @@ public:
     bool set_param(uint8_t ch, uint8_t param_id, uint32_t value);
     bool get_param(uint8_t ch, uint8_t param_id, uint32_t* out);
     bool get_raw(uint8_t ch, uint16_t* out);
-    bool measure_cp();                          // 触发逐电极寄生电容测量；返回 true 表示 PSoC SPI ACK 已实际收到
+    bool measure_cp();                          // 触发逐电极寄生电容测量；返回 true 表示 BIST 与固件 CSD 恢复已完成
     bool get_cp(uint8_t ch, uint32_t* out);     // 读指定通道 Cp：测量中=0，成功=fF，失败/未测量=0xFFFFFF
 
     // ---------- JIT 算法引擎：下发/查询(core0→信箱→core1 独占 SPI) ----------
@@ -94,16 +94,21 @@ public:
     uint32_t samples_per_sec() const { return _samples_per_sec; }
     uint32_t scan_period_us() const { return _scan_period_us; }
     bool apply_params();
-    bool calibrate();               // 真正的 IDAC 重校准 + 基线复位
-    bool baseline_reset();          // 仅重置全部通道基线
+    // 真正的 IDAC 重校准 + 基线复位。ch: 0..35=仅该通道(PSoC 只校准该 widget 并只初始化该 widget
+    // 基线), 0xFF=全 36 通道。★通道走 _submit 既有的 ch 字段★, 不新增命令码/不扩帧。
+    bool calibrate(uint8_t ch = 0xFFu);
+    // 基线复位。ch: 0..35=仅该通道, 0xFF=全通道。
+    bool baseline_reset(uint8_t ch = 0xFFu);
     // 频率自适应下探(阻塞至完成, 最多~10s): ch 0..35=单通道 / 0xFF=全通道;
     // pref 灵敏度档位 1..7(越高越灵敏, 落档时往低频多让分频);
-    // out_result 0进行中/1成功/2失败, out_div 最终写入的分频。
-    bool auto_tune(uint8_t ch, uint8_t pref, uint8_t* out_result, uint16_t* out_div);
+    // out_result 0进行中/1成功/2失败, out_div 最终写入的分频;
+    // host_seq = 发起本轮的上位机请求 seq(折成 6 bit 标签下到 PSoC 并回显, 用于识别陈旧结果)。
+    bool auto_tune(uint8_t ch, uint8_t pref, uint8_t host_seq, uint8_t* out_result, uint16_t* out_div);
     // ★异步启动(推荐)★: 入队即返回, core0 不阻塞; 阶段进度经 autotune_status() 读, 由服务层推送上位机。
     // core1 仍在 _exec_cmd 内一次跑完整个自适应(不拆成跨周期状态机), 否则 _spi_service 的 scan_count
     // 卡死兜底会在 PSoC 长校准期间误判并对其硬复位。
-    bool auto_tune_start(uint8_t ch, uint8_t pref);
+    // host_seq = 发起本轮的上位机请求 seq(见 auto_tune 说明), 服务层把它一路带到进度推送里。
+    bool auto_tune_start(uint8_t ch, uint8_t pref, uint8_t host_seq);
     // 本轮请求代号(core0 侧自增): 与 autotune_status().req 不等 ⇒ core1 尚未开始本轮(结果字段仍属上一轮)。
     uint32_t autotune_req() const { return _at_req; }
     psoc::AutoTuneProgress autotune_status() const;   // seqlock 一致读(core1 发布)
@@ -130,6 +135,7 @@ public:
 
     // 运行态带外 SWD 诊断（仅 core0 host 命令路径调用，不经 core1 SPI）。
     bool psoc_debug_counters(uint32_t out[SwdProgrammer::DEBUG_COUNTER_WORDS]);
+    bool psoc_debug_read_words(const uint32_t* addresses, uint32_t* out_words, uint8_t word_count);
     uint32_t psoc_debug_status() const;
     uint32_t psoc_debug_block_addr() const;
 

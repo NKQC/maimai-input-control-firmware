@@ -731,11 +731,16 @@ fn _import_keyboard(
         let mut table: Vec<crate::proto::KbdComboItem> = Vec::new();
         for item in items {
             let obj = _object(item, "keyboard.combo")?;
-            let zone_mask = _number(_required(obj, "zone_mask", "keyboard.combo")?, "zone_mask")? as u64;
-            let modifiers = _number(_required(obj, "modifiers", "keyboard.combo")?, "modifiers")? as u8;
-            let delay_ms = _number(_required(obj, "delay_ms", "keyboard.combo")?, "delay_ms")? as u16;
-            let max_hold_ms =
-                _number(_required(obj, "max_hold_ms", "keyboard.combo")?, "max_hold_ms")? as u16;
+            let zone_mask =
+                _number(_required(obj, "zone_mask", "keyboard.combo")?, "zone_mask")? as u64;
+            let modifiers =
+                _number(_required(obj, "modifiers", "keyboard.combo")?, "modifiers")? as u8;
+            let delay_ms =
+                _number(_required(obj, "delay_ms", "keyboard.combo")?, "delay_ms")? as u16;
+            let max_hold_ms = _number(
+                _required(obj, "max_hold_ms", "keyboard.combo")?,
+                "max_hold_ms",
+            )? as u16;
             let codes = _array(_required(obj, "keycodes", "keyboard.combo")?, "keycodes")?;
             let mut keycodes = [0u8; crate::proto::KBD_COMBO_KEY_COUNT];
             for (slot, raw_code) in keycodes.iter_mut().zip(codes.iter()) {

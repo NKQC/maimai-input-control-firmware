@@ -47,18 +47,23 @@ public:
     // 主循环正在跑 APPLY/CALIBRATE/GLOBAL_COMMIT/AUTO_TUNE 等重操作时为非 0。
     // ★调用方据此区分"主循环卡死"与"主循环正忙"★——重操作期间 scan_count 天然不推进, 不能判为卡死。
     bool get_stats(uint32_t* out_scan_count, uint8_t* out_busy = nullptr);
-    bool measure_cp();                                             // 发送命令并确认 PSoC SPI ACK；测量本身在 PSoC 主循环异步执行
+    bool measure_cp();                                             // 发送命令并等待 BIST 后固件恢复正常 CSD 扫描
     bool get_cp(uint8_t ch, uint32_t* out_cp);                     // 测量中=0，成功=fF，失败/未测量=0xFFFFFF
     bool apply();                                                   // 应用硬件参数(重扫/重校准)
-    bool calibrate();
-    bool baseline_reset();
+    // 真正的 IDAC 重校准 + 基线复位。ch(帧字节2): 0..35=只校准该 widget 并只初始化该 widget 基线,
+    // 0xFF=全 36 通道。单通道用时约为全通道的 1/36, 故超时窗按目标范围分档给。
+    bool calibrate(uint8_t ch = 0xFFu);
+    // 基线复位。ch(帧字节2): 0..35=只初始化该 widget 基线, 0xFF=全通道。
+    bool baseline_reset(uint8_t ch = 0xFFu);
     // 频率自适应下探: 触发后轮询 busy 至完成(逐档升分频重校准, 数秒), 再读结果。
     // ch: 0..35=仅该通道下探(其余通道分频不动), 0xFF=全 36 通道统一(旧行为)。
     // pref: 灵敏度档位 1..7(帧字节3), 越高=在临界频率基础上往低频多让分频(更灵敏)。
     // out_result: 0=进行中/未知 1=成功 2=失败(超硬件能力); out_div: 最终写入的 snsClk 分频。
     // on_progress != nullptr 时, 在阻塞等待中每 ~100ms 顺带读一次 GET_AUTO_TUNE 的阶段进度并回吐
     // (不改 busy 判定与超时行为, 不提高 busy 轮询频率, 避免抢占 PSoC 的 SPI 带宽影响校准)。
-    bool auto_tune(uint8_t ch, uint8_t pref, uint8_t* out_result, uint16_t* out_div,
+    // tag: 本轮请求标签(psoc::autotune_tag_of(上位机请求 seq); 0=不带标签)。PSoC 原样回显 ⇒
+    // 读到的 result/div 若带着别的标签, 那就是上一轮的残留, 一律判失败而不是冒充本轮成功。
+    bool auto_tune(uint8_t ch, uint8_t pref, uint8_t tag, uint8_t* out_result, uint16_t* out_div,
                    psoc::AutoTuneProgressFn on_progress = nullptr, void* progress_ctx = nullptr);
     bool set_mode(uint8_t mode);                                   // 0=自动校准/标准完整处理，1=半自动手动
 
@@ -105,10 +110,16 @@ private:
     // 轮询 GET_STATS 的 busy 字节(resp[2])至 PSoC 主循环真正完成重操作(busy 1→0)或超时。
     // 用于 calibrate/apply/baseline_reset 的真实完成反馈, 替代原固定 sleep 盲等。返回 true=真实完成。
     // on_progress != nullptr 时额外每 PROGRESS_POLL_MS 读一次 AUTO_TUNE 进度回吐(busy 语义不变)。
+    // progress_tag: 本轮请求标签(0=不校验)。回吐进度前先比对 PSoC 回显的标签, 不匹配即不回吐 ——
+    // 否则上一轮的阶段进度会被当成本轮的显示出去。
     bool _wait_op_done(uint32_t timeout_ms, psoc::AutoTuneProgressFn on_progress = nullptr,
-                       void* progress_ctx = nullptr);
+                       void* progress_ctx = nullptr, uint8_t progress_tag = 0u);
     // 把 PSoC 的默认响应换回实时触控帧(流水线收尾)，见 psoc_spi.cpp 实现处说明。
     void _restore_touch_response();
+    // 直发一条"重操作"命令(APPLY/CALIBRATE/BASELINE_RESET/AUTO_TUNE)并**确认 PSoC 真的收到**。
+    // 返回 false = 未受理(调用方直接失败, 不要进 _wait_op_done)。见实现处的残帧/假成功说明。
+    // b4 = 帧字节4(val24 低字节): 目前只有 AUTO_TUNE 用它带请求标签, 其余重操作传 0。
+    bool _send_heavy(uint8_t cmd, uint8_t b2, uint8_t b3, uint8_t b4 = 0u);
     static constexpr uint32_t PROGRESS_POLL_MS = 100;   // 进度读取降频周期(busy 轮询仍为 3ms)
 
     uint8_t _sck_pin;

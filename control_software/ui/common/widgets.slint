@@ -2,7 +2,7 @@
 // 公共可复用组件 (跨页面共享, 不含任何页面业务逻辑)
 // ==========================================================================
 
-import { HorizontalBox, SpinBox, CheckBox, LineEdit } from "std-widgets.slint";
+import { HorizontalBox, SpinBox, CheckBox, LineEdit, ComboBox } from "std-widgets.slint";
 import { ParamRow, AlgoSettingRow } from "types.slint";
 import { Theme } from "theme.slint";
 
@@ -24,12 +24,14 @@ export component CollapsibleSection inherits Rectangle {
     border-color: Theme.border;
     background: Theme.panel;
 
+    // 与 SectionCard 共用同一套卡片度量(内边距/行距/标题行高), 折叠区块与常规分区卡片
+    // 在同一页里并排时才不会一高一矮、一疏一密。
     VerticalLayout {
-        padding: Theme.gap;
-        spacing: Theme.gap;
+        padding: Theme.card-pad;
+        spacing: Theme.card-inner-gap;
 
         Rectangle {
-            height: 24px;
+            height: Theme.card-title-height;
             HorizontalLayout {
                 spacing: Theme.gap;
                 Text {
@@ -77,6 +79,229 @@ export component CollapsibleSection inherits Rectangle {
     }
 }
 
+// ============================================================================
+// 功能分区卡片
+// ----------------------------------------------------------------------------
+// ★为什么不再用 std-widgets 的 GroupBox★ 它只画一行标题文字, 没有底色也没有描边, 于是一页里
+// 五六个功能组看上去就是一串等距的行 —— "这一组从哪开始、到哪结束"完全要靠读文字去推。本组件把
+// 分区做成实体卡片: 底色 + 描边 + 圆角 + 标题左侧一条强调色竖条, 组间距(card-gap)明显大于组内
+// 行距(card-inner-gap), 扫一眼就能数出这一页有几个功能组。
+// 度量全部取自 Theme 的卡片令牌, 与 CollapsibleSection 完全一致(两者常在同一页并排出现)。
+export component SectionCard inherits Rectangle {
+    in property <string> title;
+    // 标题右侧的一行摘要/补充说明(可选), 过长时省略, 不挤走标题。
+    in property <string> subtitle;
+    // 标题竖条颜色。★这是本组件唯一的语义变体入口★: 常规组用默认强调色, "待提交/新建"用
+    // Theme.pick, "危险与恢复"用 Theme.err —— 用一条 3px 竖条区分组的性质, 不必再给每种组
+    // 单独设计一套配色。
+    in property <color> tint: Theme.accent;
+
+    // ★必须 vertical-stretch: 0★ 否则视口比内容高时多余高度会被各卡片平分, 卡片内的表单行随之
+    // 被摊开(行高不再统一)。多余空间统一由页面末尾的弹性占位吸收。
+    vertical-stretch: 0;
+    border-radius: Theme.radius;
+    border-width: 1px;
+    border-color: Theme.border;
+    background: Theme.panel;
+
+    VerticalLayout {
+        padding: Theme.card-pad;
+        spacing: Theme.card-inner-gap;
+
+        HorizontalLayout {
+            height: Theme.card-title-height;
+            spacing: Theme.gap;
+            // 竖条不给 height ⇒ 由布局撑满标题行, 卡片标题行高变化时无需同步改这里。
+            Rectangle {
+                width: 3px;
+                horizontal-stretch: 0;
+                border-radius: 1.5px;
+                background: root.tint;
+            }
+            Text {
+                text: root.title;
+                color: Theme.text-title;
+                font-weight: 700;
+                font-size: Theme.fs-title;
+                vertical-alignment: center;
+                horizontal-stretch: 0;
+            }
+            Text {
+                text: root.subtitle;
+                color: Theme.text-sub;
+                font-size: Theme.fs-small;
+                vertical-alignment: center;
+                horizontal-alignment: right;
+                horizontal-stretch: 1;
+                overflow: elide;
+            }
+        }
+        @children
+    }
+}
+
+// ============================================================================
+// 带焦点守卫的数字输入框
+// ----------------------------------------------------------------------------
+// ★为什么不能直接用 SpinBox + `value: <模型值>`★
+// 那是声明式绑定: 模型值一变就把新值写进部件。而设备真值是**持续回读**的(全局项每次
+// GLOBAL_GET 回来都会 bump 版本 → 回填 → 赋值), 于是用户刚敲进一个字符, 下一次回读就把它冲掉,
+// 光标与编辑态一起丢 —— 用户看到的就是"输入一下就失焦"(实测反馈)。
+// 本组件的规则:
+//   · 外部值只在**本框没有焦点**时同步进来 —— 正在编辑就绝不打扰;
+//   · 失焦那一刻按围栏夹取并回显, 同时抛 `committed` —— 这就是"失焦即按围栏截断并回显";
+//   · 编辑过程中仍逐次抛 `edited`(维持既有"改了就入草稿"的行为, 不改变保存语义)。
+// ★不用声明式 `value:` 绑定★: Slint 里对属性赋一次值就会永久摧毁其上的绑定, 两者混用只会得到
+// "有时能推进来、有时推不进来"的薛定谷行为; 这里统一走 init + changed 显式赋值。
+// ============================================================================
+export component GuardedSpinBox inherits SpinBox {
+    in property <int> model_value: 0;
+    // 失焦时按围栏夹取后的最终值(已在 [minimum, maximum] 内)。
+    callback committed(int);
+    private property <int> _snap;
+
+    init => { self.value = root.model_value; }
+    // 外部真值变化: 只在用户没在编辑本框时才同步。
+    changed model_value => {
+        if (!self.has-focus) { self._apply(root.model_value); }
+    }
+    // 失焦即按围栏夹取并回显, 再抛 committed。
+    changed has-focus => {
+        if (!self.has-focus) {
+            self._apply(self.value);
+            root.committed(self.value);
+        }
+    }
+    // 把目标值写进部件, 并尽力保证内部文本被刷新。
+    // ★为什么要绕一个中间值★ SpinBoxBase 只在 `changed value` 时才回写它私有的 TextInput;
+    // 而用户键入越界数字时 base 的 update-value 会**拒收** ⇒ value 根本没变 ⇒ 文本就一直停在
+    // 那个非法数字上。先落到一个必然不同的值再落到目标值, 制造出一次 value 变化把文本拉回合法显示。
+    function _apply(v: int) {
+        self._snap = v < self.minimum ? self.minimum : (v > self.maximum ? self.maximum : v);
+        if (self.minimum != self.maximum) {
+            self.value = self._snap == self.minimum ? self.maximum : self.minimum;
+        }
+        self.value = self._snap;
+    }
+}
+
+// 带回填守卫的单选框。
+// ★同一处坑的下拉版本★ std-widgets 的 ComboBox 在用户选中时会给自己的 current-index **赋值**,
+// 而 Slint 里一次赋值就永久摧毁该属性上的声明式绑定 ⇒ 用户手选过一次之后, Rust 侧的回填
+// (设备真值 / 撤销草稿 / 断线清值)就再也推不进这个下拉了。故此处不写声明式绑定, 改为
+// init + `changed model_index` 显式写回, 让"下拉 = 当前生效值"不依赖那条会被摧毁的绑定。
+export component GuardedComboBox inherits ComboBox {
+    in property <int> model_index: 0;
+
+    init => { self.current-index = root.model_index; }
+    changed model_index => { self.current-index = root.model_index; }
+}
+
+// 参数说明的"左侧悬浮问号"。
+// ★为什么不用 PopupWindow★ 详解有六七行(协议名/ID/作用域/取值范围/越界处理/说明/影响), 而参数行
+// 住在一个被 clip 的窄列 ScrollView 里, 弹窗在那里必然被裁掉一半。本组件只负责"鼠标进/出时把文本
+// 抛给使用方", 由页面在自己的顶层画一个不受裁切的浮层 —— 位置与宽度归页面管, 组件不假设布局。
+// ★文本内容一律来自 ParamRow.help(= Rust 侧 ParamFence::help_text)★, 这里不拼一个字。
+export component HelpDot inherits Rectangle {
+    in property <string> help;
+    // 移入 → 完整详解; 移出 → 空串(页面据此收起浮层)。
+    callback hovered(string);
+
+    width: root.help == "" ? 0px : 14px;
+    horizontal-stretch: 0;
+    visible: root.help != "";
+
+    // ★不给 root 固定 height, 圆点自己在行内垂直居中★
+    // 原实现把 14px 高度写在 root 上, 于是在 HorizontalBox 里问号被按布局规则贴着行的上沿放,
+    // 与同行 `vertical-alignment: center` 的标签文本错开半行(实测截图)。改成: root 由布局撑满行高,
+    // 圆点按 (行高 - 自身高)/2 居中 —— 这样问号与标签文本永远水平对齐, 且不依赖具体行高取值。
+    dot := Rectangle {
+        width: 14px;
+        height: 14px;
+        y: (parent.height - self.height) / 2;
+        border-radius: 7px;
+        border-width: 1px;
+        border-color: ta.has-hover ? Theme.accent : Theme.border-light;
+        background: ta.has-hover ? Theme.accent : transparent;
+
+        Text {
+            width: 100%;
+            height: 100%;
+            text: "?";
+            font-size: 10px;
+            color: ta.has-hover ? #0d1117 : Theme.text-sub;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+        ta := TouchArea {
+            // ★必须写全限定 MouseCursor.help★: 本组件有一个同名的 `help` 属性, 裸写 `help` 会被解析成
+            // 那个 string 属性 → "Cannot convert string to enum MouseCursor"。
+            mouse-cursor: MouseCursor.help;
+            changed has-hover => { root.hovered(self.has-hover ? root.help : ""); }
+        }
+    }
+}
+
+// 统一表单行: [?] + 固定宽标签列 + 控件槽 + 尾部弹性空白, 可选下方一行灰色说明。
+// ★必须定义在 HelpDot 之后★(Slint 先声明后使用)。
+// ----------------------------------------------------------------------------
+// ★为什么所有带标签的控件行都必须走这一个组件★ 三个实测病灶都出在"每页各写一遍行结构":
+//  ① 标签列宽有的写 width 有的写 min-width ⇒ 长标签把控件推走, 同页各行控件列起点对不齐;
+//  ② 行尾没有弹性空白 ⇒ Slint 在"所有子项 stretch 都是 0"时把多余宽度**平分**给每个子项,
+//     于是一行里的按钮会横跨半屏(如原「捕获当前值→手动」);
+//  ③ 有的行给了 height 有的没给 ⇒ 容器被拉伸时控件跟着纵向摊开, 同页行高参差。
+// 本组件把这三件事各定义一次: label_width 固定、行高固定、末尾常驻一个 stretch 空白。
+// ★使用约定★ 放进控件槽的控件一律写 horizontal-stretch: 0 并给出确定宽度(取 Theme 的宽度分档),
+// 剩余宽度全部归行尾空白。
+export component FormRow inherits VerticalLayout {
+    in property <string> label;
+    // 非空 ⇒ 行首出现悬浮问号(内容与悬浮上抛沿用 HelpDot 的既有语义)。
+    in property <string> help;
+    // 非空 ⇒ 控件下方一行灰色说明, 缩进到控件列, 与标签明确分层。
+    in property <string> hint;
+    // 个别页面的标签更长(或更短), 允许按页覆盖; 同一页内必须取同一个值。
+    in property <length> label_width: Theme.form-label-width;
+    callback help_hovered(string);
+
+    padding: 0px;
+    spacing: 2px;
+    vertical-stretch: 0;
+
+    HorizontalLayout {
+        // 固定行高 = 全页行高一致的唯一来源; 容器被拉伸时本行不参与摊开。
+        height: Theme.row-height;
+        spacing: Theme.gap;
+        // ★用 if 条件实例化而不是 visible★: HelpDot 宽度归零后, 布局的 spacing 仍会留下 6px,
+        // 于是"有问号"和"没问号"两种行的标签起点相差 6px。整块不实例化才真正对齐。
+        if root.help != "": HelpDot {
+            help: root.help;
+            hovered(t) => { root.help_hovered(t); }
+        }
+        Text {
+            text: root.label;
+            width: root.label_width;
+            horizontal-stretch: 0;
+            color: Theme.text-sub;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+        @children
+        // 行尾弹性空白: 吸收整行剩余宽度 —— 控件不被拉伸的根本保证(见组件头注释 ②)。
+        Rectangle { horizontal-stretch: 1; }
+    }
+    if root.hint != "": HorizontalLayout {
+        // 说明缩进到控件列: 它解释的是这一行的控件, 与标签同列会读成又一个标签。
+        padding-left: root.label_width + Theme.gap;
+        Text {
+            text: root.hint;
+            color: Theme.text-dim;
+            font-size: Theme.fs-small;
+            wrap: word-wrap;
+            horizontal-stretch: 1;
+        }
+    }
+}
+
 // 单通道参数编辑行。分辨率等需全通道一致的参数由 Rust 侧统一处理, 不再提供逐行"应用全部"。
 export component ParamEditorRow inherits HorizontalBox {
     in property <ParamRow> entry;
@@ -84,14 +309,23 @@ export component ParamEditorRow inherits HorizontalBox {
     in property <bool> mode_known: false;
     in property <bool> auto_mode: false;
     callback edited(int, int);
+    // "?" 悬浮详解: 原样上抛给页面(见 HelpDot 的注释)。
+    callback help_hovered(string);
 
     padding: 0px;
     spacing: Theme.gap;
     height: Theme.row-height;
 
+    // 左侧问号: 悬浮即给出这一项的完整详解(单位/作用域/取值/越界处理/说明/影响)。
+    HelpDot {
+        help: root.entry.help;
+        hovered(t) => { root.help_hovered(t); }
+    }
     // 标签占剩余宽度并在过窄时省略, 保证 SpinBox 与按钮始终在 360px 参数区内不越界。
+    // 单位就贴在标签后面(取自同一份元数据): 光看"手指阈值 800"看不出 800 是什么量纲。
     Text {
-        text: root.entry.label;
+        text: root.entry.unit == "" ? root.entry.label
+                                   : (root.entry.label + " / " + root.entry.unit);
         horizontal-stretch: 1;
         overflow: elide;
         wrap: no-wrap;
@@ -109,25 +343,48 @@ export component ParamEditorRow inherits HorizontalBox {
     // ★这里不许再按 param_id 写阈值★: 旧实现把 SNS_CLK_SOURCE 上界写死 6, 而设备合法持有 128
     // (0x80 = CapSense AUTO 标志), 于是 UI 把 128 夹成 6, 用户一碰就把 AUTO 标志抹掉下发。
     // 含标志位的参数其区间内存在非法点(如 0x0A 的 7..127), 那些值由 Rust 侧下发前明确拒绝并告知。
-    param_value := SpinBox {
-        visible: root.mode_known && !root.auto_mode;
+    // ★可选值少 / 带 AUTO 的参数一律单选★(见 types.slint::ParamRow.choices)
+    // 单选让用户**填不出**非法值: 时钟源这类参数的 UI 区间里存在大段非法空洞, 数字框拦不住。
+    // 两个控件都常驻, 用 visible + 宽度归零切换, 未启用的那个不占布局宽度。
+    param_choice := GuardedComboBox {
+        visible: root.entry.choices.length > 0 && root.mode_known && !root.auto_mode;
+        width: (root.entry.choices.length > 0 && root.mode_known && !root.auto_mode)
+            ? Theme.spin-width : 0px;
         horizontal-stretch: 0;
-        min-width: Theme.spin-width;
+        model: root.entry.choices;
+        model_index: root.entry.choice_index;
+        selected(_) => {
+            root.edited(root.entry.param_id, root.entry.choice_values[self.current-index]);
+        }
+    }
+    // 设备真值不在合法取值内: 如实说明, 不许假装选中某一项(否则用户以为设备就是这个值)。
+    if root.entry.choices.length > 0 && root.mode_known && !root.auto_mode
+        && root.entry.choice_index < 0: Text {
+        text: "值 " + root.entry.value + " 非法";
+        color: Theme.warn;
+        font-size: Theme.fs-small;
+        vertical-alignment: center;
+    }
+    // ★用 GuardedSpinBox 而非裸 SpinBox★ 两个理由, 都是实测踩过的:
+    // ① 回填必须能推进来: std-widgets 的 SpinBox 是 `value <=> base.value`, 而
+    //    SpinBoxBase.update-value() 对 `root.value` 是**赋值**, Slint 里一次赋值就永久摧毁该属性上
+    //    的声明式绑定 ⇒ 用户编辑过这一行之后 `value: root.entry.value` 便不存在, 此后 Rust 侧
+    //    set_row_data 换 entry 也推不进来; Repeater 又复用行实例(换通道只换 entry 不重建元素),
+    //    于是该行永远停在用户键入的数字 —— 表现为"改一个参数后所有通道都是同一个值"。
+    // ② 回填不能打断编辑: 参数是持续回读的, 无条件重推会在用户敲第二个字符前就把文本冲掉
+    //    (表现为"输入一下就失焦")。故只在本框无焦点时同步, 失焦时按 entry.min/max 夹取回显。
+    param_value := GuardedSpinBox {
+        visible: root.entry.choices.length == 0 && root.mode_known && !root.auto_mode;
+        // ★必须同时收掉占位★: 只 visible:false 仍占布局宽度, 会把单选框挤出参数区。
+        width: root.entry.choices.length == 0 ? Theme.spin-width : 0px;
+        horizontal-stretch: 0;
         minimum: root.entry.min;
         maximum: root.entry.max;
-        value: root.entry.value;
+        model_value: root.entry.value;
         edited(v) => { root.edited(root.entry.param_id, v); }
     }
-    // ★必须显式把真值重推进部件★
-    // std-widgets 的 SpinBox 是 `value <=> base.value`, 而 SpinBoxBase.update-value() 里对
-    // `root.value` 是**赋值**(common/spinbox-base.slint)。Slint 里一次赋值会永久摧毁该属性上
-    // 的声明式绑定 ⇒ 用户编辑过这一行之后, 上面 `value: root.entry.value` 就不存在了, 此后
-    // Rust 侧 set_row_data 换 entry 也推不进来。Repeater 又复用行实例(换通道只换 entry, 不重建
-    // 元素), 于是该参数行永远停在用户键入的数字 —— 表现为"改一个参数后所有通道都是同一个值",
-    // 只有重开 UI(元素重建, 绑定恢复)才好。这里在 entry 变化时手动写回, 让"显示 = 所选通道的
-    // 设备真值(草稿只覆盖同通道同参数)"这条不变量不再依赖那条会被摧毁的绑定。
-    changed entry => { param_value.value = root.entry.value; }
 }
+
 
 // 可调变量编辑行: 0..255(u8), 与 ParamEditorRow 分开(范围不同, 语义是共享算法 cfg 而非 CSD 参数)。
 export component AlgoSettingEditorRow inherits HorizontalBox {
@@ -146,17 +403,16 @@ export component AlgoSettingEditorRow inherits HorizontalBox {
         vertical-alignment: center;
         color: Theme.text-strong;
     }
-    cfg_value := SpinBox {
+    // 与 ParamEditorRow 同一处坑(见其 param_value 注释): 裸 SpinBox 编辑过就丢掉 value 绑定,
+    // 此后设备回读 / 换算法的 cfg 真值再也推不进来; 而无条件重推又会打断正在进行的输入。
+    cfg_value := GuardedSpinBox {
         horizontal-stretch: 0;
         min-width: Theme.spin-width;
         minimum: 0;
         maximum: 255;
-        value: root.entry.value;
+        model_value: root.entry.value;
         edited(v) => { root.edited(root.entry.idx, v); }
     }
-    // 与 ParamEditorRow 同一处坑(见其 changed entry 注释): 编辑过的行会丢掉 value 绑定,
-    // 此后设备回读/换算法的 cfg 真值再也推不进来。
-    changed entry => { cfg_value.value = root.entry.value; }
 }
 
 // 主图里的一条折线。所有线共用同一套 viewbox 视图变换(缩放/平移永不错层), 数据坐标固定 1000x1000。
@@ -333,5 +589,28 @@ export component KeyCaptureBox inherits Rectangle {
         font-size: Theme.fs-small;
         text: root._recording ? @tr("⌨ 录制中") : "";
         color: Theme.accent;
+    }
+}
+
+// 参数详解浮层。★必须由页面放在自己的顶层★(而不是塞在被 clip 的参数列里), 位置与宽度归页面管。
+// text 为空 ⇒ 整块不可见且不占高度, 于是"没悬浮任何问号"时页面布局与从前完全一致。
+export component HelpOverlay inherits Rectangle {
+    in property <string> text;
+
+    visible: root.text != "";
+    height: root.text == "" ? 0px : body.preferred-height + 16px;
+    border-radius: Theme.radius;
+    border-width: 1px;
+    border-color: Theme.accent;
+    background: #0f1b26;
+
+    body := Text {
+        x: 8px;
+        y: 8px;
+        width: parent.width - 16px;
+        text: root.text;
+        color: #cfe6ff;
+        font-size: Theme.fs-small;
+        wrap: word-wrap;
     }
 }

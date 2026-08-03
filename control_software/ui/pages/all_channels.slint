@@ -2,9 +2,17 @@
 // 全通道实时状态页
 // ============================================================================
 
-import { Button, CheckBox, VerticalBox, HorizontalBox, ScrollView, SpinBox } from "std-widgets.slint";
-import { ChannelStatus } from "../common/types.slint";
+import { Button, CheckBox, VerticalBox, HorizontalBox, ScrollView, SpinBox, ComboBox } from "std-widgets.slint";
+import { ChannelStatus, ParamRow } from "../common/types.slint";
 import { Theme } from "../common/theme.slint";
+import { GuardedSpinBox, GuardedComboBox, HelpDot, HelpOverlay } from "../common/widgets.slint";
+
+// 批量应用抽屉的宽度。★只定义一次★: 抽屉自身宽度与"算通道网格列数时要扣掉的宽度"必须是同一个
+// 常量, 两处各写一个数就会出现"展开后右边一列被抽屉盖住"。
+// 取值依据: 抽屉里最宽的一行 = 勾选框 + 参数名 + 控件(下拉取 Theme.combo-width) + 卡片内边距。
+global BatchDrawer {
+    out property <length> width: Theme.combo-width + 172px;
+}
 
 component ChannelStatusCell inherits Rectangle {
     in property <ChannelStatus> entry;
@@ -23,13 +31,18 @@ component ChannelStatusCell inherits Rectangle {
 
     width: 124px;
     height: 90px;
+    // 禁用通道: 整卡压暗到近乎背景色并降低不透明度。★即使用户选了"显示不启用的通道"也照样灰显★
+    // "显示"只决定它是否出现在网格里, 不改变"它此刻不工作"这个事实 —— 让它和正常通道长得一样才是骗人。
+    opacity: root.entry.enabled ? 1.0 : 0.45;
     border-width: (root.selected || root.picked || root.is_source) ? 2px : 1px;
     // 源通道优先着色(它是本次批量应用的数据来源, 必须一眼能找到), 其次勾选态, 再次精调选中态。
-    border-color: root.is_source ? #7cf5a0
-        : (root.picked ? #ffd166 : (root.selected ? #4fc3f7 : touch.has-hover ? #6b8191 : Theme.border-light));
-    background: root.is_source ? #1f3a29
+    border-color: !root.entry.enabled ? #3a4048
+        : (root.is_source ? #7cf5a0
+        : (root.picked ? #ffd166 : (root.selected ? #4fc3f7 : touch.has-hover ? #6b8191 : Theme.border-light)));
+    background: !root.entry.enabled ? #171a1d
+        : (root.is_source ? #1f3a29
         : (root.picked ? #3a3320
-            : (root.selected ? #203b4a : touch.has-hover ? #242c33 : root.entry.active ? #245f35 : #1a1e22));
+            : (root.selected ? #203b4a : touch.has-hover ? #242c33 : root.entry.active ? #245f35 : #1a1e22)));
     border-radius: 5px;
 
     // 源通道角标: 与勾选角标分列左右, 避免两种状态叠在同一位置分不清。
@@ -76,16 +89,22 @@ component ChannelStatusCell inherits Rectangle {
                 min-width: 38px;
             }
             Text {
-                // 停滞优先提示: raw 长时间完全不变疑似异常, 明确标红, 不再让人猜是否真值。
-                text: root.entry.frozen ? @tr("⚠停滞") : (root.entry.active ? @tr("触摸") : @tr("空闲"));
+                // 禁用优先: 它压根不在扫描, "空闲/触摸/停滞"三个字都不适用。
+                // 其次停滞提示: raw 长时间完全不变疑似异常, 明确标红, 不再让人猜是否真值。
+                text: !root.entry.enabled ? @tr("已禁用")
+                    : (root.entry.frozen ? @tr("⚠停滞") : (root.entry.active ? @tr("触摸") : @tr("空闲")));
                 font-size: Theme.fs-small;
-                color: root.entry.frozen ? #ff8c42 : (root.entry.active ? #d0ffd0 : #85929d);
+                color: !root.entry.enabled ? #8a939c
+                    : (root.entry.frozen ? #ff8c42 : (root.entry.active ? #d0ffd0 : #85929d));
             }
         }
         Text {
-            text: "raw " + root.entry.raw + "  diff " + root.entry.diff;
+            // 禁用通道的 raw/diff 恒为 0(设备侧不再扫描它) —— 摆两个 0 会被读成"真的测到 0",
+            // 直接写明"电极高阻"才是它的实际状态。
+            text: !root.entry.enabled ? @tr("电极高阻 · 不参与扫描")
+                : ("raw " + root.entry.raw + "  diff " + root.entry.diff);
             font-size: Theme.fs-normal;
-            color: root.entry.frozen ? #ff8c42 : #c4ccd3;
+            color: !root.entry.enabled ? #77828c : (root.entry.frozen ? #ff8c42 : #c4ccd3);
         }
         Text {
             text: @tr("逻辑区: ") + root.entry.binding_text;
@@ -138,14 +157,18 @@ component ChannelStatusCell inherits Rectangle {
 // 与 RP2040/PSoC 两处固件同源。这里绝不许按 param_id 写死阈值 —— 那会变成第四份围栏, 与固件
 // 必然漂移(widgets.slint 里刚清掉过一份写死 SNS_CLK_SOURCE 上界 6 的实现)。
 component BatchParamRow inherits Rectangle {
-    in property <string> label;
+    // ★与单通道精调共用同一份 ParamRow★(含围栏与单选项)。原先是 names/values/min/max 四条平行数组,
+    // 于是"时钟源该用单选"这件事只在精调页做了、这里漏掉, 界面上同一个参数两种表达、还能填出 12
+    // 这种非法值(实测截图)。共用一个结构就不可能再漏。
+    in property <ParamRow> entry;
     in property <bool> checked: false;
-    // -1 = 面板上尚无值(源通道未回读到该参数且用户也没手填) → 显示"—", 不摆一个假的 0。
-    in property <int> value: -1;
-    in property <int> minimum: 0;
-    in property <int> maximum: 0;
     callback toggled();
     callback value_set(int);
+    // "?" 悬浮详解: 与单通道精调同一份 ParamRow.help, 原样上抛给页面画浮层。
+    callback help_hovered(string);
+    // -1 = 面板上尚无值(源通道未回读到该参数且用户也没手填) → 显示"—", 不摆一个假的 0。
+    property <bool> has_value: root.entry.value >= 0;
+    property <bool> use_choice: root.entry.choices.length > 0;
 
     height: Theme.row-height;
     HorizontalLayout {
@@ -155,17 +178,22 @@ component BatchParamRow inherits Rectangle {
             checked: root.checked;
             toggled => { root.toggled(); }
         }
+        HelpDot {
+            help: root.entry.help;
+            hovered(t) => { root.help_hovered(t); }
+        }
         Text {
-            text: root.label;
+            text: root.entry.unit == "" ? root.entry.label
+                                       : (root.entry.label + " / " + root.entry.unit);
             font-size: Theme.fs-small;
             color: Theme.text-sub;
             vertical-alignment: center;
             horizontal-stretch: 1;
             overflow: elide;
         }
-        // 无值时用"—"占位、数字框隐身(与 widgets.slint::ParamEditorRow 的 AUTO 占位同一手法):
-        // SpinBox 装不下 -1 这个哨兵, 而摆一个 0 会被误读成"该参数真的是 0"。
-        if root.value < 0: Text {
+        // 无值时用"—"占位、编辑控件隐身(与 widgets.slint::ParamEditorRow 的 AUTO 占位同一手法):
+        // 数字框装不下 -1 这个哨兵, 而摆一个 0 会被误读成"该参数真的是 0"。
+        if !root.has_value: Text {
             min-width: Theme.spin-width;
             horizontal-stretch: 0;
             text: "—";
@@ -174,21 +202,30 @@ component BatchParamRow inherits Rectangle {
             horizontal-alignment: center;
             vertical-alignment: center;
         }
-        batch_value := SpinBox {
-            visible: root.value >= 0;
+        // 单选与数字框都常驻, 用 visible + 宽度归零切换, 未启用的那个不占宽度。
+        // 回填/失焦夹取由 Guarded* 自己管(见 widgets.slint), 故这里不再手动重推 ——
+        // 手动重推是无条件的, 会把用户正在键入的内容冲掉。
+        batch_choice := GuardedComboBox {
+            visible: root.has_value && root.use_choice;
+            // 下拉不能用数字框的宽度档: 选项是"IDAC sourcing / 自动(启动电平=抬起)"这类短语,
+            // 按 spin-width(132px) 给会被箭头区吃掉后半截(实测"IDAC sour…")。
+            width: (root.has_value && root.use_choice) ? Theme.combo-width : 0px;
             horizontal-stretch: 0;
-            min-width: Theme.spin-width;
-            minimum: root.minimum;
-            maximum: root.maximum;
-            value: root.value >= root.minimum ? root.value : root.minimum;
+            model: root.entry.choices;
+            model_index: root.entry.choice_index;
+            selected(_) => {
+                root.value_set(root.entry.choice_values[self.current-index]);
+            }
+        }
+        batch_value := GuardedSpinBox {
+            visible: root.has_value && !root.use_choice;
+            width: (root.has_value && !root.use_choice) ? Theme.spin-width : 0px;
+            horizontal-stretch: 0;
+            minimum: root.entry.min;
+            maximum: root.entry.max;
+            model_value: root.entry.value >= root.entry.min ? root.entry.value : root.entry.min;
             edited(v) => { root.value_set(v); }
         }
-    }
-    // ★必须显式把新值重推进部件★: 同 widgets.slint::ParamEditorRow 那个坑 —— SpinBox 内部对
-    // value 是赋值, 用户编辑过一次就永久摧毁了上面那条声明式绑定; 而本行在 Repeater 里被复用
-    // (换源通道只换属性、不重建元素), 不手动写回的话 Rust 侧预填的新值再也推不进来。
-    changed value => {
-        batch_value.value = root.value >= root.minimum ? root.value : root.minimum;
     }
 }
 
@@ -199,15 +236,15 @@ export component AllChannelsPage inherits Rectangle {
     // 勾选状态的真相源在 Rust(AppController::batch_*), 这里只展示与转发事件, 避免两份状态对不上。
     in property <[bool]> batch_ch_selected: [];
     in property <[bool]> batch_param_selected: [];
-    in property <[string]> batch_param_names: [];
-    // 每参数的"待写值"(可手改)。-1 = 面板上尚无值; 上下限唯一来源是 Rust 侧 proto::param_fence。
-    in property <[int]> batch_param_values: [];
-    in property <[int]> batch_param_min: [];
-    in property <[int]> batch_param_max: [];
+    // 每参数一行(名称/待写值/围栏/单选项)。★与单通道精调共用 ParamRow★ ——
+    // 原先拆成 names/values/min/max 四条平行数组, 结果"该用单选"的改动只在精调页落地、这里漏掉。
+    // value = -1 表示面板上尚无值; 围栏与单选项唯一来源是 Rust 侧 proto::param_fence。
+    in property <[ParamRow]> batch_param_rows: [];
     in-out property <bool> batch_drawer_open: false;
     callback batch_toggle_channel(int);
-    callback batch_toggle_param(int);   // 传 param_id(0x01..0x0B)
-    callback batch_param_value_set(int, int);   // param_id(0x01..0x0B), 新值
+    // 传 param_id。清单由 Rust 的 `proto::BATCH_PARAM_IDS` 决定(不含分辨率 0x07: 全局项)。
+    callback batch_toggle_param(int);
+    callback batch_param_value_set(int, int);
     callback batch_channels_all();
     callback batch_channels_invert();
     callback batch_params_all();
@@ -225,9 +262,36 @@ export component AllChannelsPage inherits Rectangle {
     // 探测周期是否有实测值; 停流时来源恒为 0, 无值显示"未测"而不是 0 ms。
     in property <bool> scan_period_valid: false;
 
-    callback telem_start();
-    callback telem_stop();
+    // ★这一页控制的是"数据源"而不是"画面"★
+    // 原先这两个按钮接的是曲线页那对 telem_start/telem_stop —— 而那对的语义早已改成"解冻/冻结绘图
+    // 视窗"(遥测一直在收)。于是这一页写着"开始实时 / 停止", 点下去却只是把曲线页的视窗冻住,
+    // 本页读数照旧在跳: 按钮名与实际行为完全不符。现在本页用独立的采集开关。
+    callback telem_source_start();
+    callback telem_source_stop();
+    // 采集是否已被用户显式停止(真停流, 非画面冻结), 由 Rust 侧 telem_user_paused 回填。
+    in property <bool> telem_paused: false;
     callback channel_selected(int);
+
+    // ---- 排序 / 筛选 ----
+    // ★排序与筛选都在 Rust 侧执行★: channels 这个模型送过来时就已经排好序、筛过了。
+    // 逻辑顺序的唯一真相源是现有绑定映射(AppController::binding_channel_of); 在 Slint 里再复制
+    // 一份"分区→通道"的映射必然与绑定页漂移, 所以这里只上抛用户的选择, 不自己算次序。
+    // 0 = 逻辑通道顺序(按绑定的 A1..E8 排, 未绑定的稳定排在末尾并按物理号升序)
+    // 1 = 物理通道顺序(PSoC channel index 0..35)
+    in-out property <int> channel_sort: 0;
+    // 是否把"未启用"的通道也显示出来(它们仍然灰显)。默认不显示, 让网格只剩真正在工作的通道。
+    in-out property <bool> channel_show_disabled: false;
+    // 当前被筛掉的通道数(由 Rust 回填), 用于在勾选框旁如实说明"少了几个", 不让人对着缺口猜。
+    in property <int> channel_hidden_count: 0;
+
+    // ---- 批量启用 / 禁用(复用同一 PARAM_ENABLED, 不新增协议) ----
+    callback batch_enable_channels();
+    callback batch_disable_channels();
+    // 抽屉从展开 → 收起时通知 Rust 清理本次批量会话(勾选/待写值/源通道)。
+    callback batch_drawer_closed();
+
+    // 批量抽屉里 "?" 悬浮详解的当前文本(空 = 没悬浮在任何问号上)。
+    property <string> help_text: "";
 
     VerticalBox {
         padding: 8px;
@@ -235,23 +299,59 @@ export component AllChannelsPage inherits Rectangle {
 
         HorizontalBox {
             padding: 0px;
-            spacing: 8px;
+            spacing: Theme.gap;
             Button {
-                text: @tr("开始实时");
-                clicked => { root.telem_start(); }
+                min-width: Theme.button-min-width;
+                horizontal-stretch: 0;
+                // 真开采集(重新下发 TELEM_START), 不是"解冻画面"。
+                text: @tr("开始采集");
+                enabled: root.telem_paused;
+                clicked => { root.telem_source_start(); }
             }
             Button {
-                text: @tr("停止");
-                clicked => { root.telem_stop(); }
+                min-width: Theme.button-min-width;
+                horizontal-stretch: 0;
+                // 真停采集: 设备停止推流, 读数/采样率/延迟一并停在最后一帧(如实反映"没数据了")。
+                // 想只把波形停住看一眼请用曲线页的「暂停画面」。
+                text: @tr("停止采集");
+                enabled: !root.telem_paused;
+                clicked => { root.telem_source_stop(); }
             }
             Text {
-                text: @tr("查看 36 通道实时状态；双击卡片进入精调。");
+                text: root.telem_paused ? @tr("■ 采集已停止(读数为最后一帧, 点「开始采集」恢复)")
+                                        : @tr("双击卡片进入精调；单击选中。");
                 vertical-alignment: center;
-                color: #89949e;
+                color: root.telem_paused ? #ff8c42 : #89949e;
+                overflow: elide;
+            }
+            Text {
+                text: @tr("排序");
+                vertical-alignment: center;
+                color: Theme.text-sub;
+            }
+            ComboBox {
+                // 150px 低于 fluent ComboBox 的 160px 下限 ⇒ "逻辑通道顺序"被箭头区压掉尾字。
+                width: Theme.combo-width;
+                horizontal-stretch: 0;
+                model: [@tr("逻辑通道顺序"), @tr("物理通道顺序")];
+                current-index: root.channel_sort;
+                selected => { root.channel_sort = self.current-index; }
+            }
+            CheckBox {
+                text: root.channel_hidden_count > 0
+                    ? (@tr("显示不启用的通道 (") + root.channel_hidden_count + @tr(" 个已隐藏)"))
+                    : @tr("显示不启用的通道");
+                checked: root.channel_show_disabled;
+                toggled => { root.channel_show_disabled = self.checked; }
             }
             Button {
                 text: root.batch_drawer_open ? @tr("收起批量应用 ▶") : @tr("◀ 批量应用参数");
-                clicked => { root.batch_drawer_open = !root.batch_drawer_open; }
+                clicked => {
+                    // 收起前先清理本次批量会话: 勾选态活在 Rust 里, 只把抽屉藏起来的话下次展开会
+                    // 带着上一批勾选出现, 而"应用到已选通道"会照着它执行(写进用户以为没选的通道)。
+                    if (root.batch_drawer_open) { root.batch_drawer_closed(); }
+                    root.batch_drawer_open = !root.batch_drawer_open;
+                }
             }
             Text {
                 // ★固定 min-width (与主页采样/延迟块同口径): 采样率与探测周期每帧刷新, 位数变化会改变
@@ -293,7 +393,7 @@ export component AllChannelsPage inherits Rectangle {
             // 滚动条反馈无关, 因此用它算列数是安全的(减去 VerticalBox 的左右 padding 与滚动条宽度)。
             // 抽屉占据的宽度必须从列数计算里扣掉, 否则展开后右侧几列会被抽屉盖住。
             // drawer_w 是常量(不是抽屉的实际渲染宽度), 所以不会把抽屉尺寸反馈回列数。
-            property <length> drawer_w: root.batch_drawer_open ? 300px : 0px;
+            property <length> drawer_w: root.batch_drawer_open ? BatchDrawer.width : 0px;
             property <float> cols: Math.max(1, Math.floor((root.width - 30px - self.drawer_w) / 130px));
             property <float> rows: Math.ceil(root.channels.length / self.cols);
             viewport-width: self.cols * 130px;
@@ -316,7 +416,7 @@ export component AllChannelsPage inherits Rectangle {
             }
         }
 
-        // 批量应用抽屉: 固定 300px 宽。
+        // 批量应用抽屉: 固定宽 = BatchDrawer.width(与上面算列数用的 drawer_w 同一个常量)。
         // ★必须用 `if` 条件实例化, 不能用 visible★: Slint 的 visible=false 只是不绘制, 元素照样
         // 参与布局求值 —— 收起时即使把 width 置 0, 内部 VerticalBox 累加出来的 min-height 仍会
         // 一路上传到 TabWidget(它会实例化全部 9 个子页), 把整个设置页撑高, 表现为"底部保存栏被顶出
@@ -327,9 +427,9 @@ export component AllChannelsPage inherits Rectangle {
         // 本 Rectangle 有固定 width, 内部子元素才可以绑 parent.width —— 反过来(尺寸由内容反推)
         // 就会形成本工程修过多次的布局环。
         if root.batch_drawer_open : Rectangle {
-            width: 300px;
-            border-radius: 6px;
-            background: #1c2126;
+            width: BatchDrawer.width;
+            border-radius: Theme.radius;
+            background: Theme.panel;
             border-width: 1px;
             border-color: Theme.border-light;
             clip: true;
@@ -363,21 +463,57 @@ export component AllChannelsPage inherits Rectangle {
                     font-size: Theme.fs-small;
                     color: Theme.text-title;
                 }
+                // 抽屉里的三组按钮行都加行尾弹性空白: Slint 在"全部子项 stretch=0"时平分余量,
+                // 没有这块空白时两三个按钮会各被摊成整列宽的巨块(用户反馈的"不够优雅"之一)。
                 HorizontalBox {
                     padding: 0px;
-                    spacing: 6px;
+                    spacing: Theme.gap;
                     Button {
+                        horizontal-stretch: 0;
                         text: @tr("全选");
                         clicked => { root.batch_channels_all(); }
                     }
                     Button {
+                        horizontal-stretch: 0;
                         text: @tr("反选");
                         clicked => { root.batch_channels_invert(); }
                     }
                     Button {
+                        horizontal-stretch: 0;
                         text: @tr("清空");
                         clicked => { root.batch_clear(); }
                     }
+                    Rectangle { horizontal-stretch: 1; }
+                }
+
+                // ---- 批量启用 / 禁用 ----
+                // ★与"批量应用参数"分开成一组★: 参数是调参(要选参数、要填值), 而启用是硬件开关
+                // (只有开/关两种结果)。混进上面那张参数表会让"启用"看着像又一个可复制的数值项。
+                Text {
+                    text: @tr("批量启用 / 禁用（作用于上面已勾选的通道）");
+                    font-size: Theme.fs-small;
+                    color: Theme.text-title;
+                }
+                Text {
+                    text: @tr("禁用是硬件级关闭：该通道的电极持续保持模拟高阻、不再参与扫描，也不再上报数据；整轮扫描周期会相应缩短。走的是与逐通道开关完全相同的草稿路径，需点“保存到设备”才下发。");
+                    font-size: Theme.fs-small;
+                    color: Theme.text-sub;
+                    wrap: word-wrap;
+                }
+                HorizontalBox {
+                    padding: 0px;
+                    spacing: Theme.gap;
+                    Button {
+                        horizontal-stretch: 0;
+                        text: @tr("启用已选");
+                        clicked => { root.batch_enable_channels(); }
+                    }
+                    Button {
+                        horizontal-stretch: 0;
+                        text: @tr("禁用已选");
+                        clicked => { root.batch_disable_channels(); }
+                    }
+                    Rectangle { horizontal-stretch: 1; }
                 }
 
                 Text {
@@ -387,15 +523,18 @@ export component AllChannelsPage inherits Rectangle {
                 }
                 HorizontalBox {
                     padding: 0px;
-                    spacing: 6px;
+                    spacing: Theme.gap;
                     Button {
+                        horizontal-stretch: 0;
                         text: @tr("全选");
                         clicked => { root.batch_params_all(); }
                     }
                     Button {
+                        horizontal-stretch: 0;
                         text: @tr("反选");
                         clicked => { root.batch_params_invert(); }
                     }
+                    Rectangle { horizontal-stretch: 1; }
                 }
 
                 // 参数行按自然高度排布(11 行 × 26px), 整列的滚动由抽屉外层那个 ScrollView 承担。
@@ -403,20 +542,23 @@ export component AllChannelsPage inherits Rectangle {
                 VerticalLayout {
                         padding: 0px;
                         spacing: 1px;
-                        for name[i] in root.batch_param_names: BatchParamRow {
-                            label: name;
+                        for row[i] in root.batch_param_rows: BatchParamRow {
+                            entry: row;
                             checked: i < root.batch_param_selected.length
                                 ? root.batch_param_selected[i] : false;
-                            value: i < root.batch_param_values.length
-                                ? root.batch_param_values[i] : -1;
-                            minimum: i < root.batch_param_min.length
-                                ? root.batch_param_min[i] : 0;
-                            maximum: i < root.batch_param_max.length
-                                ? root.batch_param_max[i] : 0;
-                            // 行下标 i 对应 param_id = i + 1(0x01..0x0B), 与 Rust 侧掩码位序一致。
-                            toggled => { root.batch_toggle_param(i + 1); }
-                            value_set(v) => { root.batch_param_value_set(i + 1, v); }
+                            // ★param_id 只能取自行自身★: 行清单由 Rust 的 `BATCH_PARAM_IDS` 给出
+                            // (分辨率是全局项, 已被剔除), 用 "下标+1" 反推会整列错位一格。
+                            toggled => { root.batch_toggle_param(row.param_id); }
+                            value_set(v) => { root.batch_param_value_set(row.param_id, v); }
+                            help_hovered(t) => { root.help_text = t; }
                         }
+                }
+
+                // 详解浮层就放在参数行下方。★这里不能像曲线页那样浮到页面顶层★: 抽屉是 clip:true
+                // 的 300px 固定宽列, 浮到外面反而会盖住通道网格; 顺着列往下长, 抽屉自身的 ScrollView
+                // 会给出滚动。没悬浮任何问号时高度为 0, 抽屉观感与从前一致。
+                HelpOverlay {
+                    text: root.help_text;
                 }
 
                 Button {

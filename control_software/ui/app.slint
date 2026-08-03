@@ -1,5 +1,5 @@
 import { Button, ComboBox, VerticalBox, HorizontalBox, GroupBox, ListView, CheckBox, SpinBox, LineEdit, ScrollView, TabWidget, TextEdit, Slider } from "std-widgets.slint";
-import { ConfigRow, ZoneCell, ParamRow, GlobalFences, ChannelStatus, AlgoReportLine, LogRow, VcamKbdRow, AlgoSettingRow, LedUnitRow } from "common/types.slint";
+import { ConfigRow, ConfigGroupCount, ZoneCell, ParamRow, GlobalFences, ChannelStatus, AlgoReportLine, LogRow, VcamKbdRow, AlgoSettingRow, LedUnitRow, SpectrumCell } from "common/types.slint";
 import { CollapsibleSection, ParamEditorRow, AlgoSettingEditorRow, PlotPath, BinAmpEditor, SeriesRow } from "common/widgets.slint";
 import { Theme } from "common/theme.slint";
 import { ConfigPage } from "pages/config.slint";
@@ -17,7 +17,7 @@ import { SettingsPage } from "pages/settings.slint";
 import { AboutPage } from "pages/about.slint";
 
 // 供 Rust 侧生成模块使用: 结构体在入口文件再次导出, 保证生成的类型名与位置不变。
-export { ConfigRow, ZoneCell, ParamRow, GlobalFences, ChannelStatus, AlgoReportLine, LogRow, VcamKbdRow, AlgoSettingRow, LedUnitRow }
+export { ConfigRow, ConfigGroupCount, ZoneCell, ParamRow, GlobalFences, ChannelStatus, AlgoReportLine, LogRow, VcamKbdRow, AlgoSettingRow, LedUnitRow, SpectrumCell }
 
 export component AppWindow inherits Window {
     title: "mai2control-ui";
@@ -50,6 +50,8 @@ export component AppWindow inherits Window {
     in property <[ConfigRow]> config_rows: [];
     // 其中未归类("其他"组)的行数, 与 config_rows 同批回填。
     in property <int> config_other_count: 0;
+    // 各分组行数: 空组据此就地自报原因(Slint 没有 filter/count, 数不出来)。
+    in property <[ConfigGroupCount]> config_group_counts: [];
 
     // 绑区页数据(几何绘制版,由 main.rs::build_zone_cells 回填,每 tick 刷新
     // 以支持触摸实时高亮)
@@ -107,18 +109,26 @@ export component AppWindow inherits Window {
     in-out property <bool> curve_params_expanded: true;
     in-out property <bool> curve_algo_cfg_expanded: false;
     in-out property <bool> curve_series_expanded: true;
+    // 响应噪声频谱(增益档 0..6 × 分频 1..64)。★默认收起★: 它是一次改写本通道 gain/div、
+    // 逐点重校准 448 次的重操作, 不该在打开页面时就挡在眼前。折叠态同样放这里, 切页不丢。
+    in-out property <bool> curve_spectrum_expanded: false;
+    in property <[SpectrumCell]> curve_spectrum_cells: [];
+    in property <bool> curve_spectrum_active: false;
+    in property <string> curve_spectrum_status: "";
+    in property <float> curve_spectrum_progress: 0;
+    callback curve_spectrum_start();
+    callback curve_spectrum_cancel();
+    // 绘图视窗是否冻结("停止" = 只冻画面, 遥测仍在收)。
+    in property <bool> plot_frozen: false;
 
     // 全通道实时状态页数据(由 main.rs 每 tick 从 telem_latest 构建)
     in property <[ChannelStatus]> all_channels: [];
     // 全通道页"批量应用"抽屉: 勾选态真相源在 AppController, 走 batch_sel_version 门控回填。
     in property <[bool]> batch_ch_selected: [];
     in property <[bool]> batch_param_selected: [];
-    in property <[string]> batch_param_names: [];
+    in property <[ParamRow]> batch_param_rows: [];
     // ★可手改的"待写值"一列★: -1 = 面板上尚无值(源通道未回读且未手填)。围栏上下限随行下发,
     // 唯一来源是 Rust 侧 proto::telemetry::param_fence(与两处固件同源), .slint 不写第四份。
-    in property <[int]> batch_param_values: [];
-    in property <[int]> batch_param_min: [];
-    in property <[int]> batch_param_max: [];
     callback batch_toggle_channel(int);
     callback batch_toggle_param(int);
     callback batch_param_value_set(int, int);   // param_id(0x01..0x0B), 新值
@@ -130,6 +140,24 @@ export component AppWindow inherits Window {
     callback batch_apply(int);
     callback batch_set_source(int);
     in property <int> batch_source: 0;
+    // 批量启用/禁用(复用 PARAM_ENABLED=0x0C) + 抽屉收起时的会话清理。
+    callback batch_enable_channels();
+    callback batch_disable_channels();
+    callback batch_drawer_closed();
+    // 全通道页排序/筛选: 真正的排序与筛选在 Rust 侧做(逻辑顺序的唯一真相源是绑定映射),
+    // 这两个属性只是把用户的选择传下去; channel_hidden_count 由 Rust 回填被筛掉的通道数。
+    in-out property <int> channel_sort: 0;
+    in-out property <bool> channel_show_disabled: false;
+    in property <int> channel_hidden_count: 0;
+    // ★采集开关与"画面冻结"是两件事★: 本对回调真正 停/开 设备遥测流(全通道页的按钮),
+    // 而 plot_resume/plot_freeze 现在只管曲线页的绘图视窗冻结/解冻。
+    callback telem_source_start();
+    callback telem_source_stop();
+    in property <bool> telem_paused: false;
+    // 单通道精调页(曲线页)的通道启用开关: 与全通道页卡片、批量启停共用 PARAM_ENABLED=0x0C,
+    // 由 Rust 侧按 sel_channel 回填/写入, 关闭后该页的校准/基线/频谱/参数编辑一并锁定。
+    in property <bool> curve_ch_enabled: true;
+    callback curve_ch_enable_set(bool);
     // 触控组合映射(多分区 → 多键)
     in property <[string]> combo_zones_text: [];
     in property <[string]> combo_keys_text: [];
@@ -264,6 +292,15 @@ export component AppWindow inherits Window {
     in property <bool> op_busy: false;
     in property <string> op_label: "";
     in property <string> auto_tune_status: "";
+    // 全通道操作的 host 侧串行队列(逐通道校准/基线/频率自适应)状态。上面那三个 callback 现在都
+    // 落到这条队列上(而不是让固件自己 for 36 遍), 于是三者共用同一份进度/取消/状态文案。
+    in property <bool> batch_op_active: false;
+    in property <float> batch_op_progress: 0;
+    in property <string> batch_op_status: "";
+    callback batch_op_cancel();
+    // "Cp 辅助": 逐通道自适应按实测 Cp 推每通道的增益档/频率偏好档。
+    in property <bool> cp_assist: false;
+    callback set_cp_assist(bool);
     // 延迟测量开关(Phase 2 前先接 no-op)
     callback latency_measure_toggled(bool);
     // 触控键盘映射开关 → CFG_SET(comm.keyboard_map_en)
@@ -348,8 +385,8 @@ export component AppWindow inherits Window {
     callback light_brightness_set(int);
 
     // 曲线页回调 (#6g-2,透传给内部 CurvesPage 实例)
-    callback telem_start();
-    callback telem_stop();
+    callback plot_resume();
+    callback plot_freeze();
     callback curve_calibrate();
     callback curve_baseline_reset();
     callback curve_measure_cp();
@@ -397,9 +434,16 @@ export component AppWindow inherits Window {
     in property <int> csd_sns_clk_div_max: 0;
     in property <int> csd_resolution: 0;
     in property <int> csd_sns_clk_source: 0;
+    // 时钟源单选项(文本/下发值/当前下标)由 Rust 侧 ParamFence::ui_choices() 派生, 界面不自造标签。
+    in property <[string]> csd_clk_labels: [];
+    in property <[int]> csd_clk_values: [];
+    in property <int> csd_clk_index: -1;
     // 异常采样标识 + 下一步动作指引(0=正常 1=警告 2=异常)。
     in property <string> sampling_advice: "";
     in property <int> sampling_advice_level: 0;
+    // Cp 测量失败的通道列表(形如 "CH0 CH5"), 空串 = 无失败。★唯一判据是设备回读 0x00FFFFFF★,
+    // 不从接法/railed/采样率反推。
+    in property <string> cp_failed_channels: "";
     callback psoc_rescue();               // PSoC 救砖: SWD 强制重刷 PSoC + 重新下发算法/CSD
     callback algo_refresh();
     callback algo_reset_default();
@@ -433,6 +477,9 @@ export component AppWindow inherits Window {
     callback restart_as_admin();
     in property <string> vcam_install_status: "未安装";
     in property <string> vcam_runtime_status: "未运行";
+    // 部署(安装/卸载)是否在进行中: 两者改同一批注册表键与文件, 只能有一个在跑,
+    // 故用**同一个**属性同时禁掉两个按钮(单一真值, 不给两个按钮各来一个标志)。
+    in property <bool> vcam_deploy_busy: false;
     // 输入源设备树(组头 + 设备项), 由 Rust 侧按分类展平后填充。
     in property <[VcamKbdRow]> vcam_kbd_rows;
     in property <int> vcam_device_index: 0;
@@ -625,6 +672,7 @@ export component AppWindow inherits Window {
                 save_pending: root.save_pending;
                 config_rows: root.config_rows;
                 config_other_count: root.config_other_count;
+                config_group_counts: root.config_group_counts;
                 config_dirty: root.config_dirty;
                 config_dirty_count: root.config_dirty_count;
                 mode_change_needs_reboot: root.mode_change_needs_reboot;
@@ -654,6 +702,12 @@ export component AppWindow inherits Window {
                 op_busy: root.op_busy;
                 op_label: root.op_label;
                 auto_tune_status: root.auto_tune_status;
+                batch_op_active: root.batch_op_active;
+                batch_op_progress: root.batch_op_progress;
+                batch_op_status: root.batch_op_status;
+                batch_op_cancel() => { root.batch_op_cancel(); }
+                cp_assist: root.cp_assist;
+                set_cp_assist(on) => { root.set_cp_assist(on); }
 
                 zones: root.zones;
                 bind_status: root.bind_status;
@@ -733,8 +787,8 @@ export component AppWindow inherits Window {
                 active_point_count: root.active_point_count;
                 show_active <=> root.show_active;
                 show_algo_overlay <=> root.show_algo_overlay;
-                telem_start() => { root.telem_start(); }
-                telem_stop() => { root.telem_stop(); }
+                plot_resume() => { root.plot_resume(); }
+                plot_freeze() => { root.plot_freeze(); }
                 curve_calibrate() => { root.curve_calibrate(); }
                 curve_baseline_reset() => { root.curve_baseline_reset(); }
                 curve_measure_cp() => { root.curve_measure_cp(); }
@@ -748,6 +802,14 @@ export component AppWindow inherits Window {
                 curve_params_expanded <=> root.curve_params_expanded;
                 curve_algo_cfg_expanded <=> root.curve_algo_cfg_expanded;
                 curve_series_expanded <=> root.curve_series_expanded;
+                curve_spectrum_expanded <=> root.curve_spectrum_expanded;
+                curve_spectrum_cells: root.curve_spectrum_cells;
+                curve_spectrum_active: root.curve_spectrum_active;
+                curve_spectrum_status: root.curve_spectrum_status;
+                curve_spectrum_progress: root.curve_spectrum_progress;
+                curve_spectrum_start() => { root.curve_spectrum_start(); }
+                curve_spectrum_cancel() => { root.curve_spectrum_cancel(); }
+                plot_frozen: root.plot_frozen;
                 report_norm_set(idx, v) => { root.report_norm_set(idx, v); }
                 threshold_set(pid, v) => { root.threshold_set(pid, v); }
                 curve_param_edited(pid, v) => { root.curve_param_edited(pid, v); }
@@ -758,10 +820,7 @@ export component AppWindow inherits Window {
                 all_channels: root.all_channels;
                 batch_ch_selected: root.batch_ch_selected;
                 batch_param_selected: root.batch_param_selected;
-                batch_param_names: root.batch_param_names;
-                batch_param_values: root.batch_param_values;
-                batch_param_min: root.batch_param_min;
-                batch_param_max: root.batch_param_max;
+                batch_param_rows: root.batch_param_rows;
                 batch_toggle_channel(ch) => { root.batch_toggle_channel(ch); }
                 batch_toggle_param(id) => { root.batch_toggle_param(id); }
                 batch_param_value_set(id, v) => { root.batch_param_value_set(id, v); }
@@ -773,6 +832,17 @@ export component AppWindow inherits Window {
                 batch_apply(src) => { root.batch_apply(src); }
                 batch_set_source(ch) => { root.batch_set_source(ch); }
                 batch_source: root.batch_source;
+                batch_enable_channels() => { root.batch_enable_channels(); }
+                batch_disable_channels() => { root.batch_disable_channels(); }
+                batch_drawer_closed() => { root.batch_drawer_closed(); }
+                channel_sort <=> root.channel_sort;
+                channel_show_disabled <=> root.channel_show_disabled;
+                channel_hidden_count: root.channel_hidden_count;
+                telem_source_start() => { root.telem_source_start(); }
+                telem_source_stop() => { root.telem_source_stop(); }
+                telem_paused: root.telem_paused;
+                curve_ch_enabled: root.curve_ch_enabled;
+                curve_ch_enable_set(on) => { root.curve_ch_enable_set(on); }
                 combo_zones_text: root.combo_zones_text;
                 combo_keys_text: root.combo_keys_text;
                 combo_delay: root.combo_delay;
@@ -872,8 +942,12 @@ export component AppWindow inherits Window {
                 csd_sns_clk_div_max: root.csd_sns_clk_div_max;
                 csd_resolution: root.csd_resolution;
                 csd_sns_clk_source: root.csd_sns_clk_source;
+                csd_clk_labels: root.csd_clk_labels;
+                csd_clk_values: root.csd_clk_values;
+                csd_clk_index: root.csd_clk_index;
                 sampling_advice: root.sampling_advice;
                 sampling_advice_level: root.sampling_advice_level;
+                cp_failed_channels: root.cp_failed_channels;
                 psoc_rescue() => { root.psoc_rescue(); }
                 algo_asm_bytes: root.algo_asm_bytes;
                 algo_asm_capacity: root.algo_asm_capacity;
@@ -910,6 +984,7 @@ export component AppWindow inherits Window {
                 restart_as_admin() => { root.restart_as_admin(); }
                 vcam_install_status: root.vcam_install_status;
                 vcam_runtime_status: root.vcam_runtime_status;
+                vcam_deploy_busy: root.vcam_deploy_busy;
                 vcam_kbd_rows: root.vcam_kbd_rows;
                 vcam_device_index: root.vcam_device_index;
                 set_vcam_enabled(v) => { root.set_vcam_enabled(v); }

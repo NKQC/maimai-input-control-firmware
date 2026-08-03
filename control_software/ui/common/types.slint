@@ -28,6 +28,14 @@ export struct ConfigRow {
     range_hex: string,
 }
 
+// 每个分组实际有多少行。★为什么必须由 Rust 回填★: Slint 没有 filter/count, 组件内部数不出
+// "属于本组的行数", 于是"本组 0 行"就只能表现为一片空白 —— 空白说不出是"没取到配置""归组名对不上"
+// 还是"页面没接上数据源"。有了这个计数, 每个组都能就地给出明确原因, 而不是让用户对着空白猜。
+export struct ConfigGroupCount {
+    group: string,
+    count: int,
+}
+
 // 一个绑区槽位的展平数据,由 main.rs::build_zone_cells 从
 // AppController::binding_channel_of()/telem_latest() 转换而来。34 个
 // (index 0..33)。ring: 分组标签("A".."E"),沿用既有分组约定。
@@ -66,6 +74,35 @@ export struct ParamRow {
     value: int,
     min: int,
     max: int,
+    // ★单选项(非空 ⇒ 用单选而不是数字框)★ 由 Rust 侧 `ParamFence::ui_choices()` 填充。
+    // 凡带 AUTO 标志位、取值离散、或可选值少于 16 的参数一律走这条路:
+    // 数字框在这些参数上必然让用户填出非法值(SNS_CLK_SOURCE 的 UI 区间 0..134 里 7..127 全是空洞),
+    // 而"128 = AUTO"这种编码更不该让用户去背。choice_values[i] 是第 i 项实际下发的值。
+    choices: [string],
+    choice_values: [int],
+    // 设备真值对应的下标; -1 = 设备当前值不在合法取值内(界面必须如实说明, 不许假装选中某项)。
+    choice_index: int,
+    // ★参数元数据(与围栏同源)★ 由 Rust 侧 `ParamFence` 的 unit / help_text() 填充。
+    // unit = 计量单位(无量纲则空串), 显示在标签后面; help = "?" 悬浮时展示的完整详解
+    // (含协议名/ID/作用域/取值范围/越界处理/说明/影响范围, 由 Rust 一处拼好)。
+    // ★不许在 .slint 里按 param_id 写说明文案★: 那就是第二份元数据, 与围栏一样必然漂移。
+    unit: string,
+    help: string,
+}
+
+// 响应噪声频谱的一个格子(main.rs::build_spectrum_cells 从 AppController::noise_sweep_cells 转换)。
+// gain 0..6, div 1..64; std/pp 为该点实测 RAW 标准差与峰峰值(ADC 计数)。
+// norm = std 在本次扫描全部有效格中的归一化位置(0..1), 供热图上色 —— ★归一化在 Rust 侧算★,
+// Slint 数不出"全部格子的最大值"。railed = 该点 RAW 撞顶/贴底, 其"低噪声"是假象, 必须区别标注。
+export struct SpectrumCell {
+    gain: int,
+    div: int,
+    std: float,
+    pp: float,
+    norm: float,
+    valid: bool,
+    railed: bool,
+    tint: color,
 }
 
 // 全局项(GPARAM_*)的数字输入围栏, 由 main.rs::build_global_fences 从 Rust 侧单一声明表
@@ -101,6 +138,12 @@ export struct ChannelStatus {
     // 数据停滞标记: raw 长时间逐帧完全不变(设备仍在出帧) → 疑似该通道扫描/测量卡死或链路停滞
     // 非真实恒定读数。UI 明确标红提示, 杜绝"是真值还是卡住"的忙猜。
     frozen: bool,
+    // 通道启用开关(PARAM_ENABLED=0x0C, 草稿优先)。false = 该通道的电极保持模拟高阻、不参与扫描,
+    // 读数恒为 0 且不会触发。UI 据此整卡灰显并禁掉一切对它无意义的操作。
+    enabled: bool,
+    // 展示次序里的位次(0 起)。★排序在 Rust 侧做★: 逻辑顺序的唯一真相源是现有绑定映射
+    // (AppController::binding_channel_of), 在 Slint 里复制一份映射必然与绑定页漂移。
+    order: int,
 }
 
 // 算法上报变量折线(main.rs::build_algo_trace_view 回填): idx 对应 io->report[idx](0..3),

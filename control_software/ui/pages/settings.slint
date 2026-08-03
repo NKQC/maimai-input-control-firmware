@@ -1,5 +1,5 @@
 import { Button, VerticalBox, HorizontalBox, CheckBox, TabWidget } from "std-widgets.slint";
-import { ConfigRow, ZoneCell, ParamRow, GlobalFences, ChannelStatus, AlgoReportLine, AlgoSettingRow, LedUnitRow } from "../common/types.slint";
+import { ConfigRow, ConfigGroupCount, ZoneCell, ParamRow, GlobalFences, ChannelStatus, AlgoReportLine, AlgoSettingRow, LedUnitRow, SpectrumCell } from "../common/types.slint";
 import { AlgoPage } from "./algo.slint";
 import { AllChannelsPage } from "./all_channels.slint";
 import { BindingPage } from "./binding.slint";
@@ -20,6 +20,8 @@ export component SettingsPage inherits Rectangle {
     in property <[ConfigRow]> config_rows: [];
     // 未归类("其他"组)行数: 为 0 时通信系统 Tab 不渲染该组, 避免空标题框。
     in property <int> config_other_count: 0;
+    // 各分组行数, 透传给两页的 ConfigGroupSection 供空组自报原因。
+    in property <[ConfigGroupCount]> config_group_counts: [];
     in property <bool> config_dirty: false;
     in property <int> config_dirty_count: 0;
     in property <bool> mode_change_needs_reboot: false;
@@ -61,6 +63,13 @@ export component SettingsPage inherits Rectangle {
     in property <int> save_pending: 0;
     in property <string> op_label: "";
     in property <string> auto_tune_status: "";
+    // 全通道操作的 host 侧串行队列状态(透传给 GlobalTunePage)。
+    in property <bool> batch_op_active: false;
+    in property <float> batch_op_progress: 0;
+    in property <string> batch_op_status: "";
+    callback batch_op_cancel();
+    in property <bool> cp_assist: false;
+    callback set_cp_assist(bool);
 
     in property <[ZoneCell]> zones: [];
     in property <string> bind_status: "";
@@ -155,8 +164,18 @@ export component SettingsPage inherits Rectangle {
     in-out property <bool> curve_params_expanded: true;
     in-out property <bool> curve_algo_cfg_expanded: false;
     in-out property <bool> curve_series_expanded: true;
-    callback telem_start();
-    callback telem_stop();
+    // 响应噪声频谱(透传给 CurvesPage): 折叠态存在 AppWindow, 默认收起。
+    in-out property <bool> curve_spectrum_expanded: false;
+    in property <[SpectrumCell]> curve_spectrum_cells: [];
+    in property <bool> curve_spectrum_active: false;
+    in property <string> curve_spectrum_status: "";
+    in property <float> curve_spectrum_progress: 0;
+    callback curve_spectrum_start();
+    callback curve_spectrum_cancel();
+    // 绘图视窗冻结态("停止" = 只冻画面, 遥测仍在收)。
+    in property <bool> plot_frozen: false;
+    callback plot_resume();
+    callback plot_freeze();
     callback curve_calibrate();
     callback curve_baseline_reset();
     callback curve_measure_cp();
@@ -193,11 +212,8 @@ export component SettingsPage inherits Rectangle {
     // 全通道页"批量应用"抽屉: 勾选状态与参数名/源值由 main.rs 回填, 真相源在 AppController。
     in property <[bool]> batch_ch_selected: [];
     in property <[bool]> batch_param_selected: [];
-    in property <[string]> batch_param_names: [];
+    in property <[ParamRow]> batch_param_rows: [];
     // 每参数的可手改"待写值"(-1 = 无值) + 围栏上下限(唯一来源 proto::param_fence)。
-    in property <[int]> batch_param_values: [];
-    in property <[int]> batch_param_min: [];
-    in property <[int]> batch_param_max: [];
     callback batch_toggle_channel(int);
     callback batch_toggle_param(int);
     callback batch_param_value_set(int, int);
@@ -209,6 +225,21 @@ export component SettingsPage inherits Rectangle {
     callback batch_apply(int);
     callback batch_set_source(int);
     in property <int> batch_source: 0;
+    // 批量启用/禁用 + 抽屉收起时的会话清理(见 all_channels.slint 的说明)。
+    callback batch_enable_channels();
+    callback batch_disable_channels();
+    callback batch_drawer_closed();
+    // 全通道页排序/筛选(排序与筛选实际由 Rust 侧按绑定映射执行, 这里只透传用户选择)。
+    in-out property <int> channel_sort: 0;
+    in-out property <bool> channel_show_disabled: false;
+    in property <int> channel_hidden_count: 0;
+    // 真正的采集开关(与曲线页的"暂停画面"是两件事)。
+    callback telem_source_start();
+    callback telem_source_stop();
+    in property <bool> telem_paused: false;
+    // 单通道精调页的通道启用开关(与全通道页的卡片、批量启停共用 PARAM_ENABLED=0x0C)。
+    in property <bool> curve_ch_enabled: true;
+    callback curve_ch_enable_set(bool);
     in property <float> scan_period_ms: 0;
     in property <int> scan_period_us: 0;
     // 探测周期是否有实测值; 无值时下游页面显示"未测"而不是 0 ms(透传自 AppWindow)。
@@ -307,9 +338,15 @@ export component SettingsPage inherits Rectangle {
     in property <int> csd_sns_clk_div_max: 0;
     in property <int> csd_resolution: 0;
     in property <int> csd_sns_clk_source: 0;
+    // 时钟源单选项(由 Rust 侧 ParamFence::ui_choices() 派生), 仅转发给 GlobalTunePage。
+    in property <[string]> csd_clk_labels: [];
+    in property <[int]> csd_clk_values: [];
+    in property <int> csd_clk_index: -1;
     // 异常采样标识(透传): 文案 + 等级(0 正常 / 1 警告 / 2 异常)。
     in property <string> sampling_advice: "";
     in property <int> sampling_advice_level: 0;
+    // Cp 测量失败通道列表(形如 "CH0 CH5"), 透传给 GlobalTunePage 的警告位; 空串 = 无失败。
+    in property <string> cp_failed_channels: "";
     callback psoc_rescue();               // PSoC 救砖(透传给 GlobalTunePage → AppWindow)
     callback algo_refresh();
     callback algo_reset_default();
@@ -375,6 +412,7 @@ export component SettingsPage inherits Rectangle {
             ProtocolPage {
                 // 协议能力参数与通信系统 Tab 共用同一份 config_rows 与草稿写入回调。
                 config_rows: root.config_rows;
+                config_group_counts: root.config_group_counts;
                 cfg_set_bool(k, v) => { root.cfg_set_bool(k, v); }
                 cfg_set_number(k, v) => { root.cfg_set_number(k, v); }
                 cfg_set_number_hex(k, v) => { root.cfg_set_number_hex(k, v); }
@@ -423,10 +461,7 @@ export component SettingsPage inherits Rectangle {
                 scan_period_valid: root.scan_period_valid;
                 batch_ch_selected: root.batch_ch_selected;
                 batch_param_selected: root.batch_param_selected;
-                batch_param_names: root.batch_param_names;
-                batch_param_values: root.batch_param_values;
-                batch_param_min: root.batch_param_min;
-                batch_param_max: root.batch_param_max;
+                batch_param_rows: root.batch_param_rows;
                 batch_toggle_channel(ch) => { root.batch_toggle_channel(ch); }
                 batch_toggle_param(id) => { root.batch_toggle_param(id); }
                 batch_param_value_set(id, v) => { root.batch_param_value_set(id, v); }
@@ -438,8 +473,15 @@ export component SettingsPage inherits Rectangle {
                 batch_apply(src) => { root.batch_apply(src); }
                 batch_set_source(ch) => { root.batch_set_source(ch); }
                 batch_source: root.batch_source;
-                telem_start() => { root.telem_start(); }
-                telem_stop() => { root.telem_stop(); }
+                batch_enable_channels() => { root.batch_enable_channels(); }
+                batch_disable_channels() => { root.batch_disable_channels(); }
+                batch_drawer_closed() => { root.batch_drawer_closed(); }
+                channel_sort <=> root.channel_sort;
+                channel_show_disabled <=> root.channel_show_disabled;
+                channel_hidden_count: root.channel_hidden_count;
+                telem_source_start() => { root.telem_source_start(); }
+                telem_source_stop() => { root.telem_source_stop(); }
+                telem_paused: root.telem_paused;
                 channel_selected(ch) => {
                     root.sel_channel = ch;
                     // Tab 顺序: 0绑区 1协议 2触控通道调整 3触控全局调整 4单通道精调 → 双击跳 4。
@@ -470,8 +512,12 @@ export component SettingsPage inherits Rectangle {
                 csd_sns_clk_div_max: root.csd_sns_clk_div_max;
                 csd_resolution: root.csd_resolution;
                 csd_sns_clk_source: root.csd_sns_clk_source;
+                csd_clk_labels: root.csd_clk_labels;
+                csd_clk_values: root.csd_clk_values;
+                csd_clk_index: root.csd_clk_index;
                 sampling_advice: root.sampling_advice;
                 sampling_advice_level: root.sampling_advice_level;
+                cp_failed_channels: root.cp_failed_channels;
                 psoc_rescue() => { root.psoc_rescue(); }
                 scan_period_ms: root.scan_period_ms;
                 scan_period_us: root.scan_period_us;
@@ -494,6 +540,14 @@ export component SettingsPage inherits Rectangle {
                 global_baseline_reset() => { root.global_baseline_reset(); }
                 calib_pref: root.calib_pref;
                 calib_pref_set(v) => { root.calib_pref_set(v); }
+                batch_op_active: root.batch_op_active;
+                batch_op_progress: root.batch_op_progress;
+                batch_op_status: root.batch_op_status;
+                batch_op_cancel() => { root.batch_op_cancel(); }
+                // 频谱扫描活跃 ⇒ 本页三个全通道动作锁定(与单通道精调页双向互斥)。
+                spectrum_active: root.curve_spectrum_active;
+                cp_assist: root.cp_assist;
+                set_cp_assist(on) => { root.set_cp_assist(on); }
             }
         }
 
@@ -537,10 +591,23 @@ export component SettingsPage inherits Rectangle {
                 params_expanded <=> root.curve_params_expanded;
                 algo_cfg_expanded <=> root.curve_algo_cfg_expanded;
                 series_expanded <=> root.curve_series_expanded;
+                spectrum_expanded <=> root.curve_spectrum_expanded;
+                spectrum_cells: root.curve_spectrum_cells;
+                spectrum_active: root.curve_spectrum_active;
+                spectrum_status: root.curve_spectrum_status;
+                spectrum_progress: root.curve_spectrum_progress;
+                spectrum_start() => { root.curve_spectrum_start(); }
+                spectrum_cancel() => { root.curve_spectrum_cancel(); }
+                // 批量队列活跃 ⇒ 本页扫描/校准/基线/自适应锁定(与全局精调页双向互斥)。
+                batch_op_active: root.batch_op_active;
+                plot_frozen: root.plot_frozen;
                 sample_rate_hz: root.sample_rate_hz;
                 threshold_warning: root.curve_threshold_warning;
-                telem_start() => { root.telem_start(); }
-                telem_stop() => { root.telem_stop(); }
+                plot_resume() => { root.plot_resume(); }
+                plot_freeze() => { root.plot_freeze(); }
+                // 通道启用开关(PARAM_ENABLED=0x0C): 关闭后本页一切对它无意义的操作全部锁定。
+                ch_enabled: root.curve_ch_enabled;
+                ch_enable_set(on) => { root.curve_ch_enable_set(on); }
                 calibrate() => { root.curve_calibrate(); }
                 baseline_reset() => { root.curve_baseline_reset(); }
                 measure_cp() => { root.curve_measure_cp(); }
@@ -632,6 +699,7 @@ export component SettingsPage inherits Rectangle {
             ConfigPage {
                 rows: root.config_rows;
                 other_count: root.config_other_count;
+                group_counts: root.config_group_counts;
                 config_dirty: root.config_dirty;
                 cfg_set_bool(k, v) => { root.cfg_set_bool(k, v); }
                 cfg_set_number(k, v) => { root.cfg_set_number(k, v); }

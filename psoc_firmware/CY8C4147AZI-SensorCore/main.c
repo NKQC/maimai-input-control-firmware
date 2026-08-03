@@ -68,7 +68,10 @@ _Static_assert(FW_VERSION <= 0xFFFFFFFFu, "FW_BUILD_STAMP overflows uint32 (YY >
 //   result==0(进行中) → 当前正在试探的 snsClk 分频(供上位机显示"正在试 ÷N");
 //   result!=0(已完成) → 最终写入 widgetContext 的分频(成功)或 0(失败)。
 #define SENSOR_CMD_GET_AUTO_TUNE         (0x3Eu)
-#define AUTO_TUNE_CH_ALL                 (0xFFu)  // AUTO_TUNE 通道号哨兵: 全通道
+/* ★通道号哨兵(全通道)★ 单一取值, 供 CALIBRATE / BASELINE_RESET / AUTO_TUNE 共用 ——
+ * 不为每条命令另造一个"全通道"常量, 免得三处各写一份必然漂移。 */
+#define SENSOR_CH_ALL                    (0xFFu)
+#define AUTO_TUNE_CH_ALL                 SENSOR_CH_ALL  // AUTO_TUNE 通道号哨兵: 全通道(同 SENSOR_CH_ALL)
 // 全局参数 id
 #define GPARAM_INACTIVE_SNS              (0x01u)  // 未激活传感器连接: 1=GND 2=High-Z 4=Shield
 #define GPARAM_IDAC_GAIN_INIT            (0x02u)  // csdIdacGainInitIndex(IDAC 增益档索引)
@@ -104,6 +107,10 @@ _Static_assert(FW_VERSION <= 0xFFFFFFFFu, "FW_BUILD_STAMP overflows uint32 (YY >
 #define PARAM_IDAC_MOD                   (0x09u)
 #define PARAM_SNS_CLK_SOURCE             (0x0Au)  // 时钟源(bit7=auto, 低位=PRS/direct 选择)
 #define PARAM_IDAC_GAIN                  (0x0Bu)  // IDAC 增益档索引(增幅), 半自动手动调优用
+/* ★通道启用开关(0=禁用/电极高阻, 1=启用)★
+ * 这是硬件开关而非调参项: 禁用 = 该 widget 永久不参与扫描, 其电极保持模拟高阻(见 g_ch_enabled)。
+ * 复用 SET_PARAM/GET_PARAM 通道, 不新增命令码。 */
+#define PARAM_ENABLED                    (0x0Cu)
 // CSD 处理模式
 #define SCAN_MODE_AUTO                   (0u)  // 自动校准：运行中间件标准完整处理链
 #define SCAN_MODE_SEMI                   (1u)  // 半自动手动：跳过噪声/阈值处理，保留 SET_PARAM 手动值
@@ -176,7 +183,7 @@ static spi_dma_state_t spi_dma;
 #define MLOOP_STAGE_AUTO_TUNE            (13u)
 #define MLOOP_STAGE_SCAN_START           (14u)
 /* APPLY 分支细分 */
-#define MLOOP_STAGE_APPLY_ENABLE         (20u)  /* AUTO+自动校准: Cy_CapSense_Enable(全通道自动校准) */
+#define MLOOP_STAGE_APPLY_ENABLE         (20u)  /* reserved */
 #define MLOOP_STAGE_APPLY_RECAL          (21u)  /* 逐通道 _recalibrate_dirty_channels */
 #define MLOOP_STAGE_APPLY_INIT           (22u)  /* Cy_CapSense_Initialize */
 #define MLOOP_STAGE_APPLY_BASELINE       (23u)  /* Cy_CapSense_InitializeAllBaselines */
@@ -252,16 +259,23 @@ static volatile bool apply_pending = false;
 static volatile uint64_t idac_dirty_mask = 0u;
 /* MEASURE_CP 指令置位，主循环执行逐电极 BIST 电容测量(不能在 ISR 里做耗时测量)。 */
 static volatile bool measure_cp_pending = false;
-/* SET_GLOBAL 置位：全局 CSD 配置(inactive_sns/IDAC/MFS)改动需完整 Init+Enable 重初始化才能
+/* SET_GLOBAL 置位：全局 CSD 配置(inactive_sns/IDAC/MFS)改动需完整 Init+Initialize 重初始化，
  * 重算内部预计算(csdInactiveSnsDm/HSIOM 见 cy_capsense_sensing.c)。轻量 APPLY 不够，会坏扫描。
- * 主循环执行与启动同序的 Cy_CapSense_Init+Enable(已验证可用)。 */
+ * 主循环执行 Cy_CapSense_Init+Initialize（已验证可用）。 */
 static volatile bool global_apply_pending = false;
 /* 主循环测量期间保持 true；SPI ISR 据 pending/active 返回 0，避免读到半更新数组。 */
 static volatile bool measure_cp_active = false;
-/* CALIBRATE 指令置位：主循环执行真正的 IDAC 重校准 CalibrateAllWidgets(不能在 ISR 里做)。 */
+/* CALIBRATE 指令置位：主循环执行真正的 IDAC 重校准(不能在 ISR 里做)。 */
 static volatile bool calibrate_pending = false;
-/* BASELINE_RESET 指令置位：主循环执行 InitializeAllBaselines 重置全部通道基线。 */
+/* BASELINE_RESET 指令置位：主循环执行基线复位。 */
 static volatile bool baseline_reset_pending = false;
+/* ★校准/基线的目标通道(单通道语义端到端透传)★ 0..35=只处理该通道, SENSOR_CH_ALL=全 36 通道。
+ * 与 auto_tune_ch 完全同构(同一哨兵、同一 rx[2] 位置), 不新增命令码、不造平行协议。
+ * ★为什么必须透传★: 上位机点"本通道校准"时原先固件把它扩成 36 通道重校准 —— 既慢(逐通道
+ * CalibrateWidget × 36)又会把其它通道刚调好的 IDAC/基线一起冲掉, 与"只调这一个通道"的语义相反。
+ * UI 的批量(全通道)现在由 host 侧可取消串行队列逐通道发起, 不再依赖固件内部循环。 */
+static volatile uint8_t calibrate_ch = SENSOR_CH_ALL;
+static volatile uint8_t baseline_ch = SENSOR_CH_ALL;
 /* AUTO_TUNE 指令置位：主循环执行频率自适应下探(逐档升 snsClk 分频重校准)。 */
 static volatile bool auto_tune_pending = false;
 /* 自适应结果: 0=未执行/进行中, 1=成功(auto_tune_div 为找到的分频), 2=失败(超硬件上限仍压不到目标)。 */
@@ -280,6 +294,15 @@ static volatile uint8_t auto_tune_pref = 4u;
  * SPI 是独立中断且优先级(2)高于 CapSense(3), 故校准阻塞期间 ISR 仍能应答这两个量。 */
 static volatile uint8_t auto_tune_phase = 0u;
 static volatile uint8_t auto_tune_step = 0u;
+/* ★本轮请求标签(6 bit)★: AUTO_TUNE 帧 rx[4] 带下来的"这条命令属于上位机哪一次请求"的标记,
+ * 由 GET_AUTO_TUNE 的 result 字节高 6 位原样回显(result 只用 0/1/2, 高 6 位本来空着 ——
+ * 这是扩展既有响应字段, 不新增命令码, 不造平行协议)。
+ * ★为什么需要它★: RP2040 侧"发命令→轮询 busy→读结果"的流水线里, 若本条 AUTO_TUNE 其实没被
+ * 本 ISR 收到(SPI 丢帧, 而 busy 恰好因上一条重操作为 1), 读回来的就是**上一轮**的 result/div,
+ * 却会被当成本轮成功。标签不匹配即可当场认出这种陈旧结果。0 = 未标记(旧 RP 固件)。 */
+static volatile uint8_t auto_tune_tag = 0u;
+#define AUTO_TUNE_TAG_MASK               (0x3Fu)
+#define AUTO_TUNE_RESULT_MASK            (0x03u)
 #define AUTO_TUNE_PHASE_IDLE             (0u)
 #define AUTO_TUNE_PHASE_COARSE           (1u)
 #define AUTO_TUNE_PHASE_FINE             (2u)
@@ -304,6 +327,45 @@ static volatile bool g_auto_calibrate = true;
 static volatile uint32_t cp_value[SENSOR_CHANNEL_COUNT];
 /* CSD 处理模式：SCAN_MODE_AUTO(自动校准/标准完整处理) / SCAN_MODE_SEMI(半自动手动)。 */
 static volatile uint8_t scan_mode = SCAN_MODE_AUTO;
+/* ★通道启用位图(bit ch = 1 启用)★ 默认全 36 通道启用。
+ * ★为什么不用 Cy_CapSense_SetPinState(HIGHZ) 去"关"一个仍在被扫描的 widget★
+ * 那只能撑到下一轮扫描: ScanAllWidgets → CSDSetupWidget → CSDConnectSns 会把电极重新挂回
+ * AMUXBUS(cy_capsense_csd_v2.c), 于是"关掉的通道"每轮都被重新连一次 —— 那是"UI 显示关闭但硬件
+ * 仍在扫"的伪实现。
+ * ★真正的关★ 用中间件自带的 widget-enable(CY_CAPSENSE_WD_ENABLE_MASK):
+ *   Cy_CapSense_SetupWidget(sensing_v2.c:180) 先查 Cy_CapSense_IsWidgetEnabled, 不启用即返回
+ *   BAD_PARAM; Cy_CapSense_ScanAllWidgets_V2 只 setup 第一个成功的 widget, 而链式推进的
+ *   Cy_CapSense_SsPostAllWidgetsScan(sensing_v2.c:1604) 对失败的 widget **直接 skip**。
+ *   ⇒ 禁用的 widget 永久不进入扫描序列, 从不被 CSDConnectSns 连接。
+ * ★电气契约★ INACTIVE_SNS 是 Host 可选的 GND / High-Z / Shield，而非禁用通道的 High-Z 保证。
+ *   Cy_CapSense_SsInitialize 会先将全部 IO 设为 STRONG_IN_OFF，CSDInitialize 又会按当前全局
+ *   inactive 配置 blanket 全部电极；故每次 CSD 模式准备完成后都由
+ *   _disabled_widgets_force_highz() 显式复位禁用 widget 的全部电极。
+ * ★注意★ 只有 Cy_CapSense_Init(cy_capsense_control.c:147) 会把全部 widget 的 ENABLE|WORKING
+ *   重新置起; Initialize/Enable 只清 ACTIVE 位(processing.c:126)不动 ENABLE。故需在 Init 之后
+ *   重放本位图(见 _ch_enable_restore)。 */
+#define CH_ENABLED_ALL                   (((uint64_t)1u << SENSOR_CHANNEL_COUNT) - 1u)
+#define PROVISION_TIMEOUT_MS             (3000u)
+/* PSoC 启动时先禁用全部 widget。RP 下发完整 enabled 位图后再用既有 APPLY 作为完成屏障；
+ * 旧 RP 未发送该位图时，超时回退为全启用。禁用电极的 High-Z 由显式 helper 保证，
+ * 不依赖 Host 可配置的 CSD inactive 状态。 */
+static volatile uint64_t g_ch_enabled = 0u;
+static volatile uint64_t g_provision_enable_seen = 0u;
+static volatile bool g_provision_pending = true;
+static volatile bool g_provision_apply_release = false;
+/* 启用态刚被 SPI 改动、尚未由主循环落到中间件的通道位图(ISR 只置位, 重活在主循环)。 */
+static volatile uint64_t ch_enable_dirty = 0u;
+
+static inline bool _ch_is_enabled(uint32_t ch)
+{
+    return (ch < SENSOR_CHANNEL_COUNT) &&
+           ((g_ch_enabled & ((uint64_t)1u << ch)) != 0u);
+}
+
+static inline bool _any_ch_enabled(void)
+{
+    return (g_ch_enabled & CH_ENABLED_ALL) != 0u;
+}
 static volatile uint32_t scan_count = 0u;  // 每完成一次全通道扫描 +1，自由递增(无触摸也增长)
 static uint8_t snapshot_buffers[2u][SENSOR_SNAPSHOT_SIZE];
 static uint16_t snapshot_generations[2u];
@@ -352,6 +414,11 @@ static void spi_cs_isr(void);
 static void spi_dma_init(void);
 static void spi_dma_arm_tx(void);
 static void spi_snapshot_latch_task(void);
+/* 启用位图 → 中间件 widget 状态的重放。定义在参数区(见 _ch_enable_restore 处的说明), 但
+ * initialize_capsense 里 Cy_CapSense_Init 之后就要用它, 故在此前置声明。 */
+static inline void _ch_enable_restore(void);
+static inline void _disabled_widgets_force_highz(void);
+static inline void _prepare_csd_mode(void);
 
 static void capsense_isr(void)
 {
@@ -411,13 +478,17 @@ static inline void _idac_lock_clear(void)
     for (i = 0u; i < SENSOR_CHANNEL_COUNT; i++) { g_idac_lock.gain[i] = 0u; }
 }
 
-/* 把锁定通道的增益档写回 widgetContext; 返回是否有值被改回(需 re-init 才真正下到硬件)。 */
-static inline bool _idac_lock_restore(void)
+/* 把锁定通道的增益档写回 widgetContext。target 为 0..35 时只恢复该 widget，
+ * SENSOR_CH_ALL 时恢复全部锁定 widget。CSDv2 会在下一次 ScanWidget 内部装载该 widget 的
+ * idacGainIndex，故这里绝不调用全局 Initialize/SsInitialize 破坏其它 widget 的运行状态。 */
+static inline bool _idac_lock_restore(uint8_t target)
 {
+    const uint32_t first = (target < SENSOR_CHANNEL_COUNT) ? target : 0u;
+    const uint32_t last = (target < SENSOR_CHANNEL_COUNT) ? ((uint32_t)target + 1u) : SENSOR_CHANNEL_COUNT;
     uint32_t w;
     bool changed = false;
     if (g_idac_lock.mask == 0u) { return false; }
-    for (w = 0u; w < SENSOR_CHANNEL_COUNT; w++)
+    for (w = first; w < last; w++)
     {
         if ((g_idac_lock.mask & ((uint64_t)1u << w)) != 0u)
         {
@@ -456,13 +527,11 @@ static inline bool _calibrate_widget_locked(uint32_t ch)
     return ok;
 }
 
-/* 校准/Enable 之后调用: 恢复锁定档并用既有的"从 widgetContext 重配硬件"路径使其真正生效
- * (Cy_CapSense_Initialize 不重算增益, 故不会再被冲回)。无锁定通道时零开销。 */
+/* 自动校准/Enable 之后恢复全部锁定档。每个 widget 的下一次扫描会从它自己的
+ * widgetContext 装载 IDAC，不能为此触发全局 Initialize 或重置其它通道基线。 */
 static inline void _idac_lock_reapply(void)
 {
-    if (!_idac_lock_restore()) { return; }
-    (void)Cy_CapSense_Initialize(&cy_capsense_context);
-    Cy_CapSense_InitializeAllBaselines(&cy_capsense_context);
+    (void)_idac_lock_restore(SENSOR_CH_ALL);
 }
 
 /* 建立全局配置 RAM 影子并重定向 ptrCommonConfig。必须在 Cy_CapSense_Init 前调用。 */
@@ -639,7 +708,11 @@ static void initialize_capsense(void)
         NVIC_ClearPendingIRQ(capsense_interrupt_config.intrSrc);
         NVIC_EnableIRQ(capsense_interrupt_config.intrSrc);
         normalize_widget_params();   /* 首次校准(Enable)前把全部通道分辨率/时钟归一, 消除口径不一致 */
+        /* Init 刚把全部 widget 置成 ENABLE|WORKING；启动位图仍是全禁用，先重放到中间件。
+         * Enable 内部仍会把所有 IO 强推到默认态；返回后必须显式恢复禁用电极的 High-Z。 */
+        _ch_enable_restore();
         Cy_CapSense_Enable(&cy_capsense_context);
+        _prepare_csd_mode();
         /* 归一 + Enable 之后立刻取样: 这就是"启动结束时真正生效的分频", 供带外 SWD 判定
          * 32 是否连启动都没活下来(见 spi_dbg.clk_boot 注释的判据表)。 */
         spi_dbg.clk_boot = cy_capsense_tuner.widgetContext[0].snsClk;
@@ -665,6 +738,17 @@ static void publish_capsense_snapshot(void)
             &cy_capsense_context.ptrWdConfig[channel].ptrSnsContext[0u];
         uint32_t offset = channel * SENSOR_BYTES_PER_CHANNEL;
 
+        /* ★禁用通道一律发布全 0★ 它已不参与扫描, sensor->raw/bsln 仍是关闭前的陈旧值 ——
+         * 原样上报会让上位机把"关掉的通道"显示成一条恒定不动的假读数(还会被停滞检测判成异常)。
+         * 全 0 是明确的"无数据"约定(status=0 ⇒ 未触摸), 与上位机的灰显一致。 */
+        if (!_ch_is_enabled(channel))
+        {
+            snapshot_write_u16(&destination[offset], 0u);
+            snapshot_write_u16(&destination[offset + 2u], 0u);
+            snapshot_write_u16(&destination[offset + 4u], 0u);
+            destination[offset + 6u] = 0u;
+            continue;
+        }
         snapshot_write_u16(&destination[offset], sensor->raw);
         snapshot_write_u16(&destination[offset + 2u], sensor->bsln);
         snapshot_write_u16(&destination[offset + 4u], sensor->diff);
@@ -737,8 +821,19 @@ static void update_touch_frame(void)
 
     for (ch = 0u; ch < SENSOR_CHANNEL_COUNT; ch++)
     {
-        uint32_t base_active = Cy_CapSense_IsWidgetActive((uint32_t)ch, &cy_capsense_context);
+        uint32_t base_active;
         uint32_t active;
+
+        /* ★禁用通道恒不触发★ 它不参与扫描也不参与处理, 既不该出现在触控掩码里, 也不该让
+         * 上一次的算法状态继续跑(那会让关闭的通道仍能点灯/仍能报按下)。 */
+        if (!_ch_is_enabled(ch))
+        {
+            g_algo_io[ch].out_active = 0u;
+            g_algo_io[ch].out_led = 0u;
+            algo_prev_active[ch] = 0u;
+            continue;
+        }
+        base_active = Cy_CapSense_IsWidgetActive((uint32_t)ch, &cy_capsense_context);
 
         if (use_algo)
         {
@@ -808,6 +903,7 @@ static bool _param_value_legal(uint8_t param_id, uint32_t value)
         case PARAM_IDAC_MOD:       return (value <= 127u);
         case PARAM_IDAC_GAIN:      return (value <= 6u);   /* 增益档 0..6(表7项,索引7越界崩溃) */
         case PARAM_SNS_CLK_SOURCE: return ((value & 0x7Fu) <= 6u);
+        case PARAM_ENABLED:        return (value <= 1u);   /* 硬件开关: 只有 0/1 有意义 */
         /* 阈值/迟滞/消抖类为 16/8 位任意值, 无硬件危险, 不额外限制。 */
         default: return true;
     }
@@ -842,6 +938,19 @@ static bool cmd_set_param(uint8_t ch, uint8_t param_id, uint32_t value)
                                   g_idac_lock.gain[ch] = (uint8_t)value;
                                   g_idac_lock.mask |= ((uint64_t)1u << ch);
                                   break;
+        /* ★启用开关只在 ISR 里改位图, 真正的生效(改 widget 状态 / 重校准 / 基线)在主循环★
+         * Cy_CapSense_SetWidgetStatus 内部会走 SwitchSensingMode(重配 CSD HW), 那是不能在 ISR 里
+         * 做的事; 且必须在 NOT_BUSY 窗口做, 否则会打断正在进行的转换。 */
+        case PARAM_ENABLED: {
+            const uint64_t bit = ((uint64_t)1u << ch);
+            const bool want = (value != 0u);
+            /* 启动 provision 需看到每个通道的明确值，0 也是有效配置，不能靠位图变化推断。 */
+            if (g_provision_pending) { g_provision_enable_seen |= bit; }
+            if (want == ((g_ch_enabled & bit) != 0u)) break;   /* 无变化: 不惊动扫描 */
+            if (want) { g_ch_enabled |= bit; } else { g_ch_enabled &= ~bit; }
+            ch_enable_dirty |= bit;
+            break;
+        }
         default: return false;
     }
     if ((param_id == PARAM_SNS_CLK_DIV) || (param_id == PARAM_RESOLUTION) ||
@@ -869,7 +978,120 @@ static uint32_t cmd_get_param(uint8_t ch, uint8_t param_id)
         case PARAM_IDAC_MOD:      return wc->idacMod[0];
         case PARAM_SNS_CLK_SOURCE:return wc->snsClkSource;
         case PARAM_IDAC_GAIN:     return wc->idacGainIndex;
+        /* 读位图而不是读 widgetContext.status: 位图是本固件的意图真相源, 而 status 会被
+         * Cy_CapSense_Init 重置(重放前的那一瞬会读出不一致值)。 */
+        case PARAM_ENABLED:       return _ch_is_enabled(ch) ? 1u : 0u;
         default: return 0u;
+    }
+}
+
+/* 把 g_ch_enabled 位图重放到中间件的 widget 状态位。
+ * ★何时必须调★ 只有 Cy_CapSense_Init 会把全部 widget 的 ENABLE|WORKING 重新置起
+ * (cy_capsense_control.c:147), 所以启动 Init 之后与 GLOBAL_COMMIT 的 Init 之后各调一次即可 ——
+ * 与 _widget_hw_restore / _idac_lock_restore 完全同一模式(都是"抵消 Init 的 ROM 重铺")。
+ * 这里直写 status 位而不调 Cy_CapSense_SetWidgetStatus: 后者附带 SwitchSensingMode(UNDEFINED),
+ * 在"Init 之后紧接 Initialize"的序列里会白白多一次 CSD 模式来回。 */
+static inline void _ch_enable_restore(void)
+{
+    uint32_t w;
+    for (w = 0u; w < SENSOR_CHANNEL_COUNT; w++)
+    {
+        cy_stc_capsense_widget_context_t * wc = &cy_capsense_tuner.widgetContext[w];
+        if (_ch_is_enabled(w))
+        {
+            wc->status |= (uint8_t)(CY_CAPSENSE_WD_ENABLE_MASK | CY_CAPSENSE_WD_WORKING_MASK);
+        }
+        else
+        {
+            wc->status &= (uint8_t)~(uint8_t)(CY_CAPSENSE_WD_ENABLE_MASK | CY_CAPSENSE_WD_ACTIVE_MASK);
+        }
+    }
+}
+
+/* INACTIVE_SNS is a host-selected operating policy, not the electrical state of disabled
+ * channels. SetPinState() follows each CSD widget's actual sensor/electrode layout and
+ * applies High-Z to every pin of a ganged electrode. Call only while the middleware is idle. */
+static inline void _disabled_widgets_force_highz(void)
+{
+    uint32_t widget;
+    for (widget = 0u; widget < cy_capsense_context.ptrCommonConfig->numWd; widget++)
+    {
+        const cy_stc_capsense_widget_config_t * cfg = &cy_capsense_context.ptrWdConfig[widget];
+        uint32_t sensor;
+        if (_ch_is_enabled(widget) || (cfg->senseMethod != CY_CAPSENSE_CSD_GROUP)) { continue; }
+        for (sensor = 0u; sensor < cfg->numSns; sensor++)
+        {
+            (void)Cy_CapSense_SetPinState(widget, sensor, CY_CAPSENSE_HIGHZ, &cy_capsense_context);
+        }
+    }
+}
+
+/* CSDInitialize applies the configurable inactive state to every electrode. Preparing CSD
+ * before a calibration or ScanAllWidgets keeps disabled electrodes High-Z without ISR work. */
+static inline void _prepare_csd_mode(void)
+{
+    if (cy_capsense_context.ptrActiveScanSns->currentSenseMethod != CY_CAPSENSE_CSD_GROUP)
+    {
+        (void)Cy_CapSense_SwitchSensingMode(CY_CAPSENSE_CSD_GROUP, &cy_capsense_context);
+    }
+    _disabled_widgets_force_highz();
+}
+
+/* 只初始化【启用】通道的基线。替代 Cy_CapSense_InitializeAllBaselines ——
+ * 后者(cy_capsense_filter.c:407)不查 enable, 会把禁用通道的基线设成它那份陈旧 raw,
+ * 白做 36 次无意义写入, 也让"禁用通道不参与任何处理"这条约束出现例外。 */
+static inline void _initialize_enabled_baselines(void)
+{
+    uint32_t w;
+    for (w = 0u; w < SENSOR_CHANNEL_COUNT; w++)
+    {
+        if (_ch_is_enabled(w))
+        {
+            Cy_CapSense_InitializeWidgetBaseline(w, &cy_capsense_context);
+        }
+    }
+}
+
+/* 主循环(NOT_BUSY 窗口)落实 SPI 收到的启用/禁用请求。
+ * 禁用: widget-enable 将其排除出扫描；SetWidgetStatus 会退出 CSD 并按全局 inactive 配置重置
+ *       所有电极，故每次状态变更后立即切回 CSD 并显式恢复禁用电极 High-Z。
+ * 启用: 恢复 enable 位后只给该 widget 重建 IDAC 与基线，绝不扰动其它通道。 */
+static inline void _ch_enable_apply(void)
+{
+    uint64_t pending;
+    uint32_t w;
+    if (g_provision_pending) { return; }
+    uint32_t st = Cy_SysLib_EnterCriticalSection();
+    pending = ch_enable_dirty;
+    ch_enable_dirty = 0u;
+    Cy_SysLib_ExitCriticalSection(st);
+    if (pending == 0u) { return; }
+
+    for (w = 0u; w < SENSOR_CHANNEL_COUNT; w++)
+    {
+        if ((pending & ((uint64_t)1u << w)) == 0u) { continue; }
+        const bool enable = _ch_is_enabled(w);
+        (void)Cy_CapSense_SetWidgetStatus(w, CY_CAPSENSE_WD_ENABLE_MASK,
+                                          enable ? CY_CAPSENSE_WD_ENABLE_MASK : 0u,
+                                          &cy_capsense_context);
+        _prepare_csd_mode();
+        if (enable)
+        {
+#if (defined(CY_CAPSENSE_CSD_CALIBRATION_EN) && (CY_CAPSENSE_ENABLE == CY_CAPSENSE_CSD_CALIBRATION_EN))
+            if (g_auto_calibrate) { (void)_calibrate_widget_locked(w); }
+#endif
+            (void)_idac_lock_restore((uint8_t)w);
+            Cy_CapSense_InitializeWidgetBaseline(w, &cy_capsense_context);
+        }
+        else
+        {
+            /* 触控/算法残留清零: 关闭的通道必须立刻表现为"没被按下", 而不是冻在最后一帧。 */
+            cy_capsense_tuner.widgetContext[w].status &= (uint8_t)~(uint8_t)CY_CAPSENSE_WD_ACTIVE_MASK;
+            memset(&g_algo_io[w], 0, sizeof(g_algo_io[w]));
+            algo_prev_active[w] = 0u;
+            /* 关闭期间它不再被校准/自适应触碰, 脏位留着只会在下次 APPLY 时白跑一次校准。 */
+            idac_dirty_mask &= ~((uint64_t)1u << w);
+        }
     }
 }
 
@@ -880,15 +1102,34 @@ static inline void _recalibrate_dirty_channels(void)
 
     for (w = 0u; w < SENSOR_CHANNEL_COUNT; w++)
     {
+        /* 禁用通道不参与校准: 校准会连接电极(CSDCalibrateWidget → 扫描该 widget), 与"电极保持
+         * 高阻"直接冲突; 且它的 IDAC 结果毫无用处。 */
+        if (!_ch_is_enabled(w)) { continue; }
         if ((idac_dirty_mask & ((uint64_t)1u << w)) != 0u)
         {
             (void)_calibrate_widget_locked(w);   /* 锁定通道按其自身增益档校准 */
         }
     }
     /* 校准把增益档拉回全局起点档, 此处把用户锁定值写回; 调用方随后的 Initialize 使其下到硬件。 */
-    (void)_idac_lock_restore();
+    (void)_idac_lock_restore(SENSOR_CH_ALL);
 #endif
     idac_dirty_mask = 0u;
+}
+
+/* Enable() would initialize and immediately start its first scan before callers can repair
+ * disabled pins. This replacement keeps the same all-enabled-widget calibration scope, but
+ * prepares CSD and forces disabled electrodes High-Z before any calibration sample starts. */
+static inline void _calibrate_enabled_channels(void)
+{
+#if (defined(CY_CAPSENSE_CSD_CALIBRATION_EN) && (CY_CAPSENSE_ENABLE == CY_CAPSENSE_CSD_CALIBRATION_EN))
+    uint32_t w;
+    for (w = 0u; w < SENSOR_CHANNEL_COUNT; w++)
+    {
+        if (_ch_is_enabled(w)) { (void)_calibrate_widget_locked(w); }
+    }
+#endif
+    idac_dirty_mask = 0u;
+    _idac_lock_reapply();
 }
 
 // 装载指令响应帧（直接填 TX FIFO；ISR 上下文，与 spi_load_touch 同）。
@@ -907,6 +1148,8 @@ static void spi_load_cmd_response(uint8_t command, uint8_t b2, uint8_t b3, uint3
 static uint16_t cmd_get_raw(uint8_t ch)
 {
     if (ch >= SENSOR_CHANNEL_COUNT) return 0u;
+    /* 与快照同口径: 禁用通道回 0(无数据), 不回关闭前的陈旧 raw。 */
+    if (!_ch_is_enabled(ch)) return 0u;
     return cy_capsense_context.ptrWdConfig[ch].ptrSnsContext[0].raw;
 }
 
@@ -1367,7 +1610,9 @@ static void spi_slave_task(uint8_t rx_index)
 
         case SENSOR_CMD_MEASURE_CP:
             // 耗时测量由主循环执行；ACK 仅表示命令已由 SPI ISR 实际接收并置为 pending。
+            // busy 覆盖 BIST 与其后的正常 CSD 恢复，RP 只会在恢复完成后继续任何重操作。
             measure_cp_pending = true;
+            g_op_busy = 1u;
             spi_load_cmd_response(SENSOR_CMD_MEASURE_CP, 0u, 0u, 0u);
             break;
 
@@ -1380,44 +1625,61 @@ static void spi_slave_task(uint8_t rx_index)
 
         case SENSOR_CMD_APPLY:
             // ★不能在 ISR 里做重校准(耗时数ms/需扫描完成)★：仅置标志，主循环执行。
-    
+            // 启动 gate 只承认已经收到全 36 个 enabled 值之后的 APPLY；该 APPLY 完成前不扫描。
+            if (g_provision_pending && (g_provision_enable_seen == CH_ENABLED_ALL))
+            {
+                g_provision_apply_release = true;
+            }
             apply_pending = true;
             g_op_busy = 1u;   // 处理中锁定
             spi_load_cmd_response(SENSOR_CMD_APPLY, 0u, 0u, 0u);
             break;
 
         case SENSOR_CMD_CALIBRATE:
-            // 真正的 IDAC 重校准(CalibrateAllWidgets)+基线复位; 耗时, 仅置标志由主循环执行。
+            // 真正的 IDAC 重校准 + 基线复位; 耗时, 仅置标志由主循环执行。
+            // rx[2]=目标通道(0..35 单通道 / 0xFF 全通道), 与 AUTO_TUNE 同构; 非法值退化为全通道。
+            // ★已 pending 时以最后一条为准★: RP2040 侧 heavy_gate 已拦住堆叠, host 侧又是串行队列,
+            //   故不会出现"两条不同通道的请求同时在队"; 真出现也只是最后一条生效, 不会做出错通道。
+            calibrate_ch = (rx[2] < SENSOR_CHANNEL_COUNT) ? rx[2] : SENSOR_CH_ALL;
             calibrate_pending = true;
             g_op_busy = 1u;   // 处理中锁定
-            spi_load_cmd_response(SENSOR_CMD_CALIBRATE, 0u, 0u, 0u);
+            spi_load_cmd_response(SENSOR_CMD_CALIBRATE, calibrate_ch, 0u, 0u);
             break;
 
         case SENSOR_CMD_BASELINE_RESET:
-            // 仅重置全部通道基线; 主循环执行 InitializeAllBaselines。
+            // 基线复位; rx[2]=目标通道(0..35 单通道 / 0xFF 全通道)。单通道时主循环只初始化该 widget。
+            baseline_ch = (rx[2] < SENSOR_CHANNEL_COUNT) ? rx[2] : SENSOR_CH_ALL;
             baseline_reset_pending = true;
             g_op_busy = 1u;   // 处理中锁定
-            spi_load_cmd_response(SENSOR_CMD_BASELINE_RESET, 0u, 0u, 0u);
+            spi_load_cmd_response(SENSOR_CMD_BASELINE_RESET, baseline_ch, 0u, 0u);
             break;
 
         case SENSOR_CMD_AUTO_TUNE:
             // 频率自适应下探(耗时: 粗定位+细搜+落档重校准); 仅置标志由主循环执行, 结果经 GET_AUTO_TUNE 读。
             // rx[2]=目标通道(0..35 单通道 / 0xFF 全通道); 非法值退化为全通道。
             // rx[3]=灵敏度偏好档位(1..7); 非法/缺省(0)退化为 4(居中)。
+            // rx[4]=本轮请求标签(6 bit, 0=未标记): 原样存下并由 GET_AUTO_TUNE 回显, 供 RP2040 认出
+            //       "读到的是上一轮的残留结果"(见 auto_tune_tag 注释)。
             auto_tune_ch      = (rx[2] < SENSOR_CHANNEL_COUNT) ? rx[2] : AUTO_TUNE_CH_ALL;
             auto_tune_pref    = ((rx[3] >= 1u) && (rx[3] <= 7u)) ? rx[3] : 4u;
+            auto_tune_tag     = (uint8_t)(rx[4] & AUTO_TUNE_TAG_MASK);
             auto_tune_pending = true;
             auto_tune_result  = 0u;   // 进行中
             auto_tune_phase   = AUTO_TUNE_PHASE_IDLE;   // 已受理, 主循环下一轮开始推进阶段
             auto_tune_step    = 0u;
             auto_tune_div     = 0u;
             g_op_busy = 1u;           // 处理中锁定(host 轮询 busy 至真实完成)
-            spi_load_cmd_response(SENSOR_CMD_AUTO_TUNE, auto_tune_ch, 0u, 0u);
+            // 受理回显里也带上标签(byte3): RP2040 的 _send_heavy 收割到本帧即可确认"这一条被收下了"。
+            spi_load_cmd_response(SENSOR_CMD_AUTO_TUNE, auto_tune_ch, auto_tune_tag, 0u);
             break;
 
         case SENSOR_CMD_GET_AUTO_TUNE:
-            // 读结果/进度: [result, ch, div_lo, div_hi, progress]; progress = phase | (step << 3)。
-            spi_load_cmd_response(SENSOR_CMD_GET_AUTO_TUNE, auto_tune_result, auto_tune_ch,
+            // 读结果/进度: [result|tag<<2, ch, div_lo, div_hi, progress]; progress = phase | (step << 3)。
+            // result 只取 0/1/2 ⇒ 高 6 位承载本轮请求标签(旧 RP 固件不带标签时回显 0, 行为不变)。
+            spi_load_cmd_response(SENSOR_CMD_GET_AUTO_TUNE,
+                                  (uint8_t)((auto_tune_result & AUTO_TUNE_RESULT_MASK) |
+                                            ((auto_tune_tag & AUTO_TUNE_TAG_MASK) << 2u)),
+                                  auto_tune_ch,
                                   (uint32_t)auto_tune_div |
                                   (((uint32_t)(auto_tune_phase & 0x07u) |
                                     ((uint32_t)(auto_tune_step & 0x1Fu) << 3u)) << 16u));
@@ -1578,12 +1840,22 @@ int main(void)
     global_apply_pending = false;
     calibrate_pending = false;
     baseline_reset_pending = false;
+    calibrate_ch = SENSOR_CH_ALL;
+    baseline_ch = SENSOR_CH_ALL;
     auto_tune_pending = false;
     auto_tune_result = 0u;
     auto_tune_div = 0u;
     auto_tune_ch = AUTO_TUNE_CH_ALL;
     auto_tune_phase = AUTO_TUNE_PHASE_IDLE;
     auto_tune_step = 0u;
+    auto_tune_tag = 0u;   /* 复位后没有任何在途请求: 标签清零 = "未标记", 不冒充上一轮 */
+    /* PSoC 无状态: 上电先禁用全部 widget。新 RP 会完整下发 enabled 位图并以 APPLY 放行；
+     * 未升级 RP 在 3 秒后走兼容全启用兜底。 */
+    g_ch_enabled = 0u;
+    g_provision_enable_seen = 0u;
+    g_provision_pending = true;
+    g_provision_apply_release = false;
+    ch_enable_dirty = 0u;
     g_any_active = false;
     published_snapshot_index = 0u;
     published_snapshot_valid = false;
@@ -1610,7 +1882,6 @@ int main(void)
     /* ★可见启动指示(修"重启白灯不亮")★: 白灯在启动后保持点亮 800ms 再交给 g_any_active 驱动,
      * 使每次上电/XRES 重启都有肉眼可见的白灯闪亮(否则仅亮几微秒无法察觉, 用户误判"重启无效")。 */
     uint32_t led_boot_until_ms = g_ms_tick + 800u;
-    Cy_CapSense_ScanAllWidgets(&cy_capsense_context);
 
     for (;;)
     {
@@ -1620,6 +1891,13 @@ int main(void)
         spi_dbg.stage = MLOOP_STAGE_WAIT_SCAN;
         spi_dbg.ms_tick_m = g_ms_tick;   /* 无条件刷新: 卡在等扫描时也能看出时间在走 */
         spi_dbg.clk_now = cy_capsense_tuner.widgetContext[0].snsClk;   /* 当前生效分频 */
+        /* 兼容未发送 PARAM_ENABLED/APPLY 的旧 RP：3 秒后明确回退全启用。 */
+        if (g_provision_pending && (g_ms_tick >= PROVISION_TIMEOUT_MS))
+        {
+            g_ch_enabled = CH_ENABLED_ALL;
+            ch_enable_dirty = CH_ENABLED_ALL;
+            g_provision_pending = false;
+        }
         /* SPI frames are moved by DMAC; the completion ISR only prepares the next response. */
         if (CY_CAPSENSE_NOT_BUSY == Cy_CapSense_IsBusy(&cy_capsense_context))
         {
@@ -1637,8 +1915,13 @@ int main(void)
                                              CY_CAPSENSE_PROCESS_BASELINE |
                                              CY_CAPSENSE_PROCESS_DIFFCOUNTS |
                                              CY_CAPSENSE_PROCESS_STATUS;
+                /* ★必须自己跳过禁用通道★ Cy_CapSense_ProcessWidgetExt 按文档明确"忽略 widget 的
+                 * disable/non-working 状态"(cy_capsense_structure.c:850 附近的说明), 与
+                 * ProcessAllWidgets(control.c:589 会查 IsWidgetEnabled)不同 —— 不自己跳的话,
+                 * 半自动模式下禁用通道仍会跑滤波/基线/状态判定, 甚至靠陈旧 raw 判出"按下"。 */
                 for (uint32_t w = 0u; w < SENSOR_CHANNEL_COUNT; w++)
                 {
+                    if (!_ch_is_enabled(w)) { continue; }
                     (void)Cy_CapSense_ProcessWidgetExt(w, manual_mask, &cy_capsense_context);
                 }
             }
@@ -1676,7 +1959,11 @@ int main(void)
                     for (uint32_t w = 0u; w < SENSOR_CHANNEL_COUNT; w++)
                     {
                         uint32_t v = 0u;
-                        cy_en_capsense_bist_status_t status =
+                        cy_en_capsense_bist_status_t status;
+                        /* BIST 测量会把该电极接到测量回路上 —— 对已禁用(要求恒高阻)的通道不能做,
+                         * 其 cp_value 保持 0xFFFFFF"未测量"。 */
+                        if (!_ch_is_enabled(w)) { continue; }
+                        status =
                             Cy_CapSense_MeasureCapacitanceSensor(w, 0u, &v, &cy_capsense_context);
 
                         /* HIGH_LIMIT is the 400pF BIST saturation/overrange outcome and
@@ -1691,9 +1978,14 @@ int main(void)
                             cp_value[w] = (v >= 0xFFFFFFu) ? 0xFFFFFEu : v;
                         }
                     }
-                    /* 测量是只读动作，不得触发全局重校准；仅从现有 widgetContext 恢复硬件和基线。 */
+                    /* BIST selects its own inactive state for every measurement; restore the disabled-channel
+                     * electrical contract before continuing or before the next BIST target. */
+                    _disabled_widgets_force_highz();
+                    /* BIST leaves the CSD block in its private configuration. Reinitialize the middleware,
+                     * then prepare CSD so disabled electrodes are High-Z before regular scanning resumes. */
                     (void)Cy_CapSense_Initialize(&cy_capsense_context);
-                    Cy_CapSense_InitializeAllBaselines(&cy_capsense_context);
+                    _prepare_csd_mode();
+                    _initialize_enabled_baselines();
 #endif
                     interrupt_state = Cy_SysLib_EnterCriticalSection();
                     measure_cp_active = false;
@@ -1724,32 +2016,37 @@ int main(void)
                 /* CRC 不一致：拒绝，algo_valid 保持旧值不变。 */
             }
 
-            /* 全局 CSD 配置改动：完整 Init+Enable 重初始化(与启动同序),重算 inactive_sns/IDAC/MFS
-             * 的内部预计算。轻量 APPLY 不重算 → 会坏扫描,故全局改动必须走此完整路径。 */
+            /* 全局 CSD 配置改动：完整 Init + Initialize 重初始化，重算 inactive_sns/IDAC/MFS
+             * 的内部预计算；随后显式恢复禁用电极 High-Z。轻量 APPLY 不重算 → 会坏扫描。 */
             if (global_apply_pending)
             {
                 spi_dbg.stage = MLOOP_STAGE_GLOBAL_APPLY;
                 global_apply_pending = false;
                 /* 全局配置变更应用: Init 从 ptrCommonConfig(RAM 影子)重算内部预计算
-                 * (含 csdInactiveSnsDm/HSIOM), Enable 校准+基线+首扫。
+                 * (含 csdInactiveSnsDm/HSIOM)，随后 Initialize 写回硬件状态。
                  * ★不再调 Cy_CapSense_DeInit★: 实测运行时 DeInit→Init→Enable 会把扫描速率从 ~180Hz
-                 * 掉到 ~15Hz(疑似 DeInit 未复位时钟分频, 再 Init 残留慢时钟); 仅 Init→Enable 同样重算
-                 * 全局预计算且保持满速。 */
+                 * 掉到 ~15Hz(疑似 DeInit 未复位时钟分频, 再 Init 残留慢时钟); 仅 Init→Initialize
+                 * 同样重算全局预计算且保持满速。 */
                 /* Init 会从 ROM 生成配置重铺 widgetContext, 打掉当前生效的 resolution/snsClk
                  * (启动归一的 32, 或用户 SET_PARAM / AUTO_TUNE 的逐通道值) → 见 _widget_hw_save 注释。 */
                 _widget_hw_save();
                 (void)Cy_CapSense_Init(&cy_capsense_context);
                 _widget_hw_restore();
+                /* Cy_CapSense_Init 会把全部 widget 的 ENABLE|WORKING 重新置起
+                 * (cy_capsense_control.c:147) —— 不重放位图, 用户关掉的通道会在每次"全局应用"
+                 * 后偷偷复活并重新参与扫描(电极离开 High-Z)。 */
+                _ch_enable_restore();
                 /* Init 会按 ptrCommonConfig 重铺 widgetContext 增益档 → 先把用户锁定值写回,
                  * 再由紧随其后的 Initialize 一并下到硬件(不额外触发校准)。 */
-                (void)_idac_lock_restore();
+                (void)_idac_lock_restore(SENSOR_CH_ALL);
                 /* ★配置更新只重算内部预计算, 不再自动校准/频率下探(转一圈)★:
                  * 恒走轻量 Initialize+基线路径, 沿用现有(上次手动校准的)IDAC。
                  * Enable 的自动校准(SmartSense 可含频率自适应)耗时长会阻塞→掉 USB, 且用户要求
                  * "频率自适应探测只能手动触发"。故校准/频率下探仅由显式 CALIBRATE / AUTO_TUNE 命令触发,
                  * 配置改动(inactive_sns/IDAC/MFS)本身即时生效但不重扫校准。 */
                 (void)Cy_CapSense_Initialize(&cy_capsense_context);
-                Cy_CapSense_InitializeAllBaselines(&cy_capsense_context);
+                _prepare_csd_mode();
+                _initialize_enabled_baselines();
             }
 
             /* APPLY 指令：在主循环(非 ISR)重新初始化扫描硬件使硬件参数(分辨率/时钟/IDAC)生效。 */
@@ -1761,28 +2058,38 @@ int main(void)
                 apply_pending = false;
                 if (scan_mode == SCAN_MODE_AUTO && g_auto_calibrate)
                 {
-                    /* 自动校准开：重新启用 CapSense(含 IDAC 自动校准)，后续继续标准完整处理。 */
-                    spi_dbg.stage = MLOOP_STAGE_APPLY_ENABLE;
-                    (void)Cy_CapSense_Enable(&cy_capsense_context);
-                    idac_dirty_mask = 0u;
-                    _idac_lock_reapply();   /* Enable 的自动校准会把增益档冲回起点档 */
+                    /* Do not call Enable here: it performs Initialize then starts ScanAllWidgets internally,
+                     * leaving no application point to restore disabled electrodes before the first sample. */
+                    spi_dbg.stage = MLOOP_STAGE_APPLY_INIT;
+                    (void)Cy_CapSense_Initialize(&cy_capsense_context);
+                    _prepare_csd_mode();
+                    spi_dbg.stage = MLOOP_STAGE_APPLY_RECAL;
+                    _calibrate_enabled_channels();
+                    spi_dbg.stage = MLOOP_STAGE_APPLY_BASELINE;
+                    _initialize_enabled_baselines();
                 }
                 else
                 {
-                    /* 硬件参数变化会使旧 IDAC 不再适用，只在用户允许自动校准时修复被改通道；
-                     * 关闭自动校准表示用户要求固定 IDAC，脏位保留到其重新允许校准。 */
+                    /* Fixed-IDAC apply still resets every IO through Initialize; restore the disabled
+                     * electrical contract before resuming scan scheduling. */
                     if (g_auto_calibrate)
                     {
                         spi_dbg.stage = MLOOP_STAGE_APPLY_RECAL;
                         _recalibrate_dirty_channels();
                     }
-                    /* 从 widgetContext 重配硬件并重置基线，保留手动阈值与手动硬件参数。 */
                     spi_dbg.stage = MLOOP_STAGE_APPLY_INIT;
                     (void)Cy_CapSense_Initialize(&cy_capsense_context);
+                    _prepare_csd_mode();
                     spi_dbg.stage = MLOOP_STAGE_APPLY_BASELINE;
-                    Cy_CapSense_InitializeAllBaselines(&cy_capsense_context);
+                    _initialize_enabled_baselines();
                 }
                 (void)apply_t0;
+                /* APPLY 是 RP provisioning 的 FIFO 完成屏障：只有主循环已执行完重配后才开闸。 */
+                if (g_provision_apply_release)
+                {
+                    g_provision_apply_release = false;
+                    g_provision_pending = false;
+                }
             }
 
             /* CALIBRATE：真正的 IDAC 重校准(把 raw 拉回目标, 修 railed), 再复位基线。
@@ -1790,8 +2097,15 @@ int main(void)
              * 才有效(否则 raw 一直卡满量程 diff=0)。CalibrateAllWidgets 需校准使能。 */
             if (calibrate_pending)
             {
+                /* ★单通道语义端到端透传★: cal_target < 36 ⇒ 只校准该 widget 并只初始化该 widget
+                 * 的基线(禁止 InitializeAllBaselines 把其它 35 个通道的基线一并冲掉)。
+                 * UI 的"全通道校准"改由 host 串行队列逐通道下发, 故 0xFF 分支只保留兼容入口
+                 * (恢复默认 / AUTO_CALIBRATE_EN 上升沿等固件内部触发仍需要它)。 */
+                const uint8_t cal_target = calibrate_ch;
+                const bool cal_one = (cal_target < SENSOR_CHANNEL_COUNT);
                 spi_dbg.stage = MLOOP_STAGE_CALIBRATE;
                 calibrate_pending = false;
+                calibrate_ch = SENSOR_CH_ALL;   /* 消费即复位: 内部触发(无 rx[2])一律全通道语义 */
 #if (defined(CY_CAPSENSE_CSD_CALIBRATION_EN) && (CY_CAPSENSE_ENABLE == CY_CAPSENSE_CSD_CALIBRATION_EN))
                 /* ★逐通道校准, 不用 CalibrateAllWidgets★
                  * CalibrateAllWidgets 对全部 widget 一律用【全局起点增益档】csdIdacGainInitIndex,
@@ -1801,28 +2115,63 @@ int main(void)
                  * 故与 _recalibrate_dirty_channels() 同口径: 逐通道调用 _calibrate_widget_locked(),
                  * 它会在校准该通道时临时把全局起点档替换为该通道自己的锁定档, 校准完还原。
                  * 未锁定的通道行为不变(仍用全局档)。 */
-                for (uint32_t cal_ch = 0u; cal_ch < SENSOR_CHANNEL_COUNT; cal_ch++)
+                /* ★禁用通道一律跳过★ 校准要连接电极并扫描该 widget, 与"关闭 ⇒ 电极恒高阻"直接
+                 * 冲突; 单通道请求落在禁用通道上就是一次无意义(且违背语义)的操作, 直接不做。 */
+                if (cal_one)
                 {
-                    (void)_calibrate_widget_locked(cal_ch);
+                    if (_ch_is_enabled((uint32_t)cal_target))
+                    {
+                        (void)_calibrate_widget_locked((uint32_t)cal_target);
+                    }
+                }
+                else
+                {
+                    for (uint32_t cal_ch = 0u; cal_ch < SENSOR_CHANNEL_COUNT; cal_ch++)
+                    {
+                        if (!_ch_is_enabled(cal_ch)) { continue; }
+                        (void)_calibrate_widget_locked(cal_ch);
+                    }
                 }
 #else
-                (void)Cy_CapSense_Enable(&cy_capsense_context);
+                (void)Cy_CapSense_Initialize(&cy_capsense_context);
+                _prepare_csd_mode();
 #endif
-                /* 校准无条件把增益档拉回起点档 → 恢复用户锁定档并重配硬件(不再校准), 否则
-                 * "手动设的增幅一点校准就没了"。 */
-                if (_idac_lock_restore())
+                /* 校准会把增益档拉回起点档；只恢复本次目标范围。CSDv2 在后续扫描时按
+                 * widgetContext 装载 IDAC，所以不调用全局 Initialize，也不重置其它 widget 状态。 */
+                (void)_idac_lock_restore(cal_target);
+                if (cal_one)
                 {
-                    (void)Cy_CapSense_Initialize(&cy_capsense_context);
+                    if (_ch_is_enabled((uint32_t)cal_target))
+                    {
+                        Cy_CapSense_InitializeWidgetBaseline((uint32_t)cal_target, &cy_capsense_context);
+                    }
                 }
-                Cy_CapSense_InitializeAllBaselines(&cy_capsense_context);
+                else
+                {
+                    _initialize_enabled_baselines();
+                }
             }
 
-            /* BASELINE_RESET：仅把全部通道基线重置到当前 raw(消除历史漂移), 不动 IDAC/参数。 */
+            /* BASELINE_RESET：把基线重置到当前 raw(消除历史漂移), 不动 IDAC/参数。
+             * baseline_ch < 36 ⇒ 只初始化该 widget 的基线(单通道"基线"不该动其它通道)。 */
             if (baseline_reset_pending)
             {
+                const uint8_t bsln_target = baseline_ch;
                 spi_dbg.stage = MLOOP_STAGE_BASELINE_RESET;
                 baseline_reset_pending = false;
-                Cy_CapSense_InitializeAllBaselines(&cy_capsense_context);
+                baseline_ch = SENSOR_CH_ALL;   /* 消费即复位, 同 calibrate_ch */
+                if (bsln_target < SENSOR_CHANNEL_COUNT)
+                {
+                    /* 禁用通道没有"当前 raw"可言(发布值恒 0), 复位它的基线毫无意义 → 跳过。 */
+                    if (_ch_is_enabled((uint32_t)bsln_target))
+                    {
+                        Cy_CapSense_InitializeWidgetBaseline((uint32_t)bsln_target, &cy_capsense_context);
+                    }
+                }
+                else
+                {
+                    _initialize_enabled_baselines();
+                }
             }
 
             /* AUTO_TUNE：频率自适应下探。高 Cp 电极在高频(小分频)下传感器来不及建立→IDAC 无论如何
@@ -1845,7 +2194,10 @@ int main(void)
 
                 if (target_ch < SENSOR_CHANNEL_COUNT)
                 {
-                    tuned = auto_tune_run_ch(target_ch, pref, &final_div);
+                    /* 禁用通道不做频率自适应: 它要逐档连接电极重校准, 与"恒高阻"冲突。
+                     * 如实回失败(result=2)而不是假装成功, 上位机据此提示"该通道已关闭"。 */
+                    tuned = _ch_is_enabled((uint32_t)target_ch) &&
+                            auto_tune_run_ch(target_ch, pref, &final_div);
                 }
                 else
                 {
@@ -1856,6 +2208,7 @@ int main(void)
                     for (w = 0u; w < SENSOR_CHANNEL_COUNT; w++)
                     {
                         uint16_t ch_div = 0u;
+                        if (!_ch_is_enabled(w)) { continue; }
                         auto_tune_ch = (uint8_t)w;
                         if (auto_tune_run_ch((uint8_t)w, pref, &ch_div)) ok_count++;
                     }
@@ -1864,14 +2217,21 @@ int main(void)
                     tuned = (ok_count > 0u);
                 }
 
-                /* 自适应内部逐档 CalibrateWidget 同样会把增益档冲回起点档: 搜索过程按中间件口径
-                 * 进行(不干扰判定), 终态再把用户锁定档恢复并重配硬件。 */
-                if (_idac_lock_restore())
+                /* 逐档校准会改回起点档；只恢复本次目标范围。扫描会自然装载该 widget 的
+                 * 新 gain，不调用全局 Initialize，避免扰动其它 widget 的状态/基线。 */
+                (void)_idac_lock_restore(target_ch);
+                /* 最终分频只影响本次目标，单通道仅重置该 widget 基线。 */
+                if (target_ch < SENSOR_CHANNEL_COUNT)
                 {
-                    (void)Cy_CapSense_Initialize(&cy_capsense_context);
+                    if (_ch_is_enabled((uint32_t)target_ch))
+                    {
+                        Cy_CapSense_InitializeWidgetBaseline((uint32_t)target_ch, &cy_capsense_context);
+                    }
                 }
-                /* 基线复位只在最终分频确定后做一次。 */
-                Cy_CapSense_InitializeAllBaselines(&cy_capsense_context);
+                else
+                {
+                    _initialize_enabled_baselines();
+                }
                 auto_tune_div = tuned ? final_div : 0u;   /* 失败: div 无效(否则残留最后一次试探值) */
                 auto_tune_phase = AUTO_TUNE_PHASE_DONE;
                 auto_tune_step  = 0u;
@@ -1881,16 +2241,35 @@ int main(void)
             /* ★处理中锁定解除★：本轮已把入队的重操作全部做完(且未被 ISR 追加新的)→ 清 busy。
              * RP2040 轮询 GET_STATS 的 busy 字节由 1→0 即判定该重操作真实完成(替代盲等 sleep)。 */
             if (!apply_pending && !calibrate_pending && !baseline_reset_pending &&
-                !global_apply_pending && !auto_tune_pending)
+                !global_apply_pending && !auto_tune_pending &&
+                !measure_cp_pending && !measure_cp_active)
             {
                 g_op_busy = 0u;
             }
+
+            /* ★通道启用/禁用在此落实★ 放在所有重操作之后、启动下一轮扫描之前:
+             * 此刻 NOT_BUSY 成立(Cy_CapSense_SetWidgetStatus 内部的 SwitchSensingMode 要求),
+             * 且新的启用集会立刻对下面这一次 ScanAllWidgets 生效(禁用的 widget 从此不再被 setup,
+             * 电极停在 High-Z; 新启用的 widget 已完成校准+基线)。 */
+            _ch_enable_apply();
 
             scan_count++;
             /* 带外 SWD 可读的存活证据: 扫描计数。 */
             spi_dbg.scan_count_m = scan_count;
             spi_dbg.stage = MLOOP_STAGE_SCAN_START;
-            Cy_CapSense_ScanAllWidgets(&cy_capsense_context);
+            /* ★全部通道都被禁用时不得启动扫描★ Cy_CapSense_ScanAllWidgets_V2 会因找不到任何可用
+             * widget 而返回 BAD_PARAM 且不置忙标志; 照旧调用只是每轮白跑一次 36 次 SetupWidget 失败。
+             * 主循环继续空转(scan_count 照增), 故 RP2040 的"主循环卡死"兜底不会误判。 */
+            if (!g_provision_pending && _any_ch_enabled())
+            {
+                /* All normal reset paths prepare CSD explicitly. This guard only repairs a
+                 * subsequent mode change, avoiding a per-scan disabled-widget traversal. */
+                if (cy_capsense_context.ptrActiveScanSns->currentSenseMethod != CY_CAPSENSE_CSD_GROUP)
+                {
+                    _prepare_csd_mode();
+                }
+                Cy_CapSense_ScanAllWidgets(&cy_capsense_context);
+            }
         }
     }
 }

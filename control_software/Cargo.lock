@@ -2945,15 +2945,9 @@ dependencies = [
  "slint",
  "slint-build",
  "windows",
+ "windows-core",
  "winresource",
  "zip",
-]
-
-[[package]]
-name = "mai2vcam-source"
-version = "0.1.0"
-dependencies = [
- "windows",
 ]
 
 [[package]]

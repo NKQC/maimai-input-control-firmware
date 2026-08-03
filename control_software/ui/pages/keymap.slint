@@ -3,7 +3,7 @@
 // ============================================================================
 
 import { VerticalBox, HorizontalBox, CheckBox, SpinBox, ScrollView, Button, ComboBox } from "std-widgets.slint";
-import { KeyCaptureBox, CollapsibleSection, PlotPath } from "../common/widgets.slint";
+import { KeyCaptureBox, CollapsibleSection, PlotPath, GuardedSpinBox } from "../common/widgets.slint";
 import { Theme } from "../common/theme.slint";
 
 // 逻辑通道池里的一个分区块。选中 = 该分区进入"待新建映射"的分区集合。
@@ -89,18 +89,18 @@ component ComboRow inherits Rectangle {
             capture_started() => { root.key_capture_started(); }
             captured(t, c, s, a, g) => { root.key_captured(t, c, s, a, g); }
         }
-        SpinBox {
+        GuardedSpinBox {
             width: Theme.spin-width;
             minimum: 0;
             maximum: 65535;
-            value: root.delay_ms;
+            model_value: root.delay_ms;
             edited(v) => { root.hold_edited(v, root.max_hold_ms); }
         }
-        SpinBox {
+        GuardedSpinBox {
             width: Theme.spin-width;
             minimum: 0;
             maximum: 65535;
-            value: root.max_hold_ms;
+            model_value: root.max_hold_ms;
             edited(v) => { root.hold_edited(root.delay_ms, v); }
         }
         Button {
@@ -498,7 +498,9 @@ component PhysKeyRow inherits Rectangle {
         HorizontalLayout {
             spacing: Theme.gap;
             ComboBox {
-                width: 150px;
+                // 最长选项是"自动(启动电平=抬起)": 150px 会把它省略成"自动(启动电…", 取宽档。
+                width: Theme.combo-wide;
+                horizontal-stretch: 0;
                 // ★model 下标必须与协议值一一对应(0/1/2)★ 另设映射表就是 off-by-one 的温床。
                 model: [@tr("低电平触发"), @tr("高电平触发"), @tr("自动(启动电平=抬起)")];
                 current-index: root.pol_mode;
@@ -516,28 +518,33 @@ component PhysKeyRow inherits Rectangle {
                 vertical-alignment: center;
             }
             Text { text: @tr("防抖(us)"); font-size: Theme.fs-small; vertical-alignment: center; }
-            SpinBox {
-                width: 96px;
+            // ★三个数字框原为 96px★, 低于 fluent SpinBox 自报的 128px 下限 ⇒ 文本区被上下箭头挤掉,
+            // 五位数(10000/65535)根本看不全。统一取 Theme.spin-narrow(=128px, 恰为下限)。
+            GuardedSpinBox {
+                width: Theme.spin-narrow;
+                horizontal-stretch: 0;
                 minimum: 0;
                 // 上限与固件 KeyboardService::DEBOUNCE_US_MAX 同源: 越界固件会 NAK, 不给用户设的机会。
                 maximum: 10000;
-                value: root.debounce_us;
+                model_value: root.debounce_us;
                 edited(v) => { root.keycfg_set(root.pol_mode, v); }
             }
             Text { text: @tr("触发延时(ms)"); font-size: Theme.fs-small; vertical-alignment: center; }
-            SpinBox {
-                width: 96px;
+            GuardedSpinBox {
+                width: Theme.spin-narrow;
+                horizontal-stretch: 0;
                 minimum: 0;
                 maximum: 65535;
-                value: root.hold_delay;
+                model_value: root.hold_delay;
                 edited(v) => { root.hold_set(v, root.hold_max); }
             }
             Text { text: @tr("自动抬起(ms)"); font-size: Theme.fs-small; vertical-alignment: center; }
-            SpinBox {
-                width: 96px;
+            GuardedSpinBox {
+                width: Theme.spin-narrow;
+                horizontal-stretch: 0;
                 minimum: 0;
                 maximum: 65535;
-                value: root.hold_max;
+                model_value: root.hold_max;
                 edited(v) => { root.hold_set(root.hold_delay, v); }
             }
             Rectangle { horizontal-stretch: 1; }
@@ -746,7 +753,9 @@ export component PhysKbdPage inherits Rectangle {
                             vertical-alignment: center;
                         }
                         ComboBox {
-                            width: 120px;
+                            // 120px 低于 fluent ComboBox 的 160px 下限 ⇒ 窗口时长文本被箭头吃掉。
+                            width: Theme.combo-width;
+                            horizontal-stretch: 0;
                             model: root.la_window_names;
                             current-index: root.la_window_index;
                             selected => { root.la_window_set(self.current-index); }
@@ -759,7 +768,12 @@ export component PhysKbdPage inherits Rectangle {
                             horizontal-stretch: 1;
                             overflow: elide;
                         }
-                        Button { text: @tr("清空波形"); clicked => { root.la_clear(); } }
+                        Button {
+                            min-width: Theme.button-min-width;
+                            horizontal-stretch: 0;
+                            text: @tr("清空波形");
+                            clicked => { root.la_clear(); }
+                        }
                     }
                     Text {
                         text: root.la_status;

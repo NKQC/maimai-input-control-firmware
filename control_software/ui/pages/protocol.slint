@@ -1,7 +1,16 @@
 import { Button, ComboBox, HorizontalBox, CheckBox, SpinBox, ScrollView } from "std-widgets.slint";
-import { ConfigRow, LedUnitRow } from "../common/types.slint";
-import { CollapsibleSection } from "../common/widgets.slint";
+import { ConfigRow, ConfigGroupCount, LedUnitRow } from "../common/types.slint";
+import { CollapsibleSection, GuardedSpinBox, GuardedComboBox } from "../common/widgets.slint";
 import { ConfigGroupSection } from "./config.slint";
+import { Theme } from "../common/theme.slint";
+
+// 灯板映射表里"非控件列"的列宽。★只在这里各定义一次★: 表头与数据行两处都引用它,
+// 控件列的宽度则直接取 Theme 的宽度分档 —— 两套宽度各有唯一来源, 改一处不会错列。
+global LedCols {
+    out property <length> unit: 108px;     // 单元名(A1/B2…, 最长四字)
+    out property <length> swatch: 34px;    // 采样色块
+    out property <length> rgb: 132px;      // "R255 G255 B255" 文本
+}
 
 
 // ============================================================================
@@ -12,6 +21,8 @@ export component ProtocolPage inherits Rectangle {
     // ---- 协议能力参数(与"通信系统"Tab 同一份 config_rows / 同一套草稿写入回调) ----
     // 行的归属由 Rust 侧 group 字段决定, 本页只挂两个协议组; 同一 KV 不会在两处出现。
     in property <[ConfigRow]> config_rows: [];
+    // 各分组行数: 组为空时就地自报原因(未取到配置 / 归组异常), 不留一片空白让人猜。
+    in property <[ConfigGroupCount]> config_group_counts: [];
     callback cfg_set_bool(string, bool);
     callback cfg_set_number(string, float);
     callback cfg_set_number_hex(string, string);
@@ -89,23 +100,25 @@ export component ProtocolPage inherits Rectangle {
                     // 那里带完整中文说明。同一页放两个控件控同一个键只会让人以为是两个设置。
                     Text {
                         text: "状态: " + root.mai2_status;
-                        color: root.mai2_status == "运行" ? #2b8a3e : #b0b8c0;
+                        color: root.mai2_status == "运行" ? Theme.ok : Theme.text-sub;
                         vertical-alignment: center;
                     }
                     Text {
                         text: "波特率: " + root.mai2_baud;
-                        color: #8fd6ff;
+                        color: Theme.accent;
                         vertical-alignment: center;
                     }
                     Text {
                         text: "游戏发 {A} 开启发送、{L}/{E} 关闭，此处为手动覆盖。";
-                        color: #7f8c96;
-                        font-size: 11px;
+                        color: Theme.text-dim;
+                        font-size: Theme.fs-normal;
                         horizontal-stretch: 1;
                         overflow: elide;
                         vertical-alignment: center;
                     }
                     Button {
+                        min-width: Theme.button-min-width;
+                        horizontal-stretch: 0;
                         text: "刷新";
                         clicked => { root.mai2_refresh(); }
                     }
@@ -118,6 +131,7 @@ export component ProtocolPage inherits Rectangle {
                 vertical-stretch: 0;
                 group_title: "mai2serial 协议参数";
                 rows: root.config_rows;
+                group_counts: root.config_group_counts;
                 set_bool(k, v) => { root.cfg_set_bool(k, v); }
                 set_number(k, v) => { root.cfg_set_number(k, v); }
                 set_number_hex(k, v) => { root.cfg_set_number_hex(k, v); }
@@ -166,13 +180,15 @@ export component ProtocolPage inherits Rectangle {
                     }
                     Text {
                         text: root.light_known ? "" : "尚未回读到设备灯效状态";
-                        color: #7f8c96;
-                        font-size: 11px;
+                        color: Theme.text-dim;
+                        font-size: Theme.fs-normal;
                         horizontal-stretch: 1;
                         overflow: elide;
                         vertical-alignment: center;
                     }
                     Button {
+                        min-width: Theme.button-min-width;
+                        horizontal-stretch: 0;
                         text: "刷新";
                         clicked => { root.light_refresh(); }
                     }
@@ -210,34 +226,37 @@ export component ProtocolPage inherits Rectangle {
                 HorizontalBox {
                     padding: 4px;
                     spacing: 8px;
-                    Text { text: "灯链0 灯珠数:"; vertical-alignment: center; color: #b0b8c0; }
-                    SpinBox {
-                        width: 112px;
+                    Text { text: "灯链0 灯珠数:"; vertical-alignment: center; color: Theme.text-sub; }
+                    GuardedSpinBox {
+                        width: Theme.spin-narrow;
+                        horizontal-stretch: 0;
                         minimum: 1;
                         maximum: 1000;
-                        value: root.light_ws_count0;
+                        model_value: root.light_ws_count0;
                         edited(v) => { root.light_ws_count_set(0, v); }
                     }
-                    Text { text: "灯链1 灯珠数:"; vertical-alignment: center; color: #b0b8c0; }
-                    SpinBox {
-                        width: 112px;
+                    Text { text: "灯链1 灯珠数:"; vertical-alignment: center; color: Theme.text-sub; }
+                    GuardedSpinBox {
+                        width: Theme.spin-narrow;
+                        horizontal-stretch: 0;
                         minimum: 1;
                         maximum: 1000;
-                        value: root.light_ws_count1;
+                        model_value: root.light_ws_count1;
                         edited(v) => { root.light_ws_count_set(1, v); }
                     }
-                    Text { text: "全局亮度:"; vertical-alignment: center; color: #b0b8c0; }
-                    SpinBox {
-                        width: 112px;
+                    Text { text: "全局亮度:"; vertical-alignment: center; color: Theme.text-sub; }
+                    GuardedSpinBox {
+                        width: Theme.spin-narrow;
+                        horizontal-stretch: 0;
                         minimum: 0;
                         maximum: 255;
-                        value: root.light_brightness;
+                        model_value: root.light_brightness;
                         edited(v) => { root.light_brightness_set(v); }
                     }
                     Text {
                         text: "以上三项为配置项，需点左下角“保存到设备”才写入 flash。";
-                        color: #7f8c96;
-                        font-size: 11px;
+                        color: Theme.text-dim;
+                        font-size: Theme.fs-normal;
                         horizontal-stretch: 1;
                         overflow: elide;
                         vertical-alignment: center;
@@ -250,13 +269,15 @@ export component ProtocolPage inherits Rectangle {
                     HorizontalLayout {
                         padding-left: 4px;
                         spacing: 8px;
-                        Text { width: 108px; text: "单元"; color: #7f8c96; font-size: 11px; vertical-alignment: center; }
-                        Text { width: 34px; text: "色"; color: #7f8c96; font-size: 11px; vertical-alignment: center; }
-                        Text { width: 132px; text: "采样 RGB"; color: #7f8c96; font-size: 11px; vertical-alignment: center; }
-                        Text { width: 104px; text: "通道"; color: #7f8c96; font-size: 11px; vertical-alignment: center; }
-                        Text { width: 112px; text: "起始"; color: #7f8c96; font-size: 11px; vertical-alignment: center; }
-                        Text { width: 112px; text: "数量"; color: #7f8c96; font-size: 11px; vertical-alignment: center; }
-                        Text { text: "预览目标"; color: #7f8c96; font-size: 11px; vertical-alignment: center; horizontal-stretch: 1; }
+                        // ★表头列宽必须与下面数据行的控件宽度逐列同源★: 控件宽度取自 Theme 的分档,
+                        // 表头也必须引用同一个令牌, 否则改一档宽度就会让表头与数据错列。
+                        Text { width: LedCols.unit; text: "单元"; color: Theme.text-dim; font-size: Theme.fs-normal; vertical-alignment: center; }
+                        Text { width: LedCols.swatch; text: "色"; color: Theme.text-dim; font-size: Theme.fs-normal; vertical-alignment: center; }
+                        Text { width: LedCols.rgb; text: "采样 RGB"; color: Theme.text-dim; font-size: Theme.fs-normal; vertical-alignment: center; }
+                        Text { width: Theme.combo-width; text: "通道"; color: Theme.text-dim; font-size: Theme.fs-normal; vertical-alignment: center; }
+                        Text { width: Theme.spin-narrow; text: "起始"; color: Theme.text-dim; font-size: Theme.fs-normal; vertical-alignment: center; }
+                        Text { width: Theme.spin-narrow; text: "数量"; color: Theme.text-dim; font-size: Theme.fs-normal; vertical-alignment: center; }
+                        Text { text: "预览目标"; color: Theme.text-dim; font-size: Theme.fs-normal; vertical-alignment: center; horizontal-stretch: 1; }
                     }
                 }
 
@@ -268,52 +289,59 @@ export component ProtocolPage inherits Rectangle {
                         padding-left: 4px;
                         spacing: 8px;
                         Text {
-                            width: 108px;
+                            width: LedCols.unit;
                             text: row.label;
-                            color: #ffffff;
-                            font-size: 12px;
+                            color: Theme.text-title;
+                            font-size: Theme.fs-title;
                             vertical-alignment: center;
                             overflow: elide;
                         }
                         Rectangle {
-                            width: 34px;
+                            width: LedCols.swatch;
                             height: 20px;
                             y: 6px;
                             border-radius: 3px;
                             border-width: 1px;
-                            border-color: #3a424a;
+                            border-color: Theme.border-light;
                             background: row.sample;
                         }
                         Text {
-                            width: 132px;
+                            width: LedCols.rgb;
                             text: row.rgb_text;
-                            color: #b0b8c0;
-                            font-size: 11px;
+                            color: Theme.text-sub;
+                            font-size: Theme.fs-normal;
                             vertical-alignment: center;
                         }
-                        ComboBox {
-                            width: 104px;
+                        GuardedComboBox {
+                            // 104px 低于 fluent ComboBox 自报的 160px 下限 ⇒ 选项文本被箭头区吃掉。
+                            width: Theme.combo-width;
+                            horizontal-stretch: 0;
                             model: ["未映射", "通道0", "通道1"];
-                            current-index: row.ch_choice;
+                            model_index: row.ch_choice;
                             selected(_) => {
                                 root.light_map_set(row.unit, self.current-index, row.start, row.count);
                             }
                         }
-                        SpinBox {
-                            width: 112px;
+                        // 112px 低于 fluent SpinBox 自报的 128px 下限 ⇒ 数字被上下箭头挤到看不全。
+                        GuardedSpinBox {
+                            width: Theme.spin-narrow;
+                            horizontal-stretch: 0;
                             minimum: 0;
                             maximum: 999;
-                            value: row.start;
+                            model_value: row.start;
                             edited(v) => { root.light_map_set(row.unit, row.ch_choice, v, row.count); }
                         }
-                        SpinBox {
-                            width: 112px;
+                        GuardedSpinBox {
+                            width: Theme.spin-narrow;
+                            horizontal-stretch: 0;
                             minimum: 0;
                             maximum: 255;
-                            value: row.count;
+                            model_value: row.count;
                             edited(v) => { root.light_map_set(row.unit, row.ch_choice, row.start, v); }
                         }
                         Button {
+                            min-width: Theme.button-min-width;
+                            horizontal-stretch: 0;
                             text: root.pv_unit == row.unit ? "预览目标 ✓" : "设为预览目标";
                             clicked => { root.pv_unit = row.unit; }
                         }
@@ -325,6 +353,8 @@ export component ProtocolPage inherits Rectangle {
                     padding: 4px;
                     spacing: 10px;
                     Button {
+                        min-width: Theme.button-min-width;
+                        horizontal-stretch: 0;
                         text: "应用映射";
                         // 本地已判定冲突就不让发: LED_SET_REGION 整批原子, 失败等于什么都没变。
                         enabled: root.light_conflict == "";
@@ -332,8 +362,8 @@ export component ProtocolPage inherits Rectangle {
                     }
                     Text {
                         text: root.light_conflict != "" ? root.light_conflict : root.light_apply_status;
-                        color: root.light_conflict != "" ? #d9480f : #b0b8c0;
-                        font-size: 11px;
+                        color: root.light_conflict != "" ? Theme.err-soft : Theme.text-sub;
+                        font-size: Theme.fs-normal;
                         vertical-alignment: center;
                         horizontal-stretch: 1;
                         overflow: elide;
@@ -346,38 +376,43 @@ export component ProtocolPage inherits Rectangle {
                     spacing: 8px;
                     Text {
                         text: "预览目标: " + (root.pv_unit < 0 ? "全部单元" : "单元 " + root.pv_unit);
-                        color: #8fd6ff;
+                        color: Theme.accent;
                         vertical-alignment: center;
                     }
+                    // 一排色按钮: 全部不拉伸, 余量归行尾空白 —— 否则五个色按钮会各自被拉成一大块。
                     Button {
+                        min-width: Theme.button-min-width;
+                        horizontal-stretch: 0;
                         text: "改为全部";
                         clicked => { root.pv_unit = -1; }
                     }
-                    Button { text: "红"; clicked => { root.light_preview(root.pv_unit, 255, 0, 0); } }
-                    Button { text: "绿"; clicked => { root.light_preview(root.pv_unit, 0, 255, 0); } }
-                    Button { text: "蓝"; clicked => { root.light_preview(root.pv_unit, 0, 0, 255); } }
-                    Button { text: "白"; clicked => { root.light_preview(root.pv_unit, 255, 255, 255); } }
-                    Button { text: "熄灭"; clicked => { root.light_preview(root.pv_unit, 0, 0, 0); } }
+                    Button { horizontal-stretch: 0; text: "红"; clicked => { root.light_preview(root.pv_unit, 255, 0, 0); } }
+                    Button { horizontal-stretch: 0; text: "绿"; clicked => { root.light_preview(root.pv_unit, 0, 255, 0); } }
+                    Button { horizontal-stretch: 0; text: "蓝"; clicked => { root.light_preview(root.pv_unit, 0, 0, 255); } }
+                    Button { horizontal-stretch: 0; text: "白"; clicked => { root.light_preview(root.pv_unit, 255, 255, 255); } }
+                    Button { horizontal-stretch: 0; text: "熄灭"; clicked => { root.light_preview(root.pv_unit, 0, 0, 0); } }
                     Rectangle { horizontal-stretch: 1; }
                 }
 
                 HorizontalBox {
                     padding: 4px;
                     spacing: 8px;
-                    Text { text: "R"; color: #d9480f; vertical-alignment: center; }
-                    SpinBox { width: 112px; minimum: 0; maximum: 255; value: root.pv_r; edited(v) => { root.pv_r = v; } }
-                    Text { text: "G"; color: #2b8a3e; vertical-alignment: center; }
-                    SpinBox { width: 112px; minimum: 0; maximum: 255; value: root.pv_g; edited(v) => { root.pv_g = v; } }
-                    Text { text: "B"; color: #2b7de9; vertical-alignment: center; }
-                    SpinBox { width: 112px; minimum: 0; maximum: 255; value: root.pv_b; edited(v) => { root.pv_b = v; } }
+                    Text { text: "R"; color: Theme.err; vertical-alignment: center; }
+                    SpinBox { width: Theme.spin-narrow; horizontal-stretch: 0; minimum: 0; maximum: 255; value: root.pv_r; edited(v) => { root.pv_r = v; } }
+                    Text { text: "G"; color: Theme.ok; vertical-alignment: center; }
+                    SpinBox { width: Theme.spin-narrow; horizontal-stretch: 0; minimum: 0; maximum: 255; value: root.pv_g; edited(v) => { root.pv_g = v; } }
+                    Text { text: "B"; color: Theme.info; vertical-alignment: center; }
+                    SpinBox { width: Theme.spin-narrow; horizontal-stretch: 0; minimum: 0; maximum: 255; value: root.pv_b; edited(v) => { root.pv_b = v; } }
                     Button {
+                        min-width: Theme.button-min-width;
+                        horizontal-stretch: 0;
                         text: "发送该色";
                         clicked => { root.light_preview(root.pv_unit, root.pv_r, root.pv_g, root.pv_b); }
                     }
                     Text {
                         text: "预览色覆盖协议色，约 3 秒无新预览后自动回到灯板协议色。";
-                        color: #7f8c96;
-                        font-size: 11px;
+                        color: Theme.text-dim;
+                        font-size: Theme.fs-normal;
                         horizontal-stretch: 1;
                         overflow: elide;
                         vertical-alignment: center;
@@ -391,6 +426,7 @@ export component ProtocolPage inherits Rectangle {
                 vertical-stretch: 0;
                 group_title: "mai2light 协议参数";
                 rows: root.config_rows;
+                group_counts: root.config_group_counts;
                 set_bool(k, v) => { root.cfg_set_bool(k, v); }
                 set_number(k, v) => { root.cfg_set_number(k, v); }
                 set_number_hex(k, v) => { root.cfg_set_number_hex(k, v); }

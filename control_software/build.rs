@@ -31,50 +31,60 @@ fn main() {
         .expect("parse RP_FIRMWARE_VERSION from firmware version header");
     println!("cargo:rustc-env=EXPECTED_RP_FW_VERSION={rp_version}");
 
-    // 媒体源是进程内 COM DLL，由 Frame Server 自己加载，主包不把它作为 Rust 依赖链接；
-    // 构建脚本只把已产出的 DLL 字节嵌进上位机，DLL 缺失时生成空数组，让首次单独构建也能通过。
-    //
-    // 候选顺序(先命中者胜)：
-    //   1. MAI2_VCAM_DLL 环境变量指定的任意路径(打包/CI 可覆盖，避免写死本机路径)
-    //   2. C++ 子项目 vcam_source_cpp/x64/<Debug|Release>/mai2vcam_source.dll —— 正式实现
-    // 都不存在则维持"本次构建未内置媒体源 DLL"的明确降级: 刻意不回退到 target/<profile> 下的
-    // 同名 Rust cdylib —— 那个 COM 实现未跑通, 静默嵌进去只会让安装看似成功、实际起不来。
-    let manifest = std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
-    // MSBuild 的配置名首字母大写，与 cargo 的 profile 名不同。
-    let msbuild_config = if std::env::var("PROFILE").unwrap() == "release" {
-        "Release"
-    } else {
-        "Debug"
-    };
-    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
-    println!("cargo:rerun-if-env-changed=MAI2_VCAM_DLL");
-    if let Some(path) = std::env::var_os("MAI2_VCAM_DLL") {
-        candidates.push(std::path::PathBuf::from(path));
-    }
-    candidates.push(
-        manifest
-            .join("vcam_source_cpp")
-            .join("x64")
-            .join(msbuild_config)
-            .join("mai2vcam_source.dll"),
+    embed_vcam_filters();
+}
+
+/// 把 DirectShow 虚拟摄像头过滤器的 **两个位宽** DLL 内嵌进 exe。
+///
+/// 为什么内嵌: 安装是"用户点一下 → 提权 → regsvr32"的一次性动作, 独立分发两个 DLL 会
+/// 变成"文件丢了就装不上"的支持负担。两个位宽都带: 32 位应用只看 WOW6432Node 视图,
+/// 少一个就表现为"32 位游戏里看不到这个摄像头"。
+///
+/// DLL 由 MSBuild 构建(`vcam_source_cpp/mai2vcam_dshow.vcxproj`, Release|x64 与 Release|Win32),
+/// 这里只负责搬运。**缺文件不让 cargo 构建失败**: 上位机的其余功能与摄像头无关,
+/// 缺失时内嵌为空字节, 由 `vcam::backend::embedded_available()` 在 UI 上明确报"本次构建未内置"。
+fn embed_vcam_filters() {
+    const SOURCES: [(&str, &str); 2] = [
+        (
+            "BYTES_DS_X64",
+            "vcam_source_cpp/x64/Release/mai2vcam_dshow.dll",
+        ),
+        (
+            "BYTES_DS_X86",
+            "vcam_source_cpp/Win32/Release/mai2vcam_dshow.dll",
+        ),
+    ];
+    let out_dir = std::env::var("OUT_DIR").expect("cargo 未提供 OUT_DIR");
+    let mut generated = String::from(
+        "// 由 build.rs 生成: DirectShow 过滤器 DLL 的内嵌字节(空 = 本次构建未携带)。\n",
     );
-    let generated =
-        std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap()).join("vcam_embedded.rs");
-    let mut found: Option<&std::path::PathBuf> = None;
-    for dll in &candidates {
-        println!("cargo:rerun-if-changed={}", dll.display());
-        if found.is_none() && dll.is_file() {
-            found = Some(dll);
+    for (symbol, relative) in SOURCES {
+        println!("cargo:rerun-if-changed={relative}");
+        let source = std::path::Path::new(relative);
+        if source.is_file() {
+            // include_bytes! 走绝对路径, 避免受 OUT_DIR 相对位置影响。
+            let absolute = std::fs::canonicalize(source)
+                .unwrap_or_else(|error| panic!("解析 {relative} 绝对路径失败: {error}"));
+            let absolute = absolute
+                .to_str()
+                .expect("DLL 路径含非 UTF-8 字符")
+                .trim_start_matches(r"\\?\")
+                .replace('\\', r"\\");
+            generated.push_str(&format!(
+                "pub const {symbol}: &[u8] = include_bytes!(\"{absolute}\");\n"
+            ));
+        } else {
+            println!(
+                "cargo:warning=未找到 {relative}，虚拟摄像头安装将不可用(先用 MSBuild 构建 vcam_source_cpp)"
+            );
+            generated.push_str(&format!("pub const {symbol}: &[u8] = &[];\n"));
         }
     }
-    let embedded = match found {
-        Some(dll) => format!(
-            "pub const EMBEDDED: bool = true;\npub static BYTES: &[u8] = include_bytes!(r#\"{}\"#);\n",
-            dll.display()
-        ),
-        None => "pub const EMBEDDED: bool = false;\npub static BYTES: &[u8] = &[];\n".to_string(),
-    };
-    fs::write(generated, embedded).expect("write embedded virtual camera source");
+    fs::write(
+        std::path::Path::new(&out_dir).join("vcam_embedded.rs"),
+        generated,
+    )
+    .expect("写入 vcam_embedded.rs 失败");
 }
 
 /// 把 `ui/assets/icon.ico` 作为 Win32 ICON 资源嵌进可执行文件，
@@ -104,6 +114,8 @@ fn embed_windows_icon() {
     let mut res = winresource::WindowsResource::new();
     res.set_icon(ICON);
     if let Err(error) = res.compile() {
-        println!("cargo:warning=嵌入 exe 图标失败({error})，继续构建；如需图标请确认 Windows SDK 的 rc.exe 可用");
+        println!(
+            "cargo:warning=嵌入 exe 图标失败({error})，继续构建；如需图标请确认 Windows SDK 的 rc.exe 可用"
+        );
     }
 }

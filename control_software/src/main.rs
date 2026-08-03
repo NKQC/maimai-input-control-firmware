@@ -17,16 +17,18 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use log::info;
 
-use mai2control_ui::app_state::{AppController, CompiledAlgo, ConnState, zone_label};
+use mai2control_ui::app_state::{
+    AppController, ChBatchKind, CompiledAlgo, ConnState, SWEEP_DIVS, zone_label,
+};
 use mai2control_ui::proto::{
-    CfgValue, ConfigEntry, FIELD_BASELINE, FIELD_DIFF, FIELD_LATENCY, FIELD_RAW, FIELD_STATS,
-    FIELD_STATUS, PARAM_FINGER_TH, PARAM_NOISE_TH, PARAM_RESOLUTION, PARAM_SNS_CLK_DIV,
-    PARAM_SNS_CLK_SOURCE,
+    BATCH_PARAM_IDS, CfgValue, ConfigEntry, FIELD_BASELINE, FIELD_DIFF, FIELD_LATENCY, FIELD_RAW,
+    FIELD_STATS, FIELD_STATUS, PARAM_FINGER_TH, PARAM_NOISE_TH, PARAM_RESOLUTION,
+    PARAM_SNS_CLK_DIV, PARAM_SNS_CLK_SOURCE,
 };
 use mai2control_ui::proto::{LED_CH_UNMAPPED, LED_PREVIEW_ALL, LED_UNIT_COUNT};
 use mai2control_ui::touch_geometry;
 use mai2control_ui::vcam::{self, FRAME_H, FRAME_W, VcamState};
-use mai2control_ui::vcam::{backend as vcam_backend, share::FramePublisher};
+use mai2control_ui::vcam::{backend as vcam_backend, share, share::FramePublisher};
 use slint::Model;
 
 slint::include_modules!();
@@ -47,9 +49,6 @@ const CP_MEASURE_FAILED: u32 = 0x00FF_FFFF;
 
 /// 项目仓库地址(关于页展示 + 一键复制到剪贴板)。
 const REPO_URL: &str = "https://github.com/NKQC/project-mai2control.git";
-
-/// 全 36 通道掩码(36 位全 1): 全通道校准/基线复位用同一动作接口(ch_mask)一次覆盖所有通道。
-const ALL_CHANNELS_MASK: u64 = (1u64 << 36) - 1;
 
 /// 后台算法编译任务。
 /// ★为什么要有这东西★: 编译一次要顺序阻塞跑 gcc/objcopy/nm/objdump 四个子进程, 首次还要解压
@@ -93,6 +92,26 @@ fn line_numbers_for(text: &str) -> String {
 }
 
 /// PSoC 逐电极 BIST 测量窗口: MEASURE_CP 受理后需约 1.5s 才有结果, 期间 CP_GET 恒回"测量中(0)"。
+/// 单通道精调主图的**固定**横轴跨度。
+///
+/// ★为什么固定★ 原先左端取"缓冲里最老的样本", 于是跨度随缓冲填充、采样率变化、切通道而变:
+/// 同一段波形的横向尺度每帧都在动(抖), 缩放倍数与滚动条比例也跟着动。固定跨度后横向 1 像素
+/// 恒等于同一时长, 波形形状跨时间、跨通道都可比。
+/// 遥测缓冲的保留时长必须 ≥ 本值(见 `app_state::TELEM_RETAIN_US`), 否则窗口左侧永远是空的。
+const PLOT_WINDOW_US: u64 = 30_000_000;
+
+/// UI 主节拍。★上限帧率就是这个数的倒数★: Slint 只在属性变脏后重绘, 而回填全在这个 tick 里,
+/// 16ms 的旧值把整个界面钉死在 60fps。5ms ⇒ 200Hz 节拍, 高刷屏上才有 180fps 以上的余量。
+const UI_TICK_MS: u32 = 5;
+/// 视觉重投影(主图 SVG / 36 张通道卡片)的墙钟上限, 约 120Hz: 比屏幕快没有意义, 只会挤占节拍。
+const VISUAL_REFRESH_MS: u32 = 8;
+
+/// 把"每 N 毫秒做一次"表达成节拍判据。周期不足一个 tick 时退化为每 tick 都做。
+fn _every_ms(tick: u32, period_ms: u32) -> bool {
+    let period = (period_ms / UI_TICK_MS).max(1);
+    tick % period == 0
+}
+
 const CP_SWEEP_START_DELAY: Duration = Duration::from_millis(1500);
 /// 同一通道未出结果时的重试间隔。
 const CP_SWEEP_RETRY: Duration = Duration::from_millis(400);
@@ -101,26 +120,45 @@ const CP_SWEEP_MAX_TRIES: u8 = 3;
 /// 整轮抓取硬超时: 到点即停, 不管还剩几个通道。
 const CP_SWEEP_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// 手动电容测量的一轮全通道抓取状态。
-/// ★没有任何自动/周期性 Cp 获取★: 仅用户点击"测量电容"时置 started_at, 之后每 tick 最多发 1 条
-/// CP_GET 顺序推进 0..35, 全部取完(或超时)即回到空闲; 单通道最多 CP_SWEEP_MAX_TRIES 次。
+/// 固件恢复确认窗口：Cp 结果完成后必须看到新的遥测与扫描周期，不能用 XRES 掩盖恢复失败。
+const CP_RECOVERY_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// 手动电容测量的一轮全通道抓取与固件恢复确认状态。
+/// ★没有任何自动/周期性 Cp 获取★: 仅用户点击"测量电容"时置 started_at；结果收齐或抓取超时后
+/// 仍保留会话，直到固件自行恢复后的新遥测证明扫描推进，绝不由 Host 静默脉冲 XRES。
 struct CpSweep {
     started_at: Option<Instant>,
     next_at: Option<Instant>,
     ch: u8,
     tries: u8,
     req_version: u64,
+    recovery_telem_version: Option<u64>,
+    recovery_started_at: Option<Instant>,
+    recovery_detail: String,
     status: String,
 }
 
 impl CpSweep {
-    /// 结束本轮抓取(完成/超时/失败/断连)并落最终文案。
+    /// 结束本轮抓取/恢复确认并落最终文案。
     fn _stop(&mut self, status: String) {
         self.started_at = None;
         self.next_at = None;
         self.tries = 0;
+        self.recovery_telem_version = None;
+        self.recovery_started_at = None;
+        self.recovery_detail.clear();
         self.status = status;
     }
+
+    /// Cp 收集结束或超时后等待新遥测。基线版本保证旧快照不能冒充 BIST 恢复证据。
+    fn _await_recovery(&mut self, telem_version: u64, detail: String) {
+        self.next_at = None;
+        self.recovery_telem_version = Some(telem_version);
+        self.recovery_started_at = Some(Instant::now());
+        self.recovery_detail = detail;
+        self.status = "Cp 已完成，等待固件恢复后的新遥测与扫描周期…".to_string();
+    }
+
     /// 推进到下一个通道(本通道已出结果或已放弃)。
     fn _advance(&mut self) {
         self.ch = self.ch.saturating_add(1);
@@ -139,6 +177,16 @@ fn main() -> Result<()> {
 
     // 全局项数字输入围栏: 常量, 只需回填一次(不进每 tick 的刷新循环)。
     ui.set_global_fences(build_global_fences());
+    // 时钟树上的时钟源单选项同样是常量表, 一次回填。★与单通道精调共用同一份围栏派生★
+    // (`ParamFence::ui_choices()`), 界面不自造标签, 也就不会漂移出第二套"128 是什么"的说法。
+    {
+        let choices = mai2control_ui::proto::param_fence(PARAM_SNS_CLK_SOURCE).ui_choices();
+        let labels: Vec<slint::SharedString> =
+            choices.iter().map(|(t, _)| t.as_str().into()).collect();
+        let values: Vec<i32> = choices.iter().map(|(_, v)| *v as i32).collect();
+        ui.set_csd_clk_labels(slint::ModelRc::new(slint::VecModel::from(labels)));
+        ui.set_csd_clk_values(slint::ModelRc::new(slint::VecModel::from(values)));
+    }
 
     let controller = Rc::new(RefCell::new(AppController::new()));
 
@@ -355,26 +403,17 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
     ui.set_vcam_submit_secs(2);
     ui.set_vcam_display_secs(10);
     ui.set_vcam_enabled(false);
-    // 映射可在关闭虚拟相机时保留；启动即创建能让日志明确记录当前命名空间，且关闭后
-    // Frame Server 重新拉起时仍有合法黑帧可读。Global 被拒绝时绝不静默退回 Local。
-    let frame_publisher = Rc::new(RefCell::new(match FramePublisher::create() {
-        Ok(publisher) => Some(publisher),
-        Err(error) => {
-            log::error!("虚拟摄像头: 共享内存创建失败: {}", error);
-            None
-        }
-    }));
-    let share_runtime_status = frame_publisher
-        .borrow()
-        .as_ref()
-        .map(|publisher| {
-            format!(
-                "未运行 · 共享内存命名空间 {}",
-                publisher.namespace().label()
-            )
-        })
-        .unwrap_or_else(|| "未运行 · 共享内存创建失败".to_string());
-    ui.set_vcam_runtime_status(share_runtime_status.into());
+    // ★启动时**不**创建共享队列★: 队列的语义是"有且仅有一个活生产者", 生产者租约随
+    // `FramePublisher` 存活。启动即创建等于本进程一直霸占租约, 第二个实例(哪怕只是想开个界面
+    // 看日志)会被拒, 而摄像头明明还没启用。故只在"启用摄像头"回调里创建, 禁用/卸载时立刻 drop。
+    let frame_publisher: Rc<RefCell<Option<FramePublisher>>> = Rc::new(RefCell::new(None));
+    ui.set_vcam_runtime_status(
+        format!(
+            "未运行 · 启用后创建共享队列 {}(独占生产者租约)",
+            share::MAP_NAME
+        )
+        .into(),
+    );
     // 权限状态 + 一键提权重启: Windows 不能给已运行进程提权, 只能以管理员重开自身。
     ui.set_is_elevated(mai2control_ui::elevation::is_elevated());
     ui.set_elevation_text(mai2control_ui::elevation::limitation_text().into());
@@ -394,8 +433,6 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
     let install_status = vcam_backend::registration_status();
     log::info!("虚拟摄像头: 系统注册状态: {}", install_status);
     ui.set_vcam_install_status(install_status.into());
-    // COM 指针只在本 UI 线程的 Rc<RefCell> 中保存，绝不交给 Raw Input 线程。
-    let virtual_camera = Rc::new(RefCell::new(None::<vcam_backend::VirtualCamera>));
     // 可选 HID 键盘列表(下拉索引 0 = 所有键盘, 之后按此 Vec 顺序对应)。
     // 启动即按持久化的设备路径恢复选择: 设备不在场时回落到"所有键盘", 不静默失效。
     let vcam_kbd_list: Rc<RefCell<Vec<vcam::keyboard::KeyboardDevice>>> =
@@ -412,6 +449,9 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
         ch: 0,
         tries: 0,
         req_version: 0,
+        recovery_telem_version: None,
+        recovery_started_at: None,
+        recovery_detail: String::new(),
         status: "未测量".to_string(),
     }));
 
@@ -467,11 +507,27 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
         let _ = ctrl.reboot_psoc();
     });
 
-    // 全通道频率自适应下探(0xFF=统一分频; 阻塞类, 结果经 tick 回填 auto_tune_status)。
+    // 全通道频率自适应: ★改走 host 侧逐通道串行队列★(不再是 0xFF 让固件自己 for 36 遍)。
+    // 队列会先把每通道的 IDAC 增益档写入并回读确认, 再逐通道下探; 全程可取消、有进度、
+    // 失败能指名到通道。见 app_state::ch_ops。
     let ctrl_clone = controller.clone();
     ui.on_auto_tune(move || {
         let mut ctrl = ctrl_clone.borrow_mut();
-        let _ = ctrl.auto_tune(0xFF);
+        if let Err(e) = ctrl.ch_batch_start(ChBatchKind::AutoTune) {
+            ctrl.push_log_warn(format!("逐通道频率自适应未能开始: {}", e));
+        }
+    });
+
+    // 批量队列取消(三种全通道操作共用一条队列, 故只有一个取消入口)。
+    let ctrl_clone = controller.clone();
+    ui.on_batch_op_cancel(move || {
+        ctrl_clone.borrow_mut().ch_batch_cancel();
+    });
+
+    // "Cp 辅助"开关: 逐通道自适应按实测 Cp 推每通道的增益档/频率偏好档。
+    let ctrl_clone = controller.clone();
+    ui.on_set_cp_assist(move |on| {
+        ctrl_clone.borrow_mut().set_cp_assist(on);
     });
 
     // PSoC 救砖: 经 SWD 强制重刷 PSoC 并重新下发算法/CSD(UI 已做两段式二次确认)。
@@ -488,17 +544,22 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
         let _ = ctrl.set_config_number("calib.pref", v.clamp(1, 7) as f64);
     });
 
-    // 全通道校准 / 全通道基线复位(立即执行的动作, 不进草稿)。掩码 = 36 位全 1。
+    // 全通道校准 / 全通道基线复位: 同样走 host 侧逐通道串行队列(每通道一条短命令, 可取消)。
+    // ★固件那条全通道路径不删★ —— "恢复默认"等设备内部触发仍要用它, 只是 UI 不再从这里进。
     let ctrl_clone = controller.clone();
     ui.on_global_calibrate(move || {
         let mut ctrl = ctrl_clone.borrow_mut();
-        let _ = ctrl.calibrate(ALL_CHANNELS_MASK);
+        if let Err(e) = ctrl.ch_batch_start(ChBatchKind::Calibrate) {
+            ctrl.push_log_warn(format!("逐通道校准未能开始: {}", e));
+        }
     });
 
     let ctrl_clone = controller.clone();
     ui.on_global_baseline_reset(move || {
         let mut ctrl = ctrl_clone.borrow_mut();
-        let _ = ctrl.baseline_reset(ALL_CHANNELS_MASK);
+        if let Err(e) = ctrl.ch_batch_start(ChBatchKind::BaselineReset) {
+            ctrl.push_log_warn(format!("逐通道基线复位未能开始: {}", e));
+        }
     });
 
     // 本通道频率自适应(只下探当前选中通道, 其余通道分频不动)。
@@ -661,6 +722,46 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
     let ctrl_clone = controller.clone();
     ui.on_batch_clear(move || {
         ctrl_clone.borrow_mut().batch_clear();
+    });
+
+    // 批量启用/禁用: 复用 PARAM_ENABLED(0x0C) 的草稿路径, 与逐通道开关同一条下发链。
+    let ctrl_clone = controller.clone();
+    ui.on_batch_enable_channels(move || {
+        let _ = ctrl_clone.borrow_mut().batch_set_enabled(true);
+    });
+
+    let ctrl_clone = controller.clone();
+    ui.on_batch_disable_channels(move || {
+        let _ = ctrl_clone.borrow_mut().batch_set_enabled(false);
+    });
+
+    // 抽屉收起: 真正清掉 Rust 侧的本次会话(勾选/待写值/源通道), 不是只把面板藏起来 ——
+    // 勾选态活在 AppController 里, 只藏面板的话"应用到已选通道"仍会照着上一批勾选执行。
+    let ctrl_clone = controller.clone();
+    ui.on_batch_drawer_closed(move || {
+        ctrl_clone.borrow_mut().batch_drawer_closed();
+    });
+
+    // 全通道页的采集开关(真停/开遥测流), 与曲线页的"暂停画面"分属两套语义。
+    let ctrl_clone = controller.clone();
+    ui.on_telem_source_start(move || {
+        ctrl_clone.borrow_mut().telem_user_start();
+    });
+
+    let ctrl_clone = controller.clone();
+    ui.on_telem_source_stop(move || {
+        ctrl_clone.borrow_mut().telem_user_stop();
+    });
+
+    // 单通道精调页的通道启用开关(草稿路径, 由"保存到设备"下发)。
+    let ctrl_clone = controller.clone();
+    let ui_weak_ch_en = ui.as_weak();
+    ui.on_curve_ch_enable_set(move |on| {
+        let Some(ui) = ui_weak_ch_en.upgrade() else {
+            return;
+        };
+        let ch = ui.get_sel_channel().clamp(0, 35) as u8;
+        let _ = ctrl_clone.borrow_mut().set_ch_enabled(ch, on);
     });
 
     let ctrl_clone = controller.clone();
@@ -1325,21 +1426,15 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
         let _ = ctrl.set_binding_channel(zone_idx as usize, 0xFF);
     });
 
-    // 曲线页
+    // 曲线页: 两个回调只管理绘图快照，绝不改变遥测接收状态。
     let ctrl_clone = controller.clone();
-    ui.on_telem_start(move || {
-        let mut ctrl = ctrl_clone.borrow_mut();
-        let _ = ctrl.start_telemetry(
-            100,
-            FIELD_RAW | FIELD_BASELINE | FIELD_DIFF | FIELD_STATUS,
-            0xFFFFFFFF_FFFFFFFFu64,
-        );
+    ui.on_plot_resume(move || {
+        ctrl_clone.borrow_mut().plot_unfreeze();
     });
 
     let ctrl_clone = controller.clone();
-    ui.on_telem_stop(move || {
-        let mut ctrl = ctrl_clone.borrow_mut();
-        let _ = ctrl.stop_telemetry();
+    ui.on_plot_freeze(move || {
+        ctrl_clone.borrow_mut().plot_freeze("用户暂停画面");
     });
 
     // 从全通道状态卡进入精调：选中物理通道并切换到“单通道精调”子标签(索引 4)。
@@ -1363,9 +1458,32 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
     let ui_bsln = ui_weak.clone();
     ui.on_curve_baseline_reset(move || {
         let ui = ui_bsln.upgrade().unwrap();
-        let ch = ui.get_sel_channel() as u8;
+        let ch = ui.get_sel_channel().clamp(0, 35) as u8;
         let mut ctrl = ctrl_clone.borrow_mut();
-        let _ = ctrl.baseline_reset(1u64 << ch);
+        // 掩码只含目标通道 —— 固件已能逐通道复位(SENSOR_CH_ALL 哨兵之外即单通道), 其余 35 个不动。
+        // ★只复位, 不再顺带冻结画面★ 冻结是"暂停画面"按钮的职责: 复位本身要看的是复位之后
+        // 基线怎么收敛, 冻住反而停在复位前的旧数据上; 而且冻结期间设备仍在出帧, 解冻时那段空档
+        // 现在由绘图管线按"无覆盖 ⇒ 虚线"表达(见 fill_uncovered_with_dashes), 不需要靠冻结遮掩。
+        if let Err(e) = ctrl.baseline_reset(1u64 << ch) {
+            ctrl.push_log_warn(format!("CH{} 基线复位失败: {}", ch, e));
+        }
+    });
+
+    // 单通道响应噪声频谱扫描: 开始 / 取消(都只作用于当前精调通道)。
+    let ctrl_clone = controller.clone();
+    let ui_sweep = ui_weak.clone();
+    ui.on_curve_spectrum_start(move || {
+        let ui = ui_sweep.upgrade().unwrap();
+        let ch = ui.get_sel_channel().clamp(0, 35) as u8;
+        let mut ctrl = ctrl_clone.borrow_mut();
+        if let Err(e) = ctrl.noise_sweep_start(ch) {
+            ctrl.push_log_warn(format!("频谱扫描未能开始: {}", e));
+        }
+    });
+
+    let ctrl_clone = controller.clone();
+    ui.on_curve_spectrum_cancel(move || {
+        ctrl_clone.borrow_mut().noise_sweep_cancel();
     });
 
     let ctrl_clone = controller.clone();
@@ -1409,6 +1527,9 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
                 state.ch = 0;
                 state.tries = 0;
                 state.req_version = 0;
+                state.recovery_telem_version = None;
+                state.recovery_started_at = None;
+                state.recovery_detail.clear();
                 state.status = "测量中…".to_string();
                 ctrl.push_log("测量电容: 已触发全电极 BIST, 将顺序回读 36 通道 Cp(仅本次)");
             }
@@ -1647,109 +1768,70 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
         }
     });
 
-    // 虚拟摄像头: 开启前先核验机器级注册；共享映射和 COM 后端都在 UI 线程创建，
-    // 避免 Frame Server 与 Raw Input 线程之间错误共享 COM 指针。
+    // 虚拟摄像头(与 OBS Virtual Camera 同实现: DirectShow 源过滤器)。
+    // ★上位机侧没有任何 COM 对象要持有★: 消费端(游戏/Unity/OBS)在自己的进程里创建过滤器,
+    // 本进程只负责把 QR 帧写进共享队列。开关只控制"采集 + 队列生产者租约"。
     let vcam_cb = vcam.clone();
     let publisher_cb = frame_publisher.clone();
-    let camera_cb = virtual_camera.clone();
     let ui_vcam = ui_weak.clone();
     ui.on_set_vcam_enabled(move |on| {
         let Some(ui) = ui_vcam.upgrade() else { return };
-        let namespace = if on && publisher_cb.borrow().is_none() {
-            match FramePublisher::create() {
-                Ok(publisher) => {
-                    let namespace = publisher.namespace();
-                    *publisher_cb.borrow_mut() = Some(publisher);
-                    Some(namespace)
-                }
-                Err(error) => {
-                    log::error!("虚拟摄像头: 无法启动帧发布: {}", error);
-                    vcam_cb.set_enabled(false);
-                    ui.set_vcam_enabled(false);
-                    ui.set_vcam_runtime_status("未运行 · 共享内存创建失败".into());
-                    return;
-                }
-            }
-        } else {
-            publisher_cb
-                .borrow()
-                .as_ref()
-                .map(|publisher| publisher.namespace())
-        };
-        let Some(namespace) = namespace else { return };
-        if on {
-            match vcam_backend::is_registered() {
-                Ok(true) => {}
-                Ok(false) => {
-                    log::warn!("虚拟摄像头: 未注册媒体源 DLL；请先点击“安装(需管理员)”");
-                    vcam_cb.set_enabled(false);
-                    ui.set_vcam_enabled(false);
-                    ui.set_vcam_install_status(vcam_backend::registration_status().into());
-                    ui.set_vcam_runtime_status(
-                        format!("未运行 · 共享内存命名空间 {} · 需先安装", namespace.label())
-                            .into(),
-                    );
-                    return;
-                }
-                Err(error) => {
-                    log::error!("虚拟摄像头: 注册状态核验失败: {}", error);
-                    vcam_cb.set_enabled(false);
-                    ui.set_vcam_enabled(false);
-                    ui.set_vcam_runtime_status("未运行 · 注册状态核验失败".into());
-                    return;
-                }
-            }
-            if camera_cb.borrow().is_none() {
-                match vcam_backend::VirtualCamera::start() {
-                    Ok(camera) => *camera_cb.borrow_mut() = Some(camera),
-                    Err(error) => {
-                        log::error!("虚拟摄像头: Media Foundation 启动失败: {}", error);
-                        vcam_cb.set_enabled(false);
-                        ui.set_vcam_enabled(false);
-                        ui.set_vcam_runtime_status(
-                            format!("未运行 · 共享内存命名空间 {} · 启动失败", namespace.label())
-                                .into(),
-                        );
-                        return;
-                    }
-                }
-            }
-            let access = camera_cb
-                .borrow()
-                .as_ref()
-                .map(|camera| camera.access_name())
-                .unwrap_or("未知");
-            vcam_cb.set_enabled(true);
-            vcam::keyboard::start(vcam_cb.clone());
-            ui.set_vcam_runtime_status(
-                format!(
-                    "运行中 ({}) · 共享内存命名空间 {}",
-                    access,
-                    namespace.label()
-                )
-                .into(),
-            );
-        } else {
+        if !on {
+            // 停止顺序不能变：先截断采集，再释放队列生产者租约。
             vcam_cb.set_enabled(false);
             vcam::keyboard::stop();
-            if let Some(camera) = camera_cb.borrow_mut().take() {
-                camera.stop();
-            }
+            *publisher_cb.borrow_mut() = None;
             ui.set_vcam_runtime_status(
-                format!("未运行 · 共享内存命名空间 {}", namespace.label()).into(),
+                "未运行 · 摄像头仍在系统设备列表中，消费端会读到黑帧".into(),
             );
+            return;
         }
+        // 启动顺序：注册核验 → 队列 → 键盘采集。每个失败分支都回收已完成阶段。
+        match vcam_backend::is_registered() {
+            Ok(true) => {}
+            Ok(false) => {
+                log::warn!("虚拟摄像头: DirectShow 注册未完整核验；请先点击“安装(需管理员)”");
+                vcam_cb.set_enabled(false);
+                ui.set_vcam_enabled(false);
+                ui.set_vcam_install_status(vcam_backend::registration_status().into());
+                ui.set_vcam_runtime_status("未运行 · DirectShow 注册未完整安装".into());
+                return;
+            }
+            Err(error) => {
+                log::error!("虚拟摄像头: 注册状态核验失败: {}", error);
+                vcam_cb.set_enabled(false);
+                ui.set_vcam_enabled(false);
+                ui.set_vcam_runtime_status("未运行 · 注册状态核验失败".into());
+                return;
+            }
+        }
+        match FramePublisher::create() {
+            Ok(publisher) => *publisher_cb.borrow_mut() = Some(publisher),
+            Err(error) => {
+                log::error!("虚拟摄像头: 无法创建共享队列: {}", error);
+                vcam_cb.set_enabled(false);
+                ui.set_vcam_enabled(false);
+                ui.set_vcam_runtime_status(format!("未运行 · {}", error).into());
+                return;
+            }
+        }
+        vcam_cb.set_enabled(true);
+        vcam::keyboard::start(vcam_cb.clone());
+        ui.set_vcam_runtime_status("运行中 · 扫码即推 QR 帧到共享队列，消费端随时可打开".into());
     });
-    // ★安装/卸载必须离开 UI 线程★: 提权走 ShellExecute("runas"), UAC 弹窗期间调用会阻塞,
-    // 再加上要等 regsvr32 跑完才能核验注册表 —— 全都压在事件循环里就是标题栏那个"(未响应)"。
-    // 这里丢到工作线程, 结果用 invoke_from_event_loop 回投给 UI。
+    // 安装/卸载仍在后台执行，避免 UAC 和 regsvr32 阻塞 Slint 事件循环。
     let ui_vcam_install = ui_weak.clone();
     ui.on_install_vcam(move || {
-        if let Some(ui) = ui_vcam_install.upgrade() {
-            ui.set_vcam_install_status("安装中… 请在 UAC 弹窗上确认".into());
+        let Some(ui) = ui_vcam_install.upgrade() else {
+            return;
+        };
+        if ui.get_vcam_deploy_busy() {
+            return;
         }
+        ui.set_vcam_deploy_busy(true);
+        ui.set_vcam_install_status("安装中… 请在 UAC 弹窗上确认".into());
         let ui_done = ui_vcam_install.clone();
-        std::thread::Builder::new()
+        let spawned = std::thread::Builder::new()
             .name("vcam-install".into())
             .spawn(move || {
                 let status = match vcam_backend::install() {
@@ -1765,27 +1847,34 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
                 };
                 let _ = ui_done.upgrade_in_event_loop(move |ui| {
                     ui.set_vcam_install_status(status.into());
+                    ui.set_vcam_deploy_busy(false);
                 });
             })
-            .ok();
+            .is_ok();
+        if !spawned {
+            ui.set_vcam_install_status("安装未启动: 无法创建工作线程".into());
+            ui.set_vcam_deploy_busy(false);
+        }
     });
     let ui_vcam_uninstall = ui_weak.clone();
-    let camera_uninstall = virtual_camera.clone();
     let vcam_uninstall = vcam.clone();
+    let publisher_uninstall = frame_publisher.clone();
     ui.on_uninstall_vcam(move || {
         let Some(ui) = ui_vcam_uninstall.upgrade() else {
             return;
         };
+        if ui.get_vcam_deploy_busy() {
+            return;
+        }
         vcam_uninstall.set_enabled(false);
         vcam::keyboard::stop();
-        if let Some(camera) = camera_uninstall.borrow_mut().take() {
-            camera.stop();
-        }
-        ui.set_vcam_install_status("卸载中… 请在 UAC 弹窗上确认".into());
+        *publisher_uninstall.borrow_mut() = None;
         ui.set_vcam_enabled(false);
-        // 同安装: 提权 + 等命令结束不能压在事件循环里。
+        ui.set_vcam_runtime_status("未运行 · 采集与共享队列已释放".into());
+        ui.set_vcam_deploy_busy(true);
+        ui.set_vcam_install_status("卸载中… 请在 UAC 弹窗上确认".into());
         let ui_done = ui_vcam_uninstall.clone();
-        std::thread::Builder::new()
+        let spawned = std::thread::Builder::new()
             .name("vcam-uninstall".into())
             .spawn(move || {
                 let status = match vcam_backend::uninstall() {
@@ -1801,9 +1890,14 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
                 };
                 let _ = ui_done.upgrade_in_event_loop(move |ui| {
                     ui.set_vcam_install_status(status.into());
+                    ui.set_vcam_deploy_busy(false);
                 });
             })
-            .ok();
+            .is_ok();
+        if !spawned {
+            ui.set_vcam_install_status("卸载未启动: 无法创建工作线程".into());
+            ui.set_vcam_deploy_busy(false);
+        }
     });
     let vcam_cb = vcam.clone();
     ui.on_set_vcam_submit_secs(move |s| {
@@ -1868,13 +1962,24 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
 
     // 主事件循环
     let mut last_config_version = 0u64;
-    let mut last_telem_version = 0u64;
+    // 主图独立版本: 冻结期间不随实时遥测推进，避免重复 SVG/path 重算；解冻时跳到最新缓冲。
+    let mut last_plot_version = u64::MAX;
     // 用非初始值确保即使尚未收到遥测，也先把完整 36 通道卡片回填到 UI。
     let mut last_telem_version_all = u64::MAX;
     // Cp 缓存版本门控：无新遥测但有新 Cp 响应时也要刷新全通道卡片的 cp_text。
     let mut last_cp_version_all = u64::MAX;
+    // 启用态(0x0C 草稿)与排序/筛选选择的门控: 三者任一变化都要重排/重筛全通道网格。
+    let mut last_param_version_all = u64::MAX;
+    let mut last_sort_all = -1i32;
+    let mut last_show_disabled_all = false;
     let mut last_param_version = 0u64;
+    // 绑定区模型仅由配置/Cp/触摸掩码/绑定进度等实际展示输入驱动，绝不由每帧遥测版本触发。
+    let mut last_zone_key: Option<(u64, u64, u64, Option<(u8, u8)>, bool)> = None;
     let mut last_batch_sel_version = u64::MAX;
+    // 噪声频谱格子模型的重建门控: 448 格每 tick 无条件重建纯属浪费, 只在扫描状态或当前选择通道变了才重建。
+    // 结果固定归属其扫描通道；切到别的 CH 时必须清空模型，绝不把旧热图冒充新通道的数据。
+    let mut last_spectrum_version = u64::MAX;
+    let mut last_spectrum_channel = -1i32;
     let mut last_combo_version = u64::MAX;
     // 上次下发给 UI 的组合映射分区文本。★行身份稳定所需★: combo_zones_text 是已有映射列表
     // Repeater 的 model, 每次 set 新 ModelRc 都会重建全部 ComboRow —— 行内 KeyCaptureBox 的
@@ -1883,6 +1988,8 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
     let mut last_combo_zones: Vec<slint::SharedString> = Vec::new();
     let mut last_channel = -1i32;
     let mut last_curve_visibility = (false, false, false);
+    // Cp 失败通道列表(形如 "CH0 CH5"); 只在内容变化时回填, 免得每 tick 都往 UI 写字符串。
+    let mut last_cp_failed = String::new();
     // 算法叠加脏标记: 它会改变主图 path, 与遥测版本一起做门控(绘图区尺寸已不再参与, 见 fit: fill)。
     let mut algo_overlay_dirty = true;
     let mut reconnect_tick = 0u32;
@@ -1935,6 +2042,18 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
         build_param_rows(&controller.borrow().params_of(0)),
     ));
     ui.set_curve_params(slint::ModelRc::from(curve_params_model.clone()));
+    // 批量面板的"待写值"一列同样必须常驻同一实例。★为什么★ 原先每次刷新都 `set_batch_param_rows`
+    // 换掉整个 ModelRc, Repeater 随之重建全部行元素 ⇒ 用户正在编辑的那个 SpinBox 连元素一起消失,
+    // 表现为"打一个字就失焦"(与 GuardedSpinBox 的焦点守卫无关 —— 守卫救不了被销毁的元素)。
+    // 常驻 + 逐行 set_row_data 后, 值没变的行连数据都不动, 编辑中的行也不会被重建。
+    // 行清单唯一来源 = `proto::BATCH_PARAM_IDS`(分辨率是全局项, 故不在其中)。
+    let batch_params_model: Rc<slint::VecModel<ParamRow>> = Rc::new(slint::VecModel::from(
+        BATCH_PARAM_IDS
+            .iter()
+            .map(|id| build_param_row(*id, -1))
+            .collect::<Vec<ParamRow>>(),
+    ));
+    ui.set_batch_param_rows(slint::ModelRc::from(batch_params_model.clone()));
 
     // 键盘键码下拉的共享键名表(一次性设置)。
     let kbd_choice_names: Vec<slint::SharedString> =
@@ -1979,21 +2098,49 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
     let vcam_timer = vcam.clone();
     let publisher_timer = frame_publisher.clone();
     let mut last_vcam_frame_version = 0u32;
+    // ★tick 剖面(每 ~2s 一条 WARN)★: "卡顿"必须用实测归因, 不能靠猜。分别累计整帧、IO 排空、
+    // 主图重建、36 卡片重建的耗时与命中次数; 峰值单独记, 因为卡顿是峰值现象而非均值现象。
+    let mut prof_ticks = 0u32;
+    let mut prof_tick_us = 0u64;
+    let mut prof_tick_max_us = 0u64;
+    let mut prof_poll_us = 0u64;
+    let mut prof_chart_us = 0u64;
+    let mut prof_chart_hits = 0u32;
+    let mut prof_chart_max_us = 0u64;
+    let mut prof_cards_us = 0u64;
+    let mut prof_cards_hits = 0u32;
+    // tick 间隔: 16ms 定时器的实际到达节奏。回调自身很短却间隔很大 ⇒ 时间花在事件循环/渲染上,
+    // 而不是我们的数据处理里 —— 这是区分"逻辑慢"与"渲染慢"的唯一直接判据。
+    let mut prof_last_tick: Option<Instant> = None;
+    let mut prof_gap_us = 0u64;
+    let mut prof_gap_max_us = 0u64;
+    let mut prof_gaps = 0u32;
     let timer = slint::Timer::default();
-    timer.start(slint::TimerMode::Repeated, std::time::Duration::from_millis(16), move || {
+    timer.start(slint::TimerMode::Repeated, Duration::from_millis(UI_TICK_MS as u64), move || {
+        let prof_tick_start = Instant::now();
+        if let Some(previous) = prof_last_tick.replace(prof_tick_start) {
+            let gap = prof_tick_start.duration_since(previous).as_micros() as u64;
+            prof_gap_us += gap;
+            prof_gap_max_us = prof_gap_max_us.max(gap);
+            prof_gaps += 1;
+        }
         let ui = ui_weak.upgrade().unwrap();
         let mut ctrl = controller.borrow_mut();
 
-        // 虚拟摄像头: 推进时序状态机(显示到期转黑)，帧变化时先提交 RGB24 到命名
-        // 共享内存，再刷新 UI 预览。序号提交由 FramePublisher 保证在像素写完之后发生。
+        // 虚拟摄像头: 推进时序状态机(显示到期转黑)。帧变化时把 RGB24 转 NV12 提交到共享
+        // 队列(序号在像素写完之后才提交, 由 FramePublisher 保证), 再刷新 UI 预览。
+        // 每 tick 都刷心跳: 过滤器靠 tick_ms 区分"画面没变"与"生产者已消失(进程被杀)"。
         vcam_timer.tick();
+        if let Some(publisher) = publisher_timer.borrow_mut().as_mut() {
+            publisher.heartbeat();
+        }
         let vframe_ver = vcam_timer.frame_version();
         if vframe_ver != last_vcam_frame_version {
             last_vcam_frame_version = vframe_ver;
             let rgb = vcam_timer.frame_copy();
             if let Some(publisher) = publisher_timer.borrow_mut().as_mut() {
                 if let Err(error) = publisher.publish(&rgb) {
-                    log::error!("虚拟摄像头: 帧共享发布失败: {}", error);
+                    log::error!("虚拟摄像头: 帧发布失败: {}", error);
                 }
             }
             let mut buf = slint::SharedPixelBuffer::<slint::Rgb8Pixel>::new(FRAME_W as u32, FRAME_H as u32);
@@ -2025,13 +2172,19 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
             // 时钟树的分频范围需要全 36 通道 snsClk(恢复默认后已全变): 一条批量取回, 非 36 条单发。
             let _ = ctrl.request_param_all_channels(PARAM_SNS_CLK_DIV);
         }
-        ctrl.poll();
+        let prof_poll_start = Instant::now();
+        ctrl.poll_ui();
+        prof_poll_us += prof_poll_start.elapsed().as_micros() as u64;
         // 侦听绑定: 捕获下一次触摸的物理通道并写入草稿(仅在侦听态时有动作)。
         let _ = ctrl.listen_tick();
 
         // 自动重连:断开且有设备时每~2s 刷新并重连第一个,用户无需手动连接。
         reconnect_tick = reconnect_tick.wrapping_add(1);
-        if ctrl.state() == ConnState::Disconnected && reconnect_tick % 125 == 0 {
+        // ★节拍与墙钟解耦★ 所有周期性动作都按毫秒表达(`_every_ms`), 不再写死"每 N 个 tick" ——
+        // tick 周期改动时那种写法会静默把所有轮询间隔一起缩放掉。
+        // 视觉重建(SVG/36 卡片)按墙钟限速: 遥测 170Hz+, 重投影没必要比屏幕刷新还快。
+        let visual_refresh_tick = _every_ms(reconnect_tick, VISUAL_REFRESH_MS);
+        if ctrl.state() == ConnState::Disconnected && _every_ms(reconnect_tick, 2_000) {
             ctrl.refresh_devices();
             let labels: Vec<slint::SharedString> =
                 ctrl.device_labels().into_iter().map(|s| s.into()).collect();
@@ -2042,13 +2195,13 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
         }
         // 握手重试:仍在 Connecting(已发首个 HELLO 但未收到 DEVICE_INFO)时每 ~400ms 重发 HELLO。
         // 重连场景下设备端 bulk OUT data toggle 与新句柄不同步会丢弃首个 HELLO, 重发即可握手成功。
-        if ctrl.state() == ConnState::Connecting && reconnect_tick % 25 == 0 {
+        if ctrl.state() == ConnState::Connecting && _every_ms(reconnect_tick, 400) {
             let _ = ctrl.resend_hello();
         }
         // PSoC 链路活性探测(~1s 一次)。★只在用户手动停流时才真的发包★(门控在 psoc_link_probe
         // 内): 遥测在跑时每帧的 samples_per_sec 就是代数推进证据, 不需要探; 而 HELLO 会顺带停流,
         // 流式期间探测等于把遥测踢停。停流后链路状态没有别的来源, 不探就只能显示握手时的旧快照。
-        if reconnect_tick % 62 == 0 {
+        if _every_ms(reconnect_tick, 1_000) {
             ctrl.psoc_link_probe();
         }
 
@@ -2086,10 +2239,50 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
                 _ => String::new(),
             }
         } else {
-            String::new()
+            // ★host 侧逐通道队列跑的是"每通道一次单通道自适应"★ ⇒ 设备侧再也不会给出"全通道那一次"
+            // 的统一终态, 全局页的结论必须从 36 个通道各自的终态汇总出来。
+            let mut ok = 0u32;
+            let mut bad = 0u32;
+            for ch in 0..36u8 {
+                match ctrl.auto_tune_ch_result(ch) {
+                    1 => ok += 1,
+                    2 => bad += 1,
+                    _ => {}
+                }
+            }
+            if ok + bad == 0 {
+                String::new()
+            } else {
+                let (lo, hi) = ctrl.sns_clk_div_range();
+                format!(
+                    "逐通道自适应: {} 个通道落档成功, {} 个超出硬件能力(保持原分频); 已下探 {}/36, 分频范围 ÷{} – ÷{}",
+                    ok, bad, ok + bad, lo, hi
+                )
+            }
         };
         ui.set_auto_tune_status(auto_tune_status.into());
+        // 全通道操作的 host 侧串行队列: 进度/状态/取消可用性(三种操作共用一条队列, 故只一份状态)。
+        ui.set_batch_op_active(ctrl.ch_batch_active());
+        ui.set_batch_op_progress(ctrl.ch_batch_progress());
+        ui.set_batch_op_status(ctrl.ch_batch_status().into());
+        ui.set_cp_assist(ctrl.cp_assist());
+        // 绘图视窗冻结态("停止" = 只冻画面; 遥测仍在收)。
+        ui.set_plot_frozen(ctrl.plot_frozen());
+        // 单通道响应噪声频谱。结果带不可变扫描通道：选择已切换时清空热图，状态文本仍说明它属于哪一条 CH。
+        ui.set_curve_spectrum_active(ctrl.noise_sweep_active());
+        ui.set_curve_spectrum_progress(ctrl.noise_sweep_progress());
+        ui.set_curve_spectrum_status(ctrl.noise_sweep_status().into());
         let sel_ch = ui.get_sel_channel().clamp(0, 35) as u8;
+        if ctrl.noise_sweep_version() != last_spectrum_version || last_spectrum_channel != sel_ch as i32 {
+            last_spectrum_version = ctrl.noise_sweep_version();
+            last_spectrum_channel = sel_ch as i32;
+            let cells = if ctrl.noise_sweep_result_channel() == Some(sel_ch) {
+                build_spectrum_cells(&ctrl)
+            } else {
+                Vec::new()
+            };
+            ui.set_curve_spectrum_cells(slint::ModelRc::new(slint::VecModel::from(cells)));
+        }
         let curve_auto_tune_status = match ctrl.auto_tune_ch_result(sel_ch) {
             1 => format!("✔ CH{} 自适应成功: snsClk 分频 = {}", sel_ch, ctrl.auto_tune_ch_div(sel_ch)),
             2 => format!("✖ CH{} 自适应失败: 已到硬件频率下限仍压不到目标%, 请降低校准目标% 或调整 IDAC", sel_ch),
@@ -2284,7 +2477,9 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
             ui.set_algo_active_path(algo_active_path.into());
             ui.set_algo_trace_point_count(active_series.len() as i32);
             ui.set_algo_sel_channel(ui.get_sel_channel());
-            algo_overlay_dirty = true;
+            if !ctrl.plot_frozen() {
+                algo_overlay_dirty = true;
+            }
         }
 
         // 算法可调变量(cfg[8])行回填(version 门控): schema 来自当前编辑器源码, 值来自设备缓存。
@@ -2385,6 +2580,10 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
         // 才收回轻档(仅采样率+延迟), 主页延迟卡照常有数据。
         let want_channel_stream = connected && ui.get_current_view() == 1;
         ctrl.telem_set_scope(want_channel_stream);
+        // 遥测自愈: 期望在推流却 >3s 收不到带采样统计的帧就重下发一次 TELEM_START(最快 5s 一次)。
+        // ★限流是硬要求★: 本设备所有流量共用一对 bulk 端点, 连发只会打爆 vendor FIFO 并与
+        // 校准/自适应抢链路(本仓已因此掉线过) —— 自愈不能反过来把固件带崩。
+        ctrl.telem_heal_tick();
 
         let global_tune_visible = connected && ui.get_current_view() == 1 && ui.get_settings_tab() == 3;
         if global_tune_visible && !last_global_tune_visible && was_connected {
@@ -2402,18 +2601,18 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
         if protocol_visible {
             // 进页边沿总取一次(折叠态的摘要行也要有真值); 持续轮询只在展开时做。
             if !last_protocol_visible
-                || (ui.get_light_panel_expanded() && reconnect_tick % 12 == 0)
+                || (ui.get_light_panel_expanded() && _every_ms(reconnect_tick, 200))
             {
                 let _ = ctrl.led_request_state();
             }
         }
         last_protocol_visible = protocol_visible;
 
-        if connected && reconnect_tick % 63 == 0 {
+        if connected && _every_ms(reconnect_tick, 1_000) {
             let _ = ctrl.ping();
         }
-        // 物理键盘实时态 ~3Hz 轮询(每 20 tick),降低 vendor IN 负载(键状态非高频需求)。
-        if connected && reconnect_tick % 20 == 0 {
+        // 物理键盘实时态 ~3Hz 轮询,降低 vendor IN 负载(键状态非高频需求)。
+        if connected && _every_ms(reconnect_tick, 320) {
             let _ = ctrl.kbd_request_state();
         }
         // 物理键盘页驻留期: 实时三态提到 ~15Hz(要看得出防抖/长按的差别),
@@ -2426,10 +2625,10 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
             if !last_phys_kbd_visible {
                 let _ = ctrl.kbd_request_keycfg();
             }
-            if reconnect_tick % 4 == 0 {
+            if _every_ms(reconnect_tick, 64) {
                 let _ = ctrl.kbd_request_state();
             }
-            if ui.get_phys_la_expanded() && reconnect_tick % 2 == 0 {
+            if ui.get_phys_la_expanded() && _every_ms(reconnect_tick, 32) {
                 let _ = ctrl.kbd_request_edges();
             }
         }
@@ -2453,7 +2652,7 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
             // 否则(主页/其它页/无算法声明)不发, 从根源杜绝 algo_get_trace NAK 刷屏。
             // 设备端无算法时的 NAK 退避由 app_state 内部处理(见 request_algo_trace)。
             let algo_trace_page = ui.get_current_view() == 1 && ui.get_settings_tab() == 4;
-            if algo_trace_page && !algo_report_idxs.is_empty() {
+            if algo_trace_page && visual_refresh_tick && !algo_report_idxs.is_empty() {
                 let ch = ui.get_sel_channel().clamp(0, 35) as u8;
                 let idx = algo_report_idxs[algo_trace_rr % algo_report_idxs.len()];
                 let _ = ctrl.request_algo_trace(ch, idx);
@@ -2518,6 +2717,24 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
                     rows.len(),
                     hist
                 );
+                // ★所有会被渲染的组都要出现在计数表里, 包括 0 行的★
+                // 只回填"有行的组"等于让空组继续静默 —— 那正是"协议页一片空白说不出原因"的成因。
+                const RENDERED_GROUPS: [&str; 6] = [
+                    "mai2serial 协议参数",
+                    "mai2light 协议参数",
+                    "工作模式",
+                    "键盘映射",
+                    "状态指示灯",
+                    "其他",
+                ];
+                let counts: Vec<ConfigGroupCount> = RENDERED_GROUPS
+                    .iter()
+                    .map(|g| ConfigGroupCount {
+                        group: (*g).into(),
+                        count: hist.get(*g).copied().unwrap_or(0) as i32,
+                    })
+                    .collect();
+                ui.set_config_group_counts(slint::ModelRc::new(slint::VecModel::from(counts)));
             }
             // 未归类行数: Slint 没有数组过滤/计数, 空组不渲染要靠这里给出行数。
             ui.set_config_other_count(rows.iter().filter(|r| r.group == "其他").count() as i32);
@@ -2539,11 +2756,22 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
             // 不再需要专属属性 —— 见 protocol.slint 内注释。
         }
 
-        // 34 分区固定: 原地比较后只写变化行，保留列表内通道输入、侦听与移除按钮的焦点状态。
-        let zones = build_zone_cells(&ctrl);
-        for (row, zone) in zones.into_iter().enumerate() {
-            if zones_model.row_data(row).as_ref() != Some(&zone) {
-                zones_model.set_row_data(row, zone);
+        // 绑定区 34 格只在实际展示输入变化时更新：实时触摸用位掩码，配置/Cp/绑定进度用各自版本。
+        // 禁止直接以 telem_version 重建，否则 16ms tick 会反复格式化 Cp/标签并替换 Slint 行模型。
+        let zone_key = (
+            ctrl.config_version(),
+            ctrl.cp_version(),
+            ctrl.active_ch_mask(),
+            ctrl.bind_progress(),
+            ctrl.interactive_bind_active(),
+        );
+        if last_zone_key.as_ref() != Some(&zone_key) {
+            last_zone_key = Some(zone_key);
+            let zones = build_zone_cells(&ctrl);
+            for (row, zone) in zones.into_iter().enumerate() {
+                if zones_model.row_data(row).as_ref() != Some(&zone) {
+                    zones_model.set_row_data(row, zone);
+                }
             }
         }
 
@@ -2558,6 +2786,7 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
 
         let current_channel = ui.get_sel_channel();
         let current_telem_version = ctrl.telem_version();
+        let current_plot_version = ctrl.plot_version();
         let current_param_version = ctrl.param_version();
         let channel_changed = current_channel != last_channel;
         let curve_visibility = (ui.get_show_raw(), ui.get_show_bsln(), ui.get_show_diff());
@@ -2576,11 +2805,37 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
                 let now = Instant::now();
                 if !connected {
                     cp_state._stop("未连接".to_string());
+                } else if let Some(telem_baseline) = cp_state.recovery_telem_version {
+                    let recovered = ctrl.telem_version() != telem_baseline
+                        && ctrl.telem_scan_period_valid()
+                        && ctrl.telem_samples_per_sec() > 0;
+                    if recovered {
+                        let detail = cp_state.recovery_detail.clone();
+                        cp_state._stop(format!(
+                            "{}；固件已恢复: 收到新遥测，扫描周期 {:.2} ms ({} Hz)",
+                            detail,
+                            ctrl.telem_scan_period_us() as f64 / 1000.0,
+                            ctrl.telem_samples_per_sec()
+                        ));
+                    } else if cp_state
+                        .recovery_started_at
+                        .is_some_and(|at| now.duration_since(at) >= CP_RECOVERY_TIMEOUT)
+                    {
+                        let detail = cp_state.recovery_detail.clone();
+                        let failure = format!(
+                            "{}；固件恢复失败: {} 秒内未收到恢复后的遥测扫描进展，请检查 PSoC 固件/链路后手动恢复",
+                            detail,
+                            CP_RECOVERY_TIMEOUT.as_secs()
+                        );
+                        ctrl.push_log_error(failure.clone());
+                        cp_state._stop(failure);
+                    }
                 } else if now.duration_since(started_at) >= CP_SWEEP_TIMEOUT {
-                    let done = cp_state.ch;
-                    cp_state._stop(format!("电容测量超时: 仅完成 {}/36 通道, 正在重启 PSoC 恢复扫描…", done));
-                    // 半途超时同样要恢复: BIST 已经改过 CSD 硬件, 不重启会留下 raw 满量程/采样率崩塌的坏状态。
-                    let _ = ctrl.reboot_psoc();
+                    let done = cp_state.ch.min(36);
+                    cp_state._await_recovery(
+                        ctrl.telem_version(),
+                        format!("Cp 获取超时: 仅完成 {}/36 通道", done),
+                    );
                 } else {
                     // 本通道是否已"落定": 响应到达(版本推进)且不是"测量中(0)"。
                     let ch = cp_state.ch;
@@ -2590,16 +2845,17 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
                     }
                     let due = cp_state.next_at.map_or(true, |deadline| now >= deadline);
                     if cp_state.ch >= 36 {
+                        // 统计口径与单通道文案同源: 失败 = 回读 0x00FFFFFF; 其余取不到结果的只算"无结果"。
                         let ok = (0..36u8)
                             .filter(|&c| matches!(ctrl.cp(c), Some(v) if v != 0 && v != CP_MEASURE_FAILED))
                             .count();
-                        cp_state._stop(format!("电容测量完成: {}/36 通道有效, 正在重启 PSoC 恢复扫描…", ok));
-                        // ★BIST 后必须重启 PSoC★: Cp 测量(BIST)会重配 CSD 硬件, 其自带的恢复路径
-                        // (Cy_CapSense_Enable/Initialize)实测不可靠——测完全通道 raw 卡 4095、采样率掉到 1-7Hz,
-                        // 只有 XRES 重启能复原(重启后立即回到 ~171Hz)。故测量收尾自动重启, 免得用户点一次就把
-                        // 扫描搞废还以为是"扫描引擎卡死"。
-                        let _ = ctrl.reboot_psoc();
-                        ctrl.push_log("测量电容: BIST 会重配 CSD 硬件, 已自动重启 PSoC 恢复扫描(约 1s)");
+                        let failed = cp_failed_list(&ctrl);
+                        let detail = if failed.is_empty() {
+                            format!("电容测量完成: {}/36 通道有效, 无测量失败", ok)
+                        } else {
+                            format!("电容测量完成: {}/36 通道有效; {} {}", ok, failed, CP_FAILURE_TEXT)
+                        };
+                        cp_state._await_recovery(ctrl.telem_version(), detail);
                     } else if due && cp_state.tries >= CP_SWEEP_MAX_TRIES {
                         cp_state._advance();   // 该通道取不到 → 跳过, 绝不无限重试
                     } else if due {
@@ -2625,6 +2881,13 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
                 cp_display_text(ctrl.cp(current_channel.clamp(0, 35) as u8))
             };
             ui.set_cp_text(text.into());
+            // 失败通道列表送到全局调整页(原 GND 猜测警告的位置): 那里是唯一有设备级证据的警告位,
+            // 空列表则整条警告隐藏。
+            let failed = cp_failed_list(&ctrl);
+            if failed != last_cp_failed {
+                last_cp_failed = failed.clone();
+                ui.set_cp_failed_channels(failed.into());
+            }
         }
 
         // ★主图回填: 唯一绘图管线的唯一消费处★
@@ -2633,12 +2896,25 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
         // 那正是旧实现"叠加线只覆盖部分宽度"的来路(见 build_chart_frame 顶部的不变量)。
         // 门控里【不再】有绘图区尺寸: PlotPath 用 fit: fill 拉满, 拖分栏/改窗口只是元素几何变化,
         // path 不必重算 —— 纯 UI 交互不该把 36 通道的采样重新投影一遍。
-        if current_telem_version != last_telem_version
-            || channel_changed
-            || curve_visibility_changed
-            || algo_overlay_dirty
+        // ★遥测驱动的重建限速到约 30Hz(visual_refresh_tick)★: 数据仍以固件节奏全速进环形缓冲,
+        // 只是"重投影成 SVG path 并推给 Slint"这一步没必要跟 16ms tick 一样快 —— 36 点以上的
+        // path 重建 + 多个 VecModel::set_row_data 是本页最重的每 tick 开销, 高负载下会挤占
+        // UI 线程导致明显卡顿。通道切换/勾选可见性变化仍立即生效, 不等下一个节拍。
+        // ★页门控是第一道闸★ 实测(PROF)单次主图重建 ~12ms/峰值 ~17ms, 已占满 16ms tick 预算;
+        // 而它此前在主页/工具箱/日志页也照样每帧重算 —— 那些页面根本没有这张图。曲线只在
+        // "设置 → 单通道精调"可见, 不可见时连算都不该算。
+        // 第二道闸是 visual_refresh_tick(~30Hz): 遥测实测 171Hz, 没有必要每帧重投影一次。
+        let curves_visible = ui.get_current_view() == 1 && ui.get_settings_tab() == 4;
+        // ★algo_overlay_dirty 也是数据驱动的★, 必须和遥测版本走同一道限速: 它跟着算法追踪回读
+        // (与遥测同量级的频率)置位, 若让它单独绕过限速, 主图就会退化成"每个 tick 重投影一次"。
+        if curves_visible
+            && (((current_plot_version != last_plot_version || algo_overlay_dirty)
+                && visual_refresh_tick)
+                || channel_changed
+                || curve_visibility_changed)
         {
-            last_telem_version = current_telem_version;
+            let prof_chart_start = Instant::now();
+            last_plot_version = current_plot_version;
             last_channel = current_channel;
             last_curve_visibility = curve_visibility;
             algo_overlay_dirty = false;
@@ -2741,6 +3017,10 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
                     current_channel, finger_th as i32, noise_th as i32)
             };
             ui.set_curve_readout(readout.into());
+            let spent = prof_chart_start.elapsed().as_micros() as u64;
+            prof_chart_us += spent;
+            prof_chart_hits += 1;
+            prof_chart_max_us = prof_chart_max_us.max(spent);
         }
 
         // 触控组合映射回填(version 门控)。
@@ -2821,20 +3101,19 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
                 ctrl.batch_ch_selected())));
             ui.set_batch_param_selected(slint::ModelRc::new(slint::VecModel::from(
                 ctrl.batch_param_selected())));
-            let names: Vec<slint::SharedString> = (0x01u8..=0x0Bu8)
-                .map(|id| param_display_name(id).into())
-                .collect();
-            ui.set_batch_param_names(slint::ModelRc::new(slint::VecModel::from(names)));
-            // 值一列现在是可编辑数字框: -1 = 面板上尚无值(源通道未回读且用户未手填), .slint 侧
-            // 显示为"—", 明确区别于"值为 0"。取的是 batch_source 的值而不是当前精调通道的 ——
-            // 抽屉里勾目标通道时不应把这一列跟着改掉。
-            ui.set_batch_param_values(slint::ModelRc::new(slint::VecModel::from(
-                ctrl.batch_values())));
-            // ★围栏随行下发★: 上下限唯一来源是 proto::param_fence(与两处固件同源),
-            // .slint 里不许按 param_id 再写一份阈值。
-            let (mins, maxs) = ctrl.batch_value_bounds();
-            ui.set_batch_param_min(slint::ModelRc::new(slint::VecModel::from(mins)));
-            ui.set_batch_param_max(slint::ModelRc::new(slint::VecModel::from(maxs)));
+            // ★与单通道精调共用 build_param_row★: 围栏与单选项(时钟源 0..6+AUTO 等)只有一处派生,
+            // 不会再出现"精调页是单选、批量面板还是数字框且能填非法值"这种两处不一致(实测截图)。
+            // 值取的是 batch_source 的值而不是当前精调通道的 —— 抽屉里勾目标通道时不该改这一列。
+            // -1 = 面板上尚无值(源通道未回读且用户未手填), .slint 侧显示"—", 区别于"值为 0"。
+            let values = ctrl.batch_values();
+            for (i, id) in BATCH_PARAM_IDS.iter().copied().enumerate() {
+                let row = build_param_row(id, values.get(i).copied().unwrap_or(-1));
+                // ★只在真的变了才写★ set_row_data 会通知 Repeater 更新该行, 无条件回写等于每
+                // 16ms 把用户正在编辑的那一行推回设备值(GuardedSpinBox 有焦点守卫, 但没必要多此一举)。
+                if batch_params_model.row_data(i).as_ref() != Some(&row) {
+                    batch_params_model.set_row_data(i, row);
+                }
+            }
         }
 
         if current_param_version != last_param_version || channel_changed {
@@ -2874,6 +3153,11 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
             }
             if let Some(value) = ctrl.param(0, PARAM_SNS_CLK_SOURCE) {
                 ui.set_csd_sns_clk_source(value as i32);
+                // 下标由围栏统一判定: 128 ⇒ AUTO(末项), 非法值 ⇒ -1(下拉留空, 不假装选中某项)。
+                ui.set_csd_clk_index(
+                    mai2control_ui::proto::param_fence(PARAM_SNS_CLK_SOURCE)
+                        .ui_choice_index(value),
+                );
             }
         }
 
@@ -2881,16 +3165,50 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
         // 也可能因 CP_GET 响应更新，否则 cp_text 会卡在旧值不刷新)。active=status bit0。
         // 原地按行更新(仅变化的行才写)，不替换 model，避免元素重建导致的悬浮闪烁/交互丢失。
         let current_cp_version_all = ctrl.cp_version();
-        if current_telem_version != last_telem_version_all || current_cp_version_all != last_cp_version_all {
+        // 排序/筛选选择与启用态(param_version 覆盖 0x0C 草稿)也要驱动重建: 否则改了下拉框或关掉
+        // 一个通道后, 网格要等下一帧遥测才变, 看起来像"点了没反应"。
+        let sort_all = ui.get_channel_sort();
+        let show_disabled_all = ui.get_channel_show_disabled();
+        let current_param_version_all = ctrl.param_version();
+        // 同主图: 36 张卡片的格式化+逐行 diff 是另一处遥测驱动的重活, 同样限速到 visual_refresh_tick;
+        // 排序/筛选/启用态变化(用户交互)仍立即生效, 不等下一个节拍。
+        // 同主图: 36 张卡片只住在"设置"页, 其它页(主页/工具箱/日志/关于)不该为它付格式化与逐行 diff
+        // 的代价(实测 ~0.38ms/次, 在主页也几乎每帧命中)。门控跳过时不更新 last_*, 回到该页时
+        // 版本判据自然成立并立即重建一次, 不会出现"回来看到旧数据"。
+        let channels_page_visible = ui.get_current_view() == 1;
+        if channels_page_visible
+            && ((current_telem_version != last_telem_version_all && visual_refresh_tick)
+                || current_cp_version_all != last_cp_version_all
+                || current_param_version_all != last_param_version_all
+                || sort_all != last_sort_all
+                || show_disabled_all != last_show_disabled_all)
+        {
+            let prof_cards_start = Instant::now();
             last_telem_version_all = current_telem_version;
             last_cp_version_all = current_cp_version_all;
-            let all = build_channel_status(&ctrl);
-            for (i, row) in all.into_iter().enumerate() {
-                if all_channels_model.row_data(i).as_ref() != Some(&row) {
-                    all_channels_model.set_row_data(i, row);
+            last_param_version_all = current_param_version_all;
+            last_sort_all = sort_all;
+            last_show_disabled_all = show_disabled_all;
+            let (all, hidden) = build_channel_status(&ctrl, sort_all, show_disabled_all);
+            // 行数会随筛选变化: 数量变了必须整表替换(逐行 set_row_data 只能改已有行, 多出来的
+            // 旧行会留在网格里变成幽灵卡片)。数量不变时仍只写变化的行, 保持无闪烁。
+            if all_channels_model.row_count() != all.len() {
+                all_channels_model.set_vec(all);
+            } else {
+                for (i, row) in all.into_iter().enumerate() {
+                    if all_channels_model.row_data(i).as_ref() != Some(&row) {
+                        all_channels_model.set_row_data(i, row);
+                    }
                 }
             }
+            ui.set_channel_hidden_count(hidden);
+            prof_cards_us += prof_cards_start.elapsed().as_micros() as u64;
+            prof_cards_hits += 1;
         }
+        // 采集开关(真停流)与画面冻结是两件事, 这里回填的是前者。
+        ui.set_telem_paused(ctrl.telem_user_paused());
+        // 单通道精调页的通道启用开关(草稿优先, 与网格卡片同一真相源)。
+        ui.set_curve_ch_enabled(ctrl.ch_enabled(ui.get_sel_channel().clamp(0, 35) as u8));
 
         // 延迟历史折线(总延迟 us),version 门控。绘制完整历史铺满 viewbox(1000宽),
         // 由 UI 侧 viewbox 缩放/横向滚动条查看局部, 不再固定窗口只显示一小段。
@@ -3171,6 +3489,46 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
         ui.set_latency_usb_us(usb);
         ui.set_latency_sensor_us(ctrl.telem_scan_period_us() as i32);
         ui.set_latency_total_us(spi + proc + usb);
+
+        // ★剖面汇报★: 16ms 的 tick 预算里究竟花在哪, 只有实测能回答。每 ~2s 一条。
+        let spent = prof_tick_start.elapsed().as_micros() as u64;
+        prof_tick_us += spent;
+        prof_tick_max_us = prof_tick_max_us.max(spent);
+        prof_ticks += 1;
+        if prof_ticks >= 120 {
+            log::debug!(
+                "[PROF] tick n={} avg={}us max={}us | gap avg={}us max={}us | poll avg={}us | chart hits={} avg={}us max={}us | cards hits={} avg={}us | telem={}Hz pts={}",
+                prof_ticks,
+                prof_tick_us / prof_ticks as u64,
+                prof_tick_max_us,
+                if prof_gaps > 0 {
+                    prof_gap_us / prof_gaps as u64
+                } else {
+                    0
+                },
+                prof_gap_max_us,
+                prof_poll_us / prof_ticks as u64,
+                prof_chart_hits,
+                if prof_chart_hits > 0 { prof_chart_us / prof_chart_hits as u64 } else { 0 },
+                prof_chart_max_us,
+                prof_cards_hits,
+                if prof_cards_hits > 0 { prof_cards_us / prof_cards_hits as u64 } else { 0 },
+                ctrl.telem_samples_per_sec(),
+                ui.get_curve_point_count(),
+            );
+            prof_ticks = 0;
+            prof_tick_us = 0;
+            prof_tick_max_us = 0;
+            prof_poll_us = 0;
+            prof_chart_us = 0;
+            prof_chart_hits = 0;
+            prof_chart_max_us = 0;
+            prof_cards_us = 0;
+            prof_cards_hits = 0;
+            prof_gap_us = 0;
+            prof_gap_max_us = 0;
+            prof_gaps = 0;
+        }
     });
 
     // 返回 Timer,由 main() 持有到 ui.run() 结束,防止被 drop 而停止轮询。
@@ -3202,8 +3560,17 @@ fn expected_scan_period_us(ctrl: &AppController) -> i32 {
 }
 
 fn build_config_rows(entries: &[ConfigEntry]) -> Vec<ConfigRow> {
-    entries
-        .iter()
+    // ★显式排序★: 入参来自按 key 排序的 BTreeMap, 直接渲染就是"英文键名字典序", 与中文标签的
+    // 阅读逻辑完全无关。先按组内显式次序排, 同次序再按 key 兜底(保证稳定、不随 HashMap 抖动)。
+    // 组之间的顺序由各页面挂 ConfigGroupSection 的先后决定, 不在这里管。
+    let mut ordered: Vec<&ConfigEntry> = entries.iter().collect();
+    ordered.sort_by(|a, b| {
+        config_display_order(&a.key)
+            .cmp(&config_display_order(&b.key))
+            .then_with(|| a.key.cmp(&b.key))
+    });
+    ordered
+        .into_iter()
         // ★渲染归属集中在这里★ 每个 KV 只允许出现在一个页面: 有专用编辑器的 key 一律在此滤掉,
         // 其余按 parse_config_label 给出的 group 决定落在"通信系统"Tab 还是"协议"页的对应块。
         // bind.map* → 分区绑定页; kbd.* → 键盘页; calib.* → 触控全局调整页的偏好滑条;
@@ -3223,9 +3590,9 @@ fn build_config_rows(entries: &[ConfigEntry]) -> Vec<ConfigRow> {
                 type_code,
                 bool_val,
                 num_val,
-                min_val,
-                max_val,
-                has_range,
+                mut min_val,
+                mut max_val,
+                mut has_range,
                 mut enum_index,
                 str_val,
             ) = match &entry.value {
@@ -3267,6 +3634,20 @@ fn build_config_rows(entries: &[ConfigEntry]) -> Vec<ConfigRow> {
                 CfgValue::F32(v) => (1, 5, false, *v, 0.0, 1.0, false, 0, "".to_string()),
                 CfgValue::Str(v) => (3, 6, false, 0.0, 0.0, 0.0, false, 0, v.clone()),
             };
+
+            // ★围栏必须用设备自报的 range, 不许按类型猜★
+            // 上面那张表只知道"这是个 U16", 于是给出 0..65535; 而固件 schema 对同一个 key 声明的
+            // 合法区间可能窄得多(例: 触控延迟只收 0..1000)。界面围栏比固件宽 = 放行必被 NAK 的值,
+            // 用户失焦夹取也夹不到正确阈值上。schema 带 range 就以它为准, 否则才回落类型上限。
+            if let Some((lo, hi)) = &entry.range {
+                if let (Some(lo), Some(hi)) = (lo.as_f32(), hi.as_f32()) {
+                    if hi >= lo {
+                        min_val = lo;
+                        max_val = hi;
+                        has_range = true;
+                    }
+                }
+            }
 
             // schema 未携带颜色枚举选项；这四个 U8 配置使用专用 ComboBox，
             // 但数值仍原样沿用 set_config_number → CfgValue::U8 的既有链路。
@@ -3323,6 +3704,72 @@ fn build_config_rows(entries: &[ConfigEntry]) -> Vec<ConfigRow> {
         .collect()
 }
 
+/// 造一行参数编辑数据(标签 + 围栏 + 单选项)。
+/// ★单通道精调与全通道批量面板共用本函数★: 围栏与单选项只有这一处派生, 不许在 .slint 里按
+/// param_id 硬编码 —— 那会成为与两处固件必然漂移的第三份定义(围栏当年就是这么漂移出
+/// "SNS_CLK_SOURCE 上界写死 6 而设备合法持有 128"那个 bug 的)。
+/// `value` 允许为 -1: 批量面板用它表示"面板上尚无值", 界面显示"—"。
+fn build_param_row(param_id: u8, value: i32) -> ParamRow {
+    let fence = mai2control_ui::proto::param_fence(param_id);
+    let choices = fence.ui_choices();
+    let choice_labels: Vec<slint::SharedString> =
+        choices.iter().map(|(t, _)| t.as_str().into()).collect();
+    let choice_values: Vec<i32> = choices.iter().map(|(_, v)| *v as i32).collect();
+    ParamRow {
+        param_id: param_id as i32,
+        label: param_display_name(param_id).into(),
+        value,
+        min: fence.ui_min() as i32,
+        max: fence.ui_max() as i32,
+        choices: slint::ModelRc::new(slint::VecModel::from(choice_labels)),
+        choice_values: slint::ModelRc::new(slint::VecModel::from(choice_values)),
+        // 无值(-1)时不指向任何一项, 界面显示"—"而不是假装选中第一项。
+        choice_index: if value < 0 {
+            -1
+        } else {
+            fence.ui_choice_index(value as u32)
+        },
+        // 元数据与围栏同源(见 proto::telemetry::ParamFence 的 unit/scope/help/impact):
+        // 界面只显示这两个字符串, 不按 param_id 自己拼说明 —— 那就是第二份元数据。
+        unit: fence.unit.into(),
+        help: fence.help_text(param_id).into(),
+    }
+}
+
+/// 组内显示次序。★为什么必须显式给★
+/// `config_entries()` 来自按 key 排序的 BTreeMap ⇒ 界面顺序 = **英文 key 的字典序**。
+/// 于是协议页会排成"聚合延迟 → 额外重发 → 触控映射… → 速率上限 → 采样延迟 → 仅变化时发送 →
+/// 触控串口波特率…"这种与阅读逻辑毫无关系的顺序(用户看到的是中文标签, 字典序按的却是英文键名)。
+/// 这里给每个 key 一个显式次序: 先"这条链路是什么"(波特率/节点), 再"怎么发"(延迟), 最后"善后行为"。
+/// 未收录的 key 一律排到末尾(999)并按 key 兜底, 新增 KV 不会插到中间打乱既有顺序。
+fn config_display_order(key: &str) -> u16 {
+    match key {
+        // —— mai2serial: 链路 → 上报延迟 → RSET 善后 ——
+        "comm.serial_baud" => 10,
+        "comm.touch_delay_100us" => 20,
+        "comm.keyboard_map_serial_only" => 30,
+        "comm.serial_reset_baseline" => 40,
+        "comm.serial_reset_calibrate" => 41,
+        // —— mai2light: 链路 → 节点 → 灯珠总数 ——
+        "comm.light_baud" => 10,
+        "led.node_id" => 20,
+        "led.count" => 30,
+        // —— 键盘映射 ——
+        "comm.keyboard_map_en" => 10,
+        "comm.keyboard_delay_100us" => 20,
+        // —— 状态指示灯: 总开关 → 亮度 → 四个颜色 ——
+        "led.enable" => 10,
+        "led.status_brightness" => 20,
+        "led.color_connected" => 30,
+        "led.color_healthy" => 31,
+        "led.color_link_error" => 32,
+        "led.color_flash_error" => 33,
+        // —— 工作模式 ——
+        "mode.work" => 10,
+        _ => 999,
+    }
+}
+
 /// 返回 (分组中文名, 配置项中文名, 小字说明)。未收录的 key 回退到英文 key 的可读形式。
 fn parse_config_label(key: &str) -> (String, String, String) {
     let parts: Vec<&str> = key.split('.').collect();
@@ -3330,15 +3777,12 @@ fn parse_config_label(key: &str) -> (String, String, String) {
     // 所以归属按语义逐 key 指定, 而不是按 key 的一级前缀 —— comm./led. 前缀下同时混着
     // "协议能力参数"(属协议页)与"键盘映射/状态指示灯"(属通信系统 Tab), 前缀分不开。
     let group = match key {
-        // mai2serial: 串口本身 + 触控上报节流 + {E}RSET 善后行为 → 协议页 mai2serial 块
+        // mai2serial: 串口本身 + 触控上报延迟线 + {E}RSET 善后行为 → 协议页 mai2serial 块
+        // ★已删掉 sample_delay_ms / aggregation_delay_ms / extra_send / rate_limit_* /
+        //   send_only_on_change★: 固件里没有任何消费点(见 app_config.cpp 该处注释), 已从 schema 移除。
+        //   "采样延迟"与"触控延迟"两个名字都像延迟, 正是混淆来源; 现在只保留真正平移上报的那一个。
         "comm.serial_baud"
         | "comm.touch_delay_100us"
-        | "comm.sample_delay_ms"
-        | "comm.send_only_on_change"
-        | "comm.aggregation_delay_ms"
-        | "comm.extra_send"
-        | "comm.rate_limit_en"
-        | "comm.rate_limit_hz"
         | "comm.serial_reset_calibrate"
         | "comm.serial_reset_baseline"
         // 「触控映射仅协议启动时生效」的判定依据就是 mai2serial 的实际发送态,
@@ -3365,12 +3809,8 @@ fn parse_config_label(key: &str) -> (String, String, String) {
     .to_string();
 
     let (label, desc): (&str, &str) = match key {
-        "comm.sample_delay_ms" => ("采样延迟 (ms)", "每次采样后延迟, 降低上报频率"),
-        "comm.send_only_on_change" => ("仅变化时发送", "触摸状态无变化则不上报, 省带宽"),
-        "comm.aggregation_delay_ms" => ("聚合延迟 (ms)", "合并一段时间的采样后再一次上报"),
-        "comm.extra_send" => ("额外重发次数", "每帧额外多发几次以防丢包"),
-        "comm.rate_limit_en" => ("启用速率限制", "限制遥测上报的最大帧率"),
-        "comm.rate_limit_hz" => ("速率上限 (Hz)", "遥测上报帧率的上限"),
+        // 上面 6 个空壳项(采样延迟/仅变化时发送/聚合延迟/额外重发/速率限制)已从固件 schema 删除,
+        // 故标签也一并删除 —— 留着标签只会在将来有人误以为"设备支持只是没显示"。
         "comm.keyboard_map_en" => ("启用触摸→键盘", "把触摸分区映射为键盘按键输出"),
         "comm.keyboard_map_serial_only" => (
             "触控映射仅协议启动时生效",
@@ -3409,15 +3849,32 @@ fn parse_config_label(key: &str) -> (String, String, String) {
 }
 
 /// 把 Cp(fF) 缓存值换算成两位小数 pF 文本，语义与曲线页一致：
-/// None=本会话尚未测量(无任何自动获取)，Some(0)=测量中，Some(CP_MEASURE_FAILED)=未测量/测量失败，
-/// 其余=正常测量值。
+/// None=本会话尚未测量(无任何自动获取)，Some(0)=设备尚未给出结果(测量中)，
+/// Some(CP_MEASURE_FAILED)=★唯一的失败判据★(MEASURE_CP 后设备回读 0x00FFFFFF)，其余=正常测量值。
+///
+/// ★不从别处推断 Cp 失败★: 非激活电极接法、railed 通道数、采样率这些都不是 Cp 失败的证据,
+/// 历史上按它们猜出来的警告只会把用户引到错误的排查方向。
 fn cp_display_text(cp: Option<u32>) -> String {
     match cp {
         None => "未测量".to_string(),
         Some(0) => "测量中…".to_string(),
-        Some(CP_MEASURE_FAILED) => "测量失败".to_string(),
+        Some(CP_MEASURE_FAILED) => CP_FAILURE_TEXT.to_string(),
         Some(value) => format!("{:.2} pF", value as f64 / 1000.0),
     }
+}
+
+/// Cp 失败的**唯一**文案。单通道显示、批量汇总、全局调整页警告三处共用同一句,
+/// 免得同一个故障在三处被描述成三种不同的原因。
+const CP_FAILURE_TEXT: &str = "测量失败：可能短接或电容过大";
+
+/// 收集 Cp 失败通道(判据只有 `CP_MEASURE_FAILED`), 返回形如 `CH0 CH5` 的列表文案。
+/// None/0(测量中)/GND 接法/raw 满量程/frozen/采样率一律不参与 —— 它们不是 Cp 失败的证据。
+fn cp_failed_list(ctrl: &AppController) -> String {
+    (0..36u8)
+        .filter(|&ch| ctrl.cp(ch) == Some(CP_MEASURE_FAILED))
+        .map(|ch| format!("CH{}", ch))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// 绑区页 34 分区静态几何 + 实时绑定/触摸/Cp 状态，几何来自 DXF 生成的
@@ -3633,7 +4090,7 @@ fn gap_threshold_us(sample_rate_hz: u32, period_mult: u32, floor_us: u64) -> u64
 /// ★阈值的语义 = "覆盖半径"★: 与某个采样点时间距离在阈值内的时刻算被该采样覆盖(正常的帧间
 /// 抖动/一个轮询周期都在此内); 超出即视为**没有数据**, 由 `fill_uncovered_with_zero` 按 0 补齐。
 struct XWindow {
-    /// 最旧样本时刻 → viewbox x = 0。
+    /// 窗口左端时刻(= `t_last_us − PLOT_WINDOW_US`, 设备上电不足一窗时被 0 截住) → viewbox x = 0。
     t_first_us: u64,
     /// 最新样本时刻 → viewbox x = 1000。
     t_last_us: u64,
@@ -3651,9 +4108,13 @@ impl XWindow {
     /// [t_first_us, t_last_us], 夹取对它们是恒等变换; 它挡住的是退化窗口(整张图一条参与系列都
     /// 没数据 ⇒ 窗口塌成 0..0)下未参与系列被顺带投影时算出的天文数字坐标 —— 那会让下游的
     /// 虚线分段循环按 i32::MAX 跑。
+    /// ★横向尺度恒为 `PLOT_WINDOW_US`★: 不用 `t_last - t_first` 当分母 —— 设备刚上电不足
+    /// 30s 时 `t_first_us` 会被 0 截住, 那时按实际跨度换算又会变成"边跑边缩放"的动态尺度。
+    /// 以右端为锚、固定跨度反推左端, 任何时刻 1 像素都等于同一时长。
     fn x_of(&self, t_us: u64) -> f32 {
-        let span = self.t_last_us.saturating_sub(self.t_first_us).max(1) as f32;
-        (t_us.saturating_sub(self.t_first_us) as f32 / span * 1000.0).clamp(0.0, 1000.0)
+        let span = PLOT_WINDOW_US as f32;
+        let left = self.t_last_us as f32 - span;
+        ((t_us as f32 - left) / span * 1000.0).clamp(0.0, 1000.0)
     }
     fn gap_us(&self, cadence: SeriesCadence) -> u64 {
         match cadence {
@@ -3661,9 +4122,9 @@ impl XWindow {
             SeriesCadence::Poll => self.gap_poll_us,
         }
     }
-    /// 全量时间跨度(ms), 供 UI 把 viewbox 横坐标换算成真实时刻。
+    /// 全量时间跨度(ms) —— 固定值, 与 `x_of` 用的是同一个跨度。
     fn t_span_ms(&self) -> f32 {
-        self.t_last_us.saturating_sub(self.t_first_us) as f32 / 1000.0
+        PLOT_WINDOW_US as f32 / 1000.0
     }
 }
 
@@ -3713,23 +4174,24 @@ impl AxisScale {
 
 /// 补齐后的一个绘图点。
 ///
-/// `zeroed = true` 表示该点是"此处无采样覆盖"合成出来的 0 值点, 不是设备真的报了 0。
-/// 两者必须在图上可区分, 见 `points_to_svg_path` 的虚线处理。
+/// `dashed = true` 表示该点是"此处无采样覆盖"合成出来的点: 取值沿用相邻真实采样的值(边缘保持),
+/// 画成虚线。★不再合成 0 值★: 无覆盖是"不知道", 不是"设备报了 0"; 拿 0 去补会把该轴量程拉到 0,
+/// 于是同一条线在有/无缺口时纵向尺度完全不同(实测: 进页面瞬间量程从 [490..542] 跳成 [0..542])。
 #[derive(Clone, Copy)]
 struct PlotPoint {
     t_us: u64,
     val: f32,
-    zeroed: bool,
+    dashed: bool,
 }
 
-/// 归零段的"虚线"节拍(viewbox x 单位, 值域 0..1000)。
+/// 无覆盖段的"虚线"节拍(viewbox x 单位, 值域 0..1000)。
 ///
 /// ★为什么用手工虚线而不是另开一条低透明度路径★: 另开路径要给 8 条系列各加一个 UI 元素与
 /// 一份颜色, 等于把"一条系列一个 path"的模型撑成两份, 且 .slint 侧要再复制一遍描边参数。
-/// 在同一条 path 里把归零段拆成 on/off 小段, 颜色/线宽天然与本系列一致(仍取自 SERIES_PALETTE),
-/// UI 一行都不用改, 而"虚线 = 无数据"与"实线贴底 = 真值 0"一眼可分。
-const ZERO_DASH_ON: i32 = 9;
-const ZERO_DASH_OFF: i32 = 7;
+/// 在同一条 path 里把无覆盖段拆成 on/off 小段, 颜色/线宽天然与本系列一致(仍取自 SERIES_PALETTE),
+/// UI 一行都不用改, 而"虚线 = 这段没数据"与"实线 = 真实采样"一眼可分。
+const DASH_ON: i32 = 9;
+const DASH_OFF: i32 = 7;
 
 /// 一条系列的最终产物。★除 path 外不带任何坐标信息★: 坐标全在 `XWindow`/`AxisScale` 里,
 /// 谁也不能凭这个结构自己再投影一遍。
@@ -3746,19 +4208,22 @@ struct SeriesPath {
 
 /// 单通道精调主图一次回填的【唯一】产物: 一个函数一次产出全部系列。
 ///
-/// ── 结构性不变量(由 `build_chart_frame` + `fill_uncovered_with_zero` 联合保证) ──────────
-/// 「同一张图内所有系列共享唯一 x 定义域(`ChartFrame::x`), 且每条**有采样**的系列在该定义域上
-///  处处有定义; 无采样覆盖处一律为 0(以垂直阶跃进出), 既不保持末值也不插值, 更不允许提前截断。」
+/// ── 结构性不变量(由 `build_chart_frame` + `fill_uncovered_with_dashes` 联合保证) ──────────
+/// 「同一张图内所有系列共享唯一 x 定义域(`ChartFrame::x`), 且每条**有采样**的系列都铺满整个
+///  定义域: 无采样覆盖处沿用相邻采样的值并画成虚线, 既不补 0、不插值, 也不允许提前截断。」
 ///
 /// 展开说明:
 ///  · 唯一 x: 只有 `XWindow::x_of` 一处做时间→横坐标映射, 任何系列不得自带 x 计算;
-///  · 处处有定义: 左端(早于首样本)、中间缺口、右端(晚于末样本)三种无覆盖区间全部补 0;
-///  · 垂直阶跃: 补 0 与真实数据之间用同一时刻的两个点表达跳变, 绝不画斜线 —— 斜线会伪造
+///  · 铺满定义域: 左端(早于首样本)、中间缺口、右端(晚于末样本)三种无覆盖区间全部补成虚线段。
+///    ★这是"各条线能画的范围不一样"的唯一修法★ —— 遥测缓冲与算法追踪缓冲的起止时刻天然不同
+///    (后者只在本页驻留时才轮询), 若各画各的, 缩放/切子标签后就会看到一条只占左半、一条只占
+///    右半(实测截图); 现在每条线的 x 覆盖恒等于窗口本身, 差异只体现为实线/虚线;
+///  · 虚线取边缘值而不是 0: 无覆盖是"不知道"。补 0 会把该轴量程拉到 0, 让同一条波形的纵向尺度
+///    随缺口有无而变(那正是"归一化"要消掉的抖动);
+///  · 垂直阶跃: 虚线段与真实数据之间用同一时刻的两个点表达跳变, 绝不画斜线 —— 斜线会伪造
 ///    "数值在这段时间里连续过渡"的假象;
-///  · 不保持末值: 右端最新采样早于窗口末端超过该系列 gap 阈值时其后必须归零。★这是修掉的 bug★
-///    旧实现让路径停在末样本, PlotPath 把最后一段一直画到右边缘, 看着像"稳定读数"其实无数据;
 ///  · 不提前截断: 每条系列路径的 x 覆盖与 `x` 一致, 不会出现"叠加线只盖住图的左半边";
-///  · 归零段与真值 0 可区分: 归零段画成同色虚线(见 `ZERO_DASH_ON`), 真值 0 是实线。
+///  · 虚实可分: 无覆盖段是同色虚线(见 `DASH_ON`), 真实采样一律实线 —— 包括真值 0。
 /// 空系列(该系列一个采样都没有)例外: 它不参与绘制, path 为空 —— 无数据的系列不该凭空多出一条
 /// 贴底的线, 它的"没有数据"由 `point_count == 0` 表达, UI 据此收起整行。
 struct ChartFrame {
@@ -3802,116 +4267,134 @@ impl ChartFrame {
     }
 }
 
-/// 把一条系列在 `XWindow` 定义域上补成"处处有定义": 无采样覆盖处一律 0, 以垂直阶跃进出。
+/// 把一条系列铺满整个 `XWindow` 定义域: 无采样覆盖处沿用相邻采样的值并标成虚线。
 ///
-/// ★唯一实现点★ 归零语义只在这里表达, `points_to_svg_path` 只管画、不再判缺口;
+/// ★唯一实现点★ "哪段没数据"只在这里判定, `points_to_svg_path` 只管画、不再判缺口;
 /// `XWindow::gap_us` 仍是唯一的缺口判据来源(作为"覆盖半径", 由调用方按系列节奏取好传进来)。
 ///
-/// 三种无覆盖区间的处理(全部产出 `zeroed = true` 的点):
-///  · 左端: 首样本比 `t_first_us` 晚出阈值 ⇒ 从 `t_first_us` 起画 0, 到首样本处垂直升上去;
-///  · 中间: 相邻样本间隔超阈值 ⇒ 在前一点处垂直落到 0, 平推到后一点, 再垂直升回;
-///  · 右端: 末样本比 `t_last_us` 早出阈值 ⇒ 在末样本处垂直落到 0, 平推到 `t_last_us`。
-///    ★这条就是"末值被拖到右边缘"那个 bug 的修法★
-/// 差距在阈值内时不补 0, 而是把边缘值平推到窗口边界: 那段时间**确实**被该采样覆盖(不足一个
-/// 采样周期), 补 0 会让最新的一条线每帧都闪出一小截虚线; 但仍必须推到边界, 否则就是提前截断。
+/// 三种无覆盖区间的处理(全部产出 `dashed = true` 的点, 取值 = 紧邻的那个真实采样值):
+///  · 左端: 首样本晚于 `t_first_us` 超出阈值 ⇒ 从 `t_first_us` 起按首样本值画虚线到首样本;
+///  · 中间: 相邻样本间隔超阈值 ⇒ 在前一点处按前值平推虚线到后一点, 再垂直阶跃到后值;
+///  · 右端: 末样本早于 `t_last_us` 超出阈值 ⇒ 从末样本按末值平推虚线到 `t_last_us`。
+/// 差距在阈值内时不画虚线, 而是把边缘值以实线推到窗口边界: 那段时间**确实**被该采样覆盖
+/// (不足一个采样周期), 画虚线会让最新的一条线每帧都闪出一小截。
 ///
-/// 空输入返回空(该系列没有任何采样 ⇒ 不参与绘制, 不能凭空造一条贴底的 0 线)。
-fn fill_uncovered_with_zero(points: &[(u64, f32)], x: &XWindow, gap_us: u64) -> Vec<PlotPoint> {
+/// ★为什么必须铺满★ 三条主曲线来自遥测环形缓冲、四条上报线与触发判定来自算法追踪缓冲, 两者的
+/// 起止时刻天然不同(后者只在本页驻留时轮询)。不铺满就会出现"一条线只画左半边、另一条只画右半边"
+/// (缩放或切子标签后尤其明显)。铺满后所有线的 x 覆盖恒等于窗口, 差异只体现为实线/虚线。
+///
+/// 空输入返回空(该系列一个采样都没有 ⇒ 不参与绘制, 不能凭空造一条线)。
+fn fill_uncovered_with_dashes(points: &[(u64, f32)], x: &XWindow, gap_us: u64) -> Vec<PlotPoint> {
     let (Some(&(first_t, first_v)), Some(&(last_t, last_v))) = (points.first(), points.last())
     else {
         return Vec::new();
     };
     // 每个缺口最多插 2 点, 首尾各最多 2 点。
     let mut out: Vec<PlotPoint> = Vec::with_capacity(points.len() + 4);
-    let zero_at = |t_us: u64| PlotPoint {
+    // 无覆盖段的合成点: 值沿用给定的边缘值(不是 0), 标成虚线。
+    let hold_at = |t_us: u64, val: f32| PlotPoint {
         t_us,
-        val: 0.0,
-        zeroed: true,
+        val,
+        dashed: true,
     };
 
     if first_t > x.t_first_us {
         if first_t - x.t_first_us > gap_us {
-            out.push(zero_at(x.t_first_us));
-            out.push(zero_at(first_t));
+            // 两个同值虚线点 ⇒ 画笔从左边界一路虚线推到首样本(见 points_to_svg_path 的判据)。
+            out.push(hold_at(x.t_first_us, first_v));
+            out.push(hold_at(first_t, first_v));
         } else {
             out.push(PlotPoint {
                 t_us: x.t_first_us,
                 val: first_v,
-                zeroed: false,
+                dashed: false,
             });
         }
     }
 
-    let mut prev_t: Option<u64> = None;
+    let mut prev: Option<(u64, f32)> = None;
     for &(t, v) in points {
-        if let Some(pt) = prev_t {
+        if let Some((pt, pv)) = prev {
             if t.saturating_sub(pt) > gap_us {
-                out.push(zero_at(pt));
-                out.push(zero_at(t));
+                out.push(hold_at(pt, pv));
+                out.push(hold_at(t, pv));
             }
         }
         out.push(PlotPoint {
             t_us: t,
             val: v,
-            zeroed: false,
+            dashed: false,
         });
-        prev_t = Some(t);
+        prev = Some((t, v));
     }
 
     if x.t_last_us > last_t {
         if x.t_last_us - last_t > gap_us {
-            out.push(zero_at(last_t));
-            out.push(zero_at(x.t_last_us));
+            out.push(hold_at(last_t, last_v));
+            out.push(hold_at(x.t_last_us, last_v));
         } else {
             out.push(PlotPoint {
                 t_us: x.t_last_us,
                 val: last_v,
-                zeroed: false,
+                dashed: false,
             });
         }
     }
     out
 }
 
-/// 在同一条 path 里把一段水平归零段画成虚线, 并把画笔停在段末(保证后续垂直阶跃起点正确)。
-fn push_zero_dashes(path: &mut String, x_from: i32, x_to: i32, y: i32) {
+/// 在同一条 path 里把一段水平的"无覆盖段"画成虚线, 并把画笔停在段末(保证后续垂直阶跃起点正确)。
+fn push_dashes(path: &mut String, x_from: i32, x_to: i32, y: i32) {
+    use std::fmt::Write;
     let mut cursor = x_from;
     while cursor < x_to {
-        let on_end = (cursor + ZERO_DASH_ON).min(x_to);
-        path.push_str(&format!(" M {} {} L {} {}", cursor, y, on_end, y));
-        cursor = on_end + ZERO_DASH_OFF;
+        let on_end = (cursor + DASH_ON).min(x_to);
+        // ★write! 而非 push_str(&format!())★: 后者每次都要先堆分配一个临时 String。
+        // 一条 1024 点的曲线 × 多条系列 = 数千次分配, 实测正是主图 12ms 的主要来源。
+        let _ = write!(path, " M {} {} L {} {}", cursor, y, on_end, y);
+        cursor = on_end + DASH_OFF;
     }
-    path.push_str(&format!(" M {} {}", x_to, y));
+    let _ = write!(path, " M {} {}", x_to, y);
 }
 
 /// 把补齐后的绘图点投影成 SVG path。
 ///
 /// ★x 只走 XWindow★: 横坐标按时间而非序号 —— 掉帧/暂停时等间距序号会把时间轴画错(同样的像素
 /// 距离代表不同时长); 且整张图共用同一个 XWindow, 任何系列都不得自带 x 计算。
-/// ★不再有"断线"★: 缺口已由 `fill_uncovered_with_zero` 补成显式的归零段, 于是这里只需逐点连线;
-/// 无数据不再表现为"没有线"(那与"线被裁到框外"无法区分), 而是明确的一条虚线 0。
-/// ★归零段画虚线★: 两端都是合成 0 点且同高的水平段 ⇒ 拆成 on/off 小段(同色, 见 `ZERO_DASH_ON`),
-/// 与"设备真的报 0"的实线区分开; 进出归零段的垂直阶跃仍画实线, 阶跃本身必须清晰可见。
+/// ★不再有"断线"★: 缺口已由 `fill_uncovered_with_dashes` 补成显式的虚线段, 于是这里只需逐点连线;
+/// 无数据不再表现为"没有线"(那与"线被裁到框外"无法区分), 而是一段明确的虚线。
+/// ★无覆盖段画虚线★: 两端都是合成点且同高的水平段 ⇒ 拆成 on/off 小段(同色, 见 `DASH_ON`),
+/// 与真实采样的实线区分开; 进出虚线段的垂直阶跃仍画实线, 阶跃本身必须清晰可见。
 fn points_to_svg_path(points: &[PlotPoint], x: &XWindow, axis: &AxisScale) -> String {
+    use std::fmt::Write;
     if points.is_empty() {
         return String::new();
     }
-    let mut path = String::new();
+    // 预留容量: 每点约 12 字节 ("&nbsp;L 1000 1000")。一次分配好过边写边搬。
+    let mut path = String::with_capacity(points.len() * 12 + 16);
     let mut prev: Option<(i32, i32, bool)> = None;
     for p in points {
         let px = x.x_of(p.t_us) as i32;
         let py = axis.y_of(p.val) as i32;
         match prev {
-            None => path.push_str(&format!("M {} {}", px, py)),
+            None => {
+                let _ = write!(path, "M {} {}", px, py);
+            }
             Some((ppx, ppy, pz)) => {
-                if pz && p.zeroed && py == ppy {
-                    push_zero_dashes(&mut path, ppx, px, py);
+                if pz && p.dashed && py == ppy {
+                    push_dashes(&mut path, ppx, px, py);
                 } else {
-                    path.push_str(&format!(" L {} {}", px, py));
+                    // ★同像素点直接丢弃★ viewbox 只有 1000×1000 个整数坐标, 而缓冲有 1024 点/通道:
+                    // 落到同一像素的点画出来完全看不见, 却要各占一段 path 命令并让 Slint 多解析一次。
+                    // 这不是抽稀采样(不丢任何可见形状), 只是不再重复画同一个点。
+                    if px == ppx && py == ppy {
+                        continue;
+                    }
+                    let _ = write!(path, " L {} {}", px, py);
                 }
             }
         }
-        prev = Some((px, py, p.zeroed));
+        prev = Some((px, py, p.dashed));
     }
     path
 }
@@ -3930,11 +4413,10 @@ fn normalize_binary(points: &[(u64, f32)], amp: f32) -> Vec<(u64, f32)> {
 /// 求一组序列的取值范围(忽略非有限值)。空 ⇒ 返回 (+inf, -inf),
 /// 由 `AxisScale::from_span` 退化成单位量程。
 ///
-/// ★入参是"补齐后"的点, 于是"0 是否进量程"由数据本身决定, 不需要额外开关★
-/// 该系列窗口内确实存在归零段 ⇒ 补齐后就含 0 值点 ⇒ 0 自然落进量程, 归零段不会被裁到边框外
-/// (裁出去就与"贴底的真实低值"分不清了); 不存在归零段 ⇒ 一个 0 点都没有 ⇒ 量程保持紧凑。
-/// 无条件把 0 塞进量程是错的: RAW 常在 2500..4095, 强行含 0 会把整条线压成贴顶的一条细带,
-/// 几十个计数的变化就此看不见。
+/// ★入参是"铺满后"的点, 但量程不会因缺口而变★: 虚线段取的是相邻真实采样的值, 不引入新极值,
+/// 于是同一段波形无论有没有缺口, 纵向尺度都一样(这正是"归一化绘制"要保证的另一半)。
+/// 反例(旧实现)是用 0 补缺口: RAW 常在 2500..4095, 一旦掺进 0 就把整条线压成贴顶的一条细带,
+/// 几十个计数的变化就此看不见 —— 而且只在"恰好有缺口"时发生, 表现为纵轴莫名跳变。
 fn value_span(series: &[&[PlotPoint]]) -> (f32, f32) {
     let mut lo = f32::INFINITY;
     let mut hi = f32::NEG_INFINITY;
@@ -3975,7 +4457,7 @@ fn build_chart_frame(
     // ---- 1. 取点 ----
     // 左轴三条按勾选取(不画就不取); 右轴五条一律取: 行模型要靠"有无数据 / 是否二值"决定整行
     // 是否收起、是否显示归一化输入, 那与"画不画"是两件事(勾掉一条线不该让它的输入框消失)。
-    let left_pts: [Vec<(u64, f32)>; 3] = [
+    let mut left_pts: [Vec<(u64, f32)>; 3] = [
         if show.raw {
             ctrl.telem_points(ch, FIELD_RAW)
         } else {
@@ -3997,7 +4479,13 @@ fn build_chart_frame(
     for idx in 0..4usize {
         let raw = ctrl.algo_trace_report_points(idx as u8);
         // 二值判定必须在归一化【之前】: 乘上 N 之后取值不再是 0/1, 归一化输入框会自己消失。
+        // ★判定与"是否参与绘制"无关★: 归一化输入框对未勾选的行也要照常出现, 故这一步不能跳。
         report_binary[idx] = points_are_binary(&raw);
+        // 未参与绘制的系列到此为止: 归一化/归零补齐/path 生成都是纯浪费(路径不会被画),
+        // 而它们正是本页每帧最重的一段 —— 8 条线里通常只有 1~2 条真的开着。
+        if !show.report[idx] {
+            continue;
+        }
         report_pts[idx] = if report_binary[idx] {
             normalize_binary(&raw, amps[idx])
         } else {
@@ -4006,32 +4494,58 @@ fn build_chart_frame(
     }
     let active_raw = ctrl.algo_trace_active_points();
     let active_binary = points_are_binary(&active_raw);
-    let active_pts = normalize_binary(&active_raw, amps[4]);
+    let mut active_pts = if show.active {
+        normalize_binary(&active_raw, amps[4])
+    } else {
+        Vec::new()
+    };
 
-    // ---- 2. ★唯一的 x 定义域★: 全部参与绘制的系列求并集, 整张图只在这里算一次 ----
+    // ---- 2. ★唯一的 x 定义域★: 整张图只在这里算一次 ----
+    // 左端由**主曲线(raw/bsln/diff)**定义, 叠加系列只能把右端往新的方向延伸, 不能把左端往旧的方向拉。
+    //
+    // ★为什么不是简单求并集★(这是实测踩到的坑)
+    // 算法上报/触发判定只在"单通道精调"页驻留时才轮询, 而遥测在整个设置页都在推。去"算法"页待一会儿
+    // 再回来: 上报缓冲停在离开那一刻、且其最老样本可能比遥测环的最老样本更早(遥测环持续丢弃旧样本),
+    // 于是并集的左端被钉在一个陈旧时间戳上, 主曲线被挤到画面右侧 —— 用户看到的就是"只有右半边能看"。
+    // 图的时间轴本质上就是遥测缓冲的时间轴("全量 x.xx s"说的是它), 比它更老的叠加样本已在窗口之外,
+    // 不该有资格撑开坐标轴。
+    // 反方向的老 bug(叠加线只画了一半宽)也仍然被覆盖: 叠加系列**不会**把窗口收窄, 只是不再撑左端。
     let mut t_first = u64::MAX;
     let mut t_last = 0u64;
     {
-        let mut union_x = |points: &[(u64, f32)]| {
+        for points in &left_pts {
             if let (Some(first), Some(last)) = (points.first(), points.last()) {
                 t_first = t_first.min(first.0);
                 t_last = t_last.max(last.0);
             }
-        };
-        for points in &left_pts {
-            union_x(&points[..]);
         }
+        let primary_has_data = t_first <= t_last;
+        let mut extend_right = |points: &[(u64, f32)]| {
+            if let (Some(first), Some(last)) = (points.first(), points.last()) {
+                // 主曲线没有数据时(例如停流后只剩上报缓冲)才允许叠加系列定义左端, 否则整张图无从落笔。
+                if !primary_has_data {
+                    t_first = t_first.min(first.0);
+                }
+                t_last = t_last.max(last.0);
+            }
+        };
         for idx in 0..4usize {
             if show.report[idx] {
-                union_x(&report_pts[idx][..]);
+                extend_right(&report_pts[idx][..]);
             }
         }
         if show.active {
-            union_x(&active_pts[..]);
+            extend_right(&active_pts[..]);
         }
     }
     // 一条参与系列都没有数据 ⇒ 空窗归零(不能留 u64::MAX, 那会让 x 映射全部落到 0)。
     let no_data = t_first > t_last;
+    // ★横轴总跨度固定 30s★ 右端 = 最新样本时刻, 左端 = 右端 − 30s。
+    // 为什么不再用"缓冲里最老那个样本"当左端: 那个值随缓冲填充、采样率变化、通道切换而漂,
+    // 于是同一段波形在图上的横向尺度每帧都在变(抖动), 缩放/滚动条的比例也跟着变 ——
+    // 固定窗口后横向 1 像素恒等于固定时长, 波形形状才可比。
+    // 数据不足 30s 时左边就是空的(不补 0, 见 fill_uncovered_with_zero 的左端注释)。
+    let t_first = t_last.saturating_sub(PLOT_WINDOW_US);
     let x = XWindow {
         t_first_us: if no_data { 0 } else { t_first },
         t_last_us: if no_data { 0 } else { t_last },
@@ -4049,20 +4563,36 @@ fn build_chart_frame(
     // 阈值按系列节奏取(两档都由 XWindow 一处算定), 补齐结果同时是后面量程与路径的唯一输入 ——
     // 量程用原始点、路径用补齐点会让归零段落在量程外, 那正是"归零段被裁到边框外"的来路。
     // 节奏仍由系列身份决定(SeriesId::cadence 是那条映射的唯一实现), 这里只是把两档各取一次。
+    // ★窗口外的样本必须先丢掉(所有系列, 含主曲线)★
+    // 窗口左端由固定跨度定义, 比它更老的样本仍留在各自缓冲里。若不丢:
+    //  · `XWindow::x_of` 会把它们统统夹到 x=0, 在左边框上糊成一条竖线;
+    //  · 它们还会参与量程, 把量程撑成陈旧数据的范围。
+    // 丢弃只影响"画不进这张图的历史点", 不改变任何仍在窗口内的数据。
+    {
+        let cut = x.t_first_us;
+        for pts in left_pts.iter_mut() {
+            pts.retain(|(t, _)| *t >= cut);
+        }
+        for pts in report_pts.iter_mut() {
+            pts.retain(|(t, _)| *t >= cut);
+        }
+        active_pts.retain(|(t, _)| *t >= cut);
+    }
+
     let gap_frame = x.gap_us(SeriesId::Raw.cadence());
     let gap_poll = x.gap_us(SeriesId::Active.cadence());
     let left_fill: [Vec<PlotPoint>; 3] = [
-        fill_uncovered_with_zero(&left_pts[0][..], &x, gap_frame),
-        fill_uncovered_with_zero(&left_pts[1][..], &x, gap_frame),
-        fill_uncovered_with_zero(&left_pts[2][..], &x, gap_frame),
+        fill_uncovered_with_dashes(&left_pts[0][..], &x, gap_frame),
+        fill_uncovered_with_dashes(&left_pts[1][..], &x, gap_frame),
+        fill_uncovered_with_dashes(&left_pts[2][..], &x, gap_frame),
     ];
     let report_fill: [Vec<PlotPoint>; 4] = [
-        fill_uncovered_with_zero(&report_pts[0][..], &x, gap_poll),
-        fill_uncovered_with_zero(&report_pts[1][..], &x, gap_poll),
-        fill_uncovered_with_zero(&report_pts[2][..], &x, gap_poll),
-        fill_uncovered_with_zero(&report_pts[3][..], &x, gap_poll),
+        fill_uncovered_with_dashes(&report_pts[0][..], &x, gap_poll),
+        fill_uncovered_with_dashes(&report_pts[1][..], &x, gap_poll),
+        fill_uncovered_with_dashes(&report_pts[2][..], &x, gap_poll),
+        fill_uncovered_with_dashes(&report_pts[3][..], &x, gap_poll),
     ];
-    let active_fill = fill_uncovered_with_zero(&active_pts[..], &x, gap_poll);
+    let active_fill = fill_uncovered_with_dashes(&active_pts[..], &x, gap_poll);
 
     // ---- 4. 两根轴的量程: 各自只由"参与绘制且走该轴"的系列决定 ----
     let left = {
@@ -4125,11 +4655,7 @@ fn build_chart_frame(
         .iter()
         .map(|&(id, points, binary, raw_count)| SeriesPath {
             id,
-            path: points_to_svg_path(
-                points,
-                &x,
-                if id.on_right_axis() { &right } else { &left },
-            ),
+            path: points_to_svg_path(points, &x, if id.on_right_axis() { &right } else { &left }),
             color: palette.take(),
             point_count: raw_count as i32,
             binary,
@@ -4512,9 +5038,17 @@ fn char_to_hid(text: &str) -> u8 {
     0
 }
 
-fn build_channel_status(ctrl: &AppController) -> Vec<ChannelStatus> {
-    let mut out = Vec::with_capacity(36);
-    for ch in 0u8..36 {
+/// 全通道网格的行模型。★排序与筛选都在这里定稿★: 次序取自
+/// `AppController::channel_display_order`(逻辑序的唯一来源是绑定映射), Slint 只按数组下标摆格子。
+/// 返回 `(行, 被筛掉的通道数)`。
+fn build_channel_status(
+    ctrl: &AppController,
+    sort: i32,
+    show_disabled: bool,
+) -> (Vec<ChannelStatus>, i32) {
+    let (order, hidden) = ctrl.channel_display_order(sort, show_disabled);
+    let mut out = Vec::with_capacity(order.len());
+    for (pos, ch) in order.into_iter().enumerate() {
         let (active, raw, diff) = match ctrl.telem_latest(ch) {
             Some(s) => (
                 (s.status.unwrap_or(0) & 0x01) != 0,
@@ -4540,14 +5074,17 @@ fn build_channel_status(ctrl: &AppController) -> Vec<ChannelStatus> {
             active,
             raw,
             diff,
-            grid_col: (ch % 6) as i32,
-            grid_row: (ch / 6) as i32,
+            // 网格坐标按【展示次序】给出(不是物理号): 排序后按物理号摆格会与实际渲染次序错位。
+            grid_col: (pos % 6) as i32,
+            grid_row: (pos / 6) as i32,
             binding_text: binding_text.into(),
             cp_text: cp_display_text(ctrl.cp(ch)).into(),
             frozen: ctrl.channel_frozen(ch),
+            enabled: ctrl.ch_enabled(ch),
+            order: pos as i32,
         });
     }
-    out
+    (out, hidden as i32)
 }
 
 fn build_param_rows(params: &[(u8, u32)]) -> Vec<ParamRow> {
@@ -4558,16 +5095,83 @@ fn build_param_rows(params: &[(u8, u32)]) -> Vec<ParamRow> {
         .filter(|&&(param_id, _)| matches!(param_id, 0x01..=0x06 | 0x08..=0x0B))
         .map(|&(param_id, value)| {
             // 围栏随行下发: Slint 只消费数值, 不再自己按 param_id 派生阈值(见 types.slint::ParamRow)。
-            let fence = mai2control_ui::proto::param_fence(param_id);
-            ParamRow {
-                param_id: param_id as i32,
-                label: param_display_name(param_id).into(),
-                value: value as i32,
-                min: fence.ui_min() as i32,
-                max: fence.ui_max() as i32,
+            build_param_row(param_id, value as i32)
+        })
+        .collect()
+}
+
+/// 响应噪声频谱的热图格子模型(SWEEP_GAINS × SWEEP_DIVS 格)。
+///
+/// ★归一化与配色必须在 Rust 侧算★ Slint 数不出"全体有效格的最小/最大值", 而热图的全部意义在于
+/// 相对高低; 若把原始标准差丢给 .slint 让它自己上色, 那边只能写死一个绝对量程 —— 换个通道或换个
+/// 分辨率就整片糊成一个颜色。
+/// ★撞顶/贴底的格子不参与 min/max★: 那种点 RAW 贴在量程边界上, 标准差小得好看但 diff 已经失效,
+/// 让它参与归一化会把整张图的基准拉歪。它们仍然画出来, 由 .slint 侧描红边区别标注。
+fn build_spectrum_cells(ctrl: &AppController) -> Vec<SpectrumCell> {
+    let cells = ctrl.noise_sweep_cells();
+    let mut lo = f32::MAX;
+    let mut hi = f32::MIN;
+    for cell in cells {
+        if !cell.valid || cell.railed {
+            continue;
+        }
+        lo = lo.min(cell.std);
+        hi = hi.max(cell.std);
+    }
+    let span = (hi - lo).max(1e-6);
+    cells
+        .iter()
+        .enumerate()
+        .map(|(i, cell)| {
+            let norm = if cell.valid && hi >= lo {
+                ((cell.std - lo) / span).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            SpectrumCell {
+                gain: (i / SWEEP_DIVS) as i32,
+                div: (i % SWEEP_DIVS + 1) as i32,
+                std: cell.std,
+                pp: cell.pp,
+                norm,
+                valid: cell.valid,
+                railed: cell.railed,
+                tint: _spectrum_tint(cell.valid, cell.railed, norm),
             }
         })
         .collect()
+}
+
+/// 一格的颜色: 未测=底色, 撞顶=暗红(其"低噪声"不可信), 其余按噪声由低到高 蓝→绿→红。
+/// 分两段线性插值而不是简单 R/B 对调: 中间层次(绿)才让人看出"哪一片是可用区"。
+fn _spectrum_tint(valid: bool, railed: bool, norm: f32) -> slint::Color {
+    if !valid {
+        return slint::Color::from_rgb_u8(0x1a, 0x1f, 0x24);
+    }
+    if railed {
+        return slint::Color::from_rgb_u8(0x4a, 0x2a, 0x2a);
+    }
+    let t = norm.clamp(0.0, 1.0);
+    let (r, g, b) = if t < 0.5 {
+        let u = t / 0.5;
+        (
+            _lerp8(0x20, 0x30, u),
+            _lerp8(0x60, 0xd0, u),
+            _lerp8(0xd0, 0x50, u),
+        )
+    } else {
+        let u = (t - 0.5) / 0.5;
+        (
+            _lerp8(0x30, 0xe0, u),
+            _lerp8(0xd0, 0x40, u),
+            _lerp8(0x50, 0x30, u),
+        )
+    };
+    slint::Color::from_rgb_u8(r, g, b)
+}
+
+fn _lerp8(a: u8, b: u8, t: f32) -> u8 {
+    (a as f32 + (b as f32 - a as f32) * t.clamp(0.0, 1.0)).round() as u8
 }
 
 /// 全局项(GPARAM_*)的数字输入围栏, 供触控全局调整页的 SpinBox 取上下界。

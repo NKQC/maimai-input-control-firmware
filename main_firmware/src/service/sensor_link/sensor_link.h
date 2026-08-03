@@ -75,6 +75,10 @@ private:
     // 组帧缓冲: 遥测与自适应进度共用(两者都只在 core0 的 TxScheduler::tick 里顺序发送, 不会重入)。
     HostFrame _telem_frame;
     uint8_t _at_req_ch;      // 本轮自适应目标通道(0..35 / 0xFF), 供进度帧回显与写穿真相源
+    // 本轮自适应的**上位机请求 seq**(AUTO_TUNE 请求帧的 seq): 逐帧回显在 AUTO_TUNE_PROGRESS 尾部,
+    // 使上位机能把终态严格归属到它发起的那一次请求 —— 推送流的帧头 seq 是设备流序号, 与请求无关,
+    // 没有这个回显时"上一轮的终态"会被算到下一个通道头上。
+    uint8_t _at_req_seq = 0;
     uint16_t _at_ticks;      // 本轮已发进度帧数: 用于自续租的硬上限(防设备侧异常导致推送永不停)
     uint16_t _rescue_ticks = 0;   // 救砖进度帧数(同上, 自续租硬上限)
 

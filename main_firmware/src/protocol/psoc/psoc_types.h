@@ -104,13 +104,26 @@ struct AutoTuneProgress {
     uint8_t  step = 0;       // 当前阶段内步序(1 起)
     uint8_t  ch = 0xFF;      // 目标通道(0..35 单通道 / 0xFF 全通道)
     uint8_t  result = 0;     // 0=进行中 1=成功 2=失败/超时
+    uint8_t  tag = 0;        // 本轮请求标签(6 bit, PSoC 回显; 0=未标记/旧 PSoC 固件)
     uint16_t cur_div = 0;    // 进行中: 当前试探的 snsClk 分频
     uint16_t div = 0;        // 完成时: 最终写入的分频(失败为 0)
 
     void clear() {
-        req = 0; state = 0; phase = 0; step = 0; ch = 0xFF; result = 0; cur_div = 0; div = 0;
+        req = 0; state = 0; phase = 0; step = 0; ch = 0xFF; result = 0; tag = 0; cur_div = 0; div = 0;
     }
 };
+
+// ---------------- AUTO_TUNE 请求标签(端到端归属) ----------------
+// 上位机请求 seq → RP2040 → PSoC(AUTO_TUNE 帧 rx[4]) → GET_AUTO_TUNE 的 result 高 6 位回显 → RP2040。
+// ★为什么要它★: "发命令→轮询 busy→读结果"的流水线里, 命令若在 SPI 上丢了而 busy 恰好因上一条重
+// 操作为 1, 读回来的 result/div 是**上一轮**的, 却会被当成本轮成功。标签一比即知。
+// 0 保留给"未标记/旧固件", 故 seq 低 6 位为 0 时映射到 0x3F。
+static constexpr uint8_t AUTOTUNE_TAG_MASK = 0x3Fu;
+static constexpr uint8_t AUTOTUNE_RESULT_MASK = 0x03u;
+static inline uint8_t autotune_tag_of(uint8_t host_seq) {
+    const uint8_t tag = (uint8_t)(host_seq & AUTOTUNE_TAG_MASK);
+    return (tag != 0u) ? tag : AUTOTUNE_TAG_MASK;
+}
 
 // SPI 层在阻塞等待中回吐进度用的回调(ctx 由调用方透传, 避免 SPI 层反向依赖门面类型)。
 using AutoTuneProgressFn = void (*)(void* ctx, const AutoTuneProgress& progress);

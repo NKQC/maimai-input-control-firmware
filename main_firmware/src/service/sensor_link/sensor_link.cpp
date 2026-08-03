@@ -45,6 +45,7 @@ constexpr uint8_t kParamIds[] = {
     0x09,  // IDAC_MOD
     0x0A,  // SNS_CLK_SOURCE
     0x0B,  // IDAC_GAIN
+    0x0C,  // ENABLED(通道启用开关: 0=禁用/电极高阻 1=启用)
 };
 constexpr uint8_t kParamCount = sizeof(kParamIds) / sizeof(kParamIds[0]);
 // Cp 哨兵(与 PSoC/上位机一致): 未测量 / 测量失败 / 读取失败。
@@ -64,6 +65,34 @@ inline bool heavy_gate_reject(const char* what, const HostFrame& frame,
     if (!psoc->heavy_busy()) return false;
     psoc->note_heavy_reject();
     *response_length = HostCmdCodec::encode_nak(frame.seq, HostCmdError::DEVICE_BUSY,
+                                                what, response, 512);
+    return true;
+}
+
+// ch_mask(u64 LE) → PSoC 的通道字节: 恰好一位 ⇒ 该通道号(0..35); 其余(空/多位/全 36 位) ⇒ 0xFF 全通道。
+// ★为什么"恰好一位"才算单通道★ 上位机的单通道入口本来就编码成 `1<<ch`, 而批量入口是 host 侧
+// 逐通道串行队列(每条仍是 `1<<ch`)。真正需要 0xFF 的只有"全 36 位"这种兼容/兜底调用。
+// 多位但不满 36 的掩码没有对应的固件语义(帧里只有一个通道字节), 退化为全通道比只做第一位诚实。
+inline uint8_t _mask_to_single_ch(const HostFrame& frame) {
+    if (frame.len < 8) return 0xFFu;
+    uint64_t mask = 0;
+    for (uint8_t i = 0; i < 8; i++) mask |= (uint64_t)frame.payload[i] << (8u * i);
+    mask &= 0xFFFFFFFFFULL;   // 低 36 位有效
+    if (mask == 0u || (mask & (mask - 1u)) != 0u) return 0xFFu;   // 空 / 多位 → 全通道
+    uint8_t ch = 0;
+    while ((mask >> ch) != 1u) ch++;
+    return ch;
+}
+
+// 单通道重操作落在【已禁用】通道上 ⇒ 明确 NAK, 而不是让它静默空转。
+// ★为什么要在 RP 这一层拦★ PSoC 侧本来就会跳过禁用通道(它的电极必须保持高阻, 不能为了校准去连),
+// 但那是"什么都没发生"—— 上位机收到 ACK 却看不到任何变化, 只能当成"设备坏了"。在这里如实回绝,
+// 上位机的既有 NAK 日志路径就会把原因写清楚。0xFF(全通道)不拦: 固件会逐通道跳过禁用项。
+inline bool disabled_ch_reject(const char* what, uint8_t ch, const HostFrame& frame,
+                               uint8_t* response, uint16_t* response_length) {
+    if (ch >= SENSOR_LINK_CHANNELS) return false;
+    if (CsdConfig::getInstance()->ch_enabled(ch)) return false;
+    *response_length = HostCmdCodec::encode_nak(frame.seq, HostCmdError::INVALID_PARAM,
                                                 what, response, 512);
     return true;
 }
@@ -271,6 +300,9 @@ void SensorLink::autotune_tick() {
     payload[length++] = st.result;
     payload[length++] = static_cast<uint8_t>(st.div);
     payload[length++] = static_cast<uint8_t>(st.div >> 8);
+    // ★尾部追加: 发起本轮的上位机请求 seq★ 前 9 字节布局一字未动(旧上位机按 >=9 解析, 兼容),
+    // 新上位机据此把终态严格归属到自己发起的那一次请求。
+    payload[length++] = _at_req_seq;
 
     _telem_frame.cmd = static_cast<uint8_t>(HostCmd::AUTO_TUNE_PROGRESS);
     _telem_frame.flags = HOST_CMD_FLAG_STREAM;
@@ -437,7 +469,8 @@ void SensorLink::_handle_param_set(const HostFrame& frame, uint8_t* response, ui
     //   - 上位机: control_software/src/proto/telemetry.rs::param_fence(上位机侧唯一权威声明表,
     //             UI 输入范围 / 下发前拒绝 / 回读防污染都只读它)
     // 合法性防护(与 PSoC 端一致): 拒绝会 railed/时钟异常/校准发散的非法值, 不下发也不写真相源。
-    // RESOLUTION 6..16; SNS_CLK_DIV 1..255; IDAC_MOD 0..127; IDAC_GAIN 0..6; SNS_CLK_SOURCE 低7位 0..6。
+    // RESOLUTION 6..16; SNS_CLK_DIV 1..255; IDAC_MOD 0..127; IDAC_GAIN 0..6; SNS_CLK_SOURCE 低7位 0..6;
+    // ENABLED(0x0C) 0..1。
     bool legal = true;
     switch (param_id) {
         case 0x07: legal = (value >= 6u)  && (value <= 16u);  break;   // RESOLUTION
@@ -445,6 +478,7 @@ void SensorLink::_handle_param_set(const HostFrame& frame, uint8_t* response, ui
         case 0x09: legal = (value <= 127u);                   break;   // IDAC_MOD
         case 0x0B: legal = (value <= 6u);                     break;   // IDAC_GAIN(0..6, 表7项索引7越界崩溃)
         case 0x0A: legal = ((value & 0x7Fu) <= 6u);           break;   // SNS_CLK_SOURCE
+        case 0x0C: legal = (value <= 1u);                     break;   // ENABLED(硬件开关, 只 0/1)
         default: break;
     }
     if (!legal) {
@@ -570,10 +604,14 @@ void SensorLink::_emit_param_all_channels(const HostFrame& frame, uint8_t* respo
 }
 
 void SensorLink::_handle_calibrate(const HostFrame& frame, uint8_t* response, uint16_t* response_length) {
-    // payload = ch_mask(u64 LE)；当前 PSoC APPLY 对全部 widget 重校准，不细分通道。
-    // 真正的 IDAC 重校准(把 railed 的 raw 拉回目标)+ 基线复位; 与 APPLY(仅重配)区分。
+    // payload = ch_mask(u64 LE)。★单通道语义端到端透传★: 掩码恰好只有一位 ⇒ 把该通道号透传给
+    // PSoC(它只校准该 widget 并只初始化该 widget 的基线); 多位/空/全 36 位 ⇒ 0xFF 全通道兼容语义。
+    // 上位机的"全通道校准"已改为 host 侧可取消串行队列逐通道下发, 不再依赖固件内部 36 通道循环。
+    const uint8_t cal_ch = _mask_to_single_ch(frame);
+    if (disabled_ch_reject("该通道已禁用(电极保持高阻), 无法校准; 请先启用该通道",
+                           cal_ch, frame, response, response_length)) return;
     if (heavy_gate_reject("PSoC 正在执行长周期指令, 请稍后重试(校准)", frame, response, response_length)) return;
-    if (Psoc::getInstance()->calibrate()) {
+    if (Psoc::getInstance()->calibrate(cal_ch)) {
         *response_length = HostCmdCodec::encode_ack(frame.seq, response, 512);
     } else {
         *response_length = HostCmdCodec::encode_nak(frame.seq, HostCmdError::SENSOR_ERROR,
@@ -582,9 +620,12 @@ void SensorLink::_handle_calibrate(const HostFrame& frame, uint8_t* response, ui
 }
 
 void SensorLink::_handle_baseline_reset(const HostFrame& frame, uint8_t* response, uint16_t* response_length) {
-    // payload = ch_mask(u64 LE)(当前 PSoC 对全部通道统一复位基线, 不细分通道)。
+    // payload = ch_mask(u64 LE); 单位掩码 ⇒ 只复位该通道基线(见 _mask_to_single_ch)。
+    const uint8_t bsln_ch = _mask_to_single_ch(frame);
+    if (disabled_ch_reject("该通道已禁用(电极保持高阻), 无法复位基线; 请先启用该通道",
+                           bsln_ch, frame, response, response_length)) return;
     if (heavy_gate_reject("PSoC 正在执行长周期指令, 请稍后重试(基线复位)", frame, response, response_length)) return;
-    if (Psoc::getInstance()->baseline_reset()) {
+    if (Psoc::getInstance()->baseline_reset(bsln_ch)) {
         *response_length = HostCmdCodec::encode_ack(frame.seq, response, 512);
     } else {
         *response_length = HostCmdCodec::encode_nak(frame.seq, HostCmdError::SENSOR_ERROR,
@@ -606,12 +647,17 @@ void SensorLink::_handle_auto_tune(const HostFrame& frame, uint8_t* response, ui
             "auto_tune channel out of range", response, 512);
         return;
     }
+    if (disabled_ch_reject("该通道已禁用(电极保持高阻), 无法做频率自适应; 请先启用该通道",
+                           req_ch, frame, response, response_length)) return;
     // ★首要嫌疑就是这条的堆叠★: 自适应单次 20s+, 期间再来一条只会背靠背排队, 把主循环整体拖长。
     if (heavy_gate_reject("PSoC 正在执行长周期指令, 请稍后重试(频率自适应)", frame, response, response_length)) return;
     SensorLink* self = getInstance();
     self->_at_req_ch = req_ch;
+    // 归属键: 本轮进度/终态帧一律回显这个 seq(上位机据此丢弃上一轮的残留帧), 并折成 6 bit 标签
+    // 随命令下到 PSoC, 使 RP↔PSoC 这一段也能认出陈旧结果。
+    self->_at_req_seq = frame.seq;
     self->_at_ticks = 0;
-    if (!Psoc::getInstance()->auto_tune_start(req_ch, req_pref)) {
+    if (!Psoc::getInstance()->auto_tune_start(req_ch, req_pref, frame.seq)) {
         *response_length = HostCmdCodec::encode_nak(frame.seq, HostCmdError::SENSOR_ERROR,
             "PSoC auto_tune enqueue failed", response, 512);
         return;

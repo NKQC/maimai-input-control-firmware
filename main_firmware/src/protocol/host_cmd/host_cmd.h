@@ -101,7 +101,10 @@ enum class HostCmd : uint8_t {
     // ★设备主动推送(flags=STREAM)★: AUTO_TUNE 受理后 5Hz 上报阶段进度, 完成帧发出即自取消任务。
     // payload = [state(u8: 0空闲/1进行中/2完成), phase(u8: 0受理/1粗定位/2细搜临界/3落档回退/4完成),
     //            step(u8 阶段内步序), cur_div(u16 LE 当前试探分频), ch(u8),
-    //            result(u8: 0进行中/1成功/2失败), final_div(u16 LE)]
+    //            result(u8: 0进行中/1成功/2失败), final_div(u16 LE), origin_seq(u8)]
+    // ★origin_seq = 发起本轮的 AUTO_TUNE 请求帧 seq★ 本流是 STREAM 推送, 帧头 seq 是设备流序号、与
+    // 请求无关, 故必须回显请求 seq, 上位机才能把终态严格归属到自己发起的那一次(逐通道批量下, 迟到的
+    // 上一轮终态否则会被算到下一个通道头上)。追加在尾部 ⇒ 前 9 字节与旧固件逐字节相同, 旧上位机不受影响。
     AUTO_TUNE_PROGRESS = 0x2E,
     // ★设备主动推送(flags=STREAM)★: 固件"自己救自己"的动作(复位 PSoC/回退算法/清空 CSD store/
     // 重新下发/PSoC 启动强制改写配置)会让设备实际状态偏离上位机以为的状态, 必须上报, 否则界面是幻觉。

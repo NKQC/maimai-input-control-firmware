@@ -832,6 +832,22 @@ bool SwdProgrammer::debug_read_spi_counters(uint32_t out_words[DEBUG_COUNTER_WOR
     return true;
 }
 
+bool SwdProgrammer::debug_read_words(const uint32_t* addresses, uint32_t* out_words, uint8_t word_count) {
+    if (addresses == nullptr || out_words == nullptr || word_count == 0u) {
+        _dbg_status = DEBUG_BLOCK_READ_FAILED;
+        return false;
+    }
+    if (!_debug_attach()) return false;
+    for (uint8_t i = 0; i < word_count; ++i) {
+        if (!_read_io(addresses[i], &out_words[i])) {
+            _dbg_status = DEBUG_BLOCK_READ_FAILED;
+            return false;
+        }
+    }
+    _dbg_status = DEBUG_OK;
+    return true;
+}
+
 bool SwdProgrammer::read_silicon_id(uint32_t* out_id) {
     if (!_ready || out_id == nullptr) return false;
 

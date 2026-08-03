@@ -1,6 +1,7 @@
 import { Button, VerticalBox, HorizontalBox, CheckBox, SpinBox, ScrollView } from "std-widgets.slint";
-import { ParamRow, AlgoReportLine, AlgoSettingRow } from "../common/types.slint";
-import { CollapsibleSection, ParamEditorRow, AlgoSettingEditorRow, PlotPath, SeriesRow } from "../common/widgets.slint";
+import { ParamRow, AlgoReportLine, AlgoSettingRow, SpectrumCell } from "../common/types.slint";
+import { CollapsibleSection, ParamEditorRow, AlgoSettingEditorRow, PlotPath, SeriesRow, GuardedSpinBox, HelpOverlay } from "../common/widgets.slint";
+import { Theme } from "../common/theme.slint";
 
 
 // ============================================================================
@@ -83,8 +84,8 @@ export component CurvesPage inherits Rectangle {
     callback algo_setting_edited(int, int);
     callback report_toggle(int, bool);   // 勾选/取消某条上报变量在主图的叠加
 
-    callback telem_start();
-    callback telem_stop();
+    callback plot_resume();
+    callback plot_freeze();
     callback calibrate();
     callback baseline_reset();
     // ★已删除 plot_area_resized★: PlotPath 改用 fit: fill(非等比拉伸)后, 曲线铺满与绘图区宽高比
@@ -108,6 +109,41 @@ export component CurvesPage inherits Rectangle {
     // 当前采样率(Hz), 供把横向可见窗口(样本数)换算成真实时间跨度显示。
     in property <int> sample_rate_hz: 0;
     in property <string> curve_threshold_warning: "";
+
+    // ── 绘图视窗冻结 ────────────────────────────────────────────────────────────
+    // ★"暂停画面"只冻结看到的东西★: 设备遥测一直在收(读数/采样率/延迟仍是实时的),
+    // 只有曲线与时间轴停在按下的那一刻。真停数据源的开关在全通道页(「停止采集」)。
+    in property <bool> plot_frozen: false;
+
+    // ── 通道启用开关(PARAM_ENABLED=0x0C) ────────────────────────────────────────
+    // false = 该通道电极保持模拟高阻、不参与扫描: 校准/基线/Cp/频谱/自适应/参数编辑对它全都无意义
+    // (固件也会拒绝或跳过), 因此本页一并锁定并如实说明, 而不是让人点了没反应。
+    in property <bool> ch_enabled: true;
+    callback ch_enable_set(bool);
+
+    // ── 响应噪声频谱(增益档 0..6 × 分频 1..64) ───────────────────────────────────
+    // 448 个格子的实测 RAW 噪声, 由 host 逐点串行扫出(每点: 写 gain/div → 单通道校准 → 采 RAW)。
+    // 归一化与配色在 Rust 侧算好随格下发(Slint 数不出全体最大值), 见 types.slint::SpectrumCell。
+    in property <[SpectrumCell]> spectrum_cells: [];
+    in property <bool> spectrum_active: false;
+    in property <string> spectrum_status: "";
+    in property <float> spectrum_progress: 0;
+    // ★默认收起★: 这是一个会改写本通道 gain/div 并耗时数分钟的重操作, 不该在打开页面时就挡在眼前。
+    in-out property <bool> spectrum_expanded: false;
+    callback spectrum_start();
+    callback spectrum_cancel();
+    // 全通道批量队列(校准/基线/自适应)是否在跑。★双向互斥★ 队列在跑时不许开扫描, 扫描在跑时
+    // 本页的校准/基线/自适应也全部锁定 —— 两者都在改同一个通道的 gain/div 与基线。
+    in property <bool> batch_op_active: false;
+
+    // 热图一格的宽度。★必须是常量, 不许由 heat.width 推★: 光标读数那行 Text 的文本一旦依赖
+    // heat.width, 就形成 "文本 → Text 的 layoutinfo → 列 min-width → ScrollView viewport-width →
+    // heat.width" 的求值环, Slint 直接报 binding loop 编译不过(本文件 right_col 处已栽过一次同类环)。
+    // 于是格宽固定、网格总宽 = 64 × 格宽, 窄窗口下由外层 ScrollView 横向滚动。
+    property <length> spec_cell_w: 4px;
+
+    // 参数 "?" 悬浮详解的当前文本(空 = 没悬浮在任何问号上)。浮层画在本页顶层, 不受右列裁切。
+    property <string> help_text: "";
 
     // 折线图视图变换(viewbox 坐标系 0..1000): 横=时间窗口, 纵=数值范围。
     // 滚轮缩放时间(横, 锚定右缘=现在), Shift+滚轮缩放纵轴, 拖拽平移, 双击复位。全览默认 0/1000。
@@ -168,19 +204,43 @@ export component CurvesPage inherits Rectangle {
                 text: "通道:";
                 vertical-alignment: center;
             }
-            SpinBox {
+            GuardedSpinBox {
                 minimum: 0;
                 maximum: 35;
-                value: root.sel_channel;
+                model_value: root.sel_channel;
                 edited(v) => { root.sel_channel = v; }
             }
             Button {
-                text: "开始";
-                clicked => { root.telem_start(); }
+                // 冻结中时这就是"继续": 解冻回到实时时间轴(遥测本来就没停, 无需重新开流)。
+                // ★不叫"开始"★: 那会让人以为它在开数据流(真正的开流在全通道页「开始采集」)。
+                text: root.plot_frozen ? @tr("▶ 继续") : @tr("实时中");
+                enabled: root.plot_frozen;
+                clicked => { root.plot_resume(); }
             }
             Button {
-                text: "停止";
-                clicked => { root.telem_stop(); }
+                // ★只冻结画面, 不停数据★ 设备遥测继续推流, 读数/采样率/延迟仍是实时的。
+                text: @tr("⏸ 暂停画面");
+                enabled: !root.plot_frozen;
+                clicked => { root.plot_freeze(); }
+            }
+            // 本通道的硬件启用开关: 与全通道页卡片、批量启停同一真相源(0x0C 草稿)。
+            CheckBox {
+                text: @tr("通道启用");
+                checked: root.ch_enabled;
+                toggled => { root.ch_enable_set(self.checked); }
+            }
+            Text {
+                text: root.ch_enabled ? "" : @tr("⛔ 本通道已禁用(电极高阻, 不扫描): 调参与校准对它无效");
+                color: #ff8c42;
+                font-size: 11px;
+                vertical-alignment: center;
+                overflow: elide;
+            }
+            Text {
+                text: root.plot_frozen ? "❄ 画面已冻结(遥测仍在接收)" : "";
+                color: #8fd6ff;
+                font-size: 11px;
+                vertical-alignment: center;
             }
             // ★序列勾选(RAW/BASELINE/DIFF/触发判定)已全部移到右列"数据序列"区★: 顶部每多一行控件
             // 就少一行波形, 竖向空间优先给时间轴; 顶部只留通道选择、采样/校准操作与这个总开关。
@@ -200,23 +260,41 @@ export component CurvesPage inherits Rectangle {
             Button {
                 // 自动模式由中间件自动校准, 手动"校准"无意义 → 锁定; 切半自动手动模式后可用。
                 // 运行中(op_busy)锁定并显示运行标识, 完成后自动解锁。
-                text: root.op_busy ? ("⏳ " + root.op_label) : (root.scan_mode == 1 ? "校准" : "校准(自动模式锁定)");
-                enabled: root.scan_mode == 1 && !root.op_busy;
+                text: root.op_busy ? ("⏳ " + root.op_label)
+                    : (!root.ch_enabled ? "校准(通道已禁用)"
+                    : (root.spectrum_active ? "校准(频谱扫描中锁定)"
+                                            : (root.scan_mode == 1 ? "校准" : "校准(自动模式锁定)")));
+                // 频谱扫描/批量队列进行中一律锁定: 插进去会改掉正在测的那一格的配置。
+                // 禁用通道锁定: 校准要连接电极扫描, 与"电极保持高阻"直接冲突(固件也会跳过)。
+                enabled: root.ch_enabled && root.scan_mode == 1 && !root.op_busy && !root.spectrum_active && !root.batch_op_active;
                 clicked => { root.calibrate(); }
             }
             Button {
-                text: "基线复位";
-                enabled: !root.op_busy;
+                // ★只复位本通道★(掩码 = 1<<sel_channel), 其余 35 个通道的基线不动。
+                // ★不再顺带冻结画面★: 冻结是右侧「暂停画面」的职责; 复位真正要看的是复位之后
+                // 基线如何收敛, 冻住只会停在复位前的旧数据上。复位期间设备不出帧的那一小段,
+                // 由绘图管线按"无覆盖 ⇒ 虚线"如实画出(见 main.rs::fill_uncovered_with_dashes)。
+                text: !root.ch_enabled ? "基线复位(通道已禁用)"
+                    : (root.spectrum_active ? "基线复位(频谱扫描中锁定)"
+                                            : ("基线复位(CH" + root.sel_channel + ")"));
+                enabled: root.ch_enabled && !root.op_busy && !root.spectrum_active && !root.batch_op_active;
                 clicked => { root.baseline_reset(); }
             }
             Button {
-                text: "测量全部电极电容";
+                // Cp 测量在 PSoC 侧走 BIST: 逐电极换配置再恢复。与频谱扫描交叠时, 恢复回来的可能是
+                // 上一格的配置, 这一格的噪声也不再属于它标称的 (gain, div) → 扫描期间锁定。
+                text: root.spectrum_active ? "测量全部电极电容(频谱扫描中锁定)"
+                                           : "测量全部电极电容";
+                enabled: !root.spectrum_active;
                 clicked => { root.measure_cp(); }
             }
             // 逐通道频率自适应: 各通道 Cp 跨度极大(22pF~138pF), 只对本通道逐档降频重校准。
             Button {
-                text: root.op_busy ? ("⏳ " + root.op_label) : ("本通道频率自适应 (CH" + root.sel_channel + ")");
-                enabled: !root.op_busy;
+                text: root.op_busy ? ("⏳ " + root.op_label)
+                    : (!root.ch_enabled ? "本通道频率自适应(通道已禁用)"
+                    : (root.spectrum_active ? "本通道频率自适应(频谱扫描中锁定)"
+                                            : ("本通道频率自适应 (CH" + root.sel_channel + ")")));
+                enabled: root.ch_enabled && !root.op_busy && !root.spectrum_active && !root.batch_op_active;
                 clicked => { root.auto_tune_channel(); }
             }
             Text {
@@ -852,7 +930,15 @@ export component CurvesPage inherits Rectangle {
                         wrap: word-wrap;
                         visible: root.auto_tune_status != "";
                     }
-                    VerticalBox {
+                    // ★禁用通道不给参数编辑入口★ 它的电极是高阻、不参与扫描, 改阈值/分频只会
+                    // 写进一份不生效的草稿, 让人以为"调过了"。如实说明并给出下一步动作。
+                    if !root.ch_enabled: Text {
+                        text: @tr("本通道已禁用: 电极保持模拟高阻、不参与扫描, 参数与校准对它无效。\n先勾选上方「通道启用」并「保存到设备」, 再回来精调。");
+                        color: #ff8c42;
+                        font-size: 11px;
+                        wrap: word-wrap;
+                    }
+                    if root.ch_enabled: VerticalBox {
                             padding: 0px;
                             spacing: 4px;
                             for row in root.params: ParamEditorRow {
@@ -860,8 +946,117 @@ export component CurvesPage inherits Rectangle {
                                 mode_known: root.mode_known;
                                 auto_mode: root.mode_known && root.scan_mode == 0;
                                 edited(pid, v) => { root.param_edited(pid, v); }
+                                // 悬浮问号 → 页面顶层浮层(见 help_text 与页面底部 HelpOverlay)。
+                                help_hovered(t) => { root.help_text = t; }
                             }
                         }
+                }
+
+                // ── 响应噪声频谱 ─────────────────────────────────────────────────
+                // ★默认收起★: 这是一次要改写本通道 gain/div、逐点重校准 448 次的重操作。
+                // 热图只显示 host 实测出来的东西, 不做任何模型推断。
+                CollapsibleSection {
+                    title: "响应噪声频谱(增益档 × 分频)";
+                    summary: root.spectrum_active
+                        ? Math.round(root.spectrum_progress * 100) + "% 扫描中"
+                        : (root.spectrum_status == "" ? "未扫描" : "已有结果");
+                    expanded <=> root.spectrum_expanded;
+
+                    Text {
+                        text: "逐点扫 7 个增益档 × 64 个分频(共 448 点): 每点写入 gain/div → 本通道校准 → "
+                            + "采一段 RAW 算标准差。需要逐通道 RAW 遥测在推流; 扫完/取消/断线都会还原原值并重新校准。";
+                        color: #b0b8c0;
+                        font-size: 10px;
+                        wrap: word-wrap;
+                    }
+                    HorizontalLayout {
+                        spacing: Theme.gap;
+                        Button {
+                            horizontal-stretch: 0;
+                            text: !root.ch_enabled ? "开始扫描(通道已禁用)"
+                                : (root.batch_op_active ? "开始扫描(批量队列进行中锁定)"
+                                                        : ("开始扫描 (CH" + root.sel_channel + ")"));
+                            // 批量队列在跑时不许开扫描(反向拒绝在 Rust 侧 ch_batch_start/noise_sweep_start,
+                            // 这里只是不给用户白点一下的机会)。
+                            enabled: root.ch_enabled && !root.spectrum_active && !root.op_busy && !root.batch_op_active;
+                            clicked => { root.spectrum_start(); }
+                        }
+                        Button {
+                            min-width: Theme.button-min-width;
+                            horizontal-stretch: 0;
+                            text: "取消";
+                            enabled: root.spectrum_active;
+                            clicked => { root.spectrum_cancel(); }
+                        }
+                        // 行尾弹性空白: 两个按钮才不会被平分成两个半屏宽的巨块。
+                        Rectangle { horizontal-stretch: 1; }
+                    }
+                    // 进度条: 只在扫描中出现, 空闲时不占一行。
+                    Rectangle {
+                        height: root.spectrum_active ? 6px : 0px;
+                        visible: root.spectrum_active;
+                        border-radius: 3px;
+                        background: #22282e;
+                        Rectangle {
+                            x: 0;
+                            width: parent.width * Math.clamp(root.spectrum_progress, 0, 1);
+                            height: parent.height;
+                            border-radius: 3px;
+                            background: #4a90d9;
+                        }
+                    }
+                    Text {
+                        text: root.spectrum_status;
+                        color: #8fd6ff;
+                        font-size: 10px;
+                        wrap: word-wrap;
+                        visible: root.spectrum_status != "";
+                    }
+                    // 热图: 横 = 分频 1..64, 纵 = 增益档 0..6。格子颜色由 Rust 侧按本次扫描的
+                    // 全体有效格归一化后给出(SpectrumCell.tint), 撞顶/贴底的格子单独描边区别标注。
+                    heat := Rectangle {
+                        // 尺寸全由常量给(见 root.spec_cell_w 的注释): 网格不随列宽伸缩, 换来的是
+                        // "光标读数不依赖布局" —— 否则必然撞上 binding loop。
+                        min-width: 64 * root.spec_cell_w + 2px;
+                        max-width: 64 * root.spec_cell_w + 2px;
+                        height: 7 * 15px;
+                        background: #12181d;
+                        border-width: 1px;
+                        border-color: #29323a;
+                        clip: true;
+                        // 一个 for 平铺 448 格并按 gain/div 绝对定位 —— 不嵌两层 for, 也不需要在
+                        // Slint 里做二维索引。
+                        for cell in root.spectrum_cells: Rectangle {
+                            x: (cell.div - 1) * root.spec_cell_w + 1px;
+                            y: cell.gain * 15px + 1px;
+                            width: root.spec_cell_w;
+                            height: 13px;
+                            background: cell.tint;
+                            border-width: cell.railed ? 1px : 0px;
+                            border-color: #ff6b64;
+                        }
+                        heat_ta := TouchArea { mouse-cursor: crosshair; }
+                    }
+                    // 光标处那一格的读数。★索引由光标位置算出★: 448 个格子各挂一个 TouchArea 会把
+                    // 一次悬浮变成 448 次命中测试, 这里只用一个。
+                    Text {
+                        property <int> hg: Math.clamp(Math.floor(heat_ta.mouse-y / 15px), 0, 6);
+                        property <int> hd: Math.clamp(Math.floor(heat_ta.mouse-x / root.spec_cell_w), 0, 63);
+                        property <int> hi: self.hg * 64 + self.hd;
+                        text: !heat_ta.has-hover || root.spectrum_cells.length <= self.hi
+                            ? (root.spectrum_cells.length == 0
+                                ? "尚无数据: 点\"开始扫描\"后本图逐格填充(横 = 分频 ÷1..÷64, 纵 = 增益档 0..6)"
+                                : "把鼠标移到热图上可读某一格的实测值")
+                            : ("增益档 " + self.hg + " · 分频 ÷" + (self.hd + 1) + " → "
+                                + (root.spectrum_cells[self.hi].valid
+                                    ? ("RAW 标准差 " + Math.round(root.spectrum_cells[self.hi].std * 10) / 10
+                                        + " · 峰峰 " + Math.round(root.spectrum_cells[self.hi].pp)
+                                        + (root.spectrum_cells[self.hi].railed ? " ⚠ 该点 RAW 撞顶/贴底, 低噪声是假象" : ""))
+                                    : "未测 / 样本不足"));
+                        color: #cfe6ff;
+                        font-size: 10px;
+                        wrap: word-wrap;
+                    }
                 }
 
                 CollapsibleSection {
@@ -912,6 +1107,15 @@ export component CurvesPage inherits Rectangle {
                     vertical-alignment: center;
                 }
             }
+        }
+
+        // 参数 "?" 的详解浮层。★放在 body 里、right_col 之外★: right_col 是 clip:true 的窄列,
+        // 浮层若长在里面会被裁掉大半。这里贴在绘图区左下角(宽度充裕), 没悬浮任何问号时高度为 0。
+        HelpOverlay {
+            x: 8px;
+            y: parent.height - self.height - 8px;
+            width: parent.width * root.split_ratio - 28px;
+            text: root.help_text;
         }
         }
     }

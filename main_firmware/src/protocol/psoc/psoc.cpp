@@ -230,6 +230,7 @@ bool Psoc::_exec_cmd(SpiOp op, uint8_t ch, uint8_t pid, uint32_t val, uint32_t* 
         case SpiOp::CALIBRATE:
         case SpiOp::BASELINE_RESET:
         case SpiOp::GLOBAL_COMMIT:
+        case SpiOp::MEASURE_CP:
             _reset_grace_until_ms = millis() + HEAVY_OP_GRACE_MS;
             break;
         case SpiOp::AUTO_TUNE:
@@ -259,9 +260,9 @@ bool Psoc::_exec_cmd(SpiOp op, uint8_t ch, uint8_t pid, uint32_t val, uint32_t* 
         case SpiOp::APPLY:
             return _spi.apply();
         case SpiOp::CALIBRATE:
-            return _spi.calibrate();
+            return _spi.calibrate(ch);          // ch 复用: 0..35=单通道 / 0xFF=全通道
         case SpiOp::BASELINE_RESET:
-            return _spi.baseline_reset();
+            return _spi.baseline_reset(ch);     // 同上
         case SpiOp::MEASURE_CP:
             return _spi.measure_cp();
         case SpiOp::GET_CP: {
@@ -325,14 +326,17 @@ bool Psoc::_exec_cmd(SpiOp op, uint8_t ch, uint8_t pid, uint32_t val, uint32_t* 
             return _spi.global_commit();
         case SpiOp::AUTO_TUNE: {
             uint8_t result = 0; uint16_t div = 0;
-            // ch 字段复用为目标通道(0xFF=全通道); pid 字段复用为灵敏度档位 pref(1..7)
+            // ch 字段复用为目标通道(0xFF=全通道); pid 字段复用为灵敏度档位 pref(1..7);
+            // val 字段复用为本轮请求标签(AUTO_TUNE 本来不用 val, 不新增信箱字段)。
             // 阶段进度: 本核在 _spi.auto_tune 的阻塞等待中被回调, 经 seqlock 发布给 core0(推送上位机)。
+            const uint8_t tag = (uint8_t)(val & psoc::AUTOTUNE_TAG_MASK);
             _at_work.clear();
             _at_work.req = _at_req;
             _at_work.state = 1;
             _at_work.ch = ch;
+            _at_work.tag = tag;
             _publish_autotune();
-            const bool ok = _spi.auto_tune(ch, pid, &result, &div, &Psoc::_on_autotune_progress, this);
+            const bool ok = _spi.auto_tune(ch, pid, tag, &result, &div, &Psoc::_on_autotune_progress, this);
             _at_work.state = 2;
             _at_work.phase = 4;
             _at_work.step = 0;
@@ -461,27 +465,34 @@ bool Psoc::get_raw(uint8_t ch, uint16_t* out) {
 bool Psoc::apply_params() {
     return _submit(SpiOp::APPLY, 0, 0, 0, nullptr);
 }
-bool Psoc::calibrate() {
-    return _submit(SpiOp::CALIBRATE, 0, 0, 0, nullptr);
+bool Psoc::calibrate(uint8_t ch) {
+    uint32_t completed = 0;
+    // 非空 out 使 _submit 等到 core1 的 _spi.calibrate 已轮询 PSoC busy 落下；等待环持续泵 USB/喂狗。
+    return _submit(SpiOp::CALIBRATE, ch, 0, 0, &completed, nullptr, 50000000u);
 }
-bool Psoc::baseline_reset() {
-    return _submit(SpiOp::BASELINE_RESET, 0, 0, 0, nullptr);
+bool Psoc::baseline_reset(uint8_t ch) {
+    uint32_t completed = 0;
+    // 同校准：Host ACK 仅在 PSoC 主循环完成目标基线复位后返回，不新增协议帧。
+    return _submit(SpiOp::BASELINE_RESET, ch, 0, 0, &completed, nullptr, 50000000u);
 }
 // 频率自适应: 阻塞至 PSoC 重校准完成。out 打包 result(低8位) | div<<8。
 // ch: 0..35=仅该通道, 0xFF=全通道逐通道各自校准(36 × 单通道 ≈ 11-23s) → 窗口 50s(> SPI 层 45s)。
-bool Psoc::auto_tune(uint8_t ch, uint8_t pref, uint8_t* out_result, uint16_t* out_div) {
+bool Psoc::auto_tune(uint8_t ch, uint8_t pref, uint8_t host_seq, uint8_t* out_result, uint16_t* out_div) {
     uint32_t packed = 0;
-    const bool ok = _submit(SpiOp::AUTO_TUNE, ch, pref, 0, &packed, nullptr, 50000000u);
+    const bool ok = _submit(SpiOp::AUTO_TUNE, ch, pref, psoc::autotune_tag_of(host_seq),
+                            &packed, nullptr, 50000000u);
     if (out_result) *out_result = (uint8_t)(packed & 0xFFu);
     if (out_div) *out_div = (uint16_t)((packed >> 8) & 0xFFFFu);
     return ok;
 }
 // ★异步启动★: 入队即返回(同 calibrate/baseline_reset 的写类语义), core0 不再为 20-25s 长自适应干等。
 // 先自增 _at_req 再入队: core1 取到本条命令时回显该代号, core0 据此区分本轮进度与上一轮残留结果。
-bool Psoc::auto_tune_start(uint8_t ch, uint8_t pref) {
+bool Psoc::auto_tune_start(uint8_t ch, uint8_t pref, uint8_t host_seq) {
     _at_req++;
     __dmb();
-    return _submit(SpiOp::AUTO_TUNE, ch, pref, 0, nullptr);
+    // host_seq = 上位机 AUTO_TUNE 请求帧的 seq: 折成 6 bit 标签随命令下到 PSoC 并由其回显,
+    // 于是"这一轮的结果"在 RP↔PSoC 这一段也有归属键, 陈旧结果不会冒充本轮成功。
+    return _submit(SpiOp::AUTO_TUNE, ch, pref, psoc::autotune_tag_of(host_seq), nullptr);
 }
 
 // core1: 把工作副本发布为一致快照(多字段防撕裂, 同 _snapshot 的 seqlock 模式)。
@@ -500,6 +511,8 @@ void Psoc::_on_autotune_progress(void* ctx, const psoc::AutoTuneProgress& p) {
     self->_at_work.phase = p.phase;
     self->_at_work.step = p.step;
     self->_at_work.cur_div = p.cur_div;
+    // tag 不从进度帧覆盖: 本轮标签在派发时就定了(_exec_cmd), PSoC 回显只用于"要不要采信这帧",
+    // 采信判定已在 SPI 层做过(不匹配根本不会回调到这里)。
     // 全通道模式下 PSoC 回显"当前正在处理的通道"→ 必须透传, 上位机才能显示 CHn/36 的逐通道进度。
     self->_at_work.ch = p.ch;
     self->_publish_autotune();
@@ -651,6 +664,10 @@ bool Psoc::acquire() {
 
 bool Psoc::psoc_debug_counters(uint32_t out[SwdProgrammer::DEBUG_COUNTER_WORDS]) {
     return _swd.debug_read_spi_counters(out);
+}
+
+bool Psoc::psoc_debug_read_words(const uint32_t* addresses, uint32_t* out_words, uint8_t word_count) {
+    return _swd.debug_read_words(addresses, out_words, word_count);
 }
 
 uint32_t Psoc::psoc_debug_status() const {

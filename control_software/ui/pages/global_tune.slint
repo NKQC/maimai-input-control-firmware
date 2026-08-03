@@ -1,31 +1,46 @@
-import { Button, ComboBox, VerticalBox, HorizontalBox, GroupBox, CheckBox, SpinBox, ScrollView, TabWidget, Slider } from "std-widgets.slint";
+import { Button, ComboBox, VerticalBox, HorizontalBox, CheckBox, SpinBox, ScrollView, TabWidget, Slider } from "std-widgets.slint";
+// 输入框/下拉一律用带守卫的版本: 全局项与 CSD 参数都在持续回读, 裸 SpinBox/ComboBox 会被
+// 回填冲掉正在进行的编辑(输入一下就失焦)或被自身赋值摧毁回填绑定。详见 widgets.slint 内注释。
+// 分区一律用 SectionCard(替代视觉过弱的 std GroupBox), 带标签的控件行一律用 FormRow。
+import { GuardedSpinBox, GuardedComboBox, SectionCard, FormRow } from "../common/widgets.slint";
 import { GlobalFences } from "../common/types.slint";
+import { Theme } from "../common/theme.slint";
 
 
 // ============================================================================
 // 触控全局调整页:CSD 处理模式 + 全局 CSD 硬件设置(从单通道精调/算法页集中迁入)
 // ============================================================================
 
+// 时钟树的排布尺寸。★只在这里各定义一次★: 时钟树用"占位块 + 手算累加宽度"把 ↓ 箭头对准上一行的
+// 某个节点, 若节点宽度写在组件里、占位宽度又在页面里各写一遍, 改一次节点宽就要同步改五处累加式
+// (历史上正是这么错位的)。组件与占位块统一引用本 global。
+global ClockGeom {
+    out property <length> node: 128px;                                 // 只读节点卡宽
+    out property <length> arrow: 22px;                                 // 横向箭头列宽
+    // 可编辑节点卡宽: 内含一个下拉/数字框, 故按最宽的那类控件 + 卡内左右边距算出, 不写死。
+    out property <length> edit: Theme.combo-width + Theme.gap * 2;
+}
+
 // 时钟树只读固定节点卡片: 灰底, 无编辑控件, 仅展示名称 + 值。
 export component ClockFixedNode inherits Rectangle {
     in property <string> node_title;
     in property <string> node_value;
 
-    width: 128px;
+    width: ClockGeom.node;
     height: 54px;
-    border-radius: 6px;
-    background: #1c2228;
+    border-radius: Theme.radius;
+    background: Theme.panel;
     border-width: 1px;
-    border-color: #3a434c;
+    border-color: Theme.border-light;
 
     VerticalBox {
-        padding: 6px;
+        padding: Theme.gap;
         spacing: 2px;
         alignment: center;
         Text {
             text: root.node_title;
-            font-size: 11px;
-            color: #8a949e;
+            font-size: Theme.fs-normal;
+            color: Theme.muted;
             horizontal-alignment: center;
             wrap: word-wrap;
         }
@@ -33,7 +48,7 @@ export component ClockFixedNode inherits Rectangle {
             text: root.node_value;
             font-size: 13px;
             font-weight: 700;
-            color: #d8e0e8;
+            color: Theme.text-strong;
             horizontal-alignment: center;
             wrap: word-wrap;
         }
@@ -43,20 +58,37 @@ export component ClockFixedNode inherits Rectangle {
 // 水平连接箭头(→), 用于同一行节点之间。
 export component ClockArrowRight inherits Text {
     text: "→";
-    color: #4a5560;
+    color: Theme.arrow;
     font-size: 18px;
     vertical-alignment: center;
     horizontal-alignment: center;
-    width: 22px;
+    width: ClockGeom.arrow;
 }
 
 // 垂直连接箭头(↓), 用于跨行连接。
 export component ClockArrowDown inherits Text {
     text: "↓";
-    color: #4a5560;
+    color: Theme.arrow;
     font-size: 18px;
     horizontal-alignment: center;
     height: 20px;
+}
+
+// 时钟树里"可编辑节点"的卡壳: 蓝调底/描边(与只读灰节点区分), 尺寸由使用方给。
+// ★抽出来的理由★ 原先四个可编辑节点各写一遍 radius/background/border, 同一语义四处写死。
+component ClockEditNode inherits Rectangle {
+    in property <string> node_title;
+    border-radius: Theme.radius;
+    background: Theme.node;
+    border-width: 1px;
+    border-color: Theme.node-border;
+    clip: true;   // 防御: 极端窄宽下控件也不外溢
+    VerticalBox {
+        padding: Theme.gap;
+        spacing: 2px;
+        Text { text: root.node_title; font-size: Theme.fs-normal; color: Theme.accent; }
+        @children
+    }
 }
 
 export component GlobalTunePage inherits Rectangle {
@@ -87,11 +119,18 @@ export component GlobalTunePage inherits Rectangle {
     in property <int> csd_resolution: 0;
     in property <int> csd_sns_clk_source: 0;
     // snsClk 分频为【逐通道】参数, 时钟树显示全 36 通道的 min–max 范围(0=未知)。
+    // 时钟源单选项: 文本与下发值都由 Rust 侧 `ParamFence::ui_choices()` 派生(0..6 + AUTO),
+    // 界面不再自造一套标签, 也不再让用户面对 128 这种不连续裸值。index=-1 ⇒ 设备值非法, 不假装选中。
+    in property <[string]> csd_clk_labels: [];
+    in property <[int]> csd_clk_values: [];
+    in property <int> csd_clk_index: -1;
     in property <int> csd_sns_clk_div_min: 0;
     in property <int> csd_sns_clk_div_max: 0;
     // 异常采样标识(顶部醒目状态行) + 等级(0 正常 / 1 警告 / 2 异常)。
     in property <string> sampling_advice: "";
     in property <int> sampling_advice_level: 0;
+    // Cp 测量失败通道列表(形如 "CH0 CH5"), 空串 = 无失败 ⇒ 警告整条隐藏。
+    in property <string> cp_failed_channels: "";
     callback psoc_rescue();                // PSoC 救砖: SWD 强制重刷 + 重新应用
     // 救砖二次确认: 第一次点击置真(按钮变"确认救砖?"), 再点才真正执行, 切页/完成后复位。
     in-out property <bool> rescue_confirm: false;
@@ -134,6 +173,21 @@ export component GlobalTunePage inherits Rectangle {
     // 频率自适应结果文案(成功: 找到的分频; 失败: 超硬件能力)。
     in property <string> auto_tune_status: "";
 
+    // ── 全通道操作 = host 侧逐通道串行队列(可取消) ──────────────────────────────────
+    // ★为什么不再是"下一条命令让固件自己 for 36 遍"★ 那条路径会把 PSoC 主循环与 RP2040 core1
+    // 一起占住十几到几十秒: 期间不可取消、没有进度、某个通道失败也说不清是哪一个。改成 host 逐通道
+    // 下发后每条都是短操作, 进度/取消/逐通道错误收敛全都成立。
+    in property <bool> batch_op_active: false;
+    in property <float> batch_op_progress: 0;
+    in property <string> batch_op_status: "";
+    callback batch_op_cancel();
+    // 单通道响应噪声频谱扫描是否在跑。★双向互斥★ 扫描期间这三个全通道动作一律锁定:
+    // 它们会改掉扫描正在测的那一格的 gain/div 与基线。反向拒绝在单通道精调页。
+    in property <bool> spectrum_active: false;
+    // "Cp 辅助": 逐通道自适应时按实测 Cp 推出每通道的增益档与频率偏好档(而不是 36 通道一个档)。
+    in property <bool> cp_assist: false;
+    callback set_cp_assist(bool);
+
     ScrollView {
         // ★铺满并滚动★: 显式绑定 Rectangle 尺寸(TabWidget 给出可用高度), 内容超高时内部滚动,
         // 而非把整页撑高挤出 SettingsPage 底部"保存到设备"栏(本页保存栏丢失的根因)。
@@ -141,215 +195,288 @@ export component GlobalTunePage inherits Rectangle {
         width: parent.width;
         height: parent.height;
         VerticalBox {
-            padding: 10px;
-            spacing: 10px;
+            padding: Theme.page-pad;
+            // 卡片之间用 card-gap(大于卡内行距), 分区边界才在扫视中成立。
+            spacing: Theme.card-gap;
 
-            Text { text: "触控全局调整"; color: #e0e6ee; font-size: 16px; }
+            Text { text: "触控全局调整"; color: Theme.text; font-size: Theme.fs-page; }
 
-            GroupBox {
+            // ★异常采样标识★: railed 通道数 / 数据停滞 / 设备拒绝固化基线 → 直接给出下一步动作指引。
+            // ★无内容时整卡不实例化★: 留一个空标题框只会让人以为诊断坏了。
+            if root.sampling_advice != "": SectionCard {
                 title: "状态与诊断";
-                VerticalBox {
-                    spacing: 4px;
-                    // ★异常采样标识★: railed 通道数 / 数据停滞 / 设备拒绝固化基线 → 直接给出下一步动作指引。
+                tint: root.sampling_advice_level == 0 ? Theme.ok
+                    : (root.sampling_advice_level == 2 ? Theme.err : Theme.warn);
+                Rectangle {
+                    height: advice_text.preferred-height + 12px;
+                    border-radius: Theme.radius-small;
+                    background: root.sampling_advice_level == 0 ? Theme.ok-bg
+                        : (root.sampling_advice_level == 2 ? #3a1c1c : #33290f);
+                    border-width: 1px;
+                    border-color: root.sampling_advice_level == 0 ? Theme.ok
+                        : (root.sampling_advice_level == 2 ? #e05a5a : Theme.warn);
+                    advice_text := Text {
+                        x: 8px;
+                        width: parent.width - 16px;
+                        y: 6px;
+                        text: root.sampling_advice;
+                        color: root.sampling_advice_level == 0 ? #7fd89a
+                            : (root.sampling_advice_level == 2 ? Theme.err-soft : #f5c46b);
+                        font-size: Theme.fs-title;
+                        wrap: word-wrap;
+                    }
+                }
+            }
+
+            // 逐通道调完分频后无需切页: 在本页对全部 36 通道一次性校准/复位基线。
+            SectionCard {
+                title: "立即执行的动作(不进草稿)";
+                subtitle: "逐通道串行下发 · 随时可取消";
+                // 三个全通道动作都走 host 侧同一条串行队列 ⇒ 队列在跑时其余两个一律锁定,
+                // 不给用户"同时排两条队"的机会(那必然导致谁也说不清设备正在做哪一件事)。
+                // ★按钮一律 horizontal-stretch: 0 + 行尾弹性空白★ 否则按钮会平分整行宽度并横跨半屏。
+                HorizontalLayout {
+                    height: Theme.row-height;
+                    spacing: Theme.gap;
+                    Button {
+                        horizontal-stretch: 0;
+                        text: root.spectrum_active ? "全通道校准(频谱扫描中锁定)"
+                                                   : "全通道校准(逐通道串行)";
+                        enabled: !root.batch_op_active && !root.spectrum_active;
+                        clicked => { root.global_calibrate(); }
+                    }
+                    Button {
+                        horizontal-stretch: 0;
+                        text: root.spectrum_active ? "全通道基线复位(频谱扫描中锁定)"
+                                                   : "全通道基线复位(逐通道串行)";
+                        enabled: !root.batch_op_active && !root.spectrum_active;
+                        clicked => { root.global_baseline_reset(); }
+                    }
+                    Rectangle { horizontal-stretch: 1; }
+                }
+                HorizontalLayout {
+                    height: Theme.row-height;
+                    spacing: Theme.gap;
+                    Button {
+                        horizontal-stretch: 0;
+                        text: root.spectrum_active
+                            ? "全通道频率自适应(频谱扫描中锁定)"
+                            : (root.auto_tune_confirm ? "⚠ 再点一次确认: 改写全部通道分频"
+                                                      : "全通道频率自适应(逐通道各自校准)");
+                        enabled: !root.batch_op_active && !root.spectrum_active;
+                        clicked => {
+                            if (root.auto_tune_confirm) {
+                                root.auto_tune_confirm = false;
+                                root.auto_tune();
+                            } else {
+                                root.auto_tune_confirm = true;
+                            }
+                        }
+                    }
+                    Button {
+                        horizontal-stretch: 0;
+                        min-width: Theme.button-min-width;
+                        text: "取消";
+                        visible: root.auto_tune_confirm;
+                        clicked => { root.auto_tune_confirm = false; }
+                    }
+                    // 队列取消: 停在当前进度上(已发出的那一条仍由设备做完, 不去打断它)。
+                    Button {
+                        horizontal-stretch: 0;
+                        text: "取消当前队列";
+                        visible: root.batch_op_active;
+                        clicked => { root.batch_op_cancel(); }
+                    }
+                    Text {
+                        text: root.auto_tune_status;
+                        color: Theme.accent;
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
+                        overflow: elide;
+                    }
+                }
+                // 队列进度条 + 进度文案(空闲时都不占高度)。
+                Rectangle {
+                    height: root.batch_op_active ? 6px : 0px;
+                    visible: root.batch_op_active;
+                    border-radius: 3px;
+                    background: #22282e;
                     Rectangle {
-                visible: root.sampling_advice != "";
-                height: advice_text.preferred-height + 12px;
-                border-radius: 4px;
-                background: root.sampling_advice_level == 0 ? #16301f
-                    : (root.sampling_advice_level == 2 ? #3a1c1c : #33290f);
-                border-width: 1px;
-                border-color: root.sampling_advice_level == 0 ? #2b8a3e
-                    : (root.sampling_advice_level == 2 ? #e05a5a : #f5a623);
-                advice_text := Text {
-                    x: 8px;
-                    width: parent.width - 16px;
-                    y: 6px;
-                    text: root.sampling_advice;
-                    color: root.sampling_advice_level == 0 ? #7fd89a
-                        : (root.sampling_advice_level == 2 ? #ff9a9a : #f5c46b);
-                    font-size: 12px;
+                        x: 0;
+                        width: parent.width * Math.clamp(root.batch_op_progress, 0, 1);
+                        height: parent.height;
+                        border-radius: 3px;
+                        background: #4a90d9;
+                    }
+                }
+                Text {
+                    text: root.batch_op_status;
+                    color: Theme.accent;
+                    font-size: Theme.fs-small;
+                    wrap: word-wrap;
+                    visible: root.batch_op_status != "";
+                }
+                Text {
+                    text: root.auto_tune_confirm
+                        ? "⚠ 确认后将逐通道改写 snsClk 分频并重校准，无法撤销。"
+                        : "三项都由上位机逐通道串行下发(每通道一条短命令)，随时可取消；"
+                        + "频率自适应会先把每通道的 IDAC 增益档写入并回读确认，确认不上就中止而不是硬着头皮开跑。";
+                    color: root.auto_tune_confirm ? Theme.err-soft : Theme.text-dim;
+                    font-size: Theme.fs-small;
+                    wrap: word-wrap;
+                }
+                // ── Cp 辅助 ─────────────────────────────────────────────────
+                // 开: 按实测 Cp 逐通道推出增益档(在**电流**上做映射, 因 idacGainTable 档号与电流
+                // 不单调)与频率偏好档(以滑条值为中心 ±2 档); 关: 36 通道统一用滑条那一个档。
+                HorizontalLayout {
+                    height: Theme.row-height;
+                    spacing: Theme.gap;
+                    CheckBox {
+                        horizontal-stretch: 0;
+                        text: "Cp 辅助: 用实测电极电容逐通道决定增益档与频率偏好档";
+                        checked: root.cp_assist;
+                        enabled: !root.batch_op_active;
+                        toggled => { root.set_cp_assist(self.checked); }
+                    }
+                    Rectangle { horizontal-stretch: 1; }
+                }
+                Text {
+                    text: root.cp_assist
+                        ? "已开启: 以本面板 Cp 中位数为参考点(该点用下面滑条选的起点档), 其余通道按 "
+                        + "I ∝ Cp 求目标补偿电流并取电流最接近的档 —— 增益档表的档号与电流并不单调, "
+                        + "故映射按电流而非档号做; 频率偏好以滑条值为中心 ±2 档(Cp 最低 -2, 最高 +2)。"
+                        + "没有有效 Cp 的通道退回滑条值, 不猜。需先点\"测量全部电极电容\"。"
+                        : "已关闭: 全部 36 通道统一使用下面滑条上的频率偏好档与全局起点增益档。";
+                    color: Theme.text-dim;
+                    font-size: Theme.fs-small;
                     wrap: word-wrap;
                 }
             }
-                }
-            }
 
-            GroupBox {
-                // 逐通道调完分频后无需切页: 在本页对全部 36 通道一次性校准/复位基线。
-                title: "立即执行的动作(不进草稿)";
-                VerticalBox {
-                    spacing: 6px;
-                    HorizontalBox {
-                        spacing: 8px;
-                        Button {
-                            text: root.op_busy ? ("⏳ " + root.op_label) : "全通道校准";
-                            enabled: !root.op_busy;
-                            clicked => { root.global_calibrate(); }
-                        }
-                        Button {
-                            text: root.op_busy ? ("⏳ " + root.op_label) : "全通道基线复位";
-                            enabled: !root.op_busy;
-                            clicked => { root.global_baseline_reset(); }
-                        }
-                        Rectangle { horizontal-stretch: 1; }
-                    }
-                    HorizontalBox {
-                        spacing: 8px;
-                        Button {
-                            text: root.op_busy ? ("⏳ " + root.op_label)
-                                : (root.auto_tune_confirm ? "⚠ 再点一次确认: 改写全部通道分频"
-                                                          : "全通道频率自适应(逐通道各自校准)");
-                            enabled: !root.op_busy;
-                            clicked => {
-                                if (root.auto_tune_confirm) {
-                                    root.auto_tune_confirm = false;
-                                    root.auto_tune();
-                                } else {
-                                    root.auto_tune_confirm = true;
-                                }
-                            }
-                        }
-                        Button {
-                            text: "取消";
-                            visible: root.auto_tune_confirm;
-                            clicked => { root.auto_tune_confirm = false; }
-                        }
-                        Text {
-                            text: root.auto_tune_status;
-                            color: #8fd6ff;
-                            vertical-alignment: center;
-                            horizontal-stretch: 1;
-                            wrap: word-wrap;
-                        }
-                    }
-                    Text {
-                        text: root.auto_tune_confirm
-                            ? "⚠ 确认后将逐通道改写 snsClk 分频并重校准，无法撤销。"
-                            : "全通道校准/基线复位立即执行；频率自适应会逐通道改写 snsClk 分频。";
-                        color: root.auto_tune_confirm ? #ff9a9a : #7f8c96;
-                        font-size: 10px;
-                        wrap: word-wrap;
-                    }
-                }
-            }
-
-            GroupBox {
+            SectionCard {
                 title: "CSD 处理模式";
-                VerticalBox {
-                    spacing: 6px;
-                    HorizontalBox {
-                        spacing: 8px;
-                        Text { text: "CSD 模式:"; color: #b0b8c0; vertical-alignment: center; }
-                        if !root.mode_known: Text {
-                            text: "读取设备真实模式中…";
-                            color: #8b98a5;
-                            vertical-alignment: center;
-                        }
-                        mode_combo := ComboBox {
-                            visible: root.mode_known;
-                            model: ["自动校准", "半自动手动"];
-                            current-index: root.scan_mode;
-                            selected(_) => {
-                                root.scan_mode = self.current-index;
-                                root.mode_changed(self.current-index);
-                            }
-                        }
-                        Button {
-                            text: root.mode_known && root.scan_mode == 1 ? "捕获当前值→手动" : "捕获当前值(半自动模式可用)";
-                            enabled: root.mode_known && root.scan_mode == 1;
-                            clicked => { root.capture_params(); }
+                FormRow {
+                    label: "CSD 模式:";
+                    if !root.mode_known: Text {
+                        text: "读取设备真实模式中…";
+                        color: Theme.muted;
+                        horizontal-stretch: 0;
+                        vertical-alignment: center;
+                    }
+                    // 下拉宽度取 combo-width(短中文选项档), 不再与数字框共用 spin-width。
+                    mode_combo := ComboBox {
+                        width: Theme.combo-width;
+                        horizontal-stretch: 0;
+                        visible: root.mode_known;
+                        model: ["自动校准", "半自动手动"];
+                        current-index: root.scan_mode;
+                        selected(_) => {
+                            root.scan_mode = self.current-index;
+                            root.mode_changed(self.current-index);
                         }
                     }
-                    Text {
-                        text: !root.mode_known ? "等待设备诊断上报真实 CSD 模式…"
-                            : (root.scan_mode == 1 ? "半自动手动:手动阈值/参数生效并可保存" : "自动校准: PSoC 已接管参数，手动值保持保存但当前失效");
-                        color: !root.mode_known ? #8b98a5 : (root.scan_mode == 1 ? #2b8a3e : #8fd6ff);
-                        wrap: word-wrap;
+                    Button {
+                        // 频谱扫描中 PSoC 上的 gain/div 是扫描的临时值, 捕获等于把中间态提交成真相源 → 锁定。
+                        horizontal-stretch: 0;
+                        text: root.spectrum_active ? "捕获当前值(频谱扫描中锁定)"
+                            : (root.mode_known && root.scan_mode == 1 ? "捕获当前值→手动" : "捕获当前值(半自动模式可用)");
+                        enabled: root.mode_known && root.scan_mode == 1 && !root.spectrum_active;
+                        clicked => { root.capture_params(); }
                     }
+                }
+                Text {
+                    text: !root.mode_known ? "等待设备诊断上报真实 CSD 模式…"
+                        : (root.scan_mode == 1 ? "半自动手动:手动阈值/参数生效并可保存" : "自动校准: PSoC 已接管参数，手动值保持保存但当前失效");
+                    color: !root.mode_known ? Theme.muted : (root.scan_mode == 1 ? Theme.ok : Theme.accent);
+                    font-size: Theme.fs-normal;
+                    wrap: word-wrap;
                 }
             }
 
-            GroupBox {
+            SectionCard {
                 // ★去重★: 采样时钟分频/分辨率/时钟源/MFS 一律在下方"CSD 时钟树"里编辑(唯一入口),
                 // 本组只保留时钟树未覆盖的全局校准项, 避免两处重复导致的不同步。
-                title: "IDAC 与校准(编辑仅暂存, 保存后下发并重初始化)";
-                VerticalBox {
-                    spacing: 6px;
-                    HorizontalBox {
-                        spacing: 8px;
-                        // ★原「刷新 CH0 参数」按钮已删★: CH0 代表值有两条自动加载路径 ——
-                        // 连接边沿(main.rs:2332)与每次真正进入本页(main.rs:2375)各拉一次,
-                        // 手动按钮不会带来任何额外真值, 只是让用户以为需要自己点。
-                        Text { text: "全局校准项; 采样时钟/分辨率/MFS 见下方时钟树。"; color: #8fd6ff; horizontal-stretch: 1; vertical-alignment: center; }
-                    }
-                    HorizontalBox {
-                        spacing: 8px;
-                        Text { text: "未激活传感器连接:"; color: #b0b8c0; vertical-alignment: center; }
-                        ComboBox {
-                            model: ["GND", "High-Z", "Shield"];
-                            current-index: root.g_inactive_sns == 4 ? 2 : (root.g_inactive_sns == 2 ? 1 : 0);
-                            selected(v) => {
-                                root.algo_global_set(1, self.current-index == 2 ? 4 : (self.current-index == 1 ? 2 : 1));
-                            }
+                title: "IDAC 与校准";
+                subtitle: "编辑仅暂存, 保存后下发并重初始化";
+                // ★原「刷新 CH0 参数」按钮已删★: CH0 代表值有两条自动加载路径 ——
+                // 连接边沿(main.rs:2332)与每次真正进入本页(main.rs:2375)各拉一次,
+                // 手动按钮不会带来任何额外真值, 只是让用户以为需要自己点。
+                Text { text: "全局校准项; 采样时钟/分辨率/MFS 见下方时钟树。"; color: Theme.accent; font-size: Theme.fs-normal; wrap: word-wrap; }
+                // ★这里曾有一条"GND 可能导致采样率下降或 railed"的警告, 已删除★:
+                // 它是从接法反推故障的猜测。同一个位置现在放**设备级证据**: 只有 MEASURE_CP 后
+                // Cp 回读 0x00FFFFFF 的通道才会出现在这里, 没有失败通道就整条隐藏。
+                if root.cp_failed_channels != "": Text {
+                    text: "电容测量失败: " + root.cp_failed_channels + " · 测量失败：可能短接或电容过大";
+                    color: #ffb454;
+                    font-size: Theme.fs-normal;
+                    wrap: word-wrap;
+                }
+                FormRow {
+                    label: "未激活传感器连接:";
+                    hint: "作用: 设置非激活电极接法。取值: GND/High-Z/Shield，保存后生效。";
+                    GuardedComboBox {
+                        width: Theme.combo-width;
+                        horizontal-stretch: 0;
+                        model: ["GND", "High-Z", "Shield"];
+                        model_index: root.g_inactive_sns == 4 ? 2 : (root.g_inactive_sns == 2 ? 1 : 0);
+                        selected(v) => {
+                            root.algo_global_set(1, self.current-index == 2 ? 4 : (self.current-index == 1 ? 2 : 1));
                         }
                     }
-                    Text {
-                        visible: root.g_inactive_sns == 1;
-                        text: "⚠ GND 可能导致采样率下降或 railed。";
-                        color: #f5a623;
-                        font-size: 11px;
-                        wrap: word-wrap;
+                }
+                FormRow {
+                    label: "IDAC 感应配置:";
+                    hint: "作用: 设置 IDAC 感应方向。取值: sourcing/sinking，保存后生效。";
+                    // ★这一项就是"下拉被当数字框缩放"的现场★: 112px 下 "IDAC sourcing" 被截成
+                    // "IDAC sour…"。选项是英文短语, 取 combo-width 档才容得下最长那一项。
+                    GuardedComboBox {
+                        width: Theme.combo-width;
+                        horizontal-stretch: 0;
+                        model: ["IDAC sourcing", "IDAC sinking"];
+                        model_index: root.g_idac_sense_config == 1 ? 1 : 0;
+                        selected(v) => { root.algo_global_set(7, self.current-index); }
                     }
-                    Text { text: "作用: 设置非激活电极接法。取值: GND/High-Z/Shield，保存后生效。"; color: #7f8c96; font-size: 10px; wrap: word-wrap; }
-                    HorizontalBox {
-                        spacing: 8px;
-                        Text { text: "IDAC 感应配置:"; color: #b0b8c0; vertical-alignment: center; }
-                        ComboBox {
-                            model: ["IDAC sourcing", "IDAC sinking"];
-                            current-index: root.g_idac_sense_config == 1 ? 1 : 0;
-                            selected(v) => { root.algo_global_set(7, self.current-index); }
-                        }
+                }
+                FormRow {
+                    label: "自动校准:";
+                    hint: "作用: 设置 IDAC 自动校准开关。开关修改后保存生效。";
+                    CheckBox {
+                        horizontal-stretch: 0;
+                        text: "启用 (IDAC auto-calibration)";
+                        checked: root.g_auto_calibrate == 1;
+                        toggled => { root.algo_global_set(8, self.checked ? 1 : 0); }
                     }
-                    Text { text: "作用: 设置 IDAC 感应方向。取值: sourcing/sinking，保存后生效。"; color: #7f8c96; font-size: 10px; wrap: word-wrap; }
-                    HorizontalBox {
-                        spacing: 8px;
-                        CheckBox {
-                            text: "启用自动校准 (IDAC auto-calibration)";
-                            checked: root.g_auto_calibrate == 1;
-                            toggled => { root.algo_global_set(8, self.checked ? 1 : 0); }
-                        }
-                        Rectangle { horizontal-stretch: 1; }
-                    }
-                    Text { text: "作用: 设置 IDAC 自动校准开关。开关修改后保存生效。"; color: #7f8c96; font-size: 10px; wrap: word-wrap; }
-                    HorizontalBox {
-                        spacing: 8px;
-                        Text { text: "IDAC 增益档:"; color: #b0b8c0; vertical-alignment: center; }
-                        SpinBox { value: root.g_idac_gain; minimum: root.global_fences.idac_gain_min; maximum: root.global_fences.idac_gain_max; edited(v) => { root.algo_global_set(2, v); } }
-                        Text { text: "IDAC min:"; color: #b0b8c0; vertical-alignment: center; }
-                        SpinBox { value: root.g_idac_min; minimum: root.global_fences.idac_min_min; maximum: root.global_fences.idac_min_max; edited(v) => { root.algo_global_set(3, v); } }
-                        Text { text: "校准目标%:"; color: #b0b8c0; vertical-alignment: center; }
-                        SpinBox { value: root.g_raw_target; minimum: root.global_fences.raw_target_min; maximum: root.global_fences.raw_target_max; edited(v) => { root.algo_global_set(4, v); } }
-                    }
+                }
+                FormRow {
+                    label: "IDAC 校准参数:";
                     // 范围文案同样取自围栏, 不写死数字(否则围栏一改这里就变成谎话)。
-                    Text {
-                        text: "作用: 设置 IDAC 参数。增益"
-                            + root.global_fences.idac_gain_min + "–" + root.global_fences.idac_gain_max
-                            + "、最小值" + root.global_fences.idac_min_min + "–" + root.global_fences.idac_min_max
-                            + "、目标" + root.global_fences.raw_target_min + "–" + root.global_fences.raw_target_max
-                            + "%，重新校准生效。";
-                        color: #7f8c96; font-size: 10px; wrap: word-wrap;
+                    hint: "作用: 设置 IDAC 参数。增益"
+                        + root.global_fences.idac_gain_min + "–" + root.global_fences.idac_gain_max
+                        + "、最小值" + root.global_fences.idac_min_min + "–" + root.global_fences.idac_min_max
+                        + "、目标" + root.global_fences.raw_target_min + "–" + root.global_fences.raw_target_max
+                        + "%，重新校准生效。";
+                    Text { text: "增益:"; color: Theme.text-sub; horizontal-stretch: 0; vertical-alignment: center; }
+                    // ★必须用 GuardedSpinBox★: 全局项在持续回读, 纯声明式 `value:` 绑定会在
+                    // 用户敲完一个字符后就被下一次回读冲掉(表现为"输入一下就失焦")。
+                    GuardedSpinBox { width: Theme.spin-width; horizontal-stretch: 0; model_value: root.g_idac_gain; minimum: root.global_fences.idac_gain_min; maximum: root.global_fences.idac_gain_max; edited(v) => { root.algo_global_set(2, v); } }
+                    Text { text: "最小:"; color: Theme.text-sub; horizontal-stretch: 0; vertical-alignment: center; }
+                    GuardedSpinBox { width: Theme.spin-width; horizontal-stretch: 0; model_value: root.g_idac_min; minimum: root.global_fences.idac_min_min; maximum: root.global_fences.idac_min_max; edited(v) => { root.algo_global_set(3, v); } }
+                    Text { text: "目标%:"; color: Theme.text-sub; horizontal-stretch: 0; vertical-alignment: center; }
+                    GuardedSpinBox { width: Theme.spin-width; horizontal-stretch: 0; model_value: root.g_raw_target; minimum: root.global_fences.raw_target_min; maximum: root.global_fences.raw_target_max; edited(v) => { root.algo_global_set(4, v); } }
+                }
+                FormRow {
+                    label: "校准频率偏好:";
+                    hint: "作用: 设置频率自适应偏好档位 1–7，立即生效，保存后持久化。";
+                    // 滑条是本行唯一需要占宽的控件, 故它自己吃剩余宽度(行尾空白仍在, 只是分不到)。
+                    pref_slider := Slider {
+                        minimum: 1;
+                        maximum: 7;
+                        value: root.calib_pref;
+                        horizontal-stretch: 1;
+                        changed(v) => { root.calib_pref_set(Math.round(v)); }
                     }
-                    HorizontalBox {
-                        spacing: 8px;
-                        Text { text: "校准频率偏好:"; color: #b0b8c0; vertical-alignment: center; }
-                        pref_slider := Slider {
-                            minimum: 1;
-                            maximum: 7;
-                            value: root.calib_pref;
-                            horizontal-stretch: 1;
-                            changed(v) => { root.calib_pref_set(Math.round(v)); }
-                        }
-                        Text {
+                    Text {
+                        horizontal-stretch: 0;
                             // ★读滑块自身的值, 不读 root.calib_pref★
                             // calib_pref 是设备真值回填口, 而草稿写入按工程约定**不 bump version**
                             // (控件自身已显示新值, 重建模型会打断输入) ⇒ 拖动时它不变, 文字就永远
@@ -361,19 +488,18 @@ export component GlobalTunePage inherits Rectangle {
                                 : (Math.round(pref_slider.value) == 4 ? "居中(默认)"
                                 : (Math.round(pref_slider.value) <= 6 ? "偏灵敏(明显低频)"
                                 : "最灵敏(过充近场)"))));
-                            color: #8fd6ff;
-                            vertical-alignment: center;
-                        }
+                        color: Theme.accent;
+                        vertical-alignment: center;
                     }
-                    Text { text: "作用: 设置频率自适应偏好档位 1–7，立即生效，保存后持久化。"; color: #7f8c96; font-size: 10px; wrap: word-wrap; }
-
                 }
             }
 
-            GroupBox {
+            SectionCard {
                 title: "采样时钟与周期诊断";
+                subtitle: "分频 / 分辨率 / 时钟源 / MFS 的唯一编辑入口";
                 VerticalBox {
-                    spacing: 10px;
+                    padding: 0px;
+                    spacing: Theme.page-pad;
 
                     // 第一行: 固定只读的振荡器/PLL/外设时钟链, 横向箭头连接。
                     HorizontalBox {
@@ -392,7 +518,7 @@ export component GlobalTunePage inherits Rectangle {
                     HorizontalBox {
                         spacing: 0px;
                         alignment: start;
-                        Rectangle { width: 128px + 22px + 128px + 22px + 128px + 22px; }
+                        Rectangle { width: (ClockGeom.node + ClockGeom.arrow) * 3; }
                         ClockArrowDown { }
                     }
 
@@ -400,50 +526,42 @@ export component GlobalTunePage inherits Rectangle {
                     HorizontalBox {
                         spacing: 0px;
                         alignment: start;
-                        Rectangle { width: 128px + 22px + 128px + 22px + 128px + 22px - 128px - 22px; }
+                        Rectangle { width: (ClockGeom.node + ClockGeom.arrow) * 2; }
                         ClockFixedNode { node_title: "ModClk ÷modCsdClk=1"; node_value: "48.00 MHz"; }
                         ClockArrowRight { }
-                        Rectangle {
-                            // ★加宽以容纳两个 SpinBox★: 原 232px 内两 SpinBox 各仅得 ~107px < 其最小宽度,
-                            // HorizontalBox 撑破本卡片 → 下拉箭头溢出到框外(未包裹好)。按每个 ≈130px 取 300px。
-                            width: 300px;
+                        ClockEditNode {
+                            // 宽度 = 两个数字框 + 卡内边距 + 间距, 由令牌算出而非再写一个魔法数:
+                            // 数字框宽度一改, 卡片跟着变宽, 不会重演"卡片装不下控件、箭头溢出框外"。
+                            node_title: "MFS DIV F1 / F2";
+                            // 这一张要并排放两个数字框, 故比通用可编辑节点宽; 同样由令牌算出。
+                            width: Theme.spin-width * 2 + Theme.gap * 3;
                             height: 92px;
-                            border-radius: 6px;
-                            background: #17222b;
-                            border-width: 1px;
-                            border-color: #2f6fa8;
-                            clip: true;   // 防御: 极端窄宽下也不外溢
-                            VerticalBox {
-                                padding: 6px;
-                                spacing: 2px;
-                                Text { text: "MFS DIV F1 / F2"; font-size: 11px; color: #8fd6ff; }
-                                HorizontalBox {
-                                    padding: 0px;
-                                    spacing: 6px;
-                                    // 围栏取自 Rust 侧 global_fence(0x05/0x06), 与 RP2040 `_handle_global_set`
-                                    // 及 PSoC `cmd_set_global` 的 <=255 同源; 超范围两处固件都 NAK/拒写。
-                                    SpinBox {
-                                        horizontal-stretch: 1;
-                                        min-width: 130px;
-                                        value: root.g_mfs_div_f1;
-                                        minimum: root.global_fences.mfs_f1_min;
-                                        maximum: root.global_fences.mfs_f1_max;
-                                        edited(v) => { root.algo_global_set(5, v); }
-                                    }
-                                    SpinBox {
-                                        horizontal-stretch: 1;
-                                        min-width: 130px;
-                                        value: root.g_mfs_div_f2;
-                                        minimum: root.global_fences.mfs_f2_min;
-                                        maximum: root.global_fences.mfs_f2_max;
-                                        edited(v) => { root.algo_global_set(6, v); }
-                                    }
+                            HorizontalBox {
+                                padding: 0px;
+                                spacing: Theme.gap;
+                                // 围栏取自 Rust 侧 global_fence(0x05/0x06), 与 RP2040 `_handle_global_set`
+                                // 及 PSoC `cmd_set_global` 的 <=255 同源; 超范围两处固件都 NAK/拒写。
+                                GuardedSpinBox {
+                                    horizontal-stretch: 0;
+                                    width: Theme.spin-width;
+                                    model_value: root.g_mfs_div_f1;
+                                    minimum: root.global_fences.mfs_f1_min;
+                                    maximum: root.global_fences.mfs_f1_max;
+                                    edited(v) => { root.algo_global_set(5, v); }
                                 }
-                                // 多频抗噪: 启用后每传感器 3 个频点各扫一次(周期≈×3)。
-                                Text {
-                                    text: "多频抗噪 F0/F1/F2 (周期×频点数)";
-                                    font-size: 10px; color: #9fe0b0; horizontal-alignment: center; wrap: word-wrap;
+                                GuardedSpinBox {
+                                    horizontal-stretch: 0;
+                                    width: Theme.spin-width;
+                                    model_value: root.g_mfs_div_f2;
+                                    minimum: root.global_fences.mfs_f2_min;
+                                    maximum: root.global_fences.mfs_f2_max;
+                                    edited(v) => { root.algo_global_set(6, v); }
                                 }
+                            }
+                            // 多频抗噪: 启用后每传感器 3 个频点各扫一次(周期≈×3)。
+                            Text {
+                                text: "多频抗噪 F0/F1/F2 (周期×频点数)";
+                                font-size: Theme.fs-small; color: Theme.ok-text; horizontal-alignment: center; wrap: word-wrap;
                             }
                         }
                     }
@@ -452,7 +570,7 @@ export component GlobalTunePage inherits Rectangle {
                     HorizontalBox {
                         spacing: 0px;
                         alignment: start;
-                        Rectangle { width: 128px + 22px + 128px; }
+                        Rectangle { width: ClockGeom.node + ClockGeom.arrow + ClockGeom.node; }
                         ClockArrowDown { }
                     }
 
@@ -460,18 +578,11 @@ export component GlobalTunePage inherits Rectangle {
                     HorizontalBox {
                         spacing: 0px;
                         alignment: start;
-                        Rectangle { width: 128px + 22px; }
-                        Rectangle {
-                            width: 150px;
+                        Rectangle { width: ClockGeom.node + ClockGeom.arrow; }
+                        ClockEditNode {
+                            node_title: "SnsClk DIV (只读, 范围)";
+                            width: ClockGeom.edit;
                             height: 72px;
-                            border-radius: 6px;
-                            background: #17222b;
-                            border-width: 1px;
-                            border-color: #2f6fa8;
-                            VerticalBox {
-                                padding: 6px;
-                                spacing: 2px;
-                                Text { text: "SnsClk DIV (只读, 范围)"; font-size: 11px; color: #8fd6ff; }
                                 // ★去重: 唯一入口★ snsClk 分频是【逐通道】参数(各通道 Cp 22~138pF 差异极大,
                                 // 无法统一), 编辑入口只在单通道页"通道参数"里。逐通道自适应后各通道值不同,
                                 // 故此处显示全 36 通道的 min–max 范围(全部相同则退化为单值)。
@@ -498,35 +609,30 @@ export component GlobalTunePage inherits Rectangle {
                                                 ? ("SnsClk = " + (Math.round(48000 / root.csd_sns_clk_div_min) / 1000) + " MHz")
                                                 : ("SnsClk = " + (Math.round(48000 / root.csd_sns_clk_div_max) / 1000)
                                                    + " — " + (Math.round(48000 / root.csd_sns_clk_div_min) / 1000) + " MHz"))));
-                                    font-size: 10px; color: #9fe0b0; horizontal-alignment: center;
+                                    font-size: Theme.fs-small; color: Theme.ok-text; horizontal-alignment: center;
                                     wrap: word-wrap;
                                 }
-                            }
                         }
                         ClockArrowRight { }
-                        Rectangle {
-                            width: 150px;
+                        ClockEditNode {
+                            node_title: "采样分辨率(位)";
+                            width: ClockGeom.edit;
                             height: 72px;
-                            border-radius: 6px;
-                            background: #17222b;
-                            border-width: 1px;
-                            border-color: #2f6fa8;
-                            VerticalBox {
-                                padding: 6px;
-                                spacing: 2px;
-                                Text { text: "采样分辨率(位)"; font-size: 11px; color: #8fd6ff; }
                                 if root.mode_known && root.scan_mode == 0: Text {
                                     text: "AUTO";
-                                    color: #8fd6ff;
+                                    color: Theme.accent;
                                     horizontal-alignment: center;
                                 }
                                 if !root.mode_known: Text {
                                     text: "读取中…";
-                                    color: #8b98a5;
+                                    color: Theme.muted;
                                     horizontal-alignment: center;
                                 }
-                                if root.mode_known && root.scan_mode == 1: SpinBox {
-                                    value: root.csd_resolution;
+                                if root.mode_known && root.scan_mode == 1: GuardedSpinBox {
+                                    // 卡内宽度 = ClockGeom.edit - 卡内左右边距, 恰好不低于数字框自报下限。
+                                    width: ClockGeom.edit - Theme.gap * 2;
+                                    horizontal-stretch: 0;
+                                    model_value: root.csd_resolution;
                                     minimum: 6;
                                     maximum: 16;
                                     edited(v) => { root.csd_param_set(7, v); }
@@ -535,55 +641,49 @@ export component GlobalTunePage inherits Rectangle {
                                 Text {
                                     text: "2^N=" + Math.round(Math.pow(2, root.csd_resolution))
                                         + " 换能≈" + (Math.round(Math.pow(2, root.csd_resolution) / 48)) + " µs";
-                                    font-size: 10px; color: #9fe0b0; horizontal-alignment: center;
+                                    font-size: Theme.fs-small; color: Theme.ok-text; horizontal-alignment: center;
                                 }
-                            }
                         }
                         ClockArrowRight { }
-                        Rectangle {
-                            width: 150px;
+                        ClockEditNode {
+                            node_title: "时钟源(协议数值)";
+                            width: ClockGeom.edit;
                             height: 72px;
-                            border-radius: 6px;
-                            background: #17222b;
-                            border-width: 1px;
-                            border-color: #2f6fa8;
-                            VerticalBox {
-                                padding: 6px;
-                                spacing: 2px;
-                                Text { text: "时钟源(协议数值)"; font-size: 11px; color: #8fd6ff; }
                                 if root.mode_known && root.scan_mode == 0: Text {
                                     text: "AUTO";
-                                    color: #8fd6ff;
+                                    color: Theme.accent;
                                     horizontal-alignment: center;
                                 }
                                 if !root.mode_known: Text {
                                     text: "读取中…";
-                                    color: #8b98a5;
+                                    color: Theme.muted;
                                     horizontal-alignment: center;
                                 }
-                                if root.mode_known && root.scan_mode == 1: SpinBox {
-                                    value: root.csd_sns_clk_source;
-                                    minimum: 0;
-                                    // 围栏依据固件 sensor_link.cpp::_handle_param_set 对 0x0A 的校验(低7位 0..6)。
-                                    maximum: 6;
-                                    edited(v) => { root.csd_param_set(10, v); }
+                                // ★单选而非数字框★ 该项 ui_max()=6|0x80=134 而 7..127 全是非法空洞,
+                                // 数字框必然让人填出 26 这种值; 选项表(含 AUTO)直接从 Rust 围栏派生。
+                                if root.mode_known && root.scan_mode == 1: GuardedComboBox {
+                                    // 同上: 卡内可用宽度就是下拉宽度, 不让它被压到自报下限以下。
+                                    width: ClockGeom.edit - Theme.gap * 2;
+                                    horizontal-stretch: 0;
+                                    model: root.csd_clk_labels;
+                                    model_index: root.csd_clk_index;
+                                    selected(v) => { root.csd_param_set(10, root.csd_clk_values[self.current-index]); }
                                 }
                                 // 非频率: 选择直连/PRS/SSC 展频方式(bit7=自动)。
                                 Text {
                                     text: (root.csd_sns_clk_source >= 128 ? "自动+" : "")
                                         + ((Math.mod(root.csd_sns_clk_source, 128) == 0) ? "直连"
                                           : (Math.mod(root.csd_sns_clk_source, 128) <= 4 ? "SSC" : "PRS"));
-                                    font-size: 10px; color: #9fe0b0; horizontal-alignment: center;
+                                    font-size: Theme.fs-small; color: Theme.ok-text; horizontal-alignment: center;
                                 }
-                            }
                         }
                     }
 
-                    // 竖直箭头: 汇聚到末端"设备实测探测周期"节点。
+                    // 竖直箭头: 汇聚到末端"设备实测探测周期"节点(对准第三行第一张卡的中线)。
                     HorizontalBox {
                         spacing: 0px;
                         alignment: start;
-                        Rectangle { width: 128px + 22px + 75px; }
+                        Rectangle { width: ClockGeom.node + ClockGeom.arrow + ClockGeom.edit / 2; }
                         ClockArrowDown { }
                     }
 
@@ -591,19 +691,19 @@ export component GlobalTunePage inherits Rectangle {
                     HorizontalBox {
                         spacing: 0px;
                         alignment: start;
-                        Rectangle { width: 128px + 22px; }
+                        Rectangle { width: ClockGeom.node + ClockGeom.arrow; }
                         Rectangle {
-                            width: 220px;
+                            width: Theme.combo-wide;
                             height: 54px;
-                            border-radius: 6px;
-                            background: #16301f;
+                            border-radius: Theme.radius;
+                            background: Theme.ok-bg;
                             border-width: 1px;
-                            border-color: #2b8a3e;
+                            border-color: Theme.ok;
                             VerticalBox {
-                                padding: 6px;
+                                padding: Theme.gap;
                                 spacing: 2px;
                                 alignment: center;
-                                Text { text: "设备实测探测周期"; font-size: 11px; color: #9fe0b0; horizontal-alignment: center; }
+                                Text { text: "设备实测探测周期"; font-size: Theme.fs-normal; color: Theme.ok-text; horizontal-alignment: center; }
                                 Text {
                                     // 无实测值时显示"— 未测", 不显示 0.00 ms(会被读成"设备真的 0ms")。
                                     text: root.scan_period_valid
@@ -655,31 +755,42 @@ export component GlobalTunePage inherits Rectangle {
                     }
                 }
             }
-            GroupBox {
+            // 竖条取 err 色: 这一组会重刷/复位设备, 与上面的调参组不是一个性质。
+            SectionCard {
                 title: "危险与恢复";
-                VerticalBox {
-                    spacing: 6px;
-                    HorizontalBox {
-                        spacing: 8px;
+                tint: Theme.err;
+                VerticalLayout {
+                    spacing: Theme.card-inner-gap;
+                    HorizontalLayout {
+                        spacing: Theme.gap;
                         Button {
+                            min-width: Theme.button-min-width;
+                            horizontal-stretch: 0;
                             text: "撤销未保存改动";
                             enabled: root.config_dirty;
                             clicked => { root.discard_draft(); }
                         }
                         Button {
+                            min-width: Theme.button-min-width;
+                            horizontal-stretch: 0;
                             text: "重启 PSoC";
                             clicked => { root.reboot_psoc(); }
                         }
                         Button {
+                            min-width: Theme.button-min-width;
+                            horizontal-stretch: 0;
                             text: "恢复默认值";
                             clicked => { root.reset_defaults(); }
                         }
+                        // 行尾弹性空白: 余量归它, 按钮才不会被拉成横跨半屏的巨块。
                         Rectangle { horizontal-stretch: 1; }
                     }
                     // ★最后手段: PSoC 救砖★ 两段式确认(先点变"确认救砖?", 再点才执行), 不引入新弹窗组件。
-                    HorizontalBox {
-                        spacing: 8px;
+                    HorizontalLayout {
+                        spacing: Theme.gap;
                         Button {
+                            min-width: Theme.button-min-width;
+                            horizontal-stretch: 0;
                             text: root.op_busy ? ("⏳ " + root.op_label)
                                 : (root.rescue_confirm ? "⚠ 再点一次确认: 立即重刷 PSoC"
                                                        : "PSoC 救砖(重刷并重新应用)");
@@ -694,6 +805,8 @@ export component GlobalTunePage inherits Rectangle {
                             }
                         }
                         Button {
+                            min-width: Theme.button-min-width;
+                            horizontal-stretch: 0;
                             text: "取消";
                             visible: root.rescue_confirm;
                             clicked => { root.rescue_confirm = false; }
@@ -702,22 +815,22 @@ export component GlobalTunePage inherits Rectangle {
                     }
                     Text {
                         text: "⚠ 危险操作：重刷期间触控不可用，切勿断电。";
-                        color: #ff9a9a;
-                        font-size: 11px;
+                        color: Theme.err-soft;
+                        font-size: Theme.fs-normal;
                         wrap: word-wrap;
                     }
                     Text {
                         text: root.config_dirty
                             ? "● 有未保存草稿:在页面底部“保存到设备”生效, 或点“撤销未保存改动”放弃"
                             : "✓ 已与设备同步";
-                        color: root.config_dirty ? #f5a623 : #2b8a3e;
-                        font-size: 12px;
+                        color: root.config_dirty ? Theme.warn : Theme.ok;
+                        font-size: Theme.fs-title;
                         wrap: word-wrap;
                     }
                     Text {
                         text: "异常时可撤销草稿；已保存可恢复默认并重启 PSoC。";
-                        color: #7f8c96;
-                        font-size: 11px;
+                        color: Theme.text-dim;
+                        font-size: Theme.fs-normal;
                         wrap: word-wrap;
                     }
                 }

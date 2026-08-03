@@ -1,5 +1,8 @@
-import { Button, VerticalBox, HorizontalBox, GroupBox, ListView, CheckBox, SpinBox, ScrollView } from "std-widgets.slint";
+import { Button, VerticalBox, HorizontalBox, ListView, CheckBox, SpinBox, ScrollView } from "std-widgets.slint";
 import { VcamKbdRow } from "../common/types.slint";
+// 分区一律用 SectionCard, 带标签的控件行一律用 FormRow(见 widgets.slint 里两者的头注释)。
+import { GuardedSpinBox, SectionCard, FormRow } from "../common/widgets.slint";
+import { Theme } from "../common/theme.slint";
 
 
 // ============================================================================
@@ -32,6 +35,8 @@ export component ToolboxPage inherits Rectangle {
     callback restart_as_admin();
     in property <string> vcam_install_status: "未安装";
     in property <string> vcam_runtime_status: "未运行";
+    // 安装/卸载正在进行中(提权 + 改注册表/文件): 两个按钮共用这一个标志一起禁用。
+    in property <bool> vcam_deploy_busy: false;
     // 输入源设备树(组头 + 设备项), 由 Rust 侧按分类展平后填充。
     in property <[VcamKbdRow]> vcam_kbd_rows;
     in property <int> vcam_device_index: 0;
@@ -102,13 +107,12 @@ export component ToolboxPage inherits Rectangle {
                 }
             }
 
-            if root.tb_tab == 0: GroupBox {
+            if root.tb_tab == 0: SectionCard {
                 title: "自动设置端口";
                 vertical-stretch: 1;
 
-                VerticalBox {
-                    padding: 4px;
-                    spacing: 10px;
+                VerticalLayout {
+                    spacing: Theme.card-inner-gap;
 
                     CheckBox {
                         text: "启动时自动设置端口号";
@@ -116,45 +120,52 @@ export component ToolboxPage inherits Rectangle {
                         toggled => { root.set_auto_port_enabled(self.checked); }
                     }
 
-                    HorizontalBox {
-                        padding: 0px;
-                        spacing: 8px;
-                        Text { text: "触控串口(mai2serial) COM:"; vertical-alignment: center; }
-                        SpinBox {
+                    // 两个 COM 口走同一个 FormRow: 标签列宽一致 ⇒ 两个数字框左边缘对齐。
+                    FormRow {
+                        label: "触控串口(mai2serial) COM:";
+                        GuardedSpinBox {
+                            width: Theme.spin-width;
+                            horizontal-stretch: 0;
                             minimum: 1;
                             maximum: 255;
-                            value: root.serial_com;
+                            model_value: root.serial_com;
                             edited(v) => { root.set_serial_com(v); }
                         }
                     }
 
-                    HorizontalBox {
-                        padding: 0px;
-                        spacing: 8px;
-                        Text { text: "灯效串口(mai2light) COM:"; vertical-alignment: center; }
-                        SpinBox {
+                    FormRow {
+                        label: "灯效串口(mai2light) COM:";
+                        GuardedSpinBox {
+                            width: Theme.spin-width;
+                            horizontal-stretch: 0;
                             minimum: 1;
                             maximum: 255;
-                            value: root.light_com;
+                            model_value: root.light_com;
                             edited(v) => { root.set_light_com(v); }
                         }
                     }
 
-                    Button {
-                        text: "立即应用";
-                        clicked => { root.apply_ports(); }
+                    HorizontalLayout {
+                        spacing: Theme.gap;
+                        Button {
+                            min-width: Theme.button-min-width;
+                            horizontal-stretch: 0;
+                            text: "立即应用";
+                            clicked => { root.apply_ports(); }
+                        }
+                        Rectangle { horizontal-stretch: 1; }
                     }
 
                     Text {
                         text: root.port_status;
-                        color: #a05a00;
+                        color: Theme.warn;
                         wrap: word-wrap;
                     }
 
                     Text {
                         text: "说明: 设置 mai2serial/mai2light 的固定 COM 口，重新插拔或重启后生效。";
-                        color: #7f8c96;
-                        font-size: 11px;
+                        color: Theme.text-dim;
+                        font-size: Theme.fs-normal;
                         wrap: word-wrap;
                     }
 
@@ -162,7 +173,7 @@ export component ToolboxPage inherits Rectangle {
                 }
             }
 
-            if root.tb_tab == 1: GroupBox {
+            if root.tb_tab == 1: SectionCard {
                 title: "虚拟扫码摄像头";
                 vertical-stretch: 1;
 
@@ -215,11 +226,21 @@ export component ToolboxPage inherits Rectangle {
                                 HorizontalBox {
                                     padding: 0px;
                                     spacing: 8px;
-                                    Button { text: "安装(需管理员)"; clicked => { root.install_vcam(); } }
-                                    Button { text: "卸载(需管理员)"; clicked => { root.uninstall_vcam(); } }
+                                    // 部署进行中两个按钮一起禁用: 它们改同一批注册表键与文件,
+                                    // 并发点只会得到互相踩踏后无法解释的核验结果。
+                                    Button {
+                                        text: root.vcam_deploy_busy ? "安装中…" : "安装(需管理员)";
+                                        enabled: !root.vcam_deploy_busy;
+                                        clicked => { root.install_vcam(); }
+                                    }
+                                    Button {
+                                        text: root.vcam_deploy_busy ? "请稍候…" : "卸载(需管理员)";
+                                        enabled: !root.vcam_deploy_busy;
+                                        clicked => { root.uninstall_vcam(); }
+                                    }
                                 }
                                 Text {
-                                    text: "仅 Windows 11 可安装，需管理员权限。";
+                                    text: "安装 = 注册 DirectShow 摄像头过滤器(x64/x86)与 Media Foundation 源(x64)，需管理员权限。";
                                     color: #7f8c96;
                                     font-size: 10px;
                                     wrap: word-wrap;
@@ -299,26 +320,29 @@ export component ToolboxPage inherits Rectangle {
                             }
                         }
 
-                        HorizontalBox {
-                            padding: 0px;
-                            spacing: 8px;
-                            Text { text: "输入停顿提交阈值(秒):"; vertical-alignment: center; }
-                            SpinBox {
+                        // 两项都走 FormRow: 左栏最宽只有 360px, 标签列取窄一档才留得下数字框。
+                        FormRow {
+                            label: "输入停顿提交阈值(秒):";
+                            label_width: 160px;
+                            GuardedSpinBox {
+                                width: Theme.spin-narrow;
+                                horizontal-stretch: 0;
                                 minimum: 1;
                                 maximum: 10;
-                                value: root.vcam_submit_secs;
+                                model_value: root.vcam_submit_secs;
                                 edited(v) => { root.set_vcam_submit_secs(v); }
                             }
                         }
 
-                        HorizontalBox {
-                            padding: 0px;
-                            spacing: 8px;
-                            Text { text: "QR 显示时长(秒):"; vertical-alignment: center; }
-                            SpinBox {
+                        FormRow {
+                            label: "QR 显示时长(秒):";
+                            label_width: 160px;
+                            GuardedSpinBox {
+                                width: Theme.spin-narrow;
+                                horizontal-stretch: 0;
                                 minimum: 1;
                                 maximum: 60;
-                                value: root.vcam_display_secs;
+                                model_value: root.vcam_display_secs;
                                 edited(v) => { root.set_vcam_display_secs(v); }
                             }
                         }

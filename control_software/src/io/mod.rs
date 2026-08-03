@@ -29,6 +29,8 @@ const IO_TIMEOUT: Duration = Duration::from_millis(20);
 const IDLE_SLEEP: Duration = Duration::from_millis(1);
 /// 命令发送必须有上限：UI 连续轮询或设备暂忙时不能无限吃内存；可靠命令会在满时反压调用方，绝不丢弃。
 const COMMAND_QUEUE_CAPACITY: usize = 256;
+/// IO→控制器事件管线同样有界；容量覆盖数秒逐通道遥测突发，防止 UI 短暂停顿时无限吃内存。
+const EVENT_QUEUE_CAPACITY: usize = 2048;
 /// 端点错误后每轮只做有限次递增退避，避免重开句柄风暴同时给固件重新 arm 端点的时间。
 const ENDPOINT_REOPEN_ATTEMPTS: u32 = 4;
 const ENDPOINT_REOPEN_BASE_BACKOFF: Duration = Duration::from_millis(15);
@@ -234,9 +236,9 @@ fn read_debug_from_interface(interface: &nusb::Interface) -> Result<Vec<u8>> {
                 request: 0x50,
                 value: 0,
                 index: 0,
-                // 必须 >= 固件 UsbDebugCounters 的实际大小(现 67B, 且只会在末尾追加字段)。
-                // 原来固定 64 会把新追加的 NvStore 落盘诊断字段整段截掉, 读出来看不到但也不报错。
-                length: 192,
+                // 必须 >= 固件 UsbDebugReport 的实际大小(现 227B, 且只会在末尾追加字段)。
+                // 原来固定 64 会把新追加的 NvStore/GPIO 诊断字段整段截掉, 读出来看不到但也不报错。
+                length: 256,
             },
             Duration::from_millis(500),
         )
@@ -452,7 +454,7 @@ pub fn spawn(device_selector: &str) -> Result<IoHandle> {
 
     // 同步 ingress + IO 线程本地 VecDeque 双重有界：既阻止生产者无限堆积，也便于替换旧轮询。
     let (cmd_tx, cmd_rx) = mpsc::sync_channel::<Frame>(COMMAND_QUEUE_CAPACITY);
-    let (evt_tx, evt_rx) = mpsc::channel::<IoEvent>();
+    let (evt_tx, evt_rx) = mpsc::sync_channel::<IoEvent>(EVENT_QUEUE_CAPACITY);
     let running = Arc::new(AtomicBool::new(true));
     let thread_running = Arc::clone(&running);
     let stats = Arc::new(IoStatsShared::default());

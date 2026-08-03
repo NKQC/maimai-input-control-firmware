@@ -21,6 +21,10 @@ export global Theme {
     out property <color> warn: #f5a623;
     out property <color> err: #d9480f;
 
+    // 危险/错误的**正文**色(比 err 亮, 用于深底上的整段警示文字)。
+    // ★与 err 分开★: err 是描边/图元色, 直接拿它写正文在深底上几乎读不出来。
+    out property <color> err-soft: #ff9a9a;
+
     // ---- 面板 / 描边 ----
     out property <color> panel: #1c2228;
     out property <color> panel-alt: #23282e;
@@ -29,16 +33,58 @@ export global Theme {
     out property <color> border: #2b3238;
     out property <color> border-light: #3a434c;
     out property <color> arrow: #4a5560;
+    // 正常/成功态提示块的底色(状态条与时钟树末端节点共用同一档深绿底)。
+    out property <color> ok-bg: #16301f;
+    // 时钟树里"可编辑节点"卡片的底色与描边(蓝调, 与只读节点的灰调区分)。
+    out property <color> node: #17222b;
+    out property <color> node-border: #2f6fa8;
+    // "待提交 / 已勾选"这类临时态的统一暖色: 分区块选中、批量勾选、新建映射区、逻辑分析仪触发线。
+    out property <color> pick: #ffd166;
+    out property <color> pick-bg: #3a3320;
+    out property <color> pick-bg-deep: #241f14;
 
-    // ---- 尺寸 ----
+    // ---- 字号 ----
     out property <length> fs-small: 10px;
     out property <length> fs-normal: 11px;
     out property <length> fs-title: 12px;
+    // 页面主标题(每个设置子页最上面那一行)。
+    out property <length> fs-page: 16px;
+
+    // ---- 间距 / 圆角 ----
     out property <length> gap: 6px;
     out property <length> radius: 6px;
     out property <length> radius-small: 4px;
-    // 参数/变量编辑行的行高与数值框宽度(两处编辑行共用)
+
+    // ---- 分区卡片(SectionCard / CollapsibleSection 共用同一套度量) ----
+    // ★card-gap 必须明显大于 card-inner-gap★: 只有"组间距 > 组内行距"时, 一页里的多个功能组
+    // 才能在扫视中被当成独立的块; 两者取同一个值就会退化成一长串等距的行。
+    out property <length> page-pad: 10px;
+    out property <length> card-gap: 12px;
+    out property <length> card-pad: 10px;
+    out property <length> card-inner-gap: 6px;
+    out property <length> card-title-height: 22px;
+
+    // ---- 表单行 ----
+    // 标签列固定宽 ⇒ 同一页所有行的控件列起点对齐(用 min-width 时长标签会把控件推走)。
+    out property <length> form-label-width: 210px;
     out property <length> row-height: 34px;
-    // Fluent SpinBox needs room for a five-digit value plus its stacked arrow affordance; 112px keeps both inside the field border.
-    out property <length> spin-width: 112px;
+    // 表单行下方那行灰色说明的行高(仅用于必须给出确定总高的场合, 如配置页按行折叠的模型行)。
+    out property <length> hint-height: 16px;
+
+    // ---- 输入控件宽度分档 ----
+    // ★为什么必须按控件类型分档★ 原先只有一个 112px 的 spin-width 被当成**所有**输入控件的宽度,
+    // 而 fluent 主题里各控件自报的最小宽度根本不同(i-slint-compiler/widgets/fluent):
+    //   SpinBox  min-width = max(128px, 内部布局)   ← 112px 比它自己的下限还窄
+    //   ComboBox min-width = max(160px, …)
+    //   LineEdit min-width = max(160px, …)
+    // 显式 width 会盖过 min-width, 于是控件被压到下限以下: 数字框的文本区被上下箭头挤掉一半
+    // (输入的数字看不全), 下拉的选项文本被右侧箭头区吃掉("IDAC sourcing" → "IDAC sour…")。
+    // ★所以每一档都不得低于对应控件自报的下限★, 且下拉宽度必须由最长选项文本决定, 与数字框无关。
+    out property <length> spin-width: 132px;    // 数字框: 五位数 + 上下箭头(> 自报下限 128px)
+    out property <length> spin-narrow: 128px;   // 窄数字框: 恰为自报下限, 再窄内部文本必被挤没
+    out property <length> combo-width: 168px;   // 下拉: 短中文/短英文短语(> 自报下限 160px)
+    out property <length> combo-wide: 220px;    // 下拉/单行输入: 长短语或带括号说明的中文
+    // 按钮宽度下限。★用 min-width 而不是 width★: 行尾有弹性空白吸收余量, 文案变长时按钮自己变宽
+    // 而不是把字裁掉; 同时保证一排按钮宽度整齐。
+    out property <length> button-min-width: 96px;
 }

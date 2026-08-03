@@ -6,11 +6,15 @@ class Psoc;
 
 // CSD 运行时参数 store：RP2040 作为"无状态 PSoC"的唯一真相源。
 // 启动/重启后把 mode + (半自动)全部通道参数下发 PSoC；PSoC 自身不持久化任何数据。
-// 参数 id 0x01..0x0B 连续，索引 = param_id - 0x01。
-// 0x01..0x09 阈值/分辨率/snsClk/idac; 0x0A snsClkSource; 0x0B idacGainIndex(增幅)。
+// 参数 id 0x01..0x0C 连续，索引 = param_id - 0x01。
+// 0x01..0x09 阈值/分辨率/snsClk/idac; 0x0A snsClkSource; 0x0B idacGainIndex(增幅);
+// 0x0C enabled(通道启用开关, 0=禁用/电极高阻 1=启用)。
 #define CSD_CHANNELS       36u
-#define CSD_PARAM_COUNT    11u
+#define CSD_PARAM_COUNT    12u
 #define CSD_PARAM_ID_MIN   0x01u
+// 通道启用开关的 param id。★它不是调参项而是硬件开关★: 与扫描模式(AUTO/SEMI)无关, 必须无条件
+// 下发(见 download_to_psoc), 且旧 blob 失效时默认为"启用"(见构造函数/clear)。
+#define CSD_PARAM_ENABLED  0x0Cu
 // 全局 CSD 配置(RAM 影子): INACTIVE_SNS/IDAC_GAIN_INIT/IDAC_MIN/RAW_TARGET/MFS_DIV_F1/MFS_DIV_F2, id 0x01..0x06
 #define CSD_GLOBAL_COUNT   8u
 #define CSD_GLOBAL_ID_MIN  0x01u
@@ -47,6 +51,13 @@ public:
     // 写穿：host_cmd 处理器在改 PSoC 的同时更新本 store，使其为真相源。
     void note_mode(uint8_t mode);
     void note_param(uint8_t ch, uint8_t param_id, uint32_t value);
+
+    /// 通道是否启用(真相源直读)。非法通道号按"启用"处理: 调用方的越界保护另有其责,
+    /// 在这里返回"禁用"会让越界通道被静默排除在各类检查之外, 掩盖真正的 bug。
+    bool ch_enabled(uint8_t ch) const {
+        return (ch >= CSD_CHANNELS) ||
+               (_param[ch][_param_index(CSD_PARAM_ENABLED)] != 0u);
+    }
     void note_global(uint8_t gparam_id, uint32_t value);   // 写穿全局配置真相源(host 改 PSoC 同时更新)
 
     // 清空 CSD 参数/全局 store 并标记无效, 使下次 PSoC 启动 provisioning 跳过参数下发,
@@ -85,6 +96,7 @@ private:
     Mirror   _mirror = {};       // NvStore 注册的落盘镜像(快照层)
     uint32_t _mirror_len = 0;    // 实际有效长度(由 NvStore 读回时回填)
     void _sync_storage();
+    void _reset_params();        // 参数表复位(enabled 列复位为 1, 其余为 0=无值)
 
     // 这些参数取 0 没有任何合法含义(分辨率 0 = 不扫描, 分频 0 = 除零, IDAC 0 = 无补偿电流→满量程),
     // store 里出现 0 只能理解为"该项无有效值", 下发时必须跳过, 保留 PSoC 侧校准/自适应的结果。

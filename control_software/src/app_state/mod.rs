@@ -28,11 +28,18 @@ use crate::proto::{
     HoldParam, KBD_DEBOUNCE_US_MAX, KBD_HOLD_KIND_PHYS, KBD_HOLD_KIND_ZONE, KBD_HOLD_PHYS_COUNT,
     KBD_HOLD_ZONE_COUNT, KbdEdgeRec, KbdHoldItem, KbdKeyCfg, Mai2State,
 };
-use crate::proto::{LED_CH_UNMAPPED, LED_PREVIEW_ALL, LED_UNIT_COUNT, LedRegion, LedState};
+use crate::proto::{
+    LED_CH_UNMAPPED, LED_PREVIEW_ALL, LED_UNIT_COUNT, LedRegion, LedState, PARAM_IDAC_GAIN,
+};
 use std::collections::{BTreeMap, VecDeque};
 
 mod drafts;
 use drafts::ConfigDrafts;
+/// 逐通道 CSD 操作的 host 侧编排(批量串行队列 / 噪声频谱扫描 / 绘图冻结)。
+/// ★为什么单独一个文件★ 三者都是"跨若干 tick 的状态机 + 自己的数据结构", 塞回本文件只会让
+/// AppController 再长几百行而与其余职责纠缠; 它们对外只暴露少量方法, 内部状态不被别处读写。
+mod ch_ops;
+pub use ch_ops::{ChBatchKind, ChBias, NoiseCell, SWEEP_DIVS, SWEEP_GAINS};
 
 /// 全局项回读对账的等待窗口(tick @16ms ≈ 12s)。
 /// 必须覆盖"PSoC 重初始化 + RP2040 自持恢复重下发"的完整过程 —— 实测重下发在保存后约 9s 才完成,
@@ -44,6 +51,14 @@ const GLOBALS_VERIFY_TICKS: u32 = 750;
 /// 2048 条 × 10B 数据量可忽略, 但足够覆盖一次长时间观察; 波形窗口本身只取其中最近一段。
 const KBD_EDGE_KEEP: usize = 2048;
 
+/// 每通道遥测缓冲的保留时长(us)。★必须 ≥ 主图固定窗口(`main.rs::PLOT_WINDOW_US` = 30s)★,
+/// 留 1s 余量吸收帧抖动: 否则窗口最左侧会永远缺一小段。
+/// 判据用时长而不是条数: 条数在不同采样率下对应的时长完全不同(171Hz 时 1024 条只有 ~6s)。
+pub const TELEM_RETAIN_US: u32 = 31_000_000;
+/// 每通道条数上限, 只作内存兜底: 采样率异常高时不至于把 31s 全留下来。
+/// 16384 条覆盖到 ~528Hz 仍满 31s; 36 通道满载约 9MB, 可接受。
+pub const TELEM_CAP: usize = 16384;
+
 /// UI 日志等级。数值越大越"啰嗦": Error(0) < Warn(1) < Info(2) < Debug(3)。
 /// 过滤规则: 仅显示 `level as u8 <= log_filter` 的条目(选 Debug 显示全部, 选 Info 隐藏 Debug)。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -52,6 +67,25 @@ pub enum LogLevel {
     Warn = 1,
     Info = 2,
     Debug = 3,
+}
+
+/// cfg 队列帧的唯一归属。批量 prime 只可清理自己的 generation，外部保存/诊断帧永不被误删。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CfgTxOwner {
+    External,
+    BatchPrime(u64),
+}
+
+struct CfgTxFrame {
+    frame: Frame,
+    owner: CfgTxOwner,
+}
+
+struct CfgTxInflight {
+    cmd: u8,
+    seq: u8,
+    waited: u32,
+    owner: CfgTxOwner,
 }
 
 // ============================================================================
@@ -75,8 +109,18 @@ struct BatchApplySel {
 }
 
 impl BatchApplySel {
-    /// per-channel 参数全集掩码(0x01..=0x0B 共 11 位)。
-    const PARAM_ALL: u16 = 0x07FF;
+    /// 可批量应用参数的全集掩码。★由 `proto::BATCH_PARAM_IDS` 派生, 不写死位图★:
+    /// 写死 0x07FF 会把分辨率(0x07)也算进"全选", 于是"全选参数"又能绕过全局唯一入口。
+    const PARAM_ALL: u16 = {
+        let mut mask = 0u16;
+        let ids = crate::proto::BATCH_PARAM_IDS;
+        let mut i = 0;
+        while i < ids.len() {
+            mask |= 1u16 << (ids[i] - 1);
+            i += 1;
+        }
+        mask
+    };
     /// 36 通道全选掩码。
     const CH_ALL: u64 = (1u64 << 36) - 1;
 
@@ -94,7 +138,8 @@ impl BatchApplySel {
     }
 
     fn param_selected(&self, param_id: u8) -> bool {
-        (0x01..=0x0B).contains(&param_id) && (self.param_mask & (1u16 << (param_id - 1))) != 0
+        crate::proto::BATCH_PARAM_IDS.contains(&param_id)
+            && (self.param_mask & (1u16 << (param_id - 1))) != 0
     }
 }
 
@@ -187,7 +232,7 @@ impl DevClock {
 /// 经 `DevClock::unwrap_us` 折进与遥测同一条展开时间轴。
 /// ⇒ 触发判定/上报线与 TELEM_DATA 从此是同一个时钟, 横向对位精确到设备侧组帧时刻,
 /// 不再受主机轮询周期(16ms)、USB 往返抖动、GUI tick 漂移影响。
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 struct TracePoint {
     t_us: u64,
     val: f32,
@@ -401,7 +446,8 @@ pub struct AppController {
     interactive_bind: bool,
 
     // 遥测数据缓冲 (#6g-1)
-    /// 36 个通道的环形缓冲,每个容量 TELEM_CAP=1024 样本
+    /// 36 个通道的环形缓冲。保留判据是**时长** `TELEM_RETAIN_US`(主图固定窗口 + 余量),
+    /// `TELEM_CAP` 只是内存兜底条数上限。
     telem_buf: Vec<VecDeque<ChannelSample>>,
     /// 数据存活检测: 每通道上一帧 raw 值 + 连续"值完全不变"的帧数。
     /// CSD 原始值在正常扫描下总有噪声抖动; 若某通道 raw 长时间逐帧完全相同(而设备仍在出帧),
@@ -418,12 +464,28 @@ pub struct AppController {
     /// 设备时钟不再推进 —— 用"最近一帧的设备时间 + 此后主机侧已流逝的时间"给追踪点定位, 停流期间
     /// 追踪线仍有正确的时间间隔, 且流式期间该修正量 <1 帧间隔, 不会与遥测曲线错位。
     telem_frame_at: Option<std::time::Instant>,
-    /// 遥测数据版本号:每次成功处理 TELEM_DATA 帧时自增,供 UI 判断是否需要重绘曲线
+    /// 遥测数据版本号:每次成功处理 TELEM_DATA 帧时自增,供实时卡片判断刷新
     telem_version: u64,
+    /// 绘图版本: 仅在未冻结时随遥测推进; 解冻时单独推进使主图跳到最新缓冲。
+    plot_version: u64,
     /// 最近一次 STATS 字段解出的采样率(Hz)
     telem_samples_per_sec: u32,
     /// 最近一次 STATS 字段解出的通道刷新延迟(us)
     telem_scan_period_us: u32,
+    /// 最近一次收到**带 STATS 的**遥测帧的时刻。逐通道档下固件按帧切分、只有首帧带 STATS,
+    /// 故必须与"收到任意遥测帧"区分开, 否则采样率/探测周期会被无 STATS 的帧冲成 0。
+    telem_stats_at: Option<std::time::Instant>,
+    /// 用户显式按过"停止"。★页面档位驱动每 tick 都跑, 没有这个位就会把用户的停止立刻覆盖掉★。
+    telem_user_paused: bool,
+    /// 上次遥测自愈(重下发 TELEM_START)的时刻, 用于最小间隔限流。
+    telem_heal_at: Option<std::time::Instant>,
+    /// 最近一次下发 TELEM_START 的时刻。自愈的超时起算点 = max(收到 STATS, 开流) ——
+    /// 少了它, 开流到首帧那几百毫秒会被误判成"卡住"而白白自愈一次。
+    telem_started_at: Option<std::time::Instant>,
+    /// 每通道最近一次出现在逐通道 TELEM_DATA 的主机时刻。全流 STATS 正常不能替它背书。
+    telem_channel_last_seen: [Option<std::time::Instant>; 36],
+    /// 单通道缺帧已经触发过几次有界恢复；收到该通道新样本即清零。
+    telem_channel_heal_attempts: [u8; 36],
     /// 最近一次 LATENCY 字段解出的 PSoC SPI 触控读耗时(us)
     telem_lat_spi_us: u16,
     /// 最近一次 LATENCY 字段解出的 RP2040 处理耗时(us)
@@ -507,12 +569,20 @@ pub struct AppController {
     batch_values: [Option<u32>; 11],
     /// 当前遥测档位: Some(true)=逐通道档, Some(false)=仅统计/延迟轻档, None=未知(需重新下发)。
     telem_scope_channels: Option<bool>,
+    /// UI 批量 CSD 操作的 host 侧串行队列(逐通道校准/基线/频率自适应)。见 `ch_ops`。
+    ch_batch: ch_ops::ChBatch,
+    /// 单通道响应噪声频谱扫描状态机。见 `ch_ops`。
+    noise_sweep: ch_ops::NoiseSweep,
+    /// 绘图视窗冻结快照。Some = 图停在快照那一刻(★遥测仍在收★, 与 telem_user_paused 语义不同)。
+    plot_freeze: Option<ch_ops::PlotFreeze>,
+    /// "Cp 辅助": 逐通道自适应时用实测 Cp 推出每通道的增益档/频率偏好档, 而不是 36 通道一个档。
+    cp_assist: bool,
     /// 配置写类命令的串行发送队列 + 在途帧(cmd, seq, 已等 tick 数)。
     /// ★为什么必须串行★: 设备侧 core0 在写 flash(停 XIP+关中断) 与 CSD 重初始化期间完全不解析
     /// vendor 命令, 背靠背灌入会让主机侧 pipe 进错误态(实测 os error 22 + ConnectionAborted)。
     /// 窗口=1 的 ACK 驱动能让主机自动跟随设备节奏: 设备忙就自然停等, 不需要猜任何固定延时。
-    cfg_tx_queue: std::collections::VecDeque<Frame>,
-    cfg_tx_inflight: Option<(u8, u8, u32)>,
+    cfg_tx_queue: std::collections::VecDeque<CfgTxFrame>,
+    cfg_tx_inflight: Option<CfgTxInflight>,
     /// 全 36 通道 per-channel 参数重读队列(待读的 param_id)。
     /// ★为什么要队列★: 恢复默认/重连原来只重读"当前通道 + CH0"两个通道, 其余 34 个通道的缓存
     /// 既不刷新也不失效, 界面显示的是过期值(或从未填充的空), 表现为"只留了一个通道的数据"。
@@ -558,6 +628,10 @@ pub struct AppController {
     /// 使 op_label 能显示"到哪一步了", 并证明设备活着(每帧重置卡死计时)。
     auto_tune_progress: crate::proto::AutoTuneProgress,
     auto_tune_progress_version: u64,
+    /// 当前在途自适应请求的 seq(= 下发 AUTO_TUNE 那一帧的 seq)。**推送流终态的归属判据**:
+    /// 设备把它逐帧回显(见 `AutoTuneProgress::origin_seq`), 对不上的帧就是上一轮的残留 —— 逐通道
+    /// 批量下必须整帧丢弃, 否则旧终态会被算到下一个通道头上。终态处理完即置 None(迟到重发不再生效)。
+    auto_tune_req_seq: Option<u8>,
     /// 设备推送的救砖进度(PSOC_RESCUE_PROGRESS 0x09): 全片擦写+校验+重新应用全程可见。
     rescue_progress: crate::proto::PsocRescueProgress,
     rescue_progress_version: u64,
@@ -747,8 +821,19 @@ impl AppController {
             telem_clock: DevClock::default(),
             telem_frame_at: None,
             telem_version: 0,
+            plot_version: 0,
             telem_samples_per_sec: 0,
             telem_scan_period_us: 0,
+            telem_stats_at: None,
+            telem_user_paused: false,
+            telem_heal_at: None,
+            telem_started_at: None,
+            telem_channel_last_seen: [None; 36],
+            telem_channel_heal_attempts: [0; 36],
+            ch_batch: ch_ops::ChBatch::default(),
+            noise_sweep: ch_ops::NoiseSweep::default(),
+            plot_freeze: None,
+            cp_assist: false,
             telem_lat_spi_us: 0,
             telem_lat_proc_us: 0,
             telem_lat_usb_us: 0,
@@ -817,6 +902,7 @@ impl AppController {
             auto_tune_all_refresh_pending: None,
             auto_tune_progress: crate::proto::AutoTuneProgress::default(),
             auto_tune_progress_version: 0,
+            auto_tune_req_seq: None,
             rescue_progress: crate::proto::PsocRescueProgress::default(),
             rescue_progress_version: 0,
             op_ack_is_accept: false,
@@ -1215,10 +1301,14 @@ impl AppController {
         self.bind_start_seq = None;
         self.telem_last_raw = [None; 36];
         self.telem_freeze_count = [0; 36];
+        self.telem_channel_last_seen = [None; 36];
+        self.telem_channel_heal_attempts = [0; 36];
         for buf in &mut self.telem_buf {
             buf.clear();
         }
         self.telem_last_ts = 0;
+        // 冻结的绘图快照属于上一条链路: 留着会让重连后的界面一直显示旧设备的波形。
+        self.plot_freeze = None;
         // 换设备/重连后设备可能已重启, ts_us 从头开始 → 时钟必须归零, 否则会算出一个巨大的假间隙。
         self.telem_clock.clear();
         self.telem_frame_at = None;
@@ -1245,22 +1335,32 @@ impl AppController {
         self.algo_trace_version = self.algo_trace_version.wrapping_add(1);
         self.algo_src_tx = None;
         self.algo_src_rx = None;
+        // 换设备/重连: 上一条链路的自适应请求不再有归属对象, 之后收到的任何终态都算旧帧。
+        self.auto_tune_req_seq = None;
     }
 
     // ------------------------------------------------------------------
     // 事件轮询(由 UI 侧 Timer 每帧调用)
     // ------------------------------------------------------------------
 
-    /// 排空 IO 事件队列并处理。应由 UI 侧定时器(如 ~16ms)周期调用。
+    /// 排空全部 IO 事件；无头工具依赖它在一次调用内收敛当前队列。
     pub fn poll(&mut self) {
-        let mut events = Vec::new();
-        if let Some(handle) = &self.io {
-            while let Some(evt) = handle.try_recv() {
-                events.push(evt);
-            }
-        }
-        for evt in events {
-            self.handle_event(evt);
+        self._poll_events(usize::MAX, None);
+    }
+
+    /// UI 事件循环使用的有界消费：每帧最多占用 2ms/256 条，避免突发遥测长期霸占 Slint 线程。
+    pub fn poll_ui(&mut self) {
+        self._poll_events(256, Some(std::time::Duration::from_millis(2)));
+    }
+
+    fn _poll_events(&mut self, max_events: usize, budget: Option<std::time::Duration>) {
+        let started = std::time::Instant::now();
+        let mut handled = 0usize;
+        while handled < max_events && budget.is_none_or(|limit| started.elapsed() < limit) {
+            let event = self.io.as_ref().and_then(|handle| handle.try_recv());
+            let Some(event) = event else { break };
+            self.handle_event(event);
+            handled += 1;
         }
         // ★写命令队列必须在这里推进, 不能只挂在 csd_diag_tick() 上★
         // `_queue_tx` 只入队, 真正发送靠 `_pump_cfg_tx`。它原先只在 csd_diag_tick(GUI 的 16ms tick)里
@@ -1333,7 +1433,9 @@ impl AppController {
                     self.csd_mode = info.diagnostics.as_ref().map(|diag| diag.csd_mode);
                     // 链路活性证据(停流时的唯一来源): link_ok=1, 或两次 DEVICE_INFO 之间代数推进了
                     // —— 后者能盖住 link_ok 那一帧恰好因 SPI 残帧抖动为 0 的情况。
-                    let gen_advanced = self.psoc_gen_seen.is_some_and(|g| g != info.psoc_generation);
+                    let gen_advanced = self
+                        .psoc_gen_seen
+                        .is_some_and(|g| g != info.psoc_generation);
                     self.psoc_gen_seen = Some(info.psoc_generation);
                     if info.psoc_link_valid || gen_advanced {
                         self.psoc_info_live_at = Some(std::time::Instant::now());
@@ -1478,8 +1580,7 @@ impl AppController {
             .config_cache
             .get(&entry.key)
             .is_some_and(|dev| Self::_cfg_eq(&dev.value, &entry.value));
-        self.drafts
-            .set_cfg(&entry.key, entry.value, same_as_device);
+        self.drafts.set_cfg(&entry.key, entry.value, same_as_device);
         Ok(())
     }
 
@@ -1506,13 +1607,72 @@ impl AppController {
         self.drafts.version()
     }
     /// 未保存配置项数量, 供 UI 显示"N 项未保存"。
+    ///
+    /// ★组合映射按"差异条数"计, 不按草稿槽位计★
+    /// 组合映射是**整表一份草稿**(脏键只有 `kbd:combo` 一个), 于是"新增了 3 条映射"会显示成
+    /// "1 项未保存" —— 数字与用户的操作对不上, 用户会以为只有一条被记住了(实测用户就这么反馈的)。
+    /// 这里把那一个槽位换算成与设备真值的实际差异条数(新增/删除/改动各算一条)。
+    /// 判定仍然派生自脏键集合(草稿不存在就不参与), 不引入第二份"是否脏"的真相。
     pub fn config_dirty_count(&self) -> i32 {
-        self.drafts.dirty_count() as i32
+        let base = self.drafts.dirty_count();
+        match self.drafts.kbd_combo() {
+            Some(table) => {
+                let diff = Self::_combo_diff_count(table, &self.kbd_combo_cache);
+                // 槽位 1 换成 diff; diff 为 0 时该草稿本不该存在(set_kbd_combo 会撤稿), 兜底不减到负数。
+                (base.saturating_sub(1) + diff) as i32
+            }
+            None => base as i32,
+        }
+    }
+
+    /// 组合映射草稿与设备真值的差异条数: 按"分区集合"认同一条映射, 内容不同算改动;
+    /// 只在一侧出现的算新增/删除。★不按下标比较★ —— 删除会让后续行整体前移, 按下标比会把
+    /// "删掉第 1 条"算成"改了 N 条"。
+    fn _combo_diff_count(
+        draft: &[crate::proto::KbdComboItem],
+        device: &[crate::proto::KbdComboItem],
+    ) -> usize {
+        let mut diff = 0usize;
+        for d in draft {
+            match device.iter().find(|c| c.zone_mask == d.zone_mask) {
+                Some(c) if c == d => {}
+                Some(_) => diff += 1, // 同一分区集合、内容改了
+                None => diff += 1,    // 新增
+            }
+        }
+        // 设备上有、草稿里没有 = 删除
+        diff += device
+            .iter()
+            .filter(|c| !draft.iter().any(|d| d.zone_mask == c.zone_mask))
+            .count();
+        diff
     }
 
     /// 按缓存原始类型设置数值配置项。
     pub fn set_config_number(&mut self, key: &str, value: f64) -> anyhow::Result<()> {
-        let cfg_value = match self.config_get(key).map(|entry| entry.value) {
+        // ★围栏统一在这一处夹取★ 所有数字配置项的草稿写入都经过本函数(界面输入框、枚举下拉、
+        // hex 口径、导入), 故把"超界即夹到阈值"放在这里, 草稿池里就永远不会存在越界值 —— 比在
+        // "保存到设备"前再遍历脏池补救更彻底(那种补救漏一条路径就白做)。围栏取设备自报的 range,
+        // 缺 range 时保持原样交由下面的类型转换处理(截断语义不变)。
+        let entry = self.config_get(key);
+        let value = match entry.as_ref().and_then(|e| e.range.as_ref()) {
+            Some((lo, hi)) => {
+                let mut v = value;
+                if let Some(lo) = lo.as_f32() {
+                    if v < lo as f64 {
+                        v = lo as f64;
+                    }
+                }
+                if let Some(hi) = hi.as_f32() {
+                    if v > hi as f64 {
+                        v = hi as f64;
+                    }
+                }
+                v
+            }
+            None => value,
+        };
+        let cfg_value = match entry.map(|entry| entry.value) {
             Some(CfgValue::Bool(_)) => CfgValue::Bool(value != 0.0),
             Some(CfgValue::I8(_)) => CfgValue::I8(value as i8),
             Some(CfgValue::U8(_)) => CfgValue::U8(value as u8),
@@ -1557,7 +1717,12 @@ impl AppController {
         }
         // 串行化守卫: 阻塞操作/冷却期间拒绝保存, 避免保存流(全局提交+校准)叠加到进行中的重操作上把设备搞死
         // (log.log 已证: 频率自适应刚成功那一刻的保存叠加 → cp_get 永久失败 + 遥测冻结)。
-        if self._reject_csd_if_locked("保存到设备") {
+        // ★保存流本身就是一次完整重配 CSD★(逐项 GLOBAL_SET + 一次 GLOBAL_COMMIT + 参数下发),
+        // 落在扫描中间会把当前那一格的 gain/div 连同全部通道一起重初始化 ⇒ 与校准/基线/自适应同等对待。
+        if self._reject_csd_if_batching("保存到设备")
+            || self._reject_csd_if_sweeping("保存到设备")
+            || self._reject_csd_if_locked("保存到设备")
+        {
             return Ok(());
         }
         // ★保存流改为串行落地★: 本函数只把帧排进 cfg_tx_queue, 由 poll 每 tick 取一帧、等到该帧的
@@ -1631,10 +1796,14 @@ impl AppController {
         //     CALIBRATE")会让 PSoC 的校准把用户刚选的增益档冲回全局起点档, 即用户改了档位却被
         //     自己这条 CALIBRATE 抹掉, UI 显示的与设备实际不符。0x0B 的生效由固件在 SET 时自行
         //     re-init 保证, 故此处跳过; 其余硬件类参数行为不变。
+        //     ★例外二: 通道启用开关(0x0C)不是硬件调参项★ —— 它 >= 0x07, 若不排除就会让"关掉一个
+        //     通道"这种操作附带一次全 36 通道 CALIBRATE(数秒重操作 + 冲掉所有手动增益档)。
+        //     PSoC 侧对 PARAM_ENABLED 有自己的落实路径(SetWidgetStatus + 只为该通道重做校准/基线),
+        //     既不需要 APPLY 也不需要 CALIBRATE。
         let hw_ids: Vec<u8> = param_items
             .iter()
             .map(|((_, id), _)| *id)
-            .filter(|id| *id >= 0x07)
+            .filter(|id| (0x07..=0x0B).contains(id))
             .collect();
         let idac_gain_only =
             !hw_ids.is_empty() && hw_ids.iter().all(|id| *id == crate::proto::PARAM_IDAC_GAIN);
@@ -1879,6 +2048,12 @@ impl AppController {
 
     /// 重置为默认配置
     pub fn reset_defaults(&mut self) -> anyhow::Result<()> {
+        // 恢复默认 = 重启 PSoC + 回填出厂 CSD 参数, 是最彻底的一次重配 ⇒ 扫描期间一律拒绝。
+        if self._reject_csd_if_batching("恢复默认配置")
+            || self._reject_csd_if_sweeping("恢复默认配置")
+        {
+            return Ok(());
+        }
         let seq = self.next_seq();
         if self.io.is_some() {
             self._queue_tx(Frame::new(HostCmd::ResetDefaults as u8, 0, seq, vec![]))?;
@@ -1909,10 +2084,12 @@ impl AppController {
         (0..36u8).map(|ch| self.batch_sel.ch_selected(ch)).collect()
     }
 
-    /// 11 个 per-channel 参数(0x01..=0x0B)的勾选状态(下标=id-1)。
+    /// 可批量应用参数的勾选状态。顺序与下标一律由 `proto::BATCH_PARAM_IDS` 决定 ——
+    /// 面板行、围栏列、待写值列共用同一份顺序, 不再各自按 `id-1` 猜位置。
     pub fn batch_param_selected(&self) -> Vec<bool> {
-        (0x01u8..=0x0Bu8)
-            .map(|id| self.batch_sel.param_selected(id))
+        crate::proto::BATCH_PARAM_IDS
+            .iter()
+            .map(|id| self.batch_sel.param_selected(*id))
             .collect()
     }
 
@@ -1935,21 +2112,22 @@ impl AppController {
         self.batch_sel_version = self.batch_sel_version.wrapping_add(1);
     }
 
-    /// 批量面板每参数的待写值(下标 = param_id - 1)。`-1` = 尚无值(源通道未回读且用户未手填):
-    /// 用一个不可能合法的哨兵值表达"无", 免得再并排一个 bool 数组(围栏 min 一律 >= 0)。
+    /// 批量面板每参数的待写值, 顺序 = `proto::BATCH_PARAM_IDS`。`-1` = 尚无值(源通道未回读且
+    /// 用户未手填): 用一个不可能合法的哨兵值表达"无", 免得再并排一个 bool 数组(围栏 min 一律 >= 0)。
     pub fn batch_values(&self) -> Vec<i32> {
-        self.batch_values
+        crate::proto::BATCH_PARAM_IDS
             .iter()
-            .map(|v| v.map_or(-1i32, |x| x as i32))
+            .map(|id| self.batch_values[(*id - 1) as usize].map_or(-1i32, |value| value as i32))
             .collect()
     }
 
     /// 各参数的合法输入范围(下标 = param_id - 1), 唯一来源 = `proto::param_fence`。
     /// ★不许在 .slint 里按 param_id 写阈值★: 那会变成第四份围栏, 与固件两处必然漂移。
     pub fn batch_value_bounds(&self) -> (Vec<i32>, Vec<i32>) {
-        let mut mins = Vec::with_capacity(11);
-        let mut maxs = Vec::with_capacity(11);
-        for id in 0x01u8..=0x0Bu8 {
+        let ids = crate::proto::BATCH_PARAM_IDS;
+        let mut mins = Vec::with_capacity(ids.len());
+        let mut maxs = Vec::with_capacity(ids.len());
+        for &id in ids {
             let fence = crate::proto::param_fence(id);
             mins.push(fence.ui_min() as i32);
             maxs.push(fence.ui_max() as i32);
@@ -1960,7 +2138,7 @@ impl AppController {
     /// 用户在批量面板里手改某项的待写值。不校验围栏 —— 校验统一在应用时由 `set_param` 做
     /// (与手工编辑同一条路径), 这里若提前拒绝, 用户就没法把数字从一个非法中间态改到合法值。
     pub fn batch_set_value(&mut self, param_id: u8, value: u32) {
-        if !(0x01..=0x0B).contains(&param_id) {
+        if !crate::proto::BATCH_PARAM_IDS.contains(&param_id) {
             return;
         }
         self.batch_values[(param_id - 1) as usize] = Some(value);
@@ -1982,7 +2160,7 @@ impl AppController {
     fn _batch_fill_missing(&mut self) -> bool {
         let src = self.batch_source;
         let mut filled = false;
-        for id in 0x01u8..=0x0Bu8 {
+        for &id in crate::proto::BATCH_PARAM_IDS {
             let slot = (id - 1) as usize;
             if self.batch_values[slot].is_some() {
                 continue;
@@ -2004,7 +2182,7 @@ impl AppController {
     }
 
     pub fn batch_toggle_param(&mut self, param_id: u8) {
-        if !(0x01..=0x0B).contains(&param_id) {
+        if !crate::proto::BATCH_PARAM_IDS.contains(&param_id) {
             return;
         }
         self.batch_sel.param_mask ^= 1u16 << (param_id - 1);
@@ -2037,6 +2215,33 @@ impl AppController {
         self.batch_sel_version = self.batch_sel_version.wrapping_add(1);
     }
 
+    /// 批量抽屉从展开 → 收起时的会话清理。
+    /// ★为什么必须真清而不是"看不见就算了"★ 勾选态、面板待写值、源通道都活在 AppController 里,
+    /// 收起抽屉只是 Slint 不再实例化那棵子树 —— 状态全都还在。于是下次展开时会带着上一次的
+    /// 一批勾选出现, 而"应用到已选通道"是立刻按它执行的: 用户以为在给新选的两个通道写值,
+    /// 实际写进了上一次遗留的一二十个通道。
+    /// 清理范围就是"本次批量会话"的全部东西: 目标通道勾选 + 参数勾选(沿用 batch_clear) +
+    /// 面板上手改过的待写值 + 源通道。草稿(已经写进 drafts 的改动)不动 —— 那是用户已确认的编辑,
+    /// 该由"保存到设备"或"撤销改动"处置, 不属于抽屉的会话状态。
+    pub fn batch_drawer_closed(&mut self) {
+        let had_ch = self.batch_sel.ch_mask != 0;
+        let had_param = self.batch_sel.param_mask != 0;
+        let had_value = self.batch_values.iter().any(|v| v.is_some());
+        if !had_ch && !had_param && !had_value && self.batch_source == 0 {
+            return;
+        }
+        self.batch_sel.clear();
+        self.batch_values = [None; 11];
+        self.batch_source = 0;
+        self.batch_sel_version = self.batch_sel_version.wrapping_add(1);
+        if had_ch || had_param {
+            self.push_log_debug(
+                "批量应用抽屉已收起: 已清空目标通道与参数勾选、面板待写值与源通道(草稿改动不受影响)"
+                    .to_string(),
+            );
+        }
+    }
+
     /// 把批量面板上被勾选的参数【按面板上的当前值】写进被勾选目标通道的草稿。
     /// 值来自 `batch_values`(选源通道时用源真值预填, 之后可由用户逐项手改) —— ★写的是面板上
     /// 显示的那个数★, 而不是重新去读源通道, 否则用户手改的值会被静默忽略。
@@ -2046,12 +2251,36 @@ impl AppController {
         if src >= 36 {
             return Ok(());
         }
-        let targets: Vec<u8> = (0..36u8)
-            .filter(|ch| *ch != src && self.batch_sel.ch_selected(*ch))
+        // ★不再排除源通道★
+        // 早期这一列的值恒等于源通道真值, "源→其余"是对的。但值一列现在**可以手改**(面板值才是
+        // 真正要写下去的东西), 于是排除源通道就变成"唯一拿不到新值的通道恰好是你选中的那个" ——
+        // 用户看到的就是"批量覆盖没覆盖部分通道"。
+        // 把它一并写入是安全的: 若源通道当前值本来就等于面板值, set_param 的 same_as_device 判定
+        // 会自动撤稿(不产生脏项、不下发), 所以这里不需要任何特例。
+        // ★禁用通道不参与批量调参★ 它的电极是高阻、不参与扫描, 写进去的阈值/分频既不会被使用,
+        // 也会在"保存到设备"时白占一轮下发与对账。勾选仍然允许(批量启用/禁用要靠它), 只在这里排除。
+        let selected: Vec<u8> = (0..36u8)
+            .filter(|ch| self.batch_sel.ch_selected(*ch))
             .collect();
-        let ids: Vec<u8> = (0x01u8..=0x0Bu8)
+        let targets: Vec<u8> = selected
+            .iter()
+            .copied()
+            .filter(|ch| self.ch_enabled(*ch))
+            .collect();
+        let skipped_disabled = selected.len() - targets.len();
+        let ids: Vec<u8> = crate::proto::BATCH_PARAM_IDS
+            .iter()
+            .copied()
             .filter(|id| self.batch_sel.param_selected(*id))
             .collect();
+        if targets.is_empty() && skipped_disabled > 0 && !ids.is_empty() {
+            self.push_log_warn(format!(
+                "批量应用未执行: 已选的 {} 个通道全部处于禁用状态(电极高阻, 不参与扫描), \
+                 调参对它们无效。先用「批量启用」打开再调。",
+                skipped_disabled
+            ));
+            return Ok(());
+        }
         if targets.is_empty() || ids.is_empty() {
             self.push_log_warn(format!(
                 "批量应用未执行: 已选目标通道 {} 个 / 已选参数 {} 项 — 两者都需至少选一项。",
@@ -2087,7 +2316,8 @@ impl AppController {
         // 批量写草稿不经控件, 必须显式 bump 让下一 tick 的既有门控重建行模型(同 JSON 导入路径)。
         self._bump_view_versions();
         let mut msg = format!(
-            "批量应用完成: 源 CH{} → {} 个通道 × {} 项参数, 共写入 {} 项草稿。需点“保存到设备”才生效。",
+            "批量应用完成: 面板值(取自 CH{}, 可手改) → 已选 {} 个通道 × {} 项参数, 共写入 {} 项草稿。\
+             与设备真值相同的项不计入(自动撤稿)。需点“保存到设备”才生效。",
             src,
             targets.len(),
             ids.len() - missing - rejected,
@@ -2105,18 +2335,62 @@ impl AppController {
                 rejected
             ));
         }
+        if skipped_disabled > 0 {
+            msg.push_str(&format!(
+                " 另有 {} 个已勾选通道被跳过(处于禁用状态, 调参对它们无效)。",
+                skipped_disabled
+            ));
+        }
         self.push_log(msg);
         Ok(())
     }
 
-    /// 配置写类命令的内部入队口。所有写操作复用唯一 `cfg_tx_queue`，由 `_pump_cfg_tx`
-    /// 在 ACK/NAK(或超时)后推进下一帧，绝不以固定 sleep 猜设备就绪时间。
+    /// 配置写类命令的内部入队口。默认归属 External；批量 prime 用私有 owner 入口，取消只清该代帧。
     fn _queue_tx(&mut self, frame: Frame) -> anyhow::Result<()> {
+        self._queue_tx_owned(frame, CfgTxOwner::External)
+    }
+
+    fn _queue_tx_owned(&mut self, frame: Frame, owner: CfgTxOwner) -> anyhow::Result<()> {
         if self.io.is_none() {
             return Err(anyhow::anyhow!("未连接, 无法下发写命令"));
         }
-        self.cfg_tx_queue.push_back(frame);
+        self.cfg_tx_queue.push_back(CfgTxFrame { frame, owner });
         Ok(())
+    }
+
+    /// 批量 AutoTune 前置写的唯一入口：仍走既有 cfg FIFO，只附 generation 所有权标记。
+    pub(super) fn _queue_batch_prime_param(
+        &mut self,
+        generation: u64,
+        ch: u8,
+        value: u32,
+    ) -> anyhow::Result<()> {
+        self._reject_illegal_param(ch, PARAM_IDAC_GAIN, value)?;
+        let seq = self.next_seq();
+        let payload = crate::proto::encode_param_set(ch, PARAM_IDAC_GAIN, value);
+        self._queue_tx_owned(
+            Frame::new(HostCmd::ParamSet as u8, 0, seq, payload),
+            CfgTxOwner::BatchPrime(generation),
+        )?;
+        self.params[ch as usize].insert(PARAM_IDAC_GAIN, value);
+        Ok(())
+    }
+
+    /// 当前 batch generation 是否仍有未发或在途 cfg 帧。
+    pub(super) fn _cfg_batch_pending(&self, generation: u64) -> bool {
+        self.cfg_tx_queue
+            .iter()
+            .any(|item| item.owner == CfgTxOwner::BatchPrime(generation))
+            || self
+                .cfg_tx_inflight
+                .as_ref()
+                .is_some_and(|item| item.owner == CfgTxOwner::BatchPrime(generation))
+    }
+
+    /// 丢弃本批尚未发送的 prime 帧；绝不清队列整体，且在途帧必须自然 ACK/NAK/超时后才算收敛。
+    pub(super) fn _cfg_purge_batch_frames(&mut self, generation: u64) {
+        self.cfg_tx_queue
+            .retain(|item| item.owner != CfgTxOwner::BatchPrime(generation));
     }
 
     fn _record_cfg_tx_failure(&mut self, cmd: u8, seq: u8, reason: impl AsRef<str>) {
@@ -2129,18 +2403,15 @@ impl AppController {
     }
 
     /// 配置写类命令的串行泵: 窗口=1, 每 tick 最多推进一帧。
-    ///
-    /// 在途帧必须等到它的 ACK/NAK 才继续 —— 设备写 flash / CSD 重初始化期间不回执, 于是主机自然
-    /// 停等, 不用猜任何固定延时。超时兜底防止个别命令无回执把整条队列卡死(SAVE_CONFIG 的 flash
-    /// 落地最慢, 故给到 ~2s)。
     fn _pump_cfg_tx(&mut self) {
-        const CFG_TX_TIMEOUT_TICKS: u32 = 125; // ~2s @16ms/tick
-        // ALGO_SET_SRC 保持既有逐片 ACK 状态机；其片在途时独占同一物理发送窗口，避免与普通写帧竞争。
+        const CFG_TX_TIMEOUT_TICKS: u32 = 125;
         if self.algo_src_tx.as_ref().and_then(|tx| tx.seq).is_some() {
             return;
         }
-        if let Some((cmd, seq, waited)) = self.cfg_tx_inflight {
-            if waited >= CFG_TX_TIMEOUT_TICKS {
+        if let Some(inflight) = self.cfg_tx_inflight.as_mut() {
+            if inflight.waited >= CFG_TX_TIMEOUT_TICKS {
+                let cmd = inflight.cmd;
+                let seq = inflight.seq;
                 let reason = "超过 2s 无 ACK/NAK，已跳过并继续下一项(设备可能卡住或仍在写 flash)";
                 self.push_log_warn(format!(
                     "保存队列: cmd=0x{:02X} seq={} {},",
@@ -2149,25 +2420,27 @@ impl AppController {
                 self._record_cfg_tx_failure(cmd, seq, reason);
                 self.cfg_tx_inflight = None;
             } else {
-                self.cfg_tx_inflight = Some((cmd, seq, waited + 1));
+                inflight.waited += 1;
                 return;
             }
         }
-        let Some(frame) = self.cfg_tx_queue.pop_front() else {
+        let Some(queued) = self.cfg_tx_queue.pop_front() else {
             return;
         };
-        let cmd = frame.cmd;
-        let seq = frame.seq;
+        let cmd = queued.frame.cmd;
+        let seq = queued.frame.seq;
         if let Some(handle) = &self.io {
-            if let Err(e) = handle.send(frame) {
-                let reason = format!("本地发送失败: {}", e);
-                log::warn!("保存队列 {}", reason);
-                self._record_cfg_tx_failure(cmd, seq, reason);
+            if let Err(e) = handle.send(queued.frame) {
+                self._record_cfg_tx_failure(cmd, seq, format!("本地发送失败: {}", e));
                 return;
             }
-            self.cfg_tx_inflight = Some((cmd, seq, 0));
+            self.cfg_tx_inflight = Some(CfgTxInflight {
+                cmd,
+                seq,
+                waited: 0,
+                owner: queued.owner,
+            });
         } else {
-            // 断连时丢弃剩余队列: 保留下去只会在重连后把过期配置写进设备。
             self.cfg_tx_queue.clear();
             self.cfg_tx_inflight = None;
         }
@@ -2184,10 +2457,10 @@ impl AppController {
         if !nak && frame.cmd != HostCmd::Ack as u8 {
             return;
         }
-        let Some((cmd, seq, _)) = self.cfg_tx_inflight else {
+        let Some(inflight) = self.cfg_tx_inflight.as_ref() else {
             return;
         };
-        if seq != frame.seq {
+        if inflight.seq != frame.seq {
             return;
         }
         if nak {
@@ -2196,18 +2469,30 @@ impl AppController {
             } else {
                 "未知错误".to_string()
             };
-            self._record_cfg_tx_failure(cmd, seq, format!("设备拒绝(NAK): {}", reason));
+            self._record_cfg_tx_failure(
+                inflight.cmd,
+                inflight.seq,
+                format!("设备拒绝(NAK): {}", reason),
+            );
         }
         self.cfg_tx_inflight = None;
+        // ★收到回执立刻发下一帧, 不再等到下一个 16ms tick★
+        // 窗口仍然是 1(同一时刻只有一帧在途, ACK 仍代表"设备真的做完了"), 但原实现把"何时发下一帧"
+        // 绑在 GUI 的 16ms tick 上, 于是吞吐被硬钉在 62.5 帧/秒 —— 与设备快慢无关。
+        // 实测代价: 一次"保存到设备"改 36 通道 × 11 项 = 396 帧, 光是这层节拍就要 6.3 秒, 用户看到的
+        // 就是"批量设置很久才生效 / 上报延迟很大"。设备 ACK 往返只有几百 µs 到数 ms, 顺势接着发下一帧
+        // 既不增加并发也不增加在途帧数, 只是把这段白等的空拍去掉。
+        // 重操作(校准/自适应/GLOBAL_COMMIT)的 ACK 本身就要等到设备真正完成才来, 所以不会被"加速"成堆叠。
+        self._pump_cfg_tx();
     }
 
     /// 排程"全 36 通道 × 全 per-channel 参数"重读。
     /// 恢复默认、重连、导入后都必须走这条: 否则未被显式重读的通道会一直显示过期或空值。
     /// 队列由 `poll` 每 tick 取一条下发, 全集读完约 11 tick(~180ms)。
     pub fn schedule_param_refetch_all(&mut self) {
-        // 0x01..=0x0B 即 per-channel 参数全集(见 proto::telemetry 的 PARAM_* 常量)。
+        // 0x01..=0x0C 即 per-channel 参数全集(见 proto::telemetry 的 PARAM_* 常量, 含 0x0C 启用开关)。
         // 倒序入队使 pop 时按 id 升序发出, 便于对着日志核对进度。
-        self.param_refetch_ids = (0x01u8..=0x0Bu8).rev().collect();
+        self.param_refetch_ids = (0x01u8..=0x0Cu8).rev().collect();
     }
 
     /// main.rs 每 tick 轮询: 恢复默认的设备端回填就绪后返回一次 true, 触发主循环做全量重读。
@@ -2304,7 +2589,13 @@ impl AppController {
     /// 设备立即回 ACK("已受理"), 阶段进度经 PSOC_RESCUE_PROGRESS(0x09) 推送流上报。
     /// 用于扫描引擎卡死/PSoC 变砖、恢复默认也救不回来时的最后手段(期间触控不可用, 耗时数秒)。
     pub fn psoc_rescue(&mut self) -> anyhow::Result<()> {
-        if self._reject_csd_if_locked("PSoC 救砖") {
+        // 救砖会全片重刷并让 RP2040 重新下发算法/CSD ⇒ 比任何一次重配都彻底, 扫描期间同样拒绝。
+        // ★不会把用户困住★: 扫描的每一步都以 `_csd_locked()` 为闸, 设备真失联/卡死时由既有 51s
+        // 看门狗解锁, 还原阶段随即收尾并置 active=false, 之后救砖立刻可用。
+        if self._reject_csd_if_batching("PSoC 救砖")
+            || self._reject_csd_if_sweeping("PSoC 救砖")
+            || self._reject_csd_if_locked("PSoC 救砖")
+        {
             return Ok(());
         }
         let seq = self.next_seq();
@@ -2371,6 +2662,12 @@ impl AppController {
     }
 
     pub fn reboot_psoc(&mut self) -> anyhow::Result<()> {
+        // XRES 复位 = PSoC 的 CSD 配置(含扫描临时写下的 gain/div)全部丢失并被 store 重新下发 ⇒
+        // 扫描中途执行会让当前格测的不是它以为的配置, 还会踩乱还原路径。
+        if self._reject_csd_if_batching("重启 PSoC") || self._reject_csd_if_sweeping("重启 PSoC")
+        {
+            return Ok(());
+        }
         let seq = self.next_seq();
         if let Some(handle) = &self.io {
             let frame = Frame::new(HostCmd::RebootPsoc as u8, 0, seq, vec![]);
@@ -2451,12 +2748,16 @@ impl AppController {
             let frame = Frame::new(HostCmd::TelemStart as u8, 0, seq, payload);
             handle.send(frame)?;
             self.telem_active = true;
+            self.telem_started_at = Some(std::time::Instant::now());
             // 只清存活检测计数(重新开流, 冻结判定从头计)。
             // ★不再清样本缓冲★: "停止/开始"要当成暂停/继续用 —— 暂停时间轴冻结、已抓到的波形留在
             // 图上可继续缩放查看; 继续后设备时间是延续的, 中间那段停流间隙由绘图侧断开子路径如实
             // 表示(不做直线插值)。设备断连/换设备才真正清缓冲(见 _clear_sensor_caches)。
             self.telem_last_raw = [None; 36];
             self.telem_freeze_count = [0; 36];
+            // 重发当前 scope 后重新给首帧一个宽限；attempts 只由收到该 CH 新样本清零，
+            // 所以持续缺失仍会升级到有界链路恢复。
+            self.telem_channel_last_seen = [None; 36];
         }
         Ok(())
     }
@@ -2475,6 +2776,12 @@ impl AppController {
         if self.io.is_none() {
             // 未连接: 档位记为未知, 重连后必然重新下发一次。
             self.telem_scope_channels = None;
+            return;
+        }
+        // ★用户按了"停止"就必须真的停住★
+        // 本方法每 16ms 被主循环调一次, 而 stop_telemetry() 会把档位记忆清成未知 —— 于是"停止"下一帧
+        // 就被这里重新开流, 表现为按钮完全没用(实测)。页面档位切换是自动行为, 不该覆盖用户的显式意图。
+        if self.telem_user_paused {
             return;
         }
         if self.telem_scope_channels == Some(want_channels) {
@@ -2502,6 +2809,118 @@ impl AppController {
                     .to_string()
             });
         }
+    }
+
+    /// 带 STATS 的帧多久没来就判定"无实测值"。取 2s: 轻档 20Hz、逐通道档 100Hz, 正常每轮都有,
+    /// 2s 足够容忍一次重操作(校准/自适应)造成的推送空档, 又不至于让过期值长期冒充实测值。
+    const TELEM_STATS_FRESH: std::time::Duration = std::time::Duration::from_secs(2);
+    /// 逐通道 RAW 期望档的 freshness 门限。超过它，缓存旧值必须标 stale，即使全局 STATS 仍正常。
+    const TELEM_CHANNEL_FRESH: std::time::Duration = std::time::Duration::from_secs(2);
+    /// 遥测自愈: STATS 断了这么久就重新下发一次 TELEM_START。
+    const TELEM_HEAL_AFTER: std::time::Duration = std::time::Duration::from_secs(3);
+    /// 自愈重试最小间隔。★必须足够稀★: 本设备所有流量共用一对 bulk 端点, 高频重发 TELEM_START
+    /// 只会把 vendor FIFO 打爆并与校准/自适应抢链路(本仓已因此掉线过)。5s 一次远低于既有 PING(1s)
+    /// 的量级, 不可能把固件带崩; 而"卡住就永远不恢复"才是真正要避免的。
+    const TELEM_HEAL_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// 仍在逐通道档且已经跨过开流宽限后，列出持续缺失的通道。
+    fn _stale_telem_channels(&self) -> Vec<u8> {
+        if self.telem_scope_channels != Some(true) || !self.telem_active {
+            return Vec::new();
+        }
+        let now = std::time::Instant::now();
+        (0..36u8)
+            // ★禁用通道不参与缺失判定★ 它按设计不上报有效数据(设备侧一律发 0), 把它算成"缺失"
+            // 会让遥测看门狗无休止地重发 TELEM_START、甚至触发 HELLO 链路恢复 —— 用户只是关了
+            // 几个通道, 却换来周期性的链路重建。
+            .filter(|ch| self.ch_enabled(*ch))
+            .filter(|ch| {
+                self.telem_channel_last_seen[*ch as usize]
+                    .or(self.telem_started_at)
+                    .is_some_and(|seen| now.duration_since(seen) >= Self::TELEM_CHANNEL_FRESH)
+            })
+            .collect()
+    }
+
+    /// 某通道的缓存值是否已经过期。调用方可继续保留历史曲线，但不得把它冒充当前设备读数。
+    pub fn channel_stale(&self, ch: u8) -> bool {
+        (ch as usize) < 36 && self._stale_telem_channels().contains(&ch)
+    }
+
+    /// 遥测看门狗：先处理单通道缺失，再处理全流 STATS 中断。单通道首次只重发当前 TELEM_START；
+    /// 持续缺失才有界触发现有 HELLO 链路恢复，绝不以校准/Cp 之类破坏 CSD 状态的操作掩盖问题。
+    pub fn telem_heal_tick(&mut self) -> bool {
+        if self.io.is_none() || !self.telem_active || self.telem_user_paused {
+            return false;
+        }
+        let now = std::time::Instant::now();
+        let cooled_down = self
+            .telem_heal_at
+            .is_some_and(|t| now.duration_since(t) < Self::TELEM_HEAL_COOLDOWN);
+        let missing = self._stale_telem_channels();
+        if let Some(ch) = missing.first().copied() {
+            if cooled_down {
+                return false;
+            }
+            let attempt = {
+                let slot = &mut self.telem_channel_heal_attempts[ch as usize];
+                *slot = slot.saturating_add(1);
+                *slot
+            };
+            self.telem_heal_at = Some(now);
+            self.telem_scope_channels = None;
+            if attempt == 1 {
+                self.push_log_warn(format!(
+                    "遥测: CH{} 持续缺失而 STATS 仍正常，旧值已标为 stale；已重发当前逐通道 TELEM_START。",
+                    ch
+                ));
+            } else {
+                self.push_log_warn(format!(
+                    "遥测: CH{} 在 {} 次有界 TELEM_START 重发后仍缺失，旧值保持 stale；正在触发现有非破坏 HELLO 链路恢复。",
+                    ch, attempt
+                ));
+                if let Err(e) = self.resend_hello() {
+                    self.push_log_warn(format!("遥测: CH{} 链路恢复下发失败: {}", ch, e));
+                }
+            }
+            return true;
+        }
+
+        let since = self.telem_stats_at.or(self.telem_started_at);
+        let Some(since) = since else {
+            return false;
+        };
+        if now.duration_since(since) < Self::TELEM_HEAL_AFTER || cooled_down {
+            return false;
+        }
+        self.telem_heal_at = Some(now);
+        self.telem_scope_channels = None;
+        self.push_log_warn(
+            "遥测: 超过 3s 没收到带采样统计的帧, 已重新下发一次 TELEM_START(最快 5s 一次, 不会连发)"
+                .to_string(),
+        );
+        true
+    }
+
+    /// 采集是否已被用户显式停止(真停流)。★与 `plot_frozen` 不是一件事★: 后者只冻结曲线视窗,
+    /// 遥测仍在收。全通道页的「开始采集/停止采集」按钮据此互斥置灰。
+    pub fn telem_user_paused(&self) -> bool {
+        self.telem_user_paused
+    }
+
+    /// 用户显式"开始": 解除暂停并强制按当前页面档位重新开流。
+    /// ★不在这里硬编码 fields/rate★: 那会与 telem_set_scope 的页面档位形成第二份定义。
+    pub fn telem_user_start(&mut self) {
+        self.telem_user_paused = false;
+        self.telem_scope_channels = None;
+        self.push_log("遥测: 已恢复推流(按当前页面档位)".to_string());
+    }
+
+    /// 用户显式"停止": 停流并置暂停位, 使每 tick 的页面档位驱动不再把它重新开起来。
+    pub fn telem_user_stop(&mut self) {
+        let _ = self.stop_telemetry();
+        self.telem_user_paused = true;
+        self.push_log("遥测: 已按用户请求停止(切换页面不会自动恢复, 需再点「开始」)".to_string());
     }
 
     /// 停止遥测流
@@ -2628,6 +3047,9 @@ impl AppController {
     /// 诊断用: 直接下发单通道参数到设备(不经草稿、不写 flash), 供无头探针实时改参验证时钟生效。
     /// 与 GUI 的 set_param(草稿) 区分: 这条立即经 PARAM_SET 送达设备并同步本地缓存。
     pub fn debug_param_now(&mut self, ch: u8, param_id: u8, value: u32) -> anyhow::Result<()> {
+        // 扫描自身的写 gain/div 走 `_sweep_tx`(own_tx 放行), 其余来源在扫描期间一律拒绝。
+        self._reject_csd_tx_if_batching("直接写入通道参数")?;
+        self._reject_csd_tx_if_sweeping("直接写入通道参数")?;
         self._reject_illegal_param(ch, param_id, value)?;
         let payload = crate::proto::encode_param_set(ch, param_id, value);
         let seq = self.next_seq();
@@ -2642,6 +3064,9 @@ impl AppController {
 
     /// 诊断用: 直接切换 CSD 处理模式(0=自动/1=半自动手动), 不经草稿、不写 flash。
     pub fn debug_mode_now(&mut self, mode: u8) -> anyhow::Result<()> {
+        // 切处理模式会换掉整条 CSD 处理链(自动校准/半自动手动) ⇒ 扫描期间拒绝。
+        self._reject_csd_tx_if_batching("直接切换 CSD 处理模式")?;
+        self._reject_csd_tx_if_sweeping("直接切换 CSD 处理模式")?;
         let seq = self.next_seq();
         if self.io.is_some() {
             self._queue_tx(Frame::new(HostCmd::ModeSet as u8, 0, seq, vec![mode]))?;
@@ -2651,6 +3076,8 @@ impl AppController {
 
     /// 诊断用: 直接下发全局 CSD 配置(不写草稿), 使 global_get 回读到的是设备真值而非草稿乐观值。
     pub fn debug_global_now(&mut self, gparam_id: u8, value: u32) -> anyhow::Result<()> {
+        self._reject_csd_tx_if_batching("直接写入全局 CSD 项")?;
+        self._reject_csd_tx_if_sweeping("直接写入全局 CSD 项")?;
         self._reject_illegal_global(gparam_id, value)?;
         let seq = self.next_seq();
         if self.io.is_some() {
@@ -2739,14 +3166,21 @@ impl AppController {
     pub fn set_param_all(&mut self, param_id: u8, value: u32) -> anyhow::Result<()> {
         self._reject_illegal_param(0xFF, param_id, value)?;
         // 整组语义: 仅当全部 36 通道都已等于设备值时才算无改动(否则任一通道不同即需下发)。
-        let same_as_device =
-            (0..36usize).all(|ch| self.params[ch].get(&param_id) == Some(&value));
+        let same_as_device = (0..36usize).all(|ch| self.params[ch].get(&param_id) == Some(&value));
         self.drafts.set_param_all(param_id, value, same_as_device);
         Ok(())
     }
 
     /// 触发全部电极的 Cp 测量。
+    ///
+    /// ★为什么它也必须让位给频谱扫描★ PSoC 侧的 Cp 测量走 BIST: 逐电极把 CSD 切到 BIST 配置测完
+    /// 再自己恢复(main.c 的 measure_cp 分支)。恢复的是"命令到达那一刻的配置", 而扫描每一格都在改
+    /// 本通道的 gain/div —— 两者交叠时, 恢复回来的可能是上一格的配置, 而这一格测出的噪声也不再属于
+    /// 它标称的那一格。这里只做"扫描期间拒绝", CP/BIST 自身的恢复语义一字未改。
     pub fn measure_cp(&mut self) -> anyhow::Result<()> {
+        if self._reject_csd_if_batching("测量 Cp") || self._reject_csd_if_sweeping("测量 Cp") {
+            return Ok(());
+        }
         let seq = self.next_seq();
         if self.io.is_some() {
             let frame = Frame::new(
@@ -2849,6 +3283,65 @@ impl AppController {
         false
     }
 
+    /// 批量控制面守卫：从 start 到取消/终态收敛期间，外部 CSD mutation 一律不得插入批次间隙。
+    fn _reject_csd_if_batching(&mut self, what: &str) -> bool {
+        if !self._batch_blocks_csd() {
+            return false;
+        }
+        self.push_log(format!(
+            "{}进行中, 已忽略「{}」——请等待批量终态或取消收敛后再操作。",
+            self.ch_batch_status(),
+            what
+        ));
+        true
+    }
+
+    /// 立即下发入口的 Err 版批次守卫，避免调用方把 Ok 当作已经写入设备。
+    fn _reject_csd_tx_if_batching(&mut self, what: &str) -> anyhow::Result<()> {
+        if !self._batch_blocks_csd() {
+            return Ok(());
+        }
+        let message = format!(
+            "{}进行中, 已拒绝「{}」——批量控制面尚未释放。",
+            self.ch_batch_status(),
+            what
+        );
+        self.push_log_warn(message.clone());
+        Err(anyhow::anyhow!(message))
+    }
+
+    /// 频谱扫描互斥守卫: 扫描活跃期间拒绝任何**外部** CSD 操作(扫描自身的下发经 `_sweep_tx` 放行)。
+    /// ★为什么必须挡★ 扫描的每一格都在改本通道的 gain/div 并逐格校准 —— 中途插进来的校准/基线复位/
+    /// 自适应会把那一格的配置换掉, 于是测出来的噪声不是这一格的, 还会踩乱扫描的原值还原路径。
+    /// 与 `_reject_csd_if_locked` 同一约定: 记日志 + 返回 true, 调用方放弃本次操作。
+    fn _reject_csd_if_sweeping(&mut self, what: &str) -> bool {
+        if !self._sweep_blocks_csd() {
+            return false;
+        }
+        let ch = self.noise_sweep_channel();
+        self.push_log(format!(
+            "CH{} 响应噪声频谱扫描进行中, 已忽略「{}」——请先取消扫描(会自动还原增益档/分频)再操作。",
+            ch, what
+        ));
+        true
+    }
+
+    /// 同一判据的 **Err 版**互斥守卫, 供"调用方一律检查 Err"的即时下发入口(`debug_*_now`)使用。
+    /// ★为什么不能复用返回 Ok 的那个★ 那三条的调用方(回读防污染的自动回写、批量前置写入)会把
+    /// `Ok(())` 当成"已经写进设备了"并照此打日志/记状态 —— 那正是本轮要消灭的假成功。
+    fn _reject_csd_tx_if_sweeping(&mut self, what: &str) -> anyhow::Result<()> {
+        if !self._sweep_blocks_csd() {
+            return Ok(());
+        }
+        let message = format!(
+            "CH{} 响应噪声频谱扫描进行中, 已拒绝「{}」——请先取消扫描(会自动还原增益档/分频)再操作。",
+            self.noise_sweep_channel(),
+            what
+        );
+        self.push_log_warn(message.clone());
+        Err(anyhow::anyhow!(message))
+    }
+
     /// 发起一次 CSD 变更后开启冷却窗口(串行化后续变更)。ticks 为保守估计的 PSoC 真实完成时长。
     fn _begin_csd_cooldown(&mut self, label: &str, ticks: u32) {
         self.csd_cooldown_ticks = ticks;
@@ -2892,9 +3385,39 @@ impl AppController {
         self.auto_tune_progress_version
     }
 
+    /// 单通道操作落在【已禁用】通道上时在源头拒绝。★为什么 host 侧也要拦★
+    /// 设备侧确实会回 NAK(sensor_link.cpp::disabled_ch_reject), 但那要走一次完整往返, 而这边的
+    /// op_busy/冷却窗已经按"命令发出去了"开始计时 —— 结果是白锁一两秒界面再报错。
+    /// 只拦"恰好一位"的单通道掩码: 全通道语义由固件逐通道跳过, 不该整条拒绝。
+    fn _reject_disabled_ch(&mut self, what: &str, ch: u8) -> bool {
+        if ch >= 36 || self.ch_enabled(ch) {
+            return false;
+        }
+        self.push_log_warn(format!(
+            "{}未执行: CH{} 已禁用(电极保持模拟高阻, 不参与扫描) — 请先在该通道的设置里启用它。",
+            what, ch
+        ));
+        true
+    }
+
+    /// 单通道掩码 → 通道号; 非单通道(空/多位)返回 0xFF(全通道语义)。
+    fn _single_ch_of(ch_mask: u64) -> u8 {
+        if ch_mask.count_ones() == 1 {
+            ch_mask.trailing_zeros() as u8
+        } else {
+            0xFF
+        }
+    }
+
     /// 触发校准(阻塞类: 固件实际完成后才回 ACK, 期间 op_busy=true)。
     pub fn calibrate(&mut self, ch_mask: u64) -> anyhow::Result<()> {
-        if self._reject_csd_if_locked("校准") {
+        if self._reject_disabled_ch("校准", Self::_single_ch_of(ch_mask)) {
+            return Ok(());
+        }
+        if self._reject_csd_if_batching("校准")
+            || self._reject_csd_if_sweeping("校准")
+            || self._reject_csd_if_locked("校准")
+        {
             return Ok(());
         }
         let seq = self.next_seq();
@@ -2903,15 +3426,30 @@ impl AppController {
             let frame = Frame::new(HostCmd::Calibrate as u8, 0, seq, payload);
             self._queue_tx(frame)?;
         }
-        self._begin_op("校准中", seq);
-        // ACK 仅表示"已受理", PSoC 实际重校准 36 通道约 1~1.5s, 故用冷却窗兜住真实完成, 串行化后续变更。
-        self._begin_csd_cooldown("校准", 120);
+        // ★冷却窗按目标范围给★ 单通道校准在 PSoC 侧只是一次 CalibrateWidget(约全通道的 1/36),
+        // 沿用全通道的 120 tick(~2s)会让 host 侧的逐通道串行队列白等 36×2s。
+        let one_ch = ch_mask.count_ones() == 1;
+        self._begin_op(
+            if one_ch {
+                "校准中(单通道)"
+            } else {
+                "校准中"
+            },
+            seq,
+        );
+        self._begin_csd_cooldown("校准", if one_ch { 25 } else { 120 });
         Ok(())
     }
 
     /// 触发基线复位(阻塞类)。
     pub fn baseline_reset(&mut self, ch_mask: u64) -> anyhow::Result<()> {
-        if self._reject_csd_if_locked("基线复位") {
+        if self._reject_disabled_ch("基线复位", Self::_single_ch_of(ch_mask)) {
+            return Ok(());
+        }
+        if self._reject_csd_if_batching("基线复位")
+            || self._reject_csd_if_sweeping("基线复位")
+            || self._reject_csd_if_locked("基线复位")
+        {
             return Ok(());
         }
         let seq = self.next_seq();
@@ -2920,8 +3458,16 @@ impl AppController {
             let frame = Frame::new(HostCmd::BaselineReset as u8, 0, seq, payload);
             self._queue_tx(frame)?;
         }
-        self._begin_op("基线复位中", seq);
-        self._begin_csd_cooldown("基线复位", 90);
+        let one_ch = ch_mask.count_ones() == 1;
+        self._begin_op(
+            if one_ch {
+                "基线复位中(单通道)"
+            } else {
+                "基线复位中"
+            },
+            seq,
+        );
+        self._begin_csd_cooldown("基线复位", if one_ch { 15 } else { 90 });
         Ok(())
     }
 
@@ -2931,12 +3477,6 @@ impl AppController {
     /// 推送流上报(5Hz), 故 UI 全程可见阶段而非干等。成功后 UI 应回读 snsClk 显示。
     /// pref 取 calib.pref(草稿优先) → 滑条一改即对下一次自适应生效, 无需先保存到设备。
     pub fn auto_tune(&mut self, ch: u8) -> anyhow::Result<()> {
-        if ch != 0xFF && (ch as usize) >= 36 {
-            return Err(anyhow::anyhow!("自适应通道越界: {}", ch));
-        }
-        if self._reject_csd_if_locked("频率自适应") {
-            return Ok(());
-        }
         // 容忍任意数值类型: 设备 schema 为 U8, 但缓存未就绪时 set_config_number 会按 U32 落草稿
         // (仅认 U8 会静默回落默认档, 表现为"滑条无效")。统一取数值再夹到 1..7。
         let pref = match self.config_get("calib.pref").map(|e| e.value) {
@@ -2952,6 +3492,26 @@ impl AppController {
         } else {
             4u8
         };
+        self.auto_tune_with_pref(ch, pref)
+    }
+
+    /// 指定偏好档的自适应。★为什么要这个入口★ host 侧的逐通道串行队列在开启"Cp 辅助"后, 每个
+    /// 通道的偏好档各不相同(由实测 Cp 推出), 而 `auto_tune` 只会取滑条上那一个统一值。
+    /// 两者共用同一份下发/进度/冷却逻辑, 不复制第二条自适应路径。
+    pub fn auto_tune_with_pref(&mut self, ch: u8, pref: u8) -> anyhow::Result<()> {
+        if ch != 0xFF && (ch as usize) >= 36 {
+            return Err(anyhow::anyhow!("自适应通道越界: {}", ch));
+        }
+        if self._reject_disabled_ch("频率自适应", ch) {
+            return Ok(());
+        }
+        if self._reject_csd_if_batching("频率自适应")
+            || self._reject_csd_if_sweeping("频率自适应")
+            || self._reject_csd_if_locked("频率自适应")
+        {
+            return Ok(());
+        }
+        let pref = pref.clamp(1, 7);
         let seq = self.next_seq();
         if self.io.is_some() {
             let frame = Frame::new(HostCmd::AutoTune as u8, 0, seq, vec![ch, pref]);
@@ -2960,8 +3520,11 @@ impl AppController {
         self.auto_tune_result = 0; // 进行中
         self.auto_tune_all_refresh_pending = None;
         self.auto_tune_ch = ch;
+        // 本轮请求的归属键: 设备把它逐帧回显在 0x2E 的 origin_seq 上, 迟到的上一轮终态据此丢弃。
+        self.auto_tune_req_seq = Some(seq);
         self.auto_tune_progress = crate::proto::AutoTuneProgress {
             ch,
+            origin_seq: Some(seq),
             ..Default::default()
         };
         self.auto_tune_progress_version = self.auto_tune_progress_version.wrapping_add(1);
@@ -2971,7 +3534,7 @@ impl AppController {
             self.auto_tune_ch_result = [0u8; 36];
         }
         let label = if (ch as usize) < 36 {
-            format!("CH{} 频率自适应中", ch)
+            format!("CH{} 频率自适应中(偏好 {})", ch, pref)
         } else {
             "逐通道频率自适应中".to_string()
         };
@@ -2980,7 +3543,9 @@ impl AppController {
         // 终态帧判定(带 result/final_div)。若让 ACK 解锁, UI 会在自适应刚开始时就误判完成。
         self.op_ack_is_accept = true;
         // 自适应逐档重校准可达数秒; 响应到达即解 op_busy, 但仍设冷却窗防止响应后立刻叠加保存/校准(日志正是此叠加致死)。
-        self._begin_csd_cooldown("频率自适应", 120);
+        // 单通道三步算法约 0.3-0.65s, 全通道(0xFF)十几到几十秒 ⇒ 冷却窗同样按范围分档,
+        // 否则 host 串行队列会在每个通道后白等 2s。
+        self._begin_csd_cooldown("频率自适应", if (ch as usize) < 36 { 60 } else { 120 });
         Ok(())
     }
 
@@ -3002,7 +3567,13 @@ impl AppController {
     }
 
     /// 触发 CSD 参数捕获(PSoC 当前自整定值 → RP2040 store)
+    /// ★扫描期间拒绝★: 此刻 PSoC 上的 gain/div 是扫描的临时值, 捕获等于把中间态提交成真相源。
     pub fn csd_capture(&mut self) -> anyhow::Result<()> {
+        if self._reject_csd_if_batching("捕获 CSD 参数")
+            || self._reject_csd_if_sweeping("捕获 CSD 参数")
+        {
+            return Ok(());
+        }
         let seq = self.next_seq();
         if self.io.is_some() {
             let frame = Frame::new(HostCmd::CsdCapture as u8, 0, seq, vec![]);
@@ -3090,6 +3661,11 @@ impl AppController {
                 self.push_log(format!(
                     "⚠ 阻塞操作超时: {} (seq={:?}) 超过 51s 未完成 → 设备可能卡在校准/重初始化(global_commit)。已自动解锁按钮。",
                     label, seq));
+                // 超时的那一条若属于逐通道批量, 归因为该通道失败(设备真值未知, 绝不算成功)。
+                if let Some(s) = seq {
+                    self._ch_batch_note_op(s, false, "超过 51s 未收到完成回执(设备实际状态未知)");
+                    self._sweep_note_op(s, false, "超过 51s 未收到完成回执(设备实际状态未知)");
+                }
                 self._end_op();
             }
         }
@@ -3113,6 +3689,10 @@ impl AppController {
         //  否则同一帧内推进两次会把 2s 无 ACK 的超时兜底压成 1s。)
         self._pump_algo_src_tx();
         self._pump_algo_src_rx();
+        // 逐通道批量操作队列与噪声频谱扫描: 并入既有 16ms tick, 不新增定时器、不提高轮询频率。
+        // 两者都以 `_csd_locked()` 为唯一"设备是否还在忙上一步"的判据, 不另设第二套忙闲状态。
+        self._pump_ch_batch();
+        self._pump_noise_sweep();
         // 全 36 通道参数重读队列: 每 tick 只发一条 PARAM_GET_ALL(0xFF) —— 不加快轮询, 也不挤爆端点。
         if let Some(param_id) = self.param_refetch_ids.pop() {
             if let Err(e) = self.request_param_all_channels(param_id) {
@@ -3199,6 +3779,12 @@ impl AppController {
     /// 单次触发 PSoC 完整重初始化, 使已写入影子的全局项真正生效(诊断/无头工具用)。
     /// GUI 侧走 `save_config` 的"批量 GLOBAL_SET + 一次 GLOBAL_COMMIT", 不直接调本方法。
     pub fn global_commit(&mut self) -> anyhow::Result<()> {
+        // 一次完整重初始化(全部 36 通道重解 IDAC + 基线复位) ⇒ 扫描期间拒绝。
+        if self._reject_csd_if_batching("提交全局 CSD 配置")
+            || self._reject_csd_if_sweeping("提交全局 CSD 配置")
+        {
+            return Ok(());
+        }
         let seq = self.next_seq();
         if self.io.is_some() {
             self._queue_tx(crate::proto::algo::encode_global_commit(seq))?;
@@ -4572,17 +5158,24 @@ impl AppController {
     }
     /// 某上报变量(idx 0..3)的 (设备时间us, 值) 序列: 供与遥测曲线共用真实时间轴的主图。
     pub fn algo_trace_report_points(&self, idx: u8) -> Vec<(u64, f32)> {
-        self.algo_trace_report
+        let report = match &self.plot_freeze {
+            Some(freeze) => &freeze.algo_report,
+            None => &self.algo_trace_report,
+        };
+        report
             .get(idx as usize)
             .map(|buf| buf.iter().map(|p| (p.t_us, p.val)).collect())
             .unwrap_or_default()
     }
     /// 触发判定(out_active)的 (设备时间us, 值) 序列, 同上。
     pub fn algo_trace_active_points(&self) -> Vec<(u64, f32)> {
-        self.algo_trace_active
-            .iter()
-            .map(|p| (p.t_us, p.val))
-            .collect()
+        match &self.plot_freeze {
+            Some(freeze) => &freeze.algo_active,
+            None => &self.algo_trace_active,
+        }
+        .iter()
+        .map(|p| (p.t_us, p.val))
+        .collect()
     }
     pub fn algo_trace_version(&self) -> u64 {
         self.algo_trace_version
@@ -5396,9 +5989,20 @@ impl AppController {
         }
     }
     /// 兼容旧固件的同步 AUTO_TUNE 响应(新固件走 0x2E 推送流的终态帧)。
+    /// ★这条路径的归属键是帧头 seq★ 响应帧回显请求 seq(与 ACK/NAK 同一约定), 故直接拿它归因,
+    /// 不必再去猜 `op_wait_seq`。
     fn _handle_auto_tune_response(&mut self, frame: &Frame) {
+        // 同步响应的帧头 seq 就是请求归属。先校验再解析 payload/修改状态，避免旧响应收割当前操作。
+        if self.auto_tune_req_seq != Some(frame.seq) {
+            self.push_log_debug(format!(
+                "已丢弃过期 AUTO_TUNE 响应: 帧 seq={}, 当前在途 {:?}",
+                frame.seq, self.auto_tune_req_seq
+            ));
+            return;
+        }
         // payload = [result(u8), div(u16 LE), ch(u8)](旧固件无尾部 ch → 视为全通道)。
         // result: 1=成功 2=失败(超硬件能力)。
+        let origin = Some(frame.seq);
         if frame.payload.len() >= 3 {
             let result = frame.payload[0];
             let div = (frame.payload[1] as u16) | ((frame.payload[2] as u16) << 8);
@@ -5407,9 +6011,9 @@ impl AppController {
             } else {
                 0xFF
             };
-            self._apply_auto_tune_result(result, div, ch);
+            self._apply_auto_tune_result(result, div, ch, origin);
         } else {
-            self._apply_auto_tune_result(2, 0, self.auto_tune_ch);
+            self._apply_auto_tune_result(2, 0, self.auto_tune_ch, origin);
         }
     }
 
@@ -5424,13 +6028,31 @@ impl AppController {
                 return;
             }
         };
+        // ★先判归属, 再动任何状态★ 本流是设备主动推送(帧头 seq 是设备流序号, 与请求无关), 所以
+        // "这一帧属于哪次请求"只能靠设备回显的 origin_seq。对不上 = 上一轮的残留帧:
+        // 既不能刷进度/重置卡死计时(会让别的操作看起来还活着), 更不能落终态(旧结果会被算到
+        // 下一个批量通道头上)。旧固件不带该字段(None) ⇒ 保持原行为, 不因兼容性丢帧。
+        if let Some(origin) = progress.origin_seq {
+            if self.auto_tune_req_seq != Some(origin) {
+                self.push_log_debug(format!(
+                    "已丢弃过期 AUTO_TUNE_PROGRESS: 帧归属请求 seq={}, 当前在途 {:?}(state={} result={})",
+                    origin, self.auto_tune_req_seq, progress.state, progress.result
+                ));
+                return;
+            }
+        }
         self.auto_tune_progress = progress;
         self.auto_tune_progress_version = self.auto_tune_progress_version.wrapping_add(1);
         // ★避免意外情况★: 收到任意进度帧就重置阻塞操作计时, 使 28s 卡死检测只在设备真的失联时才触发。
         self.op_busy_ticks = 0;
 
         if progress.state == 2 {
-            self._apply_auto_tune_result(progress.result, progress.final_div, progress.ch);
+            self._apply_auto_tune_result(
+                progress.result,
+                progress.final_div,
+                progress.ch,
+                progress.origin_seq,
+            );
             return;
         }
         // 进行中: 把阶段/步序/当前试探分频写进 op_label, UI 的 ⏳ 按钮文案随之实时更新。
@@ -5461,7 +6083,13 @@ impl AppController {
     }
 
     /// 自适应完成处理(同步响应与推送流终态共用): 落结果 + 逐通道数组 + params 乐观更新 + 日志 + 解锁。
-    fn _apply_auto_tune_result(&mut self, result: u8, div: u16, ch: u8) {
+    ///
+    /// `origin_seq` = 发起本轮自适应的请求 seq(推送流由设备回显, 同步响应取帧头)。逐通道批量的
+    /// 成败归因**只认它**; 旧固件拿不到时才回落到 `op_wait_seq`(那是"当前在等哪条回执", 在批量里
+    /// 会指向下一个通道 —— 正是本轮要修的错归属)。
+    fn _apply_auto_tune_result(&mut self, result: u8, div: u16, ch: u8, origin_seq: Option<u8>) {
+        // 本轮已出终态: 清掉在途归属键, 之后设备重发的同一终态(背压重试/旧帧)一律按过期丢弃。
+        self.auto_tune_req_seq = None;
         self.auto_tune_result = result;
         self.auto_tune_div = div;
         self.auto_tune_ch = ch;
@@ -5510,7 +6138,22 @@ impl AppController {
                 self.push_log("频率自适应失败: 超出硬件能力, 目标% 无法达到".to_string());
             }
         }
-        self._end_op();
+        // 自适应的真实终态在这里才知道(ACK 只是"已受理")。若这一条是逐通道批量发出的, 按**本轮请求
+        // 的 seq** 归因(设备回显); 旧固件没有回显时才退回 `op_wait_seq`。`_ch_batch_note_op` 内部还会
+        // 与批量的在途 seq 比对, 两不匹配一律不归因。
+        if let Some(seq) = origin_seq.or(self.op_wait_seq) {
+            let ok = result == 1 && div != 0;
+            self._ch_batch_note_op(seq, ok, "频率自适应终态失败(超出硬件能力, 目标% 无法达到)");
+        }
+        // 解锁同样要认归属: 本轮若早被 51s 看门狗提前解锁、界面已在等另一条操作, 迟到的终态不能把
+        // 别人的锁一起解掉(旧固件无回显时保持原行为)。
+        let owns_op = match origin_seq {
+            Some(seq) => self.op_wait_seq == Some(seq),
+            None => true,
+        };
+        if owns_op {
+            self._end_op();
+        }
     }
 
     fn _handle_global_get_all_response(&mut self, frame: &Frame) {
@@ -5703,12 +6346,16 @@ impl AppController {
         self.algo_rom_version = self.algo_rom_version.wrapping_add(1);
     }
 
-    /// 获取单个通道的最新样本
+    /// 获取单个通道的最新样本。
+    /// ★绘图视窗冻结时读快照★ 否则读数会继续跳而曲线不动, 同一屏上出现两个互相矛盾的"现在"。
+    /// 设备侧统计(采样率/延迟/停滞判定)不走这里, 仍然是实时的。
     pub fn telem_latest(&self, ch: u8) -> Option<ChannelSample> {
-        if (ch as usize) < 36 {
-            self.telem_buf[ch as usize].back().cloned()
-        } else {
-            None
+        if (ch as usize) >= 36 {
+            return None;
+        }
+        match &self.plot_freeze {
+            Some(f) => f.buf[ch as usize].back().cloned(),
+            None => self.telem_buf[ch as usize].back().cloned(),
         }
     }
 
@@ -5720,8 +6367,13 @@ impl AppController {
     const RAILED_RAW: u16 = 4090;
 
     /// 某通道数据是否停滞(疑似中断/异常, 非真实读数)。供 UI 明确标记, 杜绝"是真值还是卡住"的忙猜。
+    /// ★禁用通道永远不算停滞★ 它的读数按设计恒为 0(设备侧不再扫描它), "长时间不变"正是预期行为;
+    /// 判成停滞会让每个被关掉的通道都挂上"⚠停滞"红字, 把真正的异常淹掉。
     pub fn channel_frozen(&self, ch: u8) -> bool {
-        (ch as usize) < 36 && self.telem_freeze_count[ch as usize] >= Self::FREEZE_FRAMES
+        (ch as usize) < 36
+            && self.ch_enabled(ch)
+            && (self.telem_freeze_count[ch as usize] >= Self::FREEZE_FRAMES
+                || self.channel_stale(ch))
     }
 
     /// 某通道连续不变帧数(供诊断/调试展示)。
@@ -5734,10 +6386,16 @@ impl AppController {
     }
 
     /// 全局数据是否整体停滞: 遥测在流但全部 36 通道都冻结 → 链路中断/设备扫描卡死(而非个别通道)。
+    /// ★只看启用通道★ 否则"关掉大部分通道"这件事会让判据更容易成立(禁用通道恒不变),
+    /// 把正常运行误报成"扫描已卡死"。全部通道都被关掉时也不成立(无启用通道 ⇒ all() 为真, 故显式排除)。
     pub fn data_all_frozen(&self) -> bool {
+        let enabled: Vec<usize> = (0..36).filter(|ch| self.ch_enabled(*ch as u8)).collect();
         self.telem_active
             && self.telem_frame_count > 0
-            && (0..36).all(|ch| self.telem_freeze_count[ch] >= Self::FREEZE_FRAMES)
+            && !enabled.is_empty()
+            && enabled
+                .iter()
+                .all(|ch| self.telem_freeze_count[*ch] >= Self::FREEZE_FRAMES)
     }
 
     /// 某通道某字段的 (设备时间us, 值) 序列: 横轴用真实时间而非样本序号。
@@ -5750,15 +6408,20 @@ impl AppController {
         if (ch as usize) >= 36 {
             return Vec::new();
         }
-        let buf = &self.telem_buf[ch as usize];
-        let (Some(prev_raw), Some(back)) = (self.telem_clock.prev_raw, buf.back()) else {
+        // ★冻结时整条时间轴取快照★ 缓冲与时钟锚点必须成对取, 只冻一个会让 x 坐标算错。
+        let (buf, clock_prev_raw, clock_acc_us) = match &self.plot_freeze {
+            Some(f) => (&f.buf[ch as usize], f.prev_raw, f.acc_us),
+            None => (
+                &self.telem_buf[ch as usize],
+                self.telem_clock.prev_raw,
+                self.telem_clock.acc_us,
+            ),
+        };
+        let (Some(prev_raw), Some(back)) = (clock_prev_raw, buf.back()) else {
             return Vec::new();
         };
         // 该通道最新样本的展开时间 = 当前帧时间 - (当前帧 ts - 该样本 ts)。
-        let mut abs = self
-            .telem_clock
-            .acc_us
-            .saturating_sub(prev_raw.wrapping_sub(back.t_us) as u64);
+        let mut abs = clock_acc_us.saturating_sub(prev_raw.wrapping_sub(back.t_us) as u64);
         let mut newer_raw = back.t_us;
         let mut out: Vec<(u64, f32)> = Vec::with_capacity(buf.len());
         for sample in buf.iter().rev() {
@@ -5779,13 +6442,22 @@ impl AppController {
     }
 
     /// 展开后的设备时间(us): 供"最新样本绝对时刻"这类只读展示。
+    /// 冻结时返回快照时刻 —— 与 `telem_points` 同一时间基, 否则轴上的绝对时刻会继续走。
     pub fn telem_dev_time_us(&self) -> u64 {
-        self.telem_clock.acc_us
+        match &self.plot_freeze {
+            Some(f) => f.acc_us,
+            None => self.telem_clock.acc_us,
+        }
     }
 
-    /// 获取遥测版本号
+    /// 获取实时遥测版本号(全通道状态卡等实时视图使用)。
     pub fn telem_version(&self) -> u64 {
         self.telem_version
+    }
+
+    /// 获取主图版本号。冻结期间不变，解冻后跳到最新遥测缓冲。
+    pub fn plot_version(&self) -> u64 {
+        self.plot_version
     }
 
     /// 获取最近一次遥测帧解出的采样率(Hz)
@@ -5809,7 +6481,12 @@ impl AppController {
     /// 0 不是任何设备能给出的合法周期, 故以 >0 作为"有值"的判据; 与 led_rx_frames_valid() 等
     /// 既有 *_valid 访问器同一约定, 界面无值时显示"未测"而不是 0。
     pub fn telem_scan_period_valid(&self) -> bool {
+        // ★还要求"最近确实收到过带 STATS 的帧"★: 只看数值 >0 会让停流后长期显示上一次的过期值,
+        // 用户无从分辨"这是刚测的"还是"这是十分钟前的"。超过 STATS_FRESH 即判为无值(显示"未测")。
         self.telem_scan_period_us > 0
+            && self
+                .telem_stats_at
+                .is_some_and(|t| t.elapsed() < Self::TELEM_STATS_FRESH)
     }
 
     pub fn telem_lat_spi_us(&self) -> u16 {
@@ -5851,6 +6528,120 @@ impl AppController {
         merged.into_iter().collect()
     }
 
+    // ------------------------------------------------------------------
+    // 通道启用开关(PARAM_ENABLED=0x0C) —— 硬件级开关, 不是界面隐藏
+    // ------------------------------------------------------------------
+
+    /// 该通道当前是否启用(草稿优先, 即"用户看到的那个状态")。
+    /// ★真值缺失时按启用处理★: 刚连上、0x0C 还没回读到时若默认成"已禁用", 整块面板会先灰一片,
+    /// 用户会以为设备坏了; 而设备侧的默认本来就是全启用(见 CsdConfig::_reset_params)。
+    pub fn ch_enabled(&self, ch: u8) -> bool {
+        self.param(ch, crate::proto::PARAM_ENABLED)
+            .map_or(true, |v| v != 0)
+    }
+
+    /// 启用通道位图(bit ch = 1 启用)。遥测掩码 / 批量队列 / 全通道操作按它筛选,
+    /// 使"对禁用通道做无意义重操作"这件事只需在一处排除。
+    pub fn enabled_ch_mask(&self) -> u64 {
+        let mut mask = 0u64;
+        for ch in 0..36u8 {
+            if self.ch_enabled(ch) {
+                mask |= 1u64 << ch;
+            }
+        }
+        mask
+    }
+
+    /// 全通道页的展示次序 + 筛选结果(唯一真相源在这里, .slint 不自己排)。
+    ///
+    /// `mode`: 0 = 逻辑通道顺序, 1 = 物理通道顺序(PSoC channel index 升序)。
+    /// 逻辑顺序★复用现有绑定映射★(`binding_channel_of`): 按分区号 0..33 走一遍, 每个通道在它
+    /// 第一次被绑定到的分区处出场; 一个通道也没绑到的排在末尾并按物理号升序 —— 因此次序与绑定页
+    /// 永远一致, 不存在第二份"分区→通道"表。
+    ///
+    /// `show_disabled=false` 时禁用通道被筛掉。返回 `(展示次序, 被筛掉的通道数)`。
+    pub fn channel_display_order(&self, mode: i32, show_disabled: bool) -> (Vec<u8>, u32) {
+        let mut order: Vec<u8> = Vec::with_capacity(36);
+        if mode == 1 {
+            order.extend(0..36u8);
+        } else {
+            let mut seen = [false; 36];
+            // 34 = 触控分区数(与 bind_start 的越界判定、KBD_HOLD_ZONE_COUNT 同一口径)。
+            for zone in 0..KBD_HOLD_ZONE_COUNT {
+                let ch = self.binding_channel_of(zone);
+                if (ch as usize) < 36 && !seen[ch as usize] {
+                    seen[ch as usize] = true;
+                    order.push(ch);
+                }
+            }
+            order.extend((0..36u8).filter(|ch| !seen[*ch as usize]));
+        }
+        if !show_disabled {
+            order.retain(|ch| self.ch_enabled(*ch));
+        }
+        (order.clone(), 36u32 - order.len() as u32)
+    }
+
+    /// 启用/禁用某通道。★走既有草稿路径★(与手工改参数同一条路), 由"保存到设备"统一下发 ——
+    /// 不新增协议、不新增立即写路径, 界面按草稿值立刻灰显, 设备在保存时才真正关电极。
+    pub fn set_ch_enabled(&mut self, ch: u8, on: bool) -> anyhow::Result<()> {
+        if ch >= 36 {
+            return Ok(());
+        }
+        let was = self.ch_enabled(ch);
+        self.set_param(ch, crate::proto::PARAM_ENABLED, if on { 1 } else { 0 })?;
+        if was != on {
+            self.push_log(format!(
+                "CH{} 已{}(草稿): {}。需点「保存到设备」后设备才真正{}。",
+                ch,
+                if on { "启用" } else { "禁用" },
+                if on {
+                    "重新参与扫描, 固件会只为该通道重做校准与基线"
+                } else {
+                    "退出扫描序列, 电极保持模拟高阻; 该通道不再上报数据也不会触发"
+                },
+                if on { "启用" } else { "关闭" }
+            ));
+        }
+        self._bump_view_versions();
+        Ok(())
+    }
+
+    /// 对当前已勾选的目标通道整批启用/禁用。★复用同一 PARAM_ENABLED, 不造新协议★:
+    /// 与逐通道开关走完全相同的草稿路径, 因此"保存到设备"的下发/对账/持久化全部沿用既有实现。
+    pub fn batch_set_enabled(&mut self, on: bool) -> anyhow::Result<()> {
+        let targets: Vec<u8> = (0..36u8)
+            .filter(|ch| self.batch_sel.ch_selected(*ch))
+            .collect();
+        if targets.is_empty() {
+            self.push_log_warn(
+                "批量启用/禁用未执行: 尚未勾选任何目标通道(在网格里单击卡片即为勾选)。".to_string(),
+            );
+            return Ok(());
+        }
+        let mut changed = 0usize;
+        for ch in &targets {
+            if self.ch_enabled(*ch) == on {
+                continue;
+            }
+            if self
+                .set_param(*ch, crate::proto::PARAM_ENABLED, if on { 1 } else { 0 })
+                .is_ok()
+            {
+                changed += 1;
+            }
+        }
+        self._bump_view_versions();
+        self.push_log(format!(
+            "批量{}: 已选 {} 个通道, 其中 {} 个状态发生变化(其余本来就是该状态, 不产生草稿)。\
+             需点「保存到设备」才下发。",
+            if on { "启用" } else { "禁用" },
+            targets.len(),
+            changed
+        ));
+        Ok(())
+    }
+
     /// 获取某通道的单个参数, 草稿优先。
     pub fn param(&self, ch: u8, param_id: u8) -> Option<u32> {
         if (ch as usize) >= 36 {
@@ -5887,6 +6678,9 @@ impl AppController {
     /// 最新遥测里 raw 达到满量程(railed)的通道数: IDAC 校准发散的直接证据。
     pub fn railed_channel_count(&self) -> u32 {
         (0..36u8)
+            // 禁用通道的 raw 恒为 0, 本来不会被判 railed; 显式排除是为了让"禁用通道不参与任何
+            // 采样健康判定"这条约束在一处看得见, 而不是靠"恰好 0 < 4090"这个巧合成立。
+            .filter(|ch| self.ch_enabled(*ch))
             .filter(|ch| {
                 self.telem_latest(*ch)
                     .and_then(|s| s.raw)
@@ -5897,9 +6691,7 @@ impl AppController {
 
     /// raw 长时间完全不变的通道数(扫描/测量停滞)。
     pub fn frozen_channel_count(&self) -> u32 {
-        (0..36usize)
-            .filter(|ch| self.telem_freeze_count[*ch] >= Self::FREEZE_FRAMES)
-            .count() as u32
+        (0..36u8).filter(|ch| self.channel_frozen(*ch)).count() as u32
     }
 
     /// 是否处于"异常采样"(有 railed 通道 / 全通道数据停滞 / 设备拒绝固化基线)。
@@ -5921,6 +6713,14 @@ impl AppController {
     pub fn sampling_advice(&self) -> String {
         let railed = self.railed_channel_count();
         let frozen = self.frozen_channel_count();
+        let stale = self._stale_telem_channels();
+        if !stale.is_empty() {
+            let names: Vec<String> = stale.iter().map(|ch| format!("CH{}", ch)).collect();
+            return format!(
+                "⚠ 逐通道遥测缺失({})，这些通道的旧值已标为 stale；已先重发当前 TELEM_START，持续缺失会触发非破坏链路恢复。",
+                names.join(" ")
+            );
+        }
         if self.baseline_untrusted() {
             return "⚠ 恢复默认未获得可信基线(设备抽检到 raw 满量程/数据停滞, 已拒绝把异常状态存为默认) \
                     → 建议: 直接用「PSoC 救砖(重刷并重新应用)」".to_string();
@@ -5956,7 +6756,11 @@ impl AppController {
 
     /// 采样警示等级: 0=正常 1=警告 2=异常。供 UI 着色。
     pub fn sampling_advice_level(&self) -> i32 {
-        if self.baseline_untrusted() || self.data_all_frozen() || self.railed_channel_count() > 0 {
+        if self.baseline_untrusted()
+            || self.data_all_frozen()
+            || self.railed_channel_count() > 0
+            || !self._stale_telem_channels().is_empty()
+        {
             return 2;
         }
         if self.frozen_channel_count() > 0 || self.telem_frame_count == 0 {
@@ -5995,8 +6799,16 @@ impl AppController {
                 self.telem_last_ts = telem_frame.ts_us;
                 self.telem_clock.feed(telem_frame.ts_us);
                 self.telem_frame_at = Some(std::time::Instant::now());
-                self.telem_samples_per_sec = telem_frame.samples_per_sec;
-                self.telem_scan_period_us = telem_frame.scan_period_us;
+                // ★只有真的带 STATS 的帧才更新采样率/探测周期★
+                // 逐通道档下 36 通道 × 4 字段远超 64B vendor FIFO, 固件按帧切分, **只有首帧带 STATS**;
+                // 其余帧解码出的 samples_per_sec/scan_period_us 恒为 0。原先无条件赋值 ⇒ 后续帧立刻把
+                // 刚取到的真值冲成 0 ⇒ `telem_scan_period_valid()` 恒假 ⇒ 全局调整页"始终未测"
+                // (而主页轻档一帧一条、每帧都带 STATS, 所以主页看着正常 —— 这个不对称正是线索)。
+                if (telem_frame.fields & crate::proto::FIELD_STATS) != 0 {
+                    self.telem_samples_per_sec = telem_frame.samples_per_sec;
+                    self.telem_scan_period_us = telem_frame.scan_period_us;
+                    self.telem_stats_at = Some(std::time::Instant::now());
+                }
                 // ★PSoC 链路活性的最强证据★: samples_per_sec 是固件按 PSoC scan_count 增量折算的
                 // (psoc.cpp), >0 就等于"快照代数正在推进" —— 比只在握手那一瞬取一次的
                 // DEVICE_INFO.psoc_link_valid 可信得多, 且随遥测帧率(20~100Hz)持续刷新。
@@ -6024,6 +6836,10 @@ impl AppController {
                 for sample in telem_frame.samples {
                     let ch_idx = sample.ch as usize;
                     if ch_idx < 36 {
+                        // 每通道 freshness 独立于 STATS：某 CH 缺失时其旧样本立即可判 stale，
+                        // 而不是被同一帧其余 CH 的正常统计掩盖。
+                        self.telem_channel_last_seen[ch_idx] = Some(std::time::Instant::now());
+                        self.telem_channel_heal_attempts[ch_idx] = 0;
                         // 数据存活检测: 逐帧比较 raw。完全相同 → 冻结计数+1; 变化 → 清零。
                         // (只在带 RAW 字段的帧上判定; 不带 RAW 的帧跳过, 不误清计数。)
                         if let Some(raw) = sample.raw {
@@ -6035,17 +6851,31 @@ impl AppController {
                                 self.telem_last_raw[ch_idx] = Some(raw);
                             }
                         }
-                        // 如果超过容量,弹出最早的样本
-                        const TELEM_CAP: usize = 1024;
-                        if self.telem_buf[ch_idx].len() >= TELEM_CAP {
-                            self.telem_buf[ch_idx].pop_front();
+                        // ★保留时长优先于保留条数★ 主图横轴是固定 30s 窗口, 按"条数"保留会让
+                        // 实际保留时长随采样率浮动(171Hz 时 1024 条只有 ~6s ⇒ 窗口左侧 4/5 是空的)。
+                        // 条数上限只作为内存兜底(采样率异常高时不至于无限涨)。
+                        // 时间戳是协议原值(u32 us, 约 71 分钟回绕): 用 wrapping_sub 算"已过去多久",
+                        // 保留时长远小于回绕周期 ⇒ 回绕当帧也不会把整个缓冲误判为过期。
+                        let sample_t = sample.t_us;
+                        let buffer = &mut self.telem_buf[ch_idx];
+                        while buffer
+                            .front()
+                            .is_some_and(|old| sample_t.wrapping_sub(old.t_us) > TELEM_RETAIN_US)
+                        {
+                            buffer.pop_front();
                         }
-                        self.telem_buf[ch_idx].push_back(sample);
+                        if buffer.len() >= TELEM_CAP {
+                            buffer.pop_front();
+                        }
+                        buffer.push_back(sample);
                     }
                 }
 
-                // 版本号自增
-                self.telem_version += 1;
+                // 实时卡片始终跟随每帧; 主图只在未冻结时推进，冻结快照不触发 SVG/path 重算。
+                self.telem_version = self.telem_version.wrapping_add(1);
+                if self.plot_freeze.is_none() {
+                    self.plot_version = self.plot_version.wrapping_add(1);
+                }
                 self.telem_frame_count += 1;
                 // Wire framing is SOF(2)+header(5)+CRC(2); payload length is the only variable part.
                 self.telem_wire_bytes = self
@@ -6309,6 +7139,11 @@ impl AppController {
         self.bind_progress
     }
 
+    /// 当前全通道激活掩码(status bit0)，供实时绑定区仅在触摸态变化时重建模型。
+    pub fn active_ch_mask(&self) -> u64 {
+        self._active_mask()
+    }
+
     /// 当前全通道激活掩码(status bit0), bit N = 通道 N 处于触摸态。
     fn _active_mask(&self) -> u64 {
         let mut mask = 0u64;
@@ -6467,6 +7302,10 @@ impl AppController {
                     self.op_label, frame.seq
                 ));
             } else {
+                // 这类操作的 ACK = 固件真正做完 ⇒ 若它是逐通道批量发出的那一条, 这里才算它成功。
+                self._ch_batch_note_op(frame.seq, true, "");
+                // 频谱扫描的还原链(校准/基线)同样只认这一条终态回执, 不认"已排队"。
+                self._sweep_note_op(frame.seq, true, "");
                 self._end_op();
             }
         }
@@ -6693,8 +7532,21 @@ impl AppController {
             self.algo_upload_version = self.algo_upload_version.wrapping_add(1);
         }
         // 阻塞类操作失败回执也要解除 op_busy, 否则 UI 永久卡在运行中。
+        // 逐通道批量发出的那一条被 NAK ⇒ 按 seq 归因给该通道, 不让它在完成文案里冒充成功。
         if self.op_wait_seq == Some(frame.seq) {
+            let reason = format!(
+                "设备拒绝(NAK): {}",
+                self.last_error.as_deref().unwrap_or("未知错误")
+            );
+            self._ch_batch_note_op(frame.seq, false, &reason);
+            // 还原链上的校准/基线被 NAK ⇒ 恢复未确认, 不允许在完成文案里冒充"已还原"。
+            self._sweep_note_op(frame.seq, false, &reason);
             self._end_op();
+        }
+        // 自适应请求本身被拒(如固件 heavy_gate 拦下) ⇒ 这一轮压根没开始, 清掉在途归属键:
+        // 否则它会一直"占着"这个 seq, 让后续任何带同 seq 的旧帧看起来仍是本轮的。
+        if self.auto_tune_req_seq == Some(frame.seq) {
+            self.auto_tune_req_seq = None;
         }
         // 追踪请求被 NAK(设备无算法/该 idx 不可读): 退避 ~3s(约 180 次 16ms 轮询),
         // 避免每 tick 一次 NAK 刷屏; 成功响应会清零退避恢复正常轮询。
@@ -6830,10 +7682,7 @@ impl AppController {
 
     /// 链路是否联通(由活性证据判定, 不看那个只在握手时刷新的布尔位)。
     pub fn psoc_link_alive(&self) -> bool {
-        !matches!(
-            self.psoc_link_evidence(),
-            PsocLinkEvidence::Stale { .. }
-        )
+        !matches!(self.psoc_link_evidence(), PsocLinkEvidence::Stale { .. })
     }
 
     /// 判定依据的一行说明。所有展示链路状态的地方共用, 保证文案与判定同源。
@@ -6845,10 +7694,9 @@ impl AppController {
             PsocLinkEvidence::Handshake { generation } => {
                 format!("停流中, 由 DEVICE_INFO 探测确认 · 第 {} 代", generation)
             }
-            PsocLinkEvidence::Stale {
-                since_ms: None,
-                ..
-            } => "本次连接从未取得代数推进证据".to_string(),
+            PsocLinkEvidence::Stale { since_ms: None, .. } => {
+                "本次连接从未取得代数推进证据".to_string()
+            }
             PsocLinkEvidence::Stale {
                 since_ms: Some(ms),
                 last_generation,
@@ -6898,8 +7746,7 @@ impl AppController {
         }
         // snapshot_valid 同样只在握手那一帧回读: 已经有"代数在推进"的实时证据时它必然过期,
         // 不能再据它报警(否则握手时刚好在校准就永久显示"快照无效")。
-        if !info.psoc_snapshot_valid
-            && !matches!(evidence, PsocLinkEvidence::ScanAdvancing { .. })
+        if !info.psoc_snapshot_valid && !matches!(evidence, PsocLinkEvidence::ScanAdvancing { .. })
         {
             return "▲ 快照无效 — PSoC 未产出有效扫描数据(可能刚复位/正在校准)".to_string();
         }
@@ -6946,8 +7793,7 @@ impl AppController {
         if let PsocLinkEvidence::Stale { .. } = evidence {
             return 2;
         }
-        if !info.psoc_snapshot_valid
-            && !matches!(evidence, PsocLinkEvidence::ScanAdvancing { .. })
+        if !info.psoc_snapshot_valid && !matches!(evidence, PsocLinkEvidence::ScanAdvancing { .. })
         {
             return 1;
         }
@@ -7493,13 +8339,23 @@ mod tests {
         assert!(ctrl.set_binding(34, 0).is_err());
     }
 
+    /// BIND_EVENT(0x45) 的 payload 是 `[zone, channel, status]`(与固件
+    /// `BindingService::_emit_bind_event(zone, channel, 1)` 同源), 且它是**终态**通知:
+    /// 只清等待态、绝不设置等待态(等待态由 bind_start 建立)。
+    /// ★这条锁住的是"谁定义 payload 布局"★ 旧断言按 `[zone, status]` 两字节写、还指望事件把进度
+    /// 设起来 —— 那是协议改成三字节前的语义, 留着只会让人以为固件少发了一个字节。
     #[test]
-    fn test_handle_bind_event_sets_progress() {
+    fn test_handle_bind_event_writes_map_and_never_sets_progress() {
         let mut ctrl = AppController::new();
         assert_eq!(ctrl.bind_progress(), None);
-        let frame = Frame::new(HostCmd::BindEvent as u8, 0, 0, vec![7, 1]);
-        ctrl.handle_frame(frame);
-        assert_eq!(ctrl.bind_progress(), Some((7, 1)));
+        // 短包必须被丢弃, 不能按两字节布局误读成 zone=7/status=1。
+        ctrl.handle_frame(Frame::new(HostCmd::BindEvent as u8, 0, 0, vec![7, 1]));
+        assert_eq!(ctrl.bind_progress(), None);
+        assert_eq!(ctrl.get_binding(7), 0xFFFF_FFFF, "短包不许落盘");
+        // 完整包: 区 7 绑到 CH11, 缓存被同步, 等待态仍为 None。
+        ctrl.handle_frame(Frame::new(HostCmd::BindEvent as u8, 0, 0, vec![7, 11, 1]));
+        assert_eq!(ctrl.get_binding(7), 11);
+        assert_eq!(ctrl.bind_progress(), None);
     }
 
     #[test]

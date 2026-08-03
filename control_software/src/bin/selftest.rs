@@ -1,4 +1,4 @@
-//! mai2control 无头自测程序
+﻿//! mai2control 无头自测程序
 //!
 //! 行为流程:
 //! 1. 初始化日志
@@ -35,728 +35,815 @@ const LED_STATE_TIMEOUT_MS: u64 = 1_000;
 const LED_APPLY_TIMEOUT_MS: u64 = 1_000;
 const LED_PREVIEW_FALLBACK_MS: u64 = 3_300;
 
-fn _print_vcam_probe_hr<T>(step: &str, result: &windows::core::Result<T>) -> bool {
-    match result {
-        Ok(_) => {
-            println!("[VCAM] {}: 0x00000000", step);
-            true
-        }
-        Err(error) => {
-            println!("[VCAM] {}: 0x{:08X}", step, error.code().0 as u32);
-            false
-        }
+// ─────────────────────────────────────────────────────────────────────────────
+// --vcam-probe 的过滤器侧覆盖: MSBuild 产物的 PE 校验 + x64 DLL 的真实 COM 构造路径。
+//
+// 存在理由: 共享队列那半边(Rust 生产者 ↔ Rust 读端)本来就能自验, 但"过滤器 DLL 到底能不能被
+// 当成 COM 服务器加载起来"此前完全没有覆盖 —— 只打印了一句注册状态。于是 DllGetClassObject /
+// 类工厂 / IBaseFilter 状态机这条路只能靠"装上摄像头, 打开某个游戏看画面"来验, 一旦回归就只有
+// 用户能发现。这里直接 LoadLibrary 构建产物并走完整 COM 路径, **不写 HKLM、不需要管理员**。
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// MSBuild 产物的相对路径(与 build.rs 内嵌来源同源, 改一处必须同步另一处)。
+const VCAM_DLL_X64: &str = "vcam_source_cpp/x64/Release/mai2vcam_dshow.dll";
+const VCAM_DLL_X86: &str = "vcam_source_cpp/Win32/Release/mai2vcam_dshow.dll";
+/// 与 mai2vcam_dshow.def 的 EXPORTS 一一对应。
+const VCAM_EXPORTS: [&str; 4] = [
+    "DllGetClassObject",
+    "DllCanUnloadNow",
+    "DllRegisterServer",
+    "DllUnregisterServer",
+];
+const PE_MACHINE_AMD64: u16 = 0x8664;
+const PE_MACHINE_I386: u16 = 0x014C;
+/// 过滤器 CLSID(与 vcam_common.cpp 的 DEFINE_GUID 及 vcam/backend.rs 的常量一致)。
+const VCAM_CLSID: windows::core::GUID =
+    windows::core::GUID::from_u128(0x6E5A1C74_2F83_4C9B_9D1E_7A4B0F3C58E2);
+/// quartz.dll 内置 FilterGraph 与 NullRenderer；windows 0.62 的生成绑定未暴露这两个 CLSID 常量。
+const VCAM_FILTER_GRAPH_CLSID: windows::core::GUID =
+    windows::core::GUID::from_u128(0xE436EBB3_524F_11CE_9F53_0020AF0BA770);
+const VCAM_NULL_RENDERER_CLSID: windows::core::GUID =
+    windows::core::GUID::from_u128(0xC1F400A4_3F08_11D3_9F0B_006008039E37);
+/// 与 `vcam_common.h::MAI2VCAM_FRIENDLY_NAME` / `vcam/backend.rs::INSTANCE_NAME` 一致。
+const MAI2VCAM_FRIENDLY_NAME_STR: &str = "mai2control Virtual Camera";
+
+/// 在"当前目录"与"selftest.exe 的各级父目录"下找构建产物。
+/// selftest.exe 通常在 `control_software/target/debug/`, 因此 `control_software/` 就在其祖先里。
+fn _locate_build_output(relative: &str) -> Option<std::path::PathBuf> {
+    let mut roots: Vec<std::path::PathBuf> = Vec::new();
+    if let Ok(dir) = std::env::current_dir() {
+        roots.push(dir);
     }
+    if let Ok(exe) = std::env::current_exe() {
+        roots.extend(exe.ancestors().map(|path| path.to_path_buf()));
+    }
+    roots
+        .into_iter()
+        .map(|root| root.join(relative))
+        .find(|candidate| candidate.is_file())
 }
 
-/// 无论 Start 是否成功都回收会话相机，避免探测留下系统可见但不可用的残留项。
-fn _cleanup_vcam_probe_camera(
-    access_name: &str,
-    camera: &windows::Win32::Media::MediaFoundation::IMFVirtualCamera,
-) {
-    _print_vcam_probe_hr(
-        &format!("IMFVirtualCamera::Stop({})", access_name),
-        &unsafe { camera.Stop() },
-    );
-    _print_vcam_probe_hr(
-        &format!("IMFVirtualCamera::Remove({})", access_name),
-        &unsafe { camera.Remove() },
-    );
-    _print_vcam_probe_hr(
-        &format!("IMFVirtualCamera::Shutdown({})", access_name),
-        &unsafe { camera.Shutdown() },
-    );
+/// 自解析 PE 导出表, 返回 (machine, 导出名列表)。
+///
+/// 为什么自己解析而不调 dumpbin: 自测不能依赖机器上装了 VS 工具链, 而"这份 DLL 是不是目标位宽、
+/// 有没有那四个导出"恰恰是 x86 产物唯一能在 x64 进程里验的东西(x86 DLL 不可能被 x64 进程加载)。
+fn _pe_exports(path: &std::path::Path) -> Result<(u16, Vec<String>), String> {
+    let bytes =
+        std::fs::read(path).map_err(|error| format!("读取 {} 失败: {}", path.display(), error))?;
+    let u16_at = |offset: usize| -> Result<u16, String> {
+        bytes
+            .get(offset..offset + 2)
+            .map(|slice| u16::from_le_bytes([slice[0], slice[1]]))
+            .ok_or_else(|| format!("偏移 0x{:X} 越界(文件 {}B)", offset, bytes.len()))
+    };
+    let u32_at = |offset: usize| -> Result<u32, String> {
+        bytes
+            .get(offset..offset + 4)
+            .map(|slice| u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]))
+            .ok_or_else(|| format!("偏移 0x{:X} 越界(文件 {}B)", offset, bytes.len()))
+    };
+    if u16_at(0)? != 0x5A4D {
+        return Err("不是 PE 文件(缺少 MZ)".to_string());
+    }
+    let pe = u32_at(0x3C)? as usize;
+    if u32_at(pe)? != 0x0000_4550 {
+        return Err("不是 PE 文件(缺少 PE\\0\\0 签名)".to_string());
+    }
+    let machine = u16_at(pe + 4)?;
+    let sections = u16_at(pe + 6)? as usize;
+    let optional_size = u16_at(pe + 20)? as usize;
+    let optional = pe + 24;
+    // PE32 的 DataDirectory 在可选头 +96, PE32+ 在 +112。
+    let directory = match u16_at(optional)? {
+        0x010B => optional + 96,
+        0x020B => optional + 112,
+        magic => return Err(format!("未知可选头 magic 0x{:04X}", magic)),
+    };
+    let export_rva = u32_at(directory)?;
+    if export_rva == 0 {
+        return Ok((machine, Vec::new()));
+    }
+    // 节表: 每项 40 字节, 用它把 RVA 换算成文件偏移。
+    let section_table = optional + optional_size;
+    let to_offset = |rva: u32| -> Result<usize, String> {
+        for index in 0..sections {
+            let entry = section_table + index * 40;
+            let virtual_size = u32_at(entry + 8)?;
+            let virtual_address = u32_at(entry + 12)?;
+            let raw_size = u32_at(entry + 16)?;
+            let raw_pointer = u32_at(entry + 20)?;
+            let span = virtual_size.max(raw_size);
+            if rva >= virtual_address && rva < virtual_address + span {
+                return Ok((raw_pointer + (rva - virtual_address)) as usize);
+            }
+        }
+        Err(format!("RVA 0x{:X} 不落在任何节内", rva))
+    };
+    let export = to_offset(export_rva)?;
+    let name_count = u32_at(export + 24)? as usize;
+    let names_rva = u32_at(export + 32)?;
+    let names = to_offset(names_rva)?;
+    let mut exported = Vec::with_capacity(name_count);
+    for index in 0..name_count {
+        let rva = u32_at(names + index * 4)?;
+        let start = to_offset(rva)?;
+        let end = bytes[start..]
+            .iter()
+            .position(|byte| *byte == 0)
+            .map(|length| start + length)
+            .ok_or_else(|| "导出名未以 NUL 结尾".to_string())?;
+        exported.push(String::from_utf8_lossy(&bytes[start..end]).to_string());
+    }
+    Ok((machine, exported))
 }
 
-fn _run_vcam_probe() {
-    use mai2control_ui::vcam::{
-        FRAME_H, FRAME_W,
-        share::{FramePublisher, ShareNamespace},
-    };
-    use windows::Win32::Media::KernelStreaming::IKsControl;
-    use windows::Win32::Media::MediaFoundation::{
-        IMFActivate, IMFAttributes, IMFGetService, IMFMediaEventGenerator, IMFMediaSource,
-        IMFMediaSourceEx, IMFSampleAllocatorControl, IMFSourceReader,
-        MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME, MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE,
-        MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID, MF_E_SHUTDOWN, MF_MT_MAJOR_TYPE,
-        MF_MT_SUBTYPE, MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING,
-        MF_SOURCE_READER_FIRST_VIDEO_STREAM, MF_VERSION, MFCreateAttributes, MFCreateMediaType,
-        MFCreateSourceReaderFromMediaSource, MFCreateVirtualCamera, MFEnumDeviceSources,
-        MFMediaType_Video, MFSTARTUP_FULL, MFShutdown, MFStartup, MFVideoFormat_NV12,
-        MFVideoFormat_RGB32, MFVirtualCameraAccess_AllUsers, MFVirtualCameraAccess_CurrentUser,
-        MFVirtualCameraLifetime_Session, MFVirtualCameraType_SoftwareCameraSource,
-    };
-    use windows::Win32::System::Com::{
-        CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, COINIT_MULTITHREADED, CoCreateInstance,
-        CoInitializeEx, CoTaskMemFree, CoUninitialize,
-    };
-    use windows::core::{GUID, IUnknown, Interface};
-
-    fn _measure_vcam_frame(bytes: &[u8], subtype: GUID) -> Option<([f32; 3], f32)> {
-        const SAMPLE_STEP: usize = 8;
-        let x_start = FRAME_W / 2 - 80;
-        let x_end = FRAME_W / 2 + 80;
-        let y_start = FRAME_H / 2 - 60;
-        let y_end = FRAME_H / 2 + 60;
-        let (mut sums, mut non_black, mut samples) = ([0u64; 3], 0usize, 0usize);
-
-        if subtype == MFVideoFormat_RGB32 {
-            if bytes.len() < FRAME_W * FRAME_H * 4 {
-                return None;
-            }
-            for y in (y_start..y_end).step_by(SAMPLE_STEP) {
-                for x in (x_start..x_end).step_by(SAMPLE_STEP) {
-                    let offset = (y * FRAME_W + x) * 4;
-                    let pixel = [bytes[offset + 2], bytes[offset + 1], bytes[offset]];
-                    for channel in 0..3 {
-                        sums[channel] += pixel[channel] as u64;
-                    }
-                    non_black += usize::from(pixel.iter().any(|&value| value > 12));
-                    samples += 1;
-                }
-            }
-        } else if subtype == MFVideoFormat_NV12 {
-            if bytes.len() < FRAME_W * FRAME_H {
-                return None;
-            }
-            for y in (y_start..y_end).step_by(SAMPLE_STEP) {
-                for x in (x_start..x_end).step_by(SAMPLE_STEP) {
-                    let luma = bytes[y * FRAME_W + x];
-                    sums[0] += luma as u64;
-                    non_black += usize::from(luma > 24);
-                    samples += 1;
-                }
-            }
-        } else {
-            return None;
-        }
-
-        if samples == 0 {
-            return None;
-        }
-        Some((
-            [
-                sums[0] as f32 / samples as f32,
-                sums[1] as f32 / samples as f32,
-                sums[2] as f32 / samples as f32,
-            ],
-            non_black as f32 * 100.0 / samples as f32,
-        ))
-    }
-
-    fn _vcam_frame_matches(
-        mean: [f32; 3],
-        non_black_percent: f32,
-        subtype: GUID,
-        color: [u8; 3],
-    ) -> bool {
-        const COLOR_TOLERANCE: f32 = 20.0;
-        const MIN_NON_BLACK_PERCENT: f32 = 80.0;
-        if non_black_percent < MIN_NON_BLACK_PERCENT {
-            return false;
-        }
-        if subtype == MFVideoFormat_NV12 {
-            let expected_luma =
-                16.0 + 0.257 * color[0] as f32 + 0.504 * color[1] as f32 + 0.098 * color[2] as f32;
-            return (mean[0] - expected_luma).abs() <= COLOR_TOLERANCE;
-        }
-        subtype == MFVideoFormat_RGB32
-            && mean
-                .iter()
-                .zip(color)
-                .all(|(actual, expected)| (*actual - expected as f32).abs() <= COLOR_TOLERANCE)
-    }
-
-    fn _publish_and_verify_vcam_frame(
-        reader: &IMFSourceReader,
-        publisher: &mut FramePublisher,
-        subtype: GUID,
-        round_name: &str,
-        color: [u8; 3],
-    ) -> Result<(), String> {
-        let mut frame = vec![0u8; FRAME_W * FRAME_H * 3];
-        for pixel in frame.chunks_exact_mut(3) {
-            pixel.copy_from_slice(&color);
-        }
-        if let Err(error) = publisher.publish(&frame) {
-            println!("[VCAM] FramePublisher::publish({}): {}", round_name, error);
-            return Err(format!("{} 发布帧失败", round_name));
-        }
-
-        let start = std::time::Instant::now();
-        let mut frames = 0u32;
-        while start.elapsed() < Duration::from_secs(3) && frames < 60 {
-            let mut actual_stream = 0u32;
-            let mut stream_flags = 0u32;
-            let mut sample = None;
-            let read_result = unsafe {
-                reader.ReadSample(
-                    MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32,
-                    0,
-                    Some(&mut actual_stream),
-                    Some(&mut stream_flags),
-                    None,
-                    Some(&mut sample),
-                )
-            };
-            if let Err(error) = read_result {
+/// PE 层面核对一个产物: 位宽 + 四个导出齐全。失败项累加到 `failures`。
+fn _check_vcam_pe(
+    label: &str,
+    relative: &str,
+    expected_machine: u16,
+    failures: &mut Vec<String>,
+) -> Option<std::path::PathBuf> {
+    let inspected = match _locate_build_output(relative) {
+        Some(path) => match _pe_exports(&path) {
+            Ok((machine, exports)) => {
+                let missing: Vec<&str> = VCAM_EXPORTS
+                    .iter()
+                    .copied()
+                    .filter(|name| !exports.iter().any(|export| export == name))
+                    .collect();
                 println!(
-                    "[VCAM] IMFSourceReader::ReadSample({}): 0x{:08X}",
-                    round_name,
-                    error.code().0 as u32
+                    "[VCAM] {} 产物: {} machine=0x{:04X} 导出={}",
+                    label,
+                    path.display(),
+                    machine,
+                    exports.join(",")
                 );
-                return Err(format!("{} 读帧失败", round_name));
-            }
-            let Some(sample) = sample else {
-                thread::sleep(Duration::from_millis(10));
-                continue;
-            };
-            frames += 1;
-
-            let buffer_result = unsafe { sample.ConvertToContiguousBuffer() };
-            let buffer = match buffer_result {
-                Ok(buffer) => buffer,
-                Err(error) => {
-                    println!(
-                        "[VCAM] IMFSample::ConvertToContiguousBuffer({}): 0x{:08X}",
-                        round_name,
-                        error.code().0 as u32
-                    );
-                    return Err(format!("{} 连续缓冲区失败", round_name));
+                if machine != expected_machine {
+                    failures.push(format!(
+                        "{} 产物 machine=0x{:04X}, 期望 0x{:04X}",
+                        label, machine, expected_machine
+                    ));
                 }
-            };
-            let mut buffer_ptr = std::ptr::null_mut();
-            let mut buffer_len = 0u32;
-            let lock_result = unsafe { buffer.Lock(&mut buffer_ptr, None, Some(&mut buffer_len)) };
-            if let Err(error) = lock_result {
-                println!(
-                    "[VCAM] IMFMediaBuffer::Lock({}): 0x{:08X}",
-                    round_name,
-                    error.code().0 as u32
-                );
-                return Err(format!("{} 锁定缓冲区失败", round_name));
-            }
-            let measurement = if buffer_ptr.is_null() {
-                None
-            } else {
-                let bytes = unsafe { std::slice::from_raw_parts(buffer_ptr, buffer_len as usize) };
-                _measure_vcam_frame(bytes, subtype)
-            };
-            let unlock_result = unsafe { buffer.Unlock() };
-            if let Err(error) = unlock_result {
-                println!(
-                    "[VCAM] IMFMediaBuffer::Unlock({}): 0x{:08X}",
-                    round_name,
-                    error.code().0 as u32
-                );
-                return Err(format!("{} 解锁缓冲区失败", round_name));
-            }
-            let Some((mean, non_black_percent)) = measurement else {
-                return Err(format!("{} 输出格式或帧大小不支持", round_name));
-            };
-            if _vcam_frame_matches(mean, non_black_percent, subtype, color) {
-                if subtype == MFVideoFormat_NV12 {
-                    println!(
-                        "[VCAM] e2e {} hit frame={} mean=Y:{:.1} nonblack={:.1}%",
-                        round_name, frames, mean[0], non_black_percent
-                    );
-                } else {
-                    println!(
-                        "[VCAM] e2e {} hit frame={} mean=R:{:.1} G:{:.1} B:{:.1} nonblack={:.1}%",
-                        round_name, frames, mean[0], mean[1], mean[2], non_black_percent
-                    );
+                if !missing.is_empty() {
+                    failures.push(format!(
+                        "{} 产物缺少导出: {}(def 文件是否漏了?)",
+                        label,
+                        missing.join(",")
+                    ));
                 }
-                return Ok(());
+                Some(path)
             }
-        }
-        Err(format!("{} 在 3 秒/60 帧内未命中目标颜色", round_name))
-    }
-
-    fn _run_current_user_vcam_e2e(vcam_name: &str) -> Result<(), String> {
-        let mut publisher = match FramePublisher::create() {
-            Ok(publisher) => publisher,
             Err(error) => {
-                println!("[VCAM] FramePublisher::create: {}", error);
-                return Err("无法创建帧共享内存".to_string());
+                failures.push(format!("{} 产物 PE 解析失败: {}", label, error));
+                None
             }
-        };
-        println!(
-            "[VCAM] FramePublisher namespace: {}",
-            publisher.namespace().label()
-        );
-        if publisher.namespace() == ShareNamespace::Local {
-            println!(
-                "[VCAM] WARNING: Local 映射无法被 session 0 Frame Server 读取，端到端判定不可用"
-            );
-            return Err("FramePublisher 退回 Local 命名空间".to_string());
+        },
+        None => {
+            failures.push(format!(
+                "{} 构建产物未找到: {}(先用 MSBuild 构建 vcam_source_cpp 的 Release|x64 与 Release|Win32)",
+                label, relative
+            ));
+            None
         }
+    };
+    inspected
+}
 
-        let mut enum_attributes: Option<IMFAttributes> = None;
-        let enum_attributes_result = unsafe { MFCreateAttributes(&mut enum_attributes, 1) };
-        if !_print_vcam_probe_hr("MFCreateAttributes(device enum)", &enum_attributes_result) {
-            return Err("无法创建设备枚举属性".to_string());
-        }
-        let Some(enum_attributes) = enum_attributes else {
-            return Err("设备枚举属性为空".to_string());
-        };
-        let source_type_result = unsafe {
-            enum_attributes.SetGUID(
-                &MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE,
-                &MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID,
-            )
-        };
-        if !_print_vcam_probe_hr("IMFAttributes::SetGUID(VIDCAP)", &source_type_result) {
-            return Err("无法设置视频捕获枚举条件".to_string());
-        }
+/// 走真实 COM 路径构造并释放过滤器: `LoadLibrary` → `DllGetClassObject` → `IClassFactory` →
+/// `CreateInstance(IBaseFilter)` → 身份/针脚/格式核对 → 接入系统 Null Renderer 的完整 filter graph →
+/// graph Pause/Run/Stop → 全部释放 → `DllCanUnloadNow` 应回 S_OK → `FreeLibrary`。
+/// 直接加载构建产物，不写注册表；同一探针可分别编译成 x64/x86，验证两个 in-proc 位宽。
+fn _probe_vcam_com(dll: &std::path::Path, probe_registered: bool, failures: &mut Vec<String>) {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::Foundation::FreeLibrary;
+    use windows::Win32::Media::DirectShow::{IBaseFilter, IEnumPins};
+    use windows::Win32::System::Com::{
+        COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize, IClassFactory,
+    };
+    use windows::Win32::System::LibraryLoader::{
+        GetProcAddress, LOAD_WITH_ALTERED_SEARCH_PATH, LoadLibraryExW,
+    };
+    use windows::core::{GUID, HRESULT, Interface, PCSTR, PCWSTR};
 
-        let mut device_activates = std::ptr::null_mut();
-        let mut device_count = 0u32;
-        let enum_result = unsafe {
-            MFEnumDeviceSources(&enum_attributes, &mut device_activates, &mut device_count)
-        };
-        if !_print_vcam_probe_hr("MFEnumDeviceSources(VIDCAP)", &enum_result) {
-            return Err("枚举视频捕获设备失败".to_string());
-        }
-        // MFCreateVirtualCamera 将传入名称包装为 Windows Shell 可见的友好名；按枚举出的完整值精确匹配，
-        // 仍以本次唯一 MAI2_VCAM_NAME 为前缀，避免误取同 CLSID 的旧会话相机。
-        let expected_friendly_name = format!("{} (Windows 虚拟摄像头)", vcam_name);
-        let mut matching_activate = None;
-        if !device_activates.is_null() {
-            for index in 0..device_count as usize {
-                let candidate = unsafe { std::ptr::read(device_activates.add(index)) };
-                let Some(candidate) = candidate else {
-                    continue;
-                };
-                let name_len_result =
-                    unsafe { candidate.GetStringLength(&MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME) };
-                let Ok(name_len) = name_len_result else {
-                    _print_vcam_probe_hr(
-                        "IMFActivate::GetStringLength(MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME)",
-                        &name_len_result,
-                    );
-                    continue;
-                };
-                let mut name_utf16 = vec![0u16; name_len as usize + 1];
-                let name_result = unsafe {
-                    candidate.GetString(
-                        &MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME,
-                        &mut name_utf16,
-                        None,
-                    )
-                };
-                if !_print_vcam_probe_hr(
-                    "IMFActivate::GetString(MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME)",
-                    &name_result,
-                ) {
-                    continue;
+    type GetClassObject =
+        unsafe extern "system" fn(*const GUID, *const GUID, *mut *mut core::ffi::c_void) -> HRESULT;
+    type CanUnloadNow = unsafe extern "system" fn() -> HRESULT;
+
+    let wide: Vec<u16> = dll
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    // SAFETY: 全程手工管理 COM 引用与模块句柄; 所有 COM 指针在 FreeLibrary 之前释放。
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        let module =
+            match LoadLibraryExW(PCWSTR(wide.as_ptr()), None, LOAD_WITH_ALTERED_SEARCH_PATH) {
+                Ok(module) => module,
+                Err(error) => {
+                    failures.push(format!("LoadLibraryEx {} 失败: {}", dll.display(), error));
+                    CoUninitialize();
+                    return;
                 }
-                let name = String::from_utf16_lossy(&name_utf16[..name_len as usize]);
-                println!(
-                    "[VCAM] MFEnumDeviceSources candidate[{}]: '{}'",
-                    index, name
-                );
-                if name == expected_friendly_name {
-                    matching_activate = Some(candidate);
-                    break;
-                }
-            }
-            unsafe { CoTaskMemFree(Some(device_activates.cast())) };
-        }
-        println!(
-            "[VCAM] MFEnumDeviceSources: total={} {}",
-            device_count,
-            if matching_activate.is_some() {
-                "matched"
-            } else {
-                "not matched"
-            }
-        );
-        let Some(matching_activate) = matching_activate else {
-            return Err("未按友好名找到本次虚拟摄像头".to_string());
-        };
-
-        let source_result: windows::core::Result<IMFMediaSource> =
-            unsafe { matching_activate.ActivateObject() };
-        if !_print_vcam_probe_hr(
-            "IMFActivate::ActivateObject(IMFMediaSource, enumerated camera)",
-            &source_result,
-        ) {
-            return Err("无法激活枚举到的虚拟摄像头".to_string());
-        }
-        let media_source = match source_result {
-            Ok(media_source) => media_source,
-            Err(_) => return Err("枚举相机媒体源为空".to_string()),
-        };
-
-        let mut reader_attributes: Option<IMFAttributes> = None;
-        let reader_attributes_result = unsafe { MFCreateAttributes(&mut reader_attributes, 1) };
-        let mut e2e_result = if !_print_vcam_probe_hr(
-            "MFCreateAttributes(source reader)",
-            &reader_attributes_result,
-        ) {
-            Err("无法创建 SourceReader 属性".to_string())
-        } else if let Some(reader_attributes) = reader_attributes {
-            let enable_processing_result = unsafe {
-                reader_attributes.SetUINT32(&MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, 1)
             };
-            let video_processing = _print_vcam_probe_hr(
-                "IMFAttributes::SetUINT32(MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING)",
-                &enable_processing_result,
-            );
-            let reader_result =
-                unsafe { MFCreateSourceReaderFromMediaSource(&media_source, &reader_attributes) };
-            if !_print_vcam_probe_hr("MFCreateSourceReaderFromMediaSource", &reader_result) {
-                Err("无法创建 SourceReader".to_string())
-            } else {
-                match reader_result {
-                    Ok(reader) => {
-                        if video_processing {
-                            let rgb_type_result = unsafe { MFCreateMediaType() };
-                            if _print_vcam_probe_hr("MFCreateMediaType(RGB32)", &rgb_type_result) {
-                                if let Ok(rgb_type) = rgb_type_result {
-                                    let major_type_result = unsafe {
-                                        rgb_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)
-                                    };
-                                    let subtype_result = unsafe {
-                                        rgb_type.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_RGB32)
-                                    };
-                                    if _print_vcam_probe_hr(
-                                        "IMFMediaType::SetGUID(MF_MT_MAJOR_TYPE=Video)",
-                                        &major_type_result,
-                                    ) && _print_vcam_probe_hr(
-                                        "IMFMediaType::SetGUID(MF_MT_SUBTYPE=RGB32)",
-                                        &subtype_result,
-                                    ) {
-                                        _print_vcam_probe_hr(
-                                            "IMFSourceReader::SetCurrentMediaType(RGB32)",
-                                            &unsafe {
-                                                reader.SetCurrentMediaType(
-                                                    MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32,
-                                                    None,
-                                                    &rgb_type,
-                                                )
-                                            },
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                        let current_type_result = unsafe {
-                            reader.GetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32)
-                        };
-                        if !_print_vcam_probe_hr(
-                            "IMFSourceReader::GetCurrentMediaType",
-                            &current_type_result,
-                        ) {
-                            Err("无法取得 SourceReader 输出媒体类型".to_string())
-                        } else if let Ok(current_type) = current_type_result {
-                            let subtype_result = unsafe { current_type.GetGUID(&MF_MT_SUBTYPE) };
-                            if !_print_vcam_probe_hr(
-                                "IMFMediaType::GetGUID(MF_MT_SUBTYPE)",
-                                &subtype_result,
-                            ) {
-                                Err("无法取得 SourceReader 输出子类型".to_string())
-                            } else if let Ok(subtype) = subtype_result {
-                                println!("[VCAM] SourceReader output subtype: {:?}", subtype);
-                                if subtype != MFVideoFormat_RGB32 && subtype != MFVideoFormat_NV12 {
-                                    Err(format!("不支持的 SourceReader 输出格式 {:?}", subtype))
-                                } else if let Err(reason) = _publish_and_verify_vcam_frame(
-                                    &reader,
-                                    &mut publisher,
-                                    subtype,
-                                    "A",
-                                    [200, 40, 60],
-                                ) {
-                                    Err(reason)
-                                } else {
-                                    _publish_and_verify_vcam_frame(
-                                        &reader,
-                                        &mut publisher,
-                                        subtype,
-                                        "B",
-                                        [30, 180, 220],
-                                    )
-                                }
-                            } else {
-                                Err("SourceReader 输出子类型为空".to_string())
-                            }
-                        } else {
-                            Err("SourceReader 输出媒体类型为空".to_string())
-                        }
-                    }
-                    Err(_) => Err("SourceReader 为空".to_string()),
+        let entry = GetProcAddress(module, PCSTR(c"DllGetClassObject".as_ptr().cast()));
+        let unload = GetProcAddress(module, PCSTR(c"DllCanUnloadNow".as_ptr().cast()));
+        match (entry, unload) {
+            (Some(entry), Some(unload)) => {
+                let get_class_object: GetClassObject = std::mem::transmute(entry);
+                let can_unload: CanUnloadNow = std::mem::transmute(unload);
+                _probe_vcam_class_object(get_class_object, can_unload, failures);
+                if probe_registered {
+                    _probe_registered_vcam(failures);
+                } else {
+                    println!("[VCAM] 系统尚未完整部署，跳过注册表 CLSID graph 探针");
                 }
             }
-        } else {
-            Err("SourceReader 属性为空".to_string())
-        };
-
-        let source_shutdown_result = unsafe { media_source.Shutdown() };
-        // SourceReader 释放时会连带关闭它所拥有的媒体源, 所以这里的 MF_E_SHUTDOWN 是预期结果,
-        // 只有其它错误码才说明媒体源真的没能正常收尾。
-        let already_shutdown = source_shutdown_result
-            .as_ref()
-            .err()
-            .is_some_and(|error| error.code() == MF_E_SHUTDOWN);
-        if !_print_vcam_probe_hr(
-            "IMFMediaSource::Shutdown(enumerated camera)",
-            &source_shutdown_result,
-        ) && !already_shutdown
-            && e2e_result.is_ok()
-        {
-            e2e_result = Err("枚举相机媒体源 Shutdown 失败".to_string());
+            _ => failures.push(
+                "GetProcAddress 取不到 DllGetClassObject / DllCanUnloadNow(def 文件是否漏了导出?)"
+                    .to_string(),
+            ),
         }
-        drop(media_source);
-        drop(matching_activate);
-        drop(publisher);
-        e2e_result
+        if let Err(error) = FreeLibrary(module) {
+            failures.push(format!("FreeLibrary 失败: {}", error));
+        }
+        CoUninitialize();
     }
 
-    const VCAM_CLSID: GUID = GUID::from_u128(0xB7C5F1A2_3D64_4E8B_9A11_2F6C8D0E4A73);
-    // ★探针允许用唯一友好名★: MFCreateVirtualCamera 以入参为键复用已注册的虚拟相机, 沿用同名会
-    // 复用上一次(可能是失败态)的注册记录。设 MAI2_VCAM_NAME 环境变量即可用全新键跑一次干净验证。
-    let vcam_name_owned = std::env::var("MAI2_VCAM_NAME")
-        .unwrap_or_else(|_| "mai2control Virtual Camera".to_string());
-    let vcam_name: &str = vcam_name_owned.as_str();
-    const VCAM_CLSID_TEXT: &str = "{B7C5F1A2-3D64-4E8B-9A11-2F6C8D0E4A73}";
+    /// COM 对象的构造/使用/释放全在这个函数里, 保证在返回时所有引用都已 drop ——
+    /// 任何一个 COM 引用活过 FreeLibrary 都是立刻崩溃。
+    unsafe fn _probe_vcam_class_object(
+        get_class_object: GetClassObject,
+        can_unload: CanUnloadNow,
+        failures: &mut Vec<String>,
+    ) {
+        let mut raw: *mut core::ffi::c_void = std::ptr::null_mut();
+        let hr = unsafe { get_class_object(&VCAM_CLSID, &IClassFactory::IID, &mut raw) };
+        if hr.is_err() || raw.is_null() {
+            failures.push(format!(
+                "DllGetClassObject(IClassFactory) hr=0x{:08X}",
+                hr.0
+            ));
+            return;
+        }
+        // SAFETY: raw 是刚由 DllGetClassObject 返回的 IClassFactory, 所有权转交给这个包装。
+        let factory: IClassFactory = unsafe { IClassFactory::from_raw(raw) };
+        // 未注册 CLSID 也应可拒绝聚合并直接构造 —— 这才是消费端枚举后真正走的路。
+        let filter: IBaseFilter = match unsafe { factory.CreateInstance(None) } {
+            Ok(filter) => filter,
+            Err(error) => {
+                failures.push(format!(
+                    "IClassFactory::CreateInstance(IBaseFilter): {}",
+                    error
+                ));
+                return;
+            }
+        };
+        println!("[VCAM] COM: DllGetClassObject → IClassFactory → IBaseFilter 构造成功");
+        match unsafe { filter.GetClassID() } {
+            Ok(id) if id == VCAM_CLSID => println!("[VCAM] COM: GetClassID 与预期 CLSID 一致"),
+            Ok(id) => failures.push(format!("GetClassID 返回 {:?}, 与预期 CLSID 不符", id)),
+            Err(error) => failures.push(format!("GetClassID: {}", error)),
+        }
+        // 针脚: 必须恰好一个输出针脚。
+        match unsafe { filter.EnumPins() } {
+            Ok(pins) => _probe_vcam_pins(&pins, failures),
+            Err(error) => failures.push(format!("EnumPins: {}", error)),
+        }
+        // 完整图：源针脚必须真的完成 allocator 协商、推流并让 Null Renderer 进入 Paused，
+        // 这比未连接状态下直调过滤器状态机更接近 OBS/游戏的实际消费路径。
+        _probe_vcam_graph(&filter, failures);
+        drop(filter);
+        drop(factory);
+        // 全部引用已释放 ⇒ 模块计数必须归零, 否则 DLL 永远卸不掉(类工厂/枚举器漏了计数)。
+        let hr = unsafe { can_unload() };
+        if hr == HRESULT(0) {
+            println!("[VCAM] COM: 释放全部引用后 DllCanUnloadNow=S_OK(模块计数已归零)");
+        } else {
+            failures.push(format!(
+                "释放全部引用后 DllCanUnloadNow=0x{:08X}(期望 S_OK; 有对象漏了模块计数)",
+                hr.0
+            ));
+        }
+    }
+
+    unsafe fn _probe_registered_vcam(failures: &mut Vec<String>) {
+        use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance};
+        let filter: IBaseFilter =
+            match unsafe { CoCreateInstance(&VCAM_CLSID, None, CLSCTX_INPROC_SERVER) } {
+                Ok(filter) => filter,
+                Err(error) => {
+                    failures.push(format!(
+                        "注册表 CoCreateInstance(mai2control vcam): {}",
+                        error
+                    ));
+                    return;
+                }
+            };
+        println!("[VCAM] 注册表 CLSID：原生位宽 CoCreateInstance 成功");
+        _probe_vcam_graph(&filter, failures);
+        // ★直接 CoCreateInstance(CLSID) 只证明"能造实例", 不证明"消费端枚举得到它"★
+        // OBS/游戏这类消费端从不硬编码 CLSID, 而是走 ICreateDevEnum::CreateClassEnumerator(
+        // CLSID_VideoInputDeviceCategory) 拿 IEnumMoniker, 再 BindToStorage 到 IPropertyBag 读
+        // FriendlyName —— 这正是 IFilterMapper2::RegisterFilter 写的 Instance 子键那条路径的
+        // 运行期镜像。之前的探针跳过了这一步, "已安装但摄像头列表里看不到"这类问题因此漏检。
+        unsafe { _probe_system_enum(failures) };
+    }
+
+    /// 走消费端真实路径: `ICreateDevEnum` → `IEnumMoniker`(VideoInputDeviceCategory) →
+    /// 逐个 moniker `BindToStorage(IPropertyBag)` 读 FriendlyName, 核对能枚举到本过滤器。
+    unsafe fn _probe_system_enum(failures: &mut Vec<String>) {
+        use windows::Win32::Media::DirectShow::ICreateDevEnum;
+        use windows::Win32::Media::MediaFoundation::CLSID_VideoInputDeviceCategory;
+        use windows::Win32::System::Com::StructuredStorage::IPropertyBag;
+        use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, IBindCtx};
+        use windows::core::w;
+
+        let dev_enum: ICreateDevEnum = match unsafe {
+            CoCreateInstance(
+                &windows::Win32::Media::MediaFoundation::CLSID_SystemDeviceEnum,
+                None,
+                CLSCTX_INPROC_SERVER,
+            )
+        } {
+            Ok(dev_enum) => dev_enum,
+            Err(error) => {
+                failures.push(format!("CoCreateInstance(SystemDeviceEnum): {}", error));
+                return;
+            }
+        };
+        let mut moniker_enum = None;
+        if let Err(error) = unsafe {
+            dev_enum.CreateClassEnumerator(&CLSID_VideoInputDeviceCategory, &mut moniker_enum, 0)
+        } {
+            failures.push(format!(
+                "CreateClassEnumerator(VideoInputDeviceCategory): {}",
+                error
+            ));
+            return;
+        }
+        let Some(moniker_enum) = moniker_enum else {
+            failures.push(
+                "CreateClassEnumerator(VideoInputDeviceCategory) 返回空枚举器: 系统里没有任何视频输入设备"
+                    .to_string(),
+            );
+            return;
+        };
+        let bind_ctx: IBindCtx = match unsafe { windows::Win32::System::Com::CreateBindCtx(0) } {
+            Ok(ctx) => ctx,
+            Err(error) => {
+                failures.push(format!("CreateBindCtx: {}", error));
+                return;
+            }
+        };
+        let mut found = false;
+        let mut names: Vec<String> = Vec::new();
+        loop {
+            let mut slot = [None];
+            let mut fetched = 0u32;
+            let hr = unsafe { moniker_enum.Next(&mut slot, Some(&mut fetched)) };
+            let Some(moniker) = slot[0].take() else {
+                break;
+            };
+            let bag: Result<IPropertyBag, _> = unsafe { moniker.BindToStorage(&bind_ctx, None) };
+            match bag {
+                Ok(bag) => {
+                    let mut var = windows::Win32::System::Variant::VARIANT::default();
+                    let read = unsafe { bag.Read(w!("FriendlyName"), &mut var, None) };
+                    if read.is_ok() {
+                        let name = unsafe { var.Anonymous.Anonymous.Anonymous.bstrVal.to_string() };
+                        if name == MAI2VCAM_FRIENDLY_NAME_STR {
+                            found = true;
+                        }
+                        names.push(name);
+                    }
+                }
+                Err(error) => failures.push(format!(
+                    "枚举视频输入设备: BindToStorage(IPropertyBag) 失败: {}",
+                    error
+                )),
+            }
+            if hr.is_err() {
+                break;
+            }
+        }
+        if found {
+            println!(
+                "[VCAM] 系统枚举: ICreateDevEnum→VideoInputDeviceCategory 已列出「{}」(共 {} 个视频输入设备)",
+                MAI2VCAM_FRIENDLY_NAME_STR,
+                names.len()
+            );
+        } else {
+            failures.push(format!(
+                "系统枚举: VideoInputDeviceCategory 未列出「{}」; 实际列出: [{}]",
+                MAI2VCAM_FRIENDLY_NAME_STR,
+                names.join(", ")
+            ));
+        }
+    }
+
+    fn _probe_vcam_pins(pins: &IEnumPins, failures: &mut Vec<String>) {
+        use windows::Win32::Media::DirectShow::{IAMStreamConfig, PINDIR_OUTPUT};
+        let mut slot = [None];
+        let mut fetched = 0u32;
+        let hr = unsafe { pins.Next(&mut slot, Some(&mut fetched)) };
+        let Some(pin) = slot[0].take() else {
+            failures.push(format!("EnumPins::Next 未返回针脚(hr=0x{:08X})", hr.0));
+            return;
+        };
+        match unsafe { pin.QueryDirection() } {
+            Ok(direction) if direction == PINDIR_OUTPUT => {}
+            Ok(direction) => failures.push(format!("针脚方向 {:?}, 期望输出", direction)),
+            Err(error) => failures.push(format!("QueryDirection: {}", error)),
+        }
+        match pin.cast::<IAMStreamConfig>() {
+            Ok(config) => {
+                let mut count = 0i32;
+                let mut size = 0i32;
+                match unsafe { config.GetNumberOfCapabilities(&mut count, &mut size) } {
+                    Ok(()) if count == 1 => {
+                        println!("[VCAM] COM: 输出针脚 1 个, IAMStreamConfig 报 1 种能力")
+                    }
+                    Ok(()) => failures.push(format!(
+                        "GetNumberOfCapabilities 报 {} 种能力, 期望 1",
+                        count
+                    )),
+                    Err(error) => failures.push(format!("GetNumberOfCapabilities: {}", error)),
+                }
+            }
+            Err(error) => failures.push(format!("针脚 QueryInterface(IAMStreamConfig): {}", error)),
+        }
+        // 第二次 Next 必须报没有更多针脚。
+        let mut extra = [None];
+        let hr = unsafe { pins.Next(&mut extra, Some(&mut fetched)) };
+        if extra[0].is_some() || fetched != 0 {
+            failures.push(format!("EnumPins 报了第 2 个针脚(hr=0x{:08X})", hr.0));
+        }
+    }
+
+    fn _probe_vcam_graph(source: &IBaseFilter, failures: &mut Vec<String>) {
+        use windows::Win32::Media::DirectShow::{
+            FILTER_STATE, IFilterGraph, IGraphBuilder, IMediaFilter, PIN_DIRECTION, PINDIR_INPUT,
+            PINDIR_OUTPUT, State_Paused, State_Running, State_Stopped,
+        };
+        use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance};
+        use windows::core::{Interface, w};
+
+        fn first_pin(
+            filter: &IBaseFilter,
+            direction: PIN_DIRECTION,
+        ) -> Result<windows::Win32::Media::DirectShow::IPin, String> {
+            let pins = unsafe { filter.EnumPins() }.map_err(|error| error.to_string())?;
+            loop {
+                let mut slot = [None];
+                let mut fetched = 0u32;
+                let hr = unsafe { pins.Next(&mut slot, Some(&mut fetched)) };
+                let Some(pin) = slot[0].take() else {
+                    return Err(format!(
+                        "未找到方向 {:?} 的针脚(hr=0x{:08X})",
+                        direction, hr.0
+                    ));
+                };
+                if unsafe { pin.QueryDirection() }.ok() == Some(direction) {
+                    return Ok(pin);
+                }
+            }
+        }
+
+        let expect = |media: &IMediaFilter,
+                      want: FILTER_STATE,
+                      label: &str,
+                      failures: &mut Vec<String>| {
+            match unsafe { media.GetState(2_000) } {
+                Ok(state) if state == want => println!("[VCAM] graph: {} → GetState 一致", label),
+                Ok(state) => failures.push(format!(
+                    "graph {} 后 GetState={:?}, 期望 {:?}",
+                    label, state, want
+                )),
+                Err(error) => failures.push(format!("graph {} 后 GetState: {}", label, error)),
+            }
+        };
+
+        unsafe {
+            let graph: IGraphBuilder =
+                match CoCreateInstance(&VCAM_FILTER_GRAPH_CLSID, None, CLSCTX_INPROC_SERVER) {
+                    Ok(graph) => graph,
+                    Err(error) => {
+                        failures.push(format!("CoCreateInstance(FilterGraph): {}", error));
+                        return;
+                    }
+                };
+            let sink: IBaseFilter =
+                match CoCreateInstance(&VCAM_NULL_RENDERER_CLSID, None, CLSCTX_INPROC_SERVER) {
+                    Ok(sink) => sink,
+                    Err(error) => {
+                        failures.push(format!("CoCreateInstance(NullRenderer): {}", error));
+                        return;
+                    }
+                };
+            if let Err(error) = graph.AddFilter(source, w!("mai2control source")) {
+                failures.push(format!("graph AddFilter(source): {}", error));
+                return;
+            }
+            if let Err(error) = graph.AddFilter(&sink, w!("Null Renderer")) {
+                failures.push(format!("graph AddFilter(null renderer): {}", error));
+                return;
+            }
+            let output = match first_pin(source, PINDIR_OUTPUT) {
+                Ok(pin) => pin,
+                Err(error) => {
+                    failures.push(format!("graph source pin: {}", error));
+                    return;
+                }
+            };
+            let input = match first_pin(&sink, PINDIR_INPUT) {
+                Ok(pin) => pin,
+                Err(error) => {
+                    failures.push(format!("graph sink pin: {}", error));
+                    return;
+                }
+            };
+            let filter_graph: IFilterGraph = match graph.cast() {
+                Ok(filter_graph) => filter_graph,
+                Err(error) => {
+                    failures.push(format!("graph QueryInterface(IFilterGraph): {}", error));
+                    return;
+                }
+            };
+            if let Err(error) = filter_graph.ConnectDirect(&output, &input, None) {
+                failures.push(format!(
+                    "graph ConnectDirect(NV12 → NullRenderer): {}",
+                    error
+                ));
+                return;
+            }
+            println!("[VCAM] graph: NV12 输出针脚已连接到系统 Null Renderer");
+            let media: IMediaFilter = match graph.cast() {
+                Ok(media) => media,
+                Err(error) => {
+                    failures.push(format!("graph QueryInterface(IMediaFilter): {}", error));
+                    return;
+                }
+            };
+            expect(&media, State_Stopped, "初始 Stopped", failures);
+            match media.Pause() {
+                Ok(()) => expect(&media, State_Paused, "Pause(已收到预卷帧)", failures),
+                Err(error) => failures.push(format!("graph Pause: {}", error)),
+            }
+            match media.Run(0) {
+                Ok(()) => {
+                    std::thread::sleep(std::time::Duration::from_millis(180));
+                    expect(&media, State_Running, "Run", failures);
+                }
+                Err(error) => failures.push(format!("graph Run: {}", error)),
+            }
+            match media.Stop() {
+                Ok(()) => expect(&media, State_Stopped, "Stop", failures),
+                Err(error) => failures.push(format!("graph Stop: {}", error)),
+            }
+        }
+    }
+}
+
+/// `--vcam-probe`: 虚拟摄像头链路的**本机自验**(不依赖固件, 也不需要先装摄像头)。
+///
+/// 验的是生产侧全链路: 共享队列布局 → RGB24→NV12 转换 → 三缓冲发布/读取协议 → 心跳 →
+/// 退出时的 STOPPING 迁移。消费侧(DirectShow 过滤器)活在别的进程里, 与本侧唯一的耦合就是
+/// 这套布局, 因此这里用与 C++ `Mai2VcamQueueReader` **同规则**的 Rust 读端逐字节核对;
+/// 过滤器自身的注册状态只做信息打印, 不参与判定(装不装是用户的选择)。
+fn _run_vcam_probe() -> bool {
+    use mai2control_ui::vcam::share::{
+        FramePublisher, NV12_BYTES, QueueReader, QueueState, black_nv12, rgb24_to_nv12,
+    };
+    use mai2control_ui::vcam::{FRAME_H, FRAME_W, backend as vcam_backend, render_qr_frame};
 
     println!("[VCAM] probe begin");
-    // windows 0.62 的 CoInitializeEx 返回裸 HRESULT, 直接打印即可(S_FALSE=已初始化过, 非错误)。
-    let mut _com_init_count = 0u8;
-    let apartment = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
     println!(
-        "[VCAM] CoInitializeEx(COINIT_APARTMENTTHREADED): 0x{:08X}",
-        apartment.0 as u32
+        "[VCAM] 过滤器 DLL 内嵌: {}",
+        if vcam_backend::embedded_available() {
+            "是(x64 + x86)"
+        } else {
+            "否(本次构建未携带)"
+        }
     );
-    if apartment.is_ok() {
-        _com_init_count += 1;
-    }
-    let multithreaded = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
     println!(
-        "[VCAM] CoInitializeEx(COINIT_MULTITHREADED): 0x{:08X}",
-        multithreaded.0 as u32
+        "[VCAM] 系统注册状态: {}",
+        vcam_backend::registration_status()
     );
-    if multithreaded.is_ok() {
-        _com_init_count += 1;
-    }
 
-    let mf_startup = unsafe { MFStartup(MF_VERSION, MFSTARTUP_FULL) };
-    let mf_started = _print_vcam_probe_hr("MFStartup(MF_VERSION, MFSTARTUP_FULL)", &mf_startup);
+    let mut publisher = match FramePublisher::create() {
+        Ok(publisher) => publisher,
+        Err(error) => {
+            println!("[VCAM] FramePublisher::create: FAIL {}", error);
+            println!("[VCAM] probe: FAIL");
+            println!("[VCAM] probe end");
+            return false;
+        }
+    };
+    let reader = match QueueReader::open() {
+        Ok(reader) => reader,
+        Err(error) => {
+            println!("[VCAM] QueueReader::open: FAIL {}", error);
+            println!("[VCAM] probe: FAIL");
+            println!("[VCAM] probe end");
+            return false;
+        }
+    };
 
-    let unknown_result: windows::core::Result<IUnknown> =
-        unsafe { CoCreateInstance(&VCAM_CLSID, None, CLSCTX_INPROC_SERVER) };
-    _print_vcam_probe_hr(
-        "CoCreateInstance(CLSID_mai2vcam_source, CLSCTX_INPROC_SERVER, IID_IUnknown)",
-        &unknown_result,
-    );
-    let unknown = unknown_result.ok();
+    let mut failures: Vec<String> = Vec::new();
 
-    if let Some(unknown) = unknown.as_ref() {
-        let activate_result = unknown.cast::<IMFActivate>();
-        _print_vcam_probe_hr("QueryInterface(IMFActivate)", &activate_result);
-        if let Some(activate) = activate_result.ok() {
-            let media_source_result: windows::core::Result<IMFMediaSource> =
-                unsafe { activate.ActivateObject() };
-            _print_vcam_probe_hr(
-                "IMFActivate::ActivateObject(IMFMediaSource)",
-                &media_source_result,
+    // 1) 头部字段: 消费端就是按这些字段决定"要不要相信这块内存", 任一不符都会被判占位帧。
+    match reader.header() {
+        Ok(header) => {
+            println!(
+                "[VCAM] header state={:?} {}x{} slots={} slot_bytes={} interval={}x100ns pid={} seq={}",
+                header.state,
+                header.width,
+                header.height,
+                header.slot_count,
+                header.slot_bytes,
+                header.interval_100ns,
+                header.producer_pid,
+                header.sequence,
             );
+            if header.state != QueueState::Ready {
+                failures.push(format!("初始状态 {:?} 不是 Ready", header.state));
+            }
+            if header.width != FRAME_W as u32 || header.height != FRAME_H as u32 {
+                failures.push(format!(
+                    "尺寸 {}x{} 与 {}x{} 不符",
+                    header.width, header.height, FRAME_W, FRAME_H
+                ));
+            }
+            if header.slot_count != 3 || header.slot_bytes != NV12_BYTES as u32 {
+                failures.push(format!(
+                    "槽布局 {}x{}B 与 3x{}B 不符",
+                    header.slot_count, header.slot_bytes, NV12_BYTES
+                ));
+            }
+            if header.producer_pid != std::process::id() {
+                failures.push(format!(
+                    "producer_pid {} 不是本进程 {}",
+                    header.producer_pid,
+                    std::process::id()
+                ));
+            }
+        }
+        Err(error) => failures.push(format!("头部校验: {}", error)),
+    }
 
-            if let Ok(media_source) = media_source_result.as_ref() {
-                _print_vcam_probe_hr(
-                    "QueryInterface(IMFMediaSource)",
-                    &media_source.cast::<IMFMediaSource>(),
+    // 2) 黑帧编码必须与过滤器的占位帧逐字节相同, 否则"生产者不在"与"输出黑屏"会有可见跳变。
+    let black_rgb = vec![0u8; FRAME_W * FRAME_H * 3];
+    let mut converted = vec![0u8; NV12_BYTES];
+    match rgb24_to_nv12(&black_rgb, &mut converted) {
+        Ok(()) if converted == black_nv12() => {
+            println!("[VCAM] 黑帧编码: 与占位帧一致(Y=0 UV=128)")
+        }
+        Ok(()) => failures.push("黑帧 NV12 编码与占位帧不一致".to_string()),
+        Err(error) => failures.push(format!("黑帧转换: {}", error)),
+    }
+
+    // 3) 发布/读取往返: 逐字节核对, 并检查 sequence 单调 +1(顺带覆盖 3 个槽的轮转)。
+    let qr = match render_qr_frame("MAI2CONTROL-VCAM-PROBE") {
+        Ok(frame) => frame,
+        Err(error) => {
+            failures.push(format!("QR 帧生成: {}", error));
+            black_rgb.clone()
+        }
+    };
+    let mut expected_sequence = 0u32;
+    for round in 0..4u32 {
+        // 交替黑/QR: 4 轮既覆盖 slot 0/1/2 轮转, 也覆盖"内容变化"与"内容重复"两种情况。
+        let (name, rgb) = if round % 2 == 0 {
+            ("QR", &qr)
+        } else {
+            ("黑", &black_rgb)
+        };
+        if let Err(error) = publisher.publish(rgb) {
+            failures.push(format!("第 {} 轮 publish({}): {}", round + 1, name, error));
+            break;
+        }
+        expected_sequence += 1;
+        let mut got = vec![0u8; NV12_BYTES];
+        let sequence = match reader.read(&mut got) {
+            Ok(sequence) => sequence,
+            Err(error) => {
+                failures.push(format!("第 {} 轮 read({}): {}", round + 1, name, error));
+                break;
+            }
+        };
+        if sequence != expected_sequence {
+            failures.push(format!(
+                "第 {} 轮 sequence={} 期望 {}",
+                round + 1,
+                sequence,
+                expected_sequence
+            ));
+        }
+        let mut expected = vec![0u8; NV12_BYTES];
+        if let Err(error) = rgb24_to_nv12(rgb, &mut expected) {
+            failures.push(format!("第 {} 轮转换: {}", round + 1, error));
+            break;
+        }
+        match got.iter().zip(expected.iter()).position(|(a, b)| a != b) {
+            Some(index) => failures.push(format!(
+                "第 {} 轮({})读回内容不一致: 首个差异在字节 {}",
+                round + 1,
+                name,
+                index
+            )),
+            None => {
+                // 亮度统计只作为"画面确实有内容"的旁证: QR 应有大量非零亮度, 黑帧必须全零。
+                let luma = &got[..FRAME_W * FRAME_H];
+                let bright = luma.iter().filter(|value| **value > 32).count();
+                let percent = bright as f32 * 100.0 / luma.len() as f32;
+                println!(
+                    "[VCAM] 第 {} 轮({}) seq={} slot={} 亮像素={:.1}%",
+                    round + 1,
+                    name,
+                    sequence,
+                    sequence % 3,
+                    percent
                 );
-                _print_vcam_probe_hr(
-                    "QueryInterface(IMFMediaSourceEx)",
-                    &media_source.cast::<IMFMediaSourceEx>(),
-                );
-                _print_vcam_probe_hr(
-                    "QueryInterface(IMFMediaEventGenerator)",
-                    &media_source.cast::<IMFMediaEventGenerator>(),
-                );
-                _print_vcam_probe_hr(
-                    "QueryInterface(IMFGetService)",
-                    &media_source.cast::<IMFGetService>(),
-                );
-                _print_vcam_probe_hr(
-                    "QueryInterface(IKsControl)",
-                    &media_source.cast::<IKsControl>(),
-                );
-                _print_vcam_probe_hr(
-                    "QueryInterface(IMFAttributes)",
-                    &media_source.cast::<IMFAttributes>(),
-                );
-                _print_vcam_probe_hr(
-                    "QueryInterface(IMFSampleAllocatorControl)",
-                    &media_source.cast::<IMFSampleAllocatorControl>(),
-                );
-                _print_vcam_probe_hr("IMFMediaSource::CreatePresentationDescriptor", &unsafe {
-                    media_source.CreatePresentationDescriptor()
-                });
-                _print_vcam_probe_hr("IMFActivate::ShutdownObject", &unsafe {
-                    activate.ShutdownObject()
-                });
-                _print_vcam_probe_hr("IMFActivate::DetachObject", &unsafe {
-                    activate.DetachObject()
-                });
-            } else {
-                for interface_name in [
-                    "IMFMediaSource",
-                    "IMFMediaSourceEx",
-                    "IMFMediaEventGenerator",
-                    "IMFGetService",
-                    "IKsControl",
-                    "IMFAttributes",
-                    "IMFSampleAllocatorControl",
-                ] {
-                    println!(
-                        "[VCAM] QueryInterface({}): skipped (ActivateObject failed)",
-                        interface_name
-                    );
+                if name == "QR" && percent < 20.0 {
+                    failures.push(format!("QR 帧亮像素仅 {:.1}%, 疑似未真正绘制", percent));
                 }
-                println!(
-                    "[VCAM] IMFMediaSource::CreatePresentationDescriptor: skipped (ActivateObject failed)"
-                );
-                println!("[VCAM] IMFActivate::ShutdownObject: skipped (ActivateObject failed)");
-                println!("[VCAM] IMFActivate::DetachObject: skipped (ActivateObject failed)");
+                if name == "黑" && percent > 0.0 {
+                    failures.push(format!("黑帧仍有 {:.1}% 亮像素", percent));
+                }
             }
-        } else {
-            println!(
-                "[VCAM] IMFActivate::ActivateObject(IMFMediaSource): skipped (IMFActivate unavailable)"
-            );
-            for interface_name in [
-                "IMFMediaSource",
-                "IMFMediaSourceEx",
-                "IMFMediaEventGenerator",
-                "IMFGetService",
-                "IKsControl",
-                "IMFAttributes",
-                "IMFSampleAllocatorControl",
-            ] {
-                println!(
-                    "[VCAM] QueryInterface({}): skipped (IMFActivate unavailable)",
-                    interface_name
-                );
-            }
-            println!(
-                "[VCAM] IMFMediaSource::CreatePresentationDescriptor: skipped (IMFActivate unavailable)"
-            );
-            println!("[VCAM] IMFActivate::ShutdownObject: skipped (IMFActivate unavailable)");
-            println!("[VCAM] IMFActivate::DetachObject: skipped (IMFActivate unavailable)");
         }
-    } else {
-        println!("[VCAM] QueryInterface(IMFActivate): skipped (CoCreateInstance failed)");
-        println!(
-            "[VCAM] IMFActivate::ActivateObject(IMFMediaSource): skipped (CoCreateInstance failed)"
-        );
-        for interface_name in [
-            "IMFMediaSource",
-            "IMFMediaSourceEx",
-            "IMFMediaEventGenerator",
-            "IMFGetService",
-            "IKsControl",
-            "IMFAttributes",
-            "IMFSampleAllocatorControl",
-        ] {
-            println!(
-                "[VCAM] QueryInterface({}): skipped (CoCreateInstance failed)",
-                interface_name
-            );
-        }
-        println!(
-            "[VCAM] IMFMediaSource::CreatePresentationDescriptor: skipped (CoCreateInstance failed)"
-        );
-        println!("[VCAM] IMFActivate::ShutdownObject: skipped (CoCreateInstance failed)");
-        println!("[VCAM] IMFActivate::DetachObject: skipped (CoCreateInstance failed)");
     }
-    // COM 引用必须在 MFShutdown/CoUninitialize 前释放，否则 DLL 的析构会访问已卸载的套间。
-    drop(unknown);
 
-    // ★MAI2_VCAM_ONLY_CURRENT=1 时只测 CurrentUser★: 同一 sourceId 同时存在两台会互相干扰 ——
-    // AllUsers 那台 Start 失败后被 Remove(), 可能连带把该 CLSID 的虚拟相机注册一起删掉,
-    // 导致随后 CurrentUser 那台 Start 时帧服务器只看到"0 个流"。
-    let only_current = std::env::var("MAI2_VCAM_ONLY_CURRENT").is_ok();
-    let all_users_result = if only_current {
-        Err(windows::core::Error::from(
-            windows::Win32::Foundation::E_ABORT,
-        ))
+    // 4) 心跳: 过滤器靠 tick_ms 区分"画面没变"与"生产者进程已被杀"。
+    let before = reader.header().map(|header| header.tick_ms).unwrap_or(0);
+    thread::sleep(Duration::from_millis(80));
+    publisher.heartbeat();
+    match reader.header() {
+        Ok(header) if header.tick_ms.wrapping_sub(before) > 0 => {
+            println!("[VCAM] 心跳: tick {} → {}", before, header.tick_ms)
+        }
+        Ok(header) => failures.push(format!("心跳未推进(tick 仍为 {})", header.tick_ms)),
+        Err(error) => failures.push(format!("心跳读取: {}", error)),
+    }
+
+    // 5) 正常退出必须落到 STOPPING, 消费端立刻转占位帧而不用等心跳超时。
+    drop(publisher);
+    match reader.header() {
+        Ok(header) if header.state == QueueState::Stopping => {
+            println!("[VCAM] 生产者退出: state=Stopping")
+        }
+        Ok(header) => failures.push(format!(
+            "生产者退出后状态为 {:?}, 期望 Stopping",
+            header.state
+        )),
+        Err(error) => failures.push(format!("退出后头部读取: {}", error)),
+    }
+    if reader.read(&mut vec![0u8; NV12_BYTES]).is_ok() {
+        failures.push("生产者退出后仍能取到帧(消费端应转占位帧)".to_string());
+    }
+
+    // 6) 过滤器侧：两个产物都做 PE/导出核对；当前进程位宽对应的 DLL 走真实 COM + 完整 graph。
+    //    同一 selftest 分别构建为 x64 与 i686 后，两边都会覆盖自己的 in-proc 消费路径。
+    let x64 = _check_vcam_pe("x64", VCAM_DLL_X64, PE_MACHINE_AMD64, &mut failures);
+    let x86 = _check_vcam_pe("x86", VCAM_DLL_X86, PE_MACHINE_I386, &mut failures);
+    let native = if cfg!(target_pointer_width = "64") {
+        ("x64", x64)
     } else {
-        unsafe {
-            MFCreateVirtualCamera(
-                MFVirtualCameraType_SoftwareCameraSource,
-                MFVirtualCameraLifetime_Session,
-                MFVirtualCameraAccess_AllUsers,
-                &windows::core::HSTRING::from(vcam_name),
-                &windows::core::HSTRING::from(VCAM_CLSID_TEXT),
-                None,
-            )
+        ("x86", x86)
+    };
+    let probe_registered = match vcam_backend::is_registered() {
+        Ok(installed) => installed,
+        Err(error) => {
+            failures.push(format!("读取系统注册状态失败: {}", error));
+            false
         }
     };
-    if only_current {
-        println!("[VCAM] MFCreateVirtualCamera(AllUsers): skipped (MAI2_VCAM_ONLY_CURRENT)");
-    } else {
-        _print_vcam_probe_hr("MFCreateVirtualCamera(AllUsers)", &all_users_result);
-    }
-    let current_user_result = unsafe {
-        MFCreateVirtualCamera(
-            MFVirtualCameraType_SoftwareCameraSource,
-            MFVirtualCameraLifetime_Session,
-            MFVirtualCameraAccess_CurrentUser,
-            &windows::core::HSTRING::from(vcam_name),
-            &windows::core::HSTRING::from(VCAM_CLSID_TEXT),
-            None,
-        )
-    };
-    _print_vcam_probe_hr("MFCreateVirtualCamera(CurrentUser)", &current_user_result);
-
-    // ★两种 access 都要各自 Start 一次★: CurrentUser Start 成功后才可用枚举路径验证真实画面。
-    let mut any_created = false;
-    let mut e2e_result = None;
-    for (access_name, camera) in [
-        ("AllUsers", all_users_result.ok()),
-        ("CurrentUser", current_user_result.ok()),
-    ] {
-        if let Some(camera) = camera {
-            any_created = true;
-            let start_result = unsafe { camera.Start(None) };
-            let started = _print_vcam_probe_hr(
-                &format!("IMFVirtualCamera::Start({})", access_name),
-                &start_result,
-            );
-            if access_name == "CurrentUser" {
-                e2e_result = Some(if started {
-                    _run_current_user_vcam_e2e(vcam_name)
-                } else {
-                    Err("CurrentUser 虚拟摄像头 Start 失败".to_string())
-                });
-            }
-            _cleanup_vcam_probe_camera(access_name, &camera);
-        } else {
+    match native {
+        (label, Some(path)) => {
             println!(
-                "[VCAM] IMFVirtualCamera::Start({}): skipped (creation failed)",
-                access_name
+                "[VCAM] {} 原生消费探针：加载并运行完整 DirectShow graph",
+                label
             );
+            _probe_vcam_com(&path, probe_registered, &mut failures);
         }
-    }
-    if !any_created {
-        println!("[VCAM] IMFVirtualCamera::Start: skipped (both creation calls failed)");
-    }
-    match e2e_result {
-        Some(Ok(())) => println!("[VCAM] e2e: PASS"),
-        Some(Err(reason)) => println!("[VCAM] e2e: FAIL {}", reason),
-        None => println!("[VCAM] e2e: FAIL CurrentUser 虚拟摄像头未创建"),
+        (label, None) => failures.push(format!(
+            "{} 原生构建产物缺失，无法执行 COM graph 探针",
+            label
+        )),
     }
 
-    if mf_started {
-        _print_vcam_probe_hr("MFShutdown", &unsafe { MFShutdown() });
+    if failures.is_empty() {
+        println!("[VCAM] probe: PASS");
     } else {
-        println!("[VCAM] MFShutdown: skipped (MFStartup failed)");
-    }
-    while _com_init_count > 0 {
-        unsafe { CoUninitialize() };
-        _com_init_count -= 1;
+        for reason in &failures {
+            println!("[VCAM] FAIL {}", reason);
+        }
+        println!("[VCAM] probe: FAIL ({} 项)", failures.len());
     }
     println!("[VCAM] probe end");
+    failures.is_empty()
 }
 
 #[derive(Clone, Copy, Default)]
@@ -1262,7 +1349,11 @@ fn _bus_parse_xfer_ex(
     let mut frames = Vec::with_capacity(frame_count as usize);
     while offset < response.len() {
         if response.len() - offset < BUS_HDR_SIZE {
-            return Err(format!("线上帧头截断: offset={} len={}", offset, response.len()));
+            return Err(format!(
+                "线上帧头截断: offset={} len={}",
+                offset,
+                response.len()
+            ));
         }
         if response[offset] != BUS_MAGIC {
             return Err(format!("线上 magic 错误: 0x{:02X}", response[offset]));
@@ -1270,7 +1361,10 @@ fn _bus_parse_xfer_ex(
         let frag_len = response[offset + 8] as usize;
         let frame_len = BUS_HDR_SIZE + frag_len;
         if response.len() - offset < frame_len {
-            return Err(format!("线上帧载荷截断: offset={} frag_len={}", offset, frag_len));
+            return Err(format!(
+                "线上帧载荷截断: offset={} frag_len={}",
+                offset, frag_len
+            ));
         }
         let frame = &response[offset..offset + frame_len];
         let total_len = u16::from_le_bytes([frame[4], frame[5]]);
@@ -1376,7 +1470,10 @@ fn _bus_validate_led_state(
         return Err(format!("LED_STATE 非 STREAM: flags=0x{:02X}", state.flags));
     }
     if state.payload.len() != 4 {
-        return Err(format!("LED_STATE payload 长度错误: {}", state.payload.len()));
+        return Err(format!(
+            "LED_STATE payload 长度错误: {}",
+            state.payload.len()
+        ));
     }
     if state.payload[0..3] != rgb {
         return Err(format!(
@@ -1467,7 +1564,12 @@ fn _bus_stat(ctrl: &mut AppController) -> Result<BusStatSnapshot, String> {
         ));
     }
     let field = |i: usize| -> u32 {
-        u32::from_le_bytes([body[i * 4], body[i * 4 + 1], body[i * 4 + 2], body[i * 4 + 3]])
+        u32::from_le_bytes([
+            body[i * 4],
+            body[i * 4 + 1],
+            body[i * 4 + 2],
+            body[i * 4 + 3],
+        ])
     };
     Ok(BusStatSnapshot {
         tx_frag: field(0),
@@ -1495,7 +1597,11 @@ fn _bus_step_stat(ctrl: &mut AppController) -> Result<BusStatSnapshot, String> {
         ("timeout", first.timeout, second.timeout),
         ("deliver", first.deliver, second.deliver),
         ("svc_overwrite", first.svc_overwrite, second.svc_overwrite),
-        ("push_overwrite", first.push_overwrite, second.push_overwrite),
+        (
+            "push_overwrite",
+            first.push_overwrite,
+            second.push_overwrite,
+        ),
     ];
     for (name, before, after) in pairs {
         if after < before {
@@ -1623,14 +1729,17 @@ fn _bus_step_oversize(ctrl: &mut AppController, before: &BusStatSnapshot) -> Res
     let frame = _bus_make_frame(BUS_MSG_PROBE_ASM, seq, 2000, 0, BUS_FLAG_FIRST, &chunk);
     let (_, _, mut frames) = _bus_send_raw(ctrl, frame)?;
     frames.extend(_bus_drain(ctrl, BUS_DRAIN_ROUNDS)?);
-    let nak = frames.iter().any(|f| {
-        f.msg_id == BUS_MSG_PROBE_ASM && (f.flags & BUS_FLAG_NAK) != 0 && f.seq == seq
-    });
+    let nak = frames
+        .iter()
+        .any(|f| f.msg_id == BUS_MSG_PROBE_ASM && (f.flags & BUS_FLAG_NAK) != 0 && f.seq == seq);
     if !nak {
         return Err(format!(
             "声明 total_len=2000(>{}) 未被显式拒绝: 收到 {:?}",
             BUS_ASM_MAX,
-            frames.iter().map(|f| (f.msg_id, f.seq, f.flags)).collect::<Vec<_>>()
+            frames
+                .iter()
+                .map(|f| (f.msg_id, f.seq, f.flags))
+                .collect::<Vec<_>>()
         ));
     }
     let after = _bus_stat(ctrl)?;
@@ -1651,7 +1760,7 @@ fn _bus_step_oversize(ctrl: &mut AppController, before: &BusStatSnapshot) -> Res
 /// 子项 7: 坏 CRC 必须被线上层拒绝(rejected+1, rx_drop_crc+1)且不产生任何派发。
 fn _bus_step_bad_crc(ctrl: &mut AppController, before: &BusStatSnapshot) -> Result<(), String> {
     let mut frame = _bus_make_led_set(0x30, &[7, 7, 7]);
-    frame[BUS_HDR_SIZE - 2] ^= 0xFF;   // 只翻 CRC 低字节(off 14), 其余字段保持完全合法
+    frame[BUS_HDR_SIZE - 2] ^= 0xFF; // 只翻 CRC 低字节(off 14), 其余字段保持完全合法
     let (accepted, rejected, _) = _bus_send_raw(ctrl, frame)?;
     if accepted != 0 || rejected != 1 {
         return Err(format!(
@@ -1673,7 +1782,7 @@ fn _bus_step_bad_crc(ctrl: &mut AppController, before: &BusStatSnapshot) -> Resu
             before.deliver, after.deliver
         ));
     }
-    let _ = _bus_drain(ctrl, 2)?;   // 顺手排掉这条坏帧引出的 NAK 信封
+    let _ = _bus_drain(ctrl, 2)?; // 顺手排掉这条坏帧引出的 NAK 信封
     println!(
         "[BUS] bad-crc PASS: rejected=1 rx_drop_crc {} → {} deliver 未增长({})",
         before.rx_drop_crc, after.rx_drop_crc, after.deliver
@@ -1777,7 +1886,10 @@ fn _bus_step_wrap() -> Result<(), String> {
     // 回退(乱序/重放)在回绕点必须表现为一个巨大的增量, 而不是负数溢出成 1。
     let backwards = series[0].wrapping_sub(series[2]);
     if backwards != 0xFFFE {
-        return Err(format!("回绕点回退增量应为 0xFFFE, 实际 0x{:04X}", backwards));
+        return Err(format!(
+            "回绕点回退增量应为 0xFFFE, 实际 0x{:04X}",
+            backwards
+        ));
     }
     println!("[BUS] wrap PASS: 0xFFFE→0xFFFF→0x0000→0x0001 增量恒为 1, 跳号=2, 回退=0xFFFE");
     Ok(())
@@ -1790,7 +1902,13 @@ fn _bus_step_stream(ctrl: &mut AppController) -> Result<(), String> {
     if body.len() != 5 {
         return Err(format!("流式钩子响应体长度错误: {}B (期望 5)", body.len()));
     }
-    let names = ["stream_open", "write#0", "write#1", "write#2", "stream_close"];
+    let names = [
+        "stream_open",
+        "write#0",
+        "write#1",
+        "write#2",
+        "stream_close",
+    ];
     for (index, name) in names.iter().enumerate() {
         if body[index] != 1 {
             return Err(format!("固件侧 {} 失败", name));
@@ -1822,7 +1940,10 @@ fn _bus_step_stream(ctrl: &mut AppController) -> Result<(), String> {
     let mut expect_off = 0u16;
     for (index, frame) in data.iter().enumerate() {
         if (frame.flags & BUS_FLAG_STREAM) == 0 {
-            return Err(format!("流式帧 #{} 未置 STREAM: flags=0x{:02X}", index, frame.flags));
+            return Err(format!(
+                "流式帧 #{} 未置 STREAM: flags=0x{:02X}",
+                index, frame.flags
+            ));
         }
         if frame.total_len != BUS_LEN_UNKNOWN {
             return Err(format!(
@@ -1874,7 +1995,11 @@ fn _bus_step_subring(ctrl: &mut AppController) -> Result<(), String> {
     }
     for slot in 0..BUS_SUBRING_SLOTS {
         if body[slot] != 1 {
-            return Err(format!("第 {} 次 acquire 失败(应能借满 {} 个)", slot + 1, BUS_SUBRING_SLOTS));
+            return Err(format!(
+                "第 {} 次 acquire 失败(应能借满 {} 个)",
+                slot + 1,
+                BUS_SUBRING_SLOTS
+            ));
         }
     }
     if body[BUS_SUBRING_SLOTS] != 1 {
@@ -1934,7 +2059,10 @@ fn run_bus_test(ctrl: &mut AppController) -> Result<(), String> {
         return Err(format!("msg_id 错误: 0x{:02X}", invalid.msg_id));
     }
     if invalid.payload.len() != 4 {
-        return Err(format!("LED_STATE payload 长度错误: {}", invalid.payload.len()));
+        return Err(format!(
+            "LED_STATE payload 长度错误: {}",
+            invalid.payload.len()
+        ));
     }
     if (invalid.payload[3] & BUS_LED_STATE_FLAG_ERROR) == 0 {
         return Err(format!(
@@ -1950,7 +2078,8 @@ fn run_bus_test(ctrl: &mut AppController) -> Result<(), String> {
     }
     println!(
         "[BUS] step 4 PASS: 非法长度被拒(错误标志置位, 未施加), 回显设备真值 rgb={:02X?} seq={}",
-        &invalid.payload[0..3], invalid.seq
+        &invalid.payload[0..3],
+        invalid.seq
     );
 
     // ── 扩展子项: 分片/重组、超长拒绝、坏帧、推送环溢出、回绕、统计、流式、子环池 ──
@@ -2034,7 +2163,10 @@ fn run_kbd_repair(ctrl: &mut AppController) -> ! {
     };
     let read_keycfg = |ctrl: &mut AppController, label: &str| {
         let before = ctrl.kbd_keycfg_version();
-        require!(ctrl.kbd_request_keycfg(), format!("{} KBD_GET_KEYCFG 请求", label));
+        require!(
+            ctrl.kbd_request_keycfg(),
+            format!("{} KBD_GET_KEYCFG 请求", label)
+        );
         wait_version(
             ctrl,
             before,
@@ -2045,7 +2177,10 @@ fn run_kbd_repair(ctrl: &mut AppController) -> ! {
     };
     let read_state = |ctrl: &mut AppController, label: &str| {
         let before = ctrl.kbd_state_version();
-        require!(ctrl.kbd_request_state(), format!("{} KBD_GET_STATE 请求", label));
+        require!(
+            ctrl.kbd_request_state(),
+            format!("{} KBD_GET_STATE 请求", label)
+        );
         wait_version(
             ctrl,
             before,
@@ -2056,11 +2191,18 @@ fn run_kbd_repair(ctrl: &mut AppController) -> ! {
     };
     let read_config = |ctrl: &mut AppController, label: &str| {
         let before = ctrl.config_version();
-        require!(ctrl.request_config_all(), format!("{} CFG_GET_ALL 请求", label));
+        require!(
+            ctrl.request_config_all(),
+            format!("{} CFG_GET_ALL 请求", label)
+        );
         let deadline = std::time::Instant::now() + Duration::from_secs(12);
         while std::time::Instant::now() < deadline && ctrl.config_version() <= before {
             if !pump(ctrl, 16) {
-                fail!("{} CFG_GET_ALL 期间设备断开: {:?}", label, ctrl.last_error());
+                fail!(
+                    "{} CFG_GET_ALL 期间设备断开: {:?}",
+                    label,
+                    ctrl.last_error()
+                );
             }
         }
         if ctrl.config_version() <= before {
@@ -2199,7 +2341,11 @@ fn run_kbd_repair(ctrl: &mut AppController) -> ! {
             format!(
                 "键{}={}",
                 i + 1,
-                if (resolved >> i) & 1 != 0 { "高" } else { "低" }
+                if (resolved >> i) & 1 != 0 {
+                    "高"
+                } else {
+                    "低"
+                }
             )
         })
         .collect();
@@ -2223,7 +2369,11 @@ fn run_kbd_repair(ctrl: &mut AppController) -> ! {
     let led_enable = ctrl.config_get(LED_ENABLE_KEY);
     match &led_enable {
         Some(entry) => {
-            println!("[REPAIR] {} = {}", LED_ENABLE_KEY, soak_val_text(&entry.value));
+            println!(
+                "[REPAIR] {} = {}",
+                LED_ENABLE_KEY,
+                soak_val_text(&entry.value)
+            );
             if soak_val_text(&entry.value) != LED_ENABLE_DEFAULT.to_string() {
                 reasons.push(format!(
                     "{} 期望 {} 实际 {}",
@@ -2297,6 +2447,12 @@ const DBG_LEN_WITH_SEG2: usize = 146;
 /// NvStore 各区有效掩码(单份存储: 坏只坏在那一区, 必须看得见)。
 const DBG_OFF_NV_VALID_MASK: usize = 154;
 const DBG_LEN_WITH_NV_VALID: usize = 155;
+/// EP0 DEBUG_READ 的固定 GPIO/HSIOM 尾部(见 UsbDebugGpioTail)。
+const DBG_OFF_GPIO_PC: usize = DBG_LEN_WITH_NV_VALID;
+const DBG_OFF_HSIOM_PORT_SEL: usize = DBG_OFF_GPIO_PC + 8 * 4;
+const DBG_OFF_GPIO_SWD_STATUS: usize = DBG_OFF_HSIOM_PORT_SEL + 8 * 4;
+const DBG_OFF_GPIO_READ_OK: usize = DBG_OFF_GPIO_SWD_STATUS + 4;
+const DBG_LEN_WITH_GPIO: usize = DBG_OFF_GPIO_READ_OK + 4;
 /// 上次复位时"最后一次进段时本轮已耗时"(ms) —— 定位时间到底花在哪一段。
 const DBG_OFF_LAST_STAGE_AT_MS: usize = 150;
 const DBG_LEN_WITH_STAGE_AT: usize = 154;
@@ -2305,12 +2461,25 @@ const CRASH_STAGE_LOOP_BASE: u8 = 0x10;
 const CRASH_STAGE_GAMEIO_BASE: u8 = 0x20;
 /// 段名顺序必须与固件 `enum GameIoSeg` 一一对应。
 const GAMEIO_SEG_NAMES: [&str; 8] = [
-    "binding", "serial_rx", "ser_reset", "light", "touch_map", "send_touch", "light_state",
+    "binding",
+    "serial_rx",
+    "ser_reset",
+    "light",
+    "touch_map",
+    "send_touch",
+    "light_state",
     "ledmap",
 ];
 /// 段名顺序必须与固件 `enum LoopSeg` 一一对应。
 const LOOP_SEG_NAMES: [&str; 8] = [
-    "usb_task", "psoc", "host_cmd", "tx_sched", "game_io", "keyboard", "nv_commit", "led",
+    "usb_task",
+    "psoc",
+    "host_cmd",
+    "tx_sched",
+    "game_io",
+    "keyboard",
+    "nv_commit",
+    "led",
 ];
 /// 固件 WATCHDOG_TIMEOUT_MS = 5000(main.cpp) ⇒ 余量以此为基准。
 const WATCHDOG_BUDGET_US: u32 = 5_000_000;
@@ -2331,7 +2500,11 @@ struct LoopProfile {
 /// fault=0 且 last_loop_max 很小 → 既没跑飞也没拖慢, 那就是外部原因(掉电/XRES/主动重启)。
 fn print_post_mortem(tag: &str, b: &[u8]) {
     if b.len() < DBG_LEN_WITH_POSTMORTEM {
-        println!("{} 诊断结构无死前遗言增强段(len={}), 固件需更新", tag, b.len());
+        println!(
+            "{} 诊断结构无死前遗言增强段(len={}), 固件需更新",
+            tag,
+            b.len()
+        );
         return;
     }
     let stage = b[48];
@@ -2365,7 +2538,10 @@ fn print_post_mortem(tag: &str, b: &[u8]) {
     } else if stage >= CRASH_STAGE_LOOP_BASE
         && (stage - CRASH_STAGE_LOOP_BASE) < LOOP_SEG_NAMES.len() as u8
     {
-        format!("主循环段 {}", LOOP_SEG_NAMES[(stage - CRASH_STAGE_LOOP_BASE) as usize])
+        format!(
+            "主循环段 {}",
+            LOOP_SEG_NAMES[(stage - CRASH_STAGE_LOOP_BASE) as usize]
+        )
     } else {
         format!("CrashStage {}", stage)
     };
@@ -2420,7 +2596,8 @@ fn read_loop_profile(ctrl: &AppController) -> Option<LoopProfile> {
     if bytes.len() < DBG_LEN_WITH_PROFILE {
         return None;
     }
-    let u32_at = |o: usize| u32::from_le_bytes([bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]]);
+    let u32_at =
+        |o: usize| u32::from_le_bytes([bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]]);
     let mut seg = [0u32; 8];
     for (i, slot) in seg.iter_mut().enumerate() {
         *slot = u32_at(DBG_OFF_SEG_MAX_US + i * 4);
@@ -2651,7 +2828,10 @@ fn mai2_load_serial_thread(
                     println!("[LOAD] 线程A 读错误: {}", e);
                 }
                 if consecutive_errors >= ERROR_GIVE_UP {
-                    println!("[LOAD] 线程A 连续 {} 次错误, 判端口已失效, 退出。", ERROR_GIVE_UP);
+                    println!(
+                        "[LOAD] 线程A 连续 {} 次错误, 判端口已失效, 退出。",
+                        ERROR_GIVE_UP
+                    );
                     return;
                 }
                 thread::sleep(Duration::from_millis(50));
@@ -2765,7 +2945,10 @@ fn mai2_load_light_thread(
         if errored {
             consecutive_errors += 1;
             if consecutive_errors >= ERROR_GIVE_UP {
-                println!("[LOAD] 线程B 连续 {} 次错误, 判端口已失效, 退出。", ERROR_GIVE_UP);
+                println!(
+                    "[LOAD] 线程B 连续 {} 次错误, 判端口已失效, 退出。",
+                    ERROR_GIVE_UP
+                );
                 return;
             }
             thread::sleep(Duration::from_millis(50));
@@ -2852,14 +3035,14 @@ fn run_mai2_load(
     };
     let serial_baud = baud_of("comm.serial_baud");
     let light_baud = baud_of("comm.light_baud");
-    println!(
-        "[LOAD] 波特率: serial={} light={}",
-        serial_baud, light_baud
-    );
+    println!("[LOAD] 波特率: serial={} light={}", serial_baud, light_baud);
 
     // 干净窗口: 峰值量不可差分, 先清零再压。
     if let Err(e) = ctrl.clear_loop_profile() {
-        println!("[LOAD] FAIL 清零主循环剖面失败(固件是否为带剖面的新版本?): {}", e);
+        println!(
+            "[LOAD] FAIL 清零主循环剖面失败(固件是否为带剖面的新版本?): {}",
+            e
+        );
         std::process::exit(1);
     }
     let base = match read_loop_profile(ctrl) {
@@ -2946,7 +3129,9 @@ fn run_mai2_load(
         if lanes.heavy && !heavy_tune_fired && t0.elapsed() >= Duration::from_secs(2) {
             heavy_tune_fired = true;
             match ctrl.auto_tune(0) {
-                Ok(()) => println!("[LOAD] 已发起 ch0 频率自适应(长周期在途), 后续长周期指令应被闸门拒绝"),
+                Ok(()) => {
+                    println!("[LOAD] 已发起 ch0 频率自适应(长周期在途), 后续长周期指令应被闸门拒绝")
+                }
                 Err(e) => println!("[LOAD] 频率自适应发起失败: {}", e),
             }
         }
@@ -3064,7 +3249,12 @@ fn run_mai2_load(
     }
     println!(
         "[LOAD] 重启={} 掉线={} vendor_rx_dropped={}(基线 {}) nv_commit_fail={} 最后成功采样 loop_count={}",
-        reboots, disconnects, worst.rx_dropped, base.rx_dropped, worst.nv_commit_fail, last_loop_count
+        reboots,
+        disconnects,
+        worst.rx_dropped,
+        base.rx_dropped,
+        worst.nv_commit_fail,
+        last_loop_count
     );
     println!(
         "[LOAD] 反堆叠闸门: 拒绝累计={}(基线 {}, 本轮 +{}) 当前在途={} 主动发起长周期指令={}",
@@ -3150,8 +3340,32 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     // 虚拟摄像头探测不依赖 WinUSB 固件，必须在设备枚举之前独立退出。
     if args.iter().any(|a| a == "--vcam-probe") {
-        _run_vcam_probe();
-        return;
+        std::process::exit(if _run_vcam_probe() { 0 } else { 1 });
+    }
+    // 复用 UI 的真实部署事务，供无头验收双位宽注册/卸载；两条路径都会独立核验注册表与文件。
+    if args.iter().any(|a| a == "--vcam-install") {
+        match mai2control_ui::vcam::backend::install() {
+            Ok(status) => {
+                println!("[VCAM] install PASS: {}", status);
+                std::process::exit(0);
+            }
+            Err(error) => {
+                println!("[VCAM] install FAIL: {}", error);
+                std::process::exit(1);
+            }
+        }
+    }
+    if args.iter().any(|a| a == "--vcam-uninstall") {
+        match mai2control_ui::vcam::backend::uninstall() {
+            Ok(status) => {
+                println!("[VCAM] uninstall PASS: {}", status);
+                std::process::exit(0);
+            }
+            Err(error) => {
+                println!("[VCAM] uninstall FAIL: {}", error);
+                std::process::exit(1);
+            }
+        }
     }
     let reboot_bootloader = args.iter().any(|a| a == "--reboot-bootloader");
     let reboot_bootloader_only = args.iter().any(|a| a == "--reboot-bootloader-only");
@@ -3285,7 +3499,8 @@ fn main() {
             Ok(b) if b.len() >= 44 => {
                 let le16 = |o: usize| u16::from_le_bytes([b[o], b[o + 1]]);
                 let le32 = |o: usize| u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
-                println!("[DBG] magic=0x{:04X} len={}", le16(0), le16(2));
+                let report_len = usize::from(le16(2)).min(b.len());
+                println!("[DBG] magic=0x{:04X} len={}", le16(0), report_len);
                 println!("[DBG] loop_count={}", le32(4));
                 println!("[DBG] tud_task_count={}", le32(8));
                 println!("[DBG] vendor_rx_cb_count={}", le32(12));
@@ -3302,7 +3517,7 @@ fn main() {
                     b[44], b[45], b[46], b[47]
                 );
                 // 死前遗言: 上次复位前 core0 停在哪个阶段 + 上次是否为看门狗复位。
-                if b.len() > 49 {
+                if report_len > 49 {
                     let stage = match b[48] {
                         0 => "none/unknown",
                         1 => "CFG_FLASH(ConfigManager::save_config_task)",
@@ -3320,7 +3535,7 @@ fn main() {
                     );
                 }
                 // flash 子系统真相: lfs 是否挂载 + 保存流程走到第几步(死在哪半段一目了然)。
-                if b.len() > 52 {
+                if report_len > 52 {
                     let ss = b[52] as i8;
                     let step = match ss {
                         0 => "未进入过保存",
@@ -3336,7 +3551,7 @@ fn main() {
                         b[50], b[51], ss, step
                     );
                 }
-                if b.len() >= 67 {
+                if report_len >= 67 {
                     println!(
                         "[DBG] nv_dirty_mask={} nv_commit_ok={} nv_commit_fail={} nv_algo_src_len={}",
                         b[54],
@@ -3363,19 +3578,47 @@ fn main() {
                         );
                     }
                 }
-                if b.len() >= DBG_LEN_WITH_NV_VALID {
+                if report_len >= DBG_LEN_WITH_NV_VALID {
                     const NV_REGION_NAMES: [&str; 4] = ["KV", "CSD", "ALGO_BIN", "ALGO_SRC"];
                     let m = b[DBG_OFF_NV_VALID_MASK];
                     let list: Vec<String> = NV_REGION_NAMES
                         .iter()
                         .enumerate()
                         .map(|(i, n)| {
-                            format!("{}={}", n, if (m >> i) & 1 == 1 { "有效" } else { "无效" })
+                            format!(
+                                "{}={}",
+                                n,
+                                if (m >> i) & 1 == 1 {
+                                    "有效"
+                                } else {
+                                    "无效"
+                                }
+                            )
                         })
                         .collect();
                     println!("[DBG] nv_valid_mask=0x{:X} {}", m, list.join(" "));
                 }
-                if b.len() >= DBG_LEN_WITH_SEG2 {
+                if report_len >= DBG_LEN_WITH_GPIO {
+                    let pc = le32(DBG_OFF_GPIO_PC + 4);
+                    let hsiom = le32(DBG_OFF_HSIOM_PORT_SEL + 4);
+                    let dm = (pc >> (7 * 3)) & 0x7;
+                    let hsiom_sel = (hsiom >> (7 * 4)) & 0xF;
+                    println!(
+                        "[DBG] GPIO SWD: read_ok={} status={} P1.PC=0x{:08X} P1.HSIOM=0x{:08X} P1.7 DM={} HSIOM={}",
+                        b[DBG_OFF_GPIO_READ_OK],
+                        le32(DBG_OFF_GPIO_SWD_STATUS),
+                        pc,
+                        hsiom,
+                        dm,
+                        hsiom_sel
+                    );
+                } else {
+                    println!(
+                        "[DBG] GPIO SWD tail unavailable (report_len={})",
+                        report_len
+                    );
+                }
+                if report_len >= DBG_LEN_WITH_SEG2 {
                     for (i, name) in GAMEIO_SEG_NAMES.iter().enumerate() {
                         println!(
                             "[DBG]   gio {:<11} max={}us",
@@ -3634,6 +3877,16 @@ fn main() {
             );
         }
         let _ = ctrl.stop_telemetry();
+        // ★逐通道档下"实测探测周期"必须仍有值★
+        // 36 通道 × 4 字段远超 64B vendor FIFO, 固件按帧切分且**只有首帧带 STATS**。
+        // 上位机若无条件用每帧的 stats 覆盖, 后续无 STATS 的帧会立刻把真值冲成 0 ——
+        // 症状是"全局调整页始终未测"而主页(轻档、每帧带 STATS)看着正常。这里把它钉住。
+        println!(
+            "[SELFTEST] TELEM stats: scan_period_us={} samples_per_sec={} valid={}",
+            ctrl.telem_scan_period_us(),
+            ctrl.telem_samples_per_sec(),
+            ctrl.telem_scan_period_valid()
+        );
         println!("[SELFTEST] TELEM-ONLY DONE");
         std::process::exit(0);
     }
@@ -4384,105 +4637,245 @@ fn main() {
         std::process::exit(0);
     }
 
-    // IDAC增益夹紧(防越界崩溃) + inactive屏障 生效性诊断。
+    // IDAC 增益围栏 + inactive 下禁用电极的真实 GPIO High-Z 诊断。
     if args.iter().any(|a| a == "--gain-inactive-test") {
+        const G_INACTIVE: u8 = 0x01;
+        const G_IDAC_GAIN: u8 = 0x02;
+        const PARAM_IDAC_GAIN: u8 = 0x0B;
+        const PARAM_ENABLED: u8 = 0x0C;
+        const TARGET_CH: u8 = 35;
+        let settle = |ctrl: &mut AppController, ms: u64| {
+            let deadline = std::time::Instant::now() + Duration::from_millis(ms);
+            while std::time::Instant::now() < deadline {
+                ctrl.poll();
+                thread::sleep(Duration::from_millis(15));
+            }
+        };
         let get_g = |ctrl: &mut AppController, id: u8| -> Option<u32> {
             let _ = ctrl.global_get(id);
-            let s = std::time::Instant::now();
-            while s.elapsed() < Duration::from_millis(400) {
-                ctrl.poll();
-                thread::sleep(Duration::from_millis(12));
-            }
+            settle(ctrl, 500);
             ctrl.global(id)
         };
+        let get_param = |ctrl: &mut AppController, ch: u8, id: u8| -> Option<u32> {
+            let before = ctrl.param_version();
+            if ctrl.request_params(ch).is_err() {
+                return None;
+            }
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while std::time::Instant::now() < deadline {
+                ctrl.poll();
+                if ctrl.param_version() > before {
+                    return ctrl.param(ch, id);
+                }
+                thread::sleep(Duration::from_millis(15));
+            }
+            None
+        };
+        let save_and_settle = |ctrl: &mut AppController, stage: &str| -> Result<(), String> {
+            ctrl.save_config()
+                .map_err(|error| format!("{}: save_config: {}", stage, error))?;
+            let deadline = std::time::Instant::now() + Duration::from_secs(35);
+            while std::time::Instant::now() < deadline {
+                ctrl.poll();
+                if ctrl.cfg_tx_pending() == 0 && ctrl.config_dirty_count() == 0 {
+                    return Ok(());
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            Err(format!(
+                "{}: 保存超时(pending={} dirty={})",
+                stage,
+                ctrl.cfg_tx_pending(),
+                ctrl.config_dirty_count()
+            ))
+        };
+        let verify_ch35_gpio = |ctrl: &AppController,
+                                mode: &str,
+                                stage: &str|
+         -> Result<(), String> {
+            let bytes = ctrl
+                .read_debug_counters()
+                .map_err(|error| format!("mode={} stage={}: DEBUG_READ: {}", mode, stage, error))?;
+            if bytes.len() < 4 {
+                return Err(format!(
+                    "mode={} stage={}: DEBUG_READ 太短({})",
+                    mode,
+                    stage,
+                    bytes.len()
+                ));
+            }
+            let le16 = |offset: usize| u16::from_le_bytes([bytes[offset], bytes[offset + 1]]);
+            let le32 = |offset: usize| {
+                u32::from_le_bytes([
+                    bytes[offset],
+                    bytes[offset + 1],
+                    bytes[offset + 2],
+                    bytes[offset + 3],
+                ])
+            };
+            let report_len = usize::from(le16(2)).min(bytes.len());
+            if report_len < DBG_LEN_WITH_GPIO {
+                return Err(format!(
+                    "mode={} stage={}: GPIO 尾部缺失(report_len={}, need={})",
+                    mode, stage, report_len, DBG_LEN_WITH_GPIO
+                ));
+            }
+            let pc = le32(DBG_OFF_GPIO_PC + 4);
+            let hsiom = le32(DBG_OFF_HSIOM_PORT_SEL + 4);
+            let dm = (pc >> (7 * 3)) & 0x7;
+            let hsiom_sel = (hsiom >> (7 * 4)) & 0xF;
+            let read_ok = bytes[DBG_OFF_GPIO_READ_OK];
+            let swd_status = le32(DBG_OFF_GPIO_SWD_STATUS);
+            println!(
+                "[GI] mode={} stage={} raw PC(P1)=0x{:08X} HSIOM(P1)=0x{:08X} DM(P1.7)={} HSIOM(P1.7)={} read_ok={} swd_status={}",
+                mode, stage, pc, hsiom, dm, hsiom_sel, read_ok, swd_status
+            );
+            if read_ok != 1 {
+                return Err(format!(
+                    "mode={} stage={}: GPIO SWD read_ok={} status={}",
+                    mode, stage, read_ok, swd_status
+                ));
+            }
+            if dm != 1 || hsiom_sel != 0 {
+                return Err(format!(
+                    "mode={} stage={}: P1.7 expected DM=1 HSIOM=0, got DM={} HSIOM={}",
+                    mode, stage, dm, hsiom_sel
+                ));
+            }
+            Ok(())
+        };
+        let run_cp_bist = |ctrl: &mut AppController, mode: &str| -> Result<(), String> {
+            ctrl.measure_cp()
+                .map_err(|error| format!("mode={}: Cp BIST submit: {}", mode, error))?;
+            settle(ctrl, 4_000);
+            Ok(())
+        };
+
+        let original_inactive = get_g(&mut ctrl, G_INACTIVE).unwrap_or(1);
+        let original_enabled = get_param(&mut ctrl, TARGET_CH, PARAM_ENABLED).unwrap_or(1) != 0;
+        let mut failures: Vec<String> = Vec::new();
         println!(
-            "[GI] 基线: IDAC_GAIN_INIT(0x02)={:?} INACTIVE_SNS(0x01)={:?}",
-            get_g(&mut ctrl, 0x02),
-            get_g(&mut ctrl, 0x01)
+            "[GI] 基线: IDAC_GAIN_INIT(0x02)={:?} INACTIVE_SNS(0x01)={} CH35 enabled={}",
+            get_g(&mut ctrl, G_IDAC_GAIN),
+            original_inactive,
+            original_enabled
         );
 
-        // 增益=7(越界值): 应被夹紧拒绝且设备不崩溃。用 debug_global_now(不写草稿)使回读=设备真值。
-        let _ = ctrl.debug_global_now(0x02, 7);
-        thread::sleep(Duration::from_millis(300));
-        let g7 = get_g(&mut ctrl, 0x02);
-        println!(
-            "[GI] 设增益=7后回读(设备真值)={:?} → {}",
-            g7,
-            if g7 != Some(7) {
-                "PASS 被拒(未越界)"
-            } else {
-                "FAIL 接受了7(会越界崩溃)"
-            }
-        );
-        // 增益=6(合法上限): 应被接受。
-        let _ = ctrl.debug_global_now(0x02, 6);
-        thread::sleep(Duration::from_millis(300));
-        let g6 = get_g(&mut ctrl, 0x02);
-        println!(
-            "[GI] 设增益=6后回读(设备真值)={:?} → {}",
-            g6,
-            if g6 == Some(6) {
-                "PASS 接受"
-            } else {
-                "FAIL 未接受合法值6"
-            }
-        );
-
-        // per-channel IDAC_GAIN(0x0B) ch0: 7 拒 / 6 收。
-        let _ = ctrl.debug_param_now(0, 0x0B, 7);
-        thread::sleep(Duration::from_millis(200));
-        let _ = ctrl.request_params(0);
-        let s = std::time::Instant::now();
-        while s.elapsed() < Duration::from_millis(500) {
-            ctrl.poll();
-            thread::sleep(Duration::from_millis(12));
+        match ctrl.debug_global_now(G_IDAC_GAIN, 7) {
+            Err(error) => println!("[GI] 增益=7 被主机围栏拒绝: {}", error),
+            Ok(()) => settle(&mut ctrl, 300),
         }
-        let p7 = ctrl.param(0, 0x0B);
-        println!(
-            "[GI] CH0 param增益=7后回读={:?} → {}",
-            p7,
-            if p7 != Some(7) {
-                "PASS 被拒"
-            } else {
-                "FAIL 接受7"
-            }
-        );
+        let g7 = get_g(&mut ctrl, G_IDAC_GAIN);
+        println!("[GI] 增益=7 回读={:?}", g7);
+        if g7 == Some(7) {
+            failures.push("IDAC_GAIN_INIT 非法值 7 被接受".to_string());
+        }
+        if let Err(error) = ctrl.debug_global_now(G_IDAC_GAIN, 6) {
+            failures.push(format!("IDAC_GAIN_INIT=6 下发失败: {}", error));
+        }
+        settle(&mut ctrl, 300);
+        let g6 = get_g(&mut ctrl, G_IDAC_GAIN);
+        println!("[GI] 增益=6 回读={:?}", g6);
+        if g6 != Some(6) {
+            failures.push(format!("IDAC_GAIN_INIT 合法值 6 未生效: {:?}", g6));
+        }
+        match ctrl.debug_param_now(0, PARAM_IDAC_GAIN, 7) {
+            Err(error) => println!("[GI] CH0 增益=7 被主机围栏拒绝: {}", error),
+            Ok(()) => settle(&mut ctrl, 300),
+        }
+        let p7 = get_param(&mut ctrl, 0, PARAM_IDAC_GAIN);
+        println!("[GI] CH0 param 增益=7 回读={:?}", p7);
+        if p7 == Some(7) {
+            failures.push("CH0 IDAC_GAIN 非法值 7 被接受".to_string());
+        }
 
-        // inactive: 2(High-Z)/4(Shield) 应生效(RP2040 自动 global_commit → PSoC Init 重算)。设备真值回读。
-        let _ = ctrl.debug_global_now(0x01, 2);
-        thread::sleep(Duration::from_millis(400));
-        let iz = get_g(&mut ctrl, 0x01);
-        println!(
-            "[GI] 设inactive=2(High-Z)后回读(设备真值)={:?} → {}",
-            iz,
-            if iz == Some(2) {
-                "PASS 生效"
-            } else {
-                "FAIL 未生效"
-            }
-        );
-        let _ = ctrl.debug_global_now(0x01, 4);
-        thread::sleep(Duration::from_millis(400));
-        let ish = get_g(&mut ctrl, 0x01);
-        println!(
-            "[GI] 设inactive=4(Shield)后回读(设备真值)={:?} → {}",
-            ish,
-            if ish == Some(4) {
-                "PASS 生效"
-            } else {
-                "FAIL 未生效"
-            }
-        );
+        if let Err(error) = ctrl.set_ch_enabled(TARGET_CH, false) {
+            failures.push(format!("禁用 CH35 草稿失败: {}", error));
+        }
+        if let Err(error) = save_and_settle(&mut ctrl, "禁用 CH35") {
+            failures.push(error);
+        }
+        let disabled = get_param(&mut ctrl, TARGET_CH, PARAM_ENABLED);
+        println!("[GI] CH35 disabled readback={:?}", disabled);
+        if disabled != Some(0) {
+            failures.push(format!("禁用 CH35 回读期望 0, 实得 {:?}", disabled));
+        }
 
-        // 复位到安全默认(GND, 增益4)。
-        let _ = ctrl.debug_global_now(0x01, 1);
-        let _ = ctrl.debug_global_now(0x02, 4);
+        for (mode, inactive) in [("GND", 1u32), ("Shield", 4u32)] {
+            if let Err(error) = ctrl.debug_global_now(G_INACTIVE, inactive) {
+                failures.push(format!("mode={}: INACTIVE_SNS 下发失败: {}", mode, error));
+                continue;
+            }
+            if let Err(error) = ctrl.global_commit() {
+                failures.push(format!("mode={}: GLOBAL_COMMIT 下发失败: {}", mode, error));
+                continue;
+            }
+            settle(&mut ctrl, 3_000);
+            let actual = get_g(&mut ctrl, G_INACTIVE);
+            println!("[GI] mode={} INACTIVE_SNS readback={:?}", mode, actual);
+            if actual != Some(inactive) {
+                failures.push(format!(
+                    "mode={}: INACTIVE_SNS 期望 {}, 实得 {:?}",
+                    mode, inactive, actual
+                ));
+            }
+            if let Err(error) = verify_ch35_gpio(&ctrl, mode, "after-apply") {
+                failures.push(error);
+            }
+            if let Err(error) = run_cp_bist(&mut ctrl, mode) {
+                failures.push(error);
+            }
+            if let Err(error) = verify_ch35_gpio(&ctrl, mode, "after-cp-bist") {
+                failures.push(error);
+            }
+        }
+
+        if let Err(error) = ctrl.debug_global_now(G_INACTIVE, original_inactive) {
+            failures.push(format!("恢复 INACTIVE_SNS 下发失败: {}", error));
+        }
+        if let Err(error) = ctrl.global_commit() {
+            failures.push(format!("恢复 INACTIVE_SNS GLOBAL_COMMIT 失败: {}", error));
+        }
+        settle(&mut ctrl, 3_000);
+        let inactive_after = get_g(&mut ctrl, G_INACTIVE);
+        if inactive_after != Some(original_inactive) {
+            failures.push(format!(
+                "恢复 INACTIVE_SNS 期望 {}, 实得 {:?}",
+                original_inactive, inactive_after
+            ));
+        }
+        if let Err(error) = ctrl.set_ch_enabled(TARGET_CH, original_enabled) {
+            failures.push(format!("恢复 CH35 启用态草稿失败: {}", error));
+        }
+        if let Err(error) = save_and_settle(&mut ctrl, "恢复 CH35 启用态") {
+            failures.push(error);
+        }
+        let enabled_after = get_param(&mut ctrl, TARGET_CH, PARAM_ENABLED);
+        let expected_enabled = if original_enabled { 1 } else { 0 };
+        println!(
+            "[GI] restore INACTIVE_SNS={:?} CH35 enabled={:?}",
+            inactive_after, enabled_after
+        );
+        if enabled_after != Some(expected_enabled) {
+            failures.push(format!(
+                "恢复 CH35 启用态期望 {}, 实得 {:?}",
+                expected_enabled, enabled_after
+            ));
+        }
+
+        let _ = ctrl.debug_global_now(G_IDAC_GAIN, 4);
         for ch in 0..36u8 {
-            let _ = ctrl.debug_param_now(ch, 0x0B, 4);
+            let _ = ctrl.debug_param_now(ch, PARAM_IDAC_GAIN, 4);
         }
-        thread::sleep(Duration::from_millis(300));
-        println!("[GI] 已复位 inactive=GND 增益=4; 全程设备存活(能回读)=未崩溃");
-        std::process::exit(0);
+        settle(&mut ctrl, 300);
+        if failures.is_empty() {
+            println!("[GI] PASS gain fence + CH35 P1.7 inactive GPIO evidence");
+            std::process::exit(0);
+        }
+        for failure in failures {
+            println!("[GI] FAIL {}", failure);
+        }
+        std::process::exit(1);
     }
 
     // 建立"半自动默认基线": 先让 PSoC 在 AUTO 下把阈值/snsClk/IDAC 自动算好, 显式捕获成手动基线,
@@ -4526,9 +4919,14 @@ fn main() {
             .and_then(|i| args.get(i + 1))
             .and_then(|s| s.parse().ok());
         if let Some(d) = div_override {
-            println!("[BASE] 2) 把出厂默认阈值 + SNS_CLK_DIV={} 写进全 36 通道...", d);
+            println!(
+                "[BASE] 2) 把出厂默认阈值 + SNS_CLK_DIV={} 写进全 36 通道...",
+                d
+            );
         } else {
-            println!("[BASE] 2) 把出厂默认阈值写进全 36 通道(分频保持设备现值; 需要纠正时加 --div 32)...");
+            println!(
+                "[BASE] 2) 把出厂默认阈值写进全 36 通道(分频保持设备现值; 需要纠正时加 --div 32)..."
+            );
         }
         for ch in 0u8..36u8 {
             for (pid, v) in BASE {
@@ -4833,7 +5231,8 @@ fn main() {
         }
         println!(
             "[ALGODEF] 现在: is_default/psoc_valid/len = {:?}",
-            ctrl.algo_info().map(|i| (i.is_default, i.psoc_valid, i.len))
+            ctrl.algo_info()
+                .map(|i| (i.is_default, i.psoc_valid, i.len))
         );
         println!("[ALGODEF] DONE (请重启设备使 PSoC 重新加载默认算法)");
         std::process::exit(0);
@@ -4928,8 +5327,15 @@ fn main() {
         if !identity_ok || !runtime_ok {
             println!(
                 "[SELFTEST] FAIL diagnostic identity/runtime: identity_ok={} runtime_ok={} last={} failure={} flags=0x{:04X} (最低要求 RP>={} PSoC>={}, 实际 RP={} PSoC={})",
-                identity_ok, runtime_ok, diag.last_stage, diag.failure_stage, diag.flags,
-                min_rp_stamp, min_psoc_stamp, info.fw_version, diag.embedded_psoc_version
+                identity_ok,
+                runtime_ok,
+                diag.last_stage,
+                diag.failure_stage,
+                diag.flags,
+                min_rp_stamp,
+                min_psoc_stamp,
+                info.fw_version,
+                diag.embedded_psoc_version
             );
             std::process::exit(1);
         }
@@ -5474,6 +5880,24 @@ fn main() {
         thread::sleep(Duration::from_millis(50));
     }
 
+    // 保存完整自测会临时修改的 CH0 参数；后续无论 Cp 验收成败均不能遗留测试值。
+    const TH_PARAM: u8 = 0x01; // FINGER_TH
+    const CLK_PARAM: u8 = 0x08; // SNS_CLK_DIV
+    let th_orig = match ctrl.param(0, TH_PARAM) {
+        Some(value) => value,
+        None => {
+            println!("[SELFTEST] FAIL 未找到 CH0 FINGER_TH 原值");
+            std::process::exit(1);
+        }
+    };
+    let clk_orig = match ctrl.param(0, CLK_PARAM) {
+        Some(value) => value,
+        None => {
+            println!("[SELFTEST] FAIL 未找到 CH0 SNS_CLK_DIV 原值");
+            std::process::exit(1);
+        }
+    };
+
     // Step 7b: SET_PARAM round-trip 验证(证明写入真正落地 PSoC widgetContext,非仅回显)
     // 用 onDebounce(0x05)：标准完整处理链不会重写该字段，可干净验证写入机制。
     const TEST_PARAM: u8 = 0x05; // ON_DEBOUNCE
@@ -5527,9 +5951,204 @@ fn main() {
     let _ = ctrl.set_param(0, TEST_PARAM, orig_val);
     thread::sleep(Duration::from_millis(50));
 
+    // ── Step 7b-2: 通道启用开关(PARAM_ENABLED=0x0C)真机往返 ────────────────────────
+    // ★这一项必须走"保存到设备"才算数★: set_ch_enabled 只写草稿, 而 param() 是草稿优先 ——
+    // 不落盘就回读只会读到自己刚写的草稿, 证明不了任何事。故序列是
+    //   草稿 → save_config(排队串行下发) → 等 dirty 清零 → GET_ALL 回读设备真值 → 遥测取证。
+    // 遥测取证是关键: 禁用后该通道 raw 必须恒 0(电极高阻/不参与扫描), 而相邻参照通道照旧有读数,
+    // 这才排除了"只是不上报"的伪关闭; 重新启用后 raw 必须回来(固件只为该通道重做校准+基线)。
+    const EN_PARAM: u8 = 0x0C;
+    const EN_CH: u8 = 35; // 目标通道(Cp 正常)
+    const EN_REF_CH: u8 = 34; // 参照通道: 证明只关掉了目标, 没有连坐
+    let save_and_settle = |ctrl: &mut AppController, what: &str| -> bool {
+        if let Err(e) = ctrl.save_config() {
+            println!("[SELFTEST] FAIL 保存({}) : {}", what, e);
+            return false;
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            ctrl.poll();
+            if ctrl.cfg_tx_pending() == 0 && ctrl.config_dirty_count() == 0 {
+                return true;
+            }
+            if std::time::Instant::now() > deadline {
+                println!(
+                    "[SELFTEST] FAIL 保存({})超时: 待发 {} 帧, 未清脏 {} 项",
+                    what,
+                    ctrl.cfg_tx_pending(),
+                    ctrl.config_dirty_count()
+                );
+                return false;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    };
+    let device_param = |ctrl: &mut AppController, ch: u8, id: u8| -> Option<u32> {
+        let base = ctrl.param_version();
+        if let Err(e) = ctrl.request_params(ch) {
+            println!("[SELFTEST] FAIL request_params(CH{}): {}", ch, e);
+            return None;
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            ctrl.poll();
+            if ctrl.param_version() > base || std::time::Instant::now() > deadline {
+                return ctrl.param(ch, id);
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    };
+    // ★必须等"新帧"再读★: telem_latest 是缓存, 切换前那一帧会一直留在里面 —— 直接读它
+    // (或在窗口里取峰值)只会读到禁用之前的旧读数, 从而把"真关闭"误判成"没关掉"。
+    // 故先把帧计数推进若干帧, 再取当前值; 推不动就是遥测本身出了问题, 如实报出。
+    let pump_frames = |ctrl: &mut AppController, frames: u64, ms: u64| -> bool {
+        let base = ctrl.telem_version();
+        let deadline = std::time::Instant::now() + Duration::from_millis(ms);
+        loop {
+            ctrl.poll();
+            if ctrl.telem_version() >= base + frames {
+                return true;
+            }
+            if std::time::Instant::now() > deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+    };
+    let latest_raw = |ctrl: &AppController, ch: u8| {
+        ctrl.telem_latest(ch).and_then(|s| s.raw).unwrap_or(0) as u32
+    };
+    let restore_ch0_params = |ctrl: &mut AppController, stage: &str| -> bool {
+        println!(
+            "[SELFTEST] 恢复 CH0 FINGER_TH/SNS_CLK_DIV 原值 ({})...",
+            stage
+        );
+        let mut restored = true;
+        for (id, value, name) in [
+            (TH_PARAM, th_orig, "FINGER_TH"),
+            (CLK_PARAM, clk_orig, "SNS_CLK_DIV"),
+        ] {
+            if let Err(e) = ctrl.set_param(0, id, value) {
+                println!("[SELFTEST] WARN 恢复 CH0 {}={} 失败: {}", name, value, e);
+                restored = false;
+            }
+        }
+        if let Err(e) = ctrl.calibrate(u64::MAX) {
+            println!("[SELFTEST] WARN 恢复 CH0 参数 APPLY 失败: {}", e);
+            restored = false;
+        }
+        if !save_and_settle(ctrl, "恢复 CH0 FINGER_TH/SNS_CLK_DIV") {
+            restored = false;
+        }
+        let th_readback = device_param(ctrl, 0, TH_PARAM);
+        let clk_readback = device_param(ctrl, 0, CLK_PARAM);
+        let readback_ok = th_readback == Some(th_orig) && clk_readback == Some(clk_orig);
+        if readback_ok {
+            println!(
+                "[SELFTEST] CH0 临时参数已恢复并回读确认: FINGER_TH={} SNS_CLK_DIV={}",
+                th_orig, clk_orig
+            );
+        } else {
+            println!(
+                "[SELFTEST] WARN CH0 临时参数恢复回读不匹配: FINGER_TH 期望 {} 实得 {:?}, SNS_CLK_DIV 期望 {} 实得 {:?}",
+                th_orig, th_readback, clk_orig, clk_readback
+            );
+        }
+        restored && readback_ok
+    };
+    let restore_then_auto = |ctrl: &mut AppController, stage: &str| {
+        if !restore_ch0_params(ctrl, stage) {
+            println!("[SELFTEST] WARN CH0 临时参数恢复未完全确认");
+        }
+        if let Err(e) = ctrl.set_mode(0) {
+            println!("[SELFTEST] WARN 恢复自动模式失败: {}", e);
+        }
+    };
+    println!(
+        "[SELFTEST] ENABLED(0x0C) 往返: 目标 CH{} / 参照 CH{}",
+        EN_CH, EN_REF_CH
+    );
+    let en_orig = device_param(&mut ctrl, EN_CH, EN_PARAM);
+    println!("[SELFTEST]   初始设备值 CH{} enabled={:?}", EN_CH, en_orig);
+    let mut en_fail: Option<String> = None;
+    if let Err(e) = ctrl.set_ch_enabled(EN_CH, false) {
+        en_fail = Some(format!("set_ch_enabled(false) 失败: {}", e));
+    }
+    if en_fail.is_none() && !save_and_settle(&mut ctrl, "禁用通道") {
+        en_fail = Some("禁用后保存未完成".to_string());
+    }
+    if en_fail.is_none() {
+        match device_param(&mut ctrl, EN_CH, EN_PARAM) {
+            Some(0) => println!("[SELFTEST]   禁用回读 OK: 设备侧 enabled=0"),
+            other => en_fail = Some(format!("禁用回读期望 0 实得 {:?}", other)),
+        }
+    }
+    if en_fail.is_none() {
+        if let Err(e) = ctrl.start_telemetry(200, 0x1F, u64::MAX) {
+            en_fail = Some(format!("start_telemetry(禁用后): {}", e));
+        } else if !pump_frames(&mut ctrl, 40, 5000) {
+            en_fail = Some("禁用后 5s 内收不到 40 帧遥测, 无法取证".to_string());
+        } else {
+            let off_target = latest_raw(&ctrl, EN_CH);
+            let off_ref = latest_raw(&ctrl, EN_REF_CH);
+            println!(
+                "[SELFTEST]   禁用后新帧 raw: CH{}={} CH{}={}",
+                EN_CH, off_target, EN_REF_CH, off_ref
+            );
+            if off_target != 0 {
+                en_fail = Some(format!(
+                    "禁用后 CH{} 仍在出数(raw 峰值 {}) — 不是真关闭",
+                    EN_CH, off_target
+                ));
+            } else if off_ref == 0 {
+                en_fail = Some(format!(
+                    "参照 CH{} 也停了(raw 峰值 0) — 禁用连坐到了其它通道",
+                    EN_REF_CH
+                ));
+            }
+        }
+    }
+    // 无论成败都要把通道恢复回启用(禁用态会落 flash, 留给用户就是"一个通道莫名不工作")。
+    let restore_on = en_orig.unwrap_or(1) != 0;
+    if let Err(e) = ctrl.set_ch_enabled(EN_CH, restore_on) {
+        println!("[SELFTEST] WARN 恢复 CH{} 启用态失败: {}", EN_CH, e);
+    }
+    let restored = save_and_settle(&mut ctrl, "恢复通道启用态");
+    if en_fail.is_none() && restore_on {
+        match device_param(&mut ctrl, EN_CH, EN_PARAM) {
+            Some(1) => println!("[SELFTEST]   重新启用回读 OK: 设备侧 enabled=1"),
+            other => en_fail = Some(format!("重新启用回读期望 1 实得 {:?}", other)),
+        }
+        // 重新启用要给固件留出"该通道重校准 + 重建基线"的时间, 故多推几帧再取。
+        if !pump_frames(&mut ctrl, 80, 8000) {
+            println!("[SELFTEST] WARN 重新启用后遥测帧推进不足, 读数可能偏旧");
+        }
+        let on_target = latest_raw(&ctrl, EN_CH);
+        println!("[SELFTEST]   重新启用后新帧 raw: CH{}={}", EN_CH, on_target);
+        if en_fail.is_none() && on_target == 0 {
+            en_fail = Some(format!(
+                "重新启用后 CH{} 仍无读数(raw 峰值 0) — 恢复扫描/校准未生效",
+                EN_CH
+            ));
+        }
+    }
+    let _ = ctrl.stop_telemetry();
+    if !restored {
+        println!(
+            "[SELFTEST] WARN CH{} 启用态恢复保存未确认, 请复查设备",
+            EN_CH
+        );
+    }
+    match en_fail {
+        None => println!("[SELFTEST] ENABLED round-trip PASS"),
+        Some(reason) => {
+            println!("[SELFTEST] FAIL ENABLED round-trip: {}", reason);
+            std::process::exit(1);
+        }
+    }
+
     // Step 7c: 半自动手动模式 + 阈值持久验证
     // 证明 SET_MODE 生效：半自动手动模式跳过阈值处理，FINGER_TH 跨多个标准处理周期保持手动值。
-    const TH_PARAM: u8 = 0x01; // FINGER_TH（自动校准模式运行标准完整处理）
     println!("[SELFTEST] 切换半自动手动模式(SET_MODE=1)...");
     if let Err(e) = ctrl.set_mode(1) {
         println!("[SELFTEST] FAIL set_mode(semi): {}", e);
@@ -5539,12 +6158,14 @@ fn main() {
     let th_test: u32 = 199; // 明显区别于自动整定值(≈44)
     if let Err(e) = ctrl.set_param(0, TH_PARAM, th_test) {
         println!("[SELFTEST] FAIL set_param(FINGER_TH): {}", e);
+        restore_then_auto(&mut ctrl, "FINGER_TH 测试写入失败");
         std::process::exit(1);
     }
     thread::sleep(Duration::from_millis(200)); // 跨多个处理周期，验证手动阈值保持不变
     let base_ver = ctrl.param_version();
     if let Err(e) = ctrl.request_params(0) {
         println!("[SELFTEST] FAIL request_params(semi回读): {}", e);
+        restore_then_auto(&mut ctrl, "FINGER_TH 回读请求失败");
         std::process::exit(1);
     }
     let start = std::time::Instant::now();
@@ -5569,15 +6190,13 @@ fn main() {
                 "[SELFTEST] FAIL semi-mode 阈值未持久: 期望 {} 实得 {:?} (半自动手动处理未保持阈值?)",
                 th_test, other
             );
-            let _ = ctrl.set_mode(0);
+            restore_then_auto(&mut ctrl, "FINGER_TH 持久回读失败");
             std::process::exit(1);
         }
     }
     // Step 7d: 半自动手动模式硬件参数 APPLY 重初始化验证
     // 证明模式修改重初始化生效：改 SNS_CLK_DIV + CALIBRATE(APPLY) 后，
     // 硬件参数持久且手动 FINGER_TH(199) 不被重初始化覆盖。
-    const CLK_PARAM: u8 = 0x08; // SNS_CLK_DIV
-    let clk_orig = ctrl.param(0, CLK_PARAM).unwrap_or(16);
     let clk_test = if clk_orig >= 8 && clk_orig < 250 {
         clk_orig + 2
     } else {
@@ -5589,17 +6208,20 @@ fn main() {
     );
     if let Err(e) = ctrl.set_param(0, CLK_PARAM, clk_test) {
         println!("[SELFTEST] FAIL set_param(SNS_CLK): {}", e);
+        restore_then_auto(&mut ctrl, "SNS_CLK_DIV 测试写入失败");
         std::process::exit(1);
     }
     thread::sleep(Duration::from_millis(50));
     if let Err(e) = ctrl.calibrate(0xFFFF_FFFF_FFFF_FFFF) {
         println!("[SELFTEST] FAIL calibrate(APPLY): {}", e);
+        restore_then_auto(&mut ctrl, "SNS_CLK_DIV 测试 APPLY 失败");
         std::process::exit(1);
     }
     thread::sleep(Duration::from_millis(400)); // 等主循环重初始化 + 重置基线
     let base_ver = ctrl.param_version();
     if let Err(e) = ctrl.request_params(0) {
         println!("[SELFTEST] FAIL request_params(APPLY回读): {}", e);
+        restore_then_auto(&mut ctrl, "SNS_CLK_DIV APPLY 回读请求失败");
         std::process::exit(1);
     }
     let start = std::time::Instant::now();
@@ -5627,12 +6249,17 @@ fn main() {
                 "[SELFTEST] FAIL APPLY 重初始化: SNS_CLK 期望 {} 实得 {:?}, FINGER_TH 期望 {} 实得 {:?}",
                 clk_test, c, th_test, t
             );
-            let _ = ctrl.set_mode(0);
+            restore_then_auto(&mut ctrl, "SNS_CLK_DIV APPLY 回读失败");
             std::process::exit(1);
         }
     }
 
-    // 切回自动校准/标准完整处理，并在可选重启前验收一次完整的实机 Cp 测量。
+    // 切回自动校准/标准完整处理前，先恢复完整自测借用的 CH0 参数并确认其已落盘。
+    if !restore_ch0_params(&mut ctrl, "进入 CP 验收前") {
+        let _ = ctrl.set_mode(0);
+        println!("[SELFTEST] FAIL CP 前 CH0 临时参数恢复未确认");
+        std::process::exit(1);
+    }
     if let Err(e) = ctrl.set_mode(0) {
         println!("[SELFTEST] FAIL set_mode(auto): {}", e);
         std::process::exit(1);
@@ -5695,6 +6322,7 @@ fn main() {
     let mut cp_values = Vec::with_capacity(CP_CHANNEL_COUNT as usize);
     let mut cp_results = Vec::with_capacity(CP_CHANNEL_COUNT as usize);
     let mut cp_failed_channels = Vec::new();
+    let mut cp_empty_channels = Vec::new();
     for ch in 0..CP_CHANNEL_COUNT {
         let version_before_request = ctrl.cp_channel_version(ch);
         if let Err(e) = ctrl.request_cp(ch) {
@@ -5707,10 +6335,16 @@ fn main() {
             cp_poll_or_fail(&mut ctrl, &format!("等待 CP ch{}", ch));
             if ctrl.cp_channel_version(ch) > version_before_request {
                 match ctrl.cp(ch) {
-                    Some(CP_FAILURE_VALUE) | Some(0) => {
-                        let value = ctrl.cp(ch).expect("CP value present");
+                    // ★失败与"无结果"必须分开报★: 0x00FFFFFF 是设备明确的测量失败标记(唯一判据),
+                    // 0 只是"响应回来了但没给出值"。两者都不算通过, 但混成一句会误导排查方向。
+                    Some(CP_FAILURE_VALUE) => {
                         cp_failed_channels.push(ch);
-                        cp_results.push((ch, value));
+                        cp_results.push((ch, CP_FAILURE_VALUE));
+                        break;
+                    }
+                    Some(0) => {
+                        cp_empty_channels.push(ch);
+                        cp_results.push((ch, 0));
                         break;
                     }
                     Some(value) => {
@@ -5741,8 +6375,19 @@ fn main() {
         .collect::<Vec<_>>()
         .join(", ");
     println!("[SELFTEST] CP values: [{}]", cp_distribution);
-    if !cp_failed_channels.is_empty() {
-        println!("[SELFTEST] FAIL CP channels={:?}", cp_failed_channels);
+    if !cp_failed_channels.is_empty() || !cp_empty_channels.is_empty() {
+        if !cp_failed_channels.is_empty() {
+            println!(
+                "[SELFTEST] FAIL CP 测量失败(设备回读 0x{CP_FAILURE_VALUE:08X}) channels={:?}",
+                cp_failed_channels
+            );
+        }
+        if !cp_empty_channels.is_empty() {
+            println!(
+                "[SELFTEST] FAIL CP 无结果(响应到达但值为 0) channels={:?}",
+                cp_empty_channels
+            );
+        }
         std::process::exit(1);
     }
 
