@@ -5433,6 +5433,23 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        // ★上传必须在"遥测流式进行中"做★ 这正是 UI 的真实场景, 也是本项修复的回归判据:
+        // 流式期间 core1 要分页读快照, SPI 流水线里随时横着别的响应, 于是瞬时 link_ok 频繁为 false。
+        // 旧实现拿瞬时值当上传门禁 ⇒ 开着遥测必回 NAK("PSoC 链路暂时不可用"), 而不开流时一次就过 ——
+        // 所以不开流的测试根本抓不到这个 bug。现在固件改看去抖后的 link_alive(), 此处必须开流复现。
+        {
+            use mai2control_ui::proto::{FIELD_BASELINE, FIELD_DIFF, FIELD_RAW};
+            let _ = ctrl.start_telemetry(30, FIELD_RAW | FIELD_BASELINE | FIELD_DIFF, u64::MAX);
+        }
+        pump(&mut ctrl, 40);
+        println!(
+            "[SELFTEST] ALGO: 遥测流式中 samples_per_sec={} (上传将在流式期间进行)",
+            ctrl.telem_samples_per_sec()
+        );
+        if ctrl.telem_samples_per_sec() == 0 {
+            println!("[SELFTEST] FAIL 遥测未真正流起来, 无法复现 UI 场景");
+            std::process::exit(1);
+        }
         let src = "#include <stddef.h>\n#include \"psoc_algo_abi.h\"\nvoid algo(algo_io_t* io){ io->out_active = (io->base_active!=0u)?1u:0u; }\n";
         println!("[SELFTEST] ALGO: 编译并上传测试算法(base_active 透传)...");
         if let Err(e) = ctrl.compile_and_upload(src) {
@@ -5440,6 +5457,14 @@ fn main() {
             std::process::exit(1);
         }
         pump(&mut ctrl, 40);
+        // 回执判据独立于"算法是否生效": ACK 迟到(处理器被入队自旋卡住)时设备照样会装上算法,
+        // 只看 algo_info 抓不到"发出去没有回执"这个症状。
+        let ack = ctrl.algo_upload_status().to_string();
+        println!("[SELFTEST] ALGO: 上传回执 = {}", ack);
+        if !ack.contains("ACK") {
+            println!("[SELFTEST] FAIL 未在超时窗口内收到 ACK(回执缺失或被拒)");
+            std::process::exit(1);
+        }
         let _ = ctrl.algo_get_info();
         pump(&mut ctrl, 40);
         match ctrl.algo_info() {

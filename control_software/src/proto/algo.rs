@@ -226,15 +226,16 @@ pub fn encode_algo_get_trace(seq: u8, ch: u8, idx: u8) -> Frame {
     Frame::new(HostCmd::AlgoGetTrace as u8, 0, seq, vec![ch, idx])
 }
 
-/// 响应 [ch, out_active(u8), report(u16 LE)]
-pub fn decode_algo_get_trace(payload: &[u8]) -> Option<(u8, bool, u16)> {
-    if payload.len() < 4 {
+/// 响应 [ch, idx, out_active(u8), report(u16 LE)]
+pub fn decode_algo_get_trace(payload: &[u8]) -> Option<(u8, u8, bool, u16)> {
+    if payload.len() < 5 {
         return None;
     }
     let ch = payload[0];
-    let active = payload[1] != 0;
-    let report = u16::from_le_bytes([payload[2], payload[3]]);
-    Some((ch, active, report))
+    let idx = payload[1];
+    let active = payload[2] != 0;
+    let report = u16::from_le_bytes([payload[3], payload[4]]);
+    Some((ch, idx, active, report))
 }
 
 /// payload = [idx(u8), val(u8)]

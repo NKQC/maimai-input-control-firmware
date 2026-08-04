@@ -111,10 +111,30 @@ void Psoc::_spi_service() {
     const uint32_t tr = time_us_32() - t0;
     latency_note(&g_lat_spi_us, tr);
 
+    // ★触发式更新 + 有限保留 + 到期优雅释放★(掩码即真相, 见 psoc.h touch_mask 注释)
+    //   合法帧            → 更新掩码, 清失败连击, 置可信;
+    //   短暂失败(窗口内)   → 保留最后一份合法掩码(不制造假抬起), 仍视为可信;
+    //   持续失败(窗口外)   → 一次性释放为 0 并置不可信, 交由既有兜底走 XRES/重连,
+    //                       绝不把"按下"永久保持到用户重启设备。
     _pub_seq++;                       // 进入写临界区(奇)
     __dmb();
-    if (ok) _pub_touch_mask = mask;   // 读失败保留旧掩码, 避免误抬起
+    if (ok) {
+        _pub_touch_mask = mask;
+        _touch_fail_run = 0;
+        _pub_touch_hold = true;
+    } else {
+        _pub_touch_bad = _pub_touch_bad + 1u;
+        if (_touch_fail_run < TOUCH_RELEASE_FAIL_CYCLES) {
+            _touch_fail_run++;        // 保留窗口内: 掩码不动
+        } else if (_pub_touch_hold) {
+            // 越过窗口的第一拍才动手: 每次故障只释放/只计一次, 不在故障期间反复刷计数。
+            _pub_touch_mask = 0;
+            _pub_touch_hold = false;
+            _pub_touch_releases = _pub_touch_releases + 1u;
+        }
+    }
     _pub_link_ok = ok;
+    if (ok) _pub_link_ok_ms = millis();   // link_alive() 的去抖依据
     _pub_touch_read_us = tr;
     __dmb();
     _pub_seq++;                       // 离开写临界区(偶)
@@ -198,6 +218,14 @@ void Psoc::_spi_service() {
             _stats_primed = true;
         }
     }
+}
+
+// 从未成功过(_pub_link_ok_ms == 0)一律为假: "还没建链"不能算活着。
+bool Psoc::link_alive(uint32_t within_ms) const {
+    if (_pub_link_ok) return true;
+    const uint32_t last = _pub_link_ok_ms;
+    if (last == 0u) return false;
+    return (uint32_t)(millis() - last) <= within_ms;
 }
 
 // core1 入口: 置运行标志后进入固定 1ms 周期循环, 永不返回。

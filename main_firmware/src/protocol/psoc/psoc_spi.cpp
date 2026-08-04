@@ -5,6 +5,7 @@
 #include <hardware/clocks.h>
 #include <hardware/gpio.h>
 #include <hardware/pio.h>
+#include <cstring>
 
 // ============================================================
 // PIO SPI 主机程序（MODE0 / 8bit / MSB first / 全双工）—— ★延后采样 + DMA 直连版★
@@ -41,13 +42,10 @@ constexpr uint8_t PROG_WRAP_TARGET = 0;
 constexpr uint8_t PROG_WRAP = 2;
 constexpr float CYCLES_PER_BIT = 8.0f;  // out3(低相位) + nop4 + in1 = 8；采样点=升高后第 4 拍
 constexpr uint8_t SHIFT_BITS = 8;       // autopull/autopush 阈值：一次一字节，配 8 位 DMA
-// CS 建立/保持：CS 沿与首/末个 SCK 沿之间的最小间隔（PSoC SCB 从机要求，纯电气量）。
-// DMA 启动后首字节几乎立刻上时钟、RX 完成标志又在末 bit 采样时(SCK 仍高)就置起，故必须显式留出，
-// 否则 CS 会在末个下降沿之前抬起。1us ≈ 3 个 SCK 周期(3MHz)，代价可忽略。
-constexpr uint32_t CS_SETUP_US = 1;
-constexpr uint32_t CS_HOLD_US = 1;
-// 单次事务的完成判定上限：7 字节 @3MHz ≈ 19us。取 2ms 纯作"外设异常"兜底(SCK 停摆/FIFO 卡死)，
-// ★不是★用来估算传输时长 —— 传输结束一律以 DMA 通道完成标志为准。
+// CS guard time for the TXB level shifter.
+constexpr uint32_t CS_SETUP_US = 2;
+constexpr uint32_t CS_HOLD_US = 2;
+// DMA timeout backstop; normal seven-byte transfers complete in under 40us.
 constexpr uint32_t XFER_TIMEOUT_US = 2000;
 // PSoC 侧装帧窗口（本次事务结束 → 下次事务可取响应）。
 // 依据(psoc_firmware/CY8C4147AZI-SensorCore/main.c: spi_isr/spi_slave_task)：RX LEVEL=6，第 7 字节
@@ -134,23 +132,19 @@ void PsocSpi::_recover() {
     _pio->sm_set_enabled(_sm, true);
 }
 
-void PsocSpi::transfer(const uint8_t* tx, uint8_t* rx, size_t len) {
-    if (!_ready || len == 0) {
-        return;
-    }
-    // 上一次事务若曾超时被 abort，FIFO 里可能留有残字节；开帧前清一次，保证字节流严格对齐。
-    _pio->sm_clear_fifos(_sm);
+bool PsocSpi::transfer(const uint8_t* tx, uint8_t* rx, size_t len) {
+    if (rx != nullptr) std::memset(rx, 0, len);
+    if (!_ready || len == 0) return false;
 
+    _pio->sm_clear_fifos(_sm);
     gpio_put(_cs_pin, 0);
     busy_wait_us_32(CS_SETUP_US);
-    _dma.start(tx, rx, len);                 // mem→TX FIFO / RX FIFO→mem，全程无 CPU 逐字节参与
-    const bool done = _dma.wait(XFER_TIMEOUT_US);   // 完成判定 = DMA 通道忙标志，非固定延时
+    _dma.start(tx, rx, len);
+    const bool done = _dma.wait(XFER_TIMEOUT_US);
     busy_wait_us_32(CS_HOLD_US);
     gpio_put(_cs_pin, 1);
-
-    if (!done) {
-        _recover();
-    }
+    if (!done) _recover();
+    return done;
 }
 
 psoc::Frame PsocSpi::_make_request(psoc::Cmd command) {
@@ -180,42 +174,39 @@ bool PsocSpi::ping() {
     psoc::Frame fetch = _make_request(psoc::Cmd::PING);
     psoc::Frame response;
 
-    transfer(reinterpret_cast<const uint8_t*>(&request),
-             reinterpret_cast<uint8_t*>(&ignored), sizeof(request));
+    if (!transfer(reinterpret_cast<const uint8_t*>(&request),
+                  reinterpret_cast<uint8_t*>(&ignored), sizeof(request))) return false;
     busy_wait_us_32(PSOC_ISR_FRAME_US);
-    transfer(reinterpret_cast<const uint8_t*>(&fetch),
-             reinterpret_cast<uint8_t*>(&response), sizeof(fetch));
+    if (!transfer(reinterpret_cast<const uint8_t*>(&fetch),
+                  reinterpret_cast<uint8_t*>(&response), sizeof(fetch))) return false;
     return _response_matches(response, psoc::Cmd::PONG, request.seq);
 }
 
 bool PsocSpi::read_touch(uint64_t* out_mask) {
     if (!_ready || out_mask == nullptr) return false;
-    // 单次 7 字节全双工事务：MOSI 发 TOUCH 请求，MISO 读回 PSoC 常驻的触控帧（流水线）。
-    // ★按 cmd 回显路由收割, 而非"信任上一次事务留下的就是我要的"★
-    // PSoC 是"本次事务发命令、下次事务取响应"的流水线, 任何一条命令(尤其 snapshot 分页)都会把
-    // 默认响应顶掉。此前这里把"读到非 TOUCH 帧"直接判为链路失败 —— 但那只是流水线里的**陈旧帧**,
-    // 链路本身是好的。后果: 遥测开启时 snapshot 分页残帧让 read_touch 连续失败 → link_ok=false →
-    // core1 失效兜底累计到 200 个周期就 XRES 复位 PSoC → "通一会儿就掉"的自我强化循环。
-    // 现在: 帧合法但 cmd 不是 TOUCH ⇒ 判定为陈旧帧, 丢弃并重取一次(上一次事务已把 TOUCH 请求送达,
-    // PSoC 必然已把触控帧装好)。只有帧本身非法(magic 错)或重取仍不是 TOUCH 才算真失败。
+    // TOUCH is pipelined; retry stale or invalid frames after the PSoC ISR window.
     uint8_t tx[7];
     tx[0] = psoc::FRAME_MAGIC;
     tx[1] = static_cast<uint8_t>(psoc::Cmd::TOUCH);
     tx[2] = 0; tx[3] = 0; tx[4] = 0; tx[5] = 0; tx[6] = 0;
     uint8_t rx[7] = {0};
 
-    for (uint8_t attempt = 0; attempt < 2; attempt++) {
-        transfer(tx, rx, 7);
-        if (rx[0] != psoc::FRAME_MAGIC) return false;            // 帧非法 = 真链路问题
-        if (rx[1] == static_cast<uint8_t>(psoc::Cmd::TOUCH)) {
+    for (uint8_t attempt = 0; attempt < 3; attempt++) {
+        if (!transfer(tx, rx, sizeof(rx))) {
+            if (attempt < 2u) busy_wait_us_32(PSOC_ISR_FRAME_US);
+            continue;
+        }
+        if (rx[0] == psoc::FRAME_MAGIC && rx[1] == static_cast<uint8_t>(psoc::Cmd::TOUCH)) {
             uint64_t mask = 0;
             for (int i = 0; i < 5; i++) {
                 mask |= (uint64_t)rx[2 + i] << (8 * i);
             }
-            *out_mask = mask & 0xFFFFFFFFFULL;   // 低 36 位有效
-            return true;
+            if ((mask >> 36) == 0ULL) {
+                *out_mask = mask & 0xFFFFFFFFFULL;
+                return true;
+            }
         }
-        // 陈旧帧(cmd 不匹配): 本次事务已重新请求 TOUCH, 下一拍即可取到, 循环重试一次。
+        if (attempt < 2u) busy_wait_us_32(PSOC_ISR_FRAME_US);
     }
     return false;
 }
@@ -226,22 +217,15 @@ bool PsocSpi::_cmd_txn(uint8_t cmd, uint8_t b2, uint8_t b3, uint32_t val24, uint
     uint8_t tx[7] = { psoc::FRAME_MAGIC, cmd, b2, b3,
                       (uint8_t)(val24 & 0xFF), (uint8_t)((val24 >> 8) & 0xFF),
                       (uint8_t)((val24 >> 16) & 0xFF) };
-    // ★按 cmd 回显收割, 不再"盲信下一拍必是我的响应"★
-    // 经 _cmd_txn 的每条命令都以【同一 cmd】回显(PING→PONG / SNAPSHOT_BEGIN→INFO 走别的路径,
-    // 不经这里), 故 resp[1] 就是天然的请求-响应关联键 —— 无需扩帧、无需额外 id 字段。
-    // PSoC 的 TX FIFO 同时只持有【一份】响应(arm_tx 每次清空重装), 所以"取到陈旧帧"意味着本条
-    // 命令的响应已经被顶掉, 单纯再取一拍是取不回来的 —— 必须【重发命令】让 PSoC 重新装帧。
-    // 故每轮 = 完整的"发命令 + 取响应"对。经本函数的命令全是只读或幂等的(SET_*/GET_*/ALGO_PAGE/
-    // MEASURE_CP 置 pending), 重发无副作用; APPLY/CALIBRATE/AUTO_TUNE 走的是各自的直发路径, 不在此。
-    // 这样正确性不再依赖 PSOC_ISR_FRAME_US 这个"猜的"窗口, 它退化为纯效率参数。
+    // Retry idempotent command transactions until the response command matches.
     uint8_t tx2[7] = { psoc::FRAME_MAGIC, (uint8_t)psoc::Cmd::TOUCH, 0, 0, 0, 0, 0 };
     uint8_t rx1[7] = {0};
     for (uint8_t attempt = 0; attempt < 3; attempt++) {
-        transfer(tx, rx1, 7);                 // 发(或重发)命令, 让 PSoC 装本条响应
-        busy_wait_us_32(PSOC_ISR_FRAME_US);   // 给 PSoC ISR 装帧留窗口
-        transfer(tx2, resp, 7);               // 取响应(占位帧同时把默认响应换回触控帧)
-        if (resp[0] != psoc::FRAME_MAGIC) return false;   // 帧非法 = 真链路问题
-        if (resp[1] == cmd) return true;                  // cmd 回显命中 = 本条命令的响应
+        if (!transfer(tx, rx1, sizeof(rx1))) return false;
+        busy_wait_us_32(PSOC_ISR_FRAME_US);
+        if (!transfer(tx2, resp, 7)) return false;
+        if (resp[0] != psoc::FRAME_MAGIC) return false;
+        if (resp[1] == cmd) return true;
     }
     return false;
 }
@@ -300,14 +284,7 @@ bool PsocSpi::get_cp(uint8_t ch, uint32_t* out_cp) {
     return true;
 }
 
-// 轮询 GET_STATS.busy(resp[2]) 至 PSoC 主循环真正完成重操作。两阶段避免竞态:
-// 阶段1 等 busy 置起(确认命令已被 PSoC ISR 接收, 最多 40ms; 若操作极快已完成则超时后进阶段2);
-// 阶段2 等 busy 落下(真实完成, 最多 timeout_ms)。返回 true=真实完成, false=超时。
-// ★收尾必须把 PSoC 的默认响应换回实时触控帧★: 本 SPI 是"本次事务发命令、下次事务取响应"的流水线,
-// _wait_op_done 以 GET_STATS 结束, PSoC 的 TX FIFO 就停在 GET_STATS 响应上 → 紧随其后的 read_touch
-// 读到残帧判失败(link_ok 抖动), 而 core1 的 get_stats 也跟着错位 → samples_per_sec/scan_period 恒为 0
-// (实测: raw 明明在变, 统计却全 0, smoke 因 link_valid=false 反复 FAIL)。snapshot_pump 早有同样的
-// 收尾复位, 这里补齐同一口径。
+// Restore the default pipelined TOUCH response after command traffic.
 void PsocSpi::_restore_touch_response() {
     if (!_ready) return;
     uint8_t tx[7] = { psoc::FRAME_MAGIC, (uint8_t)psoc::Cmd::TOUCH, 0, 0, 0, 0, 0 };
@@ -390,9 +367,9 @@ bool PsocSpi::_send_heavy(uint8_t cmd, uint8_t b2, uint8_t b3, uint8_t b4) {
     // AUTO_TUNE 是唯一带请求身份的重操作。不能以 generic busy 证明它已受理：busy 可能属于
     // 上一条重操作，若本命令丢失则会把旧结果冒充当前请求。只发一次命令；若响应错位，随后只读
     // GET_AUTO_TUNE 查当前 channel/tag，绝不盲目重发产生第二次自适应。
-    transfer(tx, resp, 7);
+    if (!transfer(tx, resp, sizeof(resp))) return false;
     busy_wait_us_32(PSOC_ISR_FRAME_US);
-    transfer(tx2, resp, 7);
+    if (!transfer(tx2, resp, sizeof(resp))) return false;
     if (resp[0] != psoc::FRAME_MAGIC) return false;
     if (resp[1] == cmd) {
         if (!is_auto_tune) return true;
@@ -417,9 +394,9 @@ bool PsocSpi::_send_heavy(uint8_t cmd, uint8_t b2, uint8_t b3, uint8_t b4) {
     for (uint8_t attempt = 0; attempt < 2; attempt++) {
         uint8_t busy = 0;
         if (get_stats(nullptr, &busy) && busy != 0u) return true;
-        transfer(tx, resp, 7);
+        if (!transfer(tx, resp, sizeof(resp))) return false;
         busy_wait_us_32(PSOC_ISR_FRAME_US);
-        transfer(tx2, resp, 7);
+        if (!transfer(tx2, resp, sizeof(resp))) return false;
         if (resp[0] != psoc::FRAME_MAGIC) return false;
         if (resp[1] == cmd) return true;
     }
@@ -560,13 +537,17 @@ bool PsocSpi::get_algo_rom(uint8_t ch, uint16_t* out_rom) {
 }
 
 bool PsocSpi::algo_get_trace(uint8_t ch, uint8_t idx, uint8_t* out_active, uint16_t* out_report) {
-    // 帧 [magic,ALGO_GET_TRACE,ch,idx,0,0,0] → 响应 [..,ch,out_active,report_lo,report_hi,0]
+    // 帧 [magic,ALGO_GET_TRACE,ch,idx,0,0,0] → 响应 [..,ch,out_active,report_lo,report_hi,idx]
+    // idx 回显是同命令帧的关联键；否则流水线残留的其它 report 槽会被误发布为本次读取结果。
     uint8_t resp[7];
-    if (!_cmd_txn((uint8_t)psoc::Cmd::ALGO_GET_TRACE, ch, idx, 0, resp)) return false;
-    if (resp[1] != (uint8_t)psoc::Cmd::ALGO_GET_TRACE || resp[2] != ch) return false;
-    if (out_active) *out_active = resp[3];
-    if (out_report) *out_report = (uint16_t)resp[4] | ((uint16_t)resp[5] << 8);
-    return true;
+    for (uint8_t attempt = 0; attempt < 3u; ++attempt) {
+        if (!_cmd_txn((uint8_t)psoc::Cmd::ALGO_GET_TRACE, ch, idx, 0, resp)) return false;
+        if (resp[1] != (uint8_t)psoc::Cmd::ALGO_GET_TRACE || resp[2] != ch || resp[6] != idx) continue;
+        if (out_active) *out_active = resp[3];
+        if (out_report) *out_report = (uint16_t)resp[4] | ((uint16_t)resp[5] << 8);
+        return true;
+    }
+    return false;
 }
 
 bool PsocSpi::algo_set_cfg(uint8_t idx, uint8_t val) {
@@ -605,7 +586,7 @@ bool PsocSpi::global_commit() {
     // 继续排后续 PARAM_SET，避免重初始化把已排队的逐通道值覆盖。
     uint8_t tx[7] = { psoc::FRAME_MAGIC, (uint8_t)psoc::Cmd::GLOBAL_COMMIT, 0, 0, 0, 0, 0 };
     uint8_t rx[7] = {0};
-    transfer(tx, rx, sizeof(tx));
+    if (!transfer(tx, rx, sizeof(tx))) return false;
     return _wait_op_done(800);
 }
 
@@ -617,11 +598,11 @@ bool PsocSpi::indicator_on() {
     psoc::Frame fetch = _make_request(psoc::Cmd::PING);
     psoc::Frame response;
 
-    transfer(reinterpret_cast<const uint8_t*>(&request),
-             reinterpret_cast<uint8_t*>(&ignored), sizeof(request));
+    if (!transfer(reinterpret_cast<const uint8_t*>(&request),
+                  reinterpret_cast<uint8_t*>(&ignored), sizeof(request))) return false;
     busy_wait_us_32(PSOC_ISR_FRAME_US);
-    transfer(reinterpret_cast<const uint8_t*>(&fetch),
-             reinterpret_cast<uint8_t*>(&response), sizeof(fetch));
+    if (!transfer(reinterpret_cast<const uint8_t*>(&fetch),
+                  reinterpret_cast<uint8_t*>(&response), sizeof(fetch))) return false;
     return _response_matches(response, psoc::Cmd::PONG, request.seq);
 }
 
@@ -645,21 +626,19 @@ bool PsocSpi::snapshot_pump(uint8_t max_pages, psoc::SensorSnapshot* out) {
         // 新快照：BEGIN 锁存 + 请求 page0 取回 INFO(generation/valid/count)。
         psoc::Frame begin = _make_request(psoc::Cmd::SNAPSHOT_BEGIN);
         psoc::Frame ignored;
-        transfer(reinterpret_cast<const uint8_t*>(&begin),
-                 reinterpret_cast<uint8_t*>(&ignored), sizeof(begin));
+        if (!transfer(reinterpret_cast<const uint8_t*>(&begin),
+                      reinterpret_cast<uint8_t*>(&ignored), sizeof(begin))) return false;
         busy_wait_us_32(PSOC_SNAPSHOT_PAGE_DELAY_US);
 
         psoc::Frame req0 = _make_request(psoc::Cmd::SNAPSHOT_PAGE);
         req0.payload[0] = 0;
         psoc::Frame info;
-        transfer(reinterpret_cast<const uint8_t*>(&req0),
-                 reinterpret_cast<uint8_t*>(&info), sizeof(req0));
-        if (!_response_matches(info, psoc::Cmd::SNAPSHOT_INFO, begin.seq) ||
+        if (!transfer(reinterpret_cast<const uint8_t*>(&req0),
+                      reinterpret_cast<uint8_t*>(&info), sizeof(req0)) ||
+            !_response_matches(info, psoc::Cmd::SNAPSHOT_INFO, begin.seq) ||
             info.payload[3] != psoc::SENSOR_CHANNEL_COUNT) {
-            // ★失败也必须把 PSoC 默认响应换回触控帧★: 否则 TX FIFO 停在 SNAPSHOT_* 残帧上,
-            // 紧随其后的 read_touch 全部读到陈旧帧 → link_ok 抖动 → 失效兜底 XRES。
             _restore_touch_response();
-            return false;   // 起始失败，保持空闲，下次重试
+            return false;
         }
         _snap_generation = _read_u16(info.payload);
         _snap_valid = info.payload[2] != 0;
@@ -673,9 +652,12 @@ bool PsocSpi::snapshot_pump(uint8_t max_pages, psoc::SensorSnapshot* out) {
         psoc::Frame prime = _make_request(psoc::Cmd::SNAPSHOT_PAGE);
         prime.payload[0] = static_cast<uint8_t>(_snap_page);
         psoc::Frame discard;
-        transfer(reinterpret_cast<const uint8_t*>(&prime),
-                 reinterpret_cast<uint8_t*>(&discard), sizeof(prime));
-        expected_seq = prime.seq;  // prime 令 PSoC 装载 page[_snap_page]
+        if (!transfer(reinterpret_cast<const uint8_t*>(&prime),
+                      reinterpret_cast<uint8_t*>(&discard), sizeof(prime))) {
+            _restore_touch_response();
+            return false;
+        }
+        expected_seq = prime.seq;
     }
 
     // 读本块页范围：请求 PAGE[p] 取回 page[p-1] 数据（流水线）；末页用 PING 收尾。
@@ -691,13 +673,9 @@ bool PsocSpi::snapshot_pump(uint8_t max_pages, psoc::SensorSnapshot* out) {
             preq = _make_request(psoc::Cmd::PING);   // 收尾取最后一页
         }
         psoc::Frame resp;
-        transfer(reinterpret_cast<const uint8_t*>(&preq),
-                 reinterpret_cast<uint8_t*>(&resp), sizeof(preq));
-        if (!_response_matches(resp, psoc::Cmd::SNAPSHOT_DATA, expected_seq)) {
-            // 中途某页失败：不回退到 page0，保留已读进度，下次 prime 当前页重试本块。
-            // 锁存持久，重试无副作用；避免多块累积的偶发失败导致整份永不完成。
-            // ★同样必须恢复默认响应★(原先这里直接 return, 把 SNAPSHOT_DATA 残帧留在 TX FIFO,
-            // 是遥测开启时 read_touch 成批失败、进而 XRES 复位的直接原因)。
+        if (!transfer(reinterpret_cast<const uint8_t*>(&preq),
+                      reinterpret_cast<uint8_t*>(&resp), sizeof(preq)) ||
+            !_response_matches(resp, psoc::Cmd::SNAPSHOT_DATA, expected_seq)) {
             _restore_touch_response();
             return false;
         }
@@ -752,15 +730,15 @@ bool PsocSpi::read_snapshot(psoc::SensorSnapshot* snapshot) {
     psoc::Frame response;
     psoc::Frame begin = _make_request(psoc::Cmd::SNAPSHOT_BEGIN);
 
-    transfer(reinterpret_cast<const uint8_t*>(&begin),
-             reinterpret_cast<uint8_t*>(&ignored), sizeof(begin));
+    if (!transfer(reinterpret_cast<const uint8_t*>(&begin),
+                  reinterpret_cast<uint8_t*>(&ignored), sizeof(begin))) return false;
     busy_wait_us_32(PSOC_ISR_FRAME_US);
 
     psoc::Frame page_request = _make_request(psoc::Cmd::SNAPSHOT_PAGE);
     page_request.payload[0] = 0;
-    transfer(reinterpret_cast<const uint8_t*>(&page_request),
-             reinterpret_cast<uint8_t*>(&response), sizeof(page_request));
-    if (!_response_matches(response, psoc::Cmd::SNAPSHOT_INFO, begin.seq) ||
+    if (!transfer(reinterpret_cast<const uint8_t*>(&page_request),
+                  reinterpret_cast<uint8_t*>(&response), sizeof(page_request)) ||
+        !_response_matches(response, psoc::Cmd::SNAPSHOT_INFO, begin.seq) ||
         response.payload[3] != psoc::SENSOR_CHANNEL_COUNT) {
         return false;
     }
@@ -773,9 +751,9 @@ bool PsocSpi::read_snapshot(psoc::SensorSnapshot* snapshot) {
         busy_wait_us_32(PSOC_ISR_FRAME_US);
         psoc::Frame next_request = _make_request(psoc::Cmd::SNAPSHOT_PAGE);
         next_request.payload[0] = static_cast<uint8_t>(page);
-        transfer(reinterpret_cast<const uint8_t*>(&next_request),
-                 reinterpret_cast<uint8_t*>(&response), sizeof(next_request));
-        if (!_response_matches(response, psoc::Cmd::SNAPSHOT_DATA, expected_sequence)) {
+        if (!transfer(reinterpret_cast<const uint8_t*>(&next_request),
+                      reinterpret_cast<uint8_t*>(&response), sizeof(next_request)) ||
+            !_response_matches(response, psoc::Cmd::SNAPSHOT_DATA, expected_sequence)) {
             snapshot->clear();
             return false;
         }
@@ -788,9 +766,9 @@ bool PsocSpi::read_snapshot(psoc::SensorSnapshot* snapshot) {
 
     busy_wait_us_32(PSOC_ISR_FRAME_US);
     psoc::Frame finish = _make_request(psoc::Cmd::PING);
-    transfer(reinterpret_cast<const uint8_t*>(&finish),
-             reinterpret_cast<uint8_t*>(&response), sizeof(finish));
-    if (!_response_matches(response, psoc::Cmd::SNAPSHOT_DATA, expected_sequence)) {
+    if (!transfer(reinterpret_cast<const uint8_t*>(&finish),
+                  reinterpret_cast<uint8_t*>(&response), sizeof(finish)) ||
+        !_response_matches(response, psoc::Cmd::SNAPSHOT_DATA, expected_sequence)) {
         snapshot->clear();
         return false;
     }

@@ -263,7 +263,7 @@ export component DashboardPage inherits Rectangle {
                         spacing: Theme.gap;
 
                         Text {
-                            text: @tr("延迟(Phase2 固件填值)");
+                            text: @tr("延迟");
                             font-weight: 700;
                             color: Theme.text-title;
                         }
@@ -417,7 +417,7 @@ export component DashboardPage inherits Rectangle {
                             font-size: Theme.fs-small;
                         }
                         Text {
-                            text: root.lat_point_count == 0 ? @tr("无延迟数据(需固件填值)") : "";
+                            text: root.lat_point_count == 0 ? @tr("无延迟数据") : "";
                             color: Theme.text-dim;
                             font-size: Theme.fs-title;
                             horizontal-alignment: center;

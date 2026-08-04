@@ -2,7 +2,7 @@
 // 公共可复用组件 (跨页面共享, 不含任何页面业务逻辑)
 // ==========================================================================
 
-import { HorizontalBox, SpinBox, CheckBox, LineEdit, ComboBox } from "std-widgets.slint";
+import { HorizontalBox, SpinBox, CheckBox, LineEdit, ComboBox, Button } from "std-widgets.slint";
 import { ParamRow, AlgoSettingRow } from "types.slint";
 import { Theme } from "theme.slint";
 
@@ -500,20 +500,13 @@ export component SeriesRow inherits HorizontalLayout {
     }
 }
 
-// 组合键捕获输入框。
-// ★超时语义★: 进入录制态后**不限时**等待第一个按键 —— 0.5s 空闲计时只从"收到第一个动作"起算,
-// 此后每个新按键重新起算 0.5s, 静默 0.5s 才退出录制。
-// 原实现是点击即开始计时, 于是"点进去想一下再按"就已经被踢出录制态(表现为按了没反应),
-// 用户根本无法判断是没抓到还是没进录制。现在只要没动过就一直等着, 语义与用户预期一致。
+// 组合键捕获输入框。HID Usage 直填仅转发原文，解析由 Rust 统一处理。
 export component KeyCaptureBox inherits Rectangle {
     in property <string> display;
-    callback captured(string, bool, bool, bool, bool);  // text, ctrl, shift, alt, gui
-    // 一次录制会话开始的那一刻触发, 且**只触发一次**(见 _begin)。
-    // 使用方可借它实现"每次录制独立覆盖上次结果"; 不接这个回调则完全无副作用
-    // —— 物理键盘页(PhysKeyRow)就不接, 行为与从前一致。
+    callback captured(string, bool, bool, bool, bool);
+    callback hid_submitted(string);
     callback capture_started();
     property <bool> _recording: false;
-    // 已收到过至少一个按键动作 ⇒ 空闲计时才有意义(Timer 的 running 由它门控)。
     property <bool> _acted: false;
     property <duration> _capture_idle_timeout: 500ms;
     forward-focus: fs;
@@ -523,9 +516,6 @@ export component KeyCaptureBox inherits Rectangle {
     border-color: root._recording ? #4a90d9 : Theme.border-light;
     background: root._recording ? #16222e : #262b31;
 
-    // 进入录制态的唯一入口。★边沿判据 = _recording 由假变真★: 只有这条边沿上报
-    // capture_started(), 因此一次会话(点进去 → 静默 0.5s 退出)只触发一次, 会话内的后续按键
-    // 走不到这条分支。语义上 = "跨会话覆盖、会话内累加"。
     function _begin() {
         if (!root._recording) {
             root._recording = true;
@@ -533,15 +523,13 @@ export component KeyCaptureBox inherits Rectangle {
         }
     }
 
-    // 空闲焦点置于捕获域外，超时后既停止 key-pressed 冒泡也清除录制角标。
     idle_focus := FocusScope { }
+    // 录制焦点只覆盖左侧区域，直填框获得焦点后不会被 key-pressed 捕获。
     fs := FocusScope {
-        width: parent.width;
+        width: parent.width - 98px;
         height: parent.height;
         key-pressed(e) => {
-            // 从非录制态收到第一个按键也算一次会话开始(必须先于 captured, 否则清零会把本键抹掉)。
             root._begin();
-            // 置 false 再置 true 让 Timer 的 running 边沿变化 → 空闲计时从本次按键重新起算。
             root._acted = false;
             root._acted = true;
             root.captured(e.text, e.modifiers.control, e.modifiers.shift, e.modifiers.alt, e.modifiers.meta);
@@ -549,10 +537,8 @@ export component KeyCaptureBox inherits Rectangle {
         }
         TouchArea {
             mouse-cursor: pointer;
-            // clicked 不会在 ScrollView 的滚动拖拽结束后触发，避免滚动误进录制态。
             clicked => {
                 fs.focus();
-                // 进入录制态但**不启动**空闲计时: 第一个动作到来前一直等待。
                 root._acted = false;
                 root._begin();
             }
@@ -564,31 +550,34 @@ export component KeyCaptureBox inherits Rectangle {
         triggered => {
             root._recording = false;
             root._acted = false;
-            // ★只有焦点仍在本捕获框内才主动失焦★: 用户在这 0.5s 内很可能已经点进旁边的
-            // SpinBox 开始输入数字, 此时无条件 idle_focus.focus() 会把焦点从他正在编辑的
-            // 数字框抢走(表现为"数字框高亮自动取消"、键入被吞)。焦点已不在本框时只退录制态。
             if (fs.has-focus) {
                 idle_focus.focus();
             }
         }
     }
-    // 始终显示当前组合键(捕获后立即更新, 不再被焦点占位符遮挡); 录制时右侧显示角标。
     Text {
         x: 8px;
-        width: parent.width - 74px;
+        width: fs.width - 12px;
         vertical-alignment: center;
         overflow: elide;
         text: root.display;
         color: root._recording ? Theme.accent : #d0d6dd;
     }
-    Text {
-        x: parent.width - 64px;
-        width: 60px;
-        vertical-alignment: center;
-        horizontal-alignment: right;
-        font-size: Theme.fs-small;
-        text: root._recording ? @tr("⌨ 录制中") : "";
-        color: Theme.accent;
+    hid_input := LineEdit {
+        x: parent.width - 94px;
+        y: 3px;
+        width: 56px;
+        height: parent.height - 6px;
+        placeholder-text: "HID";
+        accepted(t) => { root.hid_submitted(t); }
+    }
+    Button {
+        x: parent.width - 34px;
+        y: 3px;
+        width: 30px;
+        height: parent.height - 6px;
+        text: @tr("用");
+        clicked => { root.hid_submitted(hid_input.text); }
     }
 }
 

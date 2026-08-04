@@ -243,6 +243,17 @@ fn persist_ui_settings(
     cfg.set_bool(k::VCAM_ENABLED, ui.get_vcam_enabled());
     cfg.set_i32(k::VCAM_SUBMIT_SECS, ui.get_vcam_submit_secs());
     cfg.set_i32(k::VCAM_DISPLAY_SECS, ui.get_vcam_display_secs());
+    cfg.set_bool(k::DIAG_EXPANDED, ui.get_diag_expanded());
+    cfg.set_bool(k::CURVE_PARAMS_EXPANDED, ui.get_curve_params_expanded());
+    cfg.set_bool(k::CURVE_ALGO_CFG_EXPANDED, ui.get_curve_algo_cfg_expanded());
+    cfg.set_bool(k::CURVE_SERIES_EXPANDED, ui.get_curve_series_expanded());
+    cfg.set_bool(k::CURVE_SPECTRUM_EXPANDED, ui.get_curve_spectrum_expanded());
+    cfg.set_bool(k::CHANNEL_SHOW_DISABLED, ui.get_channel_show_disabled());
+    cfg.set_bool(k::PHYS_LIVE_EXPANDED, ui.get_phys_live_expanded());
+    cfg.set_bool(k::PHYS_KEYS_EXPANDED, ui.get_phys_keys_expanded());
+    cfg.set_bool(k::PHYS_LA_EXPANDED, ui.get_phys_la_expanded());
+    cfg.set_bool(k::MAI2_PANEL_EXPANDED, ui.get_mai2_panel_expanded());
+    cfg.set_bool(k::LIGHT_PANEL_EXPANDED, ui.get_light_panel_expanded());
     cfg.set_bool(k::LATENCY_MEASURE, ui.get_measure_latency());
     cfg.set_i32(k::CURRENT_VIEW, ui.get_current_view());
     cfg.set_i32(k::SETTINGS_TAB, ui.get_settings_tab());
@@ -457,7 +468,10 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
 
     // 延迟图不再依赖绘图区宽高比：PlotPath 的 fit: fill 会把固定 1000×1000 数据坐标拉满。
 
-    // 刷新按钮
+    // 手动断开后停止后台枚举和重连；只有用户再次主动连接才恢复掉线重连。
+    let auto_reconnect = Rc::new(std::cell::Cell::new(true));
+
+    // 刷新按钮只执行本次手动扫描，不改变手动断开状态。
     let ctrl_clone = controller.clone();
     let ui_refresh = ui_weak.clone();
     ui.on_refresh(move || {
@@ -472,16 +486,21 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
     // 连接
     let ctrl_clone = controller.clone();
     let ui_conn = ui_weak.clone();
+    let reconnect_on_connect = auto_reconnect.clone();
     ui.on_connect_clicked(move || {
         let ui = ui_conn.upgrade().unwrap();
         let index = ui.get_selected_device() as usize;
         let mut ctrl = ctrl_clone.borrow_mut();
-        let _ = ctrl.connect(index);
+        if ctrl.connect(index).is_ok() {
+            reconnect_on_connect.set(true);
+        }
     });
 
     // 断开
     let ctrl_clone = controller.clone();
+    let reconnect_on_disconnect = auto_reconnect.clone();
     ui.on_disconnect_clicked(move || {
+        reconnect_on_disconnect.set(false);
         let mut ctrl = ctrl_clone.borrow_mut();
         ctrl.disconnect();
     });
@@ -619,6 +638,12 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
     });
 
     let ctrl_clone = controller.clone();
+    ui.on_combo_hid_submitted(move |text| match parse_hid_usage(text.as_str()) {
+        Ok(code) => ctrl_clone.borrow_mut().kbd_combo_capture_key(code, 0),
+        Err(error) => ctrl_clone.borrow_mut().push_log(error),
+    });
+
+    let ctrl_clone = controller.clone();
     ui.on_combo_keys_clear(move || {
         ctrl_clone.borrow_mut().kbd_combo_clear_keys();
     });
@@ -679,6 +704,19 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
         ctrl_clone
             .borrow_mut()
             .kbd_combo_capture_key_at(index as usize, code, mods);
+    });
+
+    let ctrl_clone = controller.clone();
+    ui.on_combo_key_hid_submitted(move |index, text| {
+        if index < 0 {
+            return;
+        }
+        match parse_hid_usage(text.as_str()) {
+            Ok(code) => ctrl_clone
+                .borrow_mut()
+                .kbd_combo_capture_key_at(index as usize, code, 0),
+            Err(error) => ctrl_clone.borrow_mut().push_log(error),
+        }
     });
 
     // 全通道页"批量应用": 勾选态与应用动作全部落在 AppController, UI 只转发事件。
@@ -992,6 +1030,13 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
         let _ = ctrl.kbd_set_map(idx as u8, code, m);
     });
     let ctrl_clone = controller.clone();
+    ui.on_kbd_hid_phys(move |idx, text| match parse_hid_usage(text.as_str()) {
+        Ok(code) => {
+            let _ = ctrl_clone.borrow_mut().kbd_set_map(idx as u8, code, 0);
+        }
+        Err(error) => ctrl_clone.borrow_mut().push_log(error),
+    });
+    let ctrl_clone = controller.clone();
     ui.on_kbd_capture_zone(move |zone, text, c, s, a, g| {
         let code = char_to_hid(text.as_str());
         if code == 0 {
@@ -1261,10 +1306,14 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
         let _ = ctrl.request_config_all();
     });
 
+    let mai2_verify_at = Rc::new(Cell::new(None::<Instant>));
     let ctrl_clone = controller.clone();
+    let mai2_verify_set = mai2_verify_at.clone();
     ui.on_mai2_set_send_en(move |enabled| {
         let mut ctrl = ctrl_clone.borrow_mut();
-        let _ = ctrl.mai2_set_send_en(enabled);
+        if ctrl.mai2_set_send_en(enabled).is_ok() {
+            mai2_verify_set.set(Some(Instant::now() + Duration::from_millis(250)));
+        }
     });
 
     let ctrl_clone = controller.clone();
@@ -1610,8 +1659,20 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
         let cfg = ui_cfg.borrow();
         ui.set_log_filter(cfg.get_i32(k::LOG_FILTER, 2).clamp(0, 3));
         ui.set_log_auto_scroll(cfg.get_bool(k::LOG_AUTO_SCROLL, true));
+        ui.set_vcam_enabled(cfg.get_bool(k::VCAM_ENABLED, false));
         ui.set_vcam_submit_secs(cfg.get_i32(k::VCAM_SUBMIT_SECS, 2).clamp(1, 10));
         ui.set_vcam_display_secs(cfg.get_i32(k::VCAM_DISPLAY_SECS, 10).clamp(1, 60));
+        ui.set_diag_expanded(cfg.get_bool(k::DIAG_EXPANDED, false));
+        ui.set_curve_params_expanded(cfg.get_bool(k::CURVE_PARAMS_EXPANDED, true));
+        ui.set_curve_algo_cfg_expanded(cfg.get_bool(k::CURVE_ALGO_CFG_EXPANDED, false));
+        ui.set_curve_series_expanded(cfg.get_bool(k::CURVE_SERIES_EXPANDED, true));
+        ui.set_curve_spectrum_expanded(cfg.get_bool(k::CURVE_SPECTRUM_EXPANDED, false));
+        ui.set_channel_show_disabled(cfg.get_bool(k::CHANNEL_SHOW_DISABLED, false));
+        ui.set_phys_live_expanded(cfg.get_bool(k::PHYS_LIVE_EXPANDED, true));
+        ui.set_phys_keys_expanded(cfg.get_bool(k::PHYS_KEYS_EXPANDED, false));
+        ui.set_phys_la_expanded(cfg.get_bool(k::PHYS_LA_EXPANDED, false));
+        ui.set_mai2_panel_expanded(cfg.get_bool(k::MAI2_PANEL_EXPANDED, false));
+        ui.set_light_panel_expanded(cfg.get_bool(k::LIGHT_PANEL_EXPANDED, false));
         ui.set_measure_latency(cfg.get_bool(k::LATENCY_MEASURE, false));
         // ★环境变量可强制初始页签★(MAI2_UI_VIEW / MAI2_UI_TAB)
         // 界面类缺陷必须能"打开就在那一页"地复现与截图, 否则每次验证都要人工点几下, 无法自动化取证
@@ -1781,6 +1842,7 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
             vcam_cb.set_enabled(false);
             vcam::keyboard::stop();
             *publisher_cb.borrow_mut() = None;
+            ui.set_vcam_enabled(false);
             ui.set_vcam_runtime_status(
                 "未运行 · 摄像头仍在系统设备列表中，消费端会读到黑帧".into(),
             );
@@ -1817,8 +1879,12 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
         }
         vcam_cb.set_enabled(true);
         vcam::keyboard::start(vcam_cb.clone());
+        ui.set_vcam_enabled(true);
         ui.set_vcam_runtime_status("运行中 · 扫码即推 QR 帧到共享队列，消费端随时可打开".into());
     });
+    if ui.get_vcam_enabled() {
+        ui.invoke_set_vcam_enabled(true);
+    }
     // 安装/卸载仍在后台执行，避免 UAC 和 regsvr32 阻塞 Slint 事件循环。
     let ui_vcam_install = ui_weak.clone();
     ui.on_install_vcam(move || {
@@ -2085,6 +2151,7 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
         ui.set_la_window_index(LA_WINDOW_DEFAULT as i32);
     }
     let mut last_mai2_version = u64::MAX;
+    let mai2_verify_timer = mai2_verify_at.clone();
     let mut last_led_version = u64::MAX;
     // 协议页驻留门控: 进页边沿请求一次, 离页停止轮询(见下方 protocol_visible)。
     let mut last_protocol_visible = false;
@@ -2178,13 +2245,16 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
         // 侦听绑定: 捕获下一次触摸的物理通道并写入草稿(仅在侦听态时有动作)。
         let _ = ctrl.listen_tick();
 
-        // 自动重连:断开且有设备时每~2s 刷新并重连第一个,用户无需手动连接。
+        // 自动重连仅在启动默认态或用户主动连接后启用；手动断开会保持停止扫描。
         reconnect_tick = reconnect_tick.wrapping_add(1);
         // ★节拍与墙钟解耦★ 所有周期性动作都按毫秒表达(`_every_ms`), 不再写死"每 N 个 tick" ——
         // tick 周期改动时那种写法会静默把所有轮询间隔一起缩放掉。
         // 视觉重建(SVG/36 卡片)按墙钟限速: 遥测 170Hz+, 重投影没必要比屏幕刷新还快。
         let visual_refresh_tick = _every_ms(reconnect_tick, VISUAL_REFRESH_MS);
-        if ctrl.state() == ConnState::Disconnected && _every_ms(reconnect_tick, 2_000) {
+        if auto_reconnect.get()
+            && ctrl.state() == ConnState::Disconnected
+            && _every_ms(reconnect_tick, 2_000)
+        {
             ctrl.refresh_devices();
             let labels: Vec<slint::SharedString> =
                 ctrl.device_labels().into_iter().map(|s| s.into()).collect();
@@ -2541,6 +2611,8 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
             let _ = ctrl.request_params(ch);
             // 全局页代表值固定取 CH0；即使精调当前停在其他通道也必须拉取。
             let _ = ctrl.request_params(0);
+            // 自动化队列先拿到启用真值，避免在全参数预取完成前把禁用通道误判为启用。
+            let _ = ctrl.request_param_all_channels(mai2control_ui::proto::PARAM_ENABLED);
             // 其余 34 个通道同样需要真值, 否则全通道页/批量应用读到的是空缓存。
             ctrl.schedule_param_refetch_all();
             let _ = ctrl.algo_get_info();
@@ -2593,13 +2665,18 @@ fn setup_ui_callbacks(ui: &AppWindow, controller: Rc<RefCell<AppController>>) ->
         }
         last_global_tune_visible = global_tune_visible;
 
-        // 协议页(settings_tab == 1)驻留期的灯效采样刷新。
-        // ★不得每 16ms 发★: 本设备所有流量共用一对 bulk 端点, 64B vendor FIFO 被高频轮询打爆会掉线
-        // (遥测已因此降到 30Hz)。这里取每 12 tick ≈ 192ms(约 5Hz): 色块跟手够用, 负载可忽略。
-        // 面板折叠时不轮询 —— 折叠态看不到色块, 没有理由占用链路。
+        // Protocol page state is polled at 5Hz; manual changes request one delayed confirmation.
+        if let Some(verify_at) = mai2_verify_timer.get() {
+            if Instant::now() >= verify_at {
+                let _ = ctrl.mai2_request_state();
+                mai2_verify_timer.set(None);
+            }
+        }
         let protocol_visible = connected && ui.get_current_view() == 1 && ui.get_settings_tab() == 1;
         if protocol_visible {
-            // 进页边沿总取一次(折叠态的摘要行也要有真值); 持续轮询只在展开时做。
+            if !last_protocol_visible || _every_ms(reconnect_tick, 200) {
+                let _ = ctrl.mai2_request_state();
+            }
             if !last_protocol_visible
                 || (ui.get_light_panel_expanded() && _every_ms(reconnect_tick, 200))
             {
@@ -3744,12 +3821,17 @@ fn build_param_row(param_id: u8, value: i32) -> ParamRow {
 /// 未收录的 key 一律排到末尾(999)并按 key 兜底, 新增 KV 不会插到中间打乱既有顺序。
 fn config_display_order(key: &str) -> u16 {
     match key {
-        // —— mai2serial: 链路 → 上报延迟 → RSET 善后 ——
+        // —— mai2serial: 链路 → 节流 → 延迟/聚合 → 发送策略 → RSET 善后 ——
         "comm.serial_baud" => 10,
-        "comm.touch_delay_100us" => 20,
-        "comm.keyboard_map_serial_only" => 30,
-        "comm.serial_reset_baseline" => 40,
-        "comm.serial_reset_calibrate" => 41,
+        "comm.rate_limit_en" => 20,
+        "comm.rate_limit_hz" => 21,
+        "comm.touch_delay_100us" => 30,
+        "comm.aggregation_delay_ms" => 40,
+        "comm.send_only_on_change" => 50,
+        "comm.extra_send" => 51,
+        "comm.keyboard_map_serial_only" => 60,
+        "comm.serial_reset_baseline" => 70,
+        "comm.serial_reset_calibrate" => 71,
         // —— mai2light: 链路 → 节点 → 灯珠总数 ——
         "comm.light_baud" => 10,
         "led.node_id" => 20,
@@ -3777,12 +3859,14 @@ fn parse_config_label(key: &str) -> (String, String, String) {
     // 所以归属按语义逐 key 指定, 而不是按 key 的一级前缀 —— comm./led. 前缀下同时混着
     // "协议能力参数"(属协议页)与"键盘映射/状态指示灯"(属通信系统 Tab), 前缀分不开。
     let group = match key {
-        // mai2serial: 串口本身 + 触控上报延迟线 + {E}RSET 善后行为 → 协议页 mai2serial 块
-        // ★已删掉 sample_delay_ms / aggregation_delay_ms / extra_send / rate_limit_* /
-        //   send_only_on_change★: 固件里没有任何消费点(见 app_config.cpp 该处注释), 已从 schema 移除。
-        //   "采样延迟"与"触控延迟"两个名字都像延迟, 正是混淆来源; 现在只保留真正平移上报的那一个。
+        // mai2serial: 串口、节流、延迟聚合与 {E}RSET 善后 → 协议页 mai2serial 块。
         "comm.serial_baud"
         | "comm.touch_delay_100us"
+        | "comm.aggregation_delay_ms"
+        | "comm.extra_send"
+        | "comm.rate_limit_en"
+        | "comm.rate_limit_hz"
+        | "comm.send_only_on_change"
         | "comm.serial_reset_calibrate"
         | "comm.serial_reset_baseline"
         // 「触控映射仅协议启动时生效」的判定依据就是 mai2serial 的实际发送态,
@@ -3809,8 +3893,24 @@ fn parse_config_label(key: &str) -> (String, String, String) {
     .to_string();
 
     let (label, desc): (&str, &str) = match key {
-        // 上面 6 个空壳项(采样延迟/仅变化时发送/聚合延迟/额外重发/速率限制)已从固件 schema 删除,
-        // 故标签也一并删除 —— 留着标签只会在将来有人误以为"设备支持只是没显示"。
+        "comm.touch_delay_100us" => ("触控延迟 (×100µs)", "触控串口上报延迟线, 0..100ms"),
+        "comm.aggregation_delay_ms" => (
+            "多数投票窗口 (ms)",
+            "对延迟后的触控状态按位多数投票；平票沿用上次结果",
+        ),
+        "comm.extra_send" => (
+            "改变后额外重发",
+            "仅改变时发送启用后，每个成功状态边沿额外重发的次数",
+        ),
+        "comm.rate_limit_en" => (
+            "启用发送节流",
+            "限制触控帧最高发送频率；节流不会制造重复状态边沿",
+        ),
+        "comm.rate_limit_hz" => ("发送频率上限 (Hz)", "启用发送节流时的最高成功发送频率"),
+        "comm.send_only_on_change" => (
+            "仅状态改变时发送",
+            "关闭时连续发送；开启时仅成功发送新状态及其额外重发",
+        ),
         "comm.keyboard_map_en" => ("启用触摸→键盘", "把触摸分区映射为键盘按键输出"),
         "comm.keyboard_map_serial_only" => (
             "触控映射仅协议启动时生效",
@@ -3826,7 +3926,6 @@ fn parse_config_label(key: &str) -> (String, String, String) {
             "收到 mai2serial 重启指令({E} RSET)后，自动执行一次全通道基线复位",
         ),
         "comm.light_baud" => ("灯板串口波特率", "灯板通信串口的波特率"),
-        "comm.touch_delay_100us" => ("触控延迟 (×100µs)", "触控串口上报延迟线, 0..100ms"),
         "comm.keyboard_delay_100us" => ("键盘延迟 (×100µs)", "触摸→键盘输出的附加延迟"),
         "mode.work" => ("工作模式", "Serial=游戏串口; HID=触摸屏+键盘"),
         "led.enable" => ("启用 LED", "关闭则运行时 LED 静默(启动序列不受影响)"),
@@ -4928,16 +5027,73 @@ fn kbd_key_choices() -> Vec<(&'static str, u8)> {
     v.push(("Backspace", 0x2A));
     v.push(("Tab", 0x2B));
     v.push(("Space", 0x2C));
+    v.extend_from_slice(&[
+        ("- / _", 0x2D),
+        ("= / +", 0x2E),
+        ("[ / {", 0x2F),
+        ("] / }", 0x30),
+        ("\\ / |", 0x31),
+        ("; / :", 0x33),
+        ("' / \"", 0x34),
+        ("` / ~ / ·", 0x35),
+        (", / <", 0x36),
+        (". / >", 0x37),
+        ("/ / ?", 0x38),
+        ("CapsLock", 0x39),
+    ]);
     const FKEYS: [&str; 12] = [
         "F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10", "F11", "F12",
     ];
     for (i, name) in FKEYS.iter().enumerate() {
         v.push((name, 0x3A + i as u8));
     }
+    v.extend_from_slice(&[
+        ("PrintScreen", 0x46),
+        ("ScrollLock", 0x47),
+        ("Pause", 0x48),
+        ("Insert", 0x49),
+        ("Home", 0x4A),
+        ("PageUp", 0x4B),
+        ("Delete", 0x4C),
+        ("End", 0x4D),
+        ("PageDown", 0x4E),
+    ]);
     v.push(("→ 右", 0x4F));
     v.push(("← 左", 0x50));
     v.push(("↓ 下", 0x51));
     v.push(("↑ 上", 0x52));
+    v.extend_from_slice(&[
+        ("NumLock", 0x53),
+        ("Keypad /", 0x54),
+        ("Keypad *", 0x55),
+        ("Keypad -", 0x56),
+        ("Keypad +", 0x57),
+        ("Keypad Enter", 0x58),
+        ("Keypad 1", 0x59),
+        ("Keypad 2", 0x5A),
+        ("Keypad 3", 0x5B),
+        ("Keypad 4", 0x5C),
+        ("Keypad 5", 0x5D),
+        ("Keypad 6", 0x5E),
+        ("Keypad 7", 0x5F),
+        ("Keypad 8", 0x60),
+        ("Keypad 9", 0x61),
+        ("Keypad 0", 0x62),
+        ("Keypad .", 0x63),
+        ("Menu", 0x65),
+        ("F13", 0x68),
+        ("F14", 0x69),
+        ("F15", 0x6A),
+        ("F16", 0x6B),
+        ("F17", 0x6C),
+        ("F18", 0x6D),
+        ("F19", 0x6E),
+        ("F20", 0x6F),
+        ("F21", 0x70),
+        ("F22", 0x71),
+        ("F23", 0x72),
+        ("F24", 0x73),
+    ]);
     v.push(("LCtrl", 0xE0));
     v.push(("LShift", 0xE1));
     v.push(("LAlt", 0xE2));
@@ -4969,16 +5125,16 @@ fn kbd_choice_to_code(ci: i32) -> u8 {
         .unwrap_or(0)
 }
 
-/// HID 键码 → 显示名(用于捕获输入框显示)。
-fn kbd_hid_name(code: u8) -> &'static str {
+/// HID 键码 → 显示名(用于捕获输入框显示)。未知合法值保留十六进制编码。
+fn kbd_hid_name(code: u8) -> String {
     if code == 0 {
-        return "";
+        return String::new();
     }
     kbd_key_choices()
         .iter()
         .find(|(_, c)| *c == code)
-        .map(|(n, _)| *n)
-        .unwrap_or("?")
+        .map(|(n, _)| (*n).to_string())
+        .unwrap_or_else(|| format!("HID 0x{code:02X}"))
 }
 
 /// (键码, 修饰位) → 组合键显示串, 如 "Ctrl+Shift+A"。空映射显示"未设置"。
@@ -5000,7 +5156,7 @@ fn kbd_display(code: u8, modifier: u8) -> String {
         s.push_str("Gui+");
     }
     if code != 0 {
-        s.push_str(kbd_hid_name(code));
+        s.push_str(&kbd_hid_name(code));
     } else {
         s.pop(); // 去掉尾部 '+'
     }
@@ -5008,24 +5164,47 @@ fn kbd_display(code: u8, modifier: u8) -> String {
 }
 
 /// Slint KeyEvent.text → HID 键码。纯修饰键/未识别返回 0。
-/// Slint 特殊键为私有区/控制字符常量(见 i_slint_core key_codes)。
 fn char_to_hid(text: &str) -> u8 {
     match text {
-        "\u{000a}" | "\r" => return 0x28, // Enter
-        "\u{001b}" => return 0x29,        // Escape
-        "\u{0008}" => return 0x2A,        // Backspace
-        "\u{0009}" => return 0x2B,        // Tab
-        " " => return 0x2C,               // Space
-        "\u{f700}" => return 0x52,        // Up
-        "\u{f701}" => return 0x51,        // Down
-        "\u{f702}" => return 0x50,        // Left
-        "\u{f703}" => return 0x4F,        // Right
+        "\u{000a}" | "\r" => return 0x28,
+        "\u{001b}" => return 0x29,
+        "\u{0008}" => return 0x2A,
+        "\u{0009}" => return 0x2B,
+        " " => return 0x2C,
+        "-" | "_" => return 0x2D,
+        "=" | "+" => return 0x2E,
+        "[" | "{" => return 0x2F,
+        "]" | "}" => return 0x30,
+        "\\" | "|" => return 0x31,
+        ";" | ":" => return 0x33,
+        "'" | "\"" => return 0x34,
+        "`" | "~" | "·" => return 0x35,
+        "," | "<" => return 0x36,
+        "." | ">" => return 0x37,
+        "/" | "?" => return 0x38,
+        "\u{007f}" => return 0x4C,
+        "\u{f700}" => return 0x52,
+        "\u{f701}" => return 0x51,
+        "\u{f702}" => return 0x50,
+        "\u{f703}" => return 0x4F,
+        "\u{f727}" => return 0x49,
+        "\u{f729}" => return 0x4A,
+        "\u{f72b}" => return 0x4D,
+        "\u{f72c}" => return 0x4B,
+        "\u{f72d}" => return 0x4E,
+        "\u{f72f}" => return 0x47,
+        "\u{f730}" => return 0x48,
+        "\u{f731}" => return 0x46,
+        "\u{f735}" => return 0x65,
         _ => {}
     }
     if let Some(ch) = text.chars().next() {
         let u = ch as u32;
         if (0xf704..=0xf70f).contains(&u) {
-            return 0x3A + (u - 0xf704) as u8; // F1..F12
+            return 0x3A + (u - 0xf704) as u8;
+        }
+        if (0xf710..=0xf71b).contains(&u) {
+            return 0x68 + (u - 0xf710) as u8;
         }
         let lc = ch.to_ascii_lowercase();
         match lc {
@@ -5036,6 +5215,27 @@ fn char_to_hid(text: &str) -> u8 {
         }
     }
     0
+}
+
+/// 解析十进制或 0x 前缀的 HID Keyboard/Keypad usage。
+fn parse_hid_usage(text: &str) -> Result<u8, String> {
+    let value = text.trim();
+    if value.is_empty() {
+        return Err("请输入 HID 编码".to_string());
+    }
+    let parsed = if let Some(hex) = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+    {
+        u16::from_str_radix(hex, 16)
+    } else {
+        value.parse::<u16>()
+    }
+    .map_err(|_| format!("HID 编码无效: {value}"))?;
+    if !(1..=u8::MAX as u16).contains(&parsed) {
+        return Err(format!("HID 编码超出范围 1..255: {value}"));
+    }
+    Ok(parsed as u8)
 }
 
 /// 全通道网格的行模型。★排序与筛选都在这里定稿★: 次序取自

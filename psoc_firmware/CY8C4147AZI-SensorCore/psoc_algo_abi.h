@@ -106,7 +106,7 @@ typedef void (*algo_fn_t)(algo_io_t *io);
 #define ALGO_INFO    (0x43u)
 #define ALGO_SET_ROM (0x44u)  /* [magic,SET_ROM,ch,rom_lo,rom_hi,0,0] 设 per-channel ROM */
 #define ALGO_GET_ROM (0x45u)  /* [magic,GET_ROM,ch,0,0,0,0] → resp [.. ,ch,0,rom_lo,rom_hi,0] */
-#define ALGO_GET_TRACE (0x46u) /* [magic,GET_TRACE,ch,idx,..] → resp [..,ch,out_active,report[idx]_lo,report[idx]_hi,0] */
+#define ALGO_GET_TRACE (0x46u) /* [magic,GET_TRACE,ch,idx,..] → resp [..,ch,out_active,report[idx]_lo,report[idx]_hi,idx] */
 #define ALGO_SET_CFG (0x47u)  /* [magic,SET_CFG,idx,val,..] 设共享 cfg[idx]=val(算法可设置变量) */
 #define ALGO_GET_CFG (0x48u)  /* [magic,GET_CFG,idx,..] → resp [..,idx,0,cfg[idx],0,0] */
 

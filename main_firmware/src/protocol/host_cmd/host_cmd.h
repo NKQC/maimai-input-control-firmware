@@ -144,7 +144,7 @@ enum class HostCmd : uint8_t {
     //      (offset+chunk==total)才更新有效长度并持久化。total=0 = 清空源。→ ACK / NAK
     ALGO_SET_SRC       = 0x67,
     ALGO_GET_CODE      = 0x68,  // 空 → 响应 [len(u16 LE), asm bytes] RP 存的算法 ASM 机器码回读
-    ALGO_GET_TRACE     = 0x69,  // payload=[ch(u8),idx(u8)] → 响应 [ch,out_active(u8),report(u16 LE)]
+    ALGO_GET_TRACE     = 0x69,  // payload=[ch(u8),idx(u8)] → 响应 [ch,idx,out_active(u8),report(u16 LE)]
     ALGO_SET_CFG       = 0x6A,  // payload=[idx(u8),val(u8)] 设共享 cfg[idx]+持久化+下发 → ACK
     ALGO_GET_CFG       = 0x6B,  // payload=[idx(u8)] → 响应 [idx,cfg(u8)]
 
@@ -178,7 +178,7 @@ enum class HostCmd : uint8_t {
     KBD_SET_COMBO    = 0x7B,  // [count(u8)] + count×16B → ACK (整表替换; 空掩码条目丢弃, 同掩码去重)
 
     // mai2 触控串口状态域
-    MAI2_GET_STATE   = 0x78,  // 空 → [send_en(u8), status(u8: 0=STOPPED/1=READY/2=RUNNING), baud(u32 LE)]
+    MAI2_GET_STATE   = 0x78,  // 空 → [send_active(u8: RUNNING&&serial_ok), status(u8: 0=STOPPED/1=READY/2=RUNNING), baud(u32 LE)]
     MAI2_SET_SEND_EN = 0x79,  // [en(u8)] 覆盖"是否发送触控帧"(游戏 {A}/{L} 之外的手动开关) → ACK
 
     // 应答 0x7E-0x7F

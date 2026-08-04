@@ -9,6 +9,88 @@
 
 GameIoService* GameIoService::_instance = nullptr;
 
+void GameIoService::SerialPublishState::reset() {
+    _flags.flags = 0u;
+    _last_sent.clear();
+    _last_aggregate.clear();
+    _last_recorded.clear();
+    _last_rate_send_us = 0u;
+    _remaining_extra_sends = 0u;
+    for (uint16_t slot = 0u; slot < kAggregateSlots; ++slot) {
+        _samples[slot].time_ms = UINT32_MAX;
+        _samples[slot].state = 0u;
+    }
+}
+
+bool GameIoService::SerialPublishState::rate_limited(
+    uint32_t now_us, const SerialPublishSettings& settings) const {
+    if (!settings.bits.rate_limit_enabled || _last_rate_send_us == 0u) return false;
+    const uint32_t interval_us = 1000000u / settings.rate_limit_hz;
+    return interval_us != 0u && now_us - _last_rate_send_us < interval_us;
+}
+
+void GameIoService::SerialPublishState::record(
+    uint32_t now_us, const Mai2Serial_TouchState& sample) {
+    const uint32_t now_ms = now_us / 1000u;
+    Sample& slot = _samples[now_ms % kAggregateSlots];
+    slot.time_ms = now_ms;
+    slot.state = sample.raw;
+    _last_recorded = sample;
+}
+
+Mai2Serial_TouchState GameIoService::SerialPublishState::value(
+    uint32_t now_us, uint16_t window_ms) {
+    if (window_ms == 0u) return _last_recorded;
+
+    const uint32_t now_ms = now_us / 1000u;
+    uint8_t votes[35] = {};
+    uint8_t count = 0u;
+    for (uint16_t index = 0u; index < kAggregateSlots; ++index) {
+        const Sample& current = _samples[index];
+        if (current.time_ms == UINT32_MAX || now_ms - current.time_ms > window_ms) continue;
+        ++count;
+        for (uint8_t bit = 0u; bit < 35u; ++bit) {
+            votes[bit] += static_cast<uint8_t>((current.state >> bit) & 1u);
+        }
+    }
+    if (count == 0u) return _flags.bits.has_last_aggregate ? _last_aggregate : _last_recorded;
+
+    Mai2Serial_TouchState result;
+    result.clear();
+    for (uint8_t bit = 0u; bit < 35u; ++bit) {
+        const uint8_t doubled_votes = static_cast<uint8_t>(votes[bit] * 2u);
+        const bool keep_last = doubled_votes == count && _flags.bits.has_last_aggregate &&
+                               ((_last_aggregate.raw >> bit) & 1u) != 0u;
+        if (doubled_votes > count || keep_last) result.raw |= (uint64_t(1u) << bit);
+    }
+    _last_aggregate = result;
+    _flags.bits.has_last_aggregate = 1u;
+    return result;
+}
+
+bool GameIoService::SerialPublishState::should_send(
+    const Mai2Serial_TouchState& state, const SerialPublishSettings& settings) const {
+    const bool changed = !_flags.bits.has_last_sent || state.raw != _last_sent.raw;
+    return !settings.bits.send_only_on_change || changed || _remaining_extra_sends != 0u;
+}
+
+void GameIoService::SerialPublishState::note_send_success(
+    const Mai2Serial_TouchState& state, uint32_t now_us, const SerialPublishSettings& settings) {
+    const bool changed = !_flags.bits.has_last_sent || state.raw != _last_sent.raw;
+    if (settings.bits.send_only_on_change) {
+        if (changed) {
+            _remaining_extra_sends = settings.extra_send;
+        } else if (_remaining_extra_sends != 0u) {
+            --_remaining_extra_sends;
+        }
+    } else if (changed) {
+        _remaining_extra_sends = settings.extra_send;
+    }
+    _last_sent = state;
+    _flags.bits.has_last_sent = 1u;
+    if (settings.bits.rate_limit_enabled) _last_rate_send_us = now_us;
+}
+
 GameIoService::GameIoService()
     : _serial_uart(HAL_USB_Device::getInstance(), UsbCdcPort::CDC_SERIAL),
       _light_uart(HAL_USB_Device::getInstance(), UsbCdcPort::CDC_LIGHT),
@@ -20,7 +102,10 @@ GameIoService::GameIoService()
       _initialized(false),
       _touch_delay_units(0),
       _delay_refresh_us(0),
-      _serial_reset_requests(0) {}
+      _serial_reset_requests(0) {
+    _serial_publish_settings.clear();
+    _serial_publish.reset();
+}
 
 // 懒构造无锁: 调用点(loop 内的 task、以及 UsbComm::update 同步派发的 LED_*/MAI2_* host_cmd 处理)
 // 全在 core0 单线程; core1 只跑 Psoc::core1_run, 不进入本服务, 故首次 new 无竞态。
@@ -31,7 +116,7 @@ GameIoService* GameIoService::getInstance() {
 }
 
 bool GameIoService::mai2_touch_sending() const {
-    return _serial.is_ready() && _serial.get_serial_ok();
+    return _serial.sending_active();
 }
 
 bool GameIoService::init(UsbWorkMode mode) {
@@ -68,7 +153,9 @@ bool GameIoService::init(UsbWorkMode mode) {
 
     // 触控延迟线预热: 全环清 0(无触摸), 读入初始延迟片数。
     _touch_delay.reset(0);
+    _serial_publish.reset();
     _touch_delay_units = ConfigManager::get_uint16("comm.touch_delay_100us");
+    _refresh_serial_publish_settings();
     _delay_refresh_us = 0;
 
     _initialized = true;
@@ -222,7 +309,7 @@ void GameIoService::_handle_mai2_get_state(const HostFrame& frame, uint8_t* resp
     r.cmd = static_cast<uint8_t>(HostCmd::MAI2_GET_STATE);
     r.flags = HOST_CMD_FLAG_RESPONSE;
     r.seq = frame.seq;
-    r.payload[0] = self->_serial.get_serial_ok() ? 1 : 0;
+    r.payload[0] = self->mai2_touch_sending() ? 1 : 0;
     r.payload[1] = static_cast<uint8_t>(self->_serial.get_status());  // 0=STOPPED 1=READY 2=RUNNING
     r.payload[2] = (uint8_t)(baud & 0xFF);
     r.payload[3] = (uint8_t)((baud >> 8) & 0xFF);
@@ -238,7 +325,15 @@ void GameIoService::_handle_mai2_set_send_en(const HostFrame& frame, uint8_t* re
             "mai2_set_send_en payload must be [en(u8)]", resp, HOST_CMD_RESP_BUF_MAX);
         return;
     }
-    getInstance()->_serial.set_serial_ok(frame.payload[0] != 0);
+    GameIoService* self = getInstance();
+    const bool enable = frame.payload[0] != 0u;
+    const bool changed = enable ? self->_serial.start() : self->_serial.stop();
+    if (!changed) {
+        *resp_len = HostCmdCodec::encode_nak(frame.seq, HostCmdError::SENSOR_ERROR,
+            "mai2 serial state change failed", resp, HOST_CMD_RESP_BUF_MAX);
+        return;
+    }
+    if (enable) self->_serial.set_serial_ok(true);
     *resp_len = HostCmdCodec::encode_ack(frame.seq, resp, HOST_CMD_RESP_BUF_MAX);
 }
 
@@ -263,6 +358,17 @@ void GameIoService::_process_serial_reset() {
     if (actions != 0u) {
         SelfHeal::getInstance()->note(SH_SERIAL_RESET_ACTIONS, actions);
     }
+}
+
+void GameIoService::_refresh_serial_publish_settings() {
+    _serial_publish_settings.aggregation_delay_ms =
+        ConfigManager::get_uint8("comm.aggregation_delay_ms");
+    _serial_publish_settings.extra_send = ConfigManager::get_uint8("comm.extra_send");
+    _serial_publish_settings.rate_limit_hz = ConfigManager::get_uint16("comm.rate_limit_hz");
+    _serial_publish_settings.bits.rate_limit_enabled =
+        ConfigManager::get_bool("comm.rate_limit_en") ? 1u : 0u;
+    _serial_publish_settings.bits.send_only_on_change =
+        ConfigManager::get_bool("comm.send_only_on_change") ? 1u : 0u;
 }
 
 void GameIoService::deinit() {
@@ -312,22 +418,28 @@ void GameIoService::task() {
     _light.task();
     gio_seg_mark(GIO_SEG_LIGHT, gio_t);
 
-    // 实时触控快路：链路正常时取 36 位 on/off 掩码，经 BindingService 真实绑定表转 34 区；
-    // 链路异常时上报全 0（无触摸），保持诚实。
+    // Map the retained PSoC touch mask to the 34 protocol areas.
     Psoc* psoc = Psoc::getInstance();
     const uint32_t _lt0 = gio_seg_begin(GIO_SEG_TOUCH_MAP);
-    const uint64_t channel_mask = psoc->link_ok() ? psoc->touch_mask() : 0;
-    const uint64_t area_now = BindingService::getInstance()->map_to_areas(channel_mask);
-    // 触控延迟线(100us 片, 0..100ms, UI 可配): 单拷贝环形, O(1)。延迟值 50ms 缓存刷新一次避免频繁查表。
+    const uint64_t area_now = BindingService::getInstance()->map_to_areas(psoc->touch_mask());
     if (_lt0 - _delay_refresh_us >= 50000u) {
         _touch_delay_units = ConfigManager::get_uint16("comm.touch_delay_100us");
+        _refresh_serial_publish_settings();
         _delay_refresh_us = _lt0;
     }
-    Mai2Serial_TouchState touch(_touch_delay.tick(_lt0, _touch_delay_units, area_now));
-    const uint32_t _lt1 = time_us_32();
+    const Mai2Serial_TouchState delayed_touch(
+        _touch_delay.tick(_lt0, _touch_delay_units, area_now));
+    _serial_publish.record(_lt0, delayed_touch);
     gio_seg_mark(GIO_SEG_TOUCH_MAP, _lt0);
-    gio_seg_begin(GIO_SEG_SEND_TOUCH);
-    _serial.send_touch_data(touch);
+    const uint32_t _lt1 = gio_seg_begin(GIO_SEG_SEND_TOUCH);
+    if (!_serial_publish.rate_limited(_lt0, _serial_publish_settings)) {
+        Mai2Serial_TouchState publish_touch(
+            _serial_publish.value(_lt0, _serial_publish_settings.aggregation_delay_ms));
+        if (_serial_publish.should_send(publish_touch, _serial_publish_settings) &&
+            _serial.send_touch_data(publish_touch)) {
+            _serial_publish.note_send_success(publish_touch, _lt0, _serial_publish_settings);
+        }
+    }
     const uint32_t _lt2 = time_us_32();
     gio_seg_mark(GIO_SEG_SEND_TOUCH, _lt1);
     latency_note(&g_lat_proc_us, _lt1 - _lt0);

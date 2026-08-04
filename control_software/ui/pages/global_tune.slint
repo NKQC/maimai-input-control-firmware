@@ -230,8 +230,8 @@ export component GlobalTunePage inherits Rectangle {
 
             // 逐通道调完分频后无需切页: 在本页对全部 36 通道一次性校准/复位基线。
             SectionCard {
-                title: "立即执行的动作(不进草稿)";
-                subtitle: "逐通道串行下发 · 随时可取消";
+                title: "通道操作";
+                subtitle: "仅处理已启用通道，可取消";
                 // 三个全通道动作都走 host 侧同一条串行队列 ⇒ 队列在跑时其余两个一律锁定,
                 // 不给用户"同时排两条队"的机会(那必然导致谁也说不清设备正在做哪一件事)。
                 // ★按钮一律 horizontal-stretch: 0 + 行尾弹性空白★ 否则按钮会平分整行宽度并横跨半屏。
@@ -240,15 +240,15 @@ export component GlobalTunePage inherits Rectangle {
                     spacing: Theme.gap;
                     Button {
                         horizontal-stretch: 0;
-                        text: root.spectrum_active ? "全通道校准(频谱扫描中锁定)"
-                                                   : "全通道校准(逐通道串行)";
+                        text: root.spectrum_active ? "全通道校准(已锁定)"
+                                                   : "全通道校准";
                         enabled: !root.batch_op_active && !root.spectrum_active;
                         clicked => { root.global_calibrate(); }
                     }
                     Button {
                         horizontal-stretch: 0;
-                        text: root.spectrum_active ? "全通道基线复位(频谱扫描中锁定)"
-                                                   : "全通道基线复位(逐通道串行)";
+                        text: root.spectrum_active ? "全通道基线复位(已锁定)"
+                                                   : "全通道基线复位";
                         enabled: !root.batch_op_active && !root.spectrum_active;
                         clicked => { root.global_baseline_reset(); }
                     }
@@ -260,9 +260,9 @@ export component GlobalTunePage inherits Rectangle {
                     Button {
                         horizontal-stretch: 0;
                         text: root.spectrum_active
-                            ? "全通道频率自适应(频谱扫描中锁定)"
-                            : (root.auto_tune_confirm ? "⚠ 再点一次确认: 改写全部通道分频"
-                                                      : "全通道频率自适应(逐通道各自校准)");
+                            ? "全通道频率自适应(已锁定)"
+                            : (root.auto_tune_confirm ? "⚠ 再点一次确认"
+                                                      : "全通道频率自适应");
                         enabled: !root.batch_op_active && !root.spectrum_active;
                         clicked => {
                             if (root.auto_tune_confirm) {
@@ -318,9 +318,8 @@ export component GlobalTunePage inherits Rectangle {
                 }
                 Text {
                     text: root.auto_tune_confirm
-                        ? "⚠ 确认后将逐通道改写 snsClk 分频并重校准，无法撤销。"
-                        : "三项都由上位机逐通道串行下发(每通道一条短命令)，随时可取消；"
-                        + "频率自适应会先把每通道的 IDAC 增益档写入并回读确认，确认不上就中止而不是硬着头皮开跑。";
+                        ? "⚠ 将改写已启用通道的分频。"
+                        : "操作按通道执行；频率自适应完成后统一保存。";
                     color: root.auto_tune_confirm ? Theme.err-soft : Theme.text-dim;
                     font-size: Theme.fs-small;
                     wrap: word-wrap;
@@ -333,7 +332,7 @@ export component GlobalTunePage inherits Rectangle {
                     spacing: Theme.gap;
                     CheckBox {
                         horizontal-stretch: 0;
-                        text: "Cp 辅助: 用实测电极电容逐通道决定增益档与频率偏好档";
+                        text: "Cp 辅助";
                         checked: root.cp_assist;
                         enabled: !root.batch_op_active;
                         toggled => { root.set_cp_assist(self.checked); }
@@ -342,11 +341,8 @@ export component GlobalTunePage inherits Rectangle {
                 }
                 Text {
                     text: root.cp_assist
-                        ? "已开启: 以本面板 Cp 中位数为参考点(该点用下面滑条选的起点档), 其余通道按 "
-                        + "I ∝ Cp 求目标补偿电流并取电流最接近的档 —— 增益档表的档号与电流并不单调, "
-                        + "故映射按电流而非档号做; 频率偏好以滑条值为中心 ±2 档(Cp 最低 -2, 最高 +2)。"
-                        + "没有有效 Cp 的通道退回滑条值, 不猜。需先点\"测量全部电极电容\"。"
-                        : "已关闭: 全部 36 通道统一使用下面滑条上的频率偏好档与全局起点增益档。";
+                        ? "按已测 Cp 分配各通道增益与频率偏好；无有效值时使用全局设置。"
+                        : "所有通道使用全局增益与频率偏好。";
                     color: Theme.text-dim;
                     font-size: Theme.fs-small;
                     wrap: word-wrap;
@@ -397,11 +393,11 @@ export component GlobalTunePage inherits Rectangle {
                 // ★去重★: 采样时钟分频/分辨率/时钟源/MFS 一律在下方"CSD 时钟树"里编辑(唯一入口),
                 // 本组只保留时钟树未覆盖的全局校准项, 避免两处重复导致的不同步。
                 title: "IDAC 与校准";
-                subtitle: "编辑仅暂存, 保存后下发并重初始化";
+                subtitle: "保存后生效";
                 // ★原「刷新 CH0 参数」按钮已删★: CH0 代表值有两条自动加载路径 ——
                 // 连接边沿(main.rs:2332)与每次真正进入本页(main.rs:2375)各拉一次,
                 // 手动按钮不会带来任何额外真值, 只是让用户以为需要自己点。
-                Text { text: "全局校准项; 采样时钟/分辨率/MFS 见下方时钟树。"; color: Theme.accent; font-size: Theme.fs-normal; wrap: word-wrap; }
+                Text { text: "校准参数；时钟设置见下方。"; color: Theme.accent; font-size: Theme.fs-normal; wrap: word-wrap; }
                 // ★这里曾有一条"GND 可能导致采样率下降或 railed"的警告, 已删除★:
                 // 它是从接法反推故障的猜测。同一个位置现在放**设备级证据**: 只有 MEASURE_CP 后
                 // Cp 回读 0x00FFFFFF 的通道才会出现在这里, 没有失败通道就整条隐藏。
@@ -413,7 +409,7 @@ export component GlobalTunePage inherits Rectangle {
                 }
                 FormRow {
                     label: "未激活传感器连接:";
-                    hint: "作用: 设置非激活电极接法。取值: GND/High-Z/Shield，保存后生效。";
+                    hint: "GND / High-Z / Shield；保存后生效。";
                     GuardedComboBox {
                         width: Theme.combo-width;
                         horizontal-stretch: 0;
@@ -426,7 +422,7 @@ export component GlobalTunePage inherits Rectangle {
                 }
                 FormRow {
                     label: "IDAC 感应配置:";
-                    hint: "作用: 设置 IDAC 感应方向。取值: sourcing/sinking，保存后生效。";
+                    hint: "sourcing / sinking；保存后生效。";
                     // ★这一项就是"下拉被当数字框缩放"的现场★: 112px 下 "IDAC sourcing" 被截成
                     // "IDAC sour…"。选项是英文短语, 取 combo-width 档才容得下最长那一项。
                     GuardedComboBox {
@@ -439,7 +435,7 @@ export component GlobalTunePage inherits Rectangle {
                 }
                 FormRow {
                     label: "自动校准:";
-                    hint: "作用: 设置 IDAC 自动校准开关。开关修改后保存生效。";
+                    hint: "保存后生效。";
                     CheckBox {
                         horizontal-stretch: 0;
                         text: "启用 (IDAC auto-calibration)";
@@ -466,7 +462,7 @@ export component GlobalTunePage inherits Rectangle {
                 }
                 FormRow {
                     label: "校准频率偏好:";
-                    hint: "作用: 设置频率自适应偏好档位 1–7，立即生效，保存后持久化。";
+                    hint: "频率偏好 1–7；保存后持久化。";
                     // 滑条是本行唯一需要占宽的控件, 故它自己吃剩余宽度(行尾空白仍在, 只是分不到)。
                     pref_slider := Slider {
                         minimum: 1;
@@ -496,7 +492,7 @@ export component GlobalTunePage inherits Rectangle {
 
             SectionCard {
                 title: "采样时钟与周期诊断";
-                subtitle: "分频 / 分辨率 / 时钟源 / MFS 的唯一编辑入口";
+                subtitle: "分频 / 分辨率 / 时钟源 / MFS";
                 VerticalBox {
                     padding: 0px;
                     spacing: Theme.page-pad;

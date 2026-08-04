@@ -424,6 +424,8 @@ void loop() {
     if (psoc->algo_download_take_failure()) {
         SelfHeal::getInstance()->note(SH_ALGO_FALLBACK, 1u);
     }
+    // 代码下发完成后补推每通道 ROM 与 cfg[8](不可放进 USB 命令处理器, 会拖住 ACK)。
+    PsocAlgo::getInstance()->tick(psoc);
 
     // ★大吞吐统一走定时任务队列★: 遥测等周期发送由 TxScheduler 按各自频率+租约驱动(续期制),
     // 帧经非阻塞 config_write 入 vendor TX FIFO, 由 HAL_USB task() 泵出。不再在此直接 tick 遥测。
@@ -434,7 +436,9 @@ void loop() {
     seg_t = loop_seg_begin(LOOP_SEG_GAME_IO);
     {
         const uint32_t gio_t = gio_seg_begin(GIO_SEG_BINDING);
-        BindingService::getInstance()->tick(psoc->link_ok() ? psoc->touch_mask() : 0, psoc->link_ok());
+        // 掩码与"是否可信"都取 Psoc 的统一裁决(见 psoc.h touch_mask/touch_hold_ok):
+        // 瞬时 link_ok 在遥测分页期间频繁为假, 用它清零会让指触绑定在按着的时候突然丢采样。
+        BindingService::getInstance()->tick(psoc->touch_mask(), psoc->touch_hold_ok());
         gio_seg_mark(GIO_SEG_BINDING, gio_t);
     }
     GameIoService::getInstance()->task();

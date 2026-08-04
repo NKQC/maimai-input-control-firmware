@@ -53,7 +53,7 @@ enum class Cmd : uint8_t {
     ALGO_INFO  = 0x43,   // 响应 [magic,ALGO_INFO,valid,0,len_lo,len_hi,0]
     ALGO_SET_ROM = 0x44, // [magic,ALGO_SET_ROM,ch,rom_lo,rom_hi,0,0] 设每通道 16 位只读 ROM
     ALGO_GET_ROM = 0x45, // [magic,ALGO_GET_ROM,ch,0,0,0,0] → 响应 [.. ,ch,0,rom_lo,rom_hi,0]
-    ALGO_GET_TRACE = 0x46, // [magic,GET_TRACE,ch,idx,0,0,0] → 响应 [..,ch,out_active,report[idx]_lo,report[idx]_hi,0]
+    ALGO_GET_TRACE = 0x46, // [magic,GET_TRACE,ch,idx,0,0,0] → 响应 [..,ch,out_active,report[idx]_lo,report[idx]_hi,idx]
     ALGO_SET_CFG = 0x47,   // [magic,SET_CFG,idx,val,0,0,0] 设共享 cfg[idx] → 响应回显 [..,idx,0,cfg[idx],0,0]
     ALGO_GET_CFG = 0x48,   // [magic,GET_CFG,idx,0,0,0,0] → 响应 [..,idx,0,cfg[idx],0,0]
     SNAPSHOT_INFO = 0x11,

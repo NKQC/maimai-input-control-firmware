@@ -203,12 +203,14 @@ export component SettingsPage inherits Rectangle {
     callback combo_zone_toggled(int);
     callback combo_zones_clear();
     callback combo_captured(string, bool, bool, bool, bool);
+    callback combo_hid_submitted(string);
     callback combo_keys_clear();
     callback combo_add(int, int);   // delay_ms, max_hold_ms
     callback combo_removed(int);
     callback combo_hold_set(int, int, int);
     callback combo_key_capture_started(int);
     callback combo_key_captured(int, string, bool, bool, bool, bool);
+    callback combo_key_hid_submitted(int, string);
     // 全通道页"批量应用"抽屉: 勾选状态与参数名/源值由 main.rs 回填, 真相源在 AppController。
     in property <[bool]> batch_ch_selected: [];
     in property <[bool]> batch_param_selected: [];
@@ -298,6 +300,7 @@ export component SettingsPage inherits Rectangle {
     callback kbd_set_hold_phys(int, int, int);
     callback kbd_set_hold_zone(int, int, int);
     callback kbd_capture_phys(int, string, bool, bool, bool, bool);
+    callback kbd_hid_phys(int, string);
     callback kbd_capture_zone(int, string, bool, bool, bool, bool);
     callback kbd_clear_phys(int);
     callback kbd_clear_zone(int);
@@ -647,12 +650,14 @@ export component SettingsPage inherits Rectangle {
                 combo_zone_toggled(z) => { root.combo_zone_toggled(z); }
                 combo_zones_clear() => { root.combo_zones_clear(); }
                 combo_captured(t, c, s, a, g) => { root.combo_captured(t, c, s, a, g); }
+                combo_hid_submitted(t) => { root.combo_hid_submitted(t); }
                 combo_keys_clear() => { root.combo_keys_clear(); }
                 combo_add(d, m) => { root.combo_add(d, m); }
                 combo_removed(i) => { root.combo_removed(i); }
                 combo_hold_set(i, d, m) => { root.combo_hold_set(i, d, m); }
                 combo_key_capture_started(i) => { root.combo_key_capture_started(i); }
                 combo_key_captured(i, t, c, s, a, g) => { root.combo_key_captured(i, t, c, s, a, g); }
+                combo_key_hid_submitted(i, t) => { root.combo_key_hid_submitted(i, t); }
             }
         }
 
@@ -685,6 +690,7 @@ export component SettingsPage inherits Rectangle {
                 keys_expanded <=> root.phys_keys_expanded;
                 la_expanded <=> root.phys_la_expanded;
                 phys_captured(i, t, c, s, a, g) => { root.kbd_capture_phys(i, t, c, s, a, g); }
+                phys_hid_submitted(i, t) => { root.kbd_hid_phys(i, t); }
                 phys_cleared(i) => { root.kbd_clear_phys(i); }
                 phys_hold_set(i, delay, max_hold) => { root.kbd_set_hold_phys(i, delay, max_hold); }
                 phys_keycfg_set(i, pol, db) => { root.kbd_set_keycfg(i, pol, db); }
@@ -830,38 +836,38 @@ export component SettingsPage inherits Rectangle {
                     font-weight: 700;
                 }
                 Text {
-                    text: "导入只写界面草稿，不会向设备发送任何命令；确认无误后点“保存到设备”才生效，点“撤销未保存改动”可回到导入前的设备值。覆盖与跳过明细见日志页。";
+                    text: "导入仅生成草稿；保存后生效。";
                     color: #9aa6b2;
                     font-size: 11px;
                     wrap: word-wrap;
                 }
                 CheckBox {
-                    text: "配置缓存（" + root.settings_io_config_count + " 项）：通信、模式、灯效等全部键值";
+                    text: "配置（" + root.settings_io_config_count + " 项）";
                     checked: root.settings_io_config;
                     toggled => { root.settings_io_config = self.checked; }
                 }
                 CheckBox {
-                    text: "通道参数（" + root.settings_io_channel_params_count + " 项）：36 通道 × 全部已知 CapSense 参数";
+                    text: "通道参数（" + root.settings_io_channel_params_count + " 项）";
                     checked: root.settings_io_channel_params;
                     toggled => { root.settings_io_channel_params = self.checked; }
                 }
                 CheckBox {
-                    text: "全局 CSD（" + root.settings_io_globals_count + " 项）：gparam 1–8 与 CSD 处理模式";
+                    text: "全局 CSD（" + root.settings_io_globals_count + " 项）";
                     checked: root.settings_io_globals;
                     toggled => { root.settings_io_globals = self.checked; }
                 }
                 CheckBox {
-                    text: "算法（" + root.settings_io_algo_count + " 项）：设备 C 源、机器码与 cfg[0..7]";
+                    text: "算法（" + root.settings_io_algo_count + " 项）";
                     checked: root.settings_io_algo;
                     toggled => { root.settings_io_algo = self.checked; }
                 }
                 CheckBox {
-                    text: "键盘映射（" + root.settings_io_keyboard_count + " 项）：12 物理键与 34 触控分区";
+                    text: "键盘映射（" + root.settings_io_keyboard_count + " 项）";
                     checked: root.settings_io_keyboard;
                     toggled => { root.settings_io_keyboard = self.checked; }
                 }
                 CheckBox {
-                    text: "分区绑定（" + root.settings_io_zones_count + " 项）：34 个逻辑区到物理通道的绑定";
+                    text: "分区绑定（" + root.settings_io_zones_count + " 项）";
                     checked: root.settings_io_zones;
                     toggled => { root.settings_io_zones = self.checked; }
                 }

@@ -7,16 +7,9 @@ void app_config_register_schema() {
     // This function is called during ConfigManager::initialize() to populate defaults
     
     ConfigManager::register_init_function([](config_map_t& config_map) {
-        // ===== comm.* (7 keys) =====
-        // ★已删除 6 个"从未被固件消费"的空壳项★(2026-08-01)
-        //   comm.sample_delay_ms / comm.aggregation_delay_ms / comm.extra_send /
-        //   comm.rate_limit_en / comm.rate_limit_hz / comm.send_only_on_change
-        // 全工程 grep 确认它们**没有任何读取点**: 界面把它们当成可调设置展示、用户以为调了有用,
-        // 实际连一行消费代码都没有 —— 这比"功能缺失"更糟, 属于骗人。
-        // ★与"功能总量不得减少"不冲突★: 它们本来就没有功能, 删掉的是假象, 不是能力。
-        // ★"触控延迟"才是唯一真正平移上报的那一个★: comm.touch_delay_100us 由 game_io.cpp 的
-        // DelayLine 消费(见下), 与被删的"采样延迟"完全不是一回事 —— 两个名字都像延迟正是混淆的来源。
-        // 将来若真要实现上报节流, 请连同消费代码一起加回, 不要只加 KV。
+        // ===== comm.* =====
+        // touch_delay_100us 平移采样时刻；下列 5 项由 GameIoService 的串口发布状态机实际消费：
+        // 节流 → 延迟采样 → 多数投票 → 改变时发送与额外重发。旧版键名保持兼容。
         config_map["comm.keyboard_map_en"]       = ConfigValue(false);
         // 仅当 comm.keyboard_map_en 为真时有意义；为真时触控映射仅在 mai2serial 实际发送触控数据期间生效。
         config_map["comm.keyboard_map_serial_only"] = ConfigValue(false);
@@ -30,6 +23,11 @@ void app_config_register_schema() {
         // 触控延迟仅作用于串口上报; 触控->键盘映射走原始触控, 不加键盘延迟。
         config_map["comm.touch_delay_100us"]     = ConfigValue(uint16_t(0), uint16_t(0), uint16_t(1000));
         config_map["comm.keyboard_delay_100us"]  = ConfigValue(uint16_t(0), uint16_t(0), uint16_t(1000));
+        config_map["comm.aggregation_delay_ms"]  = ConfigValue(uint8_t(0), uint8_t(0), uint8_t(100));
+        config_map["comm.extra_send"]            = ConfigValue(uint8_t(0), uint8_t(0), uint8_t(10));
+        config_map["comm.rate_limit_en"]         = ConfigValue(false);
+        config_map["comm.rate_limit_hz"]         = ConfigValue(uint16_t(120), uint16_t(10), uint16_t(1000));
+        config_map["comm.send_only_on_change"]   = ConfigValue(false);
         
         // ===== calib.* (1 key) 校准偏好 =====
         // calib.pref: 频率自适应的"灵敏度档位" 1..7(默认 4=居中)。随 AUTO_TUNE 请求下发,

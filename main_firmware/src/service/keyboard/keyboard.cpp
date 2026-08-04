@@ -379,7 +379,9 @@ void KeyboardService::task() {
     uint64_t area_raw = 0;
     if (map_active) {
         Psoc* psoc = Psoc::getInstance();
-        if (psoc->link_ok()) {
+        // 门禁用 touch_hold_ok()(保留窗口内仍可信), 而非瞬时 link_ok(): 后者会在错帧的那一拍
+        // 把映射键判成松开, 表现为按住不动却连点。
+        if (psoc->touch_hold_ok()) {
             area_raw = BindingService::getInstance()->map_to_areas(psoc->touch_mask());
         }
     }

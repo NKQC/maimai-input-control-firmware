@@ -109,6 +109,17 @@ pub mod keys {
     pub const VCAM_ENABLED: &str = "vcam_enabled";
     pub const VCAM_SUBMIT_SECS: &str = "vcam_submit_secs";
     pub const VCAM_DISPLAY_SECS: &str = "vcam_display_secs";
+    pub const DIAG_EXPANDED: &str = "diag_expanded";
+    pub const CURVE_PARAMS_EXPANDED: &str = "curve_params_expanded";
+    pub const CURVE_ALGO_CFG_EXPANDED: &str = "curve_algo_cfg_expanded";
+    pub const CURVE_SERIES_EXPANDED: &str = "curve_series_expanded";
+    pub const CURVE_SPECTRUM_EXPANDED: &str = "curve_spectrum_expanded";
+    pub const CHANNEL_SHOW_DISABLED: &str = "channel_show_disabled";
+    pub const PHYS_LIVE_EXPANDED: &str = "phys_live_expanded";
+    pub const PHYS_KEYS_EXPANDED: &str = "phys_keys_expanded";
+    pub const PHYS_LA_EXPANDED: &str = "phys_la_expanded";
+    pub const MAI2_PANEL_EXPANDED: &str = "mai2_panel_expanded";
+    pub const LIGHT_PANEL_EXPANDED: &str = "light_panel_expanded";
     pub const LATENCY_MEASURE: &str = "latency_measure";
     pub const CURRENT_VIEW: &str = "current_view";
     pub const SETTINGS_TAB: &str = "settings_tab";

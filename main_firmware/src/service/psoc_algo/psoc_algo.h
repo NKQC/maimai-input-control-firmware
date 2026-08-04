@@ -67,7 +67,12 @@ public:
     void reset_default();
 
     // 下发当前算法到 PSoC(经 SPI ALGO_* 分页事务)。返回下发+PSoC commit 校验是否成功。
+    // 完整下发(代码 + 每通道 ROM + cfg[8])。仅用于 core1 空闲的场合: 启动/复位后的 provision。
     bool download_to_psoc(Psoc* psoc);
+    // 只把代码下发入队即返回, ROM/cfg 交给 tick() 补推。USB 命令处理器必须走这个, 否则 ACK 被拖住。
+    bool request_download(Psoc* psoc);
+    // 主循环每轮调用: core1 写完代码后补推 ROM/cfg。
+    void tick(Psoc* psoc);
 
     bool save();                           // 持久化到 flash(/algo.bin)（由主循环在安全窗口调用）
     void request_save() { _save_pending = true; }
@@ -87,12 +92,15 @@ private:
     void _sync_src_storage();
 
     void _load_src();                    // 从 /algo_src.bin 载入算法 C 源(init() 调用)
+    void _push_runtime_params(Psoc* psoc);   // 推 36 条 ROM + 8 条 cfg
 
     uint8_t  _blob[PSOC_ALGO_MAX_LEN];
     uint16_t _len;
     uint16_t _crc16;
     bool     _is_default;
     bool     _save_pending = false;
+    // true = 代码下发已入队, 等 core1 写完后还要补推 ROM/cfg(见 tick)。
+    bool     _params_pending = false;   // 代码已入队, 待 tick() 补推 ROM/cfg
     uint16_t _rom[PSOC_ALGO_CHANNELS];   // 每通道 16 位只读 ROM(默认 0)
     uint8_t  _cfg[8] = {0u};             // 共享算法可设置变量(ABI cfg[8], 默认 0)
     uint8_t  _src[PSOC_ALGO_SRC_MAX];    // 算法 C 源(已滤注释), 映射表回读用

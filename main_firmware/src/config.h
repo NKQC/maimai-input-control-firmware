@@ -26,7 +26,7 @@ constexpr uint8_t PIN_PSOC_SPI_SCK  = 26;
 constexpr uint8_t PIN_PSOC_SPI_MOSI = 28;  // RP2040 数据输出
 constexpr uint8_t PIN_PSOC_SPI_MISO = 27;  // RP2040 数据输入
 constexpr uint8_t PIN_PSOC_SPI_CS   = 29;
-constexpr uint32_t PSOC_SPI_SCK_HZ  = 3000000;  // SCK 频率（延后采样补偿往返延迟；扫频找硬件上限）
+constexpr uint32_t PSOC_SPI_SCK_HZ  = 2000000;  // TXB 电平位移器裕量下的稳定 SCK
 // Phase C 全通道 raw 快照慢路：分块流水线读取，每次 update 只读少量页，与 1kHz 触控快路交织，
 // 保证触控不被 ~10ms 全快照读阻塞。每页间延时给 PSoC ISR 装载下一页的确定性窗口。
 // 看门狗自持恢复(宽松策略先保可迭代)：进入运行态后置 watchdog scratch[7]=此值。

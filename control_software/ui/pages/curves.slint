@@ -839,7 +839,7 @@ export component CurvesPage inherits Rectangle {
                             spacing: 2px;
 
                             Text {
-                                text: "原生数据读取 (设备直出量 · 左轴 ADC 量纲)";
+                                text: "设备数据（左轴）";
                                 color: #8fd6ff;
                                 font-size: 10px;
                             }
@@ -880,7 +880,7 @@ export component CurvesPage inherits Rectangle {
                             }
 
                             Text {
-                                text: "算法上报变量 (算法产出量 · 右轴算法量纲)";
+                                text: "算法变量（右轴）";
                                 color: #b98fd6;
                                 font-size: 10px;
                             }
@@ -933,7 +933,7 @@ export component CurvesPage inherits Rectangle {
                     // ★禁用通道不给参数编辑入口★ 它的电极是高阻、不参与扫描, 改阈值/分频只会
                     // 写进一份不生效的草稿, 让人以为"调过了"。如实说明并给出下一步动作。
                     if !root.ch_enabled: Text {
-                        text: @tr("本通道已禁用: 电极保持模拟高阻、不参与扫描, 参数与校准对它无效。\n先勾选上方「通道启用」并「保存到设备」, 再回来精调。");
+                        text: @tr("本通道已禁用。启用并保存后再调整参数。");
                         color: #ff8c42;
                         font-size: 11px;
                         wrap: word-wrap;
@@ -963,8 +963,7 @@ export component CurvesPage inherits Rectangle {
                     expanded <=> root.spectrum_expanded;
 
                     Text {
-                        text: "逐点扫 7 个增益档 × 64 个分频(共 448 点): 每点写入 gain/div → 本通道校准 → "
-                            + "采一段 RAW 算标准差。需要逐通道 RAW 遥测在推流; 扫完/取消/断线都会还原原值并重新校准。";
+                        text: "扫描 7 档增益 × 64 档分频；结束后恢复原参数。";
                         color: #b0b8c0;
                         font-size: 10px;
                         wrap: word-wrap;

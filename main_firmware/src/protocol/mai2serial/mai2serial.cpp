@@ -31,6 +31,7 @@ bool Mai2Serial::init() {
     }
     
     initialized_ = true;
+    serial_ok_ = false;
     status_ = Status::READY;
     
     return true;
@@ -41,6 +42,7 @@ void Mai2Serial::deinit() {
     if (initialized_) {
         uart_hal_->deinit();
         initialized_ = false;
+        serial_ok_ = false;
         status_ = Status::STOPPED;
         
         // 清理回调
@@ -76,8 +78,8 @@ Mai2Serial_Config Mai2Serial::get_config() const {
 
 // 发送触摸数据
 bool Mai2Serial::send_touch_data(Mai2Serial_TouchState& touch_data) {
-    if (!is_ready() || !serial_ok_) {
-        return false;  // 设备未就绪或串口不可用，发送失败
+    if (!sending_active()) {
+        return false;
     }
     
     // 流控逻辑：使用静态变量存储当前时间，避免重复获取
@@ -86,11 +88,8 @@ bool Mai2Serial::send_touch_data(Mai2Serial_TouchState& touch_data) {
     
     // 直接比较下次发送时间
     if (next_send_time_us_ > current_time_us) {
-        return false;  // 时间未到，发送失败
+        return false;
     }
-    
-    // 更新下次发送时间
-    next_send_time_us_ = current_time_us + packet_transmission_time_us_;
     
     // 静态预组装数据包，最低CPU占用优化
     static uint8_t packet[9] = {MAI2SERIAL_TOUCH_START_BYTE,0,0,0,0,0,0,0,MAI2SERIAL_TOUCH_END_BYTE};
@@ -105,8 +104,9 @@ bool Mai2Serial::send_touch_data(Mai2Serial_TouchState& touch_data) {
     packet[6] = (uint8_t)((combined_bits >> 25) & 0x1F); // 位25-29
     packet[7] = (uint8_t)((combined_bits >> 30) & 0x1F); // 位30-34
 
-    // 返回是否成功写入完整数据包
-    return (uart_hal_->write_to_tx_buffer(packet, 9) == 9);
+    const bool sent = uart_hal_->write_to_tx_buffer(packet, 9) == 9;
+    if (sent) next_send_time_us_ = current_time_us + packet_transmission_time_us_;
+    return sent;
 }
 
 // 处理命令 - 使用DMA接收
@@ -157,6 +157,7 @@ bool Mai2Serial::stop() {
     }
     
     status_ = Status::READY;
+    serial_ok_ = false;
     return true;
 }
 
@@ -168,6 +169,7 @@ bool Mai2Serial::reset() {
     // 重置配置为默认值
     config_ = Mai2Serial_Config();
     status_ = Status::READY;
+    serial_ok_ = false;
     return true;
 }
 

@@ -29,8 +29,8 @@ public:
     // 初始化 PIO1 + SPI 程序 + 引脚方向 + CS GPIO
     bool init();
 
-    // 全双工传输 len 字节（内部拉低/拉高 CS，DMA 搬运，等 DMA 完成标志）。tx/rx 可为 nullptr。
-    void transfer(const uint8_t* tx, uint8_t* rx, size_t len);
+    // 全双工传输 len 字节；DMA 超时后恢复并返回 false。
+    bool transfer(const uint8_t* tx, uint8_t* rx, size_t len);
 
     // 发送 PING，保留独立链路健康检查。
     bool ping();
@@ -76,7 +76,7 @@ public:
     bool upload_algo(const uint8_t* data, uint16_t len, uint16_t crc16);
     bool set_algo_rom(uint8_t ch, uint16_t rom);                   // 设每通道 16 位只读 ROM(回显校验)
     bool get_algo_rom(uint8_t ch, uint16_t* out_rom);              // 读每通道 16 位 ROM
-    // 算法运行时追踪/可调变量(ABI cfg[8]/report[4]/out_active, 见 psoc_algo_abi.h)
+    // 算法运行时追踪/可调变量(ABI cfg[8]/report[4]/out_active，trace 响应回显 idx，见 psoc_algo_abi.h)
     bool algo_get_trace(uint8_t ch, uint8_t idx, uint8_t* out_active, uint16_t* out_report);
     bool algo_set_cfg(uint8_t idx, uint8_t val);                   // 设共享 cfg[idx](回显校验)
     bool algo_get_cfg(uint8_t idx, uint8_t* out_val);

@@ -341,7 +341,9 @@ void SensorLink::autotune_tick() {
         // 实际 flash 写由主循环安全窗口(main.cpp: has_pending_save)执行, 本函数不阻塞。
         // 生效无需再 APPLY: PSoC 自适应内部已写 widgetContext 并 InitializeAllBaselines, 真相源写穿
         // 只为持久化/回读一致; 多余 APPLY 会触发整片重初始化+重校准(额外重扫, 白掉一次基线)。
-        cfg->request_save();
+        if (!_at_defer_save) {
+            cfg->request_save();
+        }
     }
     TxScheduler::getInstance()->cancel(TX_TASK_AUTOTUNE);   // 最终帧已发出 → 自取消
 }
@@ -641,6 +643,7 @@ void SensorLink::_handle_auto_tune(const HostFrame& frame, uint8_t* response, ui
     // 推送流上报, 完成帧发出后任务自取消。真相源写穿(note_param)随之搬到完成时刻。
     const uint8_t req_ch = (frame.len >= 1) ? frame.payload[0] : 0xFFu;
     uint8_t req_pref = (frame.len >= 2) ? frame.payload[1] : 4u;
+    const bool defer_save = (frame.len >= 3) && (frame.payload[2] != 0u);
     if (req_pref < 1u || req_pref > 7u) req_pref = 4u;
     if (req_ch >= 36u && req_ch != 0xFFu) {
         *response_length = HostCmdCodec::encode_nak(frame.seq, HostCmdError::INVALID_PARAM,
@@ -656,6 +659,7 @@ void SensorLink::_handle_auto_tune(const HostFrame& frame, uint8_t* response, ui
     // 归属键: 本轮进度/终态帧一律回显这个 seq(上位机据此丢弃上一轮的残留帧), 并折成 6 bit 标签
     // 随命令下到 PSoC, 使 RP↔PSoC 这一段也能认出陈旧结果。
     self->_at_req_seq = frame.seq;
+    self->_at_defer_save = defer_save;
     self->_at_ticks = 0;
     if (!Psoc::getInstance()->auto_tune_start(req_ch, req_pref, frame.seq)) {
         *response_length = HostCmdCodec::encode_nak(frame.seq, HostCmdError::SENSOR_ERROR,
@@ -920,12 +924,14 @@ void SensorLink::_handle_algo_upload(const HostFrame& frame, uint8_t* response, 
     // download_to_psoc 只有三个失败出口: 链路不可用 / 存储为空 / 入队失败。原先一律回
     // "algo download enqueue failed", 于是链路瞬断也被说成入队失败, 排查时完全指错方向(实测踩过)。
     // 链路类是【可重试】的, 必须回 DEVICE_BUSY 让上位机自动重试, 而不是 SENSOR_ERROR 让用户以为算法坏了。
-    if (!Psoc::getInstance()->link_ok()) {
+    // 用去抖后的 link_alive(): 遥测流式期间瞬时 link_ok 频繁为 false, 会把上传全部拒掉。
+    if (!Psoc::getInstance()->link_alive()) {
         *response_length = HostCmdCodec::encode_nak(frame.seq, HostCmdError::DEVICE_BUSY,
             "PSoC 链路暂时不可用(可能正在重初始化), 请稍后重试", response, 512);
         return;
     }
-    if (!store->download_to_psoc(Psoc::getInstance())) {
+    // 只入队代码下发即返回, ROM/cfg 由 PsocAlgo::tick() 补推(同步推会把 ACK 拖到几秒后)。
+    if (!store->request_download(Psoc::getInstance())) {
         *response_length = HostCmdCodec::encode_nak(frame.seq, HostCmdError::DEVICE_BUSY,
             "算法下发入队失败(core1 正忙于重校准/重初始化), 请稍后重试", response, 512);
         return;
@@ -939,7 +945,8 @@ void SensorLink::_handle_algo_apply(const HostFrame& frame, uint8_t* response, u
             "algo download still in progress", response, 512);
         return;
     }
-    if (PsocAlgo::getInstance()->download_to_psoc(Psoc::getInstance())) {
+    // 同 ALGO_UPLOAD: 只入队, 不同步推 ROM/cfg。
+    if (PsocAlgo::getInstance()->request_download(Psoc::getInstance())) {
         *response_length = HostCmdCodec::encode_ack(frame.seq, response, 512);
     } else {
         *response_length = HostCmdCodec::encode_nak(frame.seq, HostCmdError::SENSOR_ERROR,
@@ -956,7 +963,7 @@ void SensorLink::_handle_algo_reset_default(const HostFrame& frame, uint8_t* res
     }
     PsocAlgo* store = PsocAlgo::getInstance();
     store->reset_default();                          // 回退内嵌默认 + 请求持久化
-    store->download_to_psoc(Psoc::getInstance());    // 立即下发默认(失败也回 ACK, 启动会重推)
+    store->request_download(Psoc::getInstance());    // 只入队(失败也回 ACK, 启动会重推)
     *response_length = HostCmdCodec::encode_ack(frame.seq, response, 512);
 }
 
@@ -1004,7 +1011,7 @@ void SensorLink::_handle_algo_get_rom(const HostFrame& frame, uint8_t* response,
 }
 
 void SensorLink::_handle_algo_get_trace(const HostFrame& frame, uint8_t* response, uint16_t* response_length) {
-    // payload = [ch(u8), idx(u8)] → 响应 [ch, out_active(u8), report(u16 LE)]
+    // payload = [ch(u8), idx(u8)] → 响应 [ch, idx, out_active(u8), report(u16 LE)]
     if (frame.len < 2u) {
         *response_length = HostCmdCodec::encode_nak(frame.seq, HostCmdError::INVALID_PARAM,
             "algo_get_trace payload too short", response, 512);
@@ -1030,10 +1037,11 @@ void SensorLink::_handle_algo_get_trace(const HostFrame& frame, uint8_t* respons
     resp.flags = HOST_CMD_FLAG_RESPONSE;
     resp.seq = frame.seq;
     resp.payload[0] = ch;
-    resp.payload[1] = active;
-    resp.payload[2] = static_cast<uint8_t>(report);
-    resp.payload[3] = static_cast<uint8_t>(report >> 8);
-    resp.len = 4;
+    resp.payload[1] = idx;
+    resp.payload[2] = active;
+    resp.payload[3] = static_cast<uint8_t>(report);
+    resp.payload[4] = static_cast<uint8_t>(report >> 8);
+    resp.len = 5;
     *response_length = HostCmdCodec::encode_frame(resp, response, 512);
 }
 

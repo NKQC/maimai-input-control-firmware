@@ -163,7 +163,7 @@ export component ToolboxPage inherits Rectangle {
                     }
 
                     Text {
-                        text: "说明: 设置 mai2serial/mai2light 的固定 COM 口，重新插拔或重启后生效。";
+                        text: "设置固定 COM 口，重连后生效。";
                         color: Theme.text-dim;
                         font-size: Theme.fs-normal;
                         wrap: word-wrap;
@@ -194,7 +194,7 @@ export component ToolboxPage inherits Rectangle {
                             padding: 0px;
                             spacing: 8px;
                             CheckBox {
-                                text: "启用虚拟摄像头(捕获HID扫码器→生成QR帧)";
+                                text: "启用虚拟扫码摄像头";
                                 checked: root.vcam_enabled;
                                 toggled => { root.set_vcam_enabled(self.checked); }
                             }
@@ -240,7 +240,7 @@ export component ToolboxPage inherits Rectangle {
                                     }
                                 }
                                 Text {
-                                    text: "安装 = 注册 DirectShow 摄像头过滤器(x64/x86)与 Media Foundation 源(x64)，需管理员权限。";
+                                    text: "注册摄像头组件，需要管理员权限。";
                                     color: #7f8c96;
                                     font-size: 10px;
                                     wrap: word-wrap;
@@ -360,7 +360,7 @@ export component ToolboxPage inherits Rectangle {
                         }
 
                         Text {
-                            text: "说明: 将扫码器输入显示为 QR 码；停顿或 Enter 提交，按设定时长显示。";
+                            text: "扫码内容转为 QR 画面；停顿或 Enter 提交。";
                             color: #7f8c96;
                             font-size: 11px;
                             wrap: word-wrap;

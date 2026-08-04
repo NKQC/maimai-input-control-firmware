@@ -75,9 +75,11 @@ struct ChBatchOp {
 /// 明确写进 36 个通道**并回读确认**, 否则每通道的临界频率是在一个谁也说不清的增益档上找出来的。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ChBatchStage {
-    /// 逐通道写 `PARAM_SET(ch, 0x0B, gain)`；共享 cfg 队列窗口仍为 1，绝不一次灌入 36 条。
+    /// 等待一次全通道 ENABLED 回读，禁止以“缓存缺失=启用”构造自动化队列。
+    AwaitEnabled,
+    /// 把全部目标通道的 `PARAM_SET(ch, 0x0B, gain)` 一次排入共享 FIFO。
     Prime,
-    /// 等当前通道写帧结算后回读该通道的设备真值。
+    /// 全部写帧结算后只发一次全通道回读确认。
     PrimeVerify,
     /// 用户取消或前置回读超时后的收敛：仅清本批未发帧，等待本批在途帧结算后才释放所有权。
     CancelPrime,
@@ -563,55 +565,54 @@ impl AppController {
         self.ch_batch.next as f32 / self.ch_batch.queue.len() as f32
     }
 
-    /// 发起一次批量操作(逐通道串行)。已有批量在跑时忽略并记日志。
+    /// 发起一次批量操作。启用状态尚未回读完整时先自动等待一次全通道回读。
     pub fn ch_batch_start(&mut self, kind: ChBatchKind) -> anyhow::Result<()> {
         if self.io.is_none() {
             return Err(anyhow::anyhow!("未连接, 无法发起{}", kind.label()));
         }
         if let Some(cur) = self.ch_batch.kind {
             self.push_log(format!(
-                "{}正在进行中, 已忽略本次「{}」——请先等待完成或点取消。",
+                "{}正在进行中, 已忽略本次「{}」",
                 cur.label(),
                 kind.label()
             ));
             return Ok(());
         }
-        // ★与频谱扫描双向互斥★ 扫描期间每一格都在改本通道的 gain/div 并逐格校准; 批量插进来会把
-        // 那一格的配置换掉(测出来的噪声不是这一格的), 也会把扫描的还原路径踩乱。反向拒绝在
-        // `noise_sweep_start` 里, 两边一致。
         if self.noise_sweep.active {
-            return Err(anyhow::anyhow!(
-                "CH{} 响应噪声频谱扫描进行中, 请先取消扫描(会自动还原增益档/分频)再执行{}",
-                self.noise_sweep.ch,
-                kind.label()
-            ));
+            return Err(anyhow::anyhow!("CH{} 频谱扫描进行中", self.noise_sweep.ch));
         }
-        // 批次取得控制面前，不能让已排队的外部配置写或已有 CSD op 混入首个 prime 间隙。
         if self._csd_locked() || !self.cfg_tx_queue.is_empty() || self.cfg_tx_inflight.is_some() {
             return Err(anyhow::anyhow!(
-                "设备或配置发送队列仍忙，无法开始{}；请等待当前 CSD 操作与写入结算后再试",
+                "设备发送队列仍忙，无法开始{}",
                 kind.label()
             ));
         }
         self.ch_batch.clear();
         self.ch_batch.generation = self.ch_batch.generation.wrapping_add(1);
         self.ch_batch.kind = Some(kind);
-        // ★队列只含【已启用】通道★ 禁用通道的电极必须保持高阻, 而校准/基线/自适应都要连接电极扫描;
-        // 设备侧已会逐条回绝(sensor_link.cpp::disabled_ch_reject), 但把它们排进队列只会换来一串
-        // NAK、拖长整批耗时, 并让"失败 N 项"的汇总把用户主动关闭的通道说成故障。
+        if !self.ch_enabled_states_known() {
+            self.ch_batch.stage = ChBatchStage::AwaitEnabled;
+            self.ch_batch.status = format!("{}: 正在读取通道启用状态…", kind.label());
+            self.ch_batch.version = self.ch_batch.version.wrapping_add(1);
+            self.request_param_all_channels(crate::proto::PARAM_ENABLED)?;
+            return Ok(());
+        }
+        self._ch_batch_begin_ready(kind)
+    }
+
+    fn _ch_batch_begin_ready(&mut self, kind: ChBatchKind) -> anyhow::Result<()> {
         self.ch_batch.queue = (0..CH_COUNT as u8)
-            .filter(|ch| self.ch_enabled(*ch))
+            .filter(|ch| self.ch_enabled_for_operation(*ch) == Some(true))
             .collect();
         let queued = self.ch_batch.queue.len();
         if queued == 0 {
             self.ch_batch.clear();
             return Err(anyhow::anyhow!(
-                "没有已启用的通道, {}无对象可执行(全部 36 个通道当前都处于禁用状态)",
+                "没有已启用的通道, {}无对象可执行",
                 kind.label()
             ));
         }
         if kind == ChBatchKind::AutoTune {
-            // 汇总只允许属于本批的终态写入；第二次开始时绝不沿用上一次尚未覆盖的通道结果。
             self.auto_tune_ch_result = [0; CH_COUNT];
             self.auto_tune_ch_div = [0; CH_COUNT];
             self._ch_batch_plan_auto_tune();
@@ -619,17 +620,13 @@ impl AppController {
         } else {
             self.ch_batch.stage = ChBatchStage::Run;
         }
-        self.ch_batch.status = format!("{}: 已排队 {} 个已启用通道", kind.label(), queued);
+        self.ch_batch.status = format!("{}: 已排队 {} 个启用通道", kind.label(), queued);
         self.ch_batch.version = self.ch_batch.version.wrapping_add(1);
         self.push_log(format!(
-            "{}: host 侧逐通道串行下发(可随时取消), 共 {} 个已启用通道{}。",
+            "{}: 共 {} 个启用通道，跳过 {} 个禁用通道",
             kind.label(),
             queued,
-            if queued < CH_COUNT {
-                format!("(已跳过 {} 个禁用通道)", CH_COUNT - queued)
-            } else {
-                String::new()
-            }
+            CH_COUNT - queued
         ));
         Ok(())
     }
@@ -643,6 +640,12 @@ impl AppController {
             self.ch_batch.stage,
             ChBatchStage::CancelPrime | ChBatchStage::CancelRun | ChBatchStage::Done
         ) {
+            return;
+        }
+        if self.ch_batch.stage == ChBatchStage::AwaitEnabled {
+            self.ch_batch.status = format!("{}: 已取消", kind.label());
+            self.ch_batch.clear();
+            self.ch_batch.version = self.ch_batch.version.wrapping_add(1);
             return;
         }
         let (ok, _pending, failed) = self.ch_batch._tally();
@@ -776,6 +779,14 @@ impl AppController {
             return;
         }
         match self.ch_batch.stage {
+            ChBatchStage::AwaitEnabled => {
+                if self.ch_enabled_states_known() {
+                    if let Err(error) = self._ch_batch_begin_ready(kind) {
+                        self.push_log_warn(error.to_string());
+                        self.ch_batch.clear();
+                    }
+                }
+            }
             ChBatchStage::Prime => self._ch_batch_prime(),
             ChBatchStage::PrimeVerify => self._ch_batch_prime_verify(),
             ChBatchStage::CancelPrime => self._ch_batch_cancel_prime(),
@@ -790,83 +801,74 @@ impl AppController {
         }
     }
 
-    /// 前置写按「一条 → 设备真值确认 → 下一条」推进。cfg 队列仍是唯一发送路径且窗口=1，
-    /// 本批 owner 只标记自己的帧，取消时可精确丢弃未发帧而不碰保存/其他会话的队列项。
+    /// 把全部目标通道的增益档一次排入既有窗口=1 FIFO；发送仍串行，但不再逐通道写后回读。
     fn _ch_batch_prime(&mut self) {
-        // 禁用通道不属于本批(队列已排除), 其增益档也不必前置写 —— 跳过, 与队列口径保持一致。
-        while self.ch_batch.prime_next < CH_COUNT
-            && !self.ch_enabled(self.ch_batch.prime_next as u8)
-        {
-            self.ch_batch.prime_next += 1;
-        }
-        if self.ch_batch.prime_next >= CH_COUNT {
-            self.ch_batch.stage = ChBatchStage::Run;
-            self.ch_batch.status = format!(
-                "逐通道频率自适应: {} 个已启用通道的 IDAC 增益档已逐条按设备真值确认{}, 开始逐通道下探…",
-                self.ch_batch.queue.len(),
-                if self.ch_batch.cp_assisted {
-                    "(Cp 辅助)"
-                } else {
-                    ""
-                }
-            );
-            self.ch_batch.version = self.ch_batch.version.wrapping_add(1);
-            self.push_log(self.ch_batch.status.clone());
-            return;
-        }
         if self._cfg_batch_pending(self.ch_batch.generation) {
             return;
         }
-        let ch = self.ch_batch.prime_next as u8;
-        let gain = self.ch_batch.gain[ch as usize] as u32;
         let generation = self.ch_batch.generation;
-        let sent = self._ch_batch_tx(|s| s._queue_batch_prime_param(generation, ch, gain));
-        if let Err(e) = sent {
-            self.ch_batch.res[ch as usize] = ChOpRes::SendFail;
-            self.push_log_warn(format!("前置写增益档失败: CH{} — {}", ch, e));
-            self.ch_batch.stage = ChBatchStage::CancelPrime;
-            return;
+        let targets = self.ch_batch.queue.clone();
+        for ch in targets {
+            let gain = self.ch_batch.gain[ch as usize] as u32;
+            if let Err(error) =
+                self._ch_batch_tx(|s| s._queue_batch_prime_param(generation, ch, gain))
+            {
+                self.ch_batch.res[ch as usize] = ChOpRes::SendFail;
+                self.push_log_warn(format!("前置增益档下发失败: CH{} — {}", ch, error));
+                self._cfg_purge_batch_frames(generation);
+                self.ch_batch.stage = ChBatchStage::CancelPrime;
+                return;
+            }
         }
-        self.ch_batch.stage = ChBatchStage::PrimeVerify;
+        self.ch_batch.prime_next = self.ch_batch.queue.len();
         self.ch_batch.verify_ticks = 0;
-        self.ch_batch.prime_asked = false;
+        self.ch_batch.verify_asked = false;
+        self.ch_batch.stage = ChBatchStage::PrimeVerify;
         self.ch_batch.status = format!(
-            "逐通道频率自适应: 正在写入并确认 CH{} 的 IDAC 增益档({})…",
-            ch, gain
+            "逐通道频率自适应: 已批量排入 {} 个增益档，等待统一回读…",
+            self.ch_batch.queue.len()
         );
         self.ch_batch.version = self.ch_batch.version.wrapping_add(1);
     }
 
-    /// 前置确认只针对当前通道：本批唯一 owner 帧结算后清掉乐观缓存，再读回设备真值。
+    /// 全部前置写结算后只发一次全通道回读，并统一校验全部目标通道。
     fn _ch_batch_prime_verify(&mut self) {
         self.ch_batch.verify_ticks = self.ch_batch.verify_ticks.wrapping_add(1);
         if self._cfg_batch_pending(self.ch_batch.generation) {
             self._ch_batch_verify_guard();
             return;
         }
-        let ch = self.ch_batch.prime_next;
-        let want = self.ch_batch.gain[ch] as u32;
-        if !self.ch_batch.prime_asked {
-            self.ch_batch.prime_asked = true;
-            self.params[ch].remove(&PARAM_IDAC_GAIN);
-            if let Err(e) = self.request_param(ch as u8, PARAM_IDAC_GAIN) {
-                self.push_log_warn(format!("前置确认回读下发失败: CH{} — {}", ch, e));
+        if !self.ch_batch.verify_asked {
+            self.ch_batch.verify_asked = true;
+            for ch in self.ch_batch.queue.iter().copied() {
+                self.params[ch as usize].remove(&PARAM_IDAC_GAIN);
+            }
+            if let Err(error) = self.request_param_all_channels(PARAM_IDAC_GAIN) {
+                self.push_log_warn(format!("前置增益档统一回读失败: {}", error));
+                self.ch_batch.verify_asked = false;
             }
             return;
         }
-        let got = self.params[ch].get(&PARAM_IDAC_GAIN).copied();
-        self.ch_batch.verified[ch] = got == Some(want);
-        if self.ch_batch.verified[ch] {
-            self.ch_batch.prime_next += 1;
-            self.ch_batch.stage = ChBatchStage::Prime;
-            self.ch_batch.verify_ticks = 0;
-            self.ch_batch.prime_asked = false;
+        let mut missing = Vec::new();
+        for ch in self.ch_batch.queue.iter().copied() {
+            let verified = self.params[ch as usize].get(&PARAM_IDAC_GAIN).copied()
+                == Some(self.ch_batch.gain[ch as usize] as u32);
+            self.ch_batch.verified[ch as usize] = verified;
+            if !verified {
+                missing.push(ch);
+            }
+        }
+        if missing.is_empty() {
+            self.ch_batch.stage = ChBatchStage::Run;
+            self.ch_batch.status = format!(
+                "逐通道频率自适应: {} 个通道增益档已统一确认，开始执行…",
+                self.ch_batch.queue.len()
+            );
             self.ch_batch.version = self.ch_batch.version.wrapping_add(1);
             return;
         }
         if self.ch_batch.verify_ticks % 60 == 0 {
-            // 单条回读可能被传输瞬断丢失；只重发当前通道，绝不重新灌入 36 条写。
-            self.ch_batch.prime_asked = false;
+            self.ch_batch.verify_asked = false;
         }
         self._ch_batch_verify_guard();
     }
@@ -876,11 +878,8 @@ impl AppController {
         if self.ch_batch.verify_ticks < PRIME_VERIFY_TIMEOUT_TICKS {
             return;
         }
-        let ch = self.ch_batch.prime_next;
-        self.ch_batch.status = format!(
-            "逐通道频率自适应: CH{} 的 IDAC 增益档未能按设备真值确认，正在停止前置写并收敛在途帧。",
-            ch
-        );
+        self.ch_batch.status =
+            "逐通道频率自适应: 增益档统一回读未确认，正在停止并收敛在途帧。".to_string();
         self.push_log_warn(self.ch_batch.status.clone());
         self._cfg_purge_batch_frames(self.ch_batch.generation);
         self.ch_batch.stage = ChBatchStage::CancelPrime;
@@ -947,7 +946,7 @@ impl AppController {
         let res = self._ch_batch_tx(|s| match kind {
             ChBatchKind::Calibrate => s.calibrate(1u64 << ch),
             ChBatchKind::BaselineReset => s.baseline_reset(1u64 << ch),
-            ChBatchKind::AutoTune => s.auto_tune_with_pref(ch, pref),
+            ChBatchKind::AutoTune => s.auto_tune_with_pref_deferred(ch, pref),
         });
         // ★"确实发出去了"的唯一证据是 `_begin_op` 记下的 op seq★ 这三个入口在被串行化/互斥守卫拒绝时
         // 走的是既有约定"记日志 + 返回 Ok", 只看 Err 会把没发出去的那一条当成已发出并等一个永不到来的
@@ -1047,10 +1046,14 @@ impl AppController {
             )
         };
         self.push_log(self.ch_batch.status.clone());
-        // 自适应完成后回读一次全通道分频, 使时钟树显示的是设备真值。
+        // 自适应批次内每通道均延迟持久化；收尾只排入一次 SAVE_CONFIG，再统一回读分频。
         if kind == ChBatchKind::AutoTune {
-            if let Err(e) = self.request_param_all_channels(PARAM_SNS_CLK_DIV) {
-                self.push_log_warn(format!("自适应后回读分频失败: {}", e));
+            let generation = self.ch_batch.generation;
+            if let Err(error) = self._queue_batch_save(generation) {
+                self.push_log_warn(format!("自适应结果统一保存失败: {}", error));
+            }
+            if let Err(error) = self.request_param_all_channels(PARAM_SNS_CLK_DIV) {
+                self.push_log_warn(format!("自适应后回读分频失败: {}", error));
             }
         }
         // 终态文案已形成，但必须继续持有控制面到最后一个 CSD 冷却/本批 cfg 帧完全结算。

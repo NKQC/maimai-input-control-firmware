@@ -583,6 +583,8 @@ pub struct AppController {
     /// 窗口=1 的 ACK 驱动能让主机自动跟随设备节奏: 设备忙就自然停等, 不需要猜任何固定延时。
     cfg_tx_queue: std::collections::VecDeque<CfgTxFrame>,
     cfg_tx_inflight: Option<CfgTxInflight>,
+    /// SAVE_CONFIG 成功后需整通道回读的 0→1 通道，避免重新启用后只出现空参数。
+    post_save_refetch_channels: Vec<u8>,
     /// 全 36 通道 per-channel 参数重读队列(待读的 param_id)。
     /// ★为什么要队列★: 恢复默认/重连原来只重读"当前通道 + CH0"两个通道, 其余 34 个通道的缓存
     /// 既不刷新也不失效, 界面显示的是过期值(或从未填充的空), 表现为"只留了一个通道的数据"。
@@ -881,6 +883,7 @@ impl AppController {
             telem_scope_channels: None,
             cfg_tx_queue: std::collections::VecDeque::new(),
             cfg_tx_inflight: None,
+            post_save_refetch_channels: Vec::new(),
             param_refetch_ids: Vec::new(),
             param_fix_sent: std::collections::HashSet::new(),
             global_fix_sent: std::collections::HashSet::new(),
@@ -1290,6 +1293,7 @@ impl AppController {
     /// 否则重连后无从恢复触控。
     fn _clear_sensor_caches(&mut self) {
         self.restore_verify.clear();
+        self.post_save_refetch_channels.clear();
         // 灯效映射草稿按设备灯链长度校验, 换设备/重连后必须重来, 否则会拿旧链长的区段去 NAK。
         self.led_state = None;
         self.drafts.drop_led_region();
@@ -1777,6 +1781,15 @@ impl AppController {
         }
         // 2) 参数
         let param_items: Vec<((u8, u8), u32)> = self.drafts.param_items();
+        self.post_save_refetch_channels = param_items
+            .iter()
+            .filter_map(|((ch, id), value)| {
+                (*id == crate::proto::PARAM_ENABLED
+                    && *value != 0
+                    && self.params[*ch as usize].get(id).copied() == Some(0))
+                .then_some(*ch)
+            })
+            .collect();
         for ((ch, id), value) in param_items.iter().copied() {
             let payload = crate::proto::encode_param_set(ch, id, value);
             let seq = self.next_seq();
@@ -2376,6 +2389,15 @@ impl AppController {
         Ok(())
     }
 
+    /// 批量自动化收尾只排入一次 SAVE_CONFIG，持久化本批全部运行态改动。
+    pub(super) fn _queue_batch_save(&mut self, generation: u64) -> anyhow::Result<()> {
+        let seq = self.next_seq();
+        self._queue_tx_owned(
+            Frame::new(HostCmd::SaveConfig as u8, 0, seq, vec![]),
+            CfgTxOwner::BatchPrime(generation),
+        )
+    }
+
     /// 当前 batch generation 是否仍有未发或在途 cfg 帧。
     pub(super) fn _cfg_batch_pending(&self, generation: u64) -> bool {
         self.cfg_tx_queue
@@ -2463,6 +2485,8 @@ impl AppController {
         if inflight.seq != frame.seq {
             return;
         }
+        let inflight_cmd = inflight.cmd;
+        let inflight_seq = inflight.seq;
         if nak {
             let reason = if frame.payload.len() > 1 {
                 String::from_utf8_lossy(&frame.payload[1..]).into_owned()
@@ -2470,12 +2494,24 @@ impl AppController {
                 "未知错误".to_string()
             };
             self._record_cfg_tx_failure(
-                inflight.cmd,
-                inflight.seq,
+                inflight_cmd,
+                inflight_seq,
                 format!("设备拒绝(NAK): {}", reason),
             );
         }
         self.cfg_tx_inflight = None;
+        if inflight_cmd == HostCmd::SaveConfig as u8 {
+            if nak {
+                self.post_save_refetch_channels.clear();
+            } else {
+                let channels = std::mem::take(&mut self.post_save_refetch_channels);
+                for ch in channels {
+                    if let Err(error) = self.request_params(ch) {
+                        self.push_log_warn(format!("CH{} 重新启用后参数回读失败: {}", ch, error));
+                    }
+                }
+            }
+        }
         // ★收到回执立刻发下一帧, 不再等到下一个 16ms tick★
         // 窗口仍然是 1(同一时刻只有一帧在途, ACK 仍代表"设备真的做完了"), 但原实现把"何时发下一帧"
         // 绑在 GUI 的 16ms tick 上, 于是吞吐被硬钉在 62.5 帧/秒 —— 与设备快慢无关。
@@ -3499,6 +3535,15 @@ impl AppController {
     /// 通道的偏好档各不相同(由实测 Cp 推出), 而 `auto_tune` 只会取滑条上那一个统一值。
     /// 两者共用同一份下发/进度/冷却逻辑, 不复制第二条自适应路径。
     pub fn auto_tune_with_pref(&mut self, ch: u8, pref: u8) -> anyhow::Result<()> {
+        self._auto_tune_with_pref(ch, pref, false)
+    }
+
+    /// 批量队列使用：每通道只更新运行态，整批完成后统一发一次 SAVE_CONFIG。
+    pub(super) fn auto_tune_with_pref_deferred(&mut self, ch: u8, pref: u8) -> anyhow::Result<()> {
+        self._auto_tune_with_pref(ch, pref, true)
+    }
+
+    fn _auto_tune_with_pref(&mut self, ch: u8, pref: u8, defer_save: bool) -> anyhow::Result<()> {
         if ch != 0xFF && (ch as usize) >= 36 {
             return Err(anyhow::anyhow!("自适应通道越界: {}", ch));
         }
@@ -3514,7 +3559,12 @@ impl AppController {
         let pref = pref.clamp(1, 7);
         let seq = self.next_seq();
         if self.io.is_some() {
-            let frame = Frame::new(HostCmd::AutoTune as u8, 0, seq, vec![ch, pref]);
+            let frame = Frame::new(
+                HostCmd::AutoTune as u8,
+                0,
+                seq,
+                vec![ch, pref, u8::from(defer_save)],
+            );
             self._queue_tx(frame)?;
         }
         self.auto_tune_result = 0; // 进行中
@@ -4488,11 +4538,10 @@ impl AppController {
         self.kbd_edges_version = self.kbd_edges_version.wrapping_add(1);
     }
 
-    /// mai2 串口发送使能: 期望值(用户设置)优先 → 设备回读兜底; None = 从未设置且未回读。
+    /// mai2 串口实际有效发送态；None = 尚未回读。
+    /// 用户期望只用于下发与重连恢复，绝不能覆盖设备状态机的真值。
     pub fn mai2_send_en(&self) -> Option<bool> {
-        self.desired
-            .mai2_send_en
-            .or_else(|| self.mai2_state.map(|s| s.send_en))
+        self.mai2_state.map(|s| s.send_en)
     }
 
     /// mai2 串口状态: 0=停 1=就绪 2=运行; None = 尚未回读。
@@ -5244,11 +5293,11 @@ impl AppController {
         // 成功响应: 设备有算法且可读, 清退避恢复正常轮询。
         self.algo_trace_backoff = 0;
         self.algo_trace_last_seq = None;
-        if let Some((ch, active, report)) =
+        if let Some((ch, idx, active, report)) =
             crate::proto::algo::decode_algo_get_trace(&frame.payload)
         {
-            if self.algo_trace_channel != Some(ch) {
-                return; // 通道已切换, 丢弃过时响应(避免新旧通道数据混线)
+            if self.algo_trace_channel != Some(ch) || idx >= 4 {
+                return; // 通道已切换或响应索引非法，丢弃过时帧。
             }
             const TRACE_CAP: usize = 512;
             // ★采样时刻 = 设备端组帧时刻(协议尾戳), 折进与遥测共用的展开时间轴★
@@ -5264,8 +5313,7 @@ impl AppController {
                             .map_or(0, |at| at.elapsed().as_micros() as u64)
                 }
             };
-            let idx = self.algo_trace_pending_idx as usize;
-            if let Some(buf) = self.algo_trace_report.get_mut(idx) {
+            if let Some(buf) = self.algo_trace_report.get_mut(idx as usize) {
                 if buf.len() >= TRACE_CAP {
                     buf.pop_front();
                 }
@@ -6538,6 +6586,22 @@ impl AppController {
     pub fn ch_enabled(&self, ch: u8) -> bool {
         self.param(ch, crate::proto::PARAM_ENABLED)
             .map_or(true, |v| v != 0)
+    }
+
+    /// 自动化操作使用的启用真值。必须已有设备回读；未保存的“禁用”草稿立即排除，
+    /// 未保存的“启用”草稿不能把设备仍禁用的通道提前加入队列。
+    pub(super) fn ch_enabled_for_operation(&self, ch: u8) -> Option<bool> {
+        let device_on = self
+            .params
+            .get(ch as usize)?
+            .get(&crate::proto::PARAM_ENABLED)?
+            != &0;
+        let draft = self.drafts.param(ch, crate::proto::PARAM_ENABLED);
+        Some(device_on && draft != Some(0))
+    }
+
+    pub(super) fn ch_enabled_states_known(&self) -> bool {
+        (0..36u8).all(|ch| self.ch_enabled_for_operation(ch).is_some())
     }
 
     /// 启用通道位图(bit ch = 1 启用)。遥测掩码 / 批量队列 / 全通道操作按它筛选,

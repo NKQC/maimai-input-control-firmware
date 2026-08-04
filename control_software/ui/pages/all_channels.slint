@@ -445,14 +445,14 @@ export component AllChannelsPage inherits Rectangle {
                     color: Theme.text-title;
                 }
                 Text {
-                    text: @tr("下面这一列值默认预填“源通道”的当前值，可逐项直接改成想写的数字。点“应用到已选通道”后，只有勾选的参数会按这一列的值写进勾选的通道，其余一律不动；改动进草稿，需点“保存到设备”才下发。超出合法范围的值会被明确拒绝并写进日志。");
+                    text: @tr("编辑参数值并勾选目标；仅勾选项会写入。保存后生效。");
                     font-size: Theme.fs-small;
                     color: Theme.text-sub;
                     wrap: word-wrap;
                 }
 
                 Text {
-                    text: @tr("源通道: CH") + root.batch_source + @tr("（按住 Shift 单击网格中的卡片可换源通道；普通单击是勾选目标）");
+                    text: @tr("源通道: CH") + root.batch_source + @tr(" · Shift+单击更换");
                     font-size: Theme.fs-small;
                     color: #7cf5a0;
                     wrap: word-wrap;
@@ -490,12 +490,12 @@ export component AllChannelsPage inherits Rectangle {
                 // ★与"批量应用参数"分开成一组★: 参数是调参(要选参数、要填值), 而启用是硬件开关
                 // (只有开/关两种结果)。混进上面那张参数表会让"启用"看着像又一个可复制的数值项。
                 Text {
-                    text: @tr("批量启用 / 禁用（作用于上面已勾选的通道）");
+                    text: @tr("批量启用 / 禁用");
                     font-size: Theme.fs-small;
                     color: Theme.text-title;
                 }
                 Text {
-                    text: @tr("禁用是硬件级关闭：该通道的电极持续保持模拟高阻、不再参与扫描，也不再上报数据；整轮扫描周期会相应缩短。走的是与逐通道开关完全相同的草稿路径，需点“保存到设备”才下发。");
+                    text: @tr("启用或禁用已选通道；保存后生效。");
                     font-size: Theme.fs-small;
                     color: Theme.text-sub;
                     wrap: word-wrap;

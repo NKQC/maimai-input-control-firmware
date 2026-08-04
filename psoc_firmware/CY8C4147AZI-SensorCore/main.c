@@ -1264,6 +1264,18 @@ static void spi_load_algo_response(uint8_t command, uint8_t b2, uint8_t b3, uint
     spi_dma_arm_tx();
 }
 
+static void spi_load_algo_trace_response(uint8_t ch, uint8_t active, uint16_t report, uint8_t idx)
+{
+    spi_dma.tx_frame[0] = SENSOR_FRAME_MAGIC;
+    spi_dma.tx_frame[1] = ALGO_GET_TRACE;
+    spi_dma.tx_frame[2] = ch;
+    spi_dma.tx_frame[3] = active;
+    spi_dma.tx_frame[4] = (uint8_t)(report & 0xFFu);
+    spi_dma.tx_frame[5] = (uint8_t)((report >> 8u) & 0xFFu);
+    spi_dma.tx_frame[6] = idx;
+    spi_dma_arm_tx();
+}
+
 static void cmd_algo_begin(uint8_t len_lo, uint8_t len_hi)
 {
     uint16_t len = (uint16_t)len_lo | ((uint16_t)len_hi << 8u);
@@ -1315,7 +1327,7 @@ static void cmd_algo_get_rom(uint8_t ch)
     spi_load_algo_response(ALGO_GET_ROM, ch, 0u, rom);
 }
 
-/* 读某通道算法追踪: 帧 [magic,GET_TRACE,ch,idx,..]。响应 [.. ,ch,out_active,report[idx]_lo,report[idx]_hi,0]。
+/* 读某通道算法追踪: 帧 [magic,GET_TRACE,ch,idx,..]。响应 [.. ,ch,out_active,report[idx]_lo,report[idx]_hi,idx]。
  * 供上位机在单通道调整页可视化算法上报变量(report[])与触发判定(out_active)。 */
 static void cmd_algo_get_trace(uint8_t ch, uint8_t idx)
 {
@@ -1326,7 +1338,7 @@ static void cmd_algo_get_trace(uint8_t ch, uint8_t idx)
         rep = g_algo_io[ch].report[idx];
         act = (g_algo_io[ch].out_active != 0u) ? 1u : 0u;
     }
-    spi_load_algo_response(ALGO_GET_TRACE, ch, act, rep);
+    spi_load_algo_trace_response(ch, act, rep, idx);
 }
 
 /* 设共享算法可设置变量: 帧 [magic,SET_CFG,idx,val,..]。cfg[idx]=val, 下次算法执行拷入 io->cfg。 */

@@ -52,6 +52,7 @@ component ComboRow inherits Rectangle {
     callback hold_edited(int, int);   // delay, maxhold
     callback key_capture_started();
     callback key_captured(string, bool, bool, bool, bool);  // text, ctrl,shift,alt,gui
+    callback hid_submitted(string);
     callback removed();
 
     // 36px = 内边距 3px×2 + fluent SpinBox 的 min-height 30px, 再矮就会把数字框挤出行外。
@@ -84,10 +85,11 @@ component ComboRow inherits Rectangle {
         // 就地重录按键: 与新建区用同一个 KeyCaptureBox, 因此覆盖/累加语义天然一致。
         // ★列宽 150px 必须与 ComboHeader 的「按键组合」列一致★。
         KeyCaptureBox {
-            width: 150px;
+            width: 200px;
             display: root.keys_text;
             capture_started() => { root.key_capture_started(); }
             captured(t, c, s, a, g) => { root.key_captured(t, c, s, a, g); }
+            hid_submitted(t) => { root.hid_submitted(t); }
         }
         GuardedSpinBox {
             width: Theme.spin-width;
@@ -133,8 +135,8 @@ component ComboHeader inherits HorizontalLayout {
         overflow: elide;
     }
     Text {
-        text: @tr("按键组合(点击重录)");
-        width: 150px;
+        text: @tr("按键组合 / HID");
+        width: 200px;
         font-size: Theme.fs-small;
         color: Theme.text-sub;
         vertical-alignment: center;
@@ -180,6 +182,7 @@ export component KeyMapPage inherits Rectangle {
     callback combo_zone_toggled(int);
     callback combo_zones_clear();
     callback combo_captured(string, bool, bool, bool, bool);  // text, ctrl,shift,alt,gui
+    callback combo_hid_submitted(string);
     callback combo_keys_clear();
     callback combo_add(int, int);   // delay_ms, max_hold_ms
     callback combo_removed(int);
@@ -187,6 +190,7 @@ export component KeyMapPage inherits Rectangle {
     // 已有映射的按键就地重录: 行号 + 与新建区完全相同的键捕获载荷。
     callback combo_key_capture_started(int);
     callback combo_key_captured(int, string, bool, bool, bool, bool);
+    callback combo_key_hid_submitted(int, string);
 
     VerticalBox {
         padding: 8px;
@@ -196,7 +200,7 @@ export component KeyMapPage inherits Rectangle {
             padding: 0px;
             spacing: 8px;
             Text {
-                text: @tr("组合映射：一条映射 = 选定的若干触控分区【全部同时按下】才触发，输出选定的若干按键【同时按下】。触发延时从“全部分区都按住”起算，其中任一分区松开即视为松开。只要分区集合不完全相同，就可以再加一条。改动进草稿，需点左下角“保存到设备”才下发。");
+                text: @tr("选择分区并录入按键组合；保存后生效。HID 可输入十进制或 0xNN。");
                 color: Theme.text-sub;
                 wrap: word-wrap;
                 horizontal-stretch: 1;
@@ -279,6 +283,7 @@ export component KeyMapPage inherits Rectangle {
                         // 同一次会话内仍然累加, 所以"同时按住 F5+F6"这种真实和弦照旧能录成多键。
                         capture_started() => { root.combo_keys_clear(); }
                         captured(t, c, s, a, g) => { root.combo_captured(t, c, s, a, g); }
+                        hid_submitted(t) => { root.combo_keys_clear(); root.combo_hid_submitted(t); }
                     }
                     Button {
                         text: @tr("清空按键");
@@ -347,6 +352,7 @@ export component KeyMapPage inherits Rectangle {
                     hold_edited(d, m) => { root.combo_hold_set(i, d, m); }
                     key_capture_started() => { root.combo_key_capture_started(i); }
                     key_captured(t, c, s, a, g) => { root.combo_key_captured(i, t, c, s, a, g); }
+                    hid_submitted(t) => { root.combo_key_capture_started(i); root.combo_key_hid_submitted(i, t); }
                     removed => { root.combo_removed(i); }
                 }
             }
@@ -454,6 +460,7 @@ component PhysKeyRow inherits Rectangle {
     in property <int> hold_delay: 0;
     in property <int> hold_max: 0;
     callback captured(string, bool, bool, bool, bool);
+    callback hid_submitted(string);
     callback cleared();
     callback keycfg_set(int, int);
     callback hold_set(int, int);
@@ -489,6 +496,7 @@ component PhysKeyRow inherits Rectangle {
                 horizontal-stretch: 1;
                 display: root.display;
                 captured(t, c, s, a, g) => { root.captured(t, c, s, a, g); }
+                hid_submitted(t) => { root.hid_submitted(t); }
             }
             Button {
                 text: @tr("清除");
@@ -585,6 +593,7 @@ export component PhysKbdPage inherits Rectangle {
     in-out property <bool> la_expanded: false;
 
     callback phys_captured(int, string, bool, bool, bool, bool);  // idx, text, ctrl,shift,alt,gui
+    callback phys_hid_submitted(int, string);
     callback phys_cleared(int);
     callback phys_hold_set(int, int, int);
     callback phys_keycfg_set(int, int, int);   // idx, 极性(0=低/1=高/2=AUTO), 防抖 us
@@ -599,7 +608,7 @@ export component PhysKbdPage inherits Rectangle {
             padding: 0px;
             spacing: 8px;
             Text {
-                text: @tr("GPIO1–12 物理键。每键旁的「当前: 高/低电平触发」显示的是设备此刻真正生效的电平（由固件回传，不是本地推算）；固定档位就是所设档位，「自动」档则由上电那一刻的电平决定（上电为高→低电平触发，上电为低→高电平触发），之后不再重新采样，因此上电瞬间被按住的键会判反，可改成固定档位。旧固件不回传生效电平时显示「当前: 未知」。防抖 0–10000us，0=不去抖，每键各自独立计时。触发延时=按住达到该时长才真正输出；自动抬起=输出后最长保持该时长即自动松开；两者 0 表示禁用。极性/防抖/长按改动均进草稿，需点左下角“保存到设备”才下发。");
+                text: @tr("GPIO1–12 按键设置。极性、防抖、延时和 HID 键码保存后生效。");
                 color: Theme.text-sub;
                 wrap: word-wrap;
                 horizontal-stretch: 1;
@@ -620,7 +629,7 @@ export component PhysKbdPage inherits Rectangle {
                     summary: root.keycfg_status;
                     expanded <=> root.live_expanded;
                     Text {
-                        text: @tr("原始=去抖前的电平(已按极性归一)，去抖后=防抖判定后的按下态，输出=再经过长按状态机后真正发给主机的按键。原始→去抖后显示防抖耗时，去抖后→输出显示长按延迟。");
+                        text: @tr("原始 / 去抖后 / 实际输出。");
                         color: Theme.text-sub;
                         font-size: Theme.fs-small;
                         wrap: word-wrap;
@@ -731,6 +740,7 @@ export component PhysKbdPage inherits Rectangle {
                         hold_delay: i < root.phys_hold_delay.length ? root.phys_hold_delay[i] : 0;
                         hold_max: i < root.phys_hold_max.length ? root.phys_hold_max[i] : 0;
                         captured(t, c, s, a, g) => { root.phys_captured(i, t, c, s, a, g); }
+                        hid_submitted(t) => { root.phys_hid_submitted(i, t); }
                         cleared => { root.phys_cleared(i); }
                         keycfg_set(pol, db) => { root.phys_keycfg_set(i, pol, db); }
                         hold_set(d, m) => { root.phys_hold_set(i, d, m); }
@@ -740,7 +750,7 @@ export component PhysKbdPage inherits Rectangle {
 
                 // ---- 抽屉 3: 逻辑分析仪(12 通道共用一张图, 横轴为设备时间戳) ----
                 CollapsibleSection {
-                    title: @tr("逻辑分析仪（12 通道时序：原始 / 去抖后 / 实际输出）");
+                    title: @tr("逻辑分析仪");
                     summary: root.la_status;
                     expanded <=> root.la_expanded;
                     HorizontalLayout {

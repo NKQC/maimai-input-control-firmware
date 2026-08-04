@@ -139,18 +139,37 @@ void PsocAlgo::reset_default() {
     request_save();
 }
 
-bool PsocAlgo::download_to_psoc(Psoc* psoc) {
-    if (psoc == nullptr || !psoc->link_ok() || _len == 0u) return false;
+bool PsocAlgo::request_download(Psoc* psoc) {
+    // 判据用去抖后的 link_alive(): 遥测流式期间瞬时 link_ok 频繁为 false, 拿它当门禁会永远下发不了。
+    if (psoc == nullptr || !psoc->link_alive() || _len == 0u) return false;
     if (!psoc->upload_algo(_blob, _len, _crc16)) return false;
-    // 代码下发成功后推送每通道 ROM(算法所需的 per-channel 常量)。非零才推, 省事务; 失败不阻断。
+    _params_pending = true;
+    return true;
+}
+
+void PsocAlgo::tick(Psoc* psoc) {
+    if (!_params_pending) return;
+    if (psoc == nullptr) { _params_pending = false; return; }
+    if (psoc->algo_download_busy()) return;   // 代码还在写, 等下一轮
+    _params_pending = false;
+    _push_runtime_params(psoc);
+}
+
+void PsocAlgo::_push_runtime_params(Psoc* psoc) {
+    // 每通道 ROM: 非零才推, 省事务; 失败不阻断。
     for (uint8_t ch = 0; ch < PSOC_ALGO_CHANNELS; ++ch) {
         if (_rom[ch] != 0u) { (void)psoc->set_algo_rom(ch, _rom[ch]); }
     }
-    // 同时推送共享可设置变量(cfg[8]), 使复位/重刷代码后仍恢复上次设置。全量推(含0), 与 ROM
-    // 的"非零才推"不同: cfg[idx]=0 是合法且常见的默认设定值, 不能用非零判定省略。
+    // cfg[8] 全量推: cfg[idx]=0 是合法设定值, 不能按非零省略。
     for (uint8_t idx = 0; idx < 8u; ++idx) {
         (void)psoc->algo_set_cfg(idx, _cfg[idx]);
     }
+}
+
+bool PsocAlgo::download_to_psoc(Psoc* psoc) {
+    if (!request_download(psoc)) return false;
+    _params_pending = false;
+    _push_runtime_params(psoc);
     return true;
 }
 

@@ -171,12 +171,14 @@ export component AppWindow inherits Window {
     callback combo_zone_toggled(int);
     callback combo_zones_clear();
     callback combo_captured(string, bool, bool, bool, bool);
+    callback combo_hid_submitted(string);
     callback combo_keys_clear();
     callback combo_add(int, int);   // delay_ms, max_hold_ms
     callback combo_removed(int);
     callback combo_hold_set(int, int, int);
     callback combo_key_capture_started(int);
     callback combo_key_captured(int, string, bool, bool, bool, bool);
+    callback combo_key_hid_submitted(int, string);
     // 采样率(Hz)与设备实测探测周期(ms,两位小数)，由 main.rs 每 tick 从 AppController 回填
     in property <int> sample_rate_hz: 0;
     in property <string> curve_threshold_warning: "";
@@ -311,6 +313,7 @@ export component AppWindow inherits Window {
     callback kbd_set_hold_phys(int, int, int);
     callback kbd_set_hold_zone(int, int, int);
     callback kbd_capture_phys(int, string, bool, bool, bool, bool);
+    callback kbd_hid_phys(int, string);
     callback kbd_capture_zone(int, string, bool, bool, bool, bool);
     callback kbd_clear_phys(int);
     callback kbd_clear_zone(int);
@@ -855,12 +858,14 @@ export component AppWindow inherits Window {
                 combo_zone_toggled(z) => { root.combo_zone_toggled(z); }
                 combo_zones_clear() => { root.combo_zones_clear(); }
                 combo_captured(t, c, s, a, g) => { root.combo_captured(t, c, s, a, g); }
+                combo_hid_submitted(t) => { root.combo_hid_submitted(t); }
                 combo_keys_clear() => { root.combo_keys_clear(); }
                 combo_add(d, m) => { root.combo_add(d, m); }
                 combo_removed(i) => { root.combo_removed(i); }
                 combo_hold_set(i, d, m) => { root.combo_hold_set(i, d, m); }
                 combo_key_capture_started(i) => { root.combo_key_capture_started(i); }
                 combo_key_captured(i, t, c, s, a, g) => { root.combo_key_captured(i, t, c, s, a, g); }
+                combo_key_hid_submitted(i, t) => { root.combo_key_hid_submitted(i, t); }
                 sample_rate_hz: root.sample_rate_hz;
                 curve_threshold_warning: root.curve_threshold_warning;
                 scan_period_ms: root.scan_period_ms;
@@ -913,6 +918,7 @@ export component AppWindow inherits Window {
                 kbd_set_hold_phys(i, delay, max_hold) => { root.kbd_set_hold_phys(i, delay, max_hold); }
                 kbd_set_hold_zone(z, delay, max_hold) => { root.kbd_set_hold_zone(z, delay, max_hold); }
                 kbd_capture_phys(i, t, c, s, a, g) => { root.kbd_capture_phys(i, t, c, s, a, g); }
+                kbd_hid_phys(i, t) => { root.kbd_hid_phys(i, t); }
                 kbd_capture_zone(z, t, c, s, a, g) => { root.kbd_capture_zone(z, t, c, s, a, g); }
                 kbd_clear_phys(i) => { root.kbd_clear_phys(i); }
                 kbd_clear_zone(z) => { root.kbd_clear_zone(z); }

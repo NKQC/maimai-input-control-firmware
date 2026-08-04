@@ -16,6 +16,14 @@
  */
 class Psoc {
 public:
+    // link_alive() 的默认判定窗口(ms): 足以跨过快照分页与重操作期间的连续失败, 远小于掉线判据。
+    static constexpr uint32_t LINK_ALIVE_WINDOW_MS = 750u;
+    // ★触摸保留窗口(core1 周期数, 1 周期 = 1ms)★: 连续这么多周期取不到合法触控帧才把掩码优雅
+    // 释放为全 0。取 60ms —— 长于遥测分页/命令流水造成的成批错帧(实测数个到十几个周期), 短于
+    // LINK_FAIL_RESET_CYCLES(200ms)的掉线判据, 也短于人手最短一次点击, 故既不制造假抬起,
+    // 也不会在真故障时把按下状态永久保持住。
+    static constexpr uint32_t TOUCH_RELEASE_FAIL_CYCLES = 60u;
+
     static Psoc* getInstance();
 
     // 初始化 SPI(PIO1) 与 SWD(PIO0) 两条传输通道
@@ -24,15 +32,29 @@ public:
     // ---------- SPI 链路 ----------
     void update();                    // 兼容: 执行一次 SPI 服务(仅 setup 阶段 core1 未启动时直调)
     void core1_run();                 // ★core1 入口★: 固定 1ms 周期独占 PSoC SPI 传感器循环, 永不返回
-    bool link_ok() const { return _pub_link_ok; }   // core1 发布(bool 原子)
+    // core1 发布(bool 原子): 最近一拍 read_touch 的**瞬时**结果。实时消费者(触控/键盘/灯效)用它。
+    bool link_ok() const { return _pub_link_ok; }
+    // 去抖判据: 最近一次 read_touch 成功在窗口内即为真。供上传/下发这类非实时动作做门禁。
+    bool link_alive(uint32_t within_ms = LINK_ALIVE_WINDOW_MS) const;
 
     // Phase C：遥测慢路开关。激活后 update() 分块流水读全通道 raw/baseline/diff 填充 snapshot()。
     void set_telemetry_active(bool active) { _telem_active = active; }
     bool telemetry_active() const { return _telem_active; }
 
     // ---------- 实时触控快路（core1 发布, core0 经 seqlock 读）----------
+    // ★touch_mask() 自身就是触摸真相★: 合法新帧才更新; 短暂错帧保留最后一份合法值;
+    // 连续失败超过 TOUCH_RELEASE_FAIL_CYCLES 由 core1 主动释放为 0。
+    // 故消费者【不得】再用瞬时 link_ok() 给它套一层清零 —— 那正是假抬起/假按下的来源。
     uint64_t touch_mask() const;                                // 36 区 on/off 位图(seqlock 防撕裂)
+    // 掩码是否仍在可信窗口内(最近有合法帧, 或仍处于保留窗口)。需要"有没有触摸源"这一门禁的
+    // 消费者(绑定捕获/键盘映射)用它, 不要自行用 link_ok() 重新组合判据。
+    bool touch_hold_ok() const { return _pub_touch_hold; }
     uint32_t touch_read_us() const { return _pub_touch_read_us; }  // 最近触控读取耗时(us,原子)
+    // 低成本诊断计数(core1 单写者, 只增不减; 不打日志, 由上位机/压测按差值判断链路质量):
+    //   touch_bad_frames() = read_touch 未取到合法帧的周期数(含重试用尽);
+    //   touch_releases()   = 因持续失败而优雅释放掩码的次数(每次故障只记一次)。
+    uint32_t touch_bad_frames() const { return _pub_touch_bad; }
+    uint32_t touch_releases() const { return _pub_touch_releases; }
 
     // ---------- 失效兜底(core1 检测, core0 执行 XRES 复位) ----------
     // 返回复位原因: 0=无, 1=SPI 链路持续丢失(PSoC 崩溃/掉线), 2=主循环卡死(scan_count 长时间不推进, 疑似坏算法)。
@@ -211,7 +233,12 @@ private:
     volatile uint32_t _pub_seq = 0;         // 触控发布序列(奇=写入中)
     volatile uint64_t _pub_touch_mask = 0;
     volatile bool     _pub_link_ok = false;
+    volatile bool     _pub_touch_hold = false;   // 掩码可信(见 touch_hold_ok)
+    volatile uint32_t _pub_link_ok_ms = 0;   // 最近一次 read_touch 成功时刻(ms), 0=从未成功
     volatile uint32_t _pub_touch_read_us = 0;
+    volatile uint32_t _pub_touch_bad = 0;        // 累计无合法触控帧的周期数(诊断)
+    volatile uint32_t _pub_touch_releases = 0;   // 累计优雅释放次数(诊断)
+    uint32_t _touch_fail_run = 0;                // 连续无合法帧周期数(core1 独占, 与掉线判据分开计)
 
     // 失效兜底检测态(core1 唯一写者, core0 只读 _pub_reset_reason / 清零)
     volatile uint8_t  _pub_reset_reason = 0;   // 0/1/2, core1 置位, core0 处理后清零

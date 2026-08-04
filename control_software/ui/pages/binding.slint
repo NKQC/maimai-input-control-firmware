@@ -6,7 +6,8 @@ import { VerticalBox, HorizontalBox, SpinBox, ScrollView, Button } from "std-wid
 import { ZoneCell } from "../common/types.slint";
 import { Theme } from "../common/theme.slint";
 // 分区一律用 SectionCard: std GroupBox 只画一行标题, 左右两栏的边界看不出来。
-import { GuardedSpinBox, SectionCard } from "../common/widgets.slint";
+// 带标签的控件行一律用 FormRow(标签列宽/行高/尾部弹性空白只在那里定义一次)。
+import { GuardedSpinBox, SectionCard, FormRow } from "../common/widgets.slint";
 
 // 真实 34 区路径画布。所有 Path 共用同一个 SCREEN_FRAME viewbox(见
 // touch_geometry::SCREEN_W/SCREEN_H, 1000x562.5, 16:9)绘制精确 DXF 几何
@@ -223,7 +224,7 @@ component ZoneList inherits Rectangle {
     }
 }
 
-component BindingDetail inherits SectionCard {
+component BindingDetail inherits Rectangle {
     in property <int> selected_zone: -1;
     in property <string> selected_zone_label: "";
     in property <int> selected_channel: -1;
@@ -233,28 +234,47 @@ component BindingDetail inherits SectionCard {
     callback listen_cancel();
     callback unbind();
 
-    title: root.selected_zone >= 0 ? @tr("区 ") + root.selected_zone_label + @tr(" 详情") : @tr("详情");
+    background: transparent;
 
-    VerticalBox {
-        padding: 4px;
-        spacing: Theme.gap;
+    VerticalLayout {
+        spacing: Theme.card-inner-gap;
 
-        if root.selected_zone >= 0: VerticalBox {
-            padding: 0px;
-            spacing: Theme.gap;
+        if root.selected_zone >= 0: VerticalLayout {
+            spacing: Theme.card-inner-gap;
 
-            Text {
-                text: root.selected_channel >= 0 ? (@tr("当前绑定: CH") + root.selected_channel) : @tr("当前绑定: 未绑定");
-                color: Theme.text-sub;
+            // 当前绑定: 状态块而不是一行普通文字 —— 这是本卡片唯一的"结论", 必须最先被看到。
+            Rectangle {
+                height: Theme.row-height;
+                border-radius: Theme.radius-small;
+                background: root.selected_channel >= 0 ? Theme.ok-bg : Theme.panel-deep;
+                HorizontalLayout {
+                    padding-left: Theme.gap;
+                    padding-right: Theme.gap;
+                    spacing: Theme.gap;
+                    Text {
+                        text: @tr("当前绑定");
+                        color: Theme.text-dim;
+                        font-size: Theme.fs-small;
+                        vertical-alignment: center;
+                        horizontal-stretch: 0;
+                    }
+                    Text {
+                        text: root.selected_channel >= 0
+                            ? (@tr("CH") + root.selected_channel)
+                            : @tr("未绑定");
+                        color: root.selected_channel >= 0 ? Theme.ok-text : Theme.warn;
+                        font-weight: 700;
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
+                    }
+                }
             }
 
-            HorizontalBox {
-                padding: 0px;
-                spacing: 8px;
-                Text {
-                    text: @tr("通道:");
-                    vertical-alignment: center;
-                }
+            // 手改通道: 走统一表单行, 标签列按本栏宽度取窄档(300px 栏放不下 210px 的通用标签列)。
+            FormRow {
+                label: @tr("通道");
+                label_width: 56px;
+                hint: @tr("0–35 为物理通道号；改动进草稿，保存后生效。");
                 GuardedSpinBox {
                     width: Theme.spin-width;
                     horizontal-stretch: 0;
@@ -263,15 +283,16 @@ component BindingDetail inherits SectionCard {
                     model_value: root.selected_channel >= 0 ? root.selected_channel : 0;
                     edited(v) => { root.channel_set(v); }
                 }
-                Rectangle { horizontal-stretch: 1; }
             }
 
-            HorizontalBox {
-                padding: 0px;
+            // ★按动作性质分两行★ 上行是"侦听"这一对(开始/取消, 互为一组), 下行是破坏性的清除。
+            // 原实现三个按钮挤在一行, 于是"清除"紧挨着"取消侦听" —— 想停止侦听却点掉绑定的经典误触。
+            HorizontalLayout {
                 spacing: Theme.gap;
                 Button {
                     min-width: Theme.button-min-width;
                     horizontal-stretch: 0;
+                    primary: true;
                     text: @tr("侦听绑定");
                     clicked => { root.touch_start(); }
                 }
@@ -281,27 +302,42 @@ component BindingDetail inherits SectionCard {
                     text: @tr("取消侦听");
                     clicked => { root.listen_cancel(); }
                 }
+                // 行尾弹性空白: 否则 Slint 在"全部子项 stretch=0"时平分余量, 两个按钮各被摊成半栏宽。
+                Rectangle { horizontal-stretch: 1; }
+            }
+            HorizontalLayout {
+                spacing: Theme.gap;
                 Button {
                     min-width: Theme.button-min-width;
                     horizontal-stretch: 0;
-                    text: @tr("清除");
+                    text: @tr("清除绑定");
+                    // 未绑定时无可清除: 保持可点只会让人怀疑自己没点上。
+                    enabled: root.selected_channel >= 0;
                     clicked => { root.unbind(); }
                 }
-                // 行尾弹性空白: 三个按钮才不会各被摊成一大块(Slint 在全部子项 stretch=0 时平分余量)。
-                Rectangle { horizontal-stretch: 1; }
-            }
-            Text {
-                text: @tr("侦听绑定：触摸目标分区暂存通道，保存后生效。");
-                color: Theme.text-dim;
-                font-size: Theme.fs-normal;
-                wrap: word-wrap;
+                Text {
+                    text: @tr("点击后触摸该分区以捕获通道。");
+                    color: Theme.text-dim;
+                    font-size: Theme.fs-small;
+                    vertical-alignment: center;
+                    horizontal-stretch: 1;
+                    wrap: word-wrap;
+                }
             }
         }
 
-        if root.selected_zone < 0: Text {
-            text: @tr("请在左侧图上或列表中选择一个分区");
-            color: #666666;
-            wrap: word-wrap;
+        // 未选中分区: 占位说明与上面的正文等高, 避免切换选中态时右栏高度跳变。
+        if root.selected_zone < 0: Rectangle {
+            height: Theme.row-height * 2;
+            Text {
+                width: 100%;
+                text: @tr("请在左侧图上或列表中选择一个分区");
+                color: Theme.muted;
+                font-size: Theme.fs-normal;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+                wrap: word-wrap;
+            }
         }
     }
 }
@@ -337,15 +373,20 @@ export component BindingPage inherits Rectangle {
         padding: 8px;
         spacing: Theme.gap;
 
-        // 顶部信息条: 精简单行, 不再占用大块高度, 把空间留给分区画布。
-        HorizontalBox {
-            padding: 0px;
-            spacing: 8px;
+        // 顶部信息条。钉死行高: 否则外层把多余高度分给本行, 按钮被纵向拉成巨块。
+        HorizontalLayout {
+            height: Theme.row-height;
+            vertical-stretch: 0;
+            spacing: Theme.gap;
             Button {
+                min-width: Theme.button-min-width;
+                horizontal-stretch: 0;
                 text: @tr("从设备加载");
                 clicked => { root.bind_load(); }
             }
             Button {
+                min-width: Theme.button-min-width;
+                horizontal-stretch: 0;
                 // 交互式顺序绑定: 点开始后按提示依次触摸各区(A1→E8), 每区捕获即自动跳下一区。
                 text: root.interactive_active ? @tr("终止交互式绑定") : @tr("交互式绑定");
                 clicked => {
@@ -354,7 +395,7 @@ export component BindingPage inherits Rectangle {
                 }
             }
             Text {
-                text: @tr("单击选择，双击进入精调；列表可改通道或绑定。");
+                text: @tr("单击选择，双击精调。");
                 vertical-alignment: center;
                 color: Theme.text-dim;
                 font-size: Theme.fs-normal;
@@ -364,7 +405,7 @@ export component BindingPage inherits Rectangle {
             Text {
                 text: root.bind_status;
                 vertical-alignment: center;
-                color: #a05a00;
+                color: Theme.warn;
                 // 状态串长度不可控(交互式绑定会写进度), 不 elide 会把整条工具栏的 min-width 顶上去。
                 wrap: no-wrap;
                 overflow: elide;
@@ -421,25 +462,30 @@ export component BindingPage inherits Rectangle {
                     Rectangle { horizontal-stretch: 1; }
                 }
 
-                if root.right_tab == 0: BindingDetail {
-                    vertical-stretch: 1;
-                    selected_zone: root.selected_zone;
-                    selected_zone_label: root.selected_zone_label;
-                    selected_channel: root.selected_channel;
-                    channel_set(v) => { root.zone_channel_set(root.selected_zone, v); }
-                    touch_start() => { root.bind_touch_start(root.selected_zone); }
-                    listen_cancel() => { root.bind_listen_cancel(); }
-                    unbind() => { root.zone_unbind(root.selected_zone); }
-                }
-
-                if root.right_tab == 1: SectionCard {
-                    // 标题精简(原长标题使该卡片首选宽度远大于"详情"页, 是切换偏移的主因之一)。
-                    title: @tr("全部绑定");
-                    // ★这一张要吃满右栏高度★: 里面是 34 行的列表, 需要占据整栏才有滚动余地,
-                    // 故显式覆盖 SectionCard 默认的 vertical-stretch: 0。
+                SectionCard {
+                    title: root.right_tab == 1
+                        ? @tr("全部绑定")
+                        : (root.selected_zone >= 0 ? @tr("区 ") + root.selected_zone_label + @tr(" 详情") : @tr("详情"));
+                    subtitle: root.right_tab == 1 || root.selected_zone < 0
+                        ? ""
+                        : (root.selected_channel >= 0 ? @tr("已绑定 CH") + root.selected_channel : @tr("未绑定"));
+                    tint: root.right_tab == 1 || root.selected_zone < 0
+                        ? Theme.border-light
+                        : (root.selected_channel >= 0 ? Theme.ok : Theme.warn);
                     vertical-stretch: 1;
 
-                    ZoneList {
+                    if root.right_tab == 0: BindingDetail {
+                        vertical-stretch: 0;
+                        selected_zone: root.selected_zone;
+                        selected_zone_label: root.selected_zone_label;
+                        selected_channel: root.selected_channel;
+                        channel_set(v) => { root.zone_channel_set(root.selected_zone, v); }
+                        touch_start() => { root.bind_touch_start(root.selected_zone); }
+                        listen_cancel() => { root.bind_listen_cancel(); }
+                        unbind() => { root.zone_unbind(root.selected_zone); }
+                    }
+                    if root.right_tab == 0: Rectangle { vertical-stretch: 1; }
+                    if root.right_tab == 1: ZoneList {
                         zones: root.zones;
                         selected_zone: root.selected_zone;
                         zone_selected(i) => { root.selected_zone = i; root.zone_selected(i); }

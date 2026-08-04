@@ -109,7 +109,7 @@ export component ProtocolPage inherits Rectangle {
                         vertical-alignment: center;
                     }
                     Text {
-                        text: "游戏发 {A} 开启发送、{L}/{E} 关闭，此处为手动覆盖。";
+                        text: "游戏命令控制发送状态。";
                         color: Theme.text-dim;
                         font-size: Theme.fs-normal;
                         horizontal-stretch: 1;
@@ -254,7 +254,7 @@ export component ProtocolPage inherits Rectangle {
                         edited(v) => { root.light_brightness_set(v); }
                     }
                     Text {
-                        text: "以上三项为配置项，需点左下角“保存到设备”才写入 flash。";
+                        text: "保存后生效。";
                         color: Theme.text-dim;
                         font-size: Theme.fs-normal;
                         horizontal-stretch: 1;
@@ -410,7 +410,7 @@ export component ProtocolPage inherits Rectangle {
                         clicked => { root.light_preview(root.pv_unit, root.pv_r, root.pv_g, root.pv_b); }
                     }
                     Text {
-                        text: "预览色覆盖协议色，约 3 秒无新预览后自动回到灯板协议色。";
+                        text: "预览约 3 秒后恢复协议色。";
                         color: Theme.text-dim;
                         font-size: Theme.fs-normal;
                         horizontal-stretch: 1;
