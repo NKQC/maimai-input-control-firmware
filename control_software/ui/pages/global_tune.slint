@@ -93,9 +93,8 @@ component ClockEditNode inherits Rectangle {
 
 export component GlobalTunePage inherits Rectangle {
     in-out property <int> scan_mode: 0;
-    // 仅从设备诊断读到真实模式后显示下拉；未读到时不能用默认值冒充设备状态。
     in property <bool> mode_known: false;
-    // ★必须显式把真值重推进下拉★ 与 widgets.slint 的 `changed entry` 同一处坑:
+    in property <string> global_summary_text: "当前设备全局参数：未读取";
     // std-widgets 的 ComboBox 在用户选中时**赋值**自己的 current-index, 而 Slint 里一次赋值
     // 会永久摧毁该属性上的声明式绑定 ⇒ 用户手动切过一次模式后, 下方 `current-index: root.scan_mode`
     // 就不存在了, 此后 Rust 侧回填(设备真值/撤销草稿/重连清值)都推不进下拉。
@@ -200,6 +199,12 @@ export component GlobalTunePage inherits Rectangle {
             spacing: Theme.card-gap;
 
             Text { text: "触控全局调整"; color: Theme.text; font-size: Theme.fs-page; }
+
+            if root.global_summary_text != "": SectionCard {
+                title: "当前设备全局参数";
+                subtitle: "只读设备回读";
+                Text { text: root.global_summary_text; color: Theme.text-sub; font-size: Theme.fs-small; wrap: word-wrap; }
+            }
 
             // ★异常采样标识★: railed 通道数 / 数据停滞 / 设备拒绝固化基线 → 直接给出下一步动作指引。
             // ★无内容时整卡不实例化★: 留一个空标题框只会让人以为诊断坏了。
@@ -723,15 +728,17 @@ export component GlobalTunePage inherits Rectangle {
                             // 实际值只有一个来源(root.scan_period_us, 与主页同源)。★无实测值时它恒为 0,
                             // 绝不允许拿这个 0 去算差值/倍率★ —— 那会给出"差值 -5796 µs / 倍率 ×0"这种
                             // 看着像故障诊断、实则纯属数据缺失的伪结论。故无值时一律"未测/不可用"。
+                            property <float> actual_period_ms: root.scan_period_us / 1000.0;
+                            property <float> expected_period_ms: root.expected_period_us / 1000.0;
                             property <string> actual_text: root.scan_period_valid
-                                ? ((Math.round(root.scan_period_us / 10) / 100) + " ms")
+                                ? ((Math.round(self.actual_period_ms * 100) / 100) + " ms")
                                 : "未测(遥测未在运行)";
                             text: root.expected_period_us > 0
-                                ? ("期望(解算) " + (Math.round(root.expected_period_us / 10) / 100) + " ms"
+                                ? ("期望(解算) " + (Math.round(self.expected_period_ms * 100) / 100) + " ms"
                                     + "  实际 " + self.actual_text
                                     + (root.scan_period_valid
-                                        ? ("  差值 " + (root.scan_period_us - root.expected_period_us) + " µs"
-                                            + "  倍率 ×" + (Math.round(root.scan_period_us * 10 / root.expected_period_us) / 10))
+                                        ? ("  差值 " + Math.round((self.actual_period_ms - self.expected_period_ms) * 1000.0) + " µs"
+                                            + "  倍率 ×" + (Math.round(self.actual_period_ms * 10 / self.expected_period_ms) / 10))
                                         : "  差值/倍率不可用"))
                                 : ("实际 " + self.actual_text + "  (分辨率参数超范围, 期望无法解算)");
                             color: !root.scan_period_valid ? #7f9a86

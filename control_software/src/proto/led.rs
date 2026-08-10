@@ -15,8 +15,10 @@ pub const LED_UNIT_COUNT: usize = 11;
 pub const LED_CH_UNMAPPED: u8 = 0xFF;
 /// LED_PREVIEW 的"全部单元"占位 unit。
 pub const LED_PREVIEW_ALL: u8 = 0xFF;
-/// LED_GET 响应固定长度。
-const LED_GET_LEN: usize = 96;
+/// LED_GET 响应的稳定基础长度；新版固件会在其后追加运行态亮度字节，旧版保持此长度。
+const LED_GET_BASE_LEN: usize = 96;
+/// 新版固件在基础快照尾部追加的“已生效亮度”偏移。
+const LED_GET_APPLIED_BRIGHTNESS_OFFSET: usize = LED_GET_BASE_LEN;
 /// 固件默认值为 115200；1200..=3_000_000 覆盖常用 UART 配置，同时滤掉链路损坏产生的随机 u32。
 const LED_BAUD_MIN: u32 = 1_200;
 const LED_BAUD_MAX: u32 = 3_000_000;
@@ -78,6 +80,10 @@ pub struct LedState {
     pub sum_errors: u32,
     /// 两路灯链实际灯珠数(固件运行态,供本地映射越界校验)。
     pub ws_count: [u16; 2],
+    /// 固件灯链**当前已生效**的亮度(设备真值)。`None` = 旧固件未上报该字段。
+    /// ★与配置项 led.ws_brightness 分开★: 后者是 KV 里的期望值, 这里是灯链正在用的值 ——
+    /// 只有两者一致才能说"亮度已生效", 否则就是写进去了但没应用。
+    pub applied_brightness: Option<u8>,
 }
 
 impl Default for LedState {
@@ -98,6 +104,7 @@ impl Default for LedState {
             rx_frames: 0,
             sum_errors: 0,
             ws_count: [0u16; 2],
+            applied_brightness: None,
         }
     }
 }
@@ -124,13 +131,14 @@ pub fn encode_led_get() -> Vec<u8> {
     Vec::new()
 }
 
-/// 解码 LED_GET 响应载荷(96 字节)。长度不足一律返回 Err,不做部分解析、不 panic。
+/// 解码 LED_GET 响应载荷。前 96 字节为稳定快照；新版固件可追加已生效亮度。
+/// 长度不足一律返回 Err,不做部分解析、不 panic。
 pub fn decode_led_get(payload: &[u8]) -> Result<LedState, String> {
-    if payload.len() < LED_GET_LEN {
+    if payload.len() < LED_GET_BASE_LEN {
         return Err(format!(
             "LED_GET 响应过短: {} 字节 (需 >= {})",
             payload.len(),
-            LED_GET_LEN
+            LED_GET_BASE_LEN
         ));
     }
     let u16_at = |off: usize| u16::from_le_bytes([payload[off], payload[off + 1]]);
@@ -163,14 +171,20 @@ pub fn decode_led_get(payload: &[u8]) -> Result<LedState, String> {
         ..LedState::default()
     };
     for unit in 0..LED_UNIT_COUNT {
-        let c = 3 + unit * 3;
+        const C: usize = 3;
+        const REGION_OFFSET: usize = 36;
+        const REGION_SIZE: usize = 4;
+        let c = C + unit * C;
         state.colors[unit] = [payload[c], payload[c + 1], payload[c + 2]];
-        let m = 36 + unit * 4;
+        let m = REGION_OFFSET + unit * REGION_SIZE;
         state.regions[unit] = LedRegion {
             ch: payload[m],
             start: u16::from_le_bytes([payload[m + 1], payload[m + 2]]),
             count: payload[m + 3],
         };
+    }
+    if payload.len() > LED_GET_APPLIED_BRIGHTNESS_OFFSET {
+        state.applied_brightness = Some(payload[LED_GET_APPLIED_BRIGHTNESS_OFFSET]);
     }
     Ok(state)
 }

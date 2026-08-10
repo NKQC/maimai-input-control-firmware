@@ -109,6 +109,8 @@ export component CurvesPage inherits Rectangle {
     // 当前采样率(Hz), 供把横向可见窗口(样本数)换算成真实时间跨度显示。
     in property <int> sample_rate_hz: 0;
     in property <string> curve_threshold_warning: "";
+    // 单通道独占流的实测带宽文案(由 AppController::focus_bandwidth_text 回填, 不在界面里自己算)。
+    in property <string> focus_bandwidth: "独占流: 未开启（当前为全通道广谱）";
 
     // ── 绘图视窗冻结 ────────────────────────────────────────────────────────────
     // ★"暂停画面"只冻结看到的东西★: 设备遥测一直在收(读数/采样率/延迟仍是实时的),
@@ -147,6 +149,8 @@ export component CurvesPage inherits Rectangle {
 
     // 折线图视图变换(viewbox 坐标系 0..1000): 横=时间窗口, 纵=数值范围。
     // 滚轮缩放时间(横, 锚定右缘=现在), Shift+滚轮缩放纵轴, 拖拽平移, 双击复位。全览默认 0/1000。
+    // 同一大绘图区的子标签: 0=实时曲线, 1=频谱扫描。
+    property <int> plot_tab: 0;
     property <float> view_x: 0;
     property <float> view_w: 1000;
     // 当前横向可见时间跨度(ms) = 全量跨度 × 可见比例。时间来自设备端时间戳, 不再用"样本数/采样率"
@@ -320,9 +324,30 @@ export component CurvesPage inherits Rectangle {
             font-size: 12px;
             wrap: word-wrap;
         }
+        // 独占流实测吞吐: 精调时判断"是不是真的在高速拿数据"的唯一依据(帧率/字节率/丢帧均为实测)。
+        Text {
+            text: root.focus_bandwidth;
+            color: #8fd6ff;
+            font-size: 12px;
+            wrap: word-wrap;
+        }
 
-        // ★已删除顶部"上报变量"勾选行★: 与 RAW/BASELINE/DIFF/触发判定 合并到右列"数据序列"折叠区,
-        // 按"原生数据读取 / 算法上报变量"分两组竖排(见 right_col)。顶部只保留总开关。
+        // 主绘图区在实时曲线与频谱扫描之间切换，右列保留扫描控制与参数编辑。
+        HorizontalBox {
+            padding: 0px;
+            spacing: 6px;
+            Button {
+                text: "实时曲线";
+                enabled: root.plot_tab != 0;
+                clicked => { root.plot_tab = 0; }
+            }
+            Button {
+                text: "频谱扫描";
+                enabled: root.plot_tab != 1;
+                clicked => { root.plot_tab = 1; }
+            }
+            Rectangle { horizontal-stretch: 1; }
+        }
 
         // 主体左右结构(手动绝对布局: HorizontalBox 在本嵌套下不尊重 min-width 会把参数区挤没,
         // 改为容器 Rectangle + 绝对 x/width；分隔条只更新比例, 保持两侧绝对定位)。
@@ -339,6 +364,7 @@ export component CurvesPage inherits Rectangle {
             width: parent.width * root.split_ratio - 12px;
             // 独立窄带已取消(算法上报与触发判定都并入主图), 整块高度全归时间轴。
             height: parent.height;
+            visible: root.plot_tab == 0;
             clip: true;
             background: #101418;
             border-width: 1px;
@@ -489,10 +515,14 @@ export component CurvesPage inherits Rectangle {
                                 0, 1000 - root.view_h * (e.delta-y > 0 ? 0.85 : 1.1765));
                             root.view_h = Math.clamp(root.view_h * (e.delta-y > 0 ? 0.85 : 1.1765), 40, 1000);
                         } else {
-                            // 横轴(时间)缩放: ★硬锚定右缘=现在(x=1000)★, 缩放只改"显示多长的近端时间窗口"。
-                            // 视图恒为 [1000-view_w, 1000], 始终贴在最新数据右缘, 杜绝露出右侧无数据(始终无效)区。
+                            // 横轴缩放以光标对应的数据 x 为锚：缩放前后的该数据点保持在同一屏幕位置。
+                            root.view_x = Math.clamp(
+                                root.view_x + self.mouse-x / self.width * root.view_w
+                                    - self.mouse-x / self.width * Math.clamp(
+                                        root.view_w * (e.delta-y > 0 ? 0.85 : 1.1765), 40, 1000),
+                                0,
+                                1000 - Math.clamp(root.view_w * (e.delta-y > 0 ? 0.85 : 1.1765), 40, 1000));
                             root.view_w = Math.clamp(root.view_w * (e.delta-y > 0 ? 0.85 : 1.1765), 40, 1000);
-                            root.view_x = 1000 - root.view_w;
                         }
                         return accept;
                     }
@@ -749,6 +779,101 @@ export component CurvesPage inherits Rectangle {
 
         // ★原"算法上报"与"触发判定"两条独立窄带已删除★: 它们都已并入主图(算法线走右轴), 既省下
         // 两条 40px 的竖向空间给时间轴, 也免去了在两张图之间靠眼睛横向对位。
+
+        // 频谱与实时曲线共享左侧同一大绘图区，只切换内容而不挤占右列的扫描控制。
+        spectrum_plot := Rectangle {
+            x: 0;
+            y: 0;
+            width: parent.width * root.split_ratio - 12px;
+            height: parent.height;
+            visible: root.plot_tab == 1;
+            clip: true;
+            background: #101418;
+            border-width: 1px;
+            border-color: #3a3a3a;
+
+            Text {
+                x: 12px;
+                y: 10px;
+                width: parent.width - 24px;
+                text: "响应噪声频谱 · CH" + root.sel_channel
+                    + (root.spectrum_active ? (" · " + Math.round(root.spectrum_progress * 100) + "%") : "");
+                color: #cfe6ff;
+                font-size: 13px;
+            }
+            Text {
+                x: 12px;
+                y: 30px;
+                width: parent.width - 24px;
+                text: "横轴 分频 ÷1–÷64 · 纵轴 增益档 0–6";
+                color: #7f8c96;
+                font-size: 10px;
+            }
+            spectrum_grid := Rectangle {
+                x: 62px;
+                y: 52px;
+                width: parent.width - 86px;
+                height: parent.height - 112px;
+                background: #12181d;
+                border-width: 1px;
+                border-color: #29323a;
+                clip: true;
+                for cell in root.spectrum_cells: Rectangle {
+                    x: (cell.div - 1) * parent.width / 64;
+                    y: cell.gain * parent.height / 7;
+                    width: parent.width / 64 + 1px;
+                    height: parent.height / 7 + 1px;
+                    background: cell.tint;
+                    border-width: cell.railed ? 1px : 0px;
+                    border-color: #ff6b64;
+                }
+                grid_ta := TouchArea { mouse-cursor: crosshair; }
+            }
+            for gain in 7: Text {
+                x: 6px;
+                y: spectrum_grid.y + spectrum_grid.height * gain / 7 + 2px;
+                width: 48px;
+                text: gain;
+                color: #aeb9c2;
+                font-size: 10px;
+                horizontal-alignment: right;
+            }
+            Text {
+                x: spectrum_grid.x;
+                y: spectrum_grid.y + spectrum_grid.height + 5px;
+                text: "÷1";
+                color: #aeb9c2;
+                font-size: 10px;
+            }
+            Text {
+                x: spectrum_grid.x + spectrum_grid.width - 30px;
+                y: spectrum_grid.y + spectrum_grid.height + 5px;
+                width: 30px;
+                text: "÷64";
+                color: #aeb9c2;
+                font-size: 10px;
+                horizontal-alignment: right;
+            }
+            Text {
+                property <int> hg: Math.clamp(Math.floor(grid_ta.mouse-y / spectrum_grid.height * 7), 0, 6);
+                property <int> hd: Math.clamp(Math.floor(grid_ta.mouse-x / spectrum_grid.width * 64), 0, 63);
+                property <int> hi: self.hg * 64 + self.hd;
+                x: 12px;
+                y: parent.height - 23px;
+                width: parent.width - 24px;
+                text: !grid_ta.has-hover || root.spectrum_cells.length <= self.hi
+                    ? (root.spectrum_cells.length == 0 ? root.spectrum_status : "移动鼠标查看格点")
+                    : ("增益档 " + self.hg + " · 分频 ÷" + (self.hd + 1) + " · "
+                        + (root.spectrum_cells[self.hi].valid
+                            ? ("RAW 标准差 " + Math.round(root.spectrum_cells[self.hi].std * 10) / 10
+                                + " · 峰峰 " + Math.round(root.spectrum_cells[self.hi].pp)
+                                + (root.spectrum_cells[self.hi].railed ? " · 撞顶/贴底" : ""))
+                            : "未测 / 样本不足"));
+                color: #cfe6ff;
+                font-size: 10px;
+                overflow: elide;
+            }
+        }
 
         // 分隔条只占原先 12px 间隙；拖拽时夹紧比例，避免任一分区被收至不可用。
         divider := Rectangle {
@@ -1014,11 +1139,12 @@ export component CurvesPage inherits Rectangle {
                     // 热图: 横 = 分频 1..64, 纵 = 增益档 0..6。格子颜色由 Rust 侧按本次扫描的
                     // 全体有效格归一化后给出(SpectrumCell.tint), 撞顶/贴底的格子单独描边区别标注。
                     heat := Rectangle {
+                        visible: false;
                         // 尺寸全由常量给(见 root.spec_cell_w 的注释): 网格不随列宽伸缩, 换来的是
                         // "光标读数不依赖布局" —— 否则必然撞上 binding loop。
                         min-width: 64 * root.spec_cell_w + 2px;
                         max-width: 64 * root.spec_cell_w + 2px;
-                        height: 7 * 15px;
+                        height: 0px;
                         background: #12181d;
                         border-width: 1px;
                         border-color: #29323a;
@@ -1036,9 +1162,10 @@ export component CurvesPage inherits Rectangle {
                         }
                         heat_ta := TouchArea { mouse-cursor: crosshair; }
                     }
-                    // 光标处那一格的读数。★索引由光标位置算出★: 448 个格子各挂一个 TouchArea 会把
-                    // 一次悬浮变成 448 次命中测试, 这里只用一个。
+                    // 频谱详情已移至左侧大绘图区，右列只保留扫描控制。
                     Text {
+                        visible: false;
+                        height: 0px;
                         property <int> hg: Math.clamp(Math.floor(heat_ta.mouse-y / 15px), 0, 6);
                         property <int> hd: Math.clamp(Math.floor(heat_ta.mouse-x / root.spec_cell_w), 0, 63);
                         property <int> hi: self.hg * 64 + self.hd;

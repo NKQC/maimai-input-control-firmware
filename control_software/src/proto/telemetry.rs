@@ -676,6 +676,258 @@ pub fn encode_telem_start(mode: u8, rate_hz: u16, fields: u8, ch_mask: u64) -> V
     payload
 }
 
+/// 编码 FOCUS_START 请求载荷(单通道独占流)。
+/// payload = ch(u8) + fields(u8) + rate_hz(u16 LE) + lease_ms(u16 LE)
+///
+/// ★长度必须恰好 6 字节★ 固件 `_handle_focus_start` 判的是 `frame.len != 6` → 多一字节即 NAK。
+/// rate_hz 由设备 clamp 到 1..1000 并在响应里回显实际受理值(可能不等于请求值)。
+pub fn encode_focus_start(ch: u8, fields: u8, rate_hz: u16, lease_ms: u16) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(6);
+    payload.push(ch);
+    payload.push(fields);
+    payload.extend_from_slice(&rate_hz.to_le_bytes());
+    payload.extend_from_slice(&lease_ms.to_le_bytes());
+    payload
+}
+
+/// 编码 FOCUS_STOP 请求载荷。payload = session(u16 LE)
+/// 设备只接受**当前**会话号(不匹配即 NAK), 因此这里必须带上 START 响应回的 session。
+pub fn encode_focus_stop(session: u16) -> Vec<u8> {
+    session.to_le_bytes().to_vec()
+}
+
+/// 解码 FOCUS_START 响应载荷 → (session, accepted_rate_hz)。
+/// payload = session(u16 LE) + accepted_rate_hz(u16 LE)
+pub fn decode_focus_start(payload: &[u8]) -> Result<(u16, u16), String> {
+    if payload.len() < 4 {
+        return Err("FOCUS_START response too short (need >= 4 bytes)".to_string());
+    }
+    Ok((
+        u16::from_le_bytes([payload[0], payload[1]]),
+        u16::from_le_bytes([payload[2], payload[3]]),
+    ))
+}
+
+/// 编码 SWEEP_START 请求载荷(增益/分频扫描会话)。payload = ch(u8) + settle_samples(u8) + sample_count(u8)
+///
+/// ★长度必须恰好 3 字节★ 固件 `_handle_sweep_start` 判的是 `frame.len != 3` → 多一字节即 NAK。
+/// 两个采样参数由设备 clamp 到 0..64 / 1..64; 原 gain/div 由**设备**回读并在会话结束时写回。
+pub fn encode_sweep_start(ch: u8, settle_samples: u8, sample_count: u8) -> Vec<u8> {
+    vec![ch, settle_samples, sample_count]
+}
+
+/// 解码 SWEEP_START 响应载荷 → (session, total_cells)。payload = session(u16 LE) + total(u16 LE)
+pub fn decode_sweep_start(payload: &[u8]) -> Result<(u16, u16), String> {
+    if payload.len() < 4 {
+        return Err("SWEEP_START response too short (need >= 4 bytes)".to_string());
+    }
+    Ok((
+        u16::from_le_bytes([payload[0], payload[1]]),
+        u16::from_le_bytes([payload[2], payload[3]]),
+    ))
+}
+
+/// 编码 SWEEP_CTRL 取消。payload = [op=0, session u16 LE]
+/// ★取消只是"请求恢复"★ 设备仍要走完写回 + 校准 + 基线才报终态, 不会立即结束会话。
+pub fn encode_sweep_cancel(session: u16) -> Vec<u8> {
+    let s = session.to_le_bytes();
+    vec![0u8, s[0], s[1]]
+}
+
+/// 编码 SWEEP_CTRL 续租。payload = [op=2, session u16 LE]
+/// 448 格会话一定长于设备 8s 租约，上位机需固定周期显式续租，不能依赖碰巧发生的其它命令。
+pub fn encode_sweep_keepalive(session: u16) -> Vec<u8> {
+    let s = session.to_le_bytes();
+    vec![2u8, s[0], s[1]]
+}
+
+/// 编码 SWEEP_CTRL 补发。payload = [op=1, session u16 LE, first u16 LE, count u8]
+/// 设备只补发**已缓存**的格(`first < produced`), 越界即 NAK; 实际区间被截到 produced 为止。
+pub fn encode_sweep_resend(session: u16, first: u16, count: u8) -> Vec<u8> {
+    let s = session.to_le_bytes();
+    let f = first.to_le_bytes();
+    vec![1u8, s[0], s[1], f[0], f[1], count]
+}
+
+/// SWEEP_DATA 结果位(低 4 位属该格采样)。
+pub const SWEEP_FLAG_RAILED: u8 = 0x01;
+/// 该格全部样本完全不抖动 —— 固件判为扫描停滞, 不是"噪声为零"。
+pub const SWEEP_FLAG_STALLED: u8 = 0x02;
+/// 该格改参数后的单通道校准失败。
+pub const SWEEP_FLAG_CAL_FAIL: u8 = 0x04;
+/// 设备回读的 gain/div != 该格期望值(PSoC 侧钳位/拒绝)。
+pub const SWEEP_FLAG_MISMATCH: u8 = 0x08;
+/// 恢复阶段异常位(高 4 位, 只出现在 RESTORING/终态帧): 写回原参数失败。
+pub const SWEEP_RESTORE_FLAG_PARAM: u8 = 0x10;
+/// 恢复阶段: 写回后的重新校准失败。
+pub const SWEEP_RESTORE_FLAG_CAL: u8 = 0x20;
+/// 恢复阶段: 基线复位失败。
+pub const SWEEP_RESTORE_FLAG_BSLN: u8 = 0x40;
+/// 该帧是 SWEEP_CTRL 补发的重传。
+pub const SWEEP_FLAG_RETRANSMIT: u8 = 0x80;
+/// 非结果帧(RESTORING / 终态)的格号占位。
+pub const SWEEP_INDEX_NONE: u16 = 0xFFFF;
+/// SWEEP_DATA 载荷的**兼容下限**(旧固件只发这么长)。
+const SWEEP_DATA_LEN: usize = 21;
+
+/// 设备侧扫描状态机的阶段码(固件 `SensorLink::SweepPhase` 的枚举值, 逐位同源)。
+///
+/// ★为什么要把它搬到上位机★ 只有 flags 时, "这一格没结果"说不出到底卡在哪一步 —— 参数写不进、
+/// 回读不符、校准被 PSoC 拒、快照代次不推进, 四种处置完全不同。阶段码上报后, 任何未知故障都能
+/// 直接落到状态机的具体一步。改固件枚举必须同改这里。
+pub fn sweep_phase_text(phase: u8) -> &'static str {
+    match phase {
+        0 => "空闲",
+        1 => "写入本格增益档/分频",
+        2 => "等待参数写入完成",
+        3 => "回读设备真值",
+        4 => "应用参数",
+        5 => "等待应用完成",
+        6 => "等待基线/滤波稳定",
+        7 => "采样",
+        8 => "恢复: 写回原参数",
+        9 => "恢复: 等待写回完成",
+        10 => "恢复: 回读原参数",
+        11 => "恢复: 发起校准",
+        12 => "恢复: 等待校准完成",
+        13 => "恢复: 发起基线复位",
+        14 => "恢复: 等待基线复位完成",
+        15 => "终态",
+        16 => "恢复: 应用原参数",
+        17 => "恢复: 等待应用完成",
+        _ => "未知阶段",
+    }
+}
+
+/// SWEEP_DATA 帧的会话状态(固件 `SweepDataState`)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SweepState {
+    /// 一格结果(index 有效)。
+    Cell,
+    /// 已进入恢复链: 正在写回原 gain/div 并重新校准 + 复位基线。
+    Restoring,
+    /// 448 格扫完并恢复完毕。
+    Done,
+    /// 用户取消(或上位机丢失导致租约到期)后恢复完毕。
+    Cancelled,
+    /// 设备侧某阶段失败后恢复完毕。
+    Failed,
+}
+
+impl SweepState {
+    fn _from_u8(v: u8) -> Option<Self> {
+        match v {
+            1 => Some(SweepState::Cell),
+            2 => Some(SweepState::Restoring),
+            3 => Some(SweepState::Done),
+            4 => Some(SweepState::Cancelled),
+            5 => Some(SweepState::Failed),
+            _ => None,
+        }
+    }
+
+    /// 是否为会话终态(此后设备侧会话已清, 不再接受 SWEEP_CTRL)。
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            SweepState::Done | SweepState::Cancelled | SweepState::Failed
+        )
+    }
+
+    pub fn text(self) -> &'static str {
+        match self {
+            SweepState::Cell => "扫描中",
+            SweepState::Restoring => "正在恢复原始增益档/分频",
+            SweepState::Done => "已完成",
+            SweepState::Cancelled => "已取消",
+            SweepState::Failed => "设备侧失败",
+        }
+    }
+}
+
+/// SWEEP_DATA(0x38) 定长 21B 帧。
+///
+/// `[session u16][state u8][ch u8][index u16][total u16][produced u16][flags u8][gain u8][div u8]`
+/// `[samples u16][mean u16][std_q8 u16][pp u16]`
+///
+/// ★gain/div 是设备回读的实际生效值★ 与 `index` 推出的期望值不一致时 flags 会带 MISMATCH,
+/// 上位机据此把该格标为无效, 而不是让热图那一格标着一个设备并未生效的坐标。
+#[derive(Debug, Clone, Copy)]
+pub struct SweepFrame {
+    pub session: u16,
+    pub state: SweepState,
+    pub ch: u8,
+    /// 格号 = gain * 64 + (div - 1); 非结果帧为 `SWEEP_INDEX_NONE`。
+    pub index: u16,
+    pub total: u16,
+    /// 设备已产出的格数(缺口检测的上界: 只有 `index < produced` 的格才可补发)。
+    pub produced: u16,
+    pub flags: u8,
+    pub gain: u8,
+    pub div: u8,
+    pub samples: u16,
+    pub mean: u16,
+    /// RAW 标准差的 Q8 定点值(整数部分 << 8 + 小数)。
+    pub std_q8: u16,
+    pub pp: u16,
+    /// 结果帧: 该格卡住的阶段; 非结果帧: 本会话首个失败阶段。0 = 无故障。
+    /// `None` = 旧固件(载荷只有 21 字节)没这一项。
+    pub fail_phase: Option<u8>,
+    /// 发帧当刻的会话阶段(见 [`sweep_phase_text`])。
+    pub phase: Option<u8>,
+}
+
+impl SweepFrame {
+    /// 是否携带有效格结果。
+    pub fn is_cell(&self) -> bool {
+        self.state == SweepState::Cell && self.index < self.total
+    }
+
+    /// RAW 标准差真值(Q8 → f32)。
+    pub fn std(&self) -> f32 {
+        self.std_q8 as f32 / 256.0
+    }
+
+    /// 故障阶段的可读描述; 无故障或旧固件未上报时为 None。
+    pub fn fail_phase_text(&self) -> Option<&'static str> {
+        match self.fail_phase {
+            Some(phase) if phase != 0 => Some(sweep_phase_text(phase)),
+            _ => None,
+        }
+    }
+}
+
+/// 解码 SWEEP_DATA 推送载荷(定长 21B)。
+pub fn decode_sweep_data(payload: &[u8]) -> Result<SweepFrame, String> {
+    if payload.len() < SWEEP_DATA_LEN {
+        return Err(format!(
+            "SWEEP_DATA payload too short (need >= {} bytes, got {})",
+            SWEEP_DATA_LEN,
+            payload.len()
+        ));
+    }
+    let state = SweepState::_from_u8(payload[2])
+        .ok_or_else(|| format!("SWEEP_DATA unknown state {}", payload[2]))?;
+    Ok(SweepFrame {
+        session: u16::from_le_bytes([payload[0], payload[1]]),
+        state,
+        ch: payload[3],
+        index: u16::from_le_bytes([payload[4], payload[5]]),
+        total: u16::from_le_bytes([payload[6], payload[7]]),
+        produced: u16::from_le_bytes([payload[8], payload[9]]),
+        flags: payload[10],
+        gain: payload[11],
+        div: payload[12],
+        samples: u16::from_le_bytes([payload[13], payload[14]]),
+        mean: u16::from_le_bytes([payload[15], payload[16]]),
+        std_q8: u16::from_le_bytes([payload[17], payload[18]]),
+        pp: u16::from_le_bytes([payload[19], payload[20]]),
+        // 尾部追加项: 旧固件没有, 缺失即 None(不当作 0 —— 0 的语义是"无故障", 与"没上报"不同)。
+        fail_phase: payload.get(21).copied(),
+        phase: payload.get(22).copied(),
+    })
+}
+
 /// 编码 PARAM_GET 请求载荷
 /// payload = channel(u8) + param_id(u8)
 pub fn encode_param_get(channel: u8, param_id: u8) -> Vec<u8> {
@@ -897,6 +1149,130 @@ pub fn decode_telem_data(payload: &[u8]) -> Result<TelemFrame, String> {
         lat_proc_us,
         lat_usb_us,
         samples,
+    })
+}
+
+/// FOCUS_DATA(0x35) 单通道帧。
+///
+/// ★不引入第二套数据模型★ 采样体沿用 `TelemFrame`/`ChannelSample`(`samples` 恒为 1 项),
+/// 于是上位机侧 FOCUS_DATA 与 TELEM_DATA 共用同一条入库路径与同一个绘图缓冲;
+/// 会话标识(session/sample_seq/generation)是 focus 独有的那三项, 只用于归属判定与缺口统计。
+#[derive(Debug, Clone)]
+pub struct FocusFrame {
+    /// 设备回的会话号: 与主机当前会话不一致 = 旧会话残帧, 必须立即丢弃。
+    pub session: u16,
+    /// 会话内单调递增的样本序号(设备背压丢帧时仍递增) → 缺口即真实丢帧数。
+    pub sample_seq: u16,
+    /// 该样本所属的 PSoC 快照代数(设备只在代数推进时才发帧)。
+    pub generation: u16,
+    pub frame: TelemFrame,
+}
+
+/// 解码 FOCUS_DATA 推送载荷。
+/// payload = session(u16 LE) + sample_seq(u16 LE) + generation(u16 LE) + ch(u8) + fields(u8)
+///         + t_us(u32 LE) + 按 fields 顺序: (raw u16LE)? (bsln u16LE)? (diff i16LE)? (status u8)?
+///         + (STATS: samples_per_sec u32LE + scan_period_us u32LE)? + (LATENCY: spi/proc/usb u16LE)?
+///
+/// ★字段次序与 TELEM_DATA 不同★ 这里 STATS/LATENCY 在**单通道字段之后**(固件 `focus_tick` 的
+/// 组帧顺序), 而 TELEM_DATA 是帧级前置。照 TELEM_DATA 的次序解会把统计值错位成采样值。
+pub fn decode_focus_data(payload: &[u8]) -> Result<FocusFrame, String> {
+    if payload.len() < 12 {
+        return Err("FOCUS_DATA payload too short (need >= 12 bytes)".to_string());
+    }
+    let session = u16::from_le_bytes([payload[0], payload[1]]);
+    let sample_seq = u16::from_le_bytes([payload[2], payload[3]]);
+    let generation = u16::from_le_bytes([payload[4], payload[5]]);
+    let ch = payload[6];
+    let fields = payload[7];
+    let t_us = u32::from_le_bytes([payload[8], payload[9], payload[10], payload[11]]);
+    let mut pos = 12usize;
+
+    let mut sample = ChannelSample {
+        ch,
+        t_us,
+        raw: None,
+        bsln: None,
+        diff: None,
+        status: None,
+    };
+    if (fields & FIELD_RAW) != 0 {
+        if pos + 2 > payload.len() {
+            return Err("FOCUS_DATA truncated at RAW field".to_string());
+        }
+        sample.raw = Some(u16::from_le_bytes([payload[pos], payload[pos + 1]]));
+        pos += 2;
+    }
+    if (fields & FIELD_BASELINE) != 0 {
+        if pos + 2 > payload.len() {
+            return Err("FOCUS_DATA truncated at BASELINE field".to_string());
+        }
+        sample.bsln = Some(u16::from_le_bytes([payload[pos], payload[pos + 1]]));
+        pos += 2;
+    }
+    if (fields & FIELD_DIFF) != 0 {
+        if pos + 2 > payload.len() {
+            return Err("FOCUS_DATA truncated at DIFF field".to_string());
+        }
+        sample.diff = Some(i16::from_le_bytes([payload[pos], payload[pos + 1]]));
+        pos += 2;
+    }
+    if (fields & FIELD_STATUS) != 0 {
+        if pos >= payload.len() {
+            return Err("FOCUS_DATA truncated at STATUS field".to_string());
+        }
+        sample.status = Some(payload[pos]);
+        pos += 1;
+    }
+
+    let (samples_per_sec, scan_period_us) = if (fields & FIELD_STATS) != 0 {
+        if pos + 8 > payload.len() {
+            return Err("FOCUS_DATA truncated at STATS block".to_string());
+        }
+        let sps = u32::from_le_bytes([
+            payload[pos],
+            payload[pos + 1],
+            payload[pos + 2],
+            payload[pos + 3],
+        ]);
+        let spu = u32::from_le_bytes([
+            payload[pos + 4],
+            payload[pos + 5],
+            payload[pos + 6],
+            payload[pos + 7],
+        ]);
+        pos += 8;
+        (sps, spu)
+    } else {
+        (0u32, 0u32)
+    };
+
+    let (lat_spi_us, lat_proc_us, lat_usb_us) = if (fields & FIELD_LATENCY) != 0 {
+        if pos + 6 > payload.len() {
+            return Err("FOCUS_DATA truncated at LATENCY block".to_string());
+        }
+        (
+            u16::from_le_bytes([payload[pos], payload[pos + 1]]),
+            u16::from_le_bytes([payload[pos + 2], payload[pos + 3]]),
+            u16::from_le_bytes([payload[pos + 4], payload[pos + 5]]),
+        )
+    } else {
+        (0u16, 0u16, 0u16)
+    };
+
+    Ok(FocusFrame {
+        session,
+        sample_seq,
+        generation,
+        frame: TelemFrame {
+            ts_us: t_us,
+            fields,
+            samples_per_sec,
+            scan_period_us,
+            lat_spi_us,
+            lat_proc_us,
+            lat_usb_us,
+            samples: vec![sample],
+        },
     })
 }
 

@@ -66,6 +66,27 @@ struct UsbDebugCounters {
     // 单份存储的语义"坏只坏在那一区"必须**看得见** —— 上一轮 gen_inconsistent 无人调用、无人上报,
     // 等于那条链是断的, 区失效只能靠猜。★只能追加在末尾★: 前面任何插入都会整体挪偏移。
     uint8_t  nv_valid_mask;
+    // ★只能追加在末尾★(前面任何插入都会整体挪偏移, 旧上位机随即错位解析)。
+    // 上次 hardfault 发生在哪个核: 0=core0, 1=core1, 0xFF=上次不是 hardfault。
+    // 没有这一位时, 死前遗言的 stage 会因两核共写 scratch[1] 而指向错误的核。
+    uint8_t  last_boot_fault_core;
+    // 当前 core1 阶段码(CrashStage, core1 唯一写者, 见 core1_stage_set)。不跨复位保留。
+    uint8_t  core1_stage;
+    // ★只能追加在末尾★(前面任何插入都会整体挪偏移, 旧上位机随即错位解析)。
+    // ★响应编码失败取证★: dispatch 返回 resp_len==0 意味着 HostCmdCodec::encode_* 拒绝组帧
+    // (max_len 装不下, 见 _encode_into), USB 层随即不入队 ⇒ 主机侧表现为"命令发出去了但永远等不到
+    // 响应/回读为空", 而设备侧此前完全静默, 只能靠对着协议逐条猜。所有已注册 handler 都必然赋值
+    // resp_len, 遥测/自持恢复推送走各自的 _tx_buf 而不经 dispatch ⇒ 这里计数不会被正常无响应路径污染。
+    uint32_t resp_encode_fail;      // 累计失败次数(封顶不回绕, 见 usb_comm.cpp 的 _note_resp_encode_fail)
+    uint8_t  resp_fail_cmd;         // 最近一次失败的请求 cmd 码
+    uint8_t  _resp_fail_pad;
+    uint16_t resp_fail_req_len;     // 最近一次失败的请求 payload 长度
+    // 主机命令分发观测：仅追加，保持前面已有字段偏移不变。
+    uint32_t host_dispatch_count;             // HostCmdDispatcher::dispatch 累计次数
+    uint32_t host_algo_info_dispatch_count;   // ALGO_GET_INFO 分发累计次数
+    uint8_t  host_last_dispatch_cmd;          // 最近一次分发的 HostCmd 命令码
+    uint8_t  host_last_dispatch_seq;          // 最近一次分发的帧序号
+    uint16_t host_last_dispatch_resp_len;     // 最近一次分发返回的响应长度
 };
 
 // EP0 DEBUG_READ 固定尾部：P0..P7 的 GPIO drive mode(PC) 与 HSIOM PORT_SEL 快照。
@@ -112,7 +133,15 @@ enum CrashStage : uint8_t {
 /// 对"是否接近 5s"这个问题完全够用。
 #define CRASH_SCRATCH_PM     3
 #define CRASH_RUN_MAGIC      0x4D32524Eu   /// "M2RN"
-#define CRASH_FAULT_MAGIC    0x46554C54u   /// "FULT"
+/// hardfault 标记。★低字节留给"哪个核出错"★: 同一个 fault 处理程序被两个核共用, 只留一个
+/// magic 就永远答不出"是谁跑飞了" —— 而这正是本轮排查最先需要的那一位信息。
+/// 高 24 位固定 "FUL", 低 8 位 = get_core_num()。判定 fault 时只比高 24 位, 故与旧值兼容。
+#define CRASH_FAULT_MAGIC    0x46554C54u   /// "FULT" = 高24位 0x46554C + core 0
+#define CRASH_FAULT_MASK     0xFFFFFF00u
+#define CRASH_FAULT_TAG      0x46554C00u   /// "FUL" << 8
+static inline uint32_t crash_fault_word(uint32_t core) {
+    return CRASH_FAULT_TAG | (core & 0xFFu);
+}
 /// 主循环分段阶段码 = 本基址 + LoopSeg。原有 CrashStage 只覆盖若干重操作, 其余整轮都报 0(=NONE),
 /// 于是"死在 loop 的哪一段"完全看不出来 —— 实测一次复位就报 stage=0, 等于没信息。
 #define CRASH_STAGE_LOOP_BASE 0x10u
@@ -136,6 +165,17 @@ enum CrashStage : uint8_t {
 
 static inline void crash_stage_set(uint8_t stage) {
     watchdog_hw->scratch[CRASH_SCRATCH_STAGE] = stage;
+}
+
+/// ★core1 专用阶段码, 绝不碰 scratch[CRASH_SCRATCH_STAGE]★
+/// scratch[1] 只有一个, 原先两个核都往里写, 且 core1 写完 CORE1_CMD 后从不复位它 ⇒
+/// core0 崩溃后 core1 仍在跑 1ms 周期, 会把自己的 7 盖到 core0 的真实阶段上, 于是
+/// "死前遗言"恒指向 CORE1_CMD, 把排查引到错误的核上(本轮已被骗一次)。
+/// 现在 core1 只写 RAM 里的自有字段: scratch[1] 恒为 core0 真相, core1 的阶段仍可经
+/// DEBUG_READ 观察(仅不跨复位保留 —— 跨复位那一格已被 core0 的判据占满, 见 scratch 分配注释)。
+extern volatile uint8_t g_core1_stage;
+static inline void core1_stage_set(uint8_t stage) {
+    g_core1_stage = stage;
 }
 
 /// 每轮主循环调用: 标记"正在运行"。看门狗/fault 复位会保留 scratch[0..3], 于是复位后仍能读到它。

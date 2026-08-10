@@ -18,8 +18,11 @@
 use std::collections::VecDeque;
 
 use super::AppController;
-use crate::proto::{ChannelSample, IDAC_GAIN_BY_CURRENT, IDAC_GAIN_PA};
-use crate::proto::{PARAM_IDAC_GAIN, PARAM_RESOLUTION, PARAM_SNS_CLK_DIV};
+use crate::proto::{
+    ChannelSample, IDAC_GAIN_BY_CURRENT, IDAC_GAIN_PA, SWEEP_FLAG_CAL_FAIL, SWEEP_FLAG_MISMATCH,
+    SWEEP_FLAG_RAILED, SWEEP_FLAG_STALLED, SweepFrame, SweepState,
+};
+use crate::proto::{PARAM_IDAC_GAIN, PARAM_SNS_CLK_DIV};
 
 /// 面板通道数(与固件 `SENSOR_CHANNEL_COUNT` 一致)。
 const CH_COUNT: usize = 36;
@@ -297,6 +300,14 @@ pub struct NoiseCell {
     pub mean: f32,
     /// 实际用于统计的样本数。
     pub samples: u16,
+    /// 设备上报的本格诊断位(含 CAL_FAIL/MISMATCH/STALLED/RAILED)。
+    pub flags: u8,
+    /// 设备回读的实际生效 IDAC 增益档。
+    pub gain: u8,
+    /// 设备回读的实际生效传感时钟分频。
+    pub div: u8,
+    /// 设备上报的本格故障阶段；旧固件未上报时为 None。
+    pub fail_phase: Option<u8>,
     /// true = 本格已测且样本足够。
     pub valid: bool,
     /// true = 该点 RAW 撞到满量程或贴底 ⇒ diff 失效, 其"噪声低"没有意义, UI 必须区别标注。
@@ -453,36 +464,47 @@ fn _rail_margin(full_scale: f32) -> f32 {
     (full_scale * 0.01).ceil().max(1.0)
 }
 
+/// 启动响应仍在途时的归属键。代次使切换/断连后迟到响应不能安装旧会话。
+#[derive(Debug, Clone, Copy)]
+struct SweepPending {
+    seq: u8,
+    generation: u16,
+}
+
 /// 单通道响应噪声频谱扫描状态。
+///
+/// 设备会话承担逐格改参、校准、采样与恢复；主机只持有会话归属、结果位图和有界补发状态。
 #[derive(Debug)]
 pub struct NoiseSweep {
     active: bool,
     ch: u8,
-    /// 当前格: gain 索引 0..6, 分频 1..64。
+    generation: u16,
+    pending: Option<SweepPending>,
+    session: Option<u16>,
+    total: u16,
+    produced: u16,
+    received: Vec<bool>,
+    resend_tries: Vec<u8>,
+    control_seqs: Vec<u8>,
+    /// 扫描会话结束后仍可能迟到的控制 seq；仅用于静默已知过期控制 NAK。
+    expired_control_seqs: Vec<u8>,
+    /// 最近一次成功排入 SWEEP keepalive 的时刻；设备租约 8s，主机固定每 2s 续一次。
+    keepalive_at: Option<std::time::Instant>,
+    cancel: bool,
+    /// 当前格字段仅保留给旧结果访问口径；设备会话不再以它们推进扫描。
     gain: u8,
     div: u16,
-    /// 扫描开始前从设备确认的 PARAM_RESOLUTION(6..16)，整个扫描固定使用。
     resolution: u8,
-    /// 该分辨率的满量程 `(1 << resolution) - 1`，用于本次所有 rail 判定。
     full_scale: f32,
-    /// 最近一份热图不可变归属的通道；UI 只在选择同一通道时发布 cells。
     result_ch: Option<u8>,
     saved_gain: Option<u32>,
     saved_div: Option<u32>,
     phase: SweepPhase,
     phase_ticks: u32,
-    /// 配置确认状态机。见 [`SweepApply`]。★Configure 与 Restore 共用这一份★ 两个阶段互不重叠
-    /// (本格确认收敛后才 settle/sample; 还原只在扫完/取消后进入), 共用即杜绝两套确认语义漂移。
     ap: SweepApply,
-    /// 本格已采到的 RAW 样本。
     samples: Vec<u16>,
-    /// 已消费到的最新样本设备时间戳(避免同一个样本被重复计入)。
     last_t_us: Option<u32>,
     cells: Vec<NoiseCell>,
-    /// 用户请求取消: 下一拍进入 Restore。
-    cancel: bool,
-    /// true = 此刻这条 CSD 下发是扫描自己发出的。★只是调用来源标记, 不是状态★
-    /// 互斥守卫据此放行扫描自身的写 gain/div 与单通道校准, 否则扫描会把自己挡在门外。
     own_tx: bool,
     status: String,
     version: u64,
@@ -493,6 +515,17 @@ impl Default for NoiseSweep {
         Self {
             active: false,
             ch: 0,
+            generation: 0,
+            pending: None,
+            session: None,
+            total: SWEEP_CELLS as u16,
+            produced: 0,
+            received: vec![false; SWEEP_CELLS],
+            resend_tries: vec![0; SWEEP_CELLS],
+            control_seqs: Vec::new(),
+            expired_control_seqs: Vec::new(),
+            keepalive_at: None,
+            cancel: false,
             gain: 0,
             div: 1,
             resolution: 0,
@@ -506,7 +539,6 @@ impl Default for NoiseSweep {
             samples: Vec::new(),
             last_t_us: None,
             cells: vec![NoiseCell::default(); SWEEP_CELLS],
-            cancel: false,
             own_tx: false,
             status: String::new(),
             version: 0,
@@ -515,13 +547,16 @@ impl Default for NoiseSweep {
 }
 
 impl NoiseSweep {
-    /// 当前格在 `cells` 里的下标。
     fn _idx(gain: u8, div: u16) -> usize {
         (gain as usize) * SWEEP_DIVS + (div as usize - 1)
     }
-    /// 已完成格数(含标为无效的格: 它们也走完了整套流程)。
+
     fn _done(&self) -> usize {
-        (self.gain as usize) * SWEEP_DIVS + (self.div as usize - 1)
+        self.received.iter().filter(|received| **received).count()
+    }
+
+    fn _expected_total(&self) -> usize {
+        usize::from(self.total).min(SWEEP_CELLS)
     }
 }
 
@@ -1075,6 +1110,10 @@ impl AppController {
     pub fn noise_sweep_channel(&self) -> u8 {
         self.noise_sweep.ch
     }
+    /// 设备会话已产出的结果格数；与主机收到/有效格数分开，供无头验收区分设备生产与链路交付。
+    pub fn noise_sweep_produced(&self) -> u16 {
+        self.noise_sweep.produced
+    }
     /// 热图的不可变扫描通道。空值表示从未启动过扫描，调用方不得显示任何遗留格子。
     pub fn noise_sweep_result_channel(&self) -> Option<u8> {
         self.noise_sweep.result_ch
@@ -1144,8 +1183,6 @@ impl AppController {
         if self.noise_sweep.active {
             return Ok(());
         }
-        // 频谱扫描要逐格改该通道的 gain/div 并重校准取样 —— 那必然要连接电极扫描,
-        // 与"禁用 ⇒ 电极保持高阻"直接冲突; 且禁用通道的 raw 恒为 0, 测出来只会是一片假的零噪声。
         if !self.ch_enabled(ch) {
             return Err(anyhow::anyhow!(
                 "CH{} 已禁用(电极保持高阻, 不参与扫描), 无法测响应噪声频谱; 请先启用该通道",
@@ -1158,57 +1195,33 @@ impl AppController {
                 self.ch_batch.kind.map(|k| k.label()).unwrap_or("批量操作")
             ));
         }
-        if !self.telem_active || self.telem_scope_channels != Some(true) {
-            return Err(anyhow::anyhow!(
-                "频谱扫描要靠逐通道 RAW 遥测取样, 但当前不在逐通道档(请留在本页并确保遥测在推流)"
-            ));
-        }
-        // 扫描量程必须冻结为设备确认的 PARAM_RESOLUTION；缺失或越界时拒绝，不能拿 12 位常量猜。
-        let resolution = self.params[ch as usize]
-            .get(&PARAM_RESOLUTION)
-            .copied()
-            .filter(|v| (6..=16).contains(v))
-            .ok_or_else(|| anyhow::anyhow!(
-                "尚未回读到 CH{} 的设备确认分辨率(PARAM_RESOLUTION=0x07)，无法确定 RAW 满量程，故不开始扫描",
-                ch
-            ))? as u8;
-        let full_scale = ((1u32 << resolution) - 1) as f32;
-        let saved_gain = self.params[ch as usize].get(&PARAM_IDAC_GAIN).copied();
-        let saved_div = self.params[ch as usize].get(&PARAM_SNS_CLK_DIV).copied();
-        if saved_gain.is_none() || saved_div.is_none() {
-            return Err(anyhow::anyhow!(
-                "尚未回读到 CH{} 的 IDAC 增益档/传感时钟分频原值 —— 拿不到原值就没法保证扫完还原, 故不开始",
-                ch
-            ));
-        }
+        let generation = self.noise_sweep.generation.wrapping_add(1);
+        let expired_control_seqs = self.noise_sweep.expired_control_seqs.clone();
+        let seq = self.next_seq();
+        let frame = crate::proto::Frame::new(
+            crate::proto::HostCmd::SweepStart as u8,
+            0,
+            seq,
+            crate::proto::encode_sweep_start(ch, 8, 32),
+        );
+        self.io
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("未连接, 无法扫描频谱"))?
+            .send(frame)?;
         self.noise_sweep = NoiseSweep {
             active: true,
             ch,
-            gain: 0,
-            div: 1,
-            resolution,
-            full_scale,
+            generation,
+            pending: Some(SweepPending { seq, generation }),
+            expired_control_seqs,
             result_ch: Some(ch),
-            saved_gain,
-            saved_div,
-            phase: SweepPhase::Configure,
-            phase_ticks: 0,
-            ap: SweepApply::default(),
-            samples: Vec::new(),
-            last_t_us: None,
-            cells: vec![NoiseCell::default(); SWEEP_CELLS],
-            cancel: false,
-            own_tx: false,
-            status: format!("CH{} 频谱扫描: 0/{}", ch, SWEEP_CELLS),
+            status: format!("CH{} 频谱扫描: 已请求设备会话，等待响应…", ch),
             version: self.noise_sweep.version.wrapping_add(1),
+            ..NoiseSweep::default()
         };
         self.push_log(format!(
-            "CH{} 响应噪声频谱扫描开始: 增益档 0..6 × 分频 1..64 共 {} 点, 逐点单通道校准后采 RAW。\
-             原值(增益档 {}, 分频 {})将在结束/取消/出错时还原。",
-            ch,
-            SWEEP_CELLS,
-            saved_gain.unwrap_or(0),
-            saved_div.unwrap_or(0)
+            "CH{} 响应噪声频谱扫描已请求设备会话(seq={}): 设备负责 448 格改参、校准、采样与恢复。",
+            ch, seq
         ));
         Ok(())
     }
@@ -1226,42 +1239,393 @@ impl AppController {
         out
     }
 
-    /// 取消扫描: 进入还原阶段(绝不半途丢下被改过的 gain/div)。
+    /// 取消扫描: 会话已建立则请求设备恢复；启动响应尚未到达时，响应归属后立即补发取消。
     pub fn noise_sweep_cancel(&mut self) {
-        if !self.noise_sweep.active || self.noise_sweep.phase == SweepPhase::Restore {
+        if !self.noise_sweep.active || self.noise_sweep.cancel {
             return;
         }
         self.noise_sweep.cancel = true;
-        self._sweep_enter_restore();
         self.noise_sweep.status = format!(
-            "CH{} 频谱扫描: 正在取消并还原原始增益档/分频…",
+            "CH{} 频谱扫描: 已请求取消，等待设备恢复原始增益档/分频…",
             self.noise_sweep.ch
         );
         self.noise_sweep.version = self.noise_sweep.version.wrapping_add(1);
+        if let Some(session) = self.noise_sweep.session {
+            self._sweep_send_cancel(session);
+        }
         self.push_log(self.noise_sweep.status.clone());
     }
 
-    /// 频谱扫描的每 tick 推进。由 `csd_diag_tick()` 调用。
+    /// 设备会话不再由 host 逐格推进；host 只负责显式续租与补发控制。
     pub(super) fn _pump_noise_sweep(&mut self) {
         if !self.noise_sweep.active {
             return;
         }
-        // 链路掉了: 没法还原也没法采样, 如实报告并放弃(参数留在设备上, 由用户重连后再校准)。
         if self.io.is_none() {
-            self.noise_sweep.active = false;
-            self.noise_sweep.status = format!(
-                "CH{} 频谱扫描: 连接已断开, 已中止 —— 增益档/分频可能停在扫描中的值, 请重连后点\"校准\"或重新扫描以还原。",
-                self.noise_sweep.ch
-            );
-            self.push_log_warn(self.noise_sweep.status.clone());
-            self.noise_sweep.version = self.noise_sweep.version.wrapping_add(1);
+            self._sweep_device_disconnected();
             return;
         }
-        match self.noise_sweep.phase {
-            SweepPhase::Configure => self._sweep_configure(),
-            SweepPhase::Settle => self._sweep_settle(),
-            SweepPhase::Sample => self._sweep_sample(),
-            SweepPhase::Restore => self._sweep_restore(),
+        let Some(session) = self.noise_sweep.session else {
+            return;
+        };
+        let due = self
+            .noise_sweep
+            .keepalive_at
+            .is_none_or(|at| at.elapsed() >= std::time::Duration::from_secs(2));
+        if !due {
+            return;
+        }
+        let seq = self.next_seq();
+        let sent = self.io.as_ref().is_some_and(|handle| {
+            handle
+                .send(crate::proto::Frame::new(
+                    crate::proto::HostCmd::SweepCtrl as u8,
+                    0,
+                    seq,
+                    crate::proto::encode_sweep_keepalive(session),
+                ))
+                .is_ok()
+        });
+        if sent {
+            self.noise_sweep.keepalive_at = Some(std::time::Instant::now());
+            self.noise_sweep.control_seqs.push(seq);
+        } else {
+            // 不推进时间戳：下一拍立即重试；真正断链由 IO 状态统一收敛。
+            self.push_log_warn(format!("CH{} 频谱扫描续租下发失败", self.noise_sweep.ch));
+        }
+    }
+
+    /// SWEEP_START 的响应只接受当前 host generation 的 pending seq，迟到会话立即取消。
+    pub(super) fn _handle_sweep_start_response(&mut self, frame: &crate::proto::Frame) {
+        let (session, total) = match crate::proto::decode_sweep_start(&frame.payload) {
+            Ok(value) => value,
+            Err(error) => {
+                self.push_log_warn(format!("SWEEP_START 响应解析失败: {}", error));
+                return;
+            }
+        };
+        let current = self.noise_sweep.active
+            && self.noise_sweep.pending.is_some_and(|pending| {
+                pending.seq == frame.seq && pending.generation == self.noise_sweep.generation
+            });
+        if !current {
+            self._sweep_send_cancel(session);
+            return;
+        }
+        self.noise_sweep.pending = None;
+        self.noise_sweep.session = Some(session);
+        self.noise_sweep.keepalive_at = Some(std::time::Instant::now());
+        self.noise_sweep.total = total;
+        self.noise_sweep.produced = 0;
+        self.noise_sweep.received = vec![false; SWEEP_CELLS];
+        self.noise_sweep.resend_tries = vec![0; SWEEP_CELLS];
+        self.noise_sweep.status = format!(
+            "CH{} 频谱扫描: 设备会话 {} 已建立，等待 {}/{} 格结果…",
+            self.noise_sweep.ch, session, 0, total
+        );
+        self.noise_sweep.version = self.noise_sweep.version.wrapping_add(1);
+        if total as usize != SWEEP_CELLS {
+            self.push_log_warn(format!(
+                "CH{} 频谱扫描: 设备声明 {} 格，主机热图固定为 {} 格；正在取消该异常会话。",
+                self.noise_sweep.ch, total, SWEEP_CELLS
+            ));
+            self.noise_sweep.cancel = true;
+        }
+        if self.noise_sweep.cancel {
+            self._sweep_send_cancel(session);
+        }
+    }
+
+    /// 接收设备推送的结果/恢复/终态。不同 session 或通道的迟到帧一律不触碰当前热图。
+    pub(super) fn _handle_sweep_data(&mut self, frame: &crate::proto::Frame) {
+        let sweep = match crate::proto::decode_sweep_data(&frame.payload) {
+            Ok(value) => value,
+            Err(error) => {
+                self.push_log_warn(format!("SWEEP_DATA 解析失败: {}", error));
+                return;
+            }
+        };
+        if !self.noise_sweep.active
+            || self.noise_sweep.session != Some(sweep.session)
+            || self.noise_sweep.ch != sweep.ch
+        {
+            return;
+        }
+        let produced_before = self.noise_sweep.produced;
+        self.noise_sweep.produced = self
+            .noise_sweep
+            .produced
+            .max(sweep.produced.min(sweep.total));
+        if sweep.is_cell() && (sweep.index as usize) < SWEEP_CELLS {
+            let idx = sweep.index as usize;
+            self.noise_sweep.cells[idx] = NoiseCell {
+                std: sweep.std(),
+                pp: sweep.pp as f32,
+                mean: sweep.mean as f32,
+                samples: sweep.samples,
+                flags: sweep.flags,
+                gain: sweep.gain,
+                div: sweep.div,
+                fail_phase: sweep.fail_phase,
+                valid: sweep.samples != 0
+                    && sweep.flags
+                        & (SWEEP_FLAG_CAL_FAIL | SWEEP_FLAG_MISMATCH | SWEEP_FLAG_STALLED)
+                        == 0,
+                railed: sweep.flags & SWEEP_FLAG_RAILED != 0,
+            };
+            self.noise_sweep.received[idx] = true;
+        }
+        if sweep.state.is_terminal() {
+            self._sweep_finish_session(sweep);
+            return;
+        }
+        if sweep.state == SweepState::Restoring {
+            self.noise_sweep.status = format!(
+                "CH{} 频谱扫描: 设备正在恢复原始增益档/分频 ({}/{})…",
+                self.noise_sweep.ch,
+                self.noise_sweep._done(),
+                self.noise_sweep.total
+            );
+        } else {
+            // 阶段码来自设备当刻状态机: 卡住时用户能直接看到停在哪一步, 不必等终态才知道。
+            let phase = match sweep.phase {
+                Some(phase) => format!("，设备阶段: {}", crate::proto::sweep_phase_text(phase)),
+                None => String::new(),
+            };
+            self.noise_sweep.status = format!(
+                "CH{} 频谱扫描: 已收 {}/{} 格（设备已产出 {}）{}",
+                self.noise_sweep.ch,
+                self.noise_sweep._done(),
+                self.noise_sweep.total,
+                self.noise_sweep.produced,
+                phase
+            );
+        }
+        self.noise_sweep.version = self.noise_sweep.version.wrapping_add(1);
+        if self.noise_sweep.produced > produced_before {
+            self._sweep_resend_missing();
+        }
+    }
+
+    /// 以最多 32 格的批次补发已产出但漏收的结果；同一格最多请求三次。
+    fn _sweep_resend_missing(&mut self) {
+        let Some(session) = self.noise_sweep.session else {
+            return;
+        };
+        let limit = self.noise_sweep.produced as usize;
+        let mut first = 0usize;
+        while first < limit {
+            while first < limit
+                && (self.noise_sweep.received[first] || self.noise_sweep.resend_tries[first] >= 3)
+            {
+                first += 1;
+            }
+            if first == limit {
+                break;
+            }
+            let mut count = 0usize;
+            while first + count < limit
+                && count < 32
+                && !self.noise_sweep.received[first + count]
+                && self.noise_sweep.resend_tries[first + count] < 3
+            {
+                count += 1;
+            }
+            if count == 0 {
+                first += 1;
+                continue;
+            }
+            let seq = self.next_seq();
+            let send = self.io.as_ref().map(|handle| {
+                handle.send(crate::proto::Frame::new(
+                    crate::proto::HostCmd::SweepCtrl as u8,
+                    0,
+                    seq,
+                    crate::proto::encode_sweep_resend(session, first as u16, count as u8),
+                ))
+            });
+            match send {
+                Some(Ok(())) => {
+                    for idx in first..first + count {
+                        self.noise_sweep.resend_tries[idx] += 1;
+                    }
+                    self.noise_sweep.control_seqs.push(seq);
+                    first += count;
+                }
+                Some(Err(error)) => {
+                    self.push_log_warn(format!(
+                        "CH{} 频谱扫描补发请求失败(index={} count={}): {}",
+                        self.noise_sweep.ch, first, count, error
+                    ));
+                    break;
+                }
+                None => {
+                    self._sweep_device_disconnected();
+                    break;
+                }
+            }
+        }
+    }
+
+    fn _sweep_send_cancel(&mut self, session: u16) {
+        let seq = self.next_seq();
+        let send = self.io.as_ref().map(|handle| {
+            handle.send(crate::proto::Frame::new(
+                crate::proto::HostCmd::SweepCtrl as u8,
+                0,
+                seq,
+                crate::proto::encode_sweep_cancel(session),
+            ))
+        });
+        match send {
+            Some(Ok(())) => self.noise_sweep.control_seqs.push(seq),
+            Some(Err(error)) => self.push_log_warn(format!("频谱扫描取消下发失败: {}", error)),
+            None => self._sweep_device_disconnected(),
+        }
+    }
+
+    pub(super) fn _sweep_is_expired_control_seq(&self, seq: u8) -> bool {
+        self.noise_sweep.expired_control_seqs.contains(&seq)
+    }
+
+    pub(super) fn _sweep_forget_expired_control_seq(&mut self, seq: u8) {
+        self.noise_sweep
+            .expired_control_seqs
+            .retain(|expired| *expired != seq);
+    }
+
+    /// ACK/NAK 复用现有帧分发的 seq 归属。启动 NAK 结束本地会话；控制 NAK 保留会话等待设备终态。
+    pub(super) fn _sweep_note_reply(&mut self, seq: u8, ok: bool, why: &str) -> bool {
+        if self
+            .noise_sweep
+            .pending
+            .is_some_and(|pending| pending.seq == seq)
+        {
+            if !ok {
+                self.noise_sweep.active = false;
+                self.noise_sweep.pending = None;
+                self.noise_sweep.status =
+                    format!("CH{} 频谱扫描启动被设备拒绝: {}", self.noise_sweep.ch, why);
+                self.noise_sweep.version = self.noise_sweep.version.wrapping_add(1);
+            }
+            return true;
+        }
+        if let Some(pos) = self
+            .noise_sweep
+            .control_seqs
+            .iter()
+            .position(|item| *item == seq)
+        {
+            self.noise_sweep.control_seqs.swap_remove(pos);
+            if !ok {
+                self.push_log_warn(format!(
+                    "CH{} 频谱扫描控制命令被拒绝: {}",
+                    self.noise_sweep.ch, why
+                ));
+            }
+            return true;
+        }
+        if self._sweep_is_expired_control_seq(seq) {
+            self._sweep_forget_expired_control_seq(seq);
+            return true;
+        }
+        false
+    }
+
+    /// 断链时设备是否已完成恢复不可知；结果仍保留供 UI 查阅，但必须放开下一次会话。
+    pub(super) fn _sweep_device_disconnected(&mut self) {
+        if !self.noise_sweep.active {
+            return;
+        }
+        self.noise_sweep.generation = self.noise_sweep.generation.wrapping_add(1);
+        self.noise_sweep.active = false;
+        self.noise_sweep.pending = None;
+        self.noise_sweep
+            .expired_control_seqs
+            .append(&mut self.noise_sweep.control_seqs);
+        self.noise_sweep.control_seqs.clear();
+        self.noise_sweep.status = format!(
+            "CH{} 频谱扫描: 连接已断开，设备恢复状态未知。",
+            self.noise_sweep.ch
+        );
+        self.noise_sweep.version = self.noise_sweep.version.wrapping_add(1);
+        self.push_log_warn(self.noise_sweep.status.clone());
+    }
+
+    fn _sweep_finish_session(&mut self, sweep: SweepFrame) {
+        let expected = self.noise_sweep._expected_total();
+        let missing = self
+            .noise_sweep
+            .received
+            .iter()
+            .take(expected)
+            .filter(|cell| !**cell)
+            .count();
+        let restore_failed = sweep.flags & 0x70 != 0 || sweep.state == SweepState::Failed;
+        let state = sweep.state.text();
+        // 设备回报的首个失败阶段: 有它才说得出"卡在哪一步", 没有就不编造。
+        let phase_note = match sweep.fail_phase_text() {
+            Some(text) => format!("；设备侧首个失败阶段: {}", text),
+            None => String::new(),
+        };
+        // 已收到但无效的格数(设备明确报了这一格不可用): 与"没收到"分开计, 否则用户分不清是丢包还是坏点。
+        let invalid = self
+            .noise_sweep
+            .received
+            .iter()
+            .take(expected)
+            .zip(self.noise_sweep.cells.iter())
+            .filter(|(received, cell)| **received && !cell.valid)
+            .count();
+        let invalid_note = if invalid == 0 {
+            String::new()
+        } else {
+            format!("，其中 {} 格设备侧无有效结果", invalid)
+        };
+        self.noise_sweep.active = false;
+        self.noise_sweep.pending = None;
+        self.noise_sweep
+            .expired_control_seqs
+            .append(&mut self.noise_sweep.control_seqs);
+        self.noise_sweep.control_seqs.clear();
+        self.noise_sweep.status = if restore_failed {
+            format!(
+                "CH{} 频谱扫描{}: 已收 {}/{} 格{}，设备恢复状态未知(恢复标志 0x{:02X}){}。",
+                self.noise_sweep.ch,
+                state,
+                self.noise_sweep._done(),
+                self.noise_sweep.total,
+                invalid_note,
+                sweep.flags,
+                phase_note
+            )
+        } else if missing != 0 {
+            format!(
+                "CH{} 频谱扫描{}: 已收 {}/{} 格{}，仍缺 {} 格(补发已达上限){}。",
+                self.noise_sweep.ch,
+                state,
+                self.noise_sweep._done(),
+                self.noise_sweep.total,
+                invalid_note,
+                missing,
+                phase_note
+            )
+        } else {
+            format!(
+                "CH{} 频谱扫描{}: 已收 {}/{} 格{}，设备已完成恢复{}。",
+                self.noise_sweep.ch,
+                state,
+                self.noise_sweep._done(),
+                self.noise_sweep.total,
+                invalid_note,
+                phase_note
+            )
+        };
+        self.noise_sweep.version = self.noise_sweep.version.wrapping_add(1);
+        if restore_failed {
+            self.push_log_warn(self.noise_sweep.status.clone());
+        } else {
+            self.push_log(self.noise_sweep.status.clone());
         }
     }
 
@@ -1512,11 +1876,15 @@ impl AppController {
         }
         let ch = self.noise_sweep.ch;
         if !self.noise_sweep.ap.asked {
-            self.noise_sweep.ap.asked = true;
+            if self._device_busy() || self.io.is_none() {
+                return self._sweep_ap_verify_guard(req);
+            }
             self.params[ch as usize].remove(&PARAM_IDAC_GAIN);
             self.params[ch as usize].remove(&PARAM_SNS_CLK_DIV);
+            let mut sent = true;
             for id in [PARAM_IDAC_GAIN, PARAM_SNS_CLK_DIV] {
                 if let Err(e) = self.request_param(ch, id) {
+                    sent = false;
                     self.push_log_warn(format!(
                         "频谱扫描{}回读下发失败: 0x{:02X} — {}",
                         req._what(),
@@ -1524,6 +1892,9 @@ impl AppController {
                         e
                     ));
                 }
+            }
+            if sent {
+                self.noise_sweep.ap.asked = true;
             }
             return ApplyOut::Pending;
         }
@@ -1788,6 +2159,10 @@ fn _stats_of(samples: &[u16], full_scale: f32) -> NoiseCell {
         pp: hi - lo,
         mean,
         samples: n as u16,
+        flags: 0,
+        gain: 0,
+        div: 0,
+        fail_phase: None,
         valid: true,
         // 按冻结的设备分辨率计算 rail：量程两端各留约 1%（至少 1 count）余量。
         railed: hi >= full_scale - _rail_margin(full_scale) || lo <= _rail_margin(full_scale),

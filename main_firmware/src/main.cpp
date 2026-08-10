@@ -23,6 +23,7 @@
 #include "service/self_heal/self_heal.h"
 #include "service/tx_scheduler/tx_scheduler.h"
 #include "service/keyboard/keyboard.h"
+#include "service/hid_touch_mapper/hid_touch_mapper.h"
 #include "service/tx_scheduler/tx_scheduler.h"
 #include "service/bus/bus_core.h"
 #include "service/bus/bus_usb_link.h"
@@ -37,13 +38,175 @@ extern "C" {
 
 static constexpr uint32_t WATCHDOG_TIMEOUT_MS = 5000;
 
+namespace {
+// 每个 provisioning 代次只走一遍。所有重操作都只负责入队，core0 每轮仅轮询一次状态。
+enum class BootCalibrationStage : uint8_t {
+    WAIT_TRUST,
+    IDAC_START,
+    IDAC_WAIT,
+    CHANNEL_START,
+    CHANNEL_WAIT,
+    BASELINE_START,
+    BASELINE_WAIT,
+    VERIFY_WAIT,
+    DONE,
+};
+
+struct BootCalibrationState {
+    BootCalibrationStage stage = BootCalibrationStage::WAIT_TRUST;
+    uint32_t autotune_req = 0u;
+    uint32_t verify_generation = 0u;
+    uint32_t verify_started_ms = 0u;
+    uint8_t baseline_retry = 0u;
+
+    void clear() {
+        stage = BootCalibrationStage::WAIT_TRUST;
+        autotune_req = 0u;
+        verify_generation = 0u;
+        verify_started_ms = 0u;
+        baseline_retry = 0u;
+    }
+};
+
+BootCalibrationState _boot_calibration;
+constexpr uint32_t BOOT_CAL_FAILURE_FLAG = 0x80000000u;
+
+void _boot_calibration_fail(uint8_t stage) {
+    // 复用既有 SH_REPROVISIONED 事件；bit31 区分普通重下发 detail(0/1)，不新增事件码。
+    SelfHeal::getInstance()->note(SH_REPROVISIONED, BOOT_CAL_FAILURE_FLAG | stage);
+}
+
+void _boot_calibration_tick(Psoc* psoc, CsdConfig* csd) {
+    if (psoc == nullptr || csd == nullptr || !psoc->link_alive()) return;
+
+    switch (_boot_calibration.stage) {
+        case BootCalibrationStage::WAIT_TRUST:
+            // provisioning 尾部的 APPLY 尚在 core1 执行时绝不抢占重操作槽。
+            if (psoc->heavy_busy()) return;
+            // ★校准前不能要求“采样可信”★ IDAC/通道/基线三项的职责正是修复 railed、停滞和坏基线；
+            // 旧代码在这里调用 sampling_trustworthy，raw=4095 或基线未拉回时立即 DONE，等于“越需要
+            // 校准越不执行”。启动前置只要求链路已建立；采样可信度门禁放到三项完成后的 VERIFY_WAIT。
+            _boot_calibration.stage = BootCalibrationStage::IDAC_START;
+            return;
+
+        case BootCalibrationStage::IDAC_START:
+            if (!ConfigManager::get_bool("calib.boot_idac")) {
+                _boot_calibration.stage = BootCalibrationStage::CHANNEL_START;
+                return;
+            }
+            if (psoc->heavy_busy()) return;
+            if (!psoc->start_sweep_calibrate(0xFFu)) {
+                _boot_calibration_fail(2u);
+                _boot_calibration.stage = BootCalibrationStage::CHANNEL_START;
+                return;
+            }
+            _boot_calibration.stage = BootCalibrationStage::IDAC_WAIT;
+            return;
+
+        case BootCalibrationStage::IDAC_WAIT: {
+            bool ok = false;
+            if (!psoc->take_sweep_result(&ok)) return;
+            if (!ok) _boot_calibration_fail(2u);
+            _boot_calibration.stage = BootCalibrationStage::CHANNEL_START;
+            return;
+        }
+
+        case BootCalibrationStage::CHANNEL_START:
+            if (!ConfigManager::get_bool("calib.boot_channel")) {
+                _boot_calibration.stage = BootCalibrationStage::BASELINE_START;
+                return;
+            }
+            if (psoc->heavy_busy()) return;
+            if (!psoc->auto_tune_start(0xFFu, ConfigManager::get_uint8("calib.pref"), 0x3Eu)) {
+                _boot_calibration_fail(3u);
+                _boot_calibration.stage = BootCalibrationStage::BASELINE_START;
+                return;
+            }
+            _boot_calibration.autotune_req = psoc->autotune_req();
+            _boot_calibration.stage = BootCalibrationStage::CHANNEL_WAIT;
+            return;
+
+        case BootCalibrationStage::CHANNEL_WAIT: {
+            // 请求代次被别的调用覆盖时，本轮已失去归属；记失败并继续，绝不重新启动形成循环。
+            if (psoc->autotune_req() != _boot_calibration.autotune_req) {
+                _boot_calibration_fail(3u);
+                _boot_calibration.stage = BootCalibrationStage::BASELINE_START;
+                return;
+            }
+            const psoc::AutoTuneProgress status = psoc->autotune_status();
+            if (status.req != _boot_calibration.autotune_req || status.state != 2u) return;
+            if (status.result != 1u) _boot_calibration_fail(3u);
+            _boot_calibration.stage = BootCalibrationStage::BASELINE_START;
+            return;
+        }
+
+        case BootCalibrationStage::BASELINE_START:
+            if (!ConfigManager::get_bool("calib.boot_baseline")) {
+                _boot_calibration.stage = BootCalibrationStage::DONE;
+                return;
+            }
+            if (psoc->heavy_busy()) return;
+            if (!psoc->start_sweep_baseline_reset(0xFFu)) {
+                _boot_calibration_fail(4u);
+                _boot_calibration.stage = BootCalibrationStage::DONE;
+                return;
+            }
+            _boot_calibration.stage = BootCalibrationStage::BASELINE_WAIT;
+            return;
+
+        case BootCalibrationStage::BASELINE_WAIT: {
+            bool ok = false;
+            if (!psoc->take_sweep_result(&ok)) return;
+            if (!ok) {
+                _boot_calibration_fail(4u);
+                _boot_calibration.stage = BootCalibrationStage::DONE;
+                return;
+            }
+            // “命令完成”不等于“传感器恢复”：必须看到校准后的新快照代次并通过 raw/抖动门禁。
+            // 旧实现到这里直接 DONE，底层 500ms 误超时后自然把失败链当成“启动三项已执行”。
+            _boot_calibration.verify_generation = psoc->snapshot_generation();
+            _boot_calibration.verify_started_ms = millis();
+            _boot_calibration.stage = BootCalibrationStage::VERIFY_WAIT;
+            return;
+        }
+
+        case BootCalibrationStage::VERIFY_WAIT:
+            if (psoc->heavy_busy()) return;
+            if (psoc->snapshot_valid() &&
+                psoc->snapshot_generation() != _boot_calibration.verify_generation &&
+                csd->sampling_trustworthy(psoc)) {
+                _boot_calibration.stage = BootCalibrationStage::DONE;
+                return;
+            }
+            if ((uint32_t)(millis() - _boot_calibration.verify_started_ms) < 3000u) return;
+            // 基线是用户手动操作能恢复的最小动作；验收失败时只自动补做一次，禁止形成启动循环。
+            if (_boot_calibration.baseline_retry == 0u &&
+                ConfigManager::get_bool("calib.boot_baseline")) {
+                _boot_calibration.baseline_retry = 1u;
+                _boot_calibration.stage = BootCalibrationStage::BASELINE_START;
+                return;
+            }
+            _boot_calibration_fail(5u);   // 三项已跑完但快照/基线验收仍失败
+            csd->note_baseline_untrusted(true);
+            _boot_calibration.stage = BootCalibrationStage::DONE;
+            return;
+
+        case BootCalibrationStage::DONE:
+            return;
+    }
+}
+}  // namespace
+
 // ★hardfault 兜底 + 取证★
 // pico-sdk 的默认 isr_hardfault 落进 while(1), 于是"跑飞"最终也表现为看门狗超时复位 ——
 // 与"主循环真的跑太慢"完全同形, 无从区分(实测一次复位报 stage=0 就卡在这里)。
 // 覆盖它: 先在 scratch[2] 留标记(跨复位保留), 再立刻软复位。scratch[4..7] 归 SDK 的
 // watchdog_reboot 自用, 故标记只能放 0..3(见 usb_debug.h 的 scratch 分配注释)。
 extern "C" void isr_hardfault(void) {
-    watchdog_hw->scratch[CRASH_SCRATCH_FAULT] = CRASH_FAULT_MAGIC;
+    // ★连"哪个核跑飞"一起记★ 两个核共用本处理程序; 只记一个 magic 时无从区分, 而 core0 的
+    // 阶段码(scratch[1])又会被 core1 的正常运行覆盖 ⇒ 上一轮据此把 core0 的崩溃误判成 core1。
+    // 低字节存 get_core_num(), 启动时取出上报(见 UsbDebugCounters::last_boot_fault_core)。
+    watchdog_hw->scratch[CRASH_SCRATCH_FAULT] = crash_fault_word(get_core_num());
     watchdog_reboot(0u, 0u, 0u);
     while (true) { tight_loop_contents(); }
 }
@@ -105,8 +268,13 @@ void setup() {
     // 死前遗言增强: 上次是否 hardfault + 上次运行期整轮耗时峰值 + 硬件复位原因。
     // 三者合起来才能定性: fault=1 → 跑飞; fault=0 且 loop_max 接近 5s → 主循环真被拖死;
     // fault=0 且 loop_max 很小 → 既没跑飞也没拖慢, 那就是外部原因(掉电/XRES)。
+    const uint32_t fault_word = watchdog_hw->scratch[CRASH_SCRATCH_FAULT];
+    // 只比高 24 位: 低字节是出错核编号(见 crash_fault_word)。旧 magic 0x46554C54 的高 24 位
+    // 同样是 0x46554C, 故刷入新固件前留下的标记仍能被正确识别为 fault。
     g_usb_dbg.last_boot_was_fault =
-        (watchdog_hw->scratch[CRASH_SCRATCH_FAULT] == CRASH_FAULT_MAGIC) ? 1u : 0u;
+        ((fault_word & CRASH_FAULT_MASK) == CRASH_FAULT_TAG) ? 1u : 0u;
+    g_usb_dbg.last_boot_fault_core =
+        g_usb_dbg.last_boot_was_fault ? (uint8_t)(fault_word & 0xFFu) : 0xFFu;
     const uint32_t pm_word = watchdog_hw->scratch[CRASH_SCRATCH_PM];
     g_usb_dbg.last_boot_stage_at_ms = ran_before ? (uint16_t)(pm_word >> 16) : 0u;
     g_usb_dbg.last_boot_peak_ms = ran_before ? (uint16_t)(pm_word & 0xFFFFu) : 0u;
@@ -177,6 +345,9 @@ void setup() {
 #if MAI2_ENABLE_SERIAL_HID
     HID::getInstance()->init(HAL_USB_Device::getInstance());
     KeyboardService::getInstance()->init();
+    // ★HID 触摸屏点位映射★: 物理通道 → 固定屏幕坐标, 只在 WORK_HID 生效(模式在 init 里锁存)。
+    // 必须在 ConfigManager::initialize() 之后 —— 它要读 mode.work 与 hid.* 的运行值。
+    HidTouchMapper::getInstance()->init(HID::getInstance());
 #endif
 
     const UsbWorkMode work_mode = (ConfigManager::get_uint8("mode.work") ==
@@ -251,6 +422,7 @@ void loop() {
     // 完成后清 provisioned，交由下方既有 provisioning 重新下发算法 + CSD(即"重新应用")。
     if (updater->rescue_step(psoc)) {
         provisioned = false;
+        _boot_calibration.clear();
         psoc->clear_reset_request();   // 重刷期间 core1 必然判过链路丢失，清掉避免刚恢复就被 XRES
         SelfHeal::getInstance()->note(SH_PSOC_RESCUED, 0u);
     }
@@ -272,6 +444,7 @@ void loop() {
         // 反推那条路现在有重操作宽限窗守着(APPLY 12s 期间链路必然抖动, 不能判成掉线),
         // 若仍只靠它, 我们自己发起的复位就可能因宽限而不触发重新下发 → 算法/CSD 永久丢失。
         provisioned = false;
+        _boot_calibration.clear();
         // 卡死型(reason=2)永远上报; 链路丢失型(reason=1)在主机主动重启的抑制窗内跳过, 免得把
         // "上位机自己发起的重启"报成"固件自行复位"。
         if (reset_reason == 2u) {
@@ -292,6 +465,7 @@ void loop() {
         // 同上: 主机请求的重启是"确知复位", 显式清 provisioned 保证 RESET_DEFAULTS 后
         // 清空的 store 一定会被重新下发(否则 PSoC 仍留着复位前推下去的旧参数, 恢复默认等于没生效)。
         provisioned = false;
+        _boot_calibration.clear();
         host_reboot_quiet_until_ms = millis() + 3000u;
     }
 
@@ -357,6 +531,15 @@ void loop() {
             }
         }
     }
+
+    // provisioning 成功后启动一次；DONE 后本代次不再进入，只有明确的新 PSoC 代次会 clear()。
+    // ★扫描会话期间必须让位★：启动校准与 SweepSession 共用 PSoC 的单个非阻塞重操作槽
+    // (start_sweep_calibrate/take_sweep_result)，且它做的是全通道校准 —— 在扫描中途插进去会
+    // 抢掉槽位把扫描逼到阶段超时，还会推翻正在测的那一格。信号是粘性的，推迟到会话结束再走。
+    if (provisioned && !SensorLink::getInstance()->output_suppressed()) {
+        _boot_calibration_tick(psoc, CsdConfig::getInstance());
+    }
+
     // 持续断开 >400ms 视为真复位 → 清 provisioned, 链路恢复后重下发(算法/CSD 在 PSoC RAM, 复位丢失)。
     // ★但"正在执行重操作"不算掉线★: APPLY/CALIBRATE/GLOBAL_COMMIT/AUTO_TUNE 由 PSoC 主循环同步跑,
     // provision 后的 APPLY 实测 12.4s(36 通道逐个重校准), 期间 CapSense 内部临界区推迟 SPI DMA 中断,
@@ -368,8 +551,8 @@ void loop() {
     if (!link_now && link_down_since_ms != 0u && (millis() - link_down_since_ms) > 400u &&
         !psoc->busy_grace_active()) {
         provisioned = false;
+        _boot_calibration.clear();
     }
-
     // ★运行期掉枚举: 如实宣判失效, 不做救援★
     // 主机一旦拆掉接口, 设备这边任何"重新武装/重开"都改变不了主机的判断, 只会把主循环搅乱。
     // 事件是粘性的(队列 + note_rearm 兜底), 故即使掉枚举期间无人可发, 重新连上后仍会送达 ——
@@ -438,7 +621,18 @@ void loop() {
         const uint32_t gio_t = gio_seg_begin(GIO_SEG_BINDING);
         // 掩码与"是否可信"都取 Psoc 的统一裁决(见 psoc.h touch_mask/touch_hold_ok):
         // 瞬时 link_ok 在遥测分页期间频繁为假, 用它清零会让指触绑定在按着的时候突然丢采样。
-        BindingService::getInstance()->tick(psoc->touch_mask(), psoc->touch_hold_ok());
+        // 扫描会话期间掩码无意义(见 SensorLink::output_suppressed): 按"不可信"喂给绑定捕获,
+        // 免得把逐格改参数产生的噪声采成用户的指触样本。
+        const bool touch_trusted = psoc->touch_hold_ok() &&
+                                   !SensorLink::getInstance()->output_suppressed();
+        const uint64_t touch_now = psoc->touch_mask();
+        BindingService::getInstance()->tick(touch_now, touch_trusted);
+        // ★HID 触摸屏点位: 复用同一对 (掩码, 可信) 裁决★
+        // 不自行重算 touch_hold_ok/output_suppressed —— 两处各算一遍必然漂移出"绑定看得见触摸、
+        // 触摸屏却不动"这类分叉。HID 模式外本调用内部直接返回, serial 模式零开销、零副作用。
+#if MAI2_ENABLE_SERIAL_HID
+        HidTouchMapper::getInstance()->tick(touch_now, touch_trusted);
+#endif
         gio_seg_mark(GIO_SEG_BINDING, gio_t);
     }
     GameIoService::getInstance()->task();
@@ -513,6 +707,8 @@ void loop() {
         g_usb_dbg.nv_valid_mask = nv->valid_mask();
         g_usb_dbg.psoc_heavy_rejects = psoc->heavy_reject_count();
         g_usb_dbg.psoc_heavy_busy = psoc->heavy_busy() ? 1u : 0u;
+        // core1 阶段码镜像进上报结构(core1 写 g_core1_stage, core0 只读搬运)。
+        g_usb_dbg.core1_stage = g_core1_stage;
     }
 
     // ★vendor OUT 自愈★：每轮检查 config vendor OUT 是否仍处 arm 态，若因 flash 扰动等

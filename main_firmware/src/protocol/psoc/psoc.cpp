@@ -26,7 +26,9 @@ constexpr uint32_t RESET_BOOT_GRACE_MS    = 1500;
 // 实测 provision 后的 APPLY(36 通道逐个重校准)达 12.4s。期间 CapSense 内部临界区推迟 SPI DMA 中断,
 // read_touch 会成批失败 —— 那不是掉线, 不得据此 XRES 或重新下发配置。给足余量到 30s。
 // AUTO_TUNE 更长(逐通道最坏数十秒), 与其 SPI 层 45s 超时对齐并留余量。
-constexpr uint32_t HEAVY_OP_GRACE_MS      = 30000;
+// 全通道 IDAC 校准现在按真实最坏值允许 60s；宽限必须比它更长，否则操作刚完成就会继承
+// 期间累积的链路失败并被误 XRES。普通单通道操作也共用此窗，代价只是延后兜底，不改变完成判据。
+constexpr uint32_t HEAVY_OP_GRACE_MS      = 70000;
 constexpr uint32_t AUTOTUNE_GRACE_MS      = 60000;
 }
 
@@ -63,6 +65,9 @@ bool Psoc::init() {
 bool Psoc::_op_is_heavy(SpiOp op) {
     switch (op) {
         case SpiOp::APPLY:
+        // QUICK_APPLY 虽只做 Initialize(百 ms 量级), 仍由 PSoC 主循环同步执行且期间不应答扫描 ⇒
+        // 必须与其它重操作共用同一条反堆叠闸门, 否则 Sweep 的逐格应用会与主机指令互相插队。
+        case SpiOp::QUICK_APPLY:
         case SpiOp::CALIBRATE:
         case SpiOp::BASELINE_RESET:
         case SpiOp::GLOBAL_COMMIT:
@@ -89,19 +94,29 @@ void Psoc::_spi_service() {
         // 也就响应不了 lockout ⇒ core0 死等且不喂狗 ⇒ 5s 看门狗复位整机(实测: 保存后约 8.5s 掉线,
         // 设备重新枚举、LED 重启)。core0 据此标志避开这个窗口落盘。
         _core1_in_cmd = 1u;
-        crash_stage_set(CRASH_STAGE_CORE1_CMD);
+        // ★写 core1 自有阶段字段, 不写 core0 的 scratch[1]★
+        // 原先这里用 crash_stage_set(CRASH_STAGE_CORE1_CMD) 且执行完从不复位, 于是 core0 崩溃后
+        // core1 会把 7 盖到 core0 的真实阶段上 —— "死前遗言"恒报 CORE1_CMD, 排查被引到错误的核。
+        core1_stage_set(CRASH_STAGE_CORE1_CMD);
         __dmb();
         const bool ok = _exec_cmd(c.op, c.ch, c.pid, c.val, &r, c.data);
         c.result = r;
         c.ok = ok;
         __dmb();
         c.done = true;                              // 发布结果(读类 core0 在等)
+        if (c.async_token != 0u && c.async_token == _sweep_async.token) {
+            _sweep_async.ok = ok ? 1u : 0u;
+            __dmb();
+            _sweep_async.pending = 0u;
+            _sweep_async.complete = 1u;
+        }
         __dmb();
         _cmd_tail = (_cmd_tail + 1) % CMD_RING_SIZE; // 消费者推进 tail, 释放槽位
         // 长周期指令出清: core1 是本计数器的唯一写者, 与 core0 的 _heavy_enq 配对(见 heavy_busy)。
         if (_op_is_heavy(c.op)) _heavy_done = _heavy_done + 1u;
         __dmb();
         _core1_in_cmd = 0u;
+        core1_stage_set(CRASH_STAGE_NONE);   // 本条执行完即复位, 阶段码不再"粘住"
     }
 
     // 2) 触控快路: 单次 7 字节事务读 36 区位图, 实测耗时。seqlock 发布防 u64 撕裂。
@@ -110,6 +125,18 @@ void Psoc::_spi_service() {
     const bool ok = _spi.read_touch(&mask);
     const uint32_t tr = time_us_32() - t0;
     latency_note(&g_lat_spi_us, tr);
+
+    // 算法信息只在本周期触控事务完成后、命令环排空且无长周期操作时刷新，避免嵌套 SPI。
+    const uint32_t algo_now_ms = millis();
+    if (_cmd_tail == _cmd_head && _core1_in_cmd == 0u && !heavy_busy() &&
+        (uint32_t)(algo_now_ms - _algo_info_last_poll_ms) >= 100u) {
+        _algo_info_last_poll_ms = algo_now_ms;
+        if (_link_established && ok) {
+            _refresh_algo_info_cache();
+        } else {
+            _invalidate_algo_info_cache();
+        }
+    }
 
     // ★触发式更新 + 有限保留 + 到期优雅释放★(掩码即真相, 见 psoc.h touch_mask 注释)
     //   合法帧            → 更新掩码, 清失败连击, 置可信;
@@ -145,6 +172,7 @@ void Psoc::_spi_service() {
         _link_established = true;
         _link_fail_run = 0;
     } else if (_link_established) {
+        _invalidate_algo_info_cache();
         // XRES 复位后的启动宽限期内: 不累计失败、不触发复位, 让 PSoC 有时间跑完 initialize_capsense
         // 并恢复 SPI 应答, 避免"启动未完成→又复位"的死循环。宽限过后仍失败才判为真崩溃。
         if ((int32_t)(_reset_grace_until_ms - millis()) > 0) {
@@ -162,8 +190,20 @@ void Psoc::_spi_service() {
         _snapshot.generation = g;
     }
 
-    // 3) 快照慢路: 遥测激活时分块流水读全通道 → 工作缓冲, 读满一份经 seqlock 发布到 _snapshot。
-    if (_telem_active && ok) {
+    // 3a) 快照快路(独占单通道): 只读目标通道的 2-3 页, 每拍都能发布一份新代数。
+    // ★为什么独占时必须换路★ 全通道分块泵每份要 16 个 1ms tick(63页/4页), 上限 62 份/s;
+    // 而独占精调只关心这一个通道, 上位机根本不消费其余通道。只读它 ⇒ 单份约 0.5ms, 每拍一份,
+    // 实测可达数百份/s, 精调曲线才能不丢细节。全通道流仍走 3b 的分块慢路(30Hz 足够)。
+    if (_telem_active && ok && _focus_ch < psoc::SENSOR_CHANNEL_COUNT) {
+        if (_spi.snapshot_pump_channel(_focus_ch, &_snap_work)) {
+            _snap_seq++;              // 进入写临界区(奇)
+            __dmb();
+            _snapshot = _snap_work;
+            __dmb();
+            _snap_seq++;              // 离开写临界区(偶)
+        }
+    } else if (_telem_active && ok) {
+    // 3b) 快照慢路: 遥测激活时分块流水读全通道 → 工作缓冲, 读满一份经 seqlock 发布到 _snapshot。
         if (_spi.snapshot_pump(PSOC_SNAPSHOT_PAGES_PER_PUMP, &_snap_work)) {
             _snap_seq++;              // 进入写临界区(奇)
             __dmb();
@@ -255,6 +295,7 @@ bool Psoc::_exec_cmd(SpiOp op, uint8_t ch, uint8_t pid, uint32_t val, uint32_t* 
     // 形成永久 provision 风暴。宽限只影响"是否判定 PSoC 已死", 不影响任何真实完成判据。
     switch (op) {
         case SpiOp::APPLY:
+        case SpiOp::QUICK_APPLY:
         case SpiOp::CALIBRATE:
         case SpiOp::BASELINE_RESET:
         case SpiOp::GLOBAL_COMMIT:
@@ -287,6 +328,10 @@ bool Psoc::_exec_cmd(SpiOp op, uint8_t ch, uint8_t pid, uint32_t val, uint32_t* 
             return _spi.set_mode(ch);   // mode 复用 ch 字段
         case SpiOp::APPLY:
             return _spi.apply();
+        case SpiOp::QUICK_APPLY:
+            return _spi.quick_apply(ch, pid, (uint8_t)val);  // ch/gain/div 复用既有信箱字段
+        case SpiOp::FOCUS_SCAN:
+            return _spi.focus_scan(ch);
         case SpiOp::CALIBRATE:
             return _spi.calibrate(ch);          // ch 复用: 0..35=单通道 / 0xFF=全通道
         case SpiOp::BASELINE_RESET:
@@ -383,7 +428,8 @@ bool Psoc::_exec_cmd(SpiOp op, uint8_t ch, uint8_t pid, uint32_t val, uint32_t* 
 
 // core0 侧: 入队一条 SPI 指令。写类(out==null)异步立即返回; 读类阻塞等本条结果。
 // core1 未接管(setup 阶段)时本核直执行, 避免死等无人消费的队列。
-bool Psoc::_submit(SpiOp op, uint8_t ch, uint8_t pid, uint32_t val, uint32_t* out, const uint8_t* data, uint32_t timeout_us) {
+bool Psoc::_submit(SpiOp op, uint8_t ch, uint8_t pid, uint32_t val, uint32_t* out, const uint8_t* data,
+                   uint32_t timeout_us, uint8_t async_token) {
     if (!_spi_ready) return false;
     if (!_core1_running) {
         return _exec_cmd(op, ch, pid, val, out, data);
@@ -421,6 +467,7 @@ bool Psoc::_submit(SpiOp op, uint8_t ch, uint8_t pid, uint32_t val, uint32_t* ou
     c.result = 0;
     c.ok = false;
     c.done = false;
+    c.async_token = async_token;
     // ★必须在推进 head 之前置★: 否则 core1 可能先执行完并递增 _heavy_done, 之后 core0 再递增
     // _heavy_enq, heavy_busy() 就会在指令早已完成后仍报忙(且永不复位)。
     if (_op_is_heavy(op)) _heavy_enq = _heavy_enq + 1u;
@@ -445,6 +492,67 @@ bool Psoc::_submit(SpiOp op, uint8_t ch, uint8_t pid, uint32_t val, uint32_t* ou
     __dmb();
     if (out) *out = c.result;
     return c.ok;
+}
+
+void Psoc::_invalidate_algo_info_cache() {
+    _algo_info_seq++;
+    __dmb();
+    _algo_info_available = 0u;
+    _algo_info_valid = 0u;
+    _algo_info_len = 0u;
+    _algo_info_refresh_ms = 0u;
+    _algo_info_cache_epoch = _algo_info_epoch;
+    __dmb();
+    _algo_info_seq++;
+}
+
+bool Psoc::_refresh_algo_info_cache() {
+    bool valid = false;
+    uint16_t len = 0;
+    if (!_spi.algo_info(&valid, &len)) {
+        _invalidate_algo_info_cache();
+        return false;
+    }
+    _algo_info_seq++;
+    __dmb();
+    _algo_info_valid = valid ? 1u : 0u;
+    _algo_info_len = len;
+    _algo_info_refresh_ms = millis();
+    _algo_info_cache_epoch = _algo_info_epoch;
+    _algo_info_available = 1u;
+    __dmb();
+    _algo_info_seq++;
+    return true;
+}
+
+bool Psoc::get_algo_info_cached(bool* out_valid, uint16_t* out_len) const {
+    if (out_valid) *out_valid = false;
+    if (out_len) *out_len = 0u;
+    uint32_t s1;
+    uint32_t s2;
+    uint8_t available;
+    uint8_t valid;
+    uint16_t len;
+    uint32_t refreshed;
+    uint32_t epoch;
+    do {
+        s1 = _algo_info_seq;
+        __dmb();
+        available = _algo_info_available;
+        valid = _algo_info_valid;
+        len = _algo_info_len;
+        refreshed = _algo_info_refresh_ms;
+        epoch = _algo_info_cache_epoch;
+        __dmb();
+        s2 = _algo_info_seq;
+    } while ((s1 & 1u) || s1 != s2);
+    if (available == 0u || epoch != _algo_info_epoch || refreshed == 0u ||
+        (uint32_t)(millis() - refreshed) > ALGO_INFO_CACHE_MAX_AGE_MS) {
+        return false;
+    }
+    if (out_valid) *out_valid = valid != 0u;
+    if (out_len) *out_len = len;
+    return true;
 }
 
 // ---------- seqlock 读访问器(core0 侧) ----------
@@ -493,16 +601,57 @@ bool Psoc::get_raw(uint8_t ch, uint16_t* out) {
 bool Psoc::apply_params() {
     return _submit(SpiOp::APPLY, 0, 0, 0, nullptr);
 }
+bool Psoc::set_focus_scan(uint8_t ch) {
+    uint32_t acknowledged = 0;
+    return _submit(SpiOp::FOCUS_SCAN, ch, 0, 0, &acknowledged);
+}
+
 bool Psoc::calibrate(uint8_t ch) {
     uint32_t completed = 0;
-    // 非空 out 使 _submit 等到 core1 的 _spi.calibrate 已轮询 PSoC busy 落下；等待环持续泵 USB/喂狗。
-    return _submit(SpiOp::CALIBRATE, ch, 0, 0, &completed, nullptr, 50000000u);
+    // 外层信箱预算必须大于 PsocSpi 的 60s 全通道预算；否则 core0 先放弃、core1 仍占槽，
+    // 上位机又能发下一条重操作，重新制造“busy 上叠命令”。
+    return _submit(SpiOp::CALIBRATE, ch, 0, 0, &completed, nullptr, 70000000u);
 }
 bool Psoc::baseline_reset(uint8_t ch) {
     uint32_t completed = 0;
     // 同校准：Host ACK 仅在 PSoC 主循环完成目标基线复位后返回，不新增协议帧。
-    return _submit(SpiOp::BASELINE_RESET, ch, 0, 0, &completed, nullptr, 50000000u);
+    return _submit(SpiOp::BASELINE_RESET, ch, 0, 0, &completed, nullptr, 10000000u);
 }
+
+bool Psoc::_start_sweep_op(SpiOp op, uint8_t ch, uint8_t pid, uint32_t val) {
+    if (_sweep_async.pending != 0u || heavy_busy()) return false;
+    uint8_t token = static_cast<uint8_t>(_sweep_async.token + 1u);
+    if (token == 0u) token = 1u;
+    _sweep_async.token = token;
+    _sweep_async.ok = 0u;
+    _sweep_async.complete = 0u;
+    _sweep_async.pending = 1u;
+    __dmb();
+    if (_submit(op, ch, pid, val, nullptr, nullptr, 0u, token)) return true;
+    _sweep_async.pending = 0u;
+    return false;
+}
+
+bool Psoc::start_sweep_apply(uint8_t ch, uint8_t gain, uint8_t div) {
+    return _start_sweep_op(SpiOp::QUICK_APPLY, ch, gain, div);
+}
+
+bool Psoc::start_sweep_calibrate(uint8_t ch) {
+    return _start_sweep_op(SpiOp::CALIBRATE, ch);
+}
+
+bool Psoc::start_sweep_baseline_reset(uint8_t ch) {
+    return _start_sweep_op(SpiOp::BASELINE_RESET, ch);
+}
+
+bool Psoc::take_sweep_result(bool* out_ok) {
+    if (_sweep_async.complete == 0u) return false;
+    __dmb();
+    if (out_ok) *out_ok = _sweep_async.ok != 0u;
+    _sweep_async.complete = 0u;
+    return true;
+}
+
 // 频率自适应: 阻塞至 PSoC 重校准完成。out 打包 result(低8位) | div<<8。
 // ch: 0..35=仅该通道, 0xFF=全通道逐通道各自校准(36 × 单通道 ≈ 11-23s) → 窗口 50s(> SPI 层 45s)。
 bool Psoc::auto_tune(uint8_t ch, uint8_t pref, uint8_t host_seq, uint8_t* out_result, uint16_t* out_div) {
@@ -668,6 +817,10 @@ bool Psoc::busy_grace_active() const {
 
 void Psoc::reset_run() {
     _swd.reset_target_run();   // 脉冲 XRES 复位 PSoC 进运行态
+    // 复位后旧算法信息不能跨 PSoC 实例复用；递增 epoch 令 core0 读缓存时立即失效。
+    _algo_info_epoch++;
+    if (_algo_info_epoch == 0u) _algo_info_epoch = 1u;
+    __dmb();
     // 设启动宽限: XRES 后 PSoC 需数百 ms 跑完 initialize_capsense 才恢复 SPI, 期间失效兜底
     // 不得触发新的复位, 否则形成永久复位死循环(链路永不恢复)。core1 的失效检测读此截止时间。
     _reset_grace_until_ms = millis() + RESET_BOOT_GRACE_MS;

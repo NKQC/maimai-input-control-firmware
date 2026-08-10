@@ -1,0 +1,224 @@
+import { Button, CheckBox, HorizontalBox, ScrollView, VerticalBox } from "std-widgets.slint";
+import { HidPointCell } from "../common/types.slint";
+import { SectionCard } from "../common/widgets.slint";
+import { Theme } from "../common/theme.slint";
+
+component HidPointRow inherits Rectangle {
+    in property <HidPointCell> entry;
+    in property <bool> selected: false;
+    callback selected_click(int);
+    callback enabled_set(int, bool);
+
+    height: 36px;
+    border-width: root.selected ? 2px : 1px;
+    border-color: root.selected ? Theme.accent : Theme.border;
+    border-radius: Theme.radius-small;
+    background: root.selected ? #203b4a : (root.entry.enabled ? Theme.panel : Theme.panel-deep);
+
+    HorizontalLayout {
+        padding-left: Theme.gap;
+        padding-right: Theme.gap;
+        spacing: Theme.gap;
+        CheckBox {
+            checked: root.entry.enabled;
+            toggled => { root.enabled_set(root.entry.channel, self.checked); }
+        }
+        Text {
+            text: root.entry.label;
+            min-width: 38px;
+            color: root.entry.touched ? Theme.ok-text : Theme.text-title;
+            font-weight: 700;
+            vertical-alignment: center;
+        }
+        Text {
+            text: root.entry.coord_text;
+            color: root.entry.enabled ? Theme.text-sub : Theme.text-dim;
+            font-size: Theme.fs-small;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+            overflow: elide;
+        }
+    }
+    TouchArea {
+        x: 36px;
+        width: parent.width - self.x;
+        mouse-cursor: pointer;
+        clicked => { root.selected_click(root.entry.channel); }
+    }
+}
+
+component HidCanvas inherits Rectangle {
+    in property <image> screenshot;
+    in property <int> image_width: 0;
+    in property <int> image_height: 0;
+    in property <[HidPointCell]> points: [];
+    in property <int> selected_channel: -1;
+    callback point_commit(int, int, int);
+
+    property <float> zoom: 1;
+    property <length> pan_x: 0px;
+    property <length> pan_y: 0px;
+    property <length> _drag_pan_x: 0px;
+    property <length> _drag_pan_y: 0px;
+    property <bool> _pan_drag: false;
+    property <float> _next_zoom: 1;
+    property <float> _cursor_u: 0;
+    property <float> _cursor_v: 0;
+    property <length> fit_w: root.image_width > 0 && root.image_height > 0
+        ? Math.min(root.width, root.height * root.image_width / root.image_height) : 0px;
+    property <length> fit_h: root.image_width > 0 && root.image_height > 0
+        ? root.fit_w * root.image_height / root.image_width : 0px;
+    property <length> image_w: root.fit_w * root.zoom;
+    property <length> image_h: root.fit_h * root.zoom;
+    property <length> image_x: (root.width - root.image_w) / 2 + root.pan_x;
+    property <length> image_y: (root.height - root.image_h) / 2 + root.pan_y;
+
+    function _commit_at(px: length, py: length) {
+        if (root.selected_channel >= 0 && root.image_w > 0px && root.image_h > 0px) {
+            root.point_commit(root.selected_channel,
+                Math.round(Math.clamp((px - root.image_x) / root.image_w, 0, 1) * 32767),
+                Math.round(Math.clamp((py - root.image_y) / root.image_h, 0, 1) * 32767));
+        }
+    }
+
+    background: #090b0d;
+    border-width: 1px;
+    border-color: Theme.border;
+    border-radius: Theme.radius;
+    clip: true;
+
+    Image {
+        x: root.image_x;
+        y: root.image_y;
+        width: root.image_w;
+        height: root.image_h;
+        source: root.screenshot;
+        image-fit: fill;
+    }
+
+    for point in root.points: Rectangle {
+        x: root.image_x + root.image_w * point.x / 32767 - 7px;
+        y: root.image_y + root.image_h * point.y / 32767 - 7px;
+        width: 14px;
+        height: 14px;
+        border-radius: 7px;
+        border-width: point.channel == root.selected_channel ? 3px : 1px;
+        border-color: point.channel == root.selected_channel ? Theme.pick : #ffffff;
+        background: point.enabled ? (point.touched ? Theme.ok : Theme.info) : #4a5560;
+        visible: root.image_width > 0 && root.image_height > 0;
+        Text {
+            x: -14px;
+            y: 15px;
+            width: 42px;
+            text: point.channel;
+            color: Theme.text-title;
+            font-size: Theme.fs-small;
+            horizontal-alignment: center;
+        }
+    }
+
+    Text {
+        visible: root.image_width <= 0 || root.image_height <= 0;
+        text: @tr("等待主屏截图");
+        color: Theme.text-dim;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    area := TouchArea {
+        mouse-cursor: root._pan_drag ? grab : crosshair;
+        pointer-event(e) => {
+            if (e.kind == PointerEventKind.down) {
+                root._pan_drag = e.modifiers.shift;
+                root._drag_pan_x = root.pan_x;
+                root._drag_pan_y = root.pan_y;
+            }
+        }
+        moved => {
+            if (self.pressed) {
+                if (root._pan_drag) {
+                    root.pan_x = root._drag_pan_x + self.mouse-x - self.pressed-x;
+                    root.pan_y = root._drag_pan_y + self.mouse-y - self.pressed-y;
+                } else {
+                    root._commit_at(self.mouse-x, self.mouse-y);
+                }
+            }
+        }
+        clicked => {
+            if (!root._pan_drag) { root._commit_at(self.mouse-x, self.mouse-y); }
+        }
+        scroll-event(e) => {
+            root._next_zoom = Math.clamp(root.zoom * (e.delta-y > 0 ? 1.15 : 0.869565), 1, 8);
+            root._cursor_u = Math.clamp((self.mouse-x - root.image_x) / root.image_w, 0, 1);
+            root._cursor_v = Math.clamp((self.mouse-y - root.image_y) / root.image_h, 0, 1);
+            root.pan_x = self.mouse-x - (root.width - root.fit_w * root._next_zoom) / 2 - root._cursor_u * root.fit_w * root._next_zoom;
+            root.pan_y = self.mouse-y - (root.height - root.fit_h * root._next_zoom) / 2 - root._cursor_v * root.fit_h * root._next_zoom;
+            root.zoom = root._next_zoom;
+            return accept;
+        }
+        double-clicked => { root.zoom = 1; root.pan_x = 0px; root.pan_y = 0px; }
+    }
+}
+
+export component HidTouchPage inherits Rectangle {
+    in property <[HidPointCell]> points: [];
+    in property <image> screenshot;
+    in property <int> image_width: 0;
+    in property <int> image_height: 0;
+    in-out property <int> selected_channel: -1;
+    callback screenshot_refresh();
+    callback point_commit(int, int, int);
+    callback point_enabled_set(int, bool);
+
+    VerticalBox {
+        padding: Theme.page-pad;
+        spacing: Theme.gap;
+        HorizontalLayout {
+            height: Theme.row-height;
+            Text {
+                text: @tr("HID 触控点位");
+                color: Theme.text-title;
+                font-size: Theme.fs-page;
+                font-weight: 700;
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+            }
+            Text {
+                text: @tr("滚轮缩放 · Shift+拖动平移 · 点击或拖动放置选中通道");
+                color: Theme.text-dim;
+                font-size: Theme.fs-small;
+                vertical-alignment: center;
+            }
+            Button { text: @tr("刷新截图"); clicked => { root.screenshot_refresh(); } }
+        }
+        HorizontalLayout {
+            spacing: Theme.card-gap;
+            HidCanvas {
+                horizontal-stretch: 3;
+                screenshot: root.screenshot;
+                image_width: root.image_width;
+                image_height: root.image_height;
+                points: root.points;
+                selected_channel: root.selected_channel;
+                point_commit(ch, x, y) => { root.point_commit(ch, x, y); }
+            }
+            SectionCard {
+                min-width: 276px;
+                horizontal-stretch: 1;
+                title: @tr("物理通道");
+                subtitle: root.selected_channel >= 0 ? (@tr("CH") + root.selected_channel) : @tr("请选择通道");
+                ScrollView {
+                    VerticalBox {
+                        spacing: 3px;
+                        for point in root.points: HidPointRow {
+                            entry: point;
+                            selected: point.channel == root.selected_channel;
+                            selected_click(ch) => { root.selected_channel = ch; }
+                            enabled_set(ch, on) => { root.point_enabled_set(ch, on); }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

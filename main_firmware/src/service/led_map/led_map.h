@@ -49,10 +49,22 @@ public:
         return channel < LEDMAP_CHANNEL_COUNT && _chain_ready[channel];
     }
 
+    /// 从 ConfigManager 重新读取 led.ws_brightness 并立刻推给两条灯链。
+    /// 由 CFG_SET / CFG_SET_BATCH(键前缀 led.) 与 RESET_DEFAULTS 调用 —— 与 HidTouchMapper::reload()
+    /// 同一约定: 配置一写进 RAM 影子就生效, 不必等 500ms 轮询窗, 也不必等 flash 落地或重启。
+    /// ★只刷亮度★ 灯链长度(led.ws_count0/1)决定 NeoPixel 实例的缓冲与 PIO 建链, 运行期改它必须重建
+    /// 灯链(init/deinit), 那是与"改个亮度"完全不同量级的动作, 不在本入口内偷偷做。
+    void reload_brightness();
+
     // 协议色输入: 11×3 (r,g,b) flat
     void set_unit_colors(const uint8_t* rgb_flat);
     // 限速输出(非阻塞); 每次只推一条链
     void task();
+
+    /// 当前**已生效**的亮度(灯链正在用的那个值), 供 LED_GET 与上位机对账。
+    /// ★与 KV 里的 led.ws_brightness 是两件事★: 后者只是配置, 前者才是硬件行为的真相源 ——
+    /// 没有这个回读, "亮度生效了吗"就只能靠肉眼看灯。
+    inline uint8_t applied_brightness() const { return _brightness; }
 
     inline const LedMapEntry* map_table() const { return _map; }
     // 整表原子校验(越界/重叠) → 生效 → 请求持久化; 任一项非法则整批不生效

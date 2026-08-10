@@ -17,9 +17,9 @@
 #include "psoc_algo_abi.h"
 
 /* 上位机 schema(宏展开为空, 被上位机 grep 出以建折线/可调项)。 */
-ALGO_REPORT(0, "diff")     /* 实时 diff(滤波后有效差值), 便于在"算法上报"折线看信号强弱 */
-ALGO_REPORT(1, "active")   /* 当前触发判定(0/1) */
-ALGO_REPORT(2, "led")      /* 本算法请求的白灯状态(0/1) */
+ALGO_REPORT_META(0, "diff", "u16", 0, 65535, "实时滤波后有效差值", "有效差值")
+ALGO_REPORT_META(1, "active", "bool", 0, 1, "当前触发判定", "触发状态")
+ALGO_REPORT_META(2, "led", "bool", 0, 1, "算法请求的白灯状态", "白灯状态")
 
 /* ABI 入口, 必须是 .text 首符号(本文件仅此一个函数)。 */
 void algo(algo_io_t *io)

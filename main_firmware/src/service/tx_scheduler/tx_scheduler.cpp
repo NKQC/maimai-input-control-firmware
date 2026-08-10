@@ -6,7 +6,7 @@ TxScheduler* TxScheduler::_instance = nullptr;
 
 TxScheduler::TxScheduler() {
     for (uint8_t i = 0; i < MAX_TASKS; i++) {
-        _tasks[i] = Task{false, 0, 0, 0, 0, nullptr};
+        _tasks[i] = Task{false, 0, 0, 0, 0, nullptr, nullptr};
     }
 }
 
@@ -31,7 +31,8 @@ int8_t TxScheduler::_alloc(uint8_t id) {
     return -1;
 }
 
-void TxScheduler::schedule(uint8_t id, uint32_t interval_us, uint32_t lease_ms, EmitFn fn) {
+void TxScheduler::schedule(uint8_t id, uint32_t interval_us, uint32_t lease_ms, EmitFn fn,
+                           ExpireFn expire_fn) {
     const int8_t slot = _alloc(id);
     if (slot < 0) return;   // 任务表满: 忽略(过载保护, 不阻塞)
     Task& t = _tasks[slot];
@@ -41,6 +42,7 @@ void TxScheduler::schedule(uint8_t id, uint32_t interval_us, uint32_t lease_ms, 
     t.id = id;
     t.interval_us = interval_us;
     t.fn = fn;
+    t.expire_fn = expire_fn;
     t.lease_deadline_us = (lease_ms == 0) ? 0u : (now_us + lease_ms * 1000u);
     if (!reuse) {
         t.next_us = now_us;   // 新建/改频: 立即排首帧
@@ -79,7 +81,9 @@ void TxScheduler::tick() {
         if (!t.active) continue;
         // 租约到期 → 自动停(续期超时/上位机丢失)。
         if (t.lease_deadline_us != 0 && (int32_t)(now_us - t.lease_deadline_us) >= 0) {
+            const ExpireFn expire_fn = t.expire_fn;
             t.active = false;
+            if (expire_fn) expire_fn();
             continue;
         }
         // 未到发送时刻(有符号差处理 32 位回绕)。

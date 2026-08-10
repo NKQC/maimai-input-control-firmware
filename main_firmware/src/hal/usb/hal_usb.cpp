@@ -52,6 +52,10 @@ volatile uint8_t g_usb_flash_busy = 0u;
 
 volatile uint32_t g_last_host_cmd_ms = 0u;
 
+// core1 阶段码(core1 唯一写者)。★与 core0 的 watchdog scratch[1] 彻底分开★:
+// 共享同一格会让 core1 把 core0 的死前遗言盖掉, 详见 usb_debug.h 的 core1_stage_set 注释。
+volatile uint8_t g_core1_stage = 0u;
+
 // USB描述符
 static const tusb_desc_device_t device_descriptor = {
     .bLength            = sizeof(tusb_desc_device_t),
@@ -491,10 +495,9 @@ bool HAL_USB_Device::config_write(const uint8_t* data, size_t length) {
     // 超时(TIMEOUT_US)仍写不完 = 过载, 返回 false(命令响应→上位机重试; 遥测→下周期再发)。
     // 有上限、不永久阻塞; 配合上层"定时任务队列+续期降频"避免频繁触发忙等。
     static uint64_t last_avail_time = 0;
-    // 10ms 上限: 大响应帧(如 CFG_GET_ALL ~3KB)在 64B FIFO 下需分约 50 段, 每段等 IN 泵出,
-    // 3ms 不足以发完→超时丢帧。10ms 为已验证 PASS 值。大帧仅连接时偶发, 单次阻塞可接受;
-    // 遥测等高频帧较小(分段少), 且由定时任务队列降频, 不会频繁触发满忙等。
-    const uint64_t TIMEOUT_US = 10000;
+    // FIFO 已扩至 2048B，且遥测以整帧门限发送，正常路径一次写入即完成；保留短忙等
+    // 仅兜住偶发的满 FIFO，避免此前 10ms 内反复 tud_task() 形成空转。
+    const uint64_t TIMEOUT_US = 2000;
     size_t total_written = 0;
     const uint64_t start_time = time_us_64();
     while (total_written < length) {
@@ -540,13 +543,17 @@ bool HAL_USB_Device::config_write(const uint8_t* data, size_t length) {
 size_t HAL_USB_Device::config_write_some(const uint8_t* data, size_t length) {
     if (!is_ready() || !data || length == 0) return 0;
 
+    // 命令响应与异步推送共用 vendor FIFO。响应泵送只能在当前主循环中短暂写入，
+    // 不能递归 task()/tud_task()；TinyUSB 在 task() 内再次进入端点流处理会让
+    // Windows 的第二个 IN transfer 看到 STALL。UsbComm 会在下一轮继续泵送。
     UsbIrqLock lock;
-    const size_t chunk = std::min((size_t)tud_vendor_write_available(), length);
-    const size_t written = chunk > 0 ? tud_vendor_write(data, (uint32_t)chunk) : 0;
-    tud_vendor_write_flush();
+    const size_t chunk = std::min(static_cast<size_t>(tud_vendor_write_available()), length);
+    const size_t written = chunk > 0
+        ? tud_vendor_write(data, static_cast<uint32_t>(chunk)) : 0;
+    if (written > 0) tud_vendor_write_flush();
     if (written > 0) {
         g_usb_dbg.vendor_tx_calls++;
-        g_usb_dbg.vendor_tx_bytes += (uint32_t)written;
+        g_usb_dbg.vendor_tx_bytes += static_cast<uint32_t>(written);
     }
     return written;
 }
@@ -560,6 +567,11 @@ void HAL_USB_Device::end_command_response() {
 }
 
 size_t HAL_USB_Device::config_write_available() const {
+    if (!initialized_ || _command_response_active) return 0;
+    return tud_vendor_write_available();
+}
+
+size_t HAL_USB_Device::config_response_write_available() const {
     if (!initialized_) return 0;
     return tud_vendor_write_available();
 }

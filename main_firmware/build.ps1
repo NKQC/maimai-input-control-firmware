@@ -262,17 +262,16 @@ function Invoke-CdcSmoke($Topology) {
     try {
         $lightPort.Open()
         $lightPort.DiscardInBuffer()
-        [byte[]]$versionRequest = 0xE0, 0x00, 0x00, 0x12, 0xF2
-        $lightPort.Write($versionRequest, 0, $versionRequest.Length)
-        $reply = Read-SerialExact $lightPort 8 2500
-        $checksum = [byte]0
-        for ($index = 0; $index -lt 7; $index++) { $checksum = $checksum -bxor $reply[$index] }
-        if ($reply[0] -ne 0xE0 -or $reply[2] -ne 3 -or $reply[3] -ne 0x12 -or
-            $reply[4] -ne 0 -or $reply[5] -ne 0 -or $reply[6] -ne 0x10 -or
-            $reply[7] -ne $checksum) {
-            throw "Mai2Light GET_PROTOCOL_VERSION reply invalid: $([BitConverter]::ToString($reply))"
+        [byte[]]$lightRequest = 0xE0, 0x00, 0x00, 0x01, 0xF3, 0xF4
+        $lightPort.Write($lightRequest, 0, $lightRequest.Length)
+        $reply = Read-SerialExact $lightPort 11 2500
+        [byte[]]$expectedReply = 0xE0, 0x00, 0x00, 0x06, 0x01, 0xF3, 0x01, 0x01, 0x01, 0x01, 0xFE
+        for ($index = 0; $index -lt $expectedReply.Length; $index++) {
+            if ($reply[$index] -ne $expectedReply[$index]) {
+                throw "Mai2Light LIGHT smoke reply invalid: $([BitConverter]::ToString($reply))"
+            }
         }
-        Write-Host "MAI2LIGHT CDC PASS: protocol version 0x$('{0:X2}' -f $reply[6]), reply $([BitConverter]::ToString($reply))"
+        Write-Host "MAI2LIGHT CDC PASS: LIGHT reply $([BitConverter]::ToString($reply))"
     }
     finally {
         if ($lightPort.IsOpen) { $lightPort.Close() }

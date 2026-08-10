@@ -50,6 +50,11 @@ public:
     bool measure_cp();                                             // 发送命令并等待 BIST 后固件恢复正常 CSD 扫描
     bool get_cp(uint8_t ch, uint32_t* out_cp);                     // 测量中=0，成功=fF，失败/未测量=0xFFFFFF
     bool apply();                                                   // 应用硬件参数(重扫/重校准)
+    // ★Sweep 专用轻量应用★帧 [magic, QUICK_APPLY, ch, gain, div, 0, 0]；PSoC 主循环在
+    // NOT_BUSY 窗口原子写入 gain/div 后 Initialize + 准备 CSD，不重校准/不重基线。
+    bool quick_apply(uint8_t ch, uint8_t gain, uint8_t div);
+    // 请求 PSoC 只扫描一个已启用通道；0xFF 立即回到全通道。返回 true 仅代表 PSoC 明确确认当前目标。
+    bool focus_scan(uint8_t ch);
     // 真正的 IDAC 重校准 + 基线复位。ch(帧字节2): 0..35=只校准该 widget 并只初始化该 widget 基线,
     // 0xFF=全 36 通道。单通道用时约为全通道的 1/36, 故超时窗按目标范围分档给。
     bool calibrate(uint8_t ch = 0xFFu);
@@ -96,6 +101,13 @@ public:
     // 状态机自动 BEGIN→逐页→完成。完成时把整份快照写入 *out 并返回 true（该次为最后一块）；
     // 未完成返回 false。中途出错自动回到空闲，下次重新开始。
     bool snapshot_pump(uint8_t max_pages, psoc::SensorSnapshot* out);
+
+    // ★单通道快照快路(独占流专用)★：只读目标通道占用的 2-3 页, 一次调用读完一份完整样本。
+    // 独占精调时上位机只关心该通道, 为它搬运全部 63 页(=16 个 1ms tick ⇒ 62 份/s 上限)纯属浪费。
+    // 只取 [ch*7, ch*7+6] 覆盖的页 ⇒ 单份约 0.5ms, 落在一个 core1 周期内 ⇒ 可达 ~1000 份/s,
+    // 不丢失细节采样。仅回填该通道, 其余通道保持调用方原值(独占期上位机本就不消费它们)。
+    // 成功返回 true 并已把该通道写入 *out(含 generation/valid)。
+    bool snapshot_pump_channel(uint8_t channel, psoc::SensorSnapshot* out);
 
     bool ready() const { return _ready; }
 

@@ -17,6 +17,9 @@ void app_config_register_schema() {
         config_map["comm.light_baud"]            = ConfigValue(uint32_t(115200));
         config_map["comm.serial_reset_calibrate"] = ConfigValue(false);
         config_map["comm.serial_reset_baseline"]  = ConfigValue(true);
+        // 主机侧 latency correction 只重组设备已上报的三段实测峰值，不改变固件触控时序。
+        // 与 touch_delay_100us 的人工串口延迟线完全独立，默认关闭以保持既有显示口径。
+        config_map["comm.latency_correction_en"] = ConfigValue(false);
         // ★这两个是唯一真正"平移上报"的延迟★: 100us 时间片, 0..1000 片 = 0..100ms。
         // touch_delay_100us 由 GameIoService::task() 的 DelayLine 消费(game_io.cpp:323 刷新档位,
         // :328 取延迟后的值送 mai2serial) —— 它把触控上报整体往后平移, 不改变上报频率。
@@ -34,6 +37,10 @@ void app_config_register_schema() {
         // 档位越高 → PSoC 在"校准刚好通过的临界最高频率"基础上往低频多让 2 个 snsClk 分频/档,
         // 充电更充分产生近场探测效应(更灵敏); 档位 1 = 临界频率本身(最不灵敏, 余量最小)。
         config_map["calib.pref"]                 = ConfigValue(uint8_t(4), uint8_t(1), uint8_t(7));
+        // 每颗 PSoC 启动并完成 provisioning 后执行一次的非阻塞校准流水线。
+        config_map["calib.boot_idac"]            = ConfigValue(true);
+        config_map["calib.boot_channel"]         = ConfigValue(true);
+        config_map["calib.boot_baseline"]        = ConfigValue(true);
 
         // ===== mode.work (1 key) =====
         config_map["mode.work"]                  = ConfigValue(uint8_t(0), uint8_t(0), uint8_t(1));
@@ -168,6 +175,32 @@ void app_config_register_schema() {
             // 默认恒等绑定:逻辑分区 i → 物理通道 i(0..33)，保持开箱可用(等价旧 ZONE_CHANNEL_MAP)，
             // 用户可经绑定页/指触改到实际接线。值语义=物理通道索引(0..35)，0xFFFFFFFF=未映射。
             config_map[key_buf] = ConfigValue(uint32_t(i));
+        }
+
+        // ===== hid.en00..35 / hid.x00..35 / hid.y00..35 (108 keys) HID 触摸屏点位 =====
+        // ★与 bind.mapNN 完全独立的第二套映射★
+        //   bind.mapNN: 逻辑分区(34) → 物理通道, 只服务 WORK_SERIAL 的 mai2 串口协议;
+        //   hid.*     : 物理通道(36) → 屏幕绝对坐标, 只服务 WORK_HID 的触摸屏上报。
+        // 两者语义维度都不同(分区 vs 通道、通道号 vs 坐标), 故绝不复用同一份 KV: 任一方向的复用都会
+        // 让"切工作模式"或"改一边"静默破坏另一边。键前缀分离后, 上位机两页各读各的, 互不覆盖。
+        //
+        // 坐标域 = HID 触屏描述符 usage 0x30/0x31 的 LOGICAL_MAXIMUM(见 hal_usb_hid.h 的
+        // `0x26,0xFF,0x7F`) ⇒ 0..32767, 由上位机换算屏幕归一坐标, 固件不再做任何缩放。
+        // 默认值给 6×6 均匀网格的格心(通道 i: 列=i%6, 行=i/6), 使"启用后即有合理点位"而不是全挤在
+        // 左上角(0,0); 但 hid.enNN 默认 false ⇒ **默认一个点都不输出**, 必须用户逐通道锚定后才生效。
+        for (int i = 0; i < 36; i++) {
+            char key_buf[16];
+            const uint32_t col = static_cast<uint32_t>(i % 6);
+            const uint32_t row = static_cast<uint32_t>(i / 6);
+            // 格心 = (2k+1)/12 全幅; 整数运算避免浮点(格心值 2731/8192/13653/19114/24575/30036)。
+            const uint16_t cx = static_cast<uint16_t>((2u * col + 1u) * 32767u / 12u);
+            const uint16_t cy = static_cast<uint16_t>((2u * row + 1u) * 32767u / 12u);
+            snprintf(key_buf, sizeof(key_buf), "hid.en%02d", i);
+            config_map[key_buf] = ConfigValue(false);
+            snprintf(key_buf, sizeof(key_buf), "hid.x%02d", i);
+            config_map[key_buf] = ConfigValue(cx, uint16_t(0), uint16_t(32767));
+            snprintf(key_buf, sizeof(key_buf), "hid.y%02d", i);
+            config_map[key_buf] = ConfigValue(cy, uint16_t(0), uint16_t(32767));
         }
     });
 }

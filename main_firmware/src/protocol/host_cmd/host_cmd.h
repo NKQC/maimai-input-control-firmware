@@ -30,6 +30,11 @@
 // 算法 C 源(最大 32KB)分片传输的单片字节数。payload 固定 4096 且 HostFrame 常作栈对象, 绝不放大,
 // 故源必须分片; 留出 4 字节片头(offset/total 或 total/offset)后仍有充裕余量。
 #define HOST_CMD_ALGO_SRC_CHUNK 2048
+// CFG_GET_ALL 单片 payload 上限。★不再攒到满 4096★: 满载片让"边界算术只要错 1 字节就写穿
+// _resp_buf"这件事从"有余量"变成"零余量", 而分片语义本身允许任意片长(上位机按 STREAM/RESPONSE
+// 累积, 对单片大小无任何假设, 见 app_state/mod.rs 的 _handle_cfg_get_all_response)。
+// 取 1024: 319 项约 2.1KB ⇒ 3~4 片, 既不显著增加往返, 又把单片占用和峰值压到 1/4。
+#define CFG_GET_ALL_FRAME_PAYLOAD_MAX 1024u
 
 // flags 定义
 #define HOST_CMD_FLAG_RESPONSE  0x01  // bit0=1 表示响应
@@ -116,6 +121,12 @@ enum class HostCmd : uint8_t {
     TELEM_START     = 0x30,
     TELEM_STOP      = 0x31,
     TELEM_DATA      = 0x32,
+    FOCUS_START     = 0x33,  // [ch,fields,rate u16 LE,lease u16 LE] -> [session u16,accepted_rate u16]
+    FOCUS_STOP      = 0x34,  // [session u16]
+    FOCUS_DATA      = 0x35,  // STREAM: [session,sample_seq,generation,ch,fields,t_us,selected fields]
+    SWEEP_START     = 0x36,  // [ch,settle_samples,sample_count] -> [session u16,total=448 u16]
+    SWEEP_CTRL      = 0x37,  // [op(0 cancel/1 resend),session u16,first u16,count u8]
+    SWEEP_DATA      = 0x38,  // STREAM: cached grid result / restoring / terminal state
     
     // 绑区域 0x40-0x4F
     BIND_START      = 0x40,
@@ -250,9 +261,20 @@ public:
     static uint16_t encode_frame(const HostFrame& frame, uint8_t* out_buffer, uint16_t max_len);
     
     // 快捷编码应答(ACK/NAK)
+    // ★这两个绝不能持有 HostFrame★ 见下方 _encode_into 的注释: 它们被大量"已经持有一个栈上
+    // HostFrame"的 handler 调用, 再叠一个 4102B 帧就会越过 core0 的 8KB 栈写进堆。
     static uint16_t encode_ack(uint8_t seq, uint8_t* out_buffer, uint16_t max_len);
     static uint16_t encode_nak(uint8_t seq, HostCmdError err_code, const char* msg, 
                                uint8_t* out_buffer, uint16_t max_len);
+
+    // ★共享响应工作帧(core0 单线程复用)★
+    // HostFrame 是 4102B, 而 core0 的栈区只有 8192B 且其下界恰好是堆顶(__StackLimit==__HeapLimit
+    // ==0x20040000) —— 任何栈越界都是静默写坏 malloc arena, 随后第一个 malloc/free 就 hardfault。
+    // 组响应的 handler 一律借用本帧而不是在栈上开, 与 bus_usb_link.cpp 的 _resp_frame、
+    // sensor_link.h 的 _telem_frame 是同一手法。
+    // ★复用前提★: host_cmd 的分发是 core0 单线程、一帧处理完才取下一帧(UsbComm::update 内
+    // dispatch → 响应写完 → 返回), 故同一时刻只有一个使用者; 借用后必须先自行填全所用字段。
+    static HostFrame& resp_frame();
     
     // Entry 编码/解码(配置 KV 统一格式)
     // 编码一个条目到缓冲: type(u8) + has_range(u8) + key_len(u8) + key + value(+min+max if has_range)
@@ -268,6 +290,14 @@ public:
     bool is_idle() const { return _state == RxState::FIND_SOF0; }
 
 private:
+    // ★唯一的出向组帧实现★ 直接从 (cmd,flags,seq,payload,len) 组帧, 不经过 HostFrame。
+    // encode_frame / encode_ack / encode_nak 全部转发到这里, 于是"组一个帧"不再隐含
+    // "先在栈上摆一个 4102B 的 HostFrame"这个代价 —— 那正是 ACK/NAK 叠在 handler 帧之上
+    // 把 core0 栈顶出去、写坏堆、下一个 malloc 就 hardfault 的成因。
+    static uint16_t _encode_into(uint8_t cmd, uint8_t flags, uint8_t seq,
+                                 const uint8_t* payload, uint16_t len,
+                                 uint8_t* out_buffer, uint16_t max_len);
+
     enum class RxState {
         FIND_SOF0,
         FIND_SOF1,

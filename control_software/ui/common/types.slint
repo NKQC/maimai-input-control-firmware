@@ -144,25 +144,44 @@ export struct ChannelStatus {
     // 展示次序里的位次(0 起)。★排序在 Rust 侧做★: 逻辑顺序的唯一真相源是现有绑定映射
     // (AppController::binding_channel_of), 在 Slint 里复制一份映射必然与绑定页漂移。
     order: int,
+    // 链路新鲜度: 0=正常 1=遥测过期 2=连接离线/未知。Rust 复用 psoc_link_evidence 判定。
+    telemetry_state: int,
 }
 
-// 算法上报变量折线(main.rs::build_algo_trace_view 回填): idx 对应 io->report[idx](0..3),
-// name 来自源码 ALGO_REPORT(idx,"name") 声明; 未声明的 idx 该行 visible=false。
-// ★定义前置★: CurvesPage(算法可选叠加)与 AlgoPage 都用到, 须在两者之前声明(Slint 先声明后使用)。
+// 兼容曲线页内部过渡数据结构；算法页不再展示/回填 report 折线。
 export struct AlgoReportLine {
     idx: int,
     name: string,
     path: string,
     visible: bool,
-    // 该线取值只有 0/1(布尔类上报) → 才给它显示"归一化幅度 N"输入框。
     is_binary: bool,
-    // 二值线的归一化幅度 N: 0/1 被拉伸到 0..N 才能在共享右轴上看见。纯显示量, 不下发设备。
     norm_amp: float,
     line_color: color,
 }
 
-// 算法可调变量行(main.rs::build_algo_setting_rows 回填): idx 对应 io->cfg[idx](0..7),
-// name/default_val 来自源码 ALGO_SETTING(idx,"name",defval) 声明, value 为当前 cfg[idx]。
+// 算法变量元数据行：由源码声明生成，AlgoPage 展示名称、类型、范围、当前值、介绍与别名。
+export struct AlgoMetadataRow {
+    idx: int,
+    name: string,
+    value_type: string,
+    range: string,
+    current_value: string,
+    description: string,
+    alias: string,
+    kind: string,
+}
+
+// 算法可调变量行：保留编辑器所需的默认值/数值，同时携带元数据。
+export struct AlgoSettingRow {
+    idx: int,
+    name: string,
+    default_val: int,
+    value: int,
+    value_type: string,
+    range: string,
+    description: string,
+    alias: string,
+}
 // 虚拟摄像头输入源设备树的一行: 组头(分类)或设备项。
 // 日志页一行。no=全局行号(跨过滤稳定, 便于指位与去重), level: 0错误 1警告 2信息 3调试。
 export struct LogRow {
@@ -184,13 +203,6 @@ export struct VcamKbdRow {
     dev_index: int,
 }
 
-export struct AlgoSettingRow {
-    idx: int,
-    name: string,
-    default_val: int,
-    value: int,
-}
-
 // 一个虚拟 LED 单元的展平数据(main.rs::build_led_unit_rows 从 AppController 转换)。
 // unit: 0..10; 0..7=按键灯 8=Body 9=Ext 10=Side。
 // sample: LED_GET 回报的当前有效颜色(预览生效时即预览色), 直接给色块上色。
@@ -203,4 +215,18 @@ export struct LedUnitRow {
     ch_choice: int,
     start: int,
     count: int,
+}
+
+// HID 触控点位页的一行(= 一个物理通道)。
+// ★x/y 是屏幕归一坐标(0..32767), 不是像素★: 与固件 HID 触屏描述符的 LOGICAL_MAXIMUM 同域
+// (见 app_state::HID_COORD_MAX / 固件 TOUCH_LOGICAL_MAX), 因此换分辨率、换缩放都不需要重锚。
+// 画布上的像素位置由归一坐标 + 当前缩放/平移实时换算, 存储值与显示变换彻底解耦。
+export struct HidPointCell {
+    channel: int,
+    label: string,      // "CH0".."CH35"
+    enabled: bool,      // 该通道是否输出触摸点
+    x: int,             // 归一 X(0..32767)
+    y: int,             // 归一 Y(0..32767)
+    coord_text: string, // 右栏摘要文案(未锚定 / x,y)
+    touched: bool,      // 该通道此刻是否被触摸(遥测实时态, 便于确认锚的是哪一片)
 }

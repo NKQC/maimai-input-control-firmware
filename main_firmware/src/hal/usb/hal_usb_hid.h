@@ -31,6 +31,12 @@
 #define KEYBOARD_NUM            3       // 键盘数量 要和描述符保持一致
 #define KEYBOARD_SIMUL_PRESS    18      // 键盘最大同时报告数，与3个键盘端点 * 每端点6键一致
 
+// 触摸屏 X/Y 坐标的逻辑最大值。★必须与下方描述符里 usage 0x30/0x31 的 LOGICAL_MAXIMUM
+// (`0x26, 0xFF, 0x7F` = 32767)保持一致★: 上位机按此域给出归一坐标、固件按此域夹取,
+// 三处若各写一个数, 点位会被主机静默按满量程截断到屏幕边缘, 属于最难自查的一类偏移。
+// (同一描述符里另有几处 65535 是 scan time 与 PHYSICAL_MAXIMUM, 与 X/Y 逻辑域无关, 勿混用。)
+#define TOUCH_LOGICAL_MAX       32767u
+
 static const uint8_t hid_report_descriptor[] = {
     0x05, 0x0D,
     0x09, 0x04, // USAGE (Touch)

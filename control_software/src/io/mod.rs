@@ -46,6 +46,10 @@ const WRITE_MAX_REBUILDS: u32 = 6;
 /// 累计 0+120+240+480+960 = 1.8s > 一次重新枚举窗口。
 const WRITE_REBUILD_BACKOFF_STEP: Duration = Duration::from_millis(120);
 const WRITE_REBUILD_BACKOFF_CAP: Duration = Duration::from_millis(960);
+/// 连续 Windows ERROR_INVALID_FUNCTION/ERROR_BAD_COMMAND 类错误通常是设备仍在忙，
+/// 不应在短时间内耗尽端点重建预算。
+const WRITE_BUSY_ERROR_THRESHOLD: u32 = 3;
+const WRITE_BUSY_BACKOFF: Duration = Duration::from_secs(2);
 /// 单轮 IO 循环最多连续写出的帧数。一次 UI 保存会把数百帧一次性入队(36 通道参数 + 键位 + 全局项)，
 /// 全部背靠背写出会把设备 64B vendor OUT FIFO 打满并饿死读路径；分批写让读/写在同一轮交替推进。
 /// 这只限制单轮突发量，不改变任何轮询周期。
@@ -67,6 +71,12 @@ pub enum IoEvent {
     Connected,
     Disconnected,
     Error(String),
+    /// OUT 端点仍在枚举但设备暂不接受 vendor 写入(常见于写 flash/CSD 重初始化)。
+    DeviceBusy {
+        consecutive_errors: u32,
+    },
+    /// 忙窗口后的第一笔写入成功，说明端点已恢复可用。
+    DeviceRecovered,
     Frame(Frame),
 }
 
@@ -474,6 +484,8 @@ pub fn spawn(device_selector: &str) -> Result<IoHandle> {
         let mut read_buf = [0u8; 512];
         let mut last_drop_log = Instant::now();
         let mut dropped_since_log = 0u64;
+        let mut busy_error_streak: u32 = 0;
+        let mut busy_notified = false;
         // stall 自恢复限流：短窗口内过多次错误才真正进入端点恢复流程。
         const MAX_STALL_RECOVERIES: u32 = 8;
         let mut stall_recoveries: u32 = 0;
@@ -518,6 +530,12 @@ pub fn spawn(device_selector: &str) -> Result<IoHandle> {
                         });
                     match result {
                         Ok(()) => {
+                            if busy_notified {
+                                info!("WinUSB 设备已恢复: 写入重新成功");
+                                let _ = evt_tx.send(IoEvent::DeviceRecovered);
+                            }
+                            busy_error_streak = 0;
+                            busy_notified = false;
                             thread_stats
                                 .bytes_written
                                 .fetch_add(bytes.len() as u64, Ordering::Relaxed);
@@ -540,17 +558,55 @@ pub fn spawn(device_selector: &str) -> Result<IoHandle> {
                             thread::sleep(Duration::from_millis(4));
                         }
                         Err(error) => {
-                            rebuild_streak += 1;
-                            // 边界: 达到上限即结束，绝不打印越界的 #7/6(重试次数永远 <= 上限)。
-                            if rebuild_streak >= WRITE_MAX_REBUILDS {
-                                error!(
-                                    "WinUSB write failed after {} endpoint errors (recovery budget exhausted): {error} (kind={:?})",
-                                    rebuild_streak,
-                                    error.kind()
-                                );
-                                break;
+                            let is_os_22 = error.raw_os_error() == Some(22);
+                            if is_os_22 {
+                                busy_error_streak = busy_error_streak.saturating_add(1);
+                                if busy_error_streak >= WRITE_BUSY_ERROR_THRESHOLD && !busy_notified
+                                {
+                                    busy_notified = true;
+                                    warn!(
+                                        "WinUSB 设备疑似忙(写 flash/CSD 重初始化)，等待恢复: 连续 {} 次 os error 22",
+                                        busy_error_streak
+                                    );
+                                    let _ = evt_tx.send(IoEvent::DeviceBusy {
+                                        consecutive_errors: busy_error_streak,
+                                    });
+                                }
+                            } else {
+                                busy_error_streak = 0;
                             }
-                            // 同一次故障只在最终失败时报一次 ERROR；中间重试全部走 debug，不刷屏。
+                            rebuild_streak += 1;
+                            if is_os_22 && busy_error_streak >= WRITE_BUSY_ERROR_THRESHOLD {
+                                thread::sleep(WRITE_BUSY_BACKOFF);
+                            }
+                            // 只有端点重建失败且设备已从系统枚举中消失，才判定为真实拔出。
+                            if rebuild_streak >= WRITE_MAX_REBUILDS {
+                                match selected_device_present(&thread_selector) {
+                                    Ok(true) => {
+                                        warn!(
+                                            "WinUSB 写入恢复预算达到 {}，但设备仍在枚举；继续重建端点等待恢复",
+                                            WRITE_MAX_REBUILDS
+                                        );
+                                        rebuild_streak = 0;
+                                    }
+                                    Ok(false) => {
+                                        error!(
+                                            "WinUSB write failed after {} endpoint errors: device no longer enumerated (error={error}, kind={:?})",
+                                            rebuild_streak,
+                                            error.kind()
+                                        );
+                                        break;
+                                    }
+                                    Err(enumerate_error) => {
+                                        warn!(
+                                            "WinUSB 写入恢复预算达到 {}，枚举确认失败({}); 保留会话继续恢复",
+                                            WRITE_MAX_REBUILDS, enumerate_error
+                                        );
+                                        rebuild_streak = 0;
+                                    }
+                                }
+                            }
+                            // 中间重试走 debug，避免同一次设备忙故障刷屏。
                             debug!(
                                 "WinUSB write error: {error} (kind={:?}), endpoint recovery {}/{}",
                                 error.kind(),
@@ -660,18 +716,36 @@ pub fn spawn(device_selector: &str) -> Result<IoHandle> {
                         MAX_STALL_RECOVERIES
                     );
                     if stall_recoveries >= MAX_STALL_RECOVERIES {
-                        error!(
-                            "WinUSB read failed after {} short-window recoveries: {error}",
-                            stall_recoveries
-                        );
-                        log_link_diagnostics(
-                            &interface,
-                            "before disconnect after read recovery limit",
-                            &thread_stats,
-                        );
-                        let _ = evt_tx.send(IoEvent::Error(error.to_string()));
-                        let _ = evt_tx.send(IoEvent::Disconnected);
-                        return;
+                        match selected_device_present(&thread_selector) {
+                            Ok(true) => {
+                                debug!(
+                                    "WinUSB read recovery budget reached {}, but device remains enumerated; resetting recovery window and keeping session alive",
+                                    MAX_STALL_RECOVERIES
+                                );
+                                stall_recoveries = 0;
+                            }
+                            Ok(false) => {
+                                error!(
+                                    "WinUSB read failed after {} short-window recoveries: device no longer enumerated ({error})",
+                                    MAX_STALL_RECOVERIES
+                                );
+                                log_link_diagnostics(
+                                    &interface,
+                                    "before disconnect after read recovery limit",
+                                    &thread_stats,
+                                );
+                                let _ = evt_tx.send(IoEvent::Error(error.to_string()));
+                                let _ = evt_tx.send(IoEvent::Disconnected);
+                                return;
+                            }
+                            Err(enumerate_error) => {
+                                debug!(
+                                    "WinUSB read recovery budget reached {}, enumeration check failed ({}); resetting recovery window and keeping session alive",
+                                    MAX_STALL_RECOVERIES, enumerate_error
+                                );
+                                stall_recoveries = 0;
+                            }
+                        }
                     }
                     drop(reader.take());
                     match recover_endpoint("IN endpoint", &thread_selector, || {

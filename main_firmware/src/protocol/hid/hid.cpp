@@ -149,6 +149,24 @@ void HID::force_send_touch_report() {
     last_touch_send_ = _now;
 }
 
+// 把当前仍按下的触点全部转成抬起事件, 由下一次 task() 统一发出。
+// ★不在这里直接发★: 调用点在主循环热路径(输出抑制判定)上, 发报文要走 USB 端点;
+// 交给既有的 task() 触发式发送路径, 与按下/抬起走同一个出口, 不产生第二条发送时序。
+void HID::release_all_touch() {
+    if (!initialized_ || !hal_usb_) {
+        return;
+    }
+    if (touch_state.down_count() == 0) {
+        return;
+    }
+    touch_state.release_all();
+    touch_needs_send_ = true;
+}
+
+uint8_t HID::touch_down_count() const {
+    return touch_state.down_count();
+}
+
 void HID::report_keyboard() {
     // HID键盘报文格式: [modifier][reserved][key1][key2][key3][key4][key5][key6]
     // 总共8字节，符合标准HID键盘报文格式
@@ -206,8 +224,11 @@ void HID::report_keyboard() {
 
 void HID::report_touch(uint32_t _now) {
     static uint8_t TouchData[9];
-    bool has_sent_report = false;
-    
+
+    // 摘要字段用**当前并发触点数**(down_count), 不是"本轮事件数"。
+    // 边沿上报下每轮通常只有 1 个事件, 用事件数会让 36 指同按也恒报 1、抬起恒报 0。
+    const uint8_t contact_count = touch_state.down_count();
+
     // 处理按下的触摸点
     for (uint8_t i = 0; i < touch_state.press_modifier; i++) {
         const HID_TouchPoint& report = touch_state.touch_press[i];
@@ -221,10 +242,9 @@ void HID::report_touch(uint32_t _now) {
         TouchData[5] = (report.y >> 8) & 0xFF;      // Y坐标高字节
         TouchData[6] = (_now * 10) & 0xFF;          // 扫描时间低字节
         TouchData[7] = ((_now * 10) >> 8) & 0xFF;   // 扫描时间高字节
-        TouchData[8] = (touch_state.press_modifier > 1) ? 1 : 0; // 多点触摸标志
+        TouchData[8] = contact_count;               // 当前并发触点数
         
         hal_usb_->send_hid_report(HID_ReportID::REPORT_ID_TOUCHSCREEN, TouchData, 9);
-        has_sent_report = true;
     }
     
     // 处理松开的触摸点
@@ -240,26 +260,16 @@ void HID::report_touch(uint32_t _now) {
         TouchData[5] = 0;                           // Y坐标清零
         TouchData[6] = 0;                           // 扫描时间清零
         TouchData[7] = 0;                           // 扫描时间清零
-        TouchData[8] = 0;                           // 多点触摸标志清零
+        TouchData[8] = contact_count;               // 剩余并发触点数(全抬起时为 0)
         
         hal_usb_->send_hid_report(HID_ReportID::REPORT_ID_TOUCHSCREEN, TouchData, 9);
-        has_sent_report = true;
     }
     
-    // 清理已处理的松开触摸点
-    if (touch_state.release_modifier > 0) {
-        // 将release数组中的数据移动到press数组末尾，然后清空release数组
-        for (uint8_t i = 0; i < touch_state.release_modifier; i++) {
-            touch_state.remove(touch_state.touch_release[i].id);
-        }
-        touch_state.release_modifier = 0;
-    }
-    
-    // 清理已处理的按下触摸点状态（如果需要）
-    if (has_sent_report) {
-        // 重置press_modifier，因为所有按下的触摸点都已发送
-        touch_state.press_modifier = 0;
-    }
+    // ★两个队列都是"本轮待发事件", 发完无条件清空★
+    // 谁还按着由 touch_state.down_* 持久记录, 与这两个队列无关(见 hid.h 的语义说明);
+    // 旧实现把 press_modifier 兼作"按下集合", 清空后 release() 再也找不到该 id ⇒ 抬起报文永不发出。
+    touch_state.press_modifier = 0;
+    touch_state.release_modifier = 0;
 }
 
 void HID::task() {

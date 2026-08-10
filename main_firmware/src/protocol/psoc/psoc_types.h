@@ -46,6 +46,12 @@ enum class Cmd : uint8_t {
     BASELINE_RESET = 0x3C, // 仅重置全部通道基线(主循环执行)// 全部全局项设完后触发一次完整重初始化(合并, 防反复重校准漂移)
     AUTO_TUNE = 0x3D,      // 频率自适应下探(主循环逐档升 snsClk 分频重校准, 耗时数秒)
     GET_AUTO_TUNE = 0x3E,  // 读自适应结果: [magic,GET_AUTO_TUNE,result(0进行中/1成功/2失败),0,div24]
+    // ★Sweep 专用轻量应用★ [magic,QUICK_APPLY,ch,gain,div,0,0]: ISR 仅保存合法参数并置 pending；
+    // PSoC 主循环在 NOT_BUSY 窗口写 widgetContext 后 Initialize，不重校准 IDAC、不重置基线。
+    QUICK_APPLY = 0x3F,
+    // Focus 扫描控制: b2=0..35 启用/续租指定已启用通道, 0xFF=立即恢复全通道;
+    // 响应 b2=实际目标(0xFF=全通道), b3=1 接受 / 0 拒绝。
+    FOCUS_SCAN = 0x49,
     // JIT 可加载算法引擎：分页下发 blob 到 PSoC 的 1KB 可执行槽（ABI v1，见 jit-algo-engine.md）
     ALGO_BEGIN = 0x40,   // [magic,ALGO_BEGIN,len_lo,len_hi,0,0,0] 复位暂存写指针+记录期望 len
     ALGO_PAGE  = 0x41,   // [magic,ALGO_PAGE,page,d0,d1,d2,d3] 每页 4 字节写 staging[page*4..+4]

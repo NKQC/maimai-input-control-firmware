@@ -6,7 +6,9 @@
 
 BindingService* BindingService::_instance = nullptr;
 
-BindingService::BindingService() : _state(State::IDLE), _active_zone(0) {
+BindingService::BindingService()
+    : _state(State::IDLE), _active_zone(0), _bind_event_pending(false),
+      _bind_event_zone(0), _bind_event_channel(0xFF), _bind_event_status(0) {
     for (uint8_t z = 0; z < ZONE_COUNT; z++) _bind_ch[z] = 0xFF;
 }
 
@@ -49,6 +51,8 @@ uint64_t BindingService::map_to_areas(uint64_t touch_mask) const {
 }
 
 void BindingService::tick(uint64_t touch_mask, bool link_ok) {
+    // 先重试之前因命令响应占用 vendor TX 而暂存的主动事件。
+    _try_emit_bind_event();
     if (_state != State::WAIT_TOUCH) return;
     if (!link_ok || touch_mask == 0) return;
 
@@ -66,51 +70,67 @@ void BindingService::_complete_bind(uint8_t zone, uint8_t channel) {
 }
 
 void BindingService::_emit_bind_event(uint8_t zone, uint8_t channel, uint8_t status) {
-    HostFrame frame;
+    // BIND_EVENT 由 tick() 主动发送，可能发生在 dispatch() 之外，不能与响应共享帧重叠。
+    // 若当前响应占用 vendor TX，先保留事件，下一轮 tick 重试，不能静默丢回传。
+    if (_bind_event_pending) return;
+    _bind_event_pending = true;
+    _bind_event_zone = zone;
+    _bind_event_channel = channel;
+    _bind_event_status = status;
+    _try_emit_bind_event();
+}
+
+void BindingService::_try_emit_bind_event() {
+    if (!_bind_event_pending) return;
+    HAL_USB_Device* usb = HAL_USB_Device::getInstance();
+    if (!usb->is_ready() || usb->config_write_available() == 0) return;
+
+    static HostFrame frame;
     frame.clear();
     frame.cmd = static_cast<uint8_t>(HostCmd::BIND_EVENT);
     frame.flags = 0;
     frame.seq = 0;
-    frame.payload[0] = zone;
-    frame.payload[1] = channel;
-    frame.payload[2] = status;
+    frame.payload[0] = _bind_event_zone;
+    frame.payload[1] = _bind_event_channel;
+    frame.payload[2] = _bind_event_status;
     frame.len = 3;
 
     uint8_t tx_buf[32];
     const uint16_t frame_length = HostCmdCodec::encode_frame(frame, tx_buf, sizeof(tx_buf));
-    if (frame_length > 0) {
-        HAL_USB_Device::getInstance()->config_write(tx_buf, frame_length);
+    if (frame_length > 0 && usb->config_write(tx_buf, frame_length)) {
+        _bind_event_pending = false;
     }
 }
 
 void BindingService::_handle_bind_start(const HostFrame& frame, uint8_t* response, uint16_t* response_length) {
     if (frame.len < 1) {
         *response_length = HostCmdCodec::encode_nak(frame.seq, HostCmdError::INVALID_PARAM,
-            "bind_start payload too short", response, 512);
+            "bind_start payload too short", response, HOST_CMD_RESP_BUF_MAX);
         return;
     }
     const uint8_t zone = frame.payload[0];
     if (zone >= ZONE_COUNT) {
         *response_length = HostCmdCodec::encode_nak(frame.seq, HostCmdError::INVALID_PARAM,
-            "bind_start zone out of range", response, 512);
+            "bind_start zone out of range", response, HOST_CMD_RESP_BUF_MAX);
         return;
     }
 
     BindingService* self = getInstance();
     self->_active_zone = zone;
     self->_state = State::WAIT_TOUCH;
-    *response_length = HostCmdCodec::encode_ack(frame.seq, response, 512);
+    *response_length = HostCmdCodec::encode_ack(frame.seq, response, HOST_CMD_RESP_BUF_MAX);
 }
 
 void BindingService::_handle_bind_abort(const HostFrame& frame, uint8_t* response, uint16_t* response_length) {
     getInstance()->_state = State::IDLE;
-    *response_length = HostCmdCodec::encode_ack(frame.seq, response, 512);
+    *response_length = HostCmdCodec::encode_ack(frame.seq, response, HOST_CMD_RESP_BUF_MAX);
 }
 
 void BindingService::_handle_bind_get_map(const HostFrame& frame, uint8_t* response, uint16_t* response_length) {
     BindingService* self = getInstance();
 
-    HostFrame resp;
+    // HostFrame 为 4102B；core0 栈只有 8192B 且下界就是堆顶，响应帧必须借共享静态工作帧。
+    HostFrame& resp = HostCmdCodec::resp_frame();
     resp.clear();
     resp.cmd = static_cast<uint8_t>(HostCmd::BIND_GET_MAP);
     resp.flags = HOST_CMD_FLAG_RESPONSE;
@@ -119,20 +139,20 @@ void BindingService::_handle_bind_get_map(const HostFrame& frame, uint8_t* respo
     for (uint8_t z = 0; z < ZONE_COUNT; z++) {
         resp.payload[z] = self->_bind_ch[z];
     }
-    *response_length = HostCmdCodec::encode_frame(resp, response, 512);
+    *response_length = HostCmdCodec::encode_frame(resp, response, HOST_CMD_RESP_BUF_MAX);
 }
 
 void BindingService::_handle_bind_set_map(const HostFrame& frame, uint8_t* response, uint16_t* response_length) {
     if (frame.len < 2) {
         *response_length = HostCmdCodec::encode_nak(frame.seq, HostCmdError::INVALID_PARAM,
-            "bind_set_map payload too short", response, 512);
+            "bind_set_map payload too short", response, HOST_CMD_RESP_BUF_MAX);
         return;
     }
     const uint8_t zone = frame.payload[0];
     const uint8_t channel = frame.payload[1];
     if (zone >= ZONE_COUNT) {
         *response_length = HostCmdCodec::encode_nak(frame.seq, HostCmdError::INVALID_PARAM,
-            "bind_set_map zone out of range", response, 512);
+            "bind_set_map zone out of range", response, HOST_CMD_RESP_BUF_MAX);
         return;
     }
 
@@ -142,5 +162,5 @@ void BindingService::_handle_bind_set_map(const HostFrame& frame, uint8_t* respo
     ConfigManager::set_uint32(key_buf, value);
     getInstance()->reload_binding();
 
-    *response_length = HostCmdCodec::encode_ack(frame.seq, response, 512);
+    *response_length = HostCmdCodec::encode_ack(frame.seq, response, HOST_CMD_RESP_BUF_MAX);
 }

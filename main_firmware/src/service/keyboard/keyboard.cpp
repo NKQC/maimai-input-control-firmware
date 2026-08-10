@@ -2,6 +2,7 @@
 #include "../config_manager/config_manager.h"
 #include "../game_io/game_io.h"
 #include "../binding_service/binding_service.h"
+#include "../sensor_link/sensor_link.h"
 #include "../../protocol/hid/hid.h"
 #include "../../protocol/psoc/psoc.h"
 #include "../../hal/usb/hal_usb.h"
@@ -377,6 +378,8 @@ void KeyboardService::task() {
     }
     // 触控→键盘(组合语义): 不生效时 area_raw 保持 0，继续走同一全松开路径确保释放已按下的映射键。
     uint64_t area_raw = 0;
+    // 扫描会话期间该通道的 gain/div 被逐格改写, 掩码是无意义值 → 按全松开处理(见 output_suppressed)。
+    if (map_active && SensorLink::getInstance()->output_suppressed()) map_active = false;
     if (map_active) {
         Psoc* psoc = Psoc::getInstance();
         // 门禁用 touch_hold_ok()(保留窗口内仍可信), 而非瞬时 link_ok(): 后者会在错帧的那一拍
@@ -410,7 +413,8 @@ void KeyboardService::task() {
 
 void KeyboardService::_handle_get_state(const HostFrame& frame, uint8_t* resp, uint16_t* resp_len) {
     KeyboardService* self = getInstance();
-    HostFrame r;
+    // HostFrame 为 4102B；core0 栈只有 8192B 且下界就是堆顶，响应帧必须借共享静态工作帧。
+    HostFrame& r = HostCmdCodec::resp_frame();
     r.clear();
     r.cmd = static_cast<uint8_t>(HostCmd::KBD_GET_STATE);
     r.flags = HOST_CMD_FLAG_RESPONSE;
@@ -425,7 +429,7 @@ void KeyboardService::_handle_get_state(const HostFrame& frame, uint8_t* resp, u
     r.payload[3] = (uint8_t)((self->_edge_last_raw >> 8) & 0xFF);
     r.payload[4] = (uint8_t)(self->_phys_out & 0xFF);
     r.payload[5] = (uint8_t)((self->_phys_out >> 8) & 0xFF);
-    *resp_len = HostCmdCodec::encode_frame(r, resp, 512);
+    *resp_len = HostCmdCodec::encode_frame(r, resp, HOST_CMD_RESP_BUF_MAX);
 }
 
 // ============================================================================
@@ -434,7 +438,8 @@ void KeyboardService::_handle_get_state(const HostFrame& frame, uint8_t* resp, u
 
 void KeyboardService::_handle_get_keycfg(const HostFrame& frame, uint8_t* resp, uint16_t* resp_len) {
     KeyboardService* self = getInstance();
-    HostFrame r;
+    // HostFrame 为 4102B；core0 栈只有 8192B 且下界就是堆顶，响应帧必须借共享静态工作帧。
+    HostFrame& r = HostCmdCodec::resp_frame();
     r.clear();
     r.cmd = static_cast<uint8_t>(HostCmd::KBD_GET_KEYCFG);
     r.flags = HOST_CMD_FLAG_RESPONSE;
@@ -453,14 +458,14 @@ void KeyboardService::_handle_get_keycfg(const HostFrame& frame, uint8_t* resp, 
     r.payload[off++] = (uint8_t)(self->_pol_high_mask & 0xFF);
     r.payload[off++] = (uint8_t)((self->_pol_high_mask >> 8) & 0xFF);
     r.len = off;
-    *resp_len = HostCmdCodec::encode_frame(r, resp, 512);
+    *resp_len = HostCmdCodec::encode_frame(r, resp, HOST_CMD_RESP_BUF_MAX);
 }
 
 void KeyboardService::_handle_set_keycfg(const HostFrame& frame, uint8_t* resp, uint16_t* resp_len) {
     // 每项 4 字节: [idx, pol(0=低/1=高/2=AUTO), debounce_us(u16 LE)]。
     if (frame.len < 4 || (frame.len % 4) != 0) {
         *resp_len = HostCmdCodec::encode_nak(frame.seq, HostCmdError::INVALID_PARAM,
-            "kbd_set_keycfg payload must be [idx,pol,debounce16] quads", resp, 512);
+            "kbd_set_keycfg payload must be [idx,pol,debounce16] quads", resp, HOST_CMD_RESP_BUF_MAX);
         return;
     }
     // ★先全量校验再落值★ 非法值一律 NAK 且不写入任何一项(不静默夹取, 也不写半张表):
@@ -471,17 +476,17 @@ void KeyboardService::_handle_set_keycfg(const HostFrame& frame, uint8_t* resp, 
         const uint16_t db = (uint16_t)(frame.payload[off + 2] | ((uint16_t)frame.payload[off + 3] << 8));
         if (idx >= KEY_COUNT) {
             *resp_len = HostCmdCodec::encode_nak(frame.seq, HostCmdError::INVALID_PARAM,
-                "kbd_set_keycfg idx out of range (0..11)", resp, 512);
+                "kbd_set_keycfg idx out of range (0..11)", resp, HOST_CMD_RESP_BUF_MAX);
             return;
         }
         if (pol > 2) {
             *resp_len = HostCmdCodec::encode_nak(frame.seq, HostCmdError::INVALID_PARAM,
-                "kbd_set_keycfg pol must be 0(low) 1(high) or 2(auto)", resp, 512);
+                "kbd_set_keycfg pol must be 0(low) 1(high) or 2(auto)", resp, HOST_CMD_RESP_BUF_MAX);
             return;
         }
         if (db > DEBOUNCE_US_MAX) {
             *resp_len = HostCmdCodec::encode_nak(frame.seq, HostCmdError::INVALID_PARAM,
-                "kbd_set_keycfg debounce_us must be 0..10000", resp, 512);
+                "kbd_set_keycfg debounce_us must be 0..10000", resp, HOST_CMD_RESP_BUF_MAX);
             return;
         }
     }
@@ -496,7 +501,7 @@ void KeyboardService::_handle_set_keycfg(const HostFrame& frame, uint8_t* resp, 
     }
     // 只写 RAM 影子并即时下发生效; flash 落地统一由 SAVE_CONFIG 触发(保护 flash 寿命)。
     getInstance()->reload_map();
-    *resp_len = HostCmdCodec::encode_ack(frame.seq, resp, 512);
+    *resp_len = HostCmdCodec::encode_ack(frame.seq, resp, HOST_CMD_RESP_BUF_MAX);
 }
 
 void KeyboardService::_handle_get_edges(const HostFrame& frame, uint8_t* resp, uint16_t* resp_len) {
@@ -506,7 +511,8 @@ void KeyboardService::_handle_get_edges(const HostFrame& frame, uint8_t* resp, u
     if (frame.len >= 1 && frame.payload[0] != 0 && frame.payload[0] < EDGE_READ_MAX) {
         want = frame.payload[0];
     }
-    HostFrame r;
+    // HostFrame 为 4102B；core0 栈只有 8192B 且下界就是堆顶，响应帧必须借共享静态工作帧。
+    HostFrame& r = HostCmdCodec::resp_frame();
     r.clear();
     r.cmd = static_cast<uint8_t>(HostCmd::KBD_GET_EDGES);
     r.flags = HOST_CMD_FLAG_RESPONSE;
@@ -545,7 +551,8 @@ void KeyboardService::_handle_get_edges(const HostFrame& frame, uint8_t* resp, u
 
 void KeyboardService::_handle_get_map(const HostFrame& frame, uint8_t* resp, uint16_t* resp_len) {
     KeyboardService* self = getInstance();
-    HostFrame r;
+    // HostFrame 为 4102B；core0 栈只有 8192B 且下界就是堆顶，响应帧必须借共享静态工作帧。
+    HostFrame& r = HostCmdCodec::resp_frame();
     r.clear();
     r.cmd = static_cast<uint8_t>(HostCmd::KBD_GET_MAP);
     r.flags = HOST_CMD_FLAG_RESPONSE;
@@ -557,14 +564,14 @@ void KeyboardService::_handle_get_map(const HostFrame& frame, uint8_t* resp, uin
         r.payload[2 + i * 2] = self->_keymod[i];
     }
     r.len = 1 + KEY_COUNT * 2;
-    *resp_len = HostCmdCodec::encode_frame(r, resp, 512);
+    *resp_len = HostCmdCodec::encode_frame(r, resp, HOST_CMD_RESP_BUF_MAX);
 }
 
 void KeyboardService::_handle_set_map(const HostFrame& frame, uint8_t* resp, uint16_t* resp_len) {
     // 每项 3 字节: [idx, keycode, modifier]。
     if (frame.len < 3 || (frame.len % 3) != 0) {
         *resp_len = HostCmdCodec::encode_nak(frame.seq, HostCmdError::INVALID_PARAM,
-            "kbd_set_map payload must be [idx,keycode,mod] triples", resp, 512);
+            "kbd_set_map payload must be [idx,keycode,mod] triples", resp, HOST_CMD_RESP_BUF_MAX);
         return;
     }
     char key_buf[16];
@@ -580,12 +587,13 @@ void KeyboardService::_handle_set_map(const HostFrame& frame, uint8_t* resp, uin
     }
     // 只写 RAM 影子并即时下发生效; flash 落地统一由 SAVE_CONFIG 触发(保护 flash 寿命)。
     getInstance()->reload_map();
-    *resp_len = HostCmdCodec::encode_ack(frame.seq, resp, 512);
+    *resp_len = HostCmdCodec::encode_ack(frame.seq, resp, HOST_CMD_RESP_BUF_MAX);
 }
 
 void KeyboardService::_handle_get_hold(const HostFrame& frame, uint8_t* resp, uint16_t* resp_len) {
     KeyboardService* self = getInstance();
-    HostFrame r;
+    // HostFrame 为 4102B；core0 栈只有 8192B 且下界就是堆顶，响应帧必须借共享静态工作帧。
+    HostFrame& r = HostCmdCodec::resp_frame();
     r.clear();
     r.cmd = static_cast<uint8_t>(HostCmd::KBD_GET_HOLD);
     r.flags = HOST_CMD_FLAG_RESPONSE;
@@ -614,7 +622,7 @@ void KeyboardService::_handle_set_hold(const HostFrame& frame, uint8_t* resp, ui
     // 每项 6 字节: [kind(0=物理键/1=分区), idx, delay_ms(u16 LE), maxhold_ms(u16 LE)]。
     if (frame.len < 6 || (frame.len % 6) != 0) {
         *resp_len = HostCmdCodec::encode_nak(frame.seq, HostCmdError::INVALID_PARAM,
-            "kbd_set_hold payload must be [kind,idx,delay16,maxhold16] sextets", resp, 512);
+            "kbd_set_hold payload must be [kind,idx,delay16,maxhold16] sextets", resp, HOST_CMD_RESP_BUF_MAX);
         return;
     }
     char key_buf[16];
@@ -639,12 +647,13 @@ void KeyboardService::_handle_set_hold(const HostFrame& frame, uint8_t* resp, ui
     }
     // 只写 RAM 影子并即时下发生效; flash 落地统一由 SAVE_CONFIG 触发(保护 flash 寿命)。
     getInstance()->reload_map();
-    *resp_len = HostCmdCodec::encode_ack(frame.seq, resp, 512);
+    *resp_len = HostCmdCodec::encode_ack(frame.seq, resp, HOST_CMD_RESP_BUF_MAX);
 }
 
 void KeyboardService::_handle_get_touchmap(const HostFrame& frame, uint8_t* resp, uint16_t* resp_len) {
     KeyboardService* self = getInstance();
-    HostFrame r;
+    // HostFrame 为 4102B；core0 栈只有 8192B 且下界就是堆顶，响应帧必须借共享静态工作帧。
+    HostFrame& r = HostCmdCodec::resp_frame();
     r.clear();
     r.cmd = static_cast<uint8_t>(HostCmd::KBD_GET_TOUCHMAP);
     r.flags = HOST_CMD_FLAG_RESPONSE;
@@ -657,14 +666,14 @@ void KeyboardService::_handle_get_touchmap(const HostFrame& frame, uint8_t* resp
         r.payload[3 + z * 2] = self->_zone_mod[z];
     }
     r.len = 2 + ZONE_COUNT * 2;
-    *resp_len = HostCmdCodec::encode_frame(r, resp, 512);
+    *resp_len = HostCmdCodec::encode_frame(r, resp, HOST_CMD_RESP_BUF_MAX);
 }
 
 void KeyboardService::_handle_set_touchmap(const HostFrame& frame, uint8_t* resp, uint16_t* resp_len) {
     // 每项 3 字节: [zone, keycode, modifier]。
     if (frame.len < 3 || (frame.len % 3) != 0) {
         *resp_len = HostCmdCodec::encode_nak(frame.seq, HostCmdError::INVALID_PARAM,
-            "kbd_set_touchmap payload must be [zone,keycode,mod] triples", resp, 512);
+            "kbd_set_touchmap payload must be [zone,keycode,mod] triples", resp, HOST_CMD_RESP_BUF_MAX);
         return;
     }
     char key_buf[16];
@@ -680,7 +689,7 @@ void KeyboardService::_handle_set_touchmap(const HostFrame& frame, uint8_t* resp
     }
     // 只写 RAM 影子并即时下发生效; flash 落地统一由 SAVE_CONFIG 触发(保护 flash 寿命)。
     getInstance()->reload_map();
-    *resp_len = HostCmdCodec::encode_ack(frame.seq, resp, 512);
+    *resp_len = HostCmdCodec::encode_ack(frame.seq, resp, HOST_CMD_RESP_BUF_MAX);
 }
 
 // ============================================================================
@@ -692,7 +701,8 @@ void KeyboardService::_handle_set_touchmap(const HostFrame& frame, uint8_t* resp
 
 void KeyboardService::_handle_get_combo(const HostFrame& frame, uint8_t* resp, uint16_t* resp_len) {
     KeyboardService* self = getInstance();
-    HostFrame r;
+    // HostFrame 为 4102B；core0 栈只有 8192B 且下界就是堆顶，响应帧必须借共享静态工作帧。
+    HostFrame& r = HostCmdCodec::resp_frame();
     r.clear();
     r.cmd = static_cast<uint8_t>(HostCmd::KBD_GET_COMBO);
     r.flags = HOST_CMD_FLAG_RESPONSE;
@@ -715,20 +725,20 @@ void KeyboardService::_handle_get_combo(const HostFrame& frame, uint8_t* resp, u
         r.payload[off++] = (uint8_t)((cm.max_hold_ms >> 8) & 0xFFu);
     }
     r.len = off;
-    *resp_len = HostCmdCodec::encode_frame(r, resp, 512);
+    *resp_len = HostCmdCodec::encode_frame(r, resp, HOST_CMD_RESP_BUF_MAX);
 }
 
 void KeyboardService::_handle_set_combo(const HostFrame& frame, uint8_t* resp, uint16_t* resp_len) {
     // payload = [count] + count × 16B。count 允许为 0(清空整表)。
     if (frame.len < 1) {
         *resp_len = HostCmdCodec::encode_nak(frame.seq, HostCmdError::INVALID_PARAM,
-            "kbd_set_combo payload must start with count", resp, 512);
+            "kbd_set_combo payload must start with count", resp, HOST_CMD_RESP_BUF_MAX);
         return;
     }
     const uint8_t count = frame.payload[0];
     if (count > COMBO_COUNT || frame.len != (uint16_t)(1 + count * COMBO_ENTRY_BYTES)) {
         *resp_len = HostCmdCodec::encode_nak(frame.seq, HostCmdError::INVALID_PARAM,
-            "kbd_set_combo count/length mismatch", resp, 512);
+            "kbd_set_combo count/length mismatch", resp, HOST_CMD_RESP_BUF_MAX);
         return;
     }
 
@@ -782,5 +792,5 @@ void KeyboardService::_handle_set_combo(const HostFrame& frame, uint8_t* resp, u
     // 与 set_map/set_touchmap 同口径: 立刻重载一遍, 顺带把 comm.keyboard_map_en 的最新值读进来
     // (整表已写进 KV, _load_combo 读回的内容与刚 staged 的一致, 不会丢)。
     self->reload_map();
-    *resp_len = HostCmdCodec::encode_ack(frame.seq, resp, 512);
+    *resp_len = HostCmdCodec::encode_ack(frame.seq, resp, HOST_CMD_RESP_BUF_MAX);
 }

@@ -141,6 +141,20 @@ uint16_t LedMapService::chain_count(uint8_t channel) const {
     return _ws_count[channel];
 }
 
+void LedMapService::reload_brightness() {
+    // 立即取 KV 真值并推给已就绪的灯链。★同时把轮询窗口对齐到现在★: 否则本次刷新之后 _refresh()
+    // 仍可能在同一个 500ms 窗内再读一次(读到的是同一个值, 纯浪费一次 map<string> 查表)。
+    _brightness = ConfigManager::get_uint8("led.ws_brightness");
+    _brightness_refresh_ms = now_ms();
+    if (!_initialized) return;   // 未建链: 值已存好, init() 会用它
+    for (uint8_t ch = 0; ch < LEDMAP_CHANNEL_COUNT; ch++) {
+        if (_chain[ch] == nullptr || !_chain_ready[ch]) continue;
+        _chain[ch]->set_brightness(_brightness);
+    }
+    // 不在这里 show(): 输出仍由 task() 的 8.33ms 时隙按链交替推出(每链 60Hz), 下一个时隙即带上新亮度。
+    // 在命令上下文里直接推链会按字忙等 PIO FIFO(N×30us), 把 USB 响应窗口拖长。
+}
+
 void LedMapService::set_unit_colors(const uint8_t* rgb_flat) {
     if (rgb_flat == nullptr) return;
     memcpy(_protocol_rgb, rgb_flat, sizeof(_protocol_rgb));

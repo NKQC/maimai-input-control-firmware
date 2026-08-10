@@ -1,5 +1,5 @@
 import { Button, ComboBox, VerticalBox, HorizontalBox, ScrollView, TextEdit } from "std-widgets.slint";
-import { AlgoReportLine, AlgoSettingRow } from "../common/types.slint";
+import { AlgoMetadataRow, AlgoSettingRow } from "../common/types.slint";
 import { AlgoSettingEditorRow } from "../common/widgets.slint";
 import { Theme } from "../common/theme.slint";
 
@@ -34,15 +34,10 @@ export component AlgoPage inherits Rectangle {
     callback algo_load_template(int);    // 载入内置算法模板到编辑器: 0=v3.1 HDR, 1=纯白灯演示
     callback algo_source_edited(string); // 编辑时回传, main.rs 据此刷新行号
 
-    // 算法上报(report[]折线 + 触发判定追踪), 由 main.rs::build_algo_trace_view 回填。
-    in property <int> algo_sel_channel: 0;    // 当前追踪通道(与单通道精调页 sel_channel 一致, 只读展示)
-    in property <[AlgoReportLine]> algo_report_lines: [];
-    in property <string> algo_active_path: "";     // 触发判定(out_active)追踪折线
-    in property <int> algo_trace_point_count: 0;
-    // 可调变量(cfg[8]), 由 main.rs::build_algo_setting_rows 回填。
+    // 算法源码声明的变量元数据；UI 不轮询/绘制 report 折线。
+    in property <[AlgoMetadataRow]> algo_metadata_rows: [];
     in property <[AlgoSettingRow]> algo_setting_rows: [];
     callback algo_setting_edited(int, int);
-    callback report_toggle(int, bool);
 
     // ★整页装进 ScrollView★ 本页(标题 + 两行标签栏 + 编辑区下限 140px + 编译栏 + 容量条)的
     // min-height 约 420px, 与设置页底部 46px 保存栏在 520px 高窗口里贴得极近; TabWidget 的
@@ -280,82 +275,44 @@ export component AlgoPage inherits Rectangle {
 
             if root.content_tab == 1: VerticalBox {
                 padding: 0px;
-                spacing: 8px;
-
+                spacing: 6px;
+                Text { text: "算法变量元数据"; color: #b0b8c0; font-size: 12px; }
                 Text {
-                    text: "追踪通道：CH" + root.algo_sel_channel + "。";
-                    color: #8fd6ff;
-                    font-size: 12px;
+                    text: "以下信息来自当前算法源码声明；设备协议与运行时算法不变。";
+                    color: #77828c;
+                    wrap: word-wrap;
                 }
-
-                // 上报变量折线图: 静态 viewbox(main.rs 已归一化到 0..1000), 无交互缩放(信息量小, 从简)。
-                // ★同编辑面板: 必须固定 height★ 内部 report_plot 与 Path 都用 parent.width/height 绑尺寸,
-                // 一旦本 Rectangle 改成 min-height + stretch, 它的 min 就取子元素 min, 与子元素对
-                // parent.* 的依赖构成闭环 → 布局求值无限递归 → 进设置页栈溢出崩溃。整页已在 ScrollView
-                // 内, 固定高不会撑破保存栏。
-                Rectangle {
-                    height: 240px;
-                    background: #101418;
-                    border-width: 1px;
-                    border-color: #3a3a3a;
-                    clip: true;
-
-                    report_plot := Rectangle {
-                        x: 8px; y: 8px;
-                        width: parent.width - 16px;
-                        height: parent.height - 16px;
-                        background: #12181d;
-                        border-width: 1px;
-                        border-color: #29323a;
-
-                        for line in root.algo_report_lines: Path {
-                            x: 0; y: 0; width: parent.width; height: parent.height;
-                            viewbox-x: 0; viewbox-y: 0; viewbox-width: 1000; viewbox-height: 1000;
-                            commands: line.path;
-                            stroke: line.line_color;
-                            stroke-width: 2px;
-                            visible: line.visible && root.algo_trace_point_count > 0;
-                        }
-                    }
-                    Text {
-                        x: 12px; y: 4px;
-                        text: root.algo_trace_point_count > 0 ? "" : "暂无追踪数据";
-                        color: #77828c;
-                        font-size: 11px;
-                    }
+                if root.algo_metadata_rows.length == 0: Text {
+                    text: "当前算法未声明变量元数据。可使用 ALGO_REPORT_META / ALGO_SETTING_META。";
+                    color: #77828c;
                 }
-                // 图例: 逐个上报变量名称+色块。
-                HorizontalBox {
-                    spacing: 12px;
-                    for line in root.algo_report_lines: HorizontalBox {
+                ScrollView {
+                    vertical-stretch: 1;
+                    VerticalBox {
                         padding: 0px;
                         spacing: 4px;
-                        visible: line.visible;
-                        Rectangle { width: 10px; height: 10px; background: line.line_color; }
-                        Text { text: line.name; color: #b0b8c0; font-size: 11px; vertical-alignment: center; }
-                    }
-                }
-
-                Text { text: "显示触发判定状态。"; color: #b0b8c0; font-size: 11px; }
-                // 0/1 阶梯线的窄带: 只需看出高低电平。★同上必须固定 height★(内部 Path 绑 parent.*,
-                // 用 min-height 会让本 Rectangle 的 min 取子 min 从而成环)。
-                Rectangle {
-                    height: 70px;
-                    background: #101418;
-                    border-width: 1px;
-                    border-color: #3a3a3a;
-                    clip: true;
-                    Path {
-                        x: 4px; y: 4px;
-                        width: parent.width - 8px; height: parent.height - 8px;
-                        viewbox-x: 0; viewbox-y: 0; viewbox-width: 1000; viewbox-height: 1000;
-                        commands: root.algo_active_path;
-                        stroke: #ff3399;
-                        stroke-width: 2px;
-                        visible: root.algo_trace_point_count > 0;
+                        for row in root.algo_metadata_rows: Rectangle {
+                            height: 72px;
+                            border-width: 1px;
+                            border-color: #303840;
+                            background: #171c21;
+                            VerticalBox {
+                                padding: 6px;
+                                spacing: 2px;
+                                HorizontalBox {
+                                    spacing: 8px;
+                                    Text { text: row.kind + "  " + row.name; color: #e0e6ee; horizontal-stretch: 1; }
+                                    Text { text: row.alias == "" ? "" : "别名: " + row.alias; color: #8fd6ff; }
+                                    Text { text: row.value_type + "  " + row.range; color: #b0b8c0; }
+                                    Text { text: "当前值: " + row.current_value; color: #d8e0e8; }
+                                }
+                                Text { text: row.description; color: #8a939c; overflow: elide; }
+                            }
+                        }
                     }
                 }
             }
+
 
             if root.content_tab == 2: VerticalBox {
                 padding: 0px;

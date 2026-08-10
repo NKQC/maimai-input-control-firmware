@@ -54,6 +54,9 @@ windows = { version = "0.62.2", default-features = false, features = [
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Input",
     "Win32_UI_Input_KeyboardAndMouse",
+    # HID 触控点位页的主屏幕截图: GetDC/CreateCompatibleDC/CreateCompatibleBitmap/
+    # BitBlt/GetDIBits/DeleteObject/ReleaseDC 与 BITMAPINFO 全部位于该模块(windows 0.62.2)。
+    "Win32_Graphics_Gdi",
     # GetOpenFileNameW/GetSaveFileNameW/OPENFILENAMEW 位于该模块（windows 0.62.2 已核实）。
     "Win32_UI_Controls_Dialogs",
     "Win32_System_SystemInformation",
@@ -75,6 +78,9 @@ opt-level = 3
 
 [build-dependencies]
 slint-build = "1.17.1"
+# 固定资产 Interception.zip 的解包与完整性校验(见 build.rs::embed_interception_assets)。
+zip = { version = "2", default-features = false, features = ["deflate"] }
+sha2 = "=0.10.9"
 # 把 ui/assets/icon.ico 作为 Win32 图标资源嵌进 exe(资源管理器/任务栏/Alt-Tab 显示)。
 # 用 winresource 而非 winres: 后者已不维护, 在 Rust 1.61+ 上失效。
 winresource = "=0.1.31"

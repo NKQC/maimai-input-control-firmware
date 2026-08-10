@@ -198,6 +198,11 @@ public:
     // 触摸操作
     bool send_touch_report(const HID_TouchPoint& report);
     void force_send_touch_report(); // 强制发送触摸报文
+    // 把当前仍按下的触点全部转成抬起事件(下一次 task() 发出)。
+    // 输出抑制/扫描会话/退出 HID 模式时由 HidTouchMapper 调用, 保证不留粘住的触点。
+    void release_all_touch();
+    // 当前并发触点数(诊断/调用方判定"是否已全释放", 免得各自另存一份状态)。
+    uint8_t touch_down_count() const;
     
     // 状态查询
     uint32_t get_report_rate() const;
@@ -345,55 +350,74 @@ private:
         }
     };
 
+    // 触摸点状态。★两层语义必须分开★
+    //   touch_press / touch_release = **本轮待发事件队列**(报文发出即清空);
+    //   down_mask                   = **当前仍按下的触点集合**(跨轮持久, 报文发出不清)。
+    //
+    // ★为什么必须这样拆★(改造前该路径无任何调用者, 接通即暴露两处硬伤):
+    //  1) report_touch() 发完按下事件后把 press_modifier 归零 —— 那本是"待发队列"的正确清空,
+    //     但旧实现把它同时当作"谁还按着"的唯一记录 ⇒ 队列一清, 按下的点就此失忆。此后 release()
+    //     在空队列里找不到该 id, 返回 false, touch_needs_send_ 不置位, **抬起报文永远发不出去**,
+    //     主机端表现为触点粘住不放(游戏里等于一直按住)。
+    //  2) 多点触摸标志/触点数写的是 `press_modifier > 1`, 即"本轮新按下事件数"而非"当前按下触点数"。
+    //     逐通道边沿上报时每轮通常只有 1 个新事件, 于是 36 指同时按下也恒报 1; 抬起报文更是恒报 0。
+    //     现改为 down_mask 的 popcount = 真实并发触点数(Windows 精密触摸摘要字段的语义要求)。
     struct HID_Touch_state_t {
         uint8_t press_modifier = 0, release_modifier = 0;
         // 位移结构要求最后一位保留空位
         HID_TouchPoint touch_press[TOUCH_LOCAL_NUM + 1] = {};
         HID_TouchPoint touch_release[TOUCH_LOCAL_NUM + 1] = {};
-        // 数据流: press: press -> touch_press
-        // release: touch_press -> touch_release
-        // remove: touch_release -> X
+        // 当前按下触点集合(bit i = 触点 id i 按下)。id 取值 1..TOUCH_LOCAL_NUM ⇒ 需 65 位, 用两个 u64。
+        uint64_t down_lo = 0, down_hi = 0;
+
+        inline bool is_down(uint8_t _id) const {
+            return (_id < 64) ? ((down_lo >> _id) & 1ULL) != 0
+                              : ((down_hi >> (_id - 64)) & 1ULL) != 0;
+        }
+        inline void _set_down(uint8_t _id, bool on) {
+            uint64_t& word = (_id < 64) ? down_lo : down_hi;
+            const uint64_t bit = 1ULL << ((_id < 64) ? _id : (_id - 64));
+            if (on) word |= bit; else word &= ~bit;
+        }
+        // 当前并发触点数 = 报文的 contact count 字段真值。
+        inline uint8_t down_count() const {
+            return static_cast<uint8_t>(__builtin_popcountll(down_lo) +
+                                       __builtin_popcountll(down_hi));
+        }
+
+        // 按下: 入待发队列 + 记入按下集合。已按下的同 id 重复按下不产生事件(边沿语义)。
         bool press(HID_TouchPoint _touch) {
-            if (press_modifier < TOUCH_LOCAL_NUM) {
-                touch_press[press_modifier] = _touch;
-                press_modifier++;
-                return true;
-            }
-            return false;
+            if (is_down(_touch.id)) return false;
+            if (press_modifier >= TOUCH_LOCAL_NUM) return false;
+            touch_press[press_modifier] = _touch;
+            press_modifier++;
+            _set_down(_touch.id, true);
+            return true;
         }
+        // 抬起: 从按下集合移除 + 入待发抬起队列。未按下的 id 不产生事件(边沿语义)。
+        // ★不再依赖 touch_press 里能否找到该 id★ —— 那是本轮待发队列, 早已可能被清空。
         bool release(uint8_t _id) {
-            for (int32_t i = 0; i < press_modifier; i++) {
-                if (touch_press[i].id == _id) {
-                    // 将触摸点移动到release数组
-                    if (release_modifier < TOUCH_LOCAL_NUM) {
-                        touch_release[release_modifier] = touch_press[i];
-                        release_modifier++;
-                    }
-                    
-                    // 从press数组中移除
-                    for (int32_t j = i; j < press_modifier - 1; j++) {
-                        touch_press[j] = touch_press[j + 1];
-                    }
-                    press_modifier--;
-                    
-                    // 清空最后一个位置
-                    touch_press[press_modifier].clear();
-                    return true;
-                }
-            }
-            return false;
+            if (!is_down(_id)) return false;
+            _set_down(_id, false);
+            if (release_modifier >= TOUCH_LOCAL_NUM) return false;
+            HID_TouchPoint point;
+            point.clear();
+            point.id = _id;
+            touch_release[release_modifier] = point;
+            release_modifier++;
+            return true;
         }
-        void remove(uint8_t _id) {
-            for (int32_t i = 0; i < release_modifier; i++) {
-                if (touch_release[i].id == _id) {
-                    touch_release[i] = {0, 0, 0, 0};
-                    for (int32_t j = i; j < release_modifier - 1; j++) {
-                        touch_release[j] = touch_release[j + 1];
-                    }
-                    release_modifier--;
-                    return;
-                }
+        // 全释放: 把所有仍按下的触点一次性转成抬起事件(输出抑制/Sweep/模式退出时用)。
+        void release_all() {
+            for (uint8_t id = 0; id <= TOUCH_LOCAL_NUM; id++) {
+                if (is_down(id)) release(id);
             }
+        }
+        void clear() {
+            press_modifier = 0;
+            release_modifier = 0;
+            down_lo = 0;
+            down_hi = 0;
         }
     };
 

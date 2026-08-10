@@ -48,9 +48,16 @@ private:
     State _state;
     uint8_t _active_zone;
     uint8_t _bind_ch[ZONE_COUNT];  // 0xFF = 未映射
+    // BIND_EVENT 是设备主动回传，不能在命令响应占用 vendor TX 时直接丢弃。
+    // 保留一个待发事件，下一轮 tick 在响应释放后重试；绑定状态机一次只产生一个事件，单槽足够。
+    bool _bind_event_pending;
+    uint8_t _bind_event_zone;
+    uint8_t _bind_event_channel;
+    uint8_t _bind_event_status;
 
     void _complete_bind(uint8_t zone, uint8_t channel);
     void _emit_bind_event(uint8_t zone, uint8_t channel, uint8_t status);
+    void _try_emit_bind_event();
 
     static void _handle_bind_start(const HostFrame& frame, uint8_t* response, uint16_t* response_length);
     static void _handle_bind_abort(const HostFrame& frame, uint8_t* response, uint16_t* response_length);

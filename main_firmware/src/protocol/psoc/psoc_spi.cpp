@@ -410,19 +410,37 @@ bool PsocSpi::apply() {
     return _wait_op_done(800);   // 真实完成反馈(重初始化+首扫), 超时上限 800ms
 }
 
+bool PsocSpi::quick_apply(uint8_t ch, uint8_t gain, uint8_t div) {
+    if (!_ready) return false;
+    // Sweep 逐格应用: gain/div 与 QUICK_APPLY 同帧下发，不能先 SET_PARAM 在扫描 ISR 中改 widgetContext。
+    // ★预算 2000ms 而非 apply() 的 800ms★: 本命令必须等主循环走到 NOT_BUSY 窗口才会真正执行。
+    if (!_send_heavy((uint8_t)psoc::Cmd::QUICK_APPLY, ch, gain, div)) return false;
+    return _wait_op_done(2000u);
+}
+
+bool PsocSpi::focus_scan(uint8_t ch) {
+    uint8_t resp[7];
+    if (!_cmd_txn((uint8_t)psoc::Cmd::FOCUS_SCAN, ch, 0, 0, resp)) return false;
+    // PSoC response: [magic, FOCUS_SCAN, applied_ch, accepted, 0, 0, 0].
+    return resp[1] == (uint8_t)psoc::Cmd::FOCUS_SCAN &&
+           resp[2] == ch && resp[3] == 1u;
+}
+
 bool PsocSpi::calibrate(uint8_t ch) {
     if (!_ready) return false;
-    // CALIBRATE: PSoC 主循环逐通道 CalibrateWidget(重算 IDAC) + 基线复位。
-    // ch=0..35 时 PSoC 只做该 widget(约全通道的 1/36) → 窗口收到 500ms; 0xFF 仍给 1500ms。
+    // CALIBRATE 的完成预算必须覆盖最慢分频。Sweep 扫描期不再逐格调用它，因此单通道 30s
+    // 只覆盖最终恢复与手动单通道校准，不会放大扫描占用；全通道逐个校准仍给 60s 覆盖高分频与
+    // SPI 中断抖动。
     if (!_send_heavy((uint8_t)psoc::Cmd::CALIBRATE, ch, 0)) return false;
-    return _wait_op_done((ch < 36u) ? 500u : 1500u);
+    return _wait_op_done((ch < 36u) ? 30000u : 60000u);
 }
 
 bool PsocSpi::baseline_reset(uint8_t ch) {
     if (!_ready) return false;
-    // BASELINE_RESET: 单通道 = InitializeWidgetBaseline(ch), 0xFF = InitializeAllBaselines。
+    // 基线初始化本身很快，但它只能在前一轮校准真正清 busy 后执行；5s 允许最慢扫描收尾，
+    // 避免旧 500ms 窗口把“仍在收尾”误报成恢复失败。
     if (!_send_heavy((uint8_t)psoc::Cmd::BASELINE_RESET, ch, 0)) return false;
-    return _wait_op_done(500);
+    return _wait_op_done(5000u);
 }
 
 bool PsocSpi::auto_tune(uint8_t ch, uint8_t pref, uint8_t tag, uint8_t* out_result, uint16_t* out_div,
@@ -717,6 +735,84 @@ bool PsocSpi::snapshot_pump(uint8_t max_pages, psoc::SensorSnapshot* out) {
                 s.status = _snap_packed[o + 6];
             }
         }
+    }
+    return true;
+}
+
+// 单通道快照快路: 只读目标通道占用的那 2-3 页, 一次调用完成一份。
+// ★为什么不复用分块状态机★ 分块机是为"读满 63 页才算一份"设计的, 每份必然横跨 16 个 tick。
+// 独占流只要 7 个字节, 沿用它等于为 1 个通道付 36 个通道的代价(实测封顶 62 份/s)。这里独立走完
+// BEGIN→取页→恢复触控, 全程不触碰 _snap_* 分块状态, 因此与全通道慢路可以并存互不干扰。
+bool PsocSpi::snapshot_pump_channel(uint8_t channel, psoc::SensorSnapshot* out) {
+    if (!_ready || out == nullptr) return false;
+    if (channel >= psoc::SENSOR_CHANNEL_COUNT) return false;
+
+    // 目标通道的字节区间 → 覆盖它的页区间(闭区间)。
+    const size_t first_byte = (size_t)channel * psoc::SENSOR_BYTES_PER_CHANNEL;
+    const size_t last_byte = first_byte + psoc::SENSOR_BYTES_PER_CHANNEL - 1u;
+    const uint16_t first_page = (uint16_t)(first_byte / psoc::FRAME_PAYLOAD_SIZE);
+    const uint16_t last_page = (uint16_t)(last_byte / psoc::FRAME_PAYLOAD_SIZE);
+
+    // BEGIN 锁存一份一致数据, 并借 page0 的响应取回 INFO(generation/valid/count)。
+    psoc::Frame begin = _make_request(psoc::Cmd::SNAPSHOT_BEGIN);
+    psoc::Frame ignored;
+    if (!transfer(reinterpret_cast<const uint8_t*>(&begin),
+                  reinterpret_cast<uint8_t*>(&ignored), sizeof(begin))) return false;
+    busy_wait_us_32(PSOC_SNAPSHOT_PAGE_DELAY_US);
+
+    psoc::Frame req_info = _make_request(psoc::Cmd::SNAPSHOT_PAGE);
+    req_info.payload[0] = static_cast<uint8_t>(first_page);   // 顺带令 PSoC 装载首个目标页
+    psoc::Frame info;
+    if (!transfer(reinterpret_cast<const uint8_t*>(&req_info),
+                  reinterpret_cast<uint8_t*>(&info), sizeof(req_info)) ||
+        !_response_matches(info, psoc::Cmd::SNAPSHOT_INFO, begin.seq) ||
+        info.payload[3] != psoc::SENSOR_CHANNEL_COUNT) {
+        _restore_touch_response();
+        return false;
+    }
+    const uint16_t generation = _read_u16(info.payload);
+    const bool valid = info.payload[2] != 0;
+
+    // 流水线取页: 请求 PAGE[p+1] 的响应携带 page[p] 数据; 末页用 PING 收尾。
+    uint8_t bytes[3u * psoc::FRAME_PAYLOAD_SIZE] = {};
+    const uint16_t page_count = (uint16_t)(last_page - first_page + 1u);
+    uint8_t expected_seq = req_info.seq;
+    for (uint16_t i = 0; i < page_count; i++) {
+        busy_wait_us_32(PSOC_SNAPSHOT_PAGE_DELAY_US);
+        const uint16_t next = (uint16_t)(first_page + i + 1u);
+        psoc::Frame preq;
+        if (i + 1u < page_count && next < psoc::SNAPSHOT_PAGE_COUNT) {
+            preq = _make_request(psoc::Cmd::SNAPSHOT_PAGE);
+            preq.payload[0] = static_cast<uint8_t>(next);
+        } else {
+            preq = _make_request(psoc::Cmd::PING);
+        }
+        psoc::Frame resp;
+        if (!transfer(reinterpret_cast<const uint8_t*>(&preq),
+                      reinterpret_cast<uint8_t*>(&resp), sizeof(preq)) ||
+            !_response_matches(resp, psoc::Cmd::SNAPSHOT_DATA, expected_seq)) {
+            _restore_touch_response();
+            return false;
+        }
+        for (size_t b = 0; b < psoc::FRAME_PAYLOAD_SIZE; b++) {
+            bytes[i * psoc::FRAME_PAYLOAD_SIZE + b] = resp.payload[b];
+        }
+        expected_seq = preq.seq;
+    }
+
+    // 恢复默认响应为实时触控帧, 使下一拍 read_touch 立即命中(与全通道慢路同一收尾约定)。
+    _restore_touch_response();
+
+    out->generation = generation;
+    out->valid = valid;
+    if (valid) {
+        // 目标通道在本次取回字节流中的偏移 = 它的绝对字节位 - 首页起始字节位。
+        const size_t o = first_byte - (size_t)first_page * psoc::FRAME_PAYLOAD_SIZE;
+        auto& s = out->channels[channel];
+        s.raw = _read_u16(&bytes[o]);
+        s.baseline = _read_u16(&bytes[o + 2]);
+        s.diff = static_cast<int16_t>(_read_u16(&bytes[o + 4]));
+        s.status = bytes[o + 6];
     }
     return true;
 }

@@ -1,6 +1,7 @@
 #include "game_io.h"
 #include "../config_manager/config_manager.h"
 #include "../binding_service/binding_service.h"
+#include "../sensor_link/sensor_link.h"
 #include "../latency_stats.h"
 #include "../self_heal/self_heal.h"
 #include "../usb_debug.h"
@@ -179,7 +180,8 @@ void GameIoService::_handle_led_get(const HostFrame& frame, uint8_t* resp, uint1
     self->_light.get_config(light_config);
     const Mai2Light_Stats& stats = self->_light.get_stats();
 
-    HostFrame r;
+    // HostFrame 为 4102B；core0 栈只有 8192B 且下界就是堆顶，响应帧必须借共享静态工作帧。
+    HostFrame& r = HostCmdCodec::resp_frame();
     r.clear();
     r.cmd = static_cast<uint8_t>(HostCmd::LED_GET);
     r.flags = HOST_CMD_FLAG_RESPONSE;
@@ -239,6 +241,12 @@ void GameIoService::_handle_led_get(const HostFrame& frame, uint8_t* resp, uint1
         r.payload[n++] = (uint8_t)(count & 0xFFu);
         r.payload[n++] = (uint8_t)((count >> 8) & 0xFFu);
     }
+    // ★尾部追加 byte96 = 当前【已生效】亮度★(同 KBD_GET_STATE / AUTO_TUNE_PROGRESS 的追加先例:
+    // 前 96 字节一字未动, 只读 96 字节的旧上位机不受影响)。
+    // 追加它的理由: led.ws_brightness 写进 KV 只代表"配置改了", 而灯链上真正在用的是
+    // LedMapService 自己那份 _brightness —— 两者此前无从对账, "亮度到底生效没有"只能靠肉眼看灯。
+    // 有了这个字节, 批量保存后的即时生效就成了可验证事实(写入后立刻 LED_GET 比对即可)。
+    r.payload[n++] = led_map->applied_brightness();
 
     r.len = n;
     *resp_len = HostCmdCodec::encode_frame(r, resp, HOST_CMD_RESP_BUF_MAX);
@@ -304,7 +312,8 @@ void GameIoService::_handle_led_preview(const HostFrame& frame, uint8_t* resp, u
 void GameIoService::_handle_mai2_get_state(const HostFrame& frame, uint8_t* resp, uint16_t* resp_len) {
     GameIoService* self = getInstance();
     const uint32_t baud = self->_serial.get_config().baud_rate;
-    HostFrame r;
+    // HostFrame 为 4102B；core0 栈只有 8192B 且下界就是堆顶，响应帧必须借共享静态工作帧。
+    HostFrame& r = HostCmdCodec::resp_frame();
     r.clear();
     r.cmd = static_cast<uint8_t>(HostCmd::MAI2_GET_STATE);
     r.flags = HOST_CMD_FLAG_RESPONSE;
@@ -421,7 +430,11 @@ void GameIoService::task() {
     // Map the retained PSoC touch mask to the 34 protocol areas.
     Psoc* psoc = Psoc::getInstance();
     const uint32_t _lt0 = gio_seg_begin(GIO_SEG_TOUCH_MAP);
-    const uint64_t area_now = BindingService::getInstance()->map_to_areas(psoc->touch_mask());
+    // 扫描会话期间(见 SensorLink::output_suppressed)掩码是被逐格改写的无意义值: 按全松开上报,
+    // 且仍走同一条 DelayLine/publish 路径, 使已按下的区域正常释放而不是卡在按下态。
+    const uint64_t area_now = SensorLink::getInstance()->output_suppressed()
+        ? 0u
+        : BindingService::getInstance()->map_to_areas(psoc->touch_mask());
     if (_lt0 - _delay_refresh_us >= 50000u) {
         _touch_delay_units = ConfigManager::get_uint16("comm.touch_delay_100us");
         _refresh_serial_publish_settings();

@@ -35,6 +35,9 @@ use std::collections::{BTreeMap, VecDeque};
 
 mod drafts;
 use drafts::ConfigDrafts;
+mod pipeline;
+pub use pipeline::PollContext;
+use pipeline::{PendingRegistry, PendingRequest, PollRules, RequestKind, SkippedLog};
 /// 逐通道 CSD 操作的 host 侧编排(批量串行队列 / 噪声频谱扫描 / 绘图冻结)。
 /// ★为什么单独一个文件★ 三者都是"跨若干 tick 的状态机 + 自己的数据结构", 塞回本文件只会让
 /// AppController 再长几百行而与其余职责纠缠; 它们对外只暴露少量方法, 内部状态不被别处读写。
@@ -86,6 +89,47 @@ struct CfgTxInflight {
     seq: u8,
     waited: u32,
     owner: CfgTxOwner,
+}
+
+#[derive(Clone, Copy)]
+struct LatencyComponentSample {
+    value_us: u16,
+    ts_us: u32,
+}
+
+#[derive(Default)]
+struct LatencyCorrectionSamples {
+    // 固定顺序对应 TELEM 0x20 的 spi / proc / usb 三个 u16 字段。
+    components: [Option<LatencyComponentSample>; 3],
+}
+
+/// 0x20 三段是“上一遥测窗口内观察到的滚动峰值”，发帧后固件立即清零；因此字段 0 的语义是
+/// “本窗口没有观察到该段”，绝不是 0us。只用非零值刷新各段样本，并借同源 `TelemFrame.ts_us`
+/// 判定设备时钟下的新鲜度；三段都在 2s 内才给出补正值：fresh_spi + fresh_proc + fresh_usb。
+/// 本公式只修补异步窗口造成的缺段，不包含也不改写 `comm.touch_delay_100us` 人工串口延迟线。
+fn _latency_correction_us(
+    samples: &mut LatencyCorrectionSamples,
+    frame: &crate::proto::TelemFrame,
+) -> Option<u32> {
+    const FRESH_US: u32 = 2_000_000;
+    let values = [frame.lat_spi_us, frame.lat_proc_us, frame.lat_usb_us];
+    for (slot, value_us) in samples.components.iter_mut().zip(values) {
+        if value_us != 0 {
+            *slot = Some(LatencyComponentSample {
+                value_us,
+                ts_us: frame.ts_us,
+            });
+        }
+    }
+    let mut total = 0u32;
+    for sample in samples.components.iter().copied() {
+        let sample = sample?;
+        if frame.ts_us.wrapping_sub(sample.ts_us) > FRESH_US {
+            return None;
+        }
+        total = total.saturating_add(sample.value_us as u32);
+    }
+    Some(total)
 }
 
 // ============================================================================
@@ -173,6 +217,125 @@ impl ListenHold {
     fn clear(&mut self) {
         self.channel = None;
         self.since = None;
+    }
+}
+
+/// 已发出 FOCUS_START、尚未收到响应的在途请求。三项必须成组存在: 少了 generation 就无法判断
+/// 迟到响应属于哪一次切换, 少了 seq 就无法把 NAK 归因到本次请求。
+struct FocusPending {
+    seq: u8,
+    generation: u16,
+    channel: u8,
+}
+
+/// 单通道独占流(FOCUS_START/STOP/DATA)的主机侧会话状态。
+///
+/// ★为什么要 host 侧 generation★ 切换目标通道是"停旧 + 开新"两条命令, 中间必然有一段时间旧会话
+/// 的 FOCUS_DATA 仍在路上、而新会话的 START 响应还没回来。只按"当前 session"判定会漏掉第三种帧:
+/// **迟到的 START 响应**(它会把一个已经过期的会话号安装成当前会话, 于是新目标的数据被当成旧帧丢掉,
+/// 表现为切通道后曲线永久空白)。故每次切换前先自增 generation, 响应只在代次相符时才被安装,
+/// 迟到响应一律丢弃并对其携带的 session 发 FOCUS_STOP(否则设备侧那条流没人认领却继续占带宽)。
+#[derive(Default)]
+struct FocusState {
+    /// 主机侧代次: 每次切目标/启停前自增。
+    generation: u16,
+    /// 在途 START。
+    pending: Option<FocusPending>,
+    /// 设备已确认的当前会话号(None = 无会话)。
+    session: Option<u16>,
+    /// 当前目标通道(即便 START 尚在途也已确定, 用于幂等判定"目标没变就别重发")。
+    channel: Option<u8>,
+    /// 上一帧的 sample_seq, 用于算缺口。
+    last_sample_seq: Option<u16>,
+    /// 累计丢帧数(设备背压跳帧 + 链路丢帧)。
+    gaps: u64,
+    /// 实测吞吐窗口。★精调时必须能看见真实带宽★ 曲线看着"不密"到底是设备没发、链路丢了, 还是
+    /// UI 只画了一段, 光看图分不出来 —— 只有实测 帧/s 与 字节/s 能回答。
+    rate: FocusRate,
+    /// 低频诊断计数：每 100 个有效 FOCUS_DATA 样本汇总一次，避免逐帧刷屏。
+    diag_at: Option<std::time::Instant>,
+    diag_frames: u32,
+    diag_pushes: u32,
+    diag_gaps: u64,
+}
+
+/// 单通道流的 1 秒滚动吞吐窗口。窗口内累计, 满 1 秒结算一次并把结果留给 UI 读。
+#[derive(Default)]
+struct FocusRate {
+    /// 本窗口起点(None = 还没收到第一帧)。
+    window_at: Option<std::time::Instant>,
+    /// 本窗口内已收帧数与 wire 载荷字节数。
+    frames: u32,
+    bytes: u64,
+    /// 本窗口内的 sample_seq 缺口数。
+    gaps: u32,
+    /// 上一个完整窗口的结算值: (帧/s, 字节/s, 丢帧/s)。
+    last: Option<(u32, u32, u32)>,
+    /// 最近一次结算时刻, 用于判定读数是否还新鲜。
+    settled_at: Option<std::time::Instant>,
+}
+
+impl FocusRate {
+    /// 收到一帧: 累计并在跨过 1 秒时结算。
+    fn note(&mut self, wire_len: usize, gaps: u16) {
+        let now = std::time::Instant::now();
+        let start = *self.window_at.get_or_insert(now);
+        self.frames = self.frames.saturating_add(1);
+        self.bytes = self.bytes.saturating_add(wire_len as u64);
+        self.gaps = self.gaps.saturating_add(gaps as u32);
+        let elapsed = now.duration_since(start).as_secs_f32();
+        if elapsed < 1.0 {
+            return;
+        }
+        // 按真实经过时间折算, 而不是假定窗口恰好 1.0s(tick 抖动下会系统性偏低)。
+        let scale = 1.0 / elapsed;
+        self.last = Some((
+            (self.frames as f32 * scale).round() as u32,
+            (self.bytes as f32 * scale).round() as u32,
+            (self.gaps as f32 * scale).round() as u32,
+        ));
+        self.settled_at = Some(now);
+        self.window_at = Some(now);
+        self.frames = 0;
+        self.bytes = 0;
+        self.gaps = 0;
+    }
+
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
+impl FocusState {
+    /// 目标通道(含在途请求)是否已经是 `ch`。
+    fn targets(&self, ch: Option<u8>) -> bool {
+        self.channel == ch
+    }
+
+    /// 清除独占流的会话计数锚点；开始新流/会话时绝不把旧 sample_seq 或已结算带宽带过去。
+    fn reset_measurement(&mut self) {
+        self.last_sample_seq = None;
+        self.gaps = 0;
+        self.diag_at = None;
+        self.diag_frames = 0;
+        self.diag_pushes = 0;
+        self.diag_gaps = 0;
+        self.rate.reset();
+    }
+
+    /// 进入新一代: 旧会话/在途请求的一切回执与数据自此全部作废。
+    fn _bump(&mut self) -> u16 {
+        self.generation = self.generation.wrapping_add(1);
+        self.pending = None;
+        self.session = None;
+        self.channel = None;
+        self.reset_measurement();
+        self.generation
+    }
+
+    fn clear(&mut self) {
+        self._bump();
+        self.gaps = 0;
     }
 }
 
@@ -306,6 +469,30 @@ pub fn zone_key(index: usize) -> String {
     format!("bind.map{:02}", index)
 }
 
+// ============================================================================
+// HID 触摸屏点位辅助: 36 物理通道 ↔ hid.enNN / hid.xNN / hid.yNN
+// ============================================================================
+
+/// HID 触摸点位的通道数(= 物理通道数)。
+pub const HID_POINT_COUNT: usize = 36;
+/// HID 触屏坐标域上限。★与固件描述符 usage 0x30/0x31 的 LOGICAL_MAXIMUM 同源★
+/// (见 hal_usb_hid.h 的 `TOUCH_LOGICAL_MAX` / `0x26,0xFF,0x7F`)。上位机存归一坐标即用此域,
+/// 固件不再做任何缩放; 两侧若各写一个数, 点位会被主机按满量程截断到屏幕边缘。
+pub const HID_COORD_MAX: u16 = 32767;
+
+/// 通道 ch 的"是否输出该点位"配置键。
+pub fn hid_en_key(ch: usize) -> String {
+    format!("hid.en{:02}", ch)
+}
+/// 通道 ch 的 X 归一坐标配置键(0..HID_COORD_MAX)。
+pub fn hid_x_key(ch: usize) -> String {
+    format!("hid.x{:02}", ch)
+}
+/// 通道 ch 的 Y 归一坐标配置键(0..HID_COORD_MAX)。
+pub fn hid_y_key(ch: usize) -> String {
+    format!("hid.y{:02}", ch)
+}
+
 /// 从 bind.mapNN 的 u32 值中取出低 24 位通道 bitmap。
 pub fn binding_channel_mask(v: u32) -> u32 {
     v & 0x00FF_FFFF
@@ -385,11 +572,24 @@ enum LedWriteOp {
 // AppController: 纯逻辑状态机,不依赖 Slint
 // ============================================================================
 
-/// UI 主窗口对应的应用控制器
+#[derive(Clone)]
+struct ConnProbeStep {
+    kind: RequestKind,
+    frame: Frame,
+}
+
 ///
 /// 生命周期由 `main.rs` 用 `Rc<RefCell<AppController>>` 持有,在 Slint 单线程
 /// 事件循环中于各 callback 与 `Timer` 轮询闭包间共享。
 pub struct AppController {
+    /// 统一轮询请求归因注册表与声明式轮询规则。
+    pending_registry: PendingRegistry,
+    skipped_log: SkippedLog,
+    poll_rules: PollRules,
+    /// 连接后顺序回读探针：窗口=1，逐项收到数据响应后推进。
+    conn_probe_queue: VecDeque<ConnProbeStep>,
+    conn_probe_inflight: Option<(u8, ConnProbeStep)>,
+
     devices: Vec<DeviceEntry>,
     io: Option<IoHandle>,
     state: ConnState,
@@ -456,6 +656,8 @@ pub struct AppController {
     telem_freeze_count: [u32; 36],
     /// 是否正在进行遥测流
     telem_active: bool,
+    /// 单通道独占流会话状态(见 `FocusState`)。数据仍写入 `telem_buf` 的目标通道, 不另设缓冲。
+    focus: FocusState,
     /// 上一次收到的遥测帧时间戳(μs)
     telem_last_ts: u32,
     /// 帧级设备时间展开器: 所有通道的样本共用同一时基(同一帧内各通道同时扫描)。
@@ -492,6 +694,10 @@ pub struct AppController {
     telem_lat_proc_us: u16,
     /// 最近一次 LATENCY 字段解出的 serial/CDC 写耗时(us)
     telem_lat_usb_us: u16,
+    /// 三段最后一次非零且未过期的样本；0x20 的 0 是“本窗口无观测”，不能冲掉有效样本。
+    latency_correction_samples: LatencyCorrectionSamples,
+    /// 最近一次按设备 ts_us 判为三段齐全且新鲜的补正值；配置开关只控制是否对 UI 暴露。
+    telem_lat_corrected_us: Option<u32>,
     /// 延迟历史(总延迟 = spi+proc+usb, us),供仪表盘折线图。容量 LAT_CAP。
     lat_total_hist: VecDeque<f32>,
     /// 延迟历史版本号,每次 push 自增,供 UI 判断重绘。
@@ -542,6 +748,8 @@ pub struct AppController {
 
     /// 共享算法可设置变量缓存(ABI cfg[8], ALGO_GET_CFG/SET_CFG)+ 版本号。
     algo_cfg: [u8; 8],
+    /// 每槽是否已由设备或已提交草稿填入；false 时 UI 必须取 ABI 声明默认值，不能伪造 0。
+    algo_cfg_valid: [bool; 8],
     algo_cfg_version: u64,
     /// 全局 CSD 配置缓存 gparam_id → value(GLOBAL_GET/GET_ALL 响应)+ 版本号。
     globals: BTreeMap<u8, u32>,
@@ -583,6 +791,9 @@ pub struct AppController {
     /// 窗口=1 的 ACK 驱动能让主机自动跟随设备节奏: 设备忙就自然停等, 不需要猜任何固定延时。
     cfg_tx_queue: std::collections::VecDeque<CfgTxFrame>,
     cfg_tx_inflight: Option<CfgTxInflight>,
+    /// 最近一次 OUT 端点忙事件的有界抑制窗口；配置 FIFO 不受此门控影响。
+    device_busy_until: Option<std::time::Instant>,
+    device_busy_log_at: Option<std::time::Instant>,
     /// SAVE_CONFIG 成功后需整通道回读的 0→1 通道，避免重新启用后只出现空参数。
     post_save_refetch_channels: Vec<u8>,
     /// 全 36 通道 per-channel 参数重读队列(待读的 param_id)。
@@ -788,6 +999,11 @@ impl AppController {
         }
 
         AppController {
+            pending_registry: PendingRegistry::new(),
+            skipped_log: SkippedLog::new(128),
+            poll_rules: PollRules::new(),
+            conn_probe_queue: VecDeque::new(),
+            conn_probe_inflight: None,
             devices: Vec::new(),
             io: None,
             state: ConnState::Disconnected,
@@ -819,6 +1035,7 @@ impl AppController {
             telem_last_raw: [None; 36],
             telem_freeze_count: [0; 36],
             telem_active: false,
+            focus: FocusState::default(),
             telem_last_ts: 0,
             telem_clock: DevClock::default(),
             telem_frame_at: None,
@@ -839,6 +1056,8 @@ impl AppController {
             telem_lat_spi_us: 0,
             telem_lat_proc_us: 0,
             telem_lat_usb_us: 0,
+            latency_correction_samples: LatencyCorrectionSamples::default(),
+            telem_lat_corrected_us: None,
             lat_total_hist: VecDeque::new(),
             lat_version: 0,
             params,
@@ -868,6 +1087,7 @@ impl AppController {
             algo_info_refresh_in: None,
             algo_upload_version: 0,
             algo_cfg: [0u8; 8],
+            algo_cfg_valid: [false; 8],
             algo_cfg_version: 0,
             globals: BTreeMap::new(),
             globals_version: 0,
@@ -883,6 +1103,8 @@ impl AppController {
             telem_scope_channels: None,
             cfg_tx_queue: std::collections::VecDeque::new(),
             cfg_tx_inflight: None,
+            device_busy_until: None,
+            device_busy_log_at: None,
             post_save_refetch_channels: Vec::new(),
             param_refetch_ids: Vec::new(),
             param_fix_sent: std::collections::HashSet::new(),
@@ -1255,6 +1477,8 @@ impl AppController {
         self.state = ConnState::Connecting;
         self.device_info = None;
         self.csd_mode = None;
+        self.device_busy_until = None;
+        self.device_busy_log_at = None;
         self.last_error = None;
         self.push_log(format!("连接设备[{}]: 启动 IO + 发 HELLO", index));
         self.status_text = format!("连接中: {}", port_name);
@@ -1266,6 +1490,16 @@ impl AppController {
     /// 即重新对齐, 故只要在未收到 DEVICE_INFO 前周期性重发 HELLO, 后续包即可送达并握手成功。
     /// 仅在 `Connecting` 态由 UI 定时器调用。
     pub fn resend_hello(&mut self) -> anyhow::Result<()> {
+        if self._device_busy() {
+            if self
+                .device_busy_log_at
+                .is_none_or(|at| at.elapsed() >= std::time::Duration::from_secs(2))
+            {
+                self.device_busy_log_at = Some(std::time::Instant::now());
+                self.push_log_warn("设备忙，暂停 HELLO 握手轮询，等待恢复".to_string());
+            }
+            return Ok(());
+        }
         let seq = self.next_seq();
         if let Some(handle) = &self.io {
             handle.send(Frame::hello(seq))?;
@@ -1292,6 +1526,9 @@ impl AppController {
     /// 清设备回读缓存(断连/重连时调用)。★不动 `desired`★: 期望运行态必须活过断连,
     /// 否则重连后无从恢复触控。
     fn _clear_sensor_caches(&mut self) {
+        self.pending_registry.clear();
+        self.conn_probe_queue.clear();
+        self.conn_probe_inflight = None;
         self.restore_verify.clear();
         self.post_save_refetch_channels.clear();
         // 灯效映射草稿按设备灯链长度校验, 换设备/重连后必须重来, 否则会拿旧链长的区段去 NAK。
@@ -1301,6 +1538,10 @@ impl AppController {
         self.led_apply_status.clear();
         self.led_version = self.led_version.wrapping_add(1);
         self.telem_active = false;
+        // 单通道流会话属于上一条链路: 不清就会用一个设备侧已不存在的 session 去判定归属,
+        // 重连后既收不到数据也不会重开(幂等判定认为"目标没变")。
+        self.focus.clear();
+        self._sweep_device_disconnected();
         self.bind_progress = None;
         self.bind_start_seq = None;
         self.telem_last_raw = [None; 36];
@@ -1316,10 +1557,19 @@ impl AppController {
         // 换设备/重连后设备可能已重启, ts_us 从头开始 → 时钟必须归零, 否则会算出一个巨大的假间隙。
         self.telem_clock.clear();
         self.telem_frame_at = None;
+        self.telem_lat_spi_us = 0;
+        self.telem_lat_proc_us = 0;
+        self.telem_lat_usb_us = 0;
+        self.latency_correction_samples = LatencyCorrectionSamples::default();
+        self.telem_lat_corrected_us = None;
+        self.lat_total_hist.clear();
+        self.lat_version = self.lat_version.wrapping_add(1);
         // 链路活性证据必须随缓存一起清: 换设备/重连后旧设备的"活着"不能算新链路的证据。
         self.psoc_scan_live_at = None;
         self.psoc_info_live_at = None;
         self.psoc_gen_seen = None;
+        self.device_busy_until = None;
+        self.device_busy_log_at = None;
         for param_map in &mut self.params {
             param_map.clear();
         }
@@ -1378,6 +1628,315 @@ impl AppController {
         self._pump_cfg_tx();
     }
 
+    /// 统一提交只读轮询请求：连接检查、窗口=1、seq 登记和发送共用一个出口。
+    fn _submit_poll(&mut self, kind: RequestKind, mut frame: Frame) -> anyhow::Result<u8> {
+        if self.state != ConnState::Connected || self.io.is_none() {
+            self.skipped_log.push(kind, "未连接");
+            return Ok(0);
+        }
+        if self.pending_registry.contains_kind(&kind) {
+            return Ok(0);
+        }
+        let seq = self.next_seq();
+        frame.seq = seq;
+        self.io.as_ref().unwrap().send(frame)?;
+        self.pending_registry.register(
+            seq,
+            PendingRequest {
+                started_at: std::time::Instant::now(),
+                timeout_secs: 5,
+                kind,
+            },
+        );
+        Ok(seq)
+    }
+
+    /// 连接后以窗口=1顺序回读基础状态，所有数据响应均由 handle_frame 推进。
+    pub fn schedule_conn_probes(&mut self, ch: u8) {
+        self.conn_probe_queue.clear();
+        self.conn_probe_inflight = None;
+        self.cfg_all_accum.clear();
+        self.conn_probe_queue.push_back(ConnProbeStep {
+            kind: RequestKind::AlgoGetInfo,
+            frame: crate::proto::algo::encode_algo_get_info(0),
+        });
+        self.conn_probe_queue.push_back(ConnProbeStep {
+            kind: RequestKind::ConfigGetAll,
+            frame: Frame::new(HostCmd::CfgGetAll as u8, 0, 0, vec![]),
+        });
+        self.conn_probe_queue.push_back(ConnProbeStep {
+            kind: RequestKind::GlobalGetAll,
+            frame: crate::proto::algo::encode_global_get_all(0),
+        });
+        self.conn_probe_queue.push_back(ConnProbeStep {
+            kind: RequestKind::RequestParams { ch },
+            frame: Frame::new(
+                HostCmd::ParamGetAll as u8,
+                0,
+                0,
+                crate::proto::encode_param_get_all(ch),
+            ),
+        });
+        self.conn_probe_queue.push_back(ConnProbeStep {
+            kind: RequestKind::AlgoGetRom,
+            frame: crate::proto::algo::encode_algo_get_rom(0),
+        });
+        self.conn_probe_queue.push_back(ConnProbeStep {
+            kind: RequestKind::KbdRequestState,
+            frame: Frame::new(HostCmd::KbdGetState as u8, 0, 0, vec![]),
+        });
+        self.conn_probe_queue.push_back(ConnProbeStep {
+            kind: RequestKind::LedRequestState,
+            frame: Frame::new(HostCmd::LedGet as u8, 0, 0, crate::proto::encode_led_get()),
+        });
+        self.conn_probe_queue.push_back(ConnProbeStep {
+            kind: RequestKind::Mai2RequestState,
+            frame: Frame::new(HostCmd::Mai2GetState as u8, 0, 0, vec![]),
+        });
+        self.conn_probe_queue.push_back(ConnProbeStep {
+            kind: RequestKind::KbdRequestMap,
+            frame: Frame::new(HostCmd::KbdGetMap as u8, 0, 0, vec![]),
+        });
+        self.conn_probe_queue.push_back(ConnProbeStep {
+            kind: RequestKind::KbdRequestTouchmap,
+            frame: Frame::new(HostCmd::KbdGetTouchmap as u8, 0, 0, vec![]),
+        });
+        self.conn_probe_queue.push_back(ConnProbeStep {
+            kind: RequestKind::KbdRequestHold,
+            frame: Frame::new(HostCmd::KbdGetHold as u8, 0, 0, vec![]),
+        });
+        self.conn_probe_queue.push_back(ConnProbeStep {
+            kind: RequestKind::KbdGetCombo,
+            frame: Frame::new(HostCmd::KbdGetCombo as u8, 0, 0, vec![]),
+        });
+        self.conn_probe_queue.push_back(ConnProbeStep {
+            kind: RequestKind::KbdRequestKeycfg,
+            frame: Frame::new(HostCmd::KbdGetKeycfg as u8, 0, 0, vec![]),
+        });
+        self.conn_probe_queue.push_back(ConnProbeStep {
+            kind: RequestKind::KbdRequestEdges,
+            frame: Frame::new(
+                HostCmd::KbdGetEdges as u8,
+                0,
+                0,
+                crate::proto::encode_kbd_get_edges(0),
+            ),
+        });
+        self.conn_probe_queue.push_back(ConnProbeStep {
+            kind: RequestKind::RequestParams { ch },
+            frame: Frame::new(
+                HostCmd::ParamGetAll as u8,
+                0,
+                0,
+                crate::proto::encode_param_get_all(ch),
+            ),
+        });
+    }
+
+    /// 连接探针队列或在途请求是否仍未收敛。只读供 UI 主循环建立连接读取优先屏障。
+    pub fn conn_probes_pending(&self) -> bool {
+        !self.conn_probe_queue.is_empty() || self.conn_probe_inflight.is_some()
+    }
+
+    pub fn cancel_conn_probes_for_diagnostic(&mut self) {
+        self.conn_probe_queue.clear();
+        if let Some((seq, _)) = self.conn_probe_inflight.take() {
+            self.pending_registry.confirm(seq);
+        }
+        self.pending_registry.clear();
+        self.cfg_tx_queue.clear();
+        self.cfg_tx_inflight = None;
+    }
+
+    pub fn poll_scheduled(&mut self, ctx: &PollContext, _now_tick: u32, _tick_ms: u32) {
+        if !ctx.connected || self.state != ConnState::Connected {
+            return;
+        }
+        if let Some(seq) = self.conn_probe_inflight.as_ref().map(|(seq, _)| *seq) {
+            let timed_out = self
+                .pending_registry
+                .lookup(seq)
+                .is_some_and(|req| req.started_at.elapsed().as_secs() > req.timeout_secs as u64);
+            if timed_out {
+                let probe_kind = self
+                    .conn_probe_inflight
+                    .as_ref()
+                    .map(|(_, step)| step.kind.label())
+                    .unwrap_or_else(|| "unknown".to_string());
+                let probe_cmd = self
+                    .conn_probe_inflight
+                    .as_ref()
+                    .map(|(_, step)| step.frame.cmd)
+                    .unwrap_or(0);
+                self.pending_registry.confirm(seq);
+                self.conn_probe_inflight = None;
+                log::info!(
+                    "CONN_PROBE timeout kind={} seq={} cmd=0x{:02X}",
+                    probe_kind,
+                    seq,
+                    probe_cmd
+                );
+            }
+        }
+        if self.conn_probe_inflight.is_none() && self.cfg_tx_pending() != 0 {
+            return;
+        }
+        if self.conn_probe_inflight.is_none() {
+            if let Some(step) = self.conn_probe_queue.pop_front() {
+                let kind = step.kind.clone();
+                let label = kind.label();
+                let frame = step.frame.clone();
+                match self._submit_poll(kind, frame) {
+                    Ok(seq) if seq != 0 => {
+                        log::info!(
+                            "CONN_PROBE start kind={} seq={} cmd=0x{:02X}",
+                            label,
+                            seq,
+                            step.frame.cmd
+                        );
+                        self.conn_probe_inflight = Some((seq, step));
+                    }
+                    Ok(_) => self.conn_probe_queue.push_front(step),
+                    Err(error) => self.push_log_warn(format!("连接探针发送失败: {}", error)),
+                }
+            }
+        }
+        if self.conn_probes_pending() {
+            return;
+        }
+        if !self.conn_probes_pending() {
+            if let Some(idx) = ctx.algo_trace_idx {
+                let _ = self._submit_poll(
+                    RequestKind::RequestAlgoTrace {
+                        ch: ctx.sel_channel,
+                        idx,
+                    },
+                    crate::proto::algo::encode_algo_get_trace(0, ctx.sel_channel, idx),
+                );
+            }
+        }
+    }
+
+    fn _data_response_decode_ok(frame: &Frame) -> bool {
+        match frame.cmd {
+            x if x == HostCmd::CfgGetAll as u8 => {
+                (frame.flags & 0x02) == 0 && decode_entries(&frame.payload).is_ok()
+            }
+            x if x == HostCmd::ParamGetAll as u8 => {
+                crate::proto::decode_param_get_all(&frame.payload).is_ok()
+                    || crate::proto::decode_param_get_all_channels(&frame.payload).is_ok()
+            }
+            x if x == HostCmd::GlobalGetAll as u8 => {
+                !crate::proto::algo::decode_global_get_all(&frame.payload).is_empty()
+            }
+            x if x == HostCmd::AlgoGetInfo as u8 => {
+                crate::proto::algo::decode_algo_info(&frame.payload).is_some()
+            }
+            x if x == HostCmd::AlgoGetRom as u8 => {
+                frame.payload.len() == crate::proto::algo::ALGO_CHANNELS * 2
+            }
+            x if x == HostCmd::AlgoGetTrace as u8 => {
+                crate::proto::algo::decode_algo_get_trace(&frame.payload).is_some()
+            }
+            x if x == HostCmd::AlgoGetSrc as u8 => {
+                crate::proto::algo::decode_algo_src_chunk(&frame.payload).is_some()
+            }
+            x if x == HostCmd::KbdGetState as u8 => frame.payload.len() >= 2,
+            x if x == HostCmd::KbdGetMap as u8 => {
+                frame
+                    .payload
+                    .first()
+                    .is_some_and(|count| (*count as usize) <= 12)
+                    && frame.payload.len() >= 1 + frame.payload[0] as usize * 2
+            }
+            x if x == HostCmd::KbdGetTouchmap as u8 => {
+                frame
+                    .payload
+                    .get(1)
+                    .is_some_and(|count| (*count as usize) <= 34)
+                    && frame.payload.len() >= 2 + frame.payload[1] as usize * 2
+            }
+            x if x == HostCmd::KbdGetHold as u8 => {
+                crate::proto::decode_kbd_get_hold(&frame.payload).is_ok_and(|table| {
+                    table.phys.len() == KBD_HOLD_PHYS_COUNT
+                        && table.zone.len() == KBD_HOLD_ZONE_COUNT
+                })
+            }
+            x if x == HostCmd::KbdGetKeycfg as u8 => {
+                crate::proto::decode_kbd_get_keycfg(&frame.payload)
+                    .is_ok_and(|(list, _)| list.len() == KBD_HOLD_PHYS_COUNT)
+            }
+            x if x == HostCmd::KbdGetEdges as u8 => {
+                crate::proto::decode_kbd_get_edges(&frame.payload).is_ok()
+            }
+            x if x == HostCmd::KbdGetCombo as u8 => {
+                crate::proto::decode_kbd_get_combo(&frame.payload).is_ok()
+            }
+            x if x == HostCmd::Mai2GetState as u8 => {
+                crate::proto::decode_mai2_get_state(&frame.payload).is_ok()
+            }
+            x if x == HostCmd::LedGet as u8 => {
+                frame.payload.len() >= 96 && crate::proto::decode_led_get(&frame.payload).is_ok()
+            }
+            _ => false,
+        }
+    }
+
+    fn _confirm_data_pending(&mut self, frame: &Frame, handler_ok: bool) {
+        if !handler_ok
+            || (frame.flags & 0x01) == 0
+            || (frame.flags & 0x04) != 0
+            || frame.cmd == HostCmd::Ack as u8
+            || frame.cmd == HostCmd::Nak as u8
+        {
+            return;
+        }
+        let Some(req) = self.pending_registry.lookup(frame.seq).cloned() else {
+            return;
+        };
+        let matches = match req.kind {
+            RequestKind::AlgoGetInfo => frame.cmd == HostCmd::AlgoGetInfo as u8,
+            RequestKind::AlgoGetRom => frame.cmd == HostCmd::AlgoGetRom as u8,
+            RequestKind::RequestAlgoSrc => frame.cmd == HostCmd::AlgoGetSrc as u8,
+            RequestKind::RequestAlgoCode => frame.cmd == HostCmd::AlgoGetCode as u8,
+            RequestKind::RequestAlgoTrace { .. } => frame.cmd == HostCmd::AlgoGetTrace as u8,
+            RequestKind::GlobalGetAll => frame.cmd == HostCmd::GlobalGetAll as u8,
+            RequestKind::ConfigGetAll => {
+                frame.cmd == HostCmd::CfgGetAll as u8 && (frame.flags & 0x02) == 0
+            }
+            RequestKind::RequestParams { .. } | RequestKind::RequestParamAllChannels { .. } => {
+                frame.cmd == HostCmd::ParamGetAll as u8
+            }
+            RequestKind::KbdRequestState => frame.cmd == HostCmd::KbdGetState as u8,
+            RequestKind::KbdRequestMap => frame.cmd == HostCmd::KbdGetMap as u8,
+            RequestKind::KbdRequestTouchmap => frame.cmd == HostCmd::KbdGetTouchmap as u8,
+            RequestKind::KbdRequestHold => frame.cmd == HostCmd::KbdGetHold as u8,
+            RequestKind::KbdRequestKeycfg => frame.cmd == HostCmd::KbdGetKeycfg as u8,
+            RequestKind::KbdGetCombo => frame.cmd == HostCmd::KbdGetCombo as u8,
+            RequestKind::KbdRequestEdges => frame.cmd == HostCmd::KbdGetEdges as u8,
+            RequestKind::Mai2RequestState => frame.cmd == HostCmd::Mai2GetState as u8,
+            _ => false,
+        };
+        if matches {
+            let label = req.kind.label();
+            self.pending_registry.confirm(frame.seq);
+            if self
+                .conn_probe_inflight
+                .as_ref()
+                .is_some_and(|(seq, _)| *seq == frame.seq)
+            {
+                self.conn_probe_inflight = None;
+                log::info!(
+                    "CONN_PROBE complete kind={} seq={} cmd=0x{:02X} flags=0x{:02X}",
+                    label,
+                    frame.seq,
+                    frame.cmd,
+                    frame.flags
+                );
+            }
+        }
+    }
+
     fn handle_event(&mut self, evt: IoEvent) {
         match evt {
             IoEvent::Connected => {
@@ -1398,15 +1957,32 @@ impl AppController {
                 self.status_text = format!("错误: {}", msg);
                 self.last_error = Some(msg);
             }
+            IoEvent::DeviceBusy { consecutive_errors } => {
+                self.device_busy_until =
+                    Some(std::time::Instant::now() + std::time::Duration::from_secs(8));
+                self.push_log_warn(format!(
+                    "设备疑似忙(写 flash/CSD 重初始化)，等待恢复；连续 os error 22 次数={}",
+                    consecutive_errors
+                ));
+            }
+            IoEvent::DeviceRecovered => {
+                if self.device_busy_until.take().is_some() {
+                    self.device_busy_log_at = None;
+                    self.push_log("设备已恢复，继续发送轮询命令".to_string());
+                }
+            }
             IoEvent::Frame(frame) => self.handle_frame(frame),
         }
     }
 
     /// 处理单个到达的协议帧。
     fn handle_frame(&mut self, frame: Frame) {
-        // Debug 级: 记录实际收到的数据帧(排除高频 TELEM_DATA, 否则刷屏)。
+        // Debug 级: 记录实际收到的数据帧(排除高频采样推送 TELEM_DATA/FOCUS_DATA, 否则刷屏)。
         // 这是"实际数据交互"的接收侧, 选 Debug 等级即可看到真实命令响应/ACK/NAK 流。
-        if frame.cmd != HostCmd::TelemData as u8 {
+        let sample_push = frame.cmd == HostCmd::TelemData as u8
+            || frame.cmd == HostCmd::FocusData as u8
+            || frame.cmd == HostCmd::SweepData as u8;
+        if !sample_push {
             let kind = if (frame.flags & 0x04) != 0 {
                 "NAK"
             } else if (frame.flags & 0x01) != 0 {
@@ -1423,7 +1999,7 @@ impl AppController {
             ));
         }
         // C 源分片上传也是"一片一回执"的窗口=1 传输；只由 ACK/NAK 推进，普通响应不能放行。
-        if frame.cmd != HostCmd::TelemData as u8 {
+        if !sample_push {
             let nak = (frame.flags & 0x04) != 0 || frame.cmd == HostCmd::Nak as u8;
             if nak || frame.cmd == HostCmd::Ack as u8 {
                 self._algo_src_note_reply(frame.seq, !nak);
@@ -1464,8 +2040,11 @@ impl AppController {
             }
         }
         // 配置命令响应处理 (#6e-1)
-        else if frame.cmd == HostCmd::CfgGetAll as u8 {
+        if frame.cmd == HostCmd::CfgGetAll as u8 {
+            let version = self.config_version;
             self._handle_cfg_get_all_response(&frame);
+            let ok = (frame.flags & 0x02) == 0 && self.config_version != version;
+            self._confirm_data_pending(&frame, ok);
         } else if frame.cmd == HostCmd::CfgGetGroup as u8 {
             self._handle_cfg_get_group_response(&frame);
         } else if frame.cmd == HostCmd::CfgGet as u8 {
@@ -1478,16 +2057,28 @@ impl AppController {
             self._handle_bind_event(&frame);
         } else if frame.cmd == HostCmd::TelemData as u8 {
             self._handle_telem_data(&frame);
+        } else if frame.cmd == HostCmd::FocusData as u8 {
+            // 设备主动推送(STREAM): 单通道采样, 归属由 payload 里的 session 判定, 与 seq 无关。
+            self._handle_focus_data(&frame);
+        } else if frame.cmd == HostCmd::SweepData as u8 {
+            self._handle_sweep_data(&frame);
+        } else if frame.cmd == HostCmd::FocusStart as u8 && (frame.flags & 0x01) != 0 {
+            self._handle_focus_start_response(&frame);
+        } else if frame.cmd == HostCmd::SweepStart as u8 && (frame.flags & 0x01) != 0 {
+            self._handle_sweep_start_response(&frame);
         } else if frame.cmd == HostCmd::ParamGet as u8 && (frame.flags & 0x01) != 0 {
             self._handle_param_get_response(&frame);
         } else if frame.cmd == HostCmd::ParamGetAll as u8 && (frame.flags & 0x01) != 0 {
+            let version = self.param_version;
             self._handle_param_get_all_response(&frame);
+            self._confirm_data_pending(&frame, self.param_version != version);
         } else if frame.cmd == HostCmd::CpGet as u8 && (frame.flags & 0x01) != 0 {
             self._handle_cp_get_response(&frame);
         } else if frame.cmd == HostCmd::GlobalGet as u8 && (frame.flags & 0x01) != 0 {
             self._handle_global_get_response(&frame);
         } else if frame.cmd == HostCmd::GlobalGetAll as u8 && (frame.flags & 0x01) != 0 {
             self._handle_global_get_all_response(&frame);
+            self._confirm_data_pending(&frame, Self::_data_response_decode_ok(&frame));
         } else if frame.cmd == HostCmd::AutoTune as u8 && (frame.flags & 0x01) != 0 {
             self._handle_auto_tune_response(&frame);
         } else if frame.cmd == HostCmd::AutoTuneProgressPush as u8 {
@@ -1500,32 +2091,49 @@ impl AppController {
             self._handle_self_heal_event(&frame);
         } else if frame.cmd == HostCmd::AlgoGetInfo as u8 && (frame.flags & 0x01) != 0 {
             self._handle_algo_info_response(&frame);
+            self._confirm_data_pending(&frame, Self::_data_response_decode_ok(&frame));
         } else if frame.cmd == HostCmd::AlgoGetRom as u8 && (frame.flags & 0x01) != 0 {
             self._handle_algo_get_rom_response(&frame);
+            self._confirm_data_pending(&frame, Self::_data_response_decode_ok(&frame));
         } else if frame.cmd == HostCmd::AlgoGetTrace as u8 && (frame.flags & 0x01) != 0 {
             self._handle_algo_get_trace_response(&frame);
+            self._confirm_data_pending(&frame, Self::_data_response_decode_ok(&frame));
         } else if frame.cmd == HostCmd::AlgoGetCfg as u8 && (frame.flags & 0x01) != 0 {
             self._handle_algo_get_cfg_response(&frame);
         } else if frame.cmd == HostCmd::AlgoGetSrc as u8 && (frame.flags & 0x01) != 0 {
             self._handle_algo_src_chunk(&frame);
+            self._confirm_data_pending(&frame, Self::_data_response_decode_ok(&frame));
         } else if frame.cmd == HostCmd::AlgoGetCode as u8 && (frame.flags & 0x01) != 0 {
+            let len_ok = frame.payload.len() >= 2
+                && u16::from_le_bytes([frame.payload[0], frame.payload[1]]) as usize > 0
+                && u16::from_le_bytes([frame.payload[0], frame.payload[1]]) as usize
+                    <= frame.payload.len() - 2;
             let bytes = crate::proto::algo::decode_algo_len_prefixed(&frame.payload);
-            self.algo_device_code_hex = Self::_hex_dump(&bytes);
-            self.algo_device_code_version = self.algo_device_code_version.wrapping_add(1);
+            if len_ok {
+                self.algo_device_code_hex = Self::_hex_dump(&bytes);
+                self.algo_device_code_version = self.algo_device_code_version.wrapping_add(1);
+            }
+            self._confirm_data_pending(&frame, len_ok);
         } else if frame.cmd == HostCmd::KbdGetState as u8 && (frame.flags & 0x01) != 0 {
             self._handle_kbd_get_state_response(&frame);
+            self._confirm_data_pending(&frame, Self::_data_response_decode_ok(&frame));
         } else if frame.cmd == HostCmd::KbdGetMap as u8 && (frame.flags & 0x01) != 0 {
             self._handle_kbd_get_map_response(&frame);
+            self._confirm_data_pending(&frame, Self::_data_response_decode_ok(&frame));
         } else if frame.cmd == HostCmd::KbdGetTouchmap as u8 && (frame.flags & 0x01) != 0 {
             self._handle_kbd_get_touchmap_response(&frame);
+            self._confirm_data_pending(&frame, Self::_data_response_decode_ok(&frame));
         } else if frame.cmd == HostCmd::KbdGetHold as u8 && (frame.flags & 0x01) != 0 {
             self._handle_kbd_get_hold_response(&frame);
+            self._confirm_data_pending(&frame, Self::_data_response_decode_ok(&frame));
         } else if frame.cmd == HostCmd::KbdGetKeycfg as u8 && (frame.flags & 0x01) != 0 {
             self._handle_kbd_get_keycfg_response(&frame);
+            self._confirm_data_pending(&frame, Self::_data_response_decode_ok(&frame));
         } else if frame.cmd == HostCmd::KbdGetEdges as u8 && (frame.flags & 0x01) != 0 {
             self._handle_kbd_get_edges_response(&frame);
+            self._confirm_data_pending(&frame, Self::_data_response_decode_ok(&frame));
         } else if frame.cmd == HostCmd::KbdGetCombo as u8 && (frame.flags & 0x01) != 0 {
-            match crate::proto::decode_kbd_get_combo(&frame.payload) {
+            let ok = match crate::proto::decode_kbd_get_combo(&frame.payload) {
                 Ok(items) => {
                     self.kbd_combo_supported = Some(true);
                     self.kbd_combo_req_seq = None;
@@ -1533,16 +2141,21 @@ impl AppController {
                     // 回读到设备真值后丢弃草稿: 与其它页"回读即真值"的口径一致。
                     self.drafts.drop_kbd_combo();
                     self.kbd_combo_version = self.kbd_combo_version.wrapping_add(1);
+                    true
                 }
                 Err(e) => {
                     log::error!("解析 KBD_GET_COMBO 响应失败: {}", e);
                     self.last_error = Some(e);
+                    false
                 }
-            }
+            };
+            self._confirm_data_pending(&frame, ok);
         } else if frame.cmd == HostCmd::Mai2GetState as u8 && (frame.flags & 0x01) != 0 {
             self._handle_mai2_get_state_response(&frame);
+            self._confirm_data_pending(&frame, Self::_data_response_decode_ok(&frame));
         } else if frame.cmd == HostCmd::LedGet as u8 && (frame.flags & 0x01) != 0 {
             self._handle_led_get_response(&frame);
+            self._confirm_data_pending(&frame, Self::_data_response_decode_ok(&frame));
         } else {
             log::debug!(
                 "收到帧 cmd=0x{:02X} seq={} len={} (待处理)",
@@ -1558,12 +2171,18 @@ impl AppController {
     // ------------------------------------------------------------------
 
     /// 请求拉取全部配置项
+    /// 请求全量配置。连接探针拥有握手阶段 CFG_GET_ALL 的唯一权；探针未收敛时，
+    /// 手动刷新不另开第二条流，避免固件把两条流式响应交错后无法解码。
     pub fn request_config_all(&mut self) -> anyhow::Result<()> {
-        let seq = self.next_seq();
-        if let Some(handle) = &self.io {
-            let frame = Frame::new(HostCmd::CfgGetAll as u8, 0, seq, vec![]);
+        if self.conn_probes_pending() {
+            return Ok(());
+        }
+        let seq = self._submit_poll(
+            RequestKind::ConfigGetAll,
+            Frame::new(HostCmd::CfgGetAll as u8, 0, 0, vec![]),
+        )?;
+        if seq != 0 {
             self.cfg_all_accum.clear();
-            handle.send(frame)?;
         }
         Ok(())
     }
@@ -1897,6 +2516,7 @@ impl AppController {
                 queued.push(crate::proto::algo::encode_algo_set_cfg(seq, idx, val));
             }
             self.algo_cfg[idx as usize] = val;
+            self.algo_cfg_valid[idx as usize] = true;
         }
         // 4b) 触控组合映射(整表替换)。放在物理键/触控键之前无所谓: 固件侧是独立表, 互不影响。
         self._commit_combo(&mut queued)?;
@@ -2358,6 +2978,31 @@ impl AppController {
         Ok(())
     }
 
+    fn _device_busy(&self) -> bool {
+        self.device_busy_until
+            .is_some_and(|until| std::time::Instant::now() < until)
+    }
+
+    /// 非紧急轮询的统一发送入口。设备忙时只丢弃可重建的查询，不触碰配置 FIFO 和用户操作。
+    fn _send_nonurgent(&mut self, frame: Frame) -> anyhow::Result<bool> {
+        if self._device_busy() {
+            return Ok(false);
+        }
+        let Some(handle) = &self.io else {
+            return Ok(false);
+        };
+        handle.send(frame)?;
+        Ok(true)
+    }
+
+    fn _note_device_busy_nak(&mut self, frame: &Frame) {
+        if frame.payload.first().copied() == Some(0x03) {
+            self.device_busy_until =
+                Some(std::time::Instant::now() + std::time::Duration::from_secs(8));
+            self.push_log_warn("设备返回 BUSY NAK，等待设备恢复后降频轮询".to_string());
+        }
+    }
+
     /// 配置写类命令的内部入队口。默认归属 External；批量 prime 用私有 owner 入口，取消只清该代帧。
     fn _queue_tx(&mut self, frame: Frame) -> anyhow::Result<()> {
         self._queue_tx_owned(frame, CfgTxOwner::External)
@@ -2776,6 +3421,16 @@ impl AppController {
         fields: u8,
         ch_mask: u64,
     ) -> anyhow::Result<()> {
+        if self._device_busy() {
+            if self
+                .device_busy_log_at
+                .is_none_or(|at| at.elapsed() >= std::time::Duration::from_secs(2))
+            {
+                self.device_busy_log_at = Some(std::time::Instant::now());
+                self.push_log_warn("设备忙，暂停 TELEM_START，等待设备恢复".to_string());
+            }
+            return Ok(());
+        }
         let seq = self.next_seq();
         if let Some(handle) = &self.io {
             // 始终 OR 上 STATS/LATENCY 位:调用方无需关心该细节,保证实际发出的 fields 带采样率和延迟统计。
@@ -2814,6 +3469,10 @@ impl AppController {
             self.telem_scope_channels = None;
             return;
         }
+        // 连接探针优先：基础回读完成前延迟自动 TELEM_START，避免流帧占用唯一 WinUSB 会话。
+        if self.conn_probes_pending() {
+            return;
+        }
         // ★用户按了"停止"就必须真的停住★
         // 本方法每 16ms 被主循环调一次, 而 stop_telemetry() 会把档位记忆清成未知 —— 于是"停止"下一帧
         // 就被这里重新开流, 表现为按钮完全没用(实测)。页面档位切换是自动行为, 不该覆盖用户的显式意图。
@@ -2824,8 +3483,11 @@ impl AppController {
             return;
         }
         let res = if want_channels {
+            // 全通道广谱只需 30Hz: 全 36 通道的分块快照本身就要 16 个 1ms 拍才凑齐一份
+            // (物理上限 ~62 份/s), 再高的请求只会让固件重复发同一代数据, 白占 USB 与主循环预算。
+            // 30Hz 是"看整盘状态"够用的刷新率; 需要细节的场合走单通道独占流(它才是高速路)。
             self.start_telemetry(
-                100,
+                30,
                 crate::proto::FIELD_RAW
                     | crate::proto::FIELD_BASELINE
                     | crate::proto::FIELD_DIFF
@@ -2865,7 +3527,12 @@ impl AppController {
             return Vec::new();
         }
         let now = std::time::Instant::now();
+        // ★单通道流期间只判目标通道★ FOCUS_START 会让固件挂起广谱流(设计如此), 其余通道"没数据"
+        // 是正常的。不收窄就会让遥测看门狗每 5s 白重发一次 TELEM_START(那条命令在 focus 期间也
+        // 只被固件记下来备用, 除了占带宽什么都不会发生)。
+        let focus_ch = self.focus.channel;
         (0..36u8)
+            .filter(|ch| focus_ch.is_none_or(|target| target == *ch))
             // ★禁用通道不参与缺失判定★ 它按设计不上报有效数据(设备侧一律发 0), 把它算成"缺失"
             // 会让遥测看门狗无休止地重发 TELEM_START、甚至触发 HELLO 链路恢复 —— 用户只是关了
             // 几个通道, 却换来周期性的链路重建。
@@ -2887,6 +3554,19 @@ impl AppController {
     /// 持续缺失才有界触发现有 HELLO 链路恢复，绝不以校准/Cp 之类破坏 CSD 状态的操作掩盖问题。
     pub fn telem_heal_tick(&mut self) -> bool {
         if self.io.is_none() || !self.telem_active || self.telem_user_paused {
+            return false;
+        }
+        if self.conn_probes_pending() {
+            return false;
+        }
+        // ★频谱会话期间本看门狗必须整体让位★
+        // 设备侧 SWEEP_START 按设计挂起广谱流(sensor_link.cpp `_pause_broad_for_focus`), 于是带 STATS
+        // 的 TELEM_DATA 本就不再到达 —— 那是会话的正常表现, 不是链路故障。而本函数的升级路径是
+        // `resend_hello()`, 固件 HELLO 处理无条件 `SensorLink::stop()`(host_cmd.cpp:433), 它在扫描
+        // 活跃时直接把会话掀进 CANCELLED 恢复链。结果就是扫描每次都在 heal 门限(3s)+冷却(5s)内被
+        // 自己的看门狗杀掉, 只产出个位数格。会话是否健康由 SWEEP_DATA 的显式续租/终态自证, 不需要
+        // 也不允许这条通用看门狗插手。
+        if self.noise_sweep_active() {
             return false;
         }
         let now = std::time::Instant::now();
@@ -2949,6 +3629,9 @@ impl AppController {
     pub fn telem_user_start(&mut self) {
         self.telem_user_paused = false;
         self.telem_scope_channels = None;
+        // 停止期间设备已清空 FocusSession；本地也必须废弃旧会话/速率窗口，
+        // 让当前曲线页在下一拍重新下发 START，并从新会话的首帧开始计满 1 秒。
+        self.focus.clear();
         self.push_log("遥测: 已恢复推流(按当前页面档位)".to_string());
     }
 
@@ -2956,6 +3639,8 @@ impl AppController {
     pub fn telem_user_stop(&mut self) {
         let _ = self.stop_telemetry();
         self.telem_user_paused = true;
+        // 即使链路已先断开也要废弃本地 Focus 计量，旧 session/last 不能冒充下一次会话。
+        self.focus.clear();
         self.push_log("遥测: 已按用户请求停止(切换页面不会自动恢复, 需再点「开始」)".to_string());
     }
 
@@ -2969,12 +3654,137 @@ impl AppController {
             // 用户手动停流后, 档位记为未知: 否则回到通道页时 telem_set_scope 会因"档位没变"而
             // 不重新开流, 表现为"点了停止再回来就再也没有数据"。
             self.telem_scope_channels = None;
+            // ★TELEM_STOP 在设备侧会一并清掉 FocusSession★(固件 `_handle_telem_stop` → `stop()`)。
+            // 本地不同步清零, 之后"目标没变"的幂等判定就会认为单通道流还在, 再也不会重开。
+            self.focus.clear();
         }
         Ok(())
     }
 
+    /// 单通道独占流的目标通道: `Some(ch)` = 开/切到该通道, `None` = 停。由 UI 每 tick 调用,
+    /// 目标未变时一条命令都不发(否则会变成每 16ms 一轮 START/STOP)。
+    ///
+    /// ★设备侧语义★ FOCUS_START 会挂起广谱 TELEM 流, FOCUS_STOP 自动恢复它 —— 因此本方法不去动
+    /// `telem_set_scope` 记住的档位: 页面档位仍是全通道, 停 focus 后广谱流由固件原样恢复。
+    /// 单通道流的实测吞吐文案。★只报实测★ 没有会话、或最近一个结算窗口已过期(>3s 没新结算)时
+    /// 如实说"无独占流 / 已过期", 绝不把上一次的读数继续显示成当前带宽。
+    pub fn focus_bandwidth_text(&self) -> String {
+        let Some(ch) = self.focus.channel else {
+            return "独占流: 未开启（当前为全通道广谱）".to_string();
+        };
+        if self.focus.session.is_none() {
+            return format!("独占流: CH{} 会话建立中…", ch);
+        }
+        let fresh = self
+            .focus
+            .rate
+            .settled_at
+            .is_some_and(|at| at.elapsed() < std::time::Duration::from_secs(3));
+        match (self.focus.rate.last, fresh) {
+            (Some((frames, bytes, gaps)), true) => format!(
+                "独占流 CH{}: {} 帧/s · {:.1} KB/s · 丢帧 {}/s · 累计丢帧 {}",
+                ch,
+                frames,
+                bytes as f32 / 1024.0,
+                gaps,
+                self.focus.gaps
+            ),
+            (_, _) => format!("独占流 CH{}: 正在统计首个 1 秒窗口…", ch),
+        }
+    }
+
+    /// 最近一个已结算窗口的实测 (帧/s, 字节/s, 丢帧/s)。无会话或尚无结算窗口时为 None。
+    /// 供无头带宽实测取原始数值(UI 走 `focus_bandwidth_text` 的文案路径)。
+    pub fn focus_rate_last(&self) -> Option<(u32, u32, u32)> {
+        self.focus.rate.last
+    }
+
+    /// 本会话累计丢帧(按 sample_seq 跳变计), 会话重建时归零。
+    pub fn focus_gaps_total(&self) -> u64 {
+        self.focus.gaps
+    }
+
+    pub fn focus_set_target(&mut self, ch: Option<u8>) {
+        let ch = ch.filter(|c| (*c as usize) < 36);
+        if self.io.is_none() {
+            // 断链: 设备侧会话已随链路消失, 本地必须归零, 否则重连后"目标没变"会导致永不下发。
+            if self.focus.channel.is_some() || self.focus.session.is_some() {
+                self.focus.clear();
+            }
+            return;
+        }
+        // ★修复暂停恢复后带宽统计失效★：即使目标通道相同，如果会话已失效（session=None），
+        // 也必须重建会话，以便重置测量窗口。用户停止流后 telem_user_stop 会清空 session，
+        // 恢复时虽然 channel 记录还在，但没有真实会话，必须重新发 START。
+        if self.focus.targets(ch) && self.focus.session.is_some() {
+            return;
+        }
+        // ★先进代次再发命令★: 此后到达的旧 session 数据与旧 START 响应立即失效。
+        let old_session = self.focus.session;
+        let generation = self.focus._bump();
+        if let Some(session) = old_session {
+            self._focus_send_stop(session);
+        }
+        let Some(target) = ch else {
+            self.push_log_debug(
+                "单通道流: 已停止(离开单通道页/切走), 广谱遥测由固件自动恢复".to_string(),
+            );
+            return;
+        };
+        let seq = self.next_seq();
+        let payload = crate::proto::encode_focus_start(
+            target,
+            Self::FOCUS_FIELDS,
+            Self::FOCUS_RATE_HZ,
+            Self::FOCUS_LEASE_MS,
+        );
+        let sent = self
+            .io
+            .as_ref()
+            .map(|handle| handle.send(Frame::new(HostCmd::FocusStart as u8, 0, seq, payload)));
+        match sent {
+            Some(Ok(())) => {
+                self.focus.channel = Some(target);
+                self.focus.pending = Some(FocusPending {
+                    seq,
+                    generation,
+                    channel: target,
+                });
+            }
+            Some(Err(e)) => self.push_log_warn(format!("单通道流启动下发失败: {}", e)),
+            None => {}
+        }
+    }
+
+    /// 对指定 session 下发 FOCUS_STOP。设备只接受当前会话号, 故 session 必须来自 START 响应。
+    fn _focus_send_stop(&mut self, session: u16) {
+        let seq = self.next_seq();
+        let payload = crate::proto::encode_focus_stop(session);
+        if let Some(handle) = &self.io {
+            if let Err(e) = handle.send(Frame::new(HostCmd::FocusStop as u8, 0, seq, payload)) {
+                self.push_log_warn(format!("单通道流停止下发失败: {}", e));
+            }
+        }
+    }
+
+    /// 单通道流请求的字段集: 与逐通道档同一套, 外加帧级统计/延迟(主页卡片与自愈判据都靠它)。
+    const FOCUS_FIELDS: u8 = crate::proto::FIELD_RAW
+        | crate::proto::FIELD_BASELINE
+        | crate::proto::FIELD_DIFF
+        | crate::proto::FIELD_STATUS
+        | crate::proto::FIELD_STATS
+        | crate::proto::FIELD_LATENCY;
+    /// 请求速率取固件上限 1000Hz: 单通道帧仅几十字节, 且固件只在快照代数推进时才发帧
+    /// (实测 ~171Hz), 所以这里给上限等于"要多快有多快", 不会凭空造出无意义的重复帧。
+    const FOCUS_RATE_HZ: u16 = 1000;
+    /// 租约 3s: 与遥测流同量级, 上位机任意命令帧都会续租; 上位机消失则设备侧自动停流。
+    const FOCUS_LEASE_MS: u16 = 3000;
+
     /// 请求单个参数
     pub fn request_param(&mut self, ch: u8, param_id: u8) -> anyhow::Result<()> {
+        if self._device_busy() {
+            return Ok(());
+        }
         let seq = self.next_seq();
         if let Some(handle) = &self.io {
             let payload = crate::proto::encode_param_get(ch, param_id);
@@ -2986,6 +3796,9 @@ impl AppController {
 
     /// 请求所有参数(某通道)
     pub fn request_params(&mut self, ch: u8) -> anyhow::Result<()> {
+        if self._device_busy() {
+            return Ok(());
+        }
         let seq = self.next_seq();
         if let Some(handle) = &self.io {
             let payload = crate::proto::encode_param_get_all(ch);
@@ -2998,6 +3811,9 @@ impl AppController {
     /// 批量请求全 36 通道的同一参数(PARAM_GET_ALL 的 0xFF 变体): 一条命令替代 36 条单发 PARAM_GET。
     /// 用于时钟树 snsClk 范围与逐通道自适应后的回读, 避免 36 帧往返打满 vendor 端点。
     pub fn request_param_all_channels(&mut self, param_id: u8) -> anyhow::Result<()> {
+        if self._device_busy() {
+            return Ok(());
+        }
         let seq = self.next_seq();
         if let Some(handle) = &self.io {
             let payload = crate::proto::encode_param_get_all_channels(param_id);
@@ -3234,6 +4050,9 @@ impl AppController {
     pub fn request_cp(&mut self, ch: u8) -> anyhow::Result<()> {
         if ch >= 36 {
             return Err(anyhow::anyhow!("Cp 通道越界: {}", ch));
+        }
+        if self._device_busy() {
+            return Ok(());
         }
         let seq = self.next_seq();
         if let Some(handle) = &self.io {
@@ -3743,10 +4562,12 @@ impl AppController {
         // 两者都以 `_csd_locked()` 为唯一"设备是否还在忙上一步"的判据, 不另设第二套忙闲状态。
         self._pump_ch_batch();
         self._pump_noise_sweep();
-        // 全 36 通道参数重读队列: 每 tick 只发一条 PARAM_GET_ALL(0xFF) —— 不加快轮询, 也不挤爆端点。
-        if let Some(param_id) = self.param_refetch_ids.pop() {
-            if let Err(e) = self.request_param_all_channels(param_id) {
-                log::warn!("全通道参数重读 0x{:02X} 下发失败: {}", param_id, e);
+        // 连接后基础回读优先：探针存在期间不启动后台全通道参数重读，避免与 CFG_GET_ALL 等单一会话抢占。
+        if !self._device_busy() && !self.conn_probes_pending() {
+            if let Some(param_id) = self.param_refetch_ids.pop() {
+                if let Err(e) = self.request_param_all_channels(param_id) {
+                    log::warn!("全通道参数重读 0x{:02X} 下发失败: {}", param_id, e);
+                }
             }
         }
         // CSD 诊断探针(DEBUG): 改全局后 ~1.2s 触发一次设备状态回读; 窗口 ~2s 后自动关。
@@ -3820,6 +4641,9 @@ impl AppController {
     // 全局 CSD 配置 (GLOBAL_*): 未激活传感器连接/IDAC/MFS
     // ------------------------------------------------------------------
     pub fn global_get(&mut self, gparam_id: u8) -> anyhow::Result<()> {
+        if self._device_busy() {
+            return Ok(());
+        }
         let seq = self.next_seq();
         if let Some(handle) = &self.io {
             handle.send(crate::proto::algo::encode_global_get(seq, gparam_id))?;
@@ -3842,6 +4666,9 @@ impl AppController {
         Ok(())
     }
     pub fn global_get_all(&mut self) -> anyhow::Result<()> {
+        if self._device_busy() {
+            return Ok(());
+        }
         let seq = self.next_seq();
         if let Some(handle) = &self.io {
             handle.send(crate::proto::algo::encode_global_get_all(seq))?;
@@ -4605,9 +5432,7 @@ impl AppController {
             return Err(anyhow::anyhow!("未连接, 无法恢复运行态"));
         }
         if self.desired.is_empty() {
-            // 用户从未显式设置过运行态: 只拉一次真值给 UI 打底, 不下发任何东西。
-            self.kbd_request_hold()?;
-            self.mai2_request_state()?;
+            // 用户从未显式设置过运行态: 连接探针队列会顺序回读真实状态, 不在握手边沿直发并发请求。
             return Ok(());
         }
         // 1) 长按参数: 全部期望项合并为一帧下发。
@@ -4651,15 +5476,13 @@ impl AppController {
             ))?;
         }
         self.push_log(format!(
-            "重连恢复运行态: 长按 {} 项 + 触控键盘映射={} + mai2 发送使能={} 已重新下发, 正在回读对账",
+            "重连恢复运行态: 长按 {} 项 + 触控键盘映射={} + mai2 发送使能={} 已重新下发, 连接探针将在写队列排空后回读对账",
             items.len(),
             Self::_opt_on_off(self.desired.kbd_map_en),
             Self::_opt_on_off(self.desired.mai2_send_en)));
-        // 4) 回读对账: 不一致如实告警, 不静默。
+        // 4) 回读对账由连接探针队列中的 KBD_GET_HOLD/MAI2_GET_STATE 负责，避免与恢复写入并发。
         self.restore_verify.hold = true;
         self.restore_verify.mai2 = true;
-        self.kbd_request_hold()?;
-        self.mai2_request_state()?;
         Ok(())
     }
 
@@ -4786,14 +5609,8 @@ impl AppController {
             ));
         }
     }
-
     // ------------------------------------------------------------------
-    // mai2light 灯板协议 (LED_GET 0x50 / LED_SET_REGION 0x51 / LED_PREVIEW 0x52)
-    //
-    // 只读快照走 LED_GET 低频轮询(见 main.rs 协议页门控); 映射编辑先落本地草稿,
-    // 点"应用映射"才整批下发 —— 固件对 LED_SET_REGION 是全成或全不成, 逐单元下发
-    // 只会得到一串互相矛盾的中间态。
-    // ------------------------------------------------------------------
+    // mai2light
 
     /// 灯效运行态版本号(回读/草稿编辑/应用结果变化时自增)。
     pub fn led_version(&self) -> u64 {
@@ -4904,6 +5721,11 @@ impl AppController {
     /// 最近一次 LED_GET 快照中的虚拟单元数量；None 表示尚未取得有效快照。
     pub fn led_unit_count(&self) -> Option<u8> {
         self.led_state.map(|s| s.unit_count)
+    }
+
+    /// 最近一次 LED_GET 快照中的设备实际生效亮度；None 表示尚未回读或旧固件未上报。
+    pub fn led_applied_brightness(&self) -> Option<u8> {
+        self.led_state.and_then(|state| state.applied_brightness)
     }
 
     /// 本地映射校验结论: Some(原因) = 明知会被设备拒收, 不该发。
@@ -5044,10 +5866,10 @@ impl AppController {
     }
 
     fn _handle_led_get_response(&mut self, frame: &Frame) {
-        // 固件契约是固定 96B 快照；拒绝多余/缺失字节，避免上层把版本漂移误当真值。
-        if frame.payload.len() != 96 {
+        // 前 96B 是稳定快照；新版固件可在尾部追加运行态亮度字节，兼容旧固件。
+        if frame.payload.len() < 96 {
             self.push_log_warn(format!(
-                "LED_GET 响应长度错误: {} 字节 (需 96)",
+                "LED_GET 响应长度错误: {} 字节 (需 >= 96)",
                 frame.payload.len()
             ));
             return;
@@ -5061,7 +5883,9 @@ impl AppController {
                 self.led_state = Some(state);
                 self.led_version = self.led_version.wrapping_add(1);
             }
-            Err(e) => self.push_log_warn(format!("LED_GET 解析失败: {}", e)),
+            Err(e) => {
+                self.push_log_warn(format!("LED_GET 解析失败: {}", e));
+            }
         }
     }
 
@@ -5069,10 +5893,10 @@ impl AppController {
     // JIT 算法引擎 (ALGO_*)
     // ------------------------------------------------------------------
     pub fn algo_get_info(&mut self) -> anyhow::Result<()> {
-        let seq = self.next_seq();
-        if let Some(handle) = &self.io {
-            handle.send(crate::proto::algo::encode_algo_get_info(seq))?;
-        }
+        let _ = self._submit_poll(
+            RequestKind::AlgoGetInfo,
+            crate::proto::algo::encode_algo_get_info(0),
+        )?;
         Ok(())
     }
     pub fn algo_apply(&mut self) -> anyhow::Result<()> {
@@ -5186,10 +6010,12 @@ impl AppController {
             return Ok(());
         }
         self.algo_trace_pending_idx = idx;
-        let seq = self.next_seq();
-        self.algo_trace_last_seq = Some(seq);
-        if let Some(handle) = &self.io {
-            handle.send(crate::proto::algo::encode_algo_get_trace(seq, ch, idx))?;
+        let seq = self._submit_poll(
+            RequestKind::RequestAlgoTrace { ch, idx },
+            crate::proto::algo::encode_algo_get_trace(0, ch, idx),
+        )?;
+        if seq != 0 {
+            self.algo_trace_last_seq = Some(seq);
         }
         Ok(())
     }
@@ -5235,7 +6061,8 @@ impl AppController {
         if idx >= 8 {
             return Err(anyhow::anyhow!("算法可调变量索引非法: {}", idx));
         }
-        let same_as_device = self.algo_cfg.get(idx as usize) == Some(&val);
+        let slot = idx as usize;
+        let same_as_device = self.algo_cfg_valid[slot] && self.algo_cfg[slot] == val;
         self.drafts.set_algo_cfg(idx, val, same_as_device);
         // 草稿优先 getter 依赖版本号立即回显，不覆盖设备缓存以支持撤销恢复。
         self.algo_cfg_version = self.algo_cfg_version.wrapping_add(1);
@@ -5252,9 +6079,17 @@ impl AppController {
         Ok(())
     }
     pub fn algo_cfg(&self, idx: u8) -> u8 {
-        self.drafts
-            .algo_cfg(idx)
-            .unwrap_or_else(|| *self.algo_cfg.get(idx as usize).unwrap_or(&0))
+        let slot = idx as usize;
+        self.drafts.algo_cfg(idx).unwrap_or_else(|| {
+            if self.algo_cfg_valid.get(slot).copied().unwrap_or(false) {
+                self.algo_cfg[slot]
+            } else {
+                self.algo_setting_decls()
+                    .into_iter()
+                    .find(|decl| decl.idx == idx)
+                    .map_or(0, |decl| decl.default)
+            }
+        })
     }
     pub fn algo_cfg_version(&self) -> u64 {
         self.algo_cfg_version
@@ -5293,35 +6128,32 @@ impl AppController {
         // 成功响应: 设备有算法且可读, 清退避恢复正常轮询。
         self.algo_trace_backoff = 0;
         self.algo_trace_last_seq = None;
-        if let Some((ch, idx, active, report)) =
+        let Some((ch, idx, active, report)) =
             crate::proto::algo::decode_algo_get_trace(&frame.payload)
-        {
-            if self.algo_trace_channel != Some(ch) || idx >= 4 {
-                return; // 通道已切换或响应索引非法，丢弃过时帧。
+        else {
+            return;
+        };
+        if self.algo_trace_channel != Some(ch) || idx >= 4 {
+            return; // 通道已切换或响应索引非法，丢弃过时帧。
+        }
+        const TRACE_CAP: usize = 512;
+        let t_us = match frame.device_t_us {
+            Some(raw) => self.telem_clock.unwrap_us(raw),
+            None => {
+                self.telem_clock.acc_us
+                    + self
+                        .telem_frame_at
+                        .map_or(0, |at| at.elapsed().as_micros() as u64)
             }
-            const TRACE_CAP: usize = 512;
-            // ★采样时刻 = 设备端组帧时刻(协议尾戳), 折进与遥测共用的展开时间轴★
-            // 旧实现用"最近一帧遥测时间 + 主机侧 Instant::elapsed"近似, 那是两个时钟拼接,
-            // 触发判定线与遥测曲线的横向对位只能是量级正确; 现在两者同源同口径。
-            // 无尾戳(旧固件)时退回原近似式, 保证不因固件版本而失去时间轴。
-            let t_us = match frame.device_t_us {
-                Some(raw) => self.telem_clock.unwrap_us(raw),
-                None => {
-                    self.telem_clock.acc_us
-                        + self
-                            .telem_frame_at
-                            .map_or(0, |at| at.elapsed().as_micros() as u64)
-                }
-            };
-            if let Some(buf) = self.algo_trace_report.get_mut(idx as usize) {
-                if buf.len() >= TRACE_CAP {
-                    buf.pop_front();
-                }
-                buf.push_back(TracePoint {
-                    t_us,
-                    val: report as f32,
-                });
+        };
+        if let Some(buf) = self.algo_trace_report.get_mut(idx as usize) {
+            if buf.len() >= TRACE_CAP {
+                buf.pop_front();
             }
+            buf.push_back(TracePoint {
+                t_us,
+                val: report as f32,
+            });
             if self.algo_trace_active.len() >= TRACE_CAP {
                 self.algo_trace_active.pop_front();
             }
@@ -5337,6 +6169,7 @@ impl AppController {
         if let Some((idx, val)) = crate::proto::algo::decode_algo_get_cfg(&frame.payload) {
             if (idx as usize) < self.algo_cfg.len() {
                 self.algo_cfg[idx as usize] = val;
+                self.algo_cfg_valid[idx as usize] = true;
                 self.algo_cfg_version = self.algo_cfg_version.wrapping_add(1);
             }
         }
@@ -5750,7 +6583,10 @@ impl AppController {
     }
 
     fn _algo_src_request_at(&mut self, offset: usize) -> anyhow::Result<()> {
-        let seq = self.next_seq();
+        let seq = self._submit_poll(
+            RequestKind::RequestAlgoSrc,
+            crate::proto::algo::encode_algo_get_src(0, offset),
+        )?;
         if offset == 0 {
             self.algo_src_rx = Some(AlgoSrcRx {
                 total: 0,
@@ -5773,14 +6609,12 @@ impl AppController {
             rx.seq = seq;
             rx.waited = 0;
         }
-        let sent = self
-            .io
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("未连接, 无法回读算法 C 源"))?
-            .send(crate::proto::algo::encode_algo_get_src(seq, offset));
-        if let Err(e) = sent {
+        if seq == 0 {
             self.algo_src_rx = None;
-            return Err(e);
+            return Ok(());
+        }
+        if let Some(rx) = self.algo_src_rx.as_mut() {
+            rx.seq = seq;
         }
         Ok(())
     }
@@ -6255,6 +7089,16 @@ impl AppController {
             3 if detail == 1 => ("⚠ 触控算法下发到 PSoC 未通过校验, 该算法【没有装上】, PSoC 仍在跑上一份算法。请重试上传或先用「PSoC 救砖」修复链路。".to_string(), false),
             3 => ("⚠ 当前自定义触控算法被判定为致命(导致 PSoC 卡死), 固件已回退为内嵌默认算法。你的算法【已不在运行】, 需修正后重新上传。".to_string(), false),
             4 => ("⚠ PSoC 采样异常(raw 满量程或停滞), 固件拒绝把该状态固化为默认, 已【清空全部 CSD 调参并落盘】回到出厂默认链。逐通道调参需重做; 若反复出现请用「PSoC 救砖」。".to_string(), true),
+            5 if detail & 0x8000_0000 != 0 => {
+                let stage = match (detail & 0xFF) as u8 {
+                    1 => "采样可信度门禁",
+                    2 => "全通道 IDAC 校准",
+                    3 => "全通道频率自适应",
+                    4 => "全通道基线复位",
+                    _ => "未知阶段",
+                };
+                (format!("⚠ PSoC 启动校准在「{}」失败；本启动代次不再重试，避免形成校准循环。", stage), true)
+            }
             5 => (format!(
                     "PSoC 已重新下发算法与 CSD 配置(模式={})。设备配置刚被整体重建, 正回读真值同步界面。",
                     if detail != 0 { "半自动手动" } else { "自动校准" }
@@ -6547,6 +7391,25 @@ impl AppController {
 
     pub fn telem_lat_usb_us(&self) -> u16 {
         self.telem_lat_usb_us
+    }
+
+    pub fn latency_correction_enabled(&self) -> bool {
+        matches!(
+            self.config_get("comm.latency_correction_en")
+                .map(|entry| entry.value),
+            Some(CfgValue::Bool(true))
+        )
+    }
+
+    pub fn telem_lat_corrected_us(&self) -> Option<u32> {
+        if !self.latency_correction_enabled()
+            || !self
+                .telem_frame_at
+                .is_some_and(|at| at.elapsed() < Self::TELEM_STATS_FRESH)
+        {
+            return None;
+        }
+        self.telem_lat_corrected_us
     }
 
     /// 延迟历史(总延迟 us)序列, 供仪表盘折线图。
@@ -6858,108 +7721,227 @@ impl AppController {
     /// 处理 TELEM_DATA 帧
     fn _handle_telem_data(&mut self, frame: &Frame) {
         match crate::proto::decode_telem_data(&frame.payload) {
-            Ok(telem_frame) => {
-                // 更新最后时间戳 + 推进展开时钟(横轴真实时间的唯一来源, 见 DevClock)。
-                self.telem_last_ts = telem_frame.ts_us;
-                self.telem_clock.feed(telem_frame.ts_us);
-                self.telem_frame_at = Some(std::time::Instant::now());
-                // ★只有真的带 STATS 的帧才更新采样率/探测周期★
-                // 逐通道档下 36 通道 × 4 字段远超 64B vendor FIFO, 固件按帧切分, **只有首帧带 STATS**;
-                // 其余帧解码出的 samples_per_sec/scan_period_us 恒为 0。原先无条件赋值 ⇒ 后续帧立刻把
-                // 刚取到的真值冲成 0 ⇒ `telem_scan_period_valid()` 恒假 ⇒ 全局调整页"始终未测"
-                // (而主页轻档一帧一条、每帧都带 STATS, 所以主页看着正常 —— 这个不对称正是线索)。
-                if (telem_frame.fields & crate::proto::FIELD_STATS) != 0 {
-                    self.telem_samples_per_sec = telem_frame.samples_per_sec;
-                    self.telem_scan_period_us = telem_frame.scan_period_us;
-                    self.telem_stats_at = Some(std::time::Instant::now());
-                }
-                // ★PSoC 链路活性的最强证据★: samples_per_sec 是固件按 PSoC scan_count 增量折算的
-                // (psoc.cpp), >0 就等于"快照代数正在推进" —— 比只在握手那一瞬取一次的
-                // DEVICE_INFO.psoc_link_valid 可信得多, 且随遥测帧率(20~100Hz)持续刷新。
-                if telem_frame.samples_per_sec > 0 {
-                    self.psoc_scan_live_at = Some(std::time::Instant::now());
-                }
-                self.telem_lat_spi_us = telem_frame.lat_spi_us;
-                self.telem_lat_proc_us = telem_frame.lat_proc_us;
-                self.telem_lat_usb_us = telem_frame.lat_usb_us;
-                if (telem_frame.fields & crate::proto::FIELD_LATENCY) != 0 {
-                    const LAT_CAP: usize = 512;
-                    if self.lat_total_hist.len() >= LAT_CAP {
-                        self.lat_total_hist.pop_front();
-                    }
-                    let total = telem_frame.lat_spi_us as u32
-                        + telem_frame.lat_proc_us as u32
-                        + telem_frame.lat_usb_us as u32;
-                    self.lat_total_hist.push_back(total as f32);
-                    self.lat_version = self.lat_version.wrapping_add(1);
-                }
-
-                // 把样本装进相应通道的环形缓冲
-                let sample_count = telem_frame.samples.len();
-                let fields = telem_frame.fields;
-                for sample in telem_frame.samples {
-                    let ch_idx = sample.ch as usize;
-                    if ch_idx < 36 {
-                        // 每通道 freshness 独立于 STATS：某 CH 缺失时其旧样本立即可判 stale，
-                        // 而不是被同一帧其余 CH 的正常统计掩盖。
-                        self.telem_channel_last_seen[ch_idx] = Some(std::time::Instant::now());
-                        self.telem_channel_heal_attempts[ch_idx] = 0;
-                        // 数据存活检测: 逐帧比较 raw。完全相同 → 冻结计数+1; 变化 → 清零。
-                        // (只在带 RAW 字段的帧上判定; 不带 RAW 的帧跳过, 不误清计数。)
-                        if let Some(raw) = sample.raw {
-                            if self.telem_last_raw[ch_idx] == Some(raw) {
-                                self.telem_freeze_count[ch_idx] =
-                                    self.telem_freeze_count[ch_idx].saturating_add(1);
-                            } else {
-                                self.telem_freeze_count[ch_idx] = 0;
-                                self.telem_last_raw[ch_idx] = Some(raw);
-                            }
-                        }
-                        // ★保留时长优先于保留条数★ 主图横轴是固定 30s 窗口, 按"条数"保留会让
-                        // 实际保留时长随采样率浮动(171Hz 时 1024 条只有 ~6s ⇒ 窗口左侧 4/5 是空的)。
-                        // 条数上限只作为内存兜底(采样率异常高时不至于无限涨)。
-                        // 时间戳是协议原值(u32 us, 约 71 分钟回绕): 用 wrapping_sub 算"已过去多久",
-                        // 保留时长远小于回绕周期 ⇒ 回绕当帧也不会把整个缓冲误判为过期。
-                        let sample_t = sample.t_us;
-                        let buffer = &mut self.telem_buf[ch_idx];
-                        while buffer
-                            .front()
-                            .is_some_and(|old| sample_t.wrapping_sub(old.t_us) > TELEM_RETAIN_US)
-                        {
-                            buffer.pop_front();
-                        }
-                        if buffer.len() >= TELEM_CAP {
-                            buffer.pop_front();
-                        }
-                        buffer.push_back(sample);
-                    }
-                }
-
-                // 实时卡片始终跟随每帧; 主图只在未冻结时推进，冻结快照不触发 SVG/path 重算。
-                self.telem_version = self.telem_version.wrapping_add(1);
-                if self.plot_freeze.is_none() {
-                    self.plot_version = self.plot_version.wrapping_add(1);
-                }
-                self.telem_frame_count += 1;
-                // Wire framing is SOF(2)+header(5)+CRC(2); payload length is the only variable part.
-                self.telem_wire_bytes = self
-                    .telem_wire_bytes
-                    .wrapping_add(frame.payload.len() as u64 + 9);
-                if self.telem_frame_count == 1 {
-                    self.push_log("遥测数据开始流入 (首帧 TELEM_DATA)");
-                }
-                log::debug!(
-                    "TELEM_DATA: ts={} ch_count={} fields=0x{:02X}",
-                    telem_frame.ts_us,
-                    sample_count,
-                    fields
-                );
-            }
+            Ok(telem_frame) => self._ingest_telem_frame(telem_frame, frame.payload.len()),
             Err(e) => {
                 log::error!("解析 TELEM_DATA 失败: {}", e);
                 self.last_error = Some(e);
             }
         }
+    }
+
+    /// 采样帧入库: TELEM_DATA 与 FOCUS_DATA 的**唯一**共用路径(同一份 telem_buf/版本号/存活检测)。
+    /// 单通道 focus 只是"一帧只带一个通道"的同型帧, 不该有第二套入库逻辑, 更不该有平行缓冲。
+    fn _ingest_telem_frame(
+        &mut self,
+        telem_frame: crate::proto::TelemFrame,
+        wire_payload_len: usize,
+    ) {
+        // 更新最后时间戳 + 推进展开时钟(横轴真实时间的唯一来源, 见 DevClock)。
+        self.telem_last_ts = telem_frame.ts_us;
+        self.telem_clock.feed(telem_frame.ts_us);
+        self.telem_frame_at = Some(std::time::Instant::now());
+        // ★只有真的带 STATS 的帧才更新采样率/探测周期★
+        // 逐通道档下 36 通道 × 4 字段远超 64B vendor FIFO, 固件按帧切分, **只有首帧带 STATS**;
+        // 其余帧解码出的 samples_per_sec/scan_period_us 恒为 0。原先无条件赋值 ⇒ 后续帧立刻把
+        // 刚取到的真值冲成 0 ⇒ `telem_scan_period_valid()` 恒假 ⇒ 全局调整页"始终未测"
+        // (而主页轻档一帧一条、每帧都带 STATS, 所以主页看着正常 —— 这个不对称正是线索)。
+        if (telem_frame.fields & crate::proto::FIELD_STATS) != 0 {
+            self.telem_samples_per_sec = telem_frame.samples_per_sec;
+            self.telem_scan_period_us = telem_frame.scan_period_us;
+            self.telem_stats_at = Some(std::time::Instant::now());
+        }
+        // ★PSoC 链路活性的最强证据★: samples_per_sec 是固件按 PSoC scan_count 增量折算的
+        // (psoc.cpp), >0 就等于"快照代数正在推进" —— 比只在握手那一瞬取一次的
+        // DEVICE_INFO.psoc_link_valid 可信得多, 且随遥测帧率(20~100Hz)持续刷新。
+        if telem_frame.samples_per_sec > 0 {
+            self.psoc_scan_live_at = Some(std::time::Instant::now());
+        }
+        self.telem_lat_spi_us = telem_frame.lat_spi_us;
+        self.telem_lat_proc_us = telem_frame.lat_proc_us;
+        self.telem_lat_usb_us = telem_frame.lat_usb_us;
+        if (telem_frame.fields & crate::proto::FIELD_LATENCY) != 0 {
+            self.telem_lat_corrected_us =
+                _latency_correction_us(&mut self.latency_correction_samples, &telem_frame);
+            const LAT_CAP: usize = 512;
+            if self.lat_total_hist.len() >= LAT_CAP {
+                self.lat_total_hist.pop_front();
+            }
+            let total = telem_frame.lat_spi_us as u32
+                + telem_frame.lat_proc_us as u32
+                + telem_frame.lat_usb_us as u32;
+            self.lat_total_hist.push_back(total as f32);
+            self.lat_version = self.lat_version.wrapping_add(1);
+        }
+
+        // 把样本装进相应通道的环形缓冲
+        let sample_count = telem_frame.samples.len();
+        let fields = telem_frame.fields;
+        for sample in telem_frame.samples {
+            let ch_idx = sample.ch as usize;
+            if ch_idx < 36 {
+                // 每通道 freshness 独立于 STATS：某 CH 缺失时其旧样本立即可判 stale，
+                // 而不是被同一帧其余 CH 的正常统计掩盖。
+                self.telem_channel_last_seen[ch_idx] = Some(std::time::Instant::now());
+                self.telem_channel_heal_attempts[ch_idx] = 0;
+                // 数据存活检测: 逐帧比较 raw。完全相同 → 冻结计数+1; 变化 → 清零。
+                // (只在带 RAW 字段的帧上判定; 不带 RAW 的帧跳过, 不误清计数。)
+                if let Some(raw) = sample.raw {
+                    if self.telem_last_raw[ch_idx] == Some(raw) {
+                        self.telem_freeze_count[ch_idx] =
+                            self.telem_freeze_count[ch_idx].saturating_add(1);
+                    } else {
+                        self.telem_freeze_count[ch_idx] = 0;
+                        self.telem_last_raw[ch_idx] = Some(raw);
+                    }
+                }
+                // ★保留时长优先于保留条数★ 主图横轴是固定 30s 窗口, 按"条数"保留会让
+                // 实际保留时长随采样率浮动(171Hz 时 1024 条只有 ~6s ⇒ 窗口左侧 4/5 是空的)。
+                // 条数上限只作为内存兜底(采样率异常高时不至于无限涨)。
+                // 时间戳是协议原值(u32 us, 约 71 分钟回绕): 用 wrapping_sub 算"已过去多久",
+                // 保留时长远小于回绕周期 ⇒ 回绕当帧也不会把整个缓冲误判为过期。
+                let sample_t = sample.t_us;
+                let buffer = &mut self.telem_buf[ch_idx];
+                while buffer
+                    .front()
+                    .is_some_and(|old| sample_t.wrapping_sub(old.t_us) > TELEM_RETAIN_US)
+                {
+                    buffer.pop_front();
+                }
+                if buffer.len() >= TELEM_CAP {
+                    buffer.pop_front();
+                }
+                buffer.push_back(sample);
+            }
+        }
+
+        // 实时卡片始终跟随每帧; 主图只在未冻结时推进，冻结快照不触发 SVG/path 重算。
+        self.telem_version = self.telem_version.wrapping_add(1);
+        if self.plot_freeze.is_none() {
+            self.plot_version = self.plot_version.wrapping_add(1);
+        }
+        self.telem_frame_count += 1;
+        // Wire framing is SOF(2)+header(5)+CRC(2); payload length is the only variable part.
+        self.telem_wire_bytes = self
+            .telem_wire_bytes
+            .wrapping_add(wire_payload_len as u64 + 9);
+        if self.telem_frame_count == 1 {
+            self.push_log("遥测数据开始流入 (首帧 TELEM_DATA)");
+        }
+        log::debug!(
+            "采样帧: ts={} ch_count={} fields=0x{:02X}",
+            telem_frame.ts_us,
+            sample_count,
+            fields
+        );
+    }
+
+    /// 处理 FOCUS_DATA 推送(单通道独占流)。
+    ///
+    /// ★归属判定必须先于入库★ 切换目标通道时旧会话的帧仍在路上, 它们属于**上一个**通道,
+    /// 混进新目标的缓冲就是伪造数据。设备回的 session 是唯一判据(不能等 STOP 的 ACK 才开始丢,
+    /// 那期间的每一帧都会污染曲线)。
+    fn _handle_focus_data(&mut self, frame: &Frame) {
+        let focus_frame = match crate::proto::decode_focus_data(&frame.payload) {
+            Ok(f) => f,
+            Err(e) => {
+                log::error!("解析 FOCUS_DATA 失败: {}", e);
+                self.last_error = Some(e);
+                return;
+            }
+        };
+        if self.focus.session != Some(focus_frame.session) {
+            // 旧会话残帧: 立即丢弃。设备侧那条流已被 START 替换或即将被 STOP, 不必在这里补发命令。
+            return;
+        }
+        let Some(target) = self.focus.channel else {
+            return;
+        };
+        // 设备只会按 START 指定的通道发帧; 不一致说明会话号撞上了旧流, 宁可丢弃也不写错通道。
+        if focus_frame.frame.samples.first().map(|s| s.ch) != Some(target) {
+            return;
+        }
+        // sample_seq 缺口 = 设备背压跳帧 + 链路丢帧的真实条数(设备跳帧时序号照样递增)。
+        if let Some(prev) = self.focus.last_sample_seq {
+            let gap = focus_frame.sample_seq.wrapping_sub(prev).wrapping_sub(1);
+            if gap != 0 {
+                self.focus.gaps = self.focus.gaps.wrapping_add(gap as u64);
+            }
+        }
+        let gap_now = match self.focus.last_sample_seq {
+            Some(prev) => focus_frame.sample_seq.wrapping_sub(prev).wrapping_sub(1),
+            None => 0,
+        };
+        self.focus.last_sample_seq = Some(focus_frame.sample_seq);
+        let push_count = focus_frame
+            .frame
+            .samples
+            .iter()
+            .filter(|sample| sample.ch == target)
+            .count() as u32;
+        let now = std::time::Instant::now();
+        let diag_at = *self.focus.diag_at.get_or_insert(now);
+        self.focus.diag_frames = self.focus.diag_frames.saturating_add(1);
+        self.focus.diag_gaps = self.focus.diag_gaps.saturating_add(gap_now as u64);
+        self.focus.diag_pushes = self.focus.diag_pushes.saturating_add(push_count);
+        let periodic = self.focus.diag_frames >= 100
+            || now.duration_since(diag_at) >= std::time::Duration::from_secs(1);
+        if gap_now > 5 || periodic {
+            let elapsed_s = now.duration_since(diag_at).as_secs_f32().max(0.001);
+            self.push_log_debug(format!(
+                "单通道诊断: CH{} 收到 {:.1} 帧/s、入库 {:.1} 点/s（{}帧/{}点，窗口 {:.2}s），gap_count={}，最近 sample_seq={} (session={})",
+                target,
+                self.focus.diag_frames as f32 / elapsed_s,
+                self.focus.diag_pushes as f32 / elapsed_s,
+                self.focus.diag_frames,
+                self.focus.diag_pushes,
+                elapsed_s,
+                self.focus.diag_gaps,
+                focus_frame.sample_seq,
+                focus_frame.session
+            ));
+            self.focus.diag_at = Some(now);
+            self.focus.diag_frames = 0;
+            self.focus.diag_gaps = 0;
+            self.focus.diag_pushes = 0;
+        }
+        self.focus.rate.note(frame.payload.len(), gap_now);
+        self._ingest_telem_frame(focus_frame.frame, frame.payload.len());
+    }
+
+    /// 处理 FOCUS_START 响应: 只安装**当前代次**的会话。
+    fn _handle_focus_start_response(&mut self, frame: &Frame) {
+        let (session, accepted_rate) = match crate::proto::decode_focus_start(&frame.payload) {
+            Ok(v) => v,
+            Err(e) => {
+                log::error!("解析 FOCUS_START 响应失败: {}", e);
+                self.last_error = Some(e);
+                return;
+            }
+        };
+        let stale = match &self.focus.pending {
+            Some(pending) => {
+                pending.seq != frame.seq || pending.generation != self.focus.generation
+            }
+            None => true,
+        };
+        if stale {
+            // 迟到响应: 目标早已改变。它对应的设备侧会话没人认领却仍在推流 → 必须显式停掉它。
+            self.push_log_debug(format!(
+                "单通道流: 丢弃迟到的 FOCUS_START 响应(session={}), 并对其下发 FOCUS_STOP",
+                session
+            ));
+            self._focus_send_stop(session);
+            return;
+        }
+        let channel = self.focus.pending.take().map(|p| p.channel);
+        self.focus.session = Some(session);
+        self.focus.reset_measurement();
+        self.push_log(format!(
+            "单通道流已开启: CH{} session={} 受理速率 {}Hz",
+            channel.unwrap_or(0),
+            session,
+            accepted_rate
+        ));
     }
 
     /// 处理 PARAM_GET 响应
@@ -7157,6 +8139,103 @@ impl AppController {
         self.set_binding(zone, value)
     }
 
+    // ------------------------------------------------------------------
+    // HID 触摸屏点位 (hid.enNN / hid.xNN / hid.yNN)
+    //
+    // ★与 Serial 侧 bind.mapNN 完全独立★: 这里读写的是"物理通道(36) → 屏幕归一坐标",
+    // 服务 HID 模式的触摸屏上报; bind.mapNN 是"逻辑分区(34) → 物理通道", 服务 mai2 串口协议。
+    // 两套 KV 前缀不同、维度不同、页面不同, 本组访问器**从不触碰 bind.map***, 反之亦然 ⇒
+    // 切工作模式或改一边都不会覆盖另一边, 两套参数可同时存在并各自导入导出。
+    // 值一律走既有草稿层(set_config → drafts.set_cfg), 由"保存到设备"统一下发, 与其它页同规范。
+    // ------------------------------------------------------------------
+
+    /// 该通道是否已启用 HID 点位输出(草稿优先 → 设备缓存 → false)。
+    pub fn hid_point_enabled(&self, ch: usize) -> bool {
+        if ch >= HID_POINT_COUNT {
+            return false;
+        }
+        let key = hid_en_key(ch);
+        if let Some(CfgValue::Bool(v)) = self.drafts.cfg(&key) {
+            return *v;
+        }
+        self.config_cache
+            .get(&key)
+            .and_then(|entry| match entry.value {
+                CfgValue::Bool(v) => Some(v),
+                _ => None,
+            })
+            .unwrap_or(false)
+    }
+
+    /// 该通道的归一坐标 (x, y)(草稿优先 → 设备缓存 → (0,0))。
+    /// 设备把 hid.x/y 声明为 U16; 其它整型一并接受只是为了不被"类型换过"的存量固件卡住。
+    pub fn hid_point_xy(&self, ch: usize) -> (u16, u16) {
+        (self._hid_coord(ch, true), self._hid_coord(ch, false))
+    }
+
+    fn _hid_coord(&self, ch: usize, is_x: bool) -> u16 {
+        if ch >= HID_POINT_COUNT {
+            return 0;
+        }
+        let key = if is_x { hid_x_key(ch) } else { hid_y_key(ch) };
+        let pick = |v: &CfgValue| -> Option<u16> {
+            match v {
+                CfgValue::U16(v) => Some(*v),
+                CfgValue::U8(v) => Some(*v as u16),
+                CfgValue::U32(v) => Some((*v).min(HID_COORD_MAX as u32) as u16),
+                _ => None,
+            }
+        };
+        if let Some(v) = self.drafts.cfg(&key).and_then(pick) {
+            return v.min(HID_COORD_MAX);
+        }
+        self.config_cache
+            .get(&key)
+            .and_then(|entry| pick(&entry.value))
+            .unwrap_or(0)
+            .min(HID_COORD_MAX)
+    }
+
+    /// 写入该通道的启用位(只进草稿)。
+    pub fn set_hid_point_enabled(&mut self, ch: usize, on: bool) -> anyhow::Result<()> {
+        if ch >= HID_POINT_COUNT {
+            return Err(anyhow::anyhow!("HID 点位通道越界: {}", ch));
+        }
+        self.set_config(ConfigEntry::new(hid_en_key(ch), CfgValue::Bool(on)))
+    }
+
+    /// 写入该通道的归一坐标(只进草稿)。越界坐标一律夹到 0..HID_COORD_MAX ——
+    /// 该域由固件描述符决定, 超出会被主机静默截断, 夹取比放过去更诚实。
+    pub fn set_hid_point_xy(&mut self, ch: usize, x: u16, y: u16) -> anyhow::Result<()> {
+        if ch >= HID_POINT_COUNT {
+            return Err(anyhow::anyhow!("HID 点位通道越界: {}", ch));
+        }
+        let (x, y) = (x.min(HID_COORD_MAX), y.min(HID_COORD_MAX));
+        self.set_config(ConfigEntry::new(hid_x_key(ch), CfgValue::U16(x)))?;
+        self.set_config(ConfigEntry::new(hid_y_key(ch), CfgValue::U16(y)))
+    }
+
+    /// "确认锚定": 一次写入坐标并置启用位。两件事必须同时落草稿 ——
+    /// 只写坐标不启用等于用户点了确认却没有输出, 只启用不写坐标会拿旧锚点输出。
+    pub fn hid_point_commit(&mut self, ch: usize, x: u16, y: u16) -> anyhow::Result<()> {
+        self.set_hid_point_xy(ch, x, y)?;
+        self.set_hid_point_enabled(ch, true)
+    }
+
+    /// "禁用/清除当前通道": 只清启用位, **保留坐标**。
+    /// 保留是刻意的: 用户通常是临时停用某通道, 把辛苦锚好的坐标一并清掉等于逼他重锚一次;
+    /// 需要真正重锚时直接再点一次"确认锚定"即覆盖。
+    pub fn hid_point_disable(&mut self, ch: usize) -> anyhow::Result<()> {
+        self.set_hid_point_enabled(ch, false)
+    }
+
+    /// 已启用的点位数(界面提示"当前 N/36 个通道已锚定")。
+    pub fn hid_enabled_count(&self) -> usize {
+        (0..HID_POINT_COUNT)
+            .filter(|ch| self.hid_point_enabled(*ch))
+            .count()
+    }
+
     /// 按新语义读取单个绑区槽位当前绑定的物理通道索引(0..35),
     /// 未映射(0xFFFFFFFF)或越界返回 0xFF。
     pub fn binding_channel_of(&self, zone: usize) -> u8 {
@@ -7350,7 +8429,9 @@ impl AppController {
 
     /// BIND_START 成功 ACK 只表示固件已转入 WAIT_TOUCH，不能结束本地等待态。
     fn _handle_ack(&mut self, frame: &Frame) {
+        // 数据型轮询必须等对应数据响应确认；ACK 只确认写类/独立状态机，不能清掉 read pending。
         self._cfg_tx_note_reply(frame);
+        self._sweep_note_reply(frame.seq, true, "");
         if self.bind_start_seq == Some(frame.seq) {
             log::debug!("BIND_START 已确认 seq={}，继续等待触摸", frame.seq);
         } else {
@@ -7560,6 +8641,33 @@ impl AppController {
             "未知错误".to_string()
         };
         let bind_start_failed = self.bind_start_seq == Some(frame.seq);
+        let nak = (frame.flags & 0x04) != 0 || frame.cmd == HostCmd::Nak as u8;
+        if nak {
+            self._note_device_busy_nak(frame);
+            let is_data_pending = self
+                .pending_registry
+                .lookup(frame.seq)
+                .is_some_and(|req| !matches!(req.kind, RequestKind::CfgTx { .. }));
+            let probe_label = self
+                .conn_probe_inflight
+                .as_ref()
+                .filter(|(seq, _)| *seq == frame.seq)
+                .map(|(_, step)| step.kind.label());
+            if let Some(label) = probe_label {
+                self.pending_registry.confirm(frame.seq);
+                self.conn_probe_inflight = None;
+                log::info!(
+                    "CONN_PROBE response kind={} seq={} cmd=0x{:02X} flags=0x{:02X} nak=true",
+                    label,
+                    frame.seq,
+                    frame.cmd,
+                    frame.flags
+                );
+            } else if !is_data_pending {
+                self.pending_registry.confirm(frame.seq);
+            }
+        }
+        self._sweep_note_reply(frame.seq, false, &msg);
         // 组合映射回读被 NAK = 固件不认识 KBD_GET_COMBO(旧固件)。记为"不支持"而不是"空表",
         // 否则 UI 会把旧固件显示成"一条映射都没配", 用户会以为配置丢了。
         if self.kbd_combo_req_seq == Some(frame.seq) {
@@ -7578,6 +8686,20 @@ impl AppController {
             self.kbd_edge_req_seq = None;
             self.kbd_edges_supported = Some(false);
             self.kbd_edges_version = self.kbd_edges_version.wrapping_add(1);
+        }
+        // 单通道流 START 被拒(旧固件不认识 0x33 / 通道非法): 只清在途请求, **保留目标通道** ——
+        // 把目标一起清掉会让页面下一 tick 立刻重发, 变成每 16ms 一条 NAK 的刷屏。重试留给
+        // 用户下次切通道/重进页面。
+        if self
+            .focus
+            .pending
+            .as_ref()
+            .is_some_and(|p| p.seq == frame.seq)
+        {
+            self.focus.pending = None;
+            self.push_log_warn(
+                "单通道流启动被设备拒绝: 本次不再重试, 切换通道或重进页面可再试。".to_string(),
+            );
         }
         self.push_log_warn(format!("收到 NAK(seq={}): {}", frame.seq, msg));
         if bind_start_failed {

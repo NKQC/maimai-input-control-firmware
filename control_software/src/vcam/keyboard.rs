@@ -11,7 +11,7 @@
 //!   - 仅在虚拟摄像头启用(`state.enabled`)时累积; 每串数据提交后清空缓冲, 保证只用一次。
 //!   - Raw Input 是**旁路监听**, 不吞按键, 扫码器输入照常进入前台窗口。
 
-use super::VcamState;
+use super::{VcamState, interception};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
@@ -21,7 +21,8 @@ use std::time::Instant;
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, GetKeyboardState, ToUnicode, VK_RETURN, VK_SHIFT,
+    GetKeyState, GetKeyboardState, MAPVK_VSC_TO_VK_EX, MapVirtualKeyW, ToUnicode, VK_RETURN,
+    VK_SHIFT,
 };
 use windows::Win32::UI::Input::{
     GetRawInputData, GetRawInputDeviceInfoW, GetRawInputDeviceList, HRAWINPUT, RAWINPUT,
@@ -112,6 +113,8 @@ static TARGET: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 /// hDevice → 是否接受, 避免每次按键都去查设备名(每击一次注册表/驱动查询太重)。
 /// 目标变更或设备重插(句柄变化)时失效即重算。
 static ACCEPT_CACHE: OnceLock<Mutex<HashMap<isize, bool>>> = OnceLock::new();
+/// 当前实际捕获模式。目标选择持久化不变，但运行时只能如实报告已拦截或旁路降级。
+static RUNTIME_STATUS: OnceLock<Mutex<String>> = OnceLock::new();
 
 fn target_lock() -> &'static Mutex<Option<String>> {
     TARGET.get_or_init(|| Mutex::new(None))
@@ -119,16 +122,46 @@ fn target_lock() -> &'static Mutex<Option<String>> {
 fn accept_cache() -> &'static Mutex<HashMap<isize, bool>> {
     ACCEPT_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
+fn runtime_status_lock() -> &'static Mutex<String> {
+    RUNTIME_STATUS.get_or_init(|| Mutex::new("未运行 · 键盘捕获未启动".to_string()))
+}
+fn set_runtime_status(status: String) {
+    *runtime_status_lock().lock().unwrap() = status;
+}
 
-/// 设定输入源设备(`None`/空串 = 所有键盘)。可在运行中随时切换, 立即生效。
-pub fn set_target_device(path: Option<String>) {
+/// 给现有 vcam UI 的实际运行状态，不改变目标设备持久化或任何对外协议。
+pub fn runtime_status() -> String {
+    runtime_status_lock().lock().unwrap().clone()
+}
+
+/// 设定输入源设备(`None`/空串 = 所有键盘)。运行中切换时必须先等待旧会话释放所有被吞按键并退出，
+/// 再写入新目标、启动唯一的新会话，避免双开和卡键。
+pub fn set_target_device(path: Option<String>) -> anyhow::Result<()> {
     let normalized = path.filter(|p| !p.trim().is_empty());
+    if target_device() == normalized {
+        return Ok(());
+    }
+    let restart_state = {
+        let manager = manager_lock();
+        manager._worker.as_ref().and_then(|_| {
+            CAPTURE
+                .get()
+                .map(|capture| capture.lock().unwrap().state.clone())
+        })
+    };
+    if restart_state.is_some() {
+        stop();
+    }
     *target_lock().lock().unwrap() = normalized.clone();
     accept_cache().lock().unwrap().clear();
     match normalized {
-        Some(p) => log::info!("虚拟摄像头: 输入源限定为设备 {}", p),
+        Some(ref path) => log::info!("虚拟摄像头: 输入源限定为设备 {}", path),
         None => log::info!("虚拟摄像头: 输入源为所有键盘(未限定设备)"),
     }
+    if let Some(state) = restart_state {
+        start(state)?;
+    }
+    Ok(())
 }
 
 /// 当前输入源设备路径(None = 所有键盘)。
@@ -548,8 +581,9 @@ fn device_accepted(h_device: HANDLE) -> bool {
     accepted
 }
 
-/// 启动键盘捕获线程(幂等: 已在跑则只刷新 state 引用)。传入共享状态用于提交数据。
-pub fn start(state: Arc<VcamState>) {
+/// 启动键盘捕获线程。未指定目标时保留 Raw Input 旁路；指定目标时优先精确 Interception，
+/// 任何 API/驱动/签名/系统或硬件 ID 唯一性失败都明确降级为同一目标的 Raw Input 旁路，绝不声称拦截。
+pub fn start(state: Arc<VcamState>) -> anyhow::Result<()> {
     let mut manager = manager_lock();
     CAPTURE.get_or_init(|| {
         Mutex::new(Capture {
@@ -558,11 +592,9 @@ pub fn start(state: Arc<VcamState>) {
             state: state.clone(),
         })
     });
-    // 若已初始化过(再次 start), 刷新 state 引用。
-    if let Some(m) = CAPTURE.get() {
-        m.lock().unwrap().state = state;
+    if let Some(capture) = CAPTURE.get() {
+        capture.lock().unwrap().state = state;
     }
-    // 上一轮线程可能自己退了(建窗/注册失败): 回收它的句柄, 否则这里会误判成"还在跑"而永不重启。
     if manager
         ._worker
         .as_ref()
@@ -574,25 +606,74 @@ pub fn start(state: Arc<VcamState>) {
         ACTIVE_GENERATION.store(0, Ordering::SeqCst);
     }
     if manager._worker.is_some() {
-        return;
+        return Ok(());
     }
 
     manager._generation += 1;
     let generation = manager._generation;
+    let selected_target = target_device();
     ACTIVE_GENERATION.store(generation, Ordering::SeqCst);
+    match selected_target.as_deref() {
+        None => {
+            set_runtime_status("运行中 · Raw Input 旁路（所有键盘；不拦截按键）".to_string());
+            spawn_raw_worker(&mut manager, generation)
+        }
+        Some(path) => match interception::Capture::open(path) {
+            Ok(capture) => {
+                set_runtime_status(format!("运行中 · Interception 精确拦截目标设备 {}", path));
+                let target = path.to_string();
+                match std::thread::Builder::new()
+                    .name("vcam-interception".into())
+                    .spawn(move || pump_interception(generation, target, capture))
+                {
+                    Ok(worker) => {
+                        manager._worker = Some(worker);
+                        Ok(())
+                    }
+                    Err(error) => {
+                        ACTIVE_GENERATION.store(0, Ordering::SeqCst);
+                        set_runtime_status(format!(
+                            "未运行 · 无法创建 Interception 捕获线程：{}",
+                            error
+                        ));
+                        Err(anyhow::anyhow!("无法创建 Interception 捕获线程：{}", error))
+                    }
+                }
+            }
+            Err(error) => {
+                let reason = error.to_string();
+                log::warn!(
+                    "虚拟摄像头: 目标设备 Interception 不可用，降级 Raw Input 旁路: {}",
+                    reason
+                );
+                set_runtime_status(format!(
+                    "运行中 · Raw Input 旁路（仅目标设备；未拦截按键）· 降级原因：{}",
+                    reason
+                ));
+                spawn_raw_worker(&mut manager, generation)
+            }
+        },
+    }
+}
+
+fn spawn_raw_worker(manager: &mut Manager, generation: u64) -> anyhow::Result<()> {
     match std::thread::Builder::new()
         .name("vcam-rawinput".into())
         .spawn(move || pump(generation))
     {
-        Ok(worker) => manager._worker = Some(worker),
+        Ok(worker) => {
+            manager._worker = Some(worker);
+            Ok(())
+        }
         Err(error) => {
             ACTIVE_GENERATION.store(0, Ordering::SeqCst);
-            log::error!("虚拟摄像头: 无法创建键盘捕获线程: {}", error);
+            set_runtime_status(format!("未运行 · 无法创建 Raw Input 捕获线程：{}", error));
+            Err(anyhow::anyhow!("无法创建 Raw Input 捕获线程：{}", error))
         }
     }
 }
 
-/// 停止键盘捕获: **等旧线程真正注销 Raw Input、销毁窗口并退出**才返回。
+/// 停止键盘捕获: **等旧线程真正注销 Raw Input、释放 Interception 已吞按键并退出**才返回。
 /// 持锁 join 是关键 —— 它让紧随其后的 `start()` 不可能与旧线程并存。
 pub fn stop() {
     let mut manager = manager_lock();
@@ -600,6 +681,78 @@ pub fn stop() {
     if let Some(worker) = manager._worker.take() {
         let _ = worker.join();
     }
+    set_runtime_status("未运行 · 键盘捕获已停止".to_string());
+}
+
+/// Interception 捕获线程：只有已唯一匹配的目标设备进入驱动过滤；异常或目标改变时先释放已吞按键，
+/// 再继续同一目标的 Raw Input 旁路，从不把旁路误报为拦截。
+fn pump_interception(generation: u64, mut target: String, mut capture: interception::Capture) {
+    let still_mine = || ACTIVE_GENERATION.load(Ordering::SeqCst) == generation;
+    log::info!("虚拟摄像头: 目标设备 Interception 捕获已启动({})", target);
+    while still_mine() {
+        let current = target_device();
+        if current.as_deref() != Some(target.as_str()) {
+            capture.stop();
+            match current {
+                Some(next) => match interception::Capture::open(&next) {
+                    Ok(next_capture) => {
+                        target = next;
+                        capture = next_capture;
+                        set_runtime_status(format!(
+                            "运行中 · Interception 精确拦截目标设备 {}",
+                            target
+                        ));
+                        log::info!("虚拟摄像头: 已切换 Interception 目标设备 {}", target);
+                        continue;
+                    }
+                    Err(error) => {
+                        let reason = error.to_string();
+                        set_runtime_status(format!(
+                            "运行中 · Raw Input 旁路（仅目标设备；未拦截按键）· 降级原因：{}",
+                            reason
+                        ));
+                        log::warn!("虚拟摄像头: 目标设备切换降级 Raw Input 旁路: {}", reason);
+                        pump(generation);
+                        return;
+                    }
+                },
+                None => {
+                    set_runtime_status(
+                        "运行中 · Raw Input 旁路（所有键盘；不拦截按键）".to_string(),
+                    );
+                    log::info!("虚拟摄像头: 目标已清除，恢复 Raw Input 旁路捕获");
+                    pump(generation);
+                    return;
+                }
+            }
+        }
+        match capture.receive(100) {
+            Ok(Some(stroke)) if stroke.is_key_down() => {
+                let scan = u32::from(stroke.code) | if stroke.is_extended() { 0xe000 } else { 0 };
+                let vk = unsafe { MapVirtualKeyW(scan, MAPVK_VSC_TO_VK_EX) } as u16;
+                if vk != 0 {
+                    push_key(vk);
+                }
+            }
+            Ok(_) => {}
+            Err(error) => {
+                let reason = error.to_string();
+                log::error!(
+                    "虚拟摄像头: Interception 目标设备捕获已安全停止，降级 Raw Input 旁路: {}",
+                    reason
+                );
+                capture.stop();
+                set_runtime_status(format!(
+                    "运行中 · Raw Input 旁路（仅目标设备；未拦截按键）· 降级原因：{}",
+                    reason
+                ));
+                pump(generation);
+                return;
+            }
+        }
+    }
+    capture.stop();
+    log::info!("虚拟摄像头: Interception 目标设备捕获已停止");
 }
 
 /// 捕获线程主体: 建 message-only 窗口 → 注册 Raw Input → 泵消息 → 注销并销毁窗口。

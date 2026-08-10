@@ -42,6 +42,7 @@ pub use telemetry::{
     FIELD_RAW,
     FIELD_STATS,
     FIELD_STATUS,
+    FocusFrame,
     // IDAC 增益档 → 每 LSB 电流(pA)真值表 + 按电流升序的档号次序(档号非单调, 见 telemetry.rs)
     IDAC_GAIN_BY_CURRENT,
     IDAC_GAIN_PA,
@@ -64,20 +65,42 @@ pub use telemetry::{
     ParamFence,
     ParamScope,
     PsocRescueProgress,
+    SWEEP_FLAG_CAL_FAIL,
+    SWEEP_FLAG_MISMATCH,
+    SWEEP_FLAG_RAILED,
+    SWEEP_FLAG_RETRANSMIT,
+    SWEEP_FLAG_STALLED,
+    SWEEP_INDEX_NONE,
+    SWEEP_RESTORE_FLAG_BSLN,
+    SWEEP_RESTORE_FLAG_CAL,
+    SWEEP_RESTORE_FLAG_PARAM,
+    SweepFrame,
+    SweepState,
+    TelemFrame,
     decode_auto_tune_progress,
     decode_cp_get,
+    decode_focus_data,
+    decode_focus_start,
     decode_param_get,
     decode_param_get_all,
     decode_param_get_all_channels,
     decode_psoc_rescue_progress,
+    decode_sweep_data,
+    decode_sweep_start,
     decode_telem_data,
     encode_ch_mask,
     encode_cp_get,
     encode_cp_measure,
+    encode_focus_start,
+    encode_focus_stop,
     encode_param_get,
     encode_param_get_all,
     encode_param_get_all_channels,
     encode_param_set,
+    encode_sweep_cancel,
+    encode_sweep_keepalive,
+    encode_sweep_resend,
+    encode_sweep_start,
     encode_telem_start,
     // 全局项(GPARAM_*)围栏, 与单通道 param_* 同构、共用 ParamFence
     global_clamp,
@@ -86,6 +109,7 @@ pub use telemetry::{
     param_clamp,
     param_fence,
     param_value_legal,
+    sweep_phase_text,
 };
 
 // ============================================================================
@@ -174,6 +198,20 @@ pub enum HostCmd {
     TelemStart = 0x30,
     TelemStop = 0x31,
     TelemData = 0x32,
+    /// 单通道独占流启动: `[ch, fields, rate u16 LE, lease u16 LE]` → `[session u16, accepted_rate u16]`。
+    /// 设备侧受理后会**挂起广谱 TELEM 流**(focus 期间不再有 TELEM_DATA), FOCUS_STOP 时自动恢复。
+    FocusStart = 0x33,
+    /// 单通道独占流停止: `[session u16 LE]`。session 不是当前会话 → NAK(拒绝误停新会话)。
+    FocusStop = 0x34,
+    /// 设备主动推送(flags=STREAM): 单通道采样, 见 `decode_focus_data`。
+    FocusData = 0x35,
+    /// 增益/分频扫描会话启动: `[ch, settle_samples, sample_count]` → `[session u16, total u16]`。
+    /// 448 格由**设备**逐格切参数+校准+采样, 上位机只负责收结果与补发, 不再逐格下发 PARAM_SET。
+    SweepStart = 0x36,
+    /// 扫描会话控制: `[op(0=取消/1=补发), session u16, first u16, count u8]`。
+    SweepCtrl = 0x37,
+    /// 设备主动推送(flags=STREAM): 定长 21B 的格结果 / 恢复中 / 终态, 见 `decode_sweep_data`。
+    SweepData = 0x38,
 
     // Binding domain 0x40-0x4F
     BindStart = 0x40,
@@ -276,6 +314,12 @@ impl TryFrom<u8> for HostCmd {
             0x30 => Ok(TelemStart),
             0x31 => Ok(TelemStop),
             0x32 => Ok(TelemData),
+            0x33 => Ok(FocusStart),
+            0x34 => Ok(FocusStop),
+            0x35 => Ok(FocusData),
+            0x36 => Ok(SweepStart),
+            0x37 => Ok(SweepCtrl),
+            0x38 => Ok(SweepData),
             0x40 => Ok(BindStart),
             0x41 => Ok(BindAbort),
             0x42 => Ok(BindConfirm),

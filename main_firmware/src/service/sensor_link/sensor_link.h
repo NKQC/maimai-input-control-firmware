@@ -26,6 +26,17 @@ public:
     // TxScheduler 定时任务入口(无参函数指针): 转发到 getInstance()->tick()。
     static void emit_telem_task();
 
+    // FocusSession 定时任务入口: 仅在出现新的快照 generation 时发送当前单通道帧。
+    void focus_tick();
+    static void emit_focus_task();
+    static void focus_lease_expired_task();
+
+    // SweepSession 定时任务入口: 单步推进参数切换、快照统计、最终恢复校准与流式结果发送。
+    void sweep_tick();
+    static void emit_sweep_task();
+    static void sweep_lease_expired_task();
+    bool output_suppressed() const;
+
     // 发送一帧频率自适应阶段进度(AUTO_TUNE_PROGRESS)。周期由 TxScheduler 驱动;
     // 检测到设备侧终态即发最终帧、写穿真相源并自取消任务。
     void autotune_tick();
@@ -63,7 +74,140 @@ private:
         void clear() { active = false; suspended = false; }
         bool emitting() const { return active && !suspended; }
     };
+    struct FocusSession {
+        bool active = false;
+        bool suspended = false;
+        uint16_t id = 0;
+        uint16_t sample_seq = 0;
+        uint16_t last_generation = 0;
+        uint32_t last_focus_scan_ack_us = 0;
+        uint8_t generation_fence = 0;
+        uint16_t rate_hz = 0;
+        uint16_t lease_ms = 0;
+        uint8_t channel = 0;
+        uint8_t fields = 0;
+
+        void clear() {
+            active = false;
+            suspended = false;
+            id = 0;
+            sample_seq = 0;
+            last_generation = 0;
+            last_focus_scan_ack_us = 0;
+            generation_fence = 0;
+            rate_hz = 0;
+            lease_ms = 0;
+            channel = 0;
+            fields = 0;
+        }
+        bool emitting() const { return active && !suspended; }
+    };
+
+    struct SavedStreamState {
+        bool valid = false;
+        StreamState state { false, false };
+        uint32_t lease_ms = 0;
+        uint8_t mode = 0;
+        uint16_t rate_hz = 0;
+        uint8_t fields = 0;
+        uint64_t ch_mask = 0;
+
+        void clear() {
+            valid = false;
+            state.clear();
+            lease_ms = 0;
+            mode = 0;
+            rate_hz = 0;
+            fields = 0;
+            ch_mask = 0;
+        }
+    };
+
+    static constexpr uint16_t SWEEP_TOTAL = 448;
+    static constexpr uint8_t SWEEP_GAIN_COUNT = 7;
+    static constexpr uint8_t SWEEP_DIV_COUNT = 64;
+    enum class SweepPhase : uint8_t {
+        IDLE, SET_CELL, WAIT_PARAMS, READBACK, START_CALIBRATE, WAIT_CALIBRATE, SETTLE, SAMPLE,
+        RESTORE_WRITE, RESTORE_WAIT_PARAMS, RESTORE_READBACK, RESTORE_CALIBRATE,
+        RESTORE_WAIT_CALIBRATE, RESTORE_BASELINE, RESTORE_WAIT_BASELINE, TERMINAL,
+        RESTORE_APPLY, RESTORE_WAIT_APPLY,
+    };
+    enum class SweepDataState : uint8_t { CELL = 1, RESTORING = 2, DONE = 3, CANCELLED = 4, FAILED = 5 };
+    enum class SweepOutputRestore : uint8_t { BROAD, STOPPED };
+    struct SweepResult {
+        uint16_t samples = 0;
+        uint16_t mean = 0;
+        uint16_t std_q8 = 0;
+        uint16_t pp = 0;
+        uint8_t gain = 0;
+        uint8_t div = 1;
+        uint8_t flags = 0;
+        // 该格未取得有效结果时**卡在哪个阶段**(SweepPhase 枚举值; 0=无故障)。
+        // ★为什么必须逐格记★ flags 只能说"这格不可用", 说不出是参数写不进、回读不符、校准被拒
+        // 还是快照代次不推进 —— 而这四种的处置完全不同。阶段码逐格上报后, 任何未知故障都能直接
+        // 定位到状态机的具体一步, 不必再靠复现去猜。
+        uint8_t fail_phase = 0;
+
+        void clear() {
+            samples = 0; mean = 0; std_q8 = 0; pp = 0; gain = 0; div = 1; flags = 0; fail_phase = 0;
+        }
+    };
+    // 单格聚合。★用 sum/sum_sq 而非 Welford★: raw 是 u16 且单格样本数 ≤ SWEEP_SAMPLE_MAX,
+    // sum ≤ 2^22、sum_sq ≤ 2^38 都在 u64 内精确无溢出, 定点 Welford 反而要引入除法与截断误差。
+    struct SweepStats {
+        uint32_t count = 0;
+        uint64_t sum = 0;
+        uint64_t sum_sq = 0;
+        uint16_t min = 0xFFFFu;
+        uint16_t max = 0;
+        uint8_t railed = 0;
+
+        void clear() { count = 0; sum = 0; sum_sq = 0; min = 0xFFFFu; max = 0; railed = 0; }
+    };
+    struct SweepSession {
+        SweepPhase phase = SweepPhase::IDLE;
+        SweepDataState terminal = SweepDataState::DONE;
+        SweepOutputRestore output_restore = SweepOutputRestore::BROAD;
+        uint16_t id = 0;
+        uint16_t cell = 0;
+        uint16_t produced = 0;
+        uint16_t stream_cursor = 0;
+        uint16_t resend_cursor = 0;
+        uint16_t resend_end = 0;
+        uint16_t last_generation = 0;
+        uint16_t settle_seen = 0;
+        uint8_t channel = 0;
+        uint8_t settle_samples = 0;
+        uint8_t sample_count = 0;
+        uint16_t phase_ticks = 0;   // 当前阶段已耗周期数: 每个阶段都有硬超时, 任何一步卡住都必然收敛到恢复
+        uint8_t original_gain = 0;
+        uint8_t original_div = 1;
+        uint8_t restore_flags = 0;  // 恢复阶段的异常位(回显在终态帧 flags): 写回/校准/基线各自失败可辨
+        uint8_t fail_phase = 0;     // 本会话**首个**失败阶段(SweepPhase 值; 0=至今无故障), 回显在非结果帧
+        uint16_t failed_cells = 0;  // 累计无效格数(仅诊断/终态文案用, 不影响流程)
+        bool restore_announced = false;
+        SweepStats stats {};
+
+        void clear() {
+            phase = SweepPhase::IDLE;
+            terminal = SweepDataState::DONE;
+            output_restore = SweepOutputRestore::BROAD;
+            id = 0; cell = 0; produced = 0; stream_cursor = 0; resend_cursor = 0; resend_end = 0;
+            last_generation = 0; settle_seen = 0; channel = 0; settle_samples = 0; sample_count = 0;
+            phase_ticks = 0; original_gain = 0; original_div = 1; restore_flags = 0;
+            fail_phase = 0; failed_cells = 0;
+            restore_announced = false; stats.clear();
+        }
+        bool active() const { return phase != SweepPhase::IDLE; }
+    };
+
     StreamState _stream { false, false };
+    FocusSession _focus;
+    SweepSession _sweep;
+    SweepResult _sweep_results[SWEEP_TOTAL] = {};
+    SavedStreamState _saved_stream;
+    uint16_t _focus_session_counter = 0;
+    uint16_t _sweep_session_counter = 0;
     uint32_t _lease_ms;   // TELEM_START 协商的租约(自动恢复时复用同一值)
     uint8_t _mode;
     uint16_t _rate_hz;
@@ -89,7 +233,37 @@ private:
 
     static void _handle_telem_start(const HostFrame& frame, uint8_t* response, uint16_t* response_length);
     static void _handle_telem_stop(const HostFrame& frame, uint8_t* response, uint16_t* response_length);
+    static void _handle_focus_start(const HostFrame& frame, uint8_t* response, uint16_t* response_length);
+    static void _handle_focus_stop(const HostFrame& frame, uint8_t* response, uint16_t* response_length);
+    static void _handle_sweep_start(const HostFrame& frame, uint8_t* response, uint16_t* response_length);
+    static void _handle_sweep_ctrl(const HostFrame& frame, uint8_t* response, uint16_t* response_length);
     static void _handle_unsupported(const HostFrame& frame, uint8_t* response, uint16_t* response_length);
+
+    // 扫描会话进行中的互斥闸门: 会改 CSD 状态或抢 PSoC 重操作槽的命令一律回 DEVICE_BUSY。
+    // 返回 true = 已写好 NAK, 调用方直接 return。
+    static bool _sweep_busy_reject(const char* what, const HostFrame& frame,
+                                   uint8_t* response, uint16_t* response_length);
+    void _pause_broad_for_focus();
+    void _restore_broad_after_focus();
+    void _release_focus_scan();
+    void _begin_sweep_restore(SweepDataState terminal);
+    bool _emit_sweep_frame(uint16_t index, SweepDataState state, bool retransmit);
+    void _finish_sweep_cell();
+    // 扫描阶段的有界超时: 当前格无效后仍逐格继续，最终完成全部 448 格。
+    void _sweep_cell_timeout(uint16_t limit);
+    // 恢复链的有界超时: 记录首个失败阶段并置对应异常位。
+    void _sweep_note_fail_phase();
+    // 恢复完毕(或终态帧已送达/放弃重试)后的唯一收尾出口: 清会话 + 按 output_restore 复原输出。
+    void _finish_sweep_session();
+    void _sweep_enter(SweepPhase phase) { _sweep.phase = phase; _sweep.phase_ticks = 0; }
+    static bool _sweep_phase_is_restore(SweepPhase phase) {
+        return phase == SweepPhase::RESTORE_WRITE || phase == SweepPhase::RESTORE_WAIT_PARAMS ||
+               phase == SweepPhase::RESTORE_READBACK || phase == SweepPhase::RESTORE_CALIBRATE ||
+               phase == SweepPhase::RESTORE_WAIT_CALIBRATE || phase == SweepPhase::RESTORE_BASELINE ||
+               phase == SweepPhase::RESTORE_WAIT_BASELINE || phase == SweepPhase::TERMINAL ||
+               phase == SweepPhase::RESTORE_APPLY || phase == SweepPhase::RESTORE_WAIT_APPLY;
+    }
+    static uint16_t _sqrt_u32(uint32_t value);
 
     // Phase A：CSD 运行时调参（转发 PSoC SPI 指令通道）
     static void _handle_param_set(const HostFrame& frame, uint8_t* response, uint16_t* response_length);

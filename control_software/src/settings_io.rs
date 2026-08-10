@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 use anyhow::{Result, anyhow, bail};
 
-use crate::app_state::{AppController, ConnState, zone_key};
+use crate::app_state::{AppController, ConnState, HID_COORD_MAX, HID_POINT_COUNT, zone_key};
 use crate::proto::{
     CfgValue, ConfigEntry, KBD_HOLD_KIND_PHYS, KBD_HOLD_KIND_ZONE, KNOWN_PARAM_IDS,
 };
@@ -83,7 +83,8 @@ pub fn group_counts(ctrl: &AppController) -> GroupCounts {
         // 12 个物理键 + 34 个触控分区键(各含键码、修饰位与长按参数) + 现有组合映射条数。
         // ★组合映射按实际条数计★: 它是变长表, 写死常数会让勾选框上的数字与实际导出内容不符。
         keyboard: 46 + ctrl.kbd_combos().len() as i32,
-        zones: 34,
+        // 34 个 Serial 分区绑定 + 36 个 HID 触控点位(两套独立映射, 同组并列导出, 见 _export_zones)。
+        zones: 34 + HID_POINT_COUNT as i32,
     }
 }
 
@@ -400,6 +401,48 @@ fn _export_algo(ctrl: &AppController) -> JsonValue {
         JsonValue::String(ctrl.algo_device_src().to_string()),
     );
     group.insert(
+        "schema_source".to_string(),
+        JsonValue::String(ctrl.algo_schema_source().to_string()),
+    );
+    let mut metadata = Vec::new();
+    for decl in ctrl.algo_report_decls() {
+        let mut item = BTreeMap::new();
+        item.insert("kind".to_string(), JsonValue::String("report".to_string()));
+        item.insert("index".to_string(), JsonValue::Number(decl.idx as f64));
+        item.insert("name".to_string(), JsonValue::String(decl.name));
+        item.insert("type".to_string(), JsonValue::String(decl.value_type));
+        item.insert("range".to_string(), JsonValue::String(decl.range));
+        item.insert(
+            "description".to_string(),
+            JsonValue::String(decl.description),
+        );
+        item.insert("alias".to_string(), JsonValue::String(decl.alias));
+        metadata.push(JsonValue::Object(item));
+    }
+    for decl in ctrl.algo_setting_decls() {
+        let mut item = BTreeMap::new();
+        item.insert("kind".to_string(), JsonValue::String("setting".to_string()));
+        item.insert("index".to_string(), JsonValue::Number(decl.idx as f64));
+        item.insert("name".to_string(), JsonValue::String(decl.name));
+        item.insert("type".to_string(), JsonValue::String(decl.value_type));
+        item.insert("range".to_string(), JsonValue::String(decl.range));
+        item.insert(
+            "description".to_string(),
+            JsonValue::String(decl.description),
+        );
+        item.insert("alias".to_string(), JsonValue::String(decl.alias));
+        item.insert(
+            "default".to_string(),
+            JsonValue::Number(decl.default as f64),
+        );
+        item.insert(
+            "current".to_string(),
+            JsonValue::Number(ctrl.algo_cfg(decl.idx) as f64),
+        );
+        metadata.push(JsonValue::Object(item));
+    }
+    group.insert("metadata".to_string(), JsonValue::Array(metadata));
+    group.insert(
         "device_code_hex".to_string(),
         JsonValue::String(ctrl.algo_device_code_hex().to_string()),
     );
@@ -494,6 +537,17 @@ fn _key_entry(index: u8, keycode: u8, modifier: u8, hold: (u16, u16)) -> JsonVal
     JsonValue::Object(item)
 }
 
+/// zones 组导出 = **两套互不相干的映射并列**:
+///  - `bindings`(34 项): Serial 模式的 bind.mapNN, 逻辑分区 → 物理通道;
+///  - `hid_points`(36 项): HID 模式的 hid.en/x/yNN, 物理通道 → 屏幕归一坐标。
+///
+/// ★为什么并入同一组而不新开第七组★ 新增组会改 `GroupSelection` 的字段数, 而导入/导出回调的
+/// 签名是 6 个 bool(`settings_export(bool×6)`), Slint 侧勾选框与 main.rs 回调都按这个元数写死;
+/// 加一个字段就要同步改 Slint 回调签名、app.slint 透传、main.rs 两处闭包与弹窗布局 —— 那是纯
+/// 结构性改动, 且会让旧设置文件的"未勾选新组"语义变得含糊。
+/// 二者同属"触控输入映射"、同在设置页的同一个 Tab 位置(按模式二选一), 归一组语义自洽。
+/// ★互不覆盖由键前缀天然保证★: 导入 bindings 只写 bind.map*, 导入 hid_points 只写 hid.*,
+/// 两段各自独立缺失容错 ⇒ 同一份文件里两套参数可同时存在, 导入任一模式的配置都不动另一套。
 fn _export_zones(ctrl: &AppController) -> JsonValue {
     let mut bindings = Vec::with_capacity(34);
     for zone in 0..34usize {
@@ -506,8 +560,22 @@ fn _export_zones(ctrl: &AppController) -> JsonValue {
         );
         bindings.push(JsonValue::Object(item));
     }
+    let mut hid_points = Vec::with_capacity(HID_POINT_COUNT);
+    for ch in 0..HID_POINT_COUNT {
+        let (x, y) = ctrl.hid_point_xy(ch);
+        let mut item = BTreeMap::new();
+        item.insert("channel".to_string(), JsonValue::Number(ch as f64));
+        item.insert(
+            "enabled".to_string(),
+            JsonValue::Bool(ctrl.hid_point_enabled(ch)),
+        );
+        item.insert("x".to_string(), JsonValue::Number(x as f64));
+        item.insert("y".to_string(), JsonValue::Number(y as f64));
+        hid_points.push(JsonValue::Object(item));
+    }
     let mut group = BTreeMap::new();
     group.insert("bindings".to_string(), JsonValue::Array(bindings));
+    group.insert("hid_points".to_string(), JsonValue::Array(hid_points));
     JsonValue::Object(group)
 }
 
@@ -680,6 +748,12 @@ fn _import_algo(
             .unwrap_or(false);
         if non_empty {
             sum._skip(format!("algo.{field}"), SkipReason::NotDraftable);
+        }
+    }
+    // schema_source/metadata 是分享时携带的只读描述；元数据真相仍来自算法源码，导入旧文件时可缺省。
+    if let Some(metadata) = group.get("metadata") {
+        if !matches!(metadata, JsonValue::Array(_)) {
+            sum._skip("algo.metadata", SkipReason::Malformed);
         }
     }
     let cfg = _array(_required(group, "cfg", GROUP_ALGO)?, "algo.cfg")?;
@@ -866,6 +940,47 @@ fn _import_zones(
             Err(_) => sum._skip(name, SkipReason::OutOfRange),
         }
     }
+    // ★hid_points 缺失时不报错★: 旧版本导出的文件没有这一段(与 keyboard.combo 同口径),
+    // 直接失败会让用户连分区绑定都导不进来。缺失即"不动 HID 点位", 与"未勾选"同语义。
+    // 本段只写 hid.*, 上面那段只写 bind.map* ⇒ 导入其一绝不影响另一套。
+    if let Some(raw) = group.get("hid_points") {
+        let points = _array(raw, "zones.hid_points")?;
+        for item in points {
+            let item = _object(item, "hid point")?;
+            let ch = _u32(_required(item, "channel", "hid point")?, "channel")? as usize;
+            let name = format!("hid.{ch:02}");
+            if ch >= HID_POINT_COUNT {
+                sum._skip(name, SkipReason::OutOfRange);
+                continue;
+            }
+            // 坐标与启用位是一个点位的两个侧面, 但允许文件只给其中之一(缺的按"保持现值")。
+            match (item.get("x"), item.get("y")) {
+                (Some(rx), Some(ry)) => match (_u32(rx, "hid x"), _u32(ry, "hid y")) {
+                    (Ok(x), Ok(y)) => {
+                        // 越界不静默钳位: 这两个域由固件描述符决定(0..32767), 超了必须让用户知道。
+                        if x > HID_COORD_MAX as u32 || y > HID_COORD_MAX as u32 {
+                            sum._skip(&name, SkipReason::OutOfRange);
+                        } else {
+                            match ctrl.set_hid_point_xy(ch, x as u16, y as u16) {
+                                Ok(()) => sum.applied_items += 1,
+                                Err(_) => sum._skip(&name, SkipReason::OutOfRange),
+                            }
+                        }
+                    }
+                    _ => sum._skip(&name, SkipReason::TypeMismatch),
+                },
+                _ => sum.absent_items += 1,
+            }
+            match item.get("enabled") {
+                Some(JsonValue::Bool(on)) => match ctrl.set_hid_point_enabled(ch, *on) {
+                    Ok(()) => sum.applied_items += 1,
+                    Err(_) => sum._skip(format!("{name}.enabled"), SkipReason::OutOfRange),
+                },
+                Some(_) => sum._skip(format!("{name}.enabled"), SkipReason::TypeMismatch),
+                None => sum.absent_items += 1,
+            }
+        }
+    }
     Ok(())
 }
 
@@ -884,8 +999,15 @@ fn _indexed_key(key: &str, prefix: &str, limit: usize) -> Option<usize> {
         .filter(|index| *index < limit)
 }
 
+/// 分区绑定与 HID 触控点位键：由 zones 组独占导入/导出。
+/// ★hid.* 必须收在这里★ 否则它会作为普通 KV 落进 config 组, 于是同一项有两个出口:
+/// config 组按裸 KV 写一遍、zones 组按结构化 hid_points 再写一遍, 两者顺序一变结果就不同
+/// (`kbd.cb*` 正是踩过这个坑才被收进 keyboard 组的)。
 fn _is_zone_key(key: &str) -> bool {
     _indexed_key(key, "bind.map", 34).is_some()
+        || _indexed_key(key, "hid.en", HID_POINT_COUNT).is_some()
+        || _indexed_key(key, "hid.x", HID_POINT_COUNT).is_some()
+        || _indexed_key(key, "hid.y", HID_POINT_COUNT).is_some()
 }
 
 /// 键盘映射与长按参数键：由 keyboard 组独占导入/导出。

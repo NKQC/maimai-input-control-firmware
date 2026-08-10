@@ -159,18 +159,31 @@ export component GuardedSpinBox inherits SpinBox {
     // 失焦时按围栏夹取后的最终值(已在 [minimum, maximum] 内)。
     callback committed(int);
     private property <int> _snap;
+    private property <int> _committed_value;
 
-    init => { self.value = root.model_value; }
+    init => {
+        self.value = root.model_value;
+        self._committed_value = self.value;
+    }
     // 外部真值变化: 只在用户没在编辑本框时才同步。
     changed model_value => {
-        if (!self.has-focus) { self._apply(root.model_value); }
-    }
-    // 失焦即按围栏夹取并回显, 再抛 committed。
-    changed has-focus => {
         if (!self.has-focus) {
-            self._apply(self.value);
+            self._apply(root.model_value);
+            self._committed_value = self.value;
+        }
+    }
+    // 失焦时才按围栏校验并提交；编辑中的字符只留在控件草稿中。
+    // 标准 SpinBox 未向外暴露 Enter 回调；其内部 accepted 动作仍会处理文本，
+    // 业务提交统一留给失焦，避免逐键回写模型。
+    function _commit() {
+        self._apply(self.value);
+        if (self.value != self._committed_value) {
+            self._committed_value = self.value;
             root.committed(self.value);
         }
+    }
+    changed has-focus => {
+        if (!self.has-focus) { self._commit(); }
     }
     // 把目标值写进部件, 并尽力保证内部文本被刷新。
     // ★为什么要绕一个中间值★ SpinBoxBase 只在 `changed value` 时才回写它私有的 TextInput;
@@ -381,12 +394,12 @@ export component ParamEditorRow inherits HorizontalBox {
         minimum: root.entry.min;
         maximum: root.entry.max;
         model_value: root.entry.value;
-        edited(v) => { root.edited(root.entry.param_id, v); }
+        committed(v) => { root.edited(root.entry.param_id, v); }
     }
 }
 
 
-// 可调变量编辑行: 0..255(u8), 与 ParamEditorRow 分开(范围不同, 语义是共享算法 cfg 而非 CSD 参数)。
+// 算法可调变量编辑行: 0..255(u8)，同时显示别名、类型与范围。
 export component AlgoSettingEditorRow inherits HorizontalBox {
     in property <AlgoSettingRow> entry;
     callback edited(int, int);
@@ -396,22 +409,28 @@ export component AlgoSettingEditorRow inherits HorizontalBox {
     height: Theme.row-height;
 
     Text {
-        text: root.entry.name + " (cfg[" + root.entry.idx + "], " + @tr("默认") + " " + root.entry.default_val + ")";
+        text: (root.entry.alias != "" ? root.entry.alias : root.entry.name)
+            + " (cfg[" + root.entry.idx + "] / " + root.entry.value_type + ")";
         horizontal-stretch: 1;
         overflow: elide;
         wrap: no-wrap;
         vertical-alignment: center;
         color: Theme.text-strong;
     }
-    // 与 ParamEditorRow 同一处坑(见其 param_value 注释): 裸 SpinBox 编辑过就丢掉 value 绑定,
-    // 此后设备回读 / 换算法的 cfg 真值再也推不进来; 而无条件重推又会打断正在进行的输入。
+    Text {
+        text: root.entry.range;
+        width: 100px;
+        color: Theme.text-sub;
+        vertical-alignment: center;
+        overflow: elide;
+    }
     cfg_value := GuardedSpinBox {
         horizontal-stretch: 0;
         min-width: Theme.spin-width;
         minimum: 0;
         maximum: 255;
         model_value: root.entry.value;
-        edited(v) => { root.edited(root.entry.idx, v); }
+        committed(v) => { root.edited(root.entry.idx, v); }
     }
 }
 

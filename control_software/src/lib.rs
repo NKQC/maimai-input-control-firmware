@@ -9,6 +9,8 @@ pub mod elevation;
 pub mod io;
 pub mod logging;
 pub mod proto;
+/// HID 触控点位页的主屏幕截图(Win32 GDI BitBlt/GetDIBits)。
+pub mod screen_capture;
 pub mod settings_io;
 pub mod touch_geometry;
 pub mod ui_config;

@@ -7,6 +7,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, TryLockError};
 
 use anyhow::{Result, anyhow};
+
+use super::interception;
 use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_NOT_FOUND, ERROR_SUCCESS};
 use windows::Win32::Media::MediaFoundation::{
     IMFVirtualCamera, MF_E_NOT_FOUND, MF_E_SHUTDOWN, MFCreateVirtualCamera,
@@ -26,6 +28,45 @@ const INSTANCE_NAME: &str = "mai2control Virtual Camera";
 
 mod embedded {
     include!(concat!(env!("OUT_DIR"), "/vcam_embedded.rs"));
+}
+
+fn _stage_interception_assets(staging: &Path, steps: &mut Vec<String>) -> Result<()> {
+    if !interception::embedded_available() {
+        return Err(anyhow!(
+            "本次构建未内置完整 Interception v1.0.1 x64 API、官方安装器与 LGPL-3.0 许可证，拒绝声称目标设备可拦截"
+        ));
+    }
+    let directory = interception::install_dir();
+    steps.push(format!(
+        "(if not exist {dir} mkdir {dir})",
+        dir = _cmd_quote(&directory)
+    ));
+    for (name, bytes) in interception::deployment_assets() {
+        let source = staging.join(name);
+        std::fs::write(&source, bytes).map_err(|error| {
+            anyhow!(
+                "写入 Interception 暂存资产 {} 失败：{}",
+                source.display(),
+                error
+            )
+        })?;
+        steps.push(format!(
+            "copy /Y {source} {target} >nul",
+            source = _cmd_quote(&source),
+            target = _cmd_quote(&directory.join(name)),
+        ));
+        steps.push("if errorlevel 1 exit /b 40".to_string());
+    }
+    Ok(())
+}
+
+fn _interception_assets_clean() -> bool {
+    !interception::deployment_assets()
+        .iter()
+        .any(|(name, _)| interception::install_dir().join(name).is_file())
+        && !interception::install_dir()
+            .join(interception::OWNER_FILE)
+            .is_file()
 }
 
 /// 安装/卸载会修改同一组文件和 HKLM 键，必须串行执行。
@@ -154,33 +195,45 @@ fn _same_path(left: &Path, right: &Path) -> bool {
     normalize(left) == normalize(right)
 }
 
-/// 给 UI 的部署状态，DS 与 MF 必须同时成立才报告“已安装”。
+/// 给 UI 的部署状态。摄像头与目标设备吞键分别核验；驱动未确认时绝不表述为“已拦截”。
 pub fn registration_status() -> String {
-    if !embedded_available() {
-        return "本次构建未内置虚拟摄像头 DLL（需 DirectShow x64 与 x86 两份产物）".to_string();
-    }
-    let scanned = _scan();
-    let missing: Vec<&str> = scanned
-        .iter()
-        .filter(|entry| !entry._installed())
-        .map(|entry| entry._label)
-        .collect();
-    if missing.is_empty() {
-        format!(
-            "已安装（DirectShow x64/x86 视频输入设备，{}）",
-            install_dir().display()
-        )
-    } else if missing.len() == scanned.len() {
-        "未安装（系统中没有本摄像头）".to_string()
+    let camera = if !embedded_available() {
+        "本次构建未内置虚拟摄像头 DLL（需 DirectShow x64 与 x86 两份产物）".to_string()
     } else {
-        format!(
-            "部分安装（{} 未通过核验），建议重新安装",
-            missing.join("、")
-        )
+        let scanned = _scan();
+        let missing: Vec<&str> = scanned
+            .iter()
+            .filter(|entry| !entry._installed())
+            .map(|entry| entry._label)
+            .collect();
+        if missing.is_empty() {
+            format!("摄像头已安装（{}）", install_dir().display())
+        } else if missing.len() == scanned.len() {
+            "摄像头未安装（系统中没有本摄像头）".to_string()
+        } else {
+            format!("摄像头部分安装（{} 未通过核验）", missing.join("、"))
+        }
+    };
+    match interception::driver_status() {
+        interception::DriverStatus::Ready => {
+            format!("{}；{}", camera, interception::DriverStatus::Ready.detail())
+        }
+        // 待重启是"安装成功但还没生效", 与真失败分开表述: 不说失败, 也不谎称已能拦截。
+        status @ interception::DriverStatus::PendingReboot => format!(
+            "{}；{}。重启前扫码只能旁路监听, 不会拦截目标设备输入",
+            camera,
+            status.detail()
+        ),
+        status => format!(
+            "{}；目标设备吞键未确认：{}。将降级且不会声称拦截成功",
+            camera,
+            status.detail()
+        ),
     }
 }
 
-/// 启动前的完整注册核验；不接受只有 DirectShow 或只有 MF 的半安装状态。
+/// 启动前的摄像头注册核验。目标设备过滤另由 `interception::Capture::open` 精确验证，
+/// 因而不会把未选目标的 Raw Input 旁路功能误判为驱动拦截成功。
 pub fn is_registered() -> Result<bool> {
     if !embedded_available() {
         return Ok(false);
@@ -188,12 +241,18 @@ pub fn is_registered() -> Result<bool> {
     Ok(_scan().iter().all(|entry| entry._installed()))
 }
 
-/// 部署三份 DLL 并注册，然后从两个注册表视图独立核验。
+/// 部署摄像头与 Interception 运行资产；仅在 API 明确证明驱动不可用时才调用官方安装器。
+/// 已存在且可用、但并非本应用安装的驱动不会被标记为本应用所有。
 pub fn install() -> Result<String> {
     let _deploy = _deploy_guard("安装")?;
     if !embedded_available() {
         return Err(anyhow!(
             "本次构建未内置完整 DLL：先用 MSBuild 构建 DirectShow 的 Release|x64 与 Release|Win32，再重建上位机"
+        ));
+    }
+    if !interception::embedded_available() {
+        return Err(anyhow!(
+            "本次构建未内置经核验的 Interception v1.0.1 x64 API、官方安装器与 LGPL-3.0 许可证"
         ));
     }
     let directory = install_dir();
@@ -205,6 +264,7 @@ pub fn install() -> Result<String> {
         "(if not exist {dir} mkdir {dir})",
         dir = _cmd_quote(&directory)
     )];
+    _stage_interception_assets(&staging, &mut steps)?;
     for (index, item) in _items().iter().enumerate() {
         let staged = staging.join(item._dll);
         std::fs::write(&staged, item._bytes)
@@ -232,7 +292,7 @@ pub fn install() -> Result<String> {
     let exit = _run_elevated_steps(&steps)?;
     if exit != 0 {
         return Err(anyhow!(
-            "安装命令以退出码 {} 结束（{}）；现状：{}",
+            "部署命令以退出码 {} 结束（{}）；现状：{}",
             exit,
             _exit_reason(exit),
             _describe(&_scan()),
@@ -241,32 +301,106 @@ pub fn install() -> Result<String> {
     let verified = _scan();
     if !verified.iter().all(|entry| entry._installed()) {
         return Err(anyhow!(
-            "安装命令已执行（退出码 0），但注册核验未通过：{}",
+            "摄像头注册命令已执行（退出码 0），但注册核验未通过：{}",
             _describe(&verified),
         ));
     }
-    Ok(registration_status())
+    if !interception::deployed_assets_match() {
+        return Err(anyhow!(
+            "Interception 运行资产复制后未通过逐字节核验，拒绝继续安装驱动"
+        ));
+    }
+
+    match interception::driver_status() {
+        interception::DriverStatus::Ready => Ok(registration_status()),
+        // 已注册但没加载 ⇒ 上一次安装其实成功了, 只差重启; 不再重跑安装器。
+        interception::DriverStatus::PendingReboot => Ok(registration_status()),
+        interception::DriverStatus::DriverUnavailable => {
+            // 只有 API 已正确加载却无驱动设备时，才执行归档内唯一的官方安装器。
+            let marker = staging.join(interception::OWNER_FILE);
+            std::fs::write(&marker, interception::owner_marker())
+                .map_err(|error| anyhow!("写入 Interception 所有权标记失败：{}", error))?;
+            let target = interception::install_dir();
+            let installer = target.join(interception::INSTALLER_FILE);
+            let steps = vec![
+                format!("{} /install", _cmd_quote(&installer)),
+                "if errorlevel 1 exit /b 50".to_string(),
+                format!(
+                    "copy /Y {marker} {target} >nul",
+                    marker = _cmd_quote(&marker),
+                    target = _cmd_quote(&target.join(interception::OWNER_FILE)),
+                ),
+                "if errorlevel 1 exit /b 51".to_string(),
+            ];
+            let exit = _run_elevated_steps(&steps)?;
+            if exit != 0 {
+                return Err(anyhow!(
+                    "Interception 官方安装器以退出码 {} 结束（{}）；不会声称已拦截输入",
+                    exit,
+                    _exit_reason(exit),
+                ));
+            }
+            match interception::driver_status() {
+                // ★装完必然还没加载★ 键盘类上层过滤驱动只在开机重建设备栈时挂载, 因此首次安装
+                // 后立刻探测一定拿不到设备槽。这**不是**失败: 注册表已确认注册完成, 报"待重启"并
+                // 返回成功, 由 registration_status() 如实告知重启前不会拦截。
+                interception::DriverStatus::Ready | interception::DriverStatus::PendingReboot => {
+                    Ok(registration_status())
+                }
+                status => Err(anyhow!(
+                    "Interception 安装器已返回成功，但驱动注册未在注册表落地：{}；不会声称已拦截输入",
+                    status.detail()
+                )),
+            }
+        }
+        status => Err(anyhow!(
+            "Interception 运行时核验失败：{}；不会声称已拦截输入",
+            status.detail()
+        )),
+    }
 }
 
 fn _exit_reason(exit: u32) -> String {
     let items = _items();
     match exit {
-        20..=22 => format!("复制 {} DLL 失败", items[(exit - 20) as usize]._label),
-        30..=32 => format!(
+        20..=21 => format!("复制 {} DLL 失败", items[(exit - 20) as usize]._label),
+        30..=31 => format!(
             "注册 {} DLL 失败（regsvr32）",
             items[(exit - 30) as usize]._label
         ),
+        40 => "复制 Interception API/安装器/许可证失败".to_string(),
+        50 => "Interception 官方安装器失败".to_string(),
+        51 => "写入 Interception 所有权标记失败".to_string(),
         _ => "请检查管理员命令执行结果".to_string(),
     }
 }
 
-/// 反向反注册、删除 DLL/.old，最后分别核验 COM 键、类别登记及文件残留。
+/// 反向反注册并清理本应用资产。只有存在完整所有权标记时才调用官方驱动卸载，
+/// 因而绝不移除本应用安装前就存在的 Interception 驱动。
 pub fn uninstall() -> Result<String> {
     let _deploy = _deploy_guard("卸载")?;
-    // 旧版本(MF 实现)可能留下系统帧服务器设备登记：DLL 删掉后它就成了"看得见、打不开"的幽灵相机，
-    // 故卸载时先做一次一次性清理。当前实现不再注册任何 MF 设备，这一步在新装机上是空操作。
     _remove_legacy_mf_camera();
     let directory = install_dir();
+    let interception_dir = interception::install_dir();
+    let owned_driver = interception::owner_marker_matches();
+    if owned_driver
+        && !interception_dir
+            .join(interception::INSTALLER_FILE)
+            .is_file()
+    {
+        return Err(anyhow!(
+            "检测到本应用 Interception 所有权标记，但官方安装器缺失；为避免错误移除驱动，已拒绝卸载"
+        ));
+    }
+    let staging = std::env::temp_dir().join("mai2control_vcam");
+    std::fs::create_dir_all(&staging)
+        .map_err(|error| anyhow!("创建卸载核验暂存目录 {} 失败：{}", staging.display(), error))?;
+    let probe_api = staging.join("interception-uninstall-probe.dll");
+    if owned_driver {
+        std::fs::copy(interception_dir.join("interception.dll"), &probe_api)
+            .map_err(|error| anyhow!("暂存 Interception API 以核验卸载结果失败：{}", error))?;
+    }
+
     let mut steps = Vec::new();
     for item in _items().iter().rev() {
         let target = directory.join(item._dll);
@@ -275,6 +409,13 @@ pub fn uninstall() -> Result<String> {
             regsvr = item._regsvr,
             target = _cmd_quote(&target),
         ));
+    }
+    if owned_driver {
+        steps.push(format!(
+            "{} /uninstall",
+            _cmd_quote(&interception_dir.join(interception::INSTALLER_FILE))
+        ));
+        steps.push("if errorlevel 1 exit /b 50".to_string());
     }
     for item in _items().iter().rev() {
         let target = directory.join(item._dll);
@@ -287,24 +428,57 @@ pub fn uninstall() -> Result<String> {
             old = _cmd_quote(&target.with_extension("dll.old")),
         ));
     }
+    for (name, _) in interception::deployment_assets() {
+        steps.push(format!(
+            "del /q {target} >nul 2>&1",
+            target = _cmd_quote(&interception_dir.join(name)),
+        ));
+    }
+    steps.push(format!(
+        "del /q {target} >nul 2>&1",
+        target = _cmd_quote(&interception_dir.join(interception::OWNER_FILE)),
+    ));
+    steps.push(format!(
+        "rmdir {dir} >nul 2>&1",
+        dir = _cmd_quote(&interception_dir)
+    ));
+
     let exit = _run_elevated_steps(&steps)?;
     if exit != 0 {
         return Err(anyhow!(
-            "卸载命令以退出码 {} 结束；现状：{}",
+            "卸载命令以退出码 {} 结束（{}）；现状：{}",
             exit,
+            _exit_reason(exit),
             _describe(&_scan())
         ));
     }
     let verified = _scan();
-    let keys_gone = verified.iter().all(|entry| entry._absent());
-    let files_gone = verified.iter().all(|entry| entry._files_clean());
-    if keys_gone && files_gone {
-        return Ok("未安装（已核验 COM 注册、视频输入类别登记与部署文件均已清除）".to_string());
+    let camera_clean = verified
+        .iter()
+        .all(|entry| entry._absent() && entry._files_clean());
+    if !camera_clean || !_interception_assets_clean() {
+        return Err(anyhow!(
+            "卸载命令已执行（退出码 0），但仍有残留：{}；Interception 资产已清除={}",
+            _describe(&verified),
+            _interception_assets_clean(),
+        ));
     }
-    Err(anyhow!(
-        "卸载命令已执行（退出码 0），但仍有残留：{}",
-        _describe(&verified)
-    ))
+    if owned_driver {
+        if interception::driver_status_from_api(&probe_api).is_ready() {
+            return Err(anyhow!(
+                "官方 Interception 卸载器已返回成功，但驱动仍可枚举；不会声称卸载完成"
+            ));
+        }
+        Ok(
+            "未安装（已核验摄像头注册/文件清除，且仅移除了本应用安装的 Interception 驱动）"
+                .to_string(),
+        )
+    } else {
+        Ok(
+            "未安装（已核验摄像头注册/文件清除；已保留非本应用安装的 Interception 驱动）"
+                .to_string(),
+        )
+    }
 }
 
 fn _describe(entries: &[_Registered]) -> String {

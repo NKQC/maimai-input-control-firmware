@@ -68,9 +68,21 @@ _Static_assert(FW_VERSION <= 0xFFFFFFFFu, "FW_BUILD_STAMP overflows uint32 (YY >
 //   result==0(进行中) → 当前正在试探的 snsClk 分频(供上位机显示"正在试 ÷N");
 //   result!=0(已完成) → 最终写入 widgetContext 的分频(成功)或 0(失败)。
 #define SENSOR_CMD_GET_AUTO_TUNE         (0x3Eu)
+/* ★Sweep 专用轻量应用(帧字节2=目标通道 0..35, 0xFF=全通道)★
+ * 只做 Cy_CapSense_Initialize + CSD 模式准备, 使 widgetContext 的 gain(idacGainIndex)/div(snsClk)
+ * 真正落到硬件; 【绝不】重校准 IDAC、【绝不】初始化基线。
+ * ★为什么必须与 APPLY 分开★: APPLY 在 g_auto_calibrate(默认开)下必然重校准(AUTO 模式全启用通道、
+ * 半自动模式脏通道), 实测每格约 800ms 已超出 Sweep 逐格预算; 而 448 格扫描只需要"参数生效后读 raw",
+ * 校准与基线由会话结束时的一次显式 CALIBRATE + BASELINE_RESET 统一收口。
+ * 本命令只服务 Sweep, 不改变 APPLY 的任何语义。 */
+#define SENSOR_CMD_QUICK_APPLY           (0x3Fu)
+/* Focus 扫描控制: 帧字节2=0..35 时只扫描该已启用 widget 并续租；0xFF 时立即恢复全通道。
+ * 响应 b2=实际模式目标(0xFF=全通道), b3=1 接受/0 拒绝。 */
+#define SENSOR_CMD_FOCUS_SCAN            (0x49u)
 /* ★通道号哨兵(全通道)★ 单一取值, 供 CALIBRATE / BASELINE_RESET / AUTO_TUNE 共用 ——
  * 不为每条命令另造一个"全通道"常量, 免得三处各写一份必然漂移。 */
 #define SENSOR_CH_ALL                    (0xFFu)
+#define FOCUS_SCAN_LEASE_MS              (3000u)
 #define AUTO_TUNE_CH_ALL                 SENSOR_CH_ALL  // AUTO_TUNE 通道号哨兵: 全通道(同 SENSOR_CH_ALL)
 // 全局参数 id
 #define GPARAM_INACTIVE_SNS              (0x01u)  // 未激活传感器连接: 1=GND 2=High-Z 4=Shield
@@ -182,6 +194,7 @@ static spi_dma_state_t spi_dma;
 #define MLOOP_STAGE_BASELINE_RESET       (12u)
 #define MLOOP_STAGE_AUTO_TUNE            (13u)
 #define MLOOP_STAGE_SCAN_START           (14u)
+#define MLOOP_STAGE_QUICK_APPLY          (15u)
 /* APPLY 分支细分 */
 #define MLOOP_STAGE_APPLY_ENABLE         (20u)  /* reserved */
 #define MLOOP_STAGE_APPLY_RECAL          (21u)  /* 逐通道 _recalibrate_dirty_channels */
@@ -255,6 +268,19 @@ static inline uint32_t _popcount64(uint64_t v)
 static volatile uint8_t touch_frame[SENSOR_FRAME_SIZE];
 /* APPLY 指令置位，主循环执行重校准（不能在 ISR 里做耗时重扫描）。 */
 static volatile bool apply_pending = false;
+/* QUICK_APPLY(Sweep 专用)指令置位: 主循环只让 gain/div 落硬件, 不重校准/不重基线(见命令码注释)。
+ * quick_apply_ch: 0..35=本次扫描的目标通道(消掉它的脏位), SENSOR_CH_ALL=全通道(兼容入口)。 */
+static volatile bool quick_apply_pending = false;
+static volatile uint8_t quick_apply_ch = SENSOR_CH_ALL;
+static volatile uint8_t quick_apply_gain = 0u;
+static volatile uint8_t quick_apply_div = 1u;
+/* ★Focus 单通道扫描态(FOCUS_SCAN 唯一真相源)★
+ * focus_scan_ch: 0..35=主循环只扫描/只处理该 widget; SENSOR_CH_ALL=正常全通道。
+ * focus_scan_until_ms: 租约截止(g_ms_tick 口径)。RP2040 需周期性续租; 断链/宕机/忘记 STOP 时
+ * 租约到期后主循环自行回到全通道 —— 这是"永不遗留单通道模式"的兜底, 不依赖上位机。
+ * ISR 只写这两个字节, 真正的扫描目标由主循环的 _focus_scan_target() 复核(启用态+租约)。 */
+static volatile uint8_t focus_scan_ch = SENSOR_CH_ALL;
+static volatile uint32_t focus_scan_until_ms = 0u;
 /* 硬件参数改变后仅记录对应通道，避免 APPLY 为未修改通道重校准造成状态漂移。 */
 static volatile uint64_t idac_dirty_mask = 0u;
 /* MEASURE_CP 指令置位，主循环执行逐电极 BIST 电容测量(不能在 ISR 里做耗时测量)。 */
@@ -1037,6 +1063,28 @@ static inline void _prepare_csd_mode(void)
     _disabled_widgets_force_highz();
 }
 
+/* Focus 扫描目标(主循环专用)：仅当 ISR 存的 ch 当前启用且租约未过期时返回该 ch；否则回退全通道。
+ * ★为什么需要复核★ ISR 只记录命令，主循环必须按当前时间与启用位图确认"租约是否失效、通道是否
+ * 已被禁用"，返回全通道哨兵(SENSOR_CH_ALL)让扫描/处理回到正常路径，绝不遗留坏状态。 */
+static inline uint8_t _focus_scan_target(void)
+{
+    uint32_t interrupt_state = Cy_SysLib_EnterCriticalSection();
+    const uint8_t req = focus_scan_ch;
+    const uint32_t until = focus_scan_until_ms;
+    Cy_SysLib_ExitCriticalSection(interrupt_state);
+    if (req >= SENSOR_CHANNEL_COUNT) return SENSOR_CH_ALL;
+    if (!_ch_is_enabled(req)) return SENSOR_CH_ALL;
+    if (g_ms_tick >= until) {
+        /* 租约到期：主循环强制回退，ISR 里的状态一并清掉(ISR 下次收到续租会重建)。 */
+        interrupt_state = Cy_SysLib_EnterCriticalSection();
+        focus_scan_ch = SENSOR_CH_ALL;
+        focus_scan_until_ms = 0u;
+        Cy_SysLib_ExitCriticalSection(interrupt_state);
+        return SENSOR_CH_ALL;
+    }
+    return req;
+}
+
 /* 只初始化【启用】通道的基线。替代 Cy_CapSense_InitializeAllBaselines ——
  * 后者(cy_capsense_filter.c:407)不查 enable, 会把禁用通道的基线设成它那份陈旧 raw,
  * 白做 36 次无意义写入, 也让"禁用通道不参与任何处理"这条约束出现例外。 */
@@ -1647,6 +1695,44 @@ static void spi_slave_task(uint8_t rx_index)
             spi_load_cmd_response(SENSOR_CMD_APPLY, 0u, 0u, 0u);
             break;
 
+        case SENSOR_CMD_QUICK_APPLY: {
+            /* Sweep 帧 [magic, QUICK_APPLY, ch, gain, div, 0, 0]：ISR 只接收完整合法参数并置 pending，
+             * 绝不触碰 widgetContext（当前 CapSense 扫描期间写它会卡死该轮，主循环到不了 pending）。
+             * 非法帧不置 pending/busy；ACK 的 b3=0xFF、value=0 明确回显拒绝，RP 最终仍以 readback
+             * 为设备真值。 */
+            const bool valid = (rx[2] < SENSOR_CHANNEL_COUNT) && (rx[3] <= 6u) &&
+                               (rx[4] >= 1u) && (rx[4] <= 64u);
+            if (valid)
+            {
+                quick_apply_ch = rx[2];
+                quick_apply_gain = rx[3];
+                quick_apply_div = rx[4];
+                quick_apply_pending = true;
+                g_op_busy = 1u;
+            }
+            spi_load_cmd_response(SENSOR_CMD_QUICK_APPLY, rx[2],
+                                  valid ? rx[3] : 0xFFu, valid ? rx[4] : 0u);
+            break;
+        }
+
+        case SENSOR_CMD_FOCUS_SCAN: {
+            /* Focus 帧 [magic, FOCUS_SCAN, ch, 0, 0, 0, 0]：ch=0..35 启用/续租单通道, 0xFF 立即恢复全通道。
+             * 响应 [magic, FOCUS_SCAN, 实际目标 ch, 接受状态(1=OK / 0=拒绝), 0, 0, 0]。
+             * 拒绝原因：ch 非法、ch 已禁用(电极必须 High-Z, 不可扫)。主循环据租约/启用态自行回退。 */
+            const uint8_t req = rx[2];
+            const bool is_exit = (req == SENSOR_CH_ALL);
+            const bool valid = is_exit || (req < SENSOR_CHANNEL_COUNT && _ch_is_enabled(req));
+            if (valid) {
+                uint32_t st = Cy_SysLib_EnterCriticalSection();
+                focus_scan_ch = req;
+                focus_scan_until_ms = is_exit ? 0u : (g_ms_tick + FOCUS_SCAN_LEASE_MS);
+                Cy_SysLib_ExitCriticalSection(st);
+            }
+            spi_load_cmd_response(SENSOR_CMD_FOCUS_SCAN, valid ? req : SENSOR_CH_ALL,
+                                  valid ? 1u : 0u, 0u);
+            break;
+        }
+
         case SENSOR_CMD_CALIBRATE:
             // 真正的 IDAC 重校准 + 基线复位; 耗时, 仅置标志由主循环执行。
             // rx[2]=目标通道(0..35 单通道 / 0xFF 全通道), 与 AUTO_TUNE 同构; 非法值退化为全通道。
@@ -1850,6 +1936,10 @@ int main(void)
     measure_cp_pending = false;
     measure_cp_active = false;
     global_apply_pending = false;
+    quick_apply_pending = false;
+    quick_apply_ch = SENSOR_CH_ALL;
+    quick_apply_gain = 0u;
+    quick_apply_div = 1u;
     calibrate_pending = false;
     baseline_reset_pending = false;
     calibrate_ch = SENSOR_CH_ALL;
@@ -1914,27 +2004,51 @@ int main(void)
         if (CY_CAPSENSE_NOT_BUSY == Cy_CapSense_IsBusy(&cy_capsense_context))
         {
             spi_dbg.stage = MLOOP_STAGE_PROCESS;
-            if (scan_mode == SCAN_MODE_AUTO)
+            /* ★Focus 单通道处理★ 仅复核通过(启用且租约未过期)时只处理该 widget；
+             * 全通道哨兵回落正常全通道路径。租约到期由 _focus_scan_target() 强制回退。 */
+            const uint8_t focus_target = _focus_scan_target();
+            if (focus_target < SENSOR_CHANNEL_COUNT)
             {
-                /* 自动校准：运行中间件标准完整处理链。 */
-                (void)Cy_CapSense_ProcessAllWidgets(&cy_capsense_context);
+                /* Focus 单通道：只处理该 widget。scan_mode AUTO/SEMI 处理链已覆盖全部字段(滤波/基线/
+                 * 差值/状态/噪声/阈值)；无需为 Focus 另造分支——直接复用既有完整链即可。 */
+                if (scan_mode == SCAN_MODE_AUTO)
+                {
+                    (void)Cy_CapSense_ProcessWidget(focus_target, &cy_capsense_context);
+                }
+                else
+                {
+                    const uint32_t manual_mask = CY_CAPSENSE_PROCESS_FILTER |
+                                                 CY_CAPSENSE_PROCESS_BASELINE |
+                                                 CY_CAPSENSE_PROCESS_DIFFCOUNTS |
+                                                 CY_CAPSENSE_PROCESS_STATUS;
+                    (void)Cy_CapSense_ProcessWidgetExt(focus_target, manual_mask, &cy_capsense_context);
+                }
             }
             else
             {
-                /* 半自动手动：跳过 CALC_NOISE+THRESHOLDS，手动 SET_PARAM 阈值不被覆盖，
-                 * 仍跑滤波/基线/差值/状态，触控检测正常（用手动 fingerTh 判定）。 */
-                const uint32_t manual_mask = CY_CAPSENSE_PROCESS_FILTER |
-                                             CY_CAPSENSE_PROCESS_BASELINE |
-                                             CY_CAPSENSE_PROCESS_DIFFCOUNTS |
-                                             CY_CAPSENSE_PROCESS_STATUS;
-                /* ★必须自己跳过禁用通道★ Cy_CapSense_ProcessWidgetExt 按文档明确"忽略 widget 的
-                 * disable/non-working 状态"(cy_capsense_structure.c:850 附近的说明), 与
-                 * ProcessAllWidgets(control.c:589 会查 IsWidgetEnabled)不同 —— 不自己跳的话,
-                 * 半自动模式下禁用通道仍会跑滤波/基线/状态判定, 甚至靠陈旧 raw 判出"按下"。 */
-                for (uint32_t w = 0u; w < SENSOR_CHANNEL_COUNT; w++)
+                /* 全通道处理(正常路径 / Focus 租约到期回退 / 全通道禁用) */
+                if (scan_mode == SCAN_MODE_AUTO)
                 {
-                    if (!_ch_is_enabled(w)) { continue; }
-                    (void)Cy_CapSense_ProcessWidgetExt(w, manual_mask, &cy_capsense_context);
+                    /* 自动校准：运行中间件标准完整处理链。 */
+                    (void)Cy_CapSense_ProcessAllWidgets(&cy_capsense_context);
+                }
+                else
+                {
+                    /* 半自动手动：跳过 CALC_NOISE+THRESHOLDS，手动 SET_PARAM 阈值不被覆盖，
+                     * 仍跑滤波/基线/差值/状态，触控检测正常（用手动 fingerTh 判定）。 */
+                    const uint32_t manual_mask = CY_CAPSENSE_PROCESS_FILTER |
+                                                 CY_CAPSENSE_PROCESS_BASELINE |
+                                                 CY_CAPSENSE_PROCESS_DIFFCOUNTS |
+                                                 CY_CAPSENSE_PROCESS_STATUS;
+                    /* ★必须自己跳过禁用通道★ Cy_CapSense_ProcessWidgetExt 按文档明确"忽略 widget 的
+                     * disable/non-working 状态"(cy_capsense_structure.c:850 附近的说明), 与
+                     * ProcessAllWidgets(control.c:589 会查 IsWidgetEnabled)不同 —— 不自己跳的话,
+                     * 半自动模式下禁用通道仍会跑滤波/基线/状态判定, 甚至靠陈旧 raw 判出"按下"。 */
+                    for (uint32_t w = 0u; w < SENSOR_CHANNEL_COUNT; w++)
+                    {
+                        if (!_ch_is_enabled(w)) { continue; }
+                        (void)Cy_CapSense_ProcessWidgetExt(w, manual_mask, &cy_capsense_context);
+                    }
                 }
             }
             spi_dbg.stage = MLOOP_STAGE_TOUCH;
@@ -2104,6 +2218,43 @@ int main(void)
                 }
             }
 
+            /* QUICK_APPLY(Sweep 专用)：ISR 已保存本格的 gain/div；只在 NOT_BUSY 窗口原子写入
+             * widgetContext，再 Initialize 让参数下到硬件。绝不校准/基线，禁用电极由
+             * _prepare_csd_mode() 继续强制 High-Z。 */
+            if (quick_apply_pending)
+            {
+                uint8_t qa_target;
+                uint8_t qa_gain;
+                uint8_t qa_div;
+                uint32_t interrupt_state = Cy_SysLib_EnterCriticalSection();
+                qa_target = quick_apply_ch;
+                qa_gain = quick_apply_gain;
+                qa_div = quick_apply_div;
+                quick_apply_pending = false;
+                quick_apply_ch = SENSOR_CH_ALL;
+                quick_apply_gain = 0u;
+                quick_apply_div = 1u;
+                Cy_SysLib_ExitCriticalSection(interrupt_state);
+
+                spi_dbg.stage = MLOOP_STAGE_QUICK_APPLY;
+                if (qa_target < SENSOR_CHANNEL_COUNT)
+                {
+                    cy_stc_capsense_widget_context_t * wc = &cy_capsense_tuner.widgetContext[qa_target];
+                    const uint64_t bit = ((uint64_t)1u << qa_target);
+                    wc->idacGainIndex = qa_gain;
+                    wc->snsClk = qa_div;
+                    spi_dbg.clk_set_cnt++;
+                    spi_dbg.clk_set_last = (uint32_t)qa_div | ((uint32_t)qa_target << 16u);
+                    g_idac_lock.gain[qa_target] = qa_gain;
+                    g_idac_lock.mask |= bit;
+                    idac_dirty_mask |= bit;
+                    (void)Cy_CapSense_Initialize(&cy_capsense_context);
+                    _prepare_csd_mode();
+                    /* 本次已经让 gain/div 生效；普通 APPLY 不得再为该格补跑校准。 */
+                    idac_dirty_mask &= ~bit;
+                }
+            }
+
             /* CALIBRATE：真正的 IDAC 重校准(把 raw 拉回目标, 修 railed), 再复位基线。
              * 与 APPLY 区分——APPLY 只重配/re-init, 不重算 IDAC; 半自动手动下"校准"必须走这里
              * 才有效(否则 raw 一直卡满量程 diff=0)。CalibrateAllWidgets 需校准使能。 */
@@ -2252,7 +2403,8 @@ int main(void)
 
             /* ★处理中锁定解除★：本轮已把入队的重操作全部做完(且未被 ISR 追加新的)→ 清 busy。
              * RP2040 轮询 GET_STATS 的 busy 字节由 1→0 即判定该重操作真实完成(替代盲等 sleep)。 */
-            if (!apply_pending && !calibrate_pending && !baseline_reset_pending &&
+            if (!apply_pending && !quick_apply_pending && !calibrate_pending &&
+                !baseline_reset_pending &&
                 !global_apply_pending && !auto_tune_pending &&
                 !measure_cp_pending && !measure_cp_active)
             {
@@ -2280,7 +2432,15 @@ int main(void)
                 {
                     _prepare_csd_mode();
                 }
-                Cy_CapSense_ScanAllWidgets(&cy_capsense_context);
+                const uint8_t scan_target = _focus_scan_target();
+                if (scan_target < SENSOR_CHANNEL_COUNT)
+                {
+                    Cy_CapSense_ScanWidget(scan_target, &cy_capsense_context);
+                }
+                else
+                {
+                    Cy_CapSense_ScanAllWidgets(&cy_capsense_context);
+                }
             }
         }
     }

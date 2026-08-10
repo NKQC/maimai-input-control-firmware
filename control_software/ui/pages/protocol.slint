@@ -29,6 +29,10 @@ export component ProtocolPage inherits Rectangle {
     callback cfg_set_enum(string, int);
     callback cfg_set_string(string, string);
 
+    // ---- 设备/算法只读概览 ----
+    in property <string> device_summary_text: "未获取到设备信息";
+    in property <string> algo_info_text: "算法信息未读取";
+
     // ---- mai2serial(自分区绑定页迁移而来, 属性/回调名沿用) ----
     in property <bool> mai2_send_en_known: false;
     in property <bool> mai2_send_en: false;
@@ -75,6 +79,10 @@ export component ProtocolPage inherits Rectangle {
         VerticalLayout {
             padding: 8px;
             spacing: 8px;
+
+            Text { text: "协议/设备能力概览"; color: Theme.text-title; font-weight: 700; font-size: Theme.fs-title; }
+            Text { text: root.device_summary_text; color: Theme.text-sub; font-size: Theme.fs-small; wrap: word-wrap; }
+            Text { text: root.algo_info_text; color: Theme.accent; font-size: Theme.fs-small; wrap: word-wrap; }
 
             // 默认折叠: 平时只需确认"有没有在发", 展开才是手动覆盖操作。
             // ★本页所有块都必须 vertical-stretch: 0 + 末尾留一个弹性占位★
@@ -130,6 +138,19 @@ export component ProtocolPage inherits Rectangle {
             ConfigGroupSection {
                 vertical-stretch: 0;
                 group_title: "mai2serial 协议参数";
+                rows: root.config_rows;
+                group_counts: root.config_group_counts;
+                set_bool(k, v) => { root.cfg_set_bool(k, v); }
+                set_number(k, v) => { root.cfg_set_number(k, v); }
+                set_number_hex(k, v) => { root.cfg_set_number_hex(k, v); }
+                set_enum(k, v) => { root.cfg_set_enum(k, v); }
+                set_string(k, v) => { root.cfg_set_string(k, v); }
+            }
+
+            // 四个开关均走同一份配置草稿与“保存到设备”路径；启动校准失败不会在本代次循环重试。
+            ConfigGroupSection {
+                vertical-stretch: 0;
+                group_title: "启动校准与延迟补正";
                 rows: root.config_rows;
                 group_counts: root.config_group_counts;
                 set_bool(k, v) => { root.cfg_set_bool(k, v); }

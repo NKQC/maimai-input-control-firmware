@@ -22,7 +22,7 @@ enum SelfHealCode : uint8_t {
     SH_PSOC_RESET_HANG = 2,      // 主循环卡死(scan_count 不推进) → 已 XRES 复位
     SH_ALGO_FALLBACK = 3,        // 用户算法判定致命 → 已回退内嵌默认算法
     SH_STORE_CLEARED = 4,        // 采样不可信(railed/停滞) → 已清空 CSD store 回出厂默认链
-    SH_REPROVISIONED = 5,        // 已向 PSoC 重新下发算法 + CSD 配置(detail = 是否 SEMI 模式)
+    SH_REPROVISIONED = 5,        // 已向 PSoC 重新下发算法 + CSD；detail bit31=启动校准失败, low8=阶段，否则 detail=模式
     SH_PSOC_BOOT_OVERRIDE = 6,   // PSoC 启动时强制改写了生成配置(detail = 位掩码, 见 GPARAM_BOOT_OVERRIDE)
     SH_PSOC_RESCUED = 7,         // PSoC 救砖(强制重刷)完成
     SH_SERIAL_RESET_ACTIONS = 8, // mai2serial RSET 后已受理的动作(detail bit0=IDAC校准, bit1=基线复位)

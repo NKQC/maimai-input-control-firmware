@@ -1,4 +1,4 @@
-﻿//! mai2control 无头自测程序
+//! mai2control 无头自测程序
 //!
 //! 行为流程:
 //! 1. 初始化日志
@@ -2447,8 +2447,28 @@ const DBG_LEN_WITH_SEG2: usize = 146;
 /// NvStore 各区有效掩码(单份存储: 坏只坏在那一区, 必须看得见)。
 const DBG_OFF_NV_VALID_MASK: usize = 154;
 const DBG_LEN_WITH_NV_VALID: usize = 155;
+/// 上次 hardfault 发生在哪个核 / 当前 core1 阶段码(固件 last_boot_fault_core / core1_stage)。
+const DBG_OFF_LAST_FAULT_CORE: usize = 155;
+const DBG_OFF_CORE1_STAGE: usize = 156;
+/// 响应编码失败取证(固件 resp_encode_fail / resp_fail_cmd / resp_fail_req_len)。
+/// dispatch 返回 resp_len==0 ⇒ encode_* 因 max_len 装不下而拒绝组帧, 主机永远等不到该命令的响应。
+const DBG_OFF_RESP_ENCODE_FAIL: usize = 157;
+const DBG_OFF_RESP_FAIL_CMD: usize = 161;
+const DBG_OFF_RESP_FAIL_REQ_LEN: usize = 163;
+/// sizeof(UsbDebugCounters)。★GPIO 尾部必须以它为基址★: 先前这里直接用了
+/// DBG_LEN_WITH_NV_VALID(155), 但 nv_valid_mask 之后固件还有 last_boot_fault_core/core1_stage,
+/// 于是尾部整体读偏 2 字节(实测 read_ok/status/PC 全是错位垃圾值)。改固件结构必须同步这里。
+/// sizeof(UsbDebugCounters) 的旧前缀长度，旧固件仍可按此前缀解析。
+const DBG_LEN_LEGACY_COUNTERS: usize = 165;
+const DBG_LEN_COUNTERS: usize = 177;
+/// 新增 HostCmd 分发观测字段(紧随 UsbDebugCounters 原有 165B 前缀)。
+const DBG_OFF_HOST_DISPATCH_COUNT: usize = 165;
+const DBG_OFF_HOST_ALGO_INFO_DISPATCH_COUNT: usize = 169;
+const DBG_OFF_HOST_LAST_DISPATCH_CMD: usize = 173;
+const DBG_OFF_HOST_LAST_DISPATCH_SEQ: usize = 174;
+const DBG_OFF_HOST_LAST_DISPATCH_RESP_LEN: usize = 175;
 /// EP0 DEBUG_READ 的固定 GPIO/HSIOM 尾部(见 UsbDebugGpioTail)。
-const DBG_OFF_GPIO_PC: usize = DBG_LEN_WITH_NV_VALID;
+const DBG_OFF_GPIO_PC: usize = DBG_LEN_COUNTERS;
 const DBG_OFF_HSIOM_PORT_SEL: usize = DBG_OFF_GPIO_PC + 8 * 4;
 const DBG_OFF_GPIO_SWD_STATUS: usize = DBG_OFF_HSIOM_PORT_SEL + 8 * 4;
 const DBG_OFF_GPIO_READ_OK: usize = DBG_OFF_GPIO_SWD_STATUS + 4;
@@ -3396,9 +3416,17 @@ fn main() {
     // 定向修复: 只把 --nv-soak 写坏的极性与状态灯这几项救回来, 不做整体 RESET_DEFAULTS。
     let kbd_repair = args.iter().any(|a| a == "--kbd-repair");
     let led_test = args.iter().any(|a| a == "--led");
+    let set_verify_brightness: Option<u8> = args
+        .iter()
+        .position(|a| a == "--set-verify-brightness")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|s| s.parse::<u16>().ok())
+        .and_then(|value| u8::try_from(value).ok());
+    let set_verify_brightness_requested = args.iter().any(|a| a == "--set-verify-brightness");
     let soak = args.iter().any(|a| a == "--soak");
     let list_only = args.iter().any(|a| a == "--list-only");
     let debug_read = args.iter().any(|a| a == "--debug-read");
+    let algo_info_only = args.iter().any(|a| a == "--algo-info-only");
     let ctrl_bootsel = args.iter().any(|a| a == "--ctrl-bootsel");
     // 只请求配置并观测：每 200ms 打印 config_entries 数，持续 ~2.5s，看是否/何时到达及项数。
     let cfg_only = args.iter().any(|a| a == "--cfg-only");
@@ -3598,6 +3626,33 @@ fn main() {
                         .collect();
                     println!("[DBG] nv_valid_mask=0x{:X} {}", m, list.join(" "));
                 }
+                if report_len >= DBG_LEN_LEGACY_COUNTERS {
+                    // 响应编码失败取证: >0 即确证某条命令的响应被 encode_* 拒绝组帧(主机永远收不到它)。
+                    println!(
+                        "[DBG] last_boot_fault_core={} core1_stage=0x{:02X} resp_encode_fail={} last_fail_cmd=0x{:02X} last_fail_req_len={}",
+                        b[DBG_OFF_LAST_FAULT_CORE],
+                        b[DBG_OFF_CORE1_STAGE],
+                        le32(DBG_OFF_RESP_ENCODE_FAIL),
+                        b[DBG_OFF_RESP_FAIL_CMD],
+                        u16::from_le_bytes([
+                            b[DBG_OFF_RESP_FAIL_REQ_LEN],
+                            b[DBG_OFF_RESP_FAIL_REQ_LEN + 1],
+                        ])
+                    );
+                }
+                if report_len >= DBG_LEN_COUNTERS {
+                    println!(
+                        "[DBG] dispatch_count={} algo_dispatch_count={} last_cmd=0x{:02X} last_seq={} last_resp_len={}",
+                        le32(DBG_OFF_HOST_DISPATCH_COUNT),
+                        le32(DBG_OFF_HOST_ALGO_INFO_DISPATCH_COUNT),
+                        b[DBG_OFF_HOST_LAST_DISPATCH_CMD],
+                        b[DBG_OFF_HOST_LAST_DISPATCH_SEQ],
+                        u16::from_le_bytes([
+                            b[DBG_OFF_HOST_LAST_DISPATCH_RESP_LEN],
+                            b[DBG_OFF_HOST_LAST_DISPATCH_RESP_LEN + 1],
+                        ])
+                    );
+                }
                 if report_len >= DBG_LEN_WITH_GPIO {
                     let pc = le32(DBG_OFF_GPIO_PC + 4);
                     let hsiom = le32(DBG_OFF_HSIOM_PORT_SEL + 4);
@@ -3707,6 +3762,64 @@ fn main() {
         thread::sleep(Duration::from_millis(50));
     }
 
+    if algo_info_only {
+        ctrl.cancel_conn_probes_for_diagnostic();
+        let before = ctrl.algo_version();
+        let sent = ctrl.algo_get_info().is_ok();
+        println!(
+            "[ALGO-INFO] ALGO_GET_INFO 已发送={}，进入 7 秒只读观测",
+            sent
+        );
+        let started = std::time::Instant::now();
+        while started.elapsed() < Duration::from_secs(7) {
+            ctrl.poll();
+            thread::sleep(Duration::from_millis(20));
+        }
+        let received = ctrl.algo_version() > before;
+        match ctrl.algo_info() {
+            Some(info) => println!(
+                "[ALGO-INFO] {} is_default={} psoc_valid={} len={} crc16=0x{:04X}",
+                if received { "收到" } else { "未收到" },
+                info.is_default,
+                info.psoc_valid,
+                info.len,
+                info.crc16
+            ),
+            None => println!(
+                "[ALGO-INFO] {} algo_info=<未取到>",
+                if received { "收到" } else { "未收到" }
+            ),
+        }
+        match ctrl.read_debug_counters() {
+            Ok(bytes) if bytes.len() >= DBG_LEN_COUNTERS => {
+                let le16 = |offset: usize| u16::from_le_bytes([bytes[offset], bytes[offset + 1]]);
+                let le32 = |offset: usize| {
+                    u32::from_le_bytes([
+                        bytes[offset],
+                        bytes[offset + 1],
+                        bytes[offset + 2],
+                        bytes[offset + 3],
+                    ])
+                };
+                println!(
+                    "[ALGO-INFO] debug dispatch_count={} algo_dispatch_count={} last_cmd=0x{:02X} last_seq={} last_resp_len={}",
+                    le32(DBG_OFF_HOST_DISPATCH_COUNT),
+                    le32(DBG_OFF_HOST_ALGO_INFO_DISPATCH_COUNT),
+                    bytes[DBG_OFF_HOST_LAST_DISPATCH_CMD],
+                    bytes[DBG_OFF_HOST_LAST_DISPATCH_SEQ],
+                    le16(DBG_OFF_HOST_LAST_DISPATCH_RESP_LEN)
+                );
+            }
+            Ok(bytes) => println!(
+                "[ALGO-INFO] debug counters short len={} (need {} for new dispatch fields)",
+                bytes.len(),
+                DBG_LEN_COUNTERS
+            ),
+            Err(error) => println!("[ALGO-INFO] debug-read failed: {}", error),
+        }
+        std::process::exit(if sent && received { 0 } else { 1 });
+    }
+
     // 重启 RP2040 到应用(不进 BOOTSEL): 用于验证下次启动的 PSoC 烧录跳过(版本/内容一致则不擦写)。
     if args.iter().any(|a| a == "--reboot-app") {
         println!("[SELFTEST] 发送 REBOOT(RP2040 重启到应用)...");
@@ -3726,6 +3839,76 @@ fn main() {
         thread::sleep(Duration::from_millis(350));
         println!("[SELFTEST] BOOTSEL REQUESTED");
         std::process::exit(0);
+    }
+
+    if set_verify_brightness_requested {
+        let Some(brightness) = set_verify_brightness else {
+            println!("[LED-BRIGHTNESS] FAIL 参数必须是 0..255 的整数");
+            std::process::exit(1);
+        };
+        let key = "led.ws_brightness";
+        let expected = brightness as u32;
+        let config_deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < config_deadline && ctrl.config_get(key).is_none() {
+            let _ = ctrl.request_config_all();
+            ctrl.poll();
+            thread::sleep(Duration::from_millis(20));
+        }
+        if ctrl.config_get(key).is_none() {
+            println!("[LED-BRIGHTNESS] FAIL CFG_GET_ALL 超时: key={}", key);
+            std::process::exit(1);
+        }
+        if let Err(error) = ctrl.set_config_number(key, brightness as f64) {
+            println!("[LED-BRIGHTNESS] FAIL 设置草稿: {}", error);
+            std::process::exit(1);
+        }
+        if let Err(error) = ctrl.save_config() {
+            println!("[LED-BRIGHTNESS] FAIL save_config: {}", error);
+            std::process::exit(1);
+        }
+        let save_deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while std::time::Instant::now() < save_deadline && ctrl.cfg_tx_pending() != 0 {
+            ctrl.poll();
+            thread::sleep(Duration::from_millis(20));
+        }
+        if ctrl.cfg_tx_pending() != 0 {
+            println!(
+                "[LED-BRIGHTNESS] FAIL 保存超时: cfg_tx_pending={}",
+                ctrl.cfg_tx_pending()
+            );
+            std::process::exit(1);
+        }
+        let before_led = ctrl.led_version();
+        if let Err(error) = ctrl.led_request_state() {
+            println!("[LED-BRIGHTNESS] FAIL LED_GET 请求: {}", error);
+            std::process::exit(1);
+        }
+        let led_deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < led_deadline && ctrl.led_version() <= before_led {
+            ctrl.poll();
+            thread::sleep(Duration::from_millis(20));
+        }
+        let config_value = ctrl.config_get(key).and_then(|entry| match entry.value {
+            CfgValue::U8(value) => Some(value as u32),
+            CfgValue::U16(value) => Some(value as u32),
+            CfgValue::U32(value) => Some(value),
+            _ => None,
+        });
+        let applied = ctrl.led_applied_brightness();
+        let pass = config_value == Some(expected) && applied == Some(brightness);
+        println!(
+            "[LED-BRIGHTNESS] expected_config={} device_config={:?} applied_brightness={:?} {}",
+            expected,
+            config_value,
+            applied,
+            if pass { "PASS" } else { "FAIL" }
+        );
+        if !pass {
+            println!("[LED-BRIGHTNESS] 软件回读未完成一致性对账；物理亮度/光强未由本验收仪表化");
+        } else {
+            println!("[LED-BRIGHTNESS] 软件证据通过；物理亮度/光强仍需人工或仪器验证");
+        }
+        std::process::exit(if pass { 0 } else { 1 });
     }
 
     if bus_test {
@@ -3759,6 +3942,162 @@ fn main() {
     if led_test {
         let passed = run_led_test(&mut ctrl);
         println!("[LED] {}", if passed { "PASS" } else { "FAIL" });
+        std::process::exit(if passed { 0 } else { 1 });
+    }
+
+    // 无头真实 SweepSession 生命周期：设备负责 448 格、恢复与丢包补发；这里仅轮询并验收终态。
+    // 复用生产 AppController，不另写测试协议栈，保证与 UI 实际路径完全一致。
+    // --focus-band [ch] [秒]: 实测单通道独占流的端到端交付率。
+    // ★为什么按"设备代数"判定而不是只看帧率★ 固件只在快照代数推进时才发 FOCUS_DATA, 所以
+    // 帧/s 的上限就是设备扫描速率; 只报帧率会把"设备只扫这么快"误读成"链路带宽不够"。
+    // 这里同时取 samples_per_sec(设备自报扫描速率), 用交付率/扫描率的比值判断链路是否漏帧。
+    if args.iter().any(|a| a == "--focus-band") {
+        let position = args.iter().position(|a| a == "--focus-band");
+        let channel = position
+            .and_then(|i| args.get(i + 1))
+            .and_then(|v| v.parse::<u8>().ok())
+            .unwrap_or(0);
+        let secs = position
+            .and_then(|i| args.get(i + 2))
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(10);
+        println!("[FOCUS] 启动 CH{} 单通道独占流, 实测 {}s...", channel, secs);
+        ctrl.focus_set_target(Some(channel));
+        let started = std::time::Instant::now();
+        let mut last_report = std::time::Instant::now();
+        let mut best_frames = 0u32;
+        let mut worst_frames = u32::MAX;
+        let mut last_renew = std::time::Instant::now();
+        while started.elapsed() < Duration::from_secs(secs) {
+            ctrl.poll();
+            ctrl.csd_diag_tick();
+            // ★续租★ 独占流租约 3s, 靠"任意主机帧"续期。GUI 天然每帧都有命令流量, 而本无头
+            // 脚手架只读不写 ⇒ 不补一条命令的话设备会在 ~3s 后自动停流(实测第 7s 起读数归零),
+            // 那是脚手架的缺陷, 不是设备带宽问题。每 1s 发一条最轻的读命令即可。
+            if last_renew.elapsed() >= Duration::from_secs(1) {
+                let _ = ctrl.request_param(channel, 0x0B);
+                last_renew = std::time::Instant::now();
+            }
+            if last_report.elapsed() >= Duration::from_secs(1) {
+                if let Some((frames, _bytes, _gaps)) = ctrl.focus_rate_last() {
+                    if frames > best_frames {
+                        best_frames = frames;
+                    }
+                    // 首个窗口常是半窗(会话刚建立), 不计入最差值。
+                    if started.elapsed() >= Duration::from_secs(2) && frames < worst_frames {
+                        worst_frames = frames;
+                    }
+                }
+                println!(
+                    "[FOCUS] {} | 设备扫描 {}/s",
+                    ctrl.focus_bandwidth_text(),
+                    ctrl.telem_samples_per_sec()
+                );
+                last_report = std::time::Instant::now();
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+        let scan_rate = ctrl.telem_samples_per_sec();
+        let gaps = ctrl.focus_gaps_total();
+        println!(
+            "[FOCUS] END 峰值={}帧/s 最差={}帧/s 设备扫描={}/s 累计丢帧={}",
+            best_frames,
+            if worst_frames == u32::MAX {
+                0
+            } else {
+                worst_frames
+            },
+            scan_rate,
+            gaps
+        );
+        // 过测判据分两层: ① 链路必须把设备扫出来的每一轮都送到(交付率 >= 扫描率的 95%,
+        // 留 5% 给窗口错位); ② 设备扫描率本身是否达到 300QPS 目标 —— 两者分别如实报告,
+        // 不把"设备只扫 170" 混report成"链路不够"。
+        let delivered_ok = scan_rate == 0 || best_frames as f32 >= scan_rate as f32 * 0.95;
+        let target_ok = best_frames >= 300;
+        println!(
+            "[FOCUS] 链路交付={} (峰值/扫描率={:.0}%) 300QPS目标={}",
+            if delivered_ok { "PASS" } else { "FAIL" },
+            if scan_rate > 0 {
+                best_frames as f32 / scan_rate as f32 * 100.0
+            } else {
+                0.0
+            },
+            if target_ok { "PASS" } else { "FAIL" }
+        );
+        ctrl.focus_set_target(None);
+        for _ in 0..20 {
+            ctrl.poll();
+            thread::sleep(Duration::from_millis(10));
+        }
+        std::process::exit(if target_ok { 0 } else { 1 });
+    }
+
+    if args.iter().any(|a| a == "--sweep-session") {
+        let channel = args
+            .iter()
+            .position(|a| a == "--sweep-session")
+            .and_then(|i| args.get(i + 1))
+            .and_then(|v| v.parse::<u8>().ok())
+            .unwrap_or(0);
+        println!("[SWEEP] 启动 CH{} 设备侧 448 格会话...", channel);
+        if let Err(error) = ctrl.noise_sweep_start(channel) {
+            println!("[SWEEP] FAIL start: {}", error);
+            std::process::exit(1);
+        }
+        let started = std::time::Instant::now();
+        let mut last_report = std::time::Instant::now();
+        while ctrl.noise_sweep_active() && started.elapsed() < Duration::from_secs(1200) {
+            ctrl.poll();
+            // UI 每 16ms 调用同一生产 tick；无头模式也必须推进它，否则 Sweep keepalive 永远不会下发。
+            ctrl.csd_diag_tick();
+            if last_report.elapsed() >= Duration::from_secs(5) {
+                println!(
+                    "[SWEEP] {:5.1}% {}",
+                    ctrl.noise_sweep_progress() * 100.0,
+                    ctrl.noise_sweep_status()
+                );
+                last_report = std::time::Instant::now();
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        // 再泵一拍，收终态后紧随的恢复/补发帧。
+        for _ in 0..20 {
+            ctrl.poll();
+            thread::sleep(Duration::from_millis(10));
+        }
+        let cells = ctrl.noise_sweep_cells();
+        let valid = cells.iter().filter(|cell| cell.valid).count();
+        let flag_count = |flag| cells.iter().filter(|cell| cell.flags & flag != 0).count();
+        let progress = ctrl.noise_sweep_progress();
+        let produced = ctrl.noise_sweep_produced();
+        let stalled = flag_count(mai2control_ui::proto::SWEEP_FLAG_STALLED);
+        println!(
+            "[SWEEP] END produced={} progress={:.1}% valid={}/448 status={}",
+            produced,
+            progress * 100.0,
+            valid,
+            ctrl.noise_sweep_status()
+        );
+        println!(
+            "[SWEEP] FLAGS CAL_FAIL={} MISMATCH={} STALLED={} RAILED={}",
+            flag_count(mai2control_ui::proto::SWEEP_FLAG_CAL_FAIL),
+            flag_count(mai2control_ui::proto::SWEEP_FLAG_MISMATCH),
+            flag_count(mai2control_ui::proto::SWEEP_FLAG_STALLED),
+            flag_count(mai2control_ui::proto::SWEEP_FLAG_RAILED),
+        );
+        for (index, cell) in cells
+            .iter()
+            .enumerate()
+            .filter(|(_, cell)| !cell.valid)
+            .take(12)
+        {
+            println!(
+                "[SWEEP] INVALID index={} gain={} div={} samples={} flags=0x{:02X} fail_phase={:?}",
+                index, cell.gain, cell.div, cell.samples, cell.flags, cell.fail_phase
+            );
+        }
+        let passed = !ctrl.noise_sweep_active() && produced == 448 && valid == 448 && stalled == 0;
         std::process::exit(if passed { 0 } else { 1 });
     }
 

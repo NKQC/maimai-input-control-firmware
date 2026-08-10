@@ -29,6 +29,7 @@ export component DashboardPage inherits Rectangle {
     in property <int> latency_proc_us: 0;
     in property <int> latency_usb_us: 0;
     in property <int> latency_sensor_us: 0;
+    in property <string> latency_corrected_text: "补正后延迟: 未启用";
     in-out property <bool> measure_latency: false;
     // 延迟历史折线(总延迟 us): SVG path(viewbox 1000x1000) + 量程 + 点数, 由 main.rs 回填。
     in property <string> lat_path: "";
@@ -274,13 +275,24 @@ export component DashboardPage inherits Rectangle {
                             height: 52px;
                             Text {
                                 x: 0px;
-                                y: 14px;
+                                y: 2px;
                                 width: 200px;
                                 overflow: elide;
                                 text: @tr("总计 ") + root.latency_total_us + " us";
                                 font-size: 20px;
                                 horizontal-alignment: left;
                                 color: Theme.accent;
+                            }
+                            Text {
+                                x: 0px;
+                                y: 34px;
+                                width: 200px;
+                                height: 18px;
+                                overflow: elide;
+                                text: root.latency_corrected_text;
+                                font-size: Theme.fs-normal;
+                                horizontal-alignment: left;
+                                color: Theme.text-sub;
                             }
                             Rectangle {
                                 x: 212px;

@@ -40,6 +40,12 @@ public:
     // Phase C：遥测慢路开关。激活后 update() 分块流水读全通道 raw/baseline/diff 填充 snapshot()。
     void set_telemetry_active(bool active) { _telem_active = active; }
     bool telemetry_active() const { return _telem_active; }
+    // 独占单通道目标: <36 = 快照只读该通道(每拍一份, 高速精调); 0xFF = 关闭快路走全通道分块慢路。
+    // core0 写 / core1 读的单字节, 天然原子; volatile 保证 core1 每拍重新读取而非缓存在寄存器里。
+    void set_focus_channel(uint8_t ch) { _focus_ch = ch; }
+    uint8_t focus_channel() const { return _focus_ch; }
+    // PSoC 实际扫描切换。仅收到 PSoC 对目标/状态的明确回显才成功；0xFF 关闭单通道模式。
+    bool set_focus_scan(uint8_t ch);
 
     // ---------- 实时触控快路（core1 发布, core0 经 seqlock 读）----------
     // ★touch_mask() 自身就是触摸真相★: 合法新帧才更新; 短暂错帧保留最后一份合法值;
@@ -102,6 +108,8 @@ public:
     // core0: 取走并清除"最近一次下发未通过 PSoC commit 校验"标志(用于一次性上报, 不重复刷屏)。
     bool algo_download_take_failure();
     bool get_algo_info(bool* out_valid, uint16_t* out_len);   // 读 PSoC 端算法 valid/len
+    // 只读 core1 周期刷新结果；不会投递或同步等待 SPI 命令。返回 true 表示缓存可用。
+    bool get_algo_info_cached(bool* out_valid, uint16_t* out_len) const;
     bool set_algo_rom(uint8_t ch, uint16_t rom);              // 设每通道 16 位只读 ROM
     bool get_algo_rom(uint8_t ch, uint16_t* out_rom);         // 读每通道 16 位 ROM
     // 算法运行时追踪(report[]/out_active)与可调变量(cfg[8], 见 psoc_algo_abi.h)
@@ -121,6 +129,13 @@ public:
     bool calibrate(uint8_t ch = 0xFFu);
     // 基线复位。ch: 0..35=仅该通道, 0xFF=全通道。
     bool baseline_reset(uint8_t ch = 0xFFu);
+    // SweepSession 专用的非阻塞重操作: 仅允许单个在途操作；完成结果由 take_sweep_result() 取走。
+    // ★start_sweep_apply 走 QUICK_APPLY(0x3F) 而非 APPLY★: 逐格把 gain/div 随帧原子下发，绝不先
+    // SET_PARAM 改 widgetContext；PSoC 仅在 NOT_BUSY 窗口写入并 Initialize。
+    bool start_sweep_apply(uint8_t ch, uint8_t gain, uint8_t div);
+    bool start_sweep_calibrate(uint8_t ch);
+    bool start_sweep_baseline_reset(uint8_t ch);
+    bool take_sweep_result(bool* out_ok);
     // 频率自适应下探(阻塞至完成, 最多~10s): ch 0..35=单通道 / 0xFF=全通道;
     // pref 灵敏度档位 1..7(越高越灵敏, 落档时往低频多让分频);
     // out_result 0进行中/1成功/2失败, out_div 最终写入的分频;
@@ -209,6 +224,7 @@ private:
     bool _swd_ready;
     bool _link_ok;
     bool _telem_active = false;       // 遥测慢路是否激活（TELEM_START/STOP 控制）
+    volatile uint8_t _focus_ch = 0xFF;   // 独占单通道目标(0xFF = 无, 走全通道分块慢路)
     uint32_t _last_update_ms;
     psoc::SensorSnapshot _snapshot;
     uint64_t _touch_mask = 0;
@@ -223,7 +239,7 @@ private:
 
     // ---------- 双核: core1 独占 SPI, seqlock 发布共享态 + 命令信箱投递低频指令 ----------
     // RP2040 无 cache, 跨核共享用 volatile + __dmb() 内存屏障即可保证可见性与顺序。
-    enum class SpiOp : uint8_t { NONE, SET_PARAM, GET_PARAM, GET_RAW, SET_MODE, APPLY, CALIBRATE, BASELINE_RESET, MEASURE_CP, GET_CP,
+    enum class SpiOp : uint8_t { NONE, SET_PARAM, GET_PARAM, GET_RAW, SET_MODE, APPLY, QUICK_APPLY, FOCUS_SCAN, CALIBRATE, BASELINE_RESET, MEASURE_CP, GET_CP,
                                  UPLOAD_ALGO, GET_ALGO_INFO, SET_ALGO_ROM, GET_ALGO_ROM,
                                  ALGO_GET_TRACE, ALGO_SET_CFG, ALGO_GET_CFG,
                                  SET_GLOBAL, GET_GLOBAL, GLOBAL_COMMIT, AUTO_TUNE };
@@ -253,6 +269,17 @@ private:
     // core0 写, core1 读。
     volatile uint32_t _reset_grace_until_ms = 0;
     uint32_t _hang_intervals = 0;               // 连续 scan_count 不推进的统计间隔数
+    // 算法信息缓存：仅 core1 刷新/失效，core0 通过 seqlock 只读；epoch 由 core0 在复位时递增。
+    static constexpr uint32_t ALGO_INFO_CACHE_MAX_AGE_MS = 500u;
+    volatile uint32_t _algo_info_seq = 0;
+    volatile uint8_t _algo_info_available = 0;
+    volatile uint8_t _algo_info_valid = 0;
+    volatile uint16_t _algo_info_len = 0;
+    volatile uint32_t _algo_info_refresh_ms = 0;
+    volatile uint32_t _algo_info_cache_epoch = 0;
+    volatile uint32_t _algo_info_epoch = 1;
+    uint32_t _algo_info_last_poll_ms = 0;       // core1 独占
+
     // 频率自适应阶段进度: core1 唯一写者(经 _at_seq seqlock 发布多字段一致副本), core0 只读。
     // _at_req 反向: core0 唯一写者(启动时自增), core1 只读回显, 使 core0 能区分"上一轮的 done"。
     volatile uint32_t _at_req = 0;
@@ -274,6 +301,16 @@ private:
     };
     AlgoDownloadState _algo_dl { 0u, 0u };
 
+    struct SweepAsyncState {
+        volatile uint8_t pending = 0;
+        volatile uint8_t complete = 0;
+        volatile uint8_t ok = 0;
+        volatile uint8_t token = 0;
+
+        void clear() { pending = 0; complete = 0; ok = 0; token = 0; }
+    };
+    SweepAsyncState _sweep_async;
+
     // 命令 SPSC 环形队列(core0 生产, core1 消费, 单拷贝, 无锁):
     //   写类指令(set_param/set_mode/apply) 入队即返回(异步), core0 不再每条阻塞 ~1ms;
     //   读类指令(get_param/get_raw) 入队后按 FIFO 阻塞等本条 done, 顺序与前序写一致。
@@ -290,6 +327,7 @@ private:
         uint32_t       result = 0;
         bool           ok = false;
         volatile bool  done = false;   // core1 执行完置真(读类 core0 等此位)
+        uint8_t        async_token = 0; // Sweep 非阻塞重操作的完成归属(0=普通命令)
     };
     SpiCmd            _cmd_ring[CMD_RING_SIZE];
     volatile uint32_t _cmd_head = 0;   // core0 生产位置(生产者独占推进)
@@ -302,7 +340,11 @@ private:
     static bool _op_is_heavy(SpiOp op);
 
     void _spi_service();   // core1 每周期: 命令队列 + 触控快路 + 快照慢路 + 采样率统计
-    bool _submit(SpiOp op, uint8_t ch, uint8_t pid, uint32_t val, uint32_t* out, const uint8_t* data = nullptr, uint32_t timeout_us = 0u);  // core0 投递(读类等结果); timeout_us=0 用默认
+    bool _refresh_algo_info_cache();       // core1 安全位置直接读取 PSoC
+    void _invalidate_algo_info_cache();   // core1 写者：链路失效时清空
+    bool _start_sweep_op(SpiOp op, uint8_t ch, uint8_t pid = 0u, uint32_t val = 0u);
+    bool _submit(SpiOp op, uint8_t ch, uint8_t pid, uint32_t val, uint32_t* out, const uint8_t* data = nullptr,
+                 uint32_t timeout_us = 0u, uint8_t async_token = 0u);
     bool _exec_cmd(SpiOp op, uint8_t ch, uint8_t pid, uint32_t val, uint32_t* out, const uint8_t* data = nullptr); // 实际执行(core1 或 setup 直调)
 
     static Psoc* _instance;

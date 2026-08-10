@@ -71,6 +71,9 @@ typedef struct
  *   ALGO_SETTING(0, "gain", 15)    -> cfg[0] adjustable in UI as "gain", default 15 */
 #define ALGO_REPORT(idx, name)
 #define ALGO_SETTING(idx, name, defval)
+/* Extended host-only metadata declarations. They also compile to nothing and do not change the ABI. */
+#define ALGO_REPORT_META(idx, name, type, minval, maxval, description, alias)
+#define ALGO_SETTING_META(idx, name, type, defval, minval, maxval, description, alias)
 
 /* Compile-time layout guarantees (offsetof-based; portable, no attributes). */
 #define _ALGO_IO_OFFSETOF(field) ((uint32_t)(size_t)&(((const algo_io_t *)0)->field))

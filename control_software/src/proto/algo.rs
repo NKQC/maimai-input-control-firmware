@@ -255,45 +255,115 @@ pub fn decode_algo_get_cfg(payload: &[u8]) -> Option<(u8, u8)> {
     Some((payload[0], payload[1]))
 }
 
-/// 算法上报变量声明: `ALGO_REPORT(idx, "name")`。idx 对应 io->report[idx](0..3)。
+/// 算法上报变量声明。旧格式仅提供 idx/name；META 格式补充类型、范围、介绍和别名。
 #[derive(Debug, Clone)]
 pub struct AlgoReportDecl {
     pub idx: u8,
     pub name: String,
+    pub value_type: String,
+    pub range: String,
+    pub description: String,
+    pub alias: String,
 }
 
-/// 算法可设置变量声明: `ALGO_SETTING(idx, "name", defval)`。idx 对应 io->cfg[idx](0..7)。
+/// 算法可设置变量声明。default 保持 u8 兼容设备 cfg[8]，其余字段来自 META 声明。
 #[derive(Debug, Clone)]
 pub struct AlgoSettingDecl {
     pub idx: u8,
     pub name: String,
     pub default: u8,
+    pub value_type: String,
+    pub range: String,
+    pub description: String,
+    pub alias: String,
 }
 
-/// 从算法 C 源里手写扫描 `ALGO_REPORT(idx, "name")` 声明(宏在 ABI 头里展开为空, 仅供上位机
-/// grep 源码取 schema)。不引入 regex 依赖, 用简单的逐字符扫描定位调用形如 `IDENT(...)`。
+fn _meta_text(args: &[String], index: usize) -> String {
+    args.get(index).map(|v| _unquote(v)).unwrap_or_default()
+}
+
+fn _meta_range(args: &[String], min_index: usize) -> String {
+    match (args.get(min_index), args.get(min_index + 1)) {
+        (Some(min), Some(max)) => format!("{}..{}", min.trim(), max.trim()),
+        _ => String::new(),
+    }
+}
+
+/// 从算法 C 源解析旧声明与稳定的 META 扩展声明：
+/// `ALGO_REPORT_META(idx, "name", "type", min, max, "description", "alias")`。
 pub fn parse_algo_reports(src: &str) -> Vec<AlgoReportDecl> {
-    _scan_macro_calls(src, "ALGO_REPORT")
-        .into_iter()
-        .filter_map(|args| {
-            let idx: u8 = args.first()?.trim().parse().ok()?;
-            let name = _unquote(args.get(1)?);
-            Some(AlgoReportDecl { idx, name })
-        })
-        .collect()
+    let mut out = Vec::new();
+    for args in _scan_macro_calls(src, "ALGO_REPORT_META") {
+        let Some(idx) = args.first().and_then(|v| v.trim().parse().ok()) else {
+            continue;
+        };
+        out.push(AlgoReportDecl {
+            idx,
+            name: _meta_text(&args, 1),
+            value_type: _meta_text(&args, 2),
+            range: _meta_range(&args, 3),
+            description: _meta_text(&args, 5),
+            alias: _meta_text(&args, 6),
+        });
+    }
+    for args in _scan_macro_calls(src, "ALGO_REPORT") {
+        let Some(idx) = args.first().and_then(|v| v.trim().parse().ok()) else {
+            continue;
+        };
+        if out.iter().any(|decl: &AlgoReportDecl| decl.idx == idx) {
+            continue;
+        }
+        let name = _meta_text(&args, 1);
+        out.push(AlgoReportDecl {
+            idx,
+            alias: String::new(),
+            name,
+            value_type: "u16".to_string(),
+            range: "0..65535".to_string(),
+            description: String::new(),
+        });
+    }
+    out
 }
 
-/// 从算法 C 源里扫描 `ALGO_SETTING(idx, "name", defval)` 声明。
+/// 解析旧 `ALGO_SETTING(idx, "name", defval)` 与 META 扩展声明。
 pub fn parse_algo_settings(src: &str) -> Vec<AlgoSettingDecl> {
-    _scan_macro_calls(src, "ALGO_SETTING")
-        .into_iter()
-        .filter_map(|args| {
-            let idx: u8 = args.first()?.trim().parse().ok()?;
-            let name = _unquote(args.get(1)?);
-            let default: u8 = args.get(2)?.trim().parse().ok()?;
-            Some(AlgoSettingDecl { idx, name, default })
-        })
-        .collect()
+    let mut out = Vec::new();
+    for args in _scan_macro_calls(src, "ALGO_SETTING_META") {
+        let Some(idx) = args.first().and_then(|v| v.trim().parse().ok()) else {
+            continue;
+        };
+        let default = args.get(3).and_then(|v| v.trim().parse().ok()).unwrap_or(0);
+        out.push(AlgoSettingDecl {
+            idx,
+            name: _meta_text(&args, 1),
+            default,
+            value_type: _meta_text(&args, 2),
+            range: _meta_range(&args, 4),
+            description: _meta_text(&args, 6),
+            alias: _meta_text(&args, 7),
+        });
+    }
+    for args in _scan_macro_calls(src, "ALGO_SETTING") {
+        let Some(idx) = args.first().and_then(|v| v.trim().parse().ok()) else {
+            continue;
+        };
+        if out.iter().any(|decl: &AlgoSettingDecl| decl.idx == idx) {
+            continue;
+        }
+        let name = _meta_text(&args, 1);
+        let default = args.get(2).and_then(|v| v.trim().parse().ok()).unwrap_or(0);
+        out.push(AlgoSettingDecl {
+            idx,
+            name,
+            default,
+            value_type: "u8".to_string(),
+            range: "0..255".to_string(),
+            description: String::new(),
+            alias: _meta_text(&args, 1),
+        });
+    }
+    out
 }
 
 /// 去掉字符串字面量两端的双引号(若有)并 trim 空白。

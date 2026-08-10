@@ -1,5 +1,5 @@
 import { Button, ComboBox, VerticalBox, HorizontalBox, GroupBox, ListView, CheckBox, SpinBox, LineEdit, ScrollView, TabWidget, TextEdit, Slider } from "std-widgets.slint";
-import { ConfigRow, ConfigGroupCount, ZoneCell, ParamRow, GlobalFences, ChannelStatus, AlgoReportLine, LogRow, VcamKbdRow, AlgoSettingRow, LedUnitRow, SpectrumCell } from "common/types.slint";
+import { ConfigRow, ConfigGroupCount, ZoneCell, HidPointCell, ParamRow, GlobalFences, ChannelStatus, AlgoReportLine, AlgoMetadataRow, LogRow, VcamKbdRow, AlgoSettingRow, LedUnitRow, SpectrumCell } from "common/types.slint";
 import { CollapsibleSection, ParamEditorRow, AlgoSettingEditorRow, PlotPath, BinAmpEditor, SeriesRow } from "common/widgets.slint";
 import { Theme } from "common/theme.slint";
 import { ConfigPage } from "pages/config.slint";
@@ -17,7 +17,7 @@ import { SettingsPage } from "pages/settings.slint";
 import { AboutPage } from "pages/about.slint";
 
 // 供 Rust 侧生成模块使用: 结构体在入口文件再次导出, 保证生成的类型名与位置不变。
-export { ConfigRow, ConfigGroupCount, ZoneCell, ParamRow, GlobalFences, ChannelStatus, AlgoReportLine, LogRow, VcamKbdRow, AlgoSettingRow, LedUnitRow, SpectrumCell }
+export { ConfigRow, ConfigGroupCount, ZoneCell, HidPointCell, ParamRow, GlobalFences, ChannelStatus, AlgoReportLine, AlgoMetadataRow, LogRow, VcamKbdRow, AlgoSettingRow, LedUnitRow, SpectrumCell }
 
 export component AppWindow inherits Window {
     title: "mai2control-ui";
@@ -55,6 +55,16 @@ export component AppWindow inherits Window {
 
     // 绑区页数据(几何绘制版,由 main.rs::build_zone_cells 回填,每 tick 刷新
     // 以支持触摸实时高亮)
+    in property <[HidPointCell]> hid_points: [];
+    in property <image> hid_screenshot;
+    in property <int> hid_screenshot_width: 0;
+    in property <int> hid_screenshot_height: 0;
+    in property <bool> hid_mode: false;
+    in-out property <int> hid_selected_channel: -1;
+    callback hid_screenshot_refresh();
+    callback hid_point_commit(int, int, int);
+    callback hid_point_enabled_set(int, bool);
+
     in property <[ZoneCell]> zones: [];
     in property <string> bind_status: "";
     in-out property <int> selected_zone: -1;
@@ -115,6 +125,7 @@ export component AppWindow inherits Window {
     in property <[SpectrumCell]> curve_spectrum_cells: [];
     in property <bool> curve_spectrum_active: false;
     in property <string> curve_spectrum_status: "";
+    in property <string> focus_bandwidth: "";
     in property <float> curve_spectrum_progress: 0;
     callback curve_spectrum_start();
     callback curve_spectrum_cancel();
@@ -210,6 +221,7 @@ export component AppWindow inherits Window {
     in property <int> latency_proc_us: 0;
     in property <int> latency_usb_us: 0;
     in property <int> latency_sensor_us: 0;
+    in property <string> latency_corrected_text: "补正后延迟: 未启用";
     in-out property <bool> measure_latency: false;
     in property <string> log_text: "";
     in property <string> log_line_numbers: "";
@@ -405,6 +417,7 @@ export component AppWindow inherits Window {
 
     // 算法页(透传给 SettingsPage → AlgoPage)
     in property <string> algo_info_text: "算法信息未读取";
+    in property <string> global_summary_text: "当前设备全局参数：未读取";
     in-out property <string> algo_c_source;
     in property <string> algo_line_numbers: "1";
     in property <string> algo_status: "";
@@ -416,13 +429,8 @@ export component AppWindow inherits Window {
     in property <int> algo_asm_capacity: 1024;
     in property <int> algo_c_bytes: 0;
     in property <int> algo_c_capacity: 32768;
-    in property <int> algo_sel_channel: 0;
-    in property <[AlgoReportLine]> algo_report_lines: [];
-    in property <string> algo_active_path: "";
-    in property <int> algo_trace_point_count: 0;
+    in property <[AlgoMetadataRow]> algo_metadata_rows: [];
     in property <[AlgoSettingRow]> algo_setting_rows: [];
-    callback algo_setting_edited(int, int);
-    callback report_toggle(int, bool);
     in property <int> g_inactive_sns: 1;
     in property <int> g_idac_gain: 4;
     in property <int> g_idac_sense_config: 0;   // 0=IDAC sourcing, 1=IDAC sinking
@@ -455,6 +463,7 @@ export component AppWindow inherits Window {
     callback algo_build_upload(string);
     callback algo_load_template(int);
     callback algo_source_edited(string);
+    callback algo_setting_edited(int, int);
     callback algo_global_set(int, int);
     callback csd_param_set(int, int);
 
@@ -655,6 +664,7 @@ export component AppWindow inherits Window {
                 latency_proc_us: root.latency_proc_us;
                 latency_usb_us: root.latency_usb_us;
                 latency_sensor_us: root.latency_sensor_us;
+                latency_corrected_text: root.latency_corrected_text;
                 measure_latency <=> root.measure_latency;
                 lat_path: root.lat_path;
                 lat_y_max: root.lat_y_max;
@@ -676,6 +686,9 @@ export component AppWindow inherits Window {
                 config_rows: root.config_rows;
                 config_other_count: root.config_other_count;
                 config_group_counts: root.config_group_counts;
+                device_summary_text: root.device_summary_text;
+                algo_info_text: root.algo_info_text;
+                global_summary_text: root.global_summary_text;
                 config_dirty: root.config_dirty;
                 config_dirty_count: root.config_dirty_count;
                 mode_change_needs_reboot: root.mode_change_needs_reboot;
@@ -711,6 +724,16 @@ export component AppWindow inherits Window {
                 batch_op_cancel() => { root.batch_op_cancel(); }
                 cp_assist: root.cp_assist;
                 set_cp_assist(on) => { root.set_cp_assist(on); }
+
+                hid_points: root.hid_points;
+                hid_screenshot: root.hid_screenshot;
+                hid_screenshot_width: root.hid_screenshot_width;
+                hid_screenshot_height: root.hid_screenshot_height;
+                hid_mode: root.hid_mode;
+                hid_selected_channel <=> root.hid_selected_channel;
+                hid_screenshot_refresh() => { root.hid_screenshot_refresh(); }
+                hid_point_commit(ch, x, y) => { root.hid_point_commit(ch, x, y); }
+                hid_point_enabled_set(ch, on) => { root.hid_point_enabled_set(ch, on); }
 
                 zones: root.zones;
                 bind_status: root.bind_status;
@@ -809,6 +832,7 @@ export component AppWindow inherits Window {
                 curve_spectrum_cells: root.curve_spectrum_cells;
                 curve_spectrum_active: root.curve_spectrum_active;
                 curve_spectrum_status: root.curve_spectrum_status;
+            focus_bandwidth: root.focus_bandwidth;
                 curve_spectrum_progress: root.curve_spectrum_progress;
                 curve_spectrum_start() => { root.curve_spectrum_start(); }
                 curve_spectrum_cancel() => { root.curve_spectrum_cancel(); }
@@ -923,18 +947,13 @@ export component AppWindow inherits Window {
                 kbd_clear_phys(i) => { root.kbd_clear_phys(i); }
                 kbd_clear_zone(z) => { root.kbd_clear_zone(z); }
 
-                algo_info_text: root.algo_info_text;
                 algo_c_source <=> root.algo_c_source;
                 algo_line_numbers: root.algo_line_numbers;
                 algo_status: root.algo_status;
                 algo_asm: root.algo_asm;
-                algo_sel_channel: root.algo_sel_channel;
-                algo_report_lines: root.algo_report_lines;
-                algo_active_path: root.algo_active_path;
-                algo_trace_point_count: root.algo_trace_point_count;
+                algo_metadata_rows: root.algo_metadata_rows;
                 algo_setting_rows: root.algo_setting_rows;
                 algo_setting_edited(idx, v) => { root.algo_setting_edited(idx, v); }
-                report_toggle(idx, on) => { root.report_toggle(idx, on); }
                 g_inactive_sns: root.g_inactive_sns;
                 g_idac_gain: root.g_idac_gain;
                 g_idac_sense_config: root.g_idac_sense_config;

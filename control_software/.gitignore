@@ -2,3 +2,10 @@
 # MSBuild 中间/输出目录(媒体源 C++ 子项目)
 /vcam_source_cpp/x64/
 /vcam_source_cpp/packages/
+
+# 第三方固定资产: Interception v1.0.1 官方发布包(build.rs 按 SHA-256 校验后内嵌)。
+# ★为什么默认不入库★ 官方为**双授权**: 非商业用途按 LGPL 明文允许随库/API 分发其驱动与安装器,
+# 商业用途须另购授权。本仓库的商业性质无法由代码判定, 故把"是否随仓库分发该二进制"留给维护者:
+# 确认为非商业用途时删掉本行即可; 否则各自按 README 的下载地址自取放到该路径。
+# 缺该文件不影响构建: 内嵌为空字节, UI 明确报"本次构建未内置吞键驱动/API"。
+/vendor/interception/Interception.zip

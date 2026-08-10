@@ -91,20 +91,28 @@ component ChannelStatusCell inherits Rectangle {
             Text {
                 // 禁用优先: 它压根不在扫描, "空闲/触摸/停滞"三个字都不适用。
                 // 其次停滞提示: raw 长时间完全不变疑似异常, 明确标红, 不再让人猜是否真值。
-                text: !root.entry.enabled ? @tr("已禁用")
-                    : (root.entry.frozen ? @tr("⚠停滞") : (root.entry.active ? @tr("触摸") : @tr("空闲")));
+                text: root.entry.telemetry_state == 2 ? @tr("离线/未知")
+                    : (root.entry.telemetry_state == 1 ? @tr("遥测过期")
+                    : (!root.entry.enabled ? @tr("已禁用")
+                    : (root.entry.frozen ? @tr("⚠停滞") : (root.entry.active ? @tr("触摸") : @tr("空闲")))));
                 font-size: Theme.fs-small;
-                color: !root.entry.enabled ? #8a939c
-                    : (root.entry.frozen ? #ff8c42 : (root.entry.active ? #d0ffd0 : #85929d));
+                color: root.entry.telemetry_state == 2 ? #ff6b64
+                    : (root.entry.telemetry_state == 1 ? #ffb454
+                    : (!root.entry.enabled ? #8a939c
+                    : (root.entry.frozen ? #ff8c42 : (root.entry.active ? #d0ffd0 : #85929d))));
             }
         }
         Text {
             // 禁用通道的 raw/diff 恒为 0(设备侧不再扫描它) —— 摆两个 0 会被读成"真的测到 0",
             // 直接写明"电极高阻"才是它的实际状态。
-            text: !root.entry.enabled ? @tr("电极高阻 · 不参与扫描")
-                : ("raw " + root.entry.raw + "  diff " + root.entry.diff);
+            text: root.entry.telemetry_state == 2 ? @tr("设备连接离线，读数未知")
+                : (root.entry.telemetry_state == 1 ? @tr("最后遥测已过期")
+                : (!root.entry.enabled ? @tr("电极高阻 · 不参与扫描")
+                : ("raw " + root.entry.raw + "  diff " + root.entry.diff)));
             font-size: Theme.fs-normal;
-            color: !root.entry.enabled ? #77828c : (root.entry.frozen ? #ff8c42 : #c4ccd3);
+            color: root.entry.telemetry_state == 2 ? #ff6b64
+                : (root.entry.telemetry_state == 1 ? #ffb454
+                : (!root.entry.enabled ? #77828c : (root.entry.frozen ? #ff8c42 : #c4ccd3)));
         }
         Text {
             text: @tr("逻辑区: ") + root.entry.binding_text;
@@ -224,7 +232,7 @@ component BatchParamRow inherits Rectangle {
             minimum: root.entry.min;
             maximum: root.entry.max;
             model_value: root.entry.value >= root.entry.min ? root.entry.value : root.entry.min;
-            edited(v) => { root.value_set(v); }
+            committed(v) => { root.value_set(v); }
         }
     }
 }

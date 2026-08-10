@@ -143,6 +143,11 @@ public:
     
     // 批量操作接口
     static std::map<std::string, ConfigValue> get_all();
+    /// 只读直取运行表。★给 CFG_GET_ALL 这类"只遍历、不修改"的消费者用★
+    /// get_all() 是按值返回, 一次调用就整表深拷贝(约 319 项 ≈ 41KB 堆 + 约 640 次 malloc);
+    /// 分片流每次续帧都要重新定位游标, 若沿用拷贝语义等于把这笔开销乘上片数。
+    /// 遍历期间调用方不得写配置(core0 单线程分发, 天然满足)。
+    static const config_map_t& runtime_map() { return _runtime_map; }
     static void set_batch(const std::map<std::string, ConfigValue>& values);
     
     // 配置分组接口

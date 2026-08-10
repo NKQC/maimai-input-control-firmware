@@ -1,7 +1,8 @@
 import { Button, VerticalBox, HorizontalBox, CheckBox, TabWidget } from "std-widgets.slint";
-import { ConfigRow, ConfigGroupCount, ZoneCell, ParamRow, GlobalFences, ChannelStatus, AlgoReportLine, AlgoSettingRow, LedUnitRow, SpectrumCell } from "../common/types.slint";
+import { ConfigRow, ConfigGroupCount, ZoneCell, HidPointCell, ParamRow, GlobalFences, ChannelStatus, AlgoReportLine, AlgoMetadataRow, AlgoSettingRow, LedUnitRow, SpectrumCell } from "../common/types.slint";
 import { AlgoPage } from "./algo.slint";
 import { AllChannelsPage } from "./all_channels.slint";
+import { HidTouchPage } from "./hid_touch.slint";
 import { BindingPage } from "./binding.slint";
 import { ConfigPage } from "./config.slint";
 import { CurvesPage } from "./curves.slint";
@@ -70,6 +71,16 @@ export component SettingsPage inherits Rectangle {
     callback batch_op_cancel();
     in property <bool> cp_assist: false;
     callback set_cp_assist(bool);
+
+    in property <[HidPointCell]> hid_points: [];
+    in property <image> hid_screenshot;
+    in property <int> hid_screenshot_width: 0;
+    in property <int> hid_screenshot_height: 0;
+    in property <bool> hid_mode: false;
+    in-out property <int> hid_selected_channel: -1;
+    callback hid_screenshot_refresh();
+    callback hid_point_commit(int, int, int);
+    callback hid_point_enabled_set(int, bool);
 
     in property <[ZoneCell]> zones: [];
     in property <string> bind_status: "";
@@ -169,6 +180,7 @@ export component SettingsPage inherits Rectangle {
     in property <[SpectrumCell]> curve_spectrum_cells: [];
     in property <bool> curve_spectrum_active: false;
     in property <string> curve_spectrum_status: "";
+    in property <string> focus_bandwidth: "";
     in property <float> curve_spectrum_progress: 0;
     callback curve_spectrum_start();
     callback curve_spectrum_cancel();
@@ -305,12 +317,20 @@ export component SettingsPage inherits Rectangle {
     callback kbd_clear_phys(int);
     callback kbd_clear_zone(int);
 
-    // 算法页
+    // ---- 设备/算法只读概览 ----
+    in property <string> device_summary_text: "未获取到设备信息";
     in property <string> algo_info_text: "算法信息未读取";
+
+    // ---- 全局 CSD 只读摘要 ----
+    in property <string> global_summary_text: "当前设备全局参数：未读取";
+
+    // ---- 算法页
     in-out property <string> algo_c_source;
     in property <string> algo_line_numbers: "1";
+    in property <[AlgoMetadataRow]> algo_metadata_rows: [];
+    in property <[AlgoSettingRow]> algo_setting_rows: [];
+    callback algo_setting_edited(int, int);
     in property <string> algo_status: "";
-    // 编译/上传同步执行时的阶段反馈；忙碌期间锁定一键操作以避免重入。
     in property <bool> algo_busy: false;
     in property <string> algo_phase: "";
     in property <string> algo_asm: "";
@@ -318,14 +338,6 @@ export component SettingsPage inherits Rectangle {
     in property <int> algo_asm_capacity: 1024;
     in property <int> algo_c_bytes: 0;
     in property <int> algo_c_capacity: 32768;
-    // 算法上报(report[]折线+触发判定追踪) + 可调变量(cfg[8])
-    in property <int> algo_sel_channel: 0;
-    in property <[AlgoReportLine]> algo_report_lines: [];
-    in property <string> algo_active_path: "";
-    in property <int> algo_trace_point_count: 0;
-    in property <[AlgoSettingRow]> algo_setting_rows: [];
-    callback algo_setting_edited(int, int);
-    callback report_toggle(int, bool);
     // 全局 CSD(现由"触控全局调整"页使用)
     in property <int> g_inactive_sns: 1;
     in property <int> g_idac_gain: 4;
@@ -361,12 +373,22 @@ export component SettingsPage inherits Rectangle {
     callback algo_global_set(int, int);
     callback csd_param_set(int, int);
 
+    // ★Tab 索引 == settings_tab 页号, 一比一★  Serial/HID 两种模式的 Tab **数量恒定为 9**:
+    // 第 0 页在 HID 模式下是"HID 触控点位", 在 Serial 模式下是"分区绑定"(同一个 Tab, 换标题换内容),
+    // 所以不存在"某模式少一个 Tab"的索引偏移。历史实现把两者都常驻渲染(10 个 Tab)却仍按
+    // "少一个"折算索引, 结果 Serial 模式下每个页号都偏 1(跳"单通道精调"=4 落到"触控全局调整"),
+    // 并且两种模式的页面同时出现。★不要再引入 tab_index/page_id 折算函数★: 唯一真相是
+    // "Tab 顺序 == main.rs 的 SETTINGS_PAGE_* 常量", 加/删 Tab 必须同步 main.rs 的常量。
+    // 顺序: 0分区绑定|HID触控点位 1协议 2触控通道调整 3触控全局调整 4单通道精调
+    //       5触控键盘映射 6物理键盘 7通信系统 8算法。
+
     VerticalBox {
         padding: 0px;
         spacing: 0px;
 
         TabWidget {
             vertical-stretch: 1;
+            current-index <=> root.settings_tab;
             // ★保存栏永不丢失的根因修法★ TabWidgetImpl 默认 min-height = 各子页 min-height 最大值
             // + 标签栏高, min-width = max(子页 min-width, 标签栏首选宽 ≈760px)。而 Slint 的盒布局在
             // "min 之和 > 可用尺寸"时不会压过 min, 直接溢出并把最后一个子元素(=下面的保存栏)推出视口。
@@ -378,37 +400,53 @@ export component SettingsPage inherits Rectangle {
             // 就与内部计算互相引用 → 布局求值无限递归 → 进设置页直接栈溢出崩溃(实测 9 个 Tab 全崩)。
             // 保存栏永不丢失改由 SettingsPage 根层的绝对定位保证(见下), 不靠约束 TabWidget。
             clip: true;
-            current-index <=> root.settings_tab;
+        // 第 0 页 = 触控点位的**唯一**入口, 两种模式互斥:
+        // HID 模式下设备自己上报触控点(要调的是点位坐标), Serial 模式下走 mai2 分区协议(要调的是分区↔通道绑定)。
+        // 两页同时出现过一版, 是因为 TabWidget 不支持 `if`/`for` 动态 Tab(见 lower_tabwidget:
+        // "dynamic tabs ('if' or 'for') are currently not supported"), 当时改成两个常驻 Tab。
+        // 正确做法是**一个** Tab + 标题绑定 + 内容条件渲染: Tab.title 是普通属性绑定, 允许随模式变化。
         Tab {
-            title: "分区绑定";
+            title: root.hid_mode ? "HID 触控点位" : "分区绑定";
 
-            BindingPage {
-                zones: root.zones;
-                bind_status: root.bind_status;
-                selected_zone: root.selected_zone;
-                selected_zone_label: root.selected_zone_label;
-                selected_channel: root.selected_channel;
-                view_x: root.zone_view_x;
-                view_y: root.zone_view_y;
-                view_w: root.zone_view_w;
-                view_h: root.zone_view_h;
-                bind_load() => { root.bind_load(); }
-                interactive_bind() => { root.interactive_bind(); }
-                interactive_bind_cancel() => { root.interactive_bind_cancel(); }
-                interactive_active: root.interactive_active;
-                zone_selected(i) => { root.selected_zone = i; root.zone_selected(i); }
-                zone_activated(i) => { root.selected_zone = i; root.zone_activated(i); }
-                zone_channel_set(z, v) => { root.zone_channel_set(z, v); }
-                bind_touch_start(z) => { root.bind_touch_start(z); }
-                bind_listen_cancel() => { root.bind_listen_cancel(); }
-                zone_unbind(z) => { root.zone_unbind(z); }
-                zone_hit_test(x, y) => { return root.zone_hit_test(x, y); }
+            // Tab 只接受单一内容子元素来承接 content-x/y/width/height, 故用一层容器包住两个互斥页。
+            Rectangle {
+                if root.hid_mode: HidTouchPage {
+                    points: root.hid_points;
+                    screenshot: root.hid_screenshot;
+                    image_width: root.hid_screenshot_width;
+                    image_height: root.hid_screenshot_height;
+                    selected_channel: root.hid_selected_channel;
+                    changed selected_channel => { root.hid_selected_channel = self.selected_channel; }
+                    screenshot_refresh() => { root.hid_screenshot_refresh(); }
+                    point_commit(ch, x, y) => { root.hid_point_commit(ch, x, y); }
+                    point_enabled_set(ch, on) => { root.hid_point_enabled_set(ch, on); }
+                }
+
+                if !root.hid_mode: BindingPage {
+                    zones: root.zones;
+                    bind_status: root.bind_status;
+                    selected_zone: root.selected_zone;
+                    selected_zone_label: root.selected_zone_label;
+                    selected_channel: root.selected_channel;
+                    view_x: root.zone_view_x;
+                    view_y: root.zone_view_y;
+                    view_w: root.zone_view_w;
+                    view_h: root.zone_view_h;
+                    bind_load() => { root.bind_load(); }
+                    interactive_bind() => { root.interactive_bind(); }
+                    interactive_bind_cancel() => { root.interactive_bind_cancel(); }
+                    interactive_active: root.interactive_active;
+                    zone_selected(i) => { root.selected_zone = i; root.zone_selected(i); }
+                    zone_activated(i) => { root.selected_zone = i; root.zone_activated(i); }
+                    zone_channel_set(z, v) => { root.zone_channel_set(z, v); }
+                    bind_touch_start(z) => { root.bind_touch_start(z); }
+                    bind_listen_cancel() => { root.bind_listen_cancel(); }
+                    zone_unbind(z) => { root.zone_unbind(z); }
+                    zone_hit_test(x, y) => { return root.zone_hit_test(x, y); }
+                }
             }
         }
 
-        // ★Tab 顺序 = 隐含契约★  settings_tab 的索引判断散在 app.slint 与 main.rs 两侧
-        // (跳转到精调=4 / 全局调整=3 / 算法追踪轮询=4 / 协议页驻留轮询=1), 调整顺序必须同步全部索引。
-        // 现顺序: 0分区绑定 1协议 2触控通道调整 3触控全局调整 4单通道精调 5触控键盘映射 6物理键盘 7通信系统 8算法。
         Tab {
             title: "协议";
 
@@ -416,6 +454,8 @@ export component SettingsPage inherits Rectangle {
                 // 协议能力参数与通信系统 Tab 共用同一份 config_rows 与草稿写入回调。
                 config_rows: root.config_rows;
                 config_group_counts: root.config_group_counts;
+                device_summary_text: root.device_summary_text;
+                algo_info_text: root.algo_info_text;
                 cfg_set_bool(k, v) => { root.cfg_set_bool(k, v); }
                 cfg_set_number(k, v) => { root.cfg_set_number(k, v); }
                 cfg_set_number_hex(k, v) => { root.cfg_set_number_hex(k, v); }
@@ -487,7 +527,7 @@ export component SettingsPage inherits Rectangle {
                 telem_paused: root.telem_paused;
                 channel_selected(ch) => {
                     root.sel_channel = ch;
-                    // Tab 顺序: 0绑区 1协议 2触控通道调整 3触控全局调整 4单通道精调 → 双击跳 4。
+                    // Tab 顺序: 0绑区/HID点位 1协议 2触控通道调整 3触控全局调整 4单通道精调 → 双击跳 4。
                     root.settings_tab = 4;
                     root.channel_selected(ch);
                 }
@@ -498,8 +538,9 @@ export component SettingsPage inherits Rectangle {
             title: "触控全局调整";
 
             global_tune := GlobalTunePage {
-                // 触控全局调整 = 索引 3(协议页插入到索引 1 后整体后移一位)。
+                // 触控全局调整 = 索引 3(与 main.rs::SETTINGS_PAGE_GLOBAL_TUNE 同源)。
                 page_active: root.settings_tab == 3;
+                global_summary_text: root.global_summary_text;
                 scan_mode <=> root.scan_mode;
                 mode_known: root.mode_known;
                 g_inactive_sns: root.g_inactive_sns;
@@ -598,6 +639,7 @@ export component SettingsPage inherits Rectangle {
                 spectrum_cells: root.curve_spectrum_cells;
                 spectrum_active: root.curve_spectrum_active;
                 spectrum_status: root.curve_spectrum_status;
+                focus_bandwidth: root.focus_bandwidth;
                 spectrum_progress: root.curve_spectrum_progress;
                 spectrum_start() => { root.curve_spectrum_start(); }
                 spectrum_cancel() => { root.curve_spectrum_cancel(); }
@@ -623,11 +665,6 @@ export component SettingsPage inherits Rectangle {
                 report_norm_set(idx, v) => { root.report_norm_set(idx, v); }
                 op_busy: root.op_busy;
                 op_label: root.op_label;
-                algo_report_lines: root.algo_report_lines;
-                algo_trace_point_count: root.algo_trace_point_count;
-                algo_setting_rows: root.algo_setting_rows;
-                algo_setting_edited(idx, v) => { root.algo_setting_edited(idx, v); }
-                report_toggle(idx, on) => { root.report_toggle(idx, on); }
             }
         }
 
@@ -724,21 +761,16 @@ export component SettingsPage inherits Rectangle {
             AlgoPage {
                 algo_info_text: root.algo_info_text;
                 algo_c_source <=> root.algo_c_source;
-                algo_line_numbers: root.algo_line_numbers;
+                algo_metadata_rows: root.algo_metadata_rows;
+                algo_setting_rows: root.algo_setting_rows;
+                algo_refresh() => { root.algo_refresh(); }
                 algo_status: root.algo_status;
-                algo_busy: root.algo_busy;
                 algo_phase: root.algo_phase;
                 algo_asm: root.algo_asm;
                 algo_asm_bytes: root.algo_asm_bytes;
                 algo_asm_capacity: root.algo_asm_capacity;
                 algo_c_bytes: root.algo_c_bytes;
                 algo_c_capacity: root.algo_c_capacity;
-                algo_sel_channel: root.algo_sel_channel;
-                algo_report_lines: root.algo_report_lines;
-                algo_active_path: root.algo_active_path;
-                algo_trace_point_count: root.algo_trace_point_count;
-                algo_setting_rows: root.algo_setting_rows;
-                algo_refresh() => { root.algo_refresh(); }
                 algo_reset_default() => { root.algo_reset_default(); }
                 algo_compile(s) => { root.algo_compile(s); }
                 algo_upload() => { root.algo_upload(); }

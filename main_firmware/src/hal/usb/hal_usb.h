@@ -68,6 +68,9 @@ public:
     virtual size_t config_write_some(const uint8_t* data, size_t length) = 0;
     virtual void begin_command_response() = 0;
     virtual void end_command_response() = 0;
+    // 命令响应专用 FIFO 可用空间；与异步 config_write_available() 分开，
+    // 响应泵送期间必须允许 UsbComm 自己继续写出当前响应。
+    virtual size_t config_response_write_available() const = 0;
     virtual size_t config_read(uint8_t* buffer, size_t max_length) = 0;
     virtual size_t config_available() const = 0;
     // 异步发送队列(vendor TX FIFO)当前剩余可写字节, 供发送方按余量决策(过载即弃/保留响应余量)。
@@ -93,6 +96,7 @@ public:
     size_t config_write_some(const uint8_t* data, size_t length) override;
     void begin_command_response() override;
     void end_command_response() override;
+    size_t config_response_write_available() const override;
     size_t config_read(uint8_t* buffer, size_t max_length) override;
     size_t config_available() const override;
     size_t config_write_available() const override;
@@ -142,10 +146,9 @@ private:
     bool _command_response_active;
 
     // config（vendor）通道的接收环形缓冲，由 tud_vendor_rx_cb 填充。
-    // ★1024 → 4096★: core0 做重操作(XRES 后 CSD 全量重下发 = 396 条阻塞 SPI + apply)时不解析
-    // vendor 帧, 只有 tud_vendor_rx_cb 在往这个环里搬字节。1024B 在上位机 16ms 一轮的命令下几秒
-    // 就满, 满了原来是**静默丢弃**, 命令凭空消失且无任何计数, 排障时完全看不见。
-    static const size_t CONFIG_BUFFER_SIZE = 4096;
+    // ★4096 → 8192★: core0 做重操作（最坏 PSoC 段 156ms）期间无人取环；4096B 会被主机命令
+    // 灌满而丢帧。静态 RAM 当前 47728/262144，扩容后的余量仍充足。
+    static const size_t CONFIG_BUFFER_SIZE = 8192;
     uint8_t config_rx_buffer_[CONFIG_BUFFER_SIZE];
     size_t config_rx_head_;
     size_t config_rx_tail_;
