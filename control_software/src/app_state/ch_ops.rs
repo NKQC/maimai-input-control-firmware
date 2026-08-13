@@ -209,8 +209,9 @@ pub struct ChBias {
     pub from_cp: bool,
 }
 
-/// Cp 哨兵: 未测量 / 测量失败(与固件、`main.rs` 同一取值)。
+/// Cp 真失败与禁用通道未测量哨兵（与固件、`main.rs` 同一取值）；均不是有效读数。
 const CP_INVALID: u32 = 0x00FF_FFFF;
+const CP_NOT_MEASURED: u32 = 0x00FF_FFFD;
 
 /// `pref` 相对用户偏好的最大偏移(±)。★必须有界★: pref 每 +1 就在临界分频上再往低频让 2 档,
 /// 放开了会把低 Cp 通道推到毫无必要的低频, 白白拖慢整轮扫描。
@@ -241,7 +242,7 @@ pub fn cp_bias_table(cp: &[Option<u32>], start_gain: u8, user_pref: u8) -> [ChBi
         .iter()
         .take(CH_COUNT)
         .filter_map(|v| *v)
-        .filter(|v| *v != 0 && *v != CP_INVALID)
+        .filter(|v| *v != 0 && *v != CP_INVALID && *v != CP_NOT_MEASURED)
         .collect();
     if valid.len() < 2 {
         return out; // 有效样本不足两个 ⇒ 谈不上"相对偏向", 全部退回用户偏好
@@ -256,7 +257,7 @@ pub fn cp_bias_table(cp: &[Option<u32>], start_gain: u8, user_pref: u8) -> [ChBi
         let Some(v) = cp.get(ch).copied().flatten() else {
             continue;
         };
-        if v == 0 || v == CP_INVALID {
+        if v == 0 || v == CP_INVALID || v == CP_NOT_MEASURED {
             continue; // 该通道无有效 Cp: 保持用户偏好(fallback), 不猜
         }
         let cp_ff = v as f32;
@@ -742,7 +743,7 @@ impl AppController {
             return;
         }
         self.ch_batch.status =
-            "逐通道频率自适应: 增益档统一回读未确认，正在停止并收敛在途帧。".to_string();
+            "逐通道频率自适应未开始：增益确认超时，正在回读设备真值。".to_string();
         self.push_log_warn(self.ch_batch.status.clone());
         self._cfg_purge_batch_frames(self.ch_batch.generation);
         self.ch_batch.stage = ChBatchStage::CancelPrime;
@@ -755,9 +756,6 @@ impl AppController {
             return;
         }
         self._param_refetch_push(PARAM_IDAC_GAIN);
-        self.ch_batch
-            .status
-            .push_str(" 前置写已收敛，已排程全通道设备真值回读。");
         self.ch_batch.clear();
         self.ch_batch.version = self.ch_batch.version.wrapping_add(1);
     }

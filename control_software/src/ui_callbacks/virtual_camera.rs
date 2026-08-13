@@ -333,6 +333,34 @@ pub(crate) fn register_callbacks(
     let kbd_list_sel = state.vcam_kbd_list.clone();
     let ui_kbd_sel = ui_weak.clone();
     ui.on_set_vcam_device(move |index| {
+        // ★不可捕获的目标必须当场拒绝★ Raw Input 看不见的节点选中后一个字符也收不到,
+        // 静默接受等于让用户以为已经选好了。
+        let blocked = {
+            let list = kbd_list_sel.borrow();
+            (index > 0)
+                .then(|| list.get((index - 1) as usize).map(|d| !d.selectable()))
+                .flatten()
+                .unwrap_or(false)
+        };
+        if blocked {
+            let restored = vcam::keyboard::target_device()
+                .as_deref()
+                .and_then(|target| {
+                    kbd_list_sel
+                        .borrow()
+                        .iter()
+                        .position(|device| device.path.eq_ignore_ascii_case(target))
+                })
+                .map_or(0, |position| position as i32 + 1);
+            log::warn!("虚拟摄像头: 拒绝切换输入源: {}", NOT_SELECTABLE);
+            if let Some(ui) = ui_kbd_sel.upgrade() {
+                ui.set_vcam_device_index(restored);
+                ui.set_vcam_runtime_status(
+                    format!("{} · {}", vcam::keyboard::runtime_status(), NOT_SELECTABLE).into(),
+                );
+            }
+            return;
+        }
         let picked = {
             let list = kbd_list_sel.borrow();
             (index > 0)
@@ -450,6 +478,22 @@ fn _spawn_winusb_action(
         .is_ok()
 }
 
+/// 设备行名的状态前缀。★只在渲染侧拼，绝不烧进 `label`★ 否则持久化比较、排序与日志全被污染。
+/// 改绑与"Raw Input 看不见"同时成立时只报改绑: 改绑是更强的解释, 看不见是它的必然结果。
+#[inline]
+fn _name_prefix(dev: &vcam::keyboard::KeyboardDevice) -> &'static str {
+    match (dev.rebound, dev.rawinput_visible) {
+        (true, _) => "[WinUSB 直读] ",
+        (false, false) => "[无 Raw Input] ",
+        (false, true) => "",
+    }
+}
+
+/// 选中一个不可捕获的设备时给出的明确原因。★不静默失败★ 设备树里在位不等于 Raw Input 能收到数据。
+const NOT_SELECTABLE: &str =
+    "该设备不在 Raw Input 列表内，无法旁路捕获（设备树里在位，但键盘栈未把它公开给 Raw Input；\
+     可改绑 WinUSB 后走直读）";
+
 /// 重新枚举 HID 键盘并刷新设备树: 首行固定"所有键盘"(dev_index=0),
 /// 之后按分类插入组头, 组内设备 dev_index = 在 `list` 中的下标 + 1。
 /// `saved_path` 非空且仍在场 → 恢复该选择并生效; 否则回落"所有键盘"。返回设备个数。
@@ -468,16 +512,46 @@ pub(crate) fn refresh_vcam_devices(
             .any(|device| device.path.eq_ignore_ascii_case(saved_path))
         && vcam::driver_pkg::binding_status(saved_path).bound()
     {
+        // 端点读数只能落在 USB 节点上: HID 节点已随改绑消失, 这里如实标注"HID 节点已消失"而非留空。
+        let status = vcam::driver_pkg::binding_status(saved_path);
+        let usb_node = status.instance().unwrap_or("未知").to_string();
+        let service = vcam::keyboard::device_service(&usb_node).unwrap_or_else(|| "未知".into());
+        // ★原名从改绑前的登记里恢复★ 占位名("已改绑 WinUSB 的扫码器")既认不出是哪台设备,
+        // 也把端点读数挤掉了。名字与 VID/PID 只能来自所有权记录 —— 设备已不在键盘枚举里,
+        // 现场再也查不到。老记录没登记这些字段时如实显示"未知（改绑前未登记设备名）", 不编造。
+        let identity = vcam::driver_pkg::rebound_identity();
+        let recorded = |value: Option<&String>| -> Option<String> {
+            value.filter(|text| !text.trim().is_empty()).cloned()
+        };
+        let product = recorded(identity.as_ref().map(|id| &id.product))
+            .unwrap_or_else(|| "未知（改绑前未登记设备名）".to_string());
+        let label = recorded(identity.as_ref().map(|id| &id.label)).unwrap_or_else(|| product.clone());
+        let vendor = recorded(identity.as_ref().map(|id| &id.vendor)).unwrap_or_default();
+        // 端点行与普通行同口径: VID/PID + 实例 + 实测 service; 拿不到的项写"未知"。
+        let vid_pid = match (
+            vcam::driver_pkg::hex_field(&usb_node.to_ascii_uppercase(), "VID_"),
+            vcam::driver_pkg::hex_field(&usb_node.to_ascii_uppercase(), "PID_"),
+        ) {
+            (Some(vid), Some(pid)) => format!("VID_{} PID_{}", vid, pid),
+            _ => "VID/PID 未知".to_string(),
+        };
         devices.insert(
             0,
             vcam::keyboard::KeyboardDevice {
                 path: saved_path.to_string(),
-                label: "已改绑 WinUSB 的扫码器".into(),
-                detail: "Windows 不再将其识别为键盘；按键只进入本程序".into(),
+                label,
+                detail: format!("{}  ·  USB 实例 {}", vid_pid, usb_node),
                 category: vcam::keyboard::CAT_USB.to_string(),
                 parent_key: saved_path.to_string(),
-                product: "已改绑 WinUSB 的扫码器（不再是键盘）".into(),
-                vendor: String::new(),
+                product,
+                vendor,
+                rawinput_visible: false,
+                endpoint_text: format!(
+                    "HID 节点已随改绑消失 · service={} · RawInput=不可见 · {} · USB节点={}",
+                    service, vid_pid, usb_node
+                ),
+                service,
+                rebound: true,
             },
         );
     }
@@ -525,7 +599,7 @@ pub(crate) fn refresh_vcam_devices(
                 });
             }
         }
-        let (title, detail) = if siblings > 1 {
+        let (title, mut detail) = if siblings > 1 {
             (dev.label.clone(), dev.detail.clone())
         } else {
             let mut d = dev.vendor.clone();
@@ -535,19 +609,38 @@ pub(crate) fn refresh_vcam_devices(
             d.push_str(&dev.detail);
             (dev.product.clone(), d)
         };
+        // 端点读数(含 service 与 Raw Input 可见性)一律进副文案: 这是"设备树有、Raw Input 没有"
+        // 这个矛盾在界面上唯一可见的地方。
+        if !detail.is_empty() {
+            detail.push_str("  ·  ");
+        }
+        detail.push_str(&dev.endpoint_text);
         rows.push(VcamKbdRow {
             is_group: false,
             level: if siblings > 1 { 2 } else { 1 },
-            title: title.into(),
+            title: format!("{}{}", _name_prefix(dev), title).into(),
             detail: detail.into(),
             dev_index: i as i32 + 1,
         });
     }
     ui.set_vcam_kbd_rows(slint::ModelRc::new(slint::VecModel::from(rows)));
 
-    let picked = devices
+    let found = devices
         .iter()
         .position(|d| d.path.eq_ignore_ascii_case(saved_path));
+    // 持久化的目标可能已退化成"设备树在位但 Raw Input 不可见"(例如恢复原驱动后键盘栈没把它公开)。
+    // 恢复到这种目标只会静默收不到数据, 故如实回落"所有键盘"并告警。
+    let picked = match found {
+        Some(i) if !devices[i].selectable() => {
+            log::warn!(
+                "虚拟摄像头: 持久化目标 {} 不可捕获（{}）；已回落到所有键盘",
+                devices[i].label,
+                NOT_SELECTABLE
+            );
+            None
+        }
+        other => other,
+    };
     ui.set_vcam_device_index(picked.map(|i| i as i32 + 1).unwrap_or(0));
     if let Err(error) = vcam::keyboard::set_target_device(picked.map(|i| devices[i].path.clone())) {
         log::warn!("虚拟摄像头: 恢复输入源时未能重启捕获: {}", error);
@@ -556,13 +649,28 @@ pub(crate) fn refresh_vcam_devices(
     let count = devices.len();
     for d in &devices {
         log::debug!(
-            "虚拟摄像头设备树: [{}] 产品={} 厂商={} 项={} ({}) parent={}",
+            "虚拟摄像头设备树: [{}] 产品={} 厂商={} 项={} ({}) parent={} 端点={}",
             d.category,
             d.product,
             d.vendor,
             d.label,
             d.detail,
-            d.parent_key
+            d.parent_key,
+            d.endpoint_text
+        );
+    }
+    // ★设备树与 Raw Input 不一致本身就是最重要的诊断信息★ 必须在日志里点名, 否则"UI 看不到自己的
+    // HID 端点"只能靠用户逐行读 debug 日志才发现。根因尚未定位, 这里只如实报告矛盾。
+    let invisible: Vec<&str> = devices
+        .iter()
+        .filter(|d| !d.rawinput_visible && !d.rebound)
+        .map(|d| d.endpoint_text.as_str())
+        .collect();
+    if !invisible.is_empty() {
+        log::warn!(
+            "虚拟摄像头: {} 个键盘节点在设备树里在位但不在 Raw Input 列表内（根因未定位，这些节点无法旁路捕获）：{}",
+            invisible.len(),
+            invisible.join(" ｜ ")
         );
     }
     log::info!(

@@ -164,6 +164,26 @@ impl IoHandle {
             .context("control_out 0x53 clear loop profile")
     }
 
+    /// 清除固件"上次复位的死前遗言"(EP0 vendor 0x54)。
+    /// 遗言字段保留到下次复位，不清则每次连接都会把同一次崩溃再报一遍，新崩溃随即被噪声淹没。
+    pub fn clear_last_crash(&self) -> Result<()> {
+        self.debug_interface
+            .control_out(
+                ControlOut {
+                    control_type: ControlType::Vendor,
+                    recipient: Recipient::Device,
+                    request: 0x54,
+                    value: 0,
+                    index: 0,
+                    data: &[],
+                },
+                Duration::from_millis(500),
+            )
+            .wait()
+            .map(|_| ())
+            .context("control_out 0x54 clear last crash")
+    }
+
     pub fn stop(mut self) {
         self.running.store(false, Ordering::Release);
         if let Some(handle) = self._thread_handle.take() {

@@ -1,6 +1,6 @@
 import { Button, CheckBox, HorizontalBox, ScrollView, VerticalBox } from "std-widgets.slint";
 import { HidPointCell } from "../common/types.slint";
-import { SectionCard } from "../common/widgets.slint";
+import { SectionCard, GuardedCheckBox } from "../common/widgets.slint";
 import { Theme } from "../common/theme.slint";
 
 component HidPointRow inherits Rectangle {
@@ -19,8 +19,9 @@ component HidPointRow inherits Rectangle {
         padding-left: Theme.gap;
         padding-right: Theme.gap;
         spacing: Theme.gap;
-        CheckBox {
-            checked: root.entry.enabled;
+        // ★必须用 GuardedCheckBox★ Repeater 复用行实例, 裸 CheckBox 点一次即失去设备真值回填。
+        GuardedCheckBox {
+            model_checked: root.entry.enabled;
             toggled => { root.enabled_set(root.entry.channel, self.checked); }
         }
         Text {

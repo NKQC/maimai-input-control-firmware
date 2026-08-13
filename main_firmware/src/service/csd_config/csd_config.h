@@ -85,6 +85,11 @@ public:
     // 得不偿失。判定逻辑保留, 只用于提示。
     bool baseline_untrusted() const { return _baseline_untrusted; }
     void note_baseline_untrusted(bool untrusted) { _baseline_untrusted = untrusted; }
+    // ★建议必须能自己撤销★ 上面这个标志历史上只被置真(启动观察窗失败、验收失败各处), 从不撤销,
+    // 于是问题早已消失的面板也会一直显示"采样质量抽检存疑" —— 那是历史判定, 不是当前结论。
+    // 本函数周期性重做一次实测抽检: 恢复可信即清标志并记 SH_BASELINE_TRUST_RESTORED。
+    // ★只在标志已置位时才付抽检成本★ 常态(未存疑)直接返回, 不产生任何 SPI 事务。
+    void tick_trust_recheck(Psoc* psoc);
 
     // PSoC 同步。启动期由主循环单步推进，每次最多入队一条 SPI 命令。
     bool download_to_psoc(Psoc* psoc);
@@ -157,6 +162,7 @@ private:
     bool     _save_pending = false;
     bool     _recapture_pending = false;   // 恢复默认: 重启就绪后回读校准好的默认→切SEMI
     bool     _baseline_untrusted = false;  // 采样质量抽检存疑(仅建议, 不拦截); 运行态标志, 不持久化
+    uint32_t _trust_recheck_ms = 0u;       // 上次自愈重评估时刻(0=从未做过); 见 tick_trust_recheck
     bool     _global_valid = false;   // host 设过或从 PSoC 捕获过全局配置
     uint16_t _param[CSD_CHANNELS][CSD_PARAM_COUNT];
     uint16_t _global[CSD_GLOBAL_COUNT];

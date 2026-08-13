@@ -1,6 +1,6 @@
 import { Button, VerticalBox, HorizontalBox, CheckBox, SpinBox, ScrollView } from "std-widgets.slint";
 import { ParamRow, AlgoReportLine, AlgoSettingRow, SpectrumCell } from "../common/types.slint";
-import { CollapsibleSection, ParamEditorRow, AlgoSettingEditorRow, PlotPath, SeriesRow, AlgoSeriesRow, GuardedSpinBox, HelpOverlay } from "../common/widgets.slint";
+import { CollapsibleSection, ParamEditorRow, AlgoSettingEditorRow, PlotPath, SeriesRow, AlgoSeriesRow, GuardedSpinBox, GuardedCheckBox, HelpOverlay } from "../common/widgets.slint";
 import { Theme } from "../common/theme.slint";
 
 
@@ -228,9 +228,11 @@ export component CurvesPage inherits Rectangle {
                 clicked => { root.plot_freeze(); }
             }
             // 本通道的硬件启用开关: 与全通道页卡片、批量启停同一真相源(0x0C 草稿)。
-            CheckBox {
+            // ★必须用 GuardedCheckBox★ 裸 CheckBox 被点一次就摧毁 `checked` 上的绑定, 之后切
+            // 通道再也回填不进来(表现为"复选框说禁用、旁边按钮却全部可用")。见 widgets.slint 说明。
+            GuardedCheckBox {
                 text: @tr("通道启用");
-                checked: root.ch_enabled;
+                model_checked: root.ch_enabled;
                 toggled => { root.ch_enable_set(self.checked); }
             }
             Text {

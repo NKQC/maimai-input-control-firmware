@@ -148,6 +148,15 @@ public:
     bool calibrate(uint8_t ch = 0xFFu);
     // 基线复位。ch: 0..35=仅该通道, 0xFF=全通道。
     bool baseline_reset(uint8_t ch = 0xFFu);
+    // ---------- 开机校准流水线专用: 非阻塞入队 ----------
+    // 上面那两个是 Host 延迟 ACK 用的**阻塞**版(CALIBRATE 预算 70s, 全通道实测 12s+), core0 的
+    // 启动流水线绝不能阻塞在那里 —— 那会把 USB 服务与看门狗喂狗压在一条同步等待后面。
+    // 这两个用 out=nullptr 走 _submit 的写类分支: 入队即返回, 且因 CALIBRATE/BASELINE_RESET 都在
+    // _op_is_heavy 名单内, 调用方直接用 heavy_busy() 由真到假判定"本条已真正执行完", 不需要额外
+    // 完成标志、也不占用 _host_write 的单槽(那是主机延迟 ACK 的所有权窗口)。
+    // 代价: 拿不到成功/失败回执。开机流水线本就"失败不重试、只记诊断事件", 由后续快照验收兜底。
+    bool start_boot_calibrate(uint8_t ch = 0xFFu);
+    bool start_boot_baseline_reset(uint8_t ch = 0xFFu);
     // 运行时参数硬件应用：仅向 PSoC 发送已存在的 RUNTIME_PARAM_APPLY 指令并由 RP2040 单步轮询
     // “参数回显一致 + scan_count 恢复推进”。它不校准、不复位基线、不触发 XRES，也不占用长任务槽。
     // 这是 gain/div 真正载入 CSD 硬件的唯一只读 PSoC 原语；SET_PARAM 本身仅更新 shadow RAM。

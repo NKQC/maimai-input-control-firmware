@@ -77,20 +77,20 @@ pub(crate) fn build_config_rows(entries: &[ConfigEntry]) -> Vec<ConfigRow> {
     ordered
         .into_iter()
         // ★渲染归属集中在这里★ 每个 KV 只允许出现在一个页面: 有专用编辑器的 key 一律在此滤掉,
-        // 其余按 parse_config_label 给出的 group 决定落在"通信系统"Tab 还是"协议"页的对应块。
+        // 其余按 parse_config_label 给出的 group 决定落在"设备设置"Tab 还是"协议"页的对应块。
         // bind.map* → 分区绑定页; kbd.* → 键盘页; calib.* → 触控全局调整页的偏好滑条;
         // led.map* → 协议页 11 单元映射可视化编辑器(裸 KV 是打包 u32, 暴露出来只会被误改);
         // led.ws_count0/1 与 led.ws_brightness → 协议页 mai2light 块已有专用 SpinBox。
         .filter(|entry| {
             let k = entry.key.as_str();
             // ★只滤有专用编辑器的那一个 calib 键★ 原先按 `calib.` 整个前缀滤, 于是后加的三个
-            // 启动校准开关(calib.boot_*)被连带滤掉 —— 协议页"启动校准与延迟补正"只剩 1 行,
-            // 实测直方图正是 `"启动校准与延迟补正": 1`。前缀级黑名单挡住的是未来的键, 不是设计意图。
+            // 启动校准开关(calib.boot_*)被连带滤掉 —— 当时分组只剩 1 行。
+            // 前缀级黑名单挡住的是未来的键, 不是设计意图。
             !k.starts_with("bind.")
                 && !k.starts_with("kbd.")
                 // hid.enNN/xNN/yNN(108 项) → HID 触控点位页的截图锚定编辑器。
                 // 裸 KV 是屏幕归一坐标, 手改数字既无参照也看不出落在屏幕哪里; 更要紧的是
-                // 108 行会把"通信系统"配置表整体淹掉(该表原本约 60 行)。
+                // 108 行会把"设备设置"配置表整体淹掉(该表原本约 60 行)。
                 && !k.starts_with("hid.")
                 && k != "calib.pref"
                 && !k.starts_with("led.map")
@@ -183,7 +183,7 @@ pub(crate) fn build_config_rows(entries: &[ConfigEntry]) -> Vec<ConfigRow> {
 
             let (group, label, desc) = parse_config_label(&entry.key);
 
-            // 通信系统配置一律十进制展示(hex 口径仅用于需寄存器处理的 CSD 内容, 见触控全局调整)。
+            // 设备设置配置一律十进制展示(hex 口径仅用于需寄存器处理的 CSD 内容, 见触控全局调整)。
             // hex_val 保留为空(不再走 hex 输入); range_hex 复用为十进制取值范围小字, 便于新人上手。
             let is_num_int = kind == 1 && matches!(type_code, 1 | 2 | 3 | 4);
             let hex_val = String::new();
@@ -297,7 +297,7 @@ pub(crate) fn parse_config_label(key: &str) -> (String, String, String) {
     let parts: Vec<&str> = key.split('.').collect();
     // ★group 就是渲染位置★ 各 Slint 端的 ConfigGroupSection 用 group_title 精确匹配取行,
     // 所以归属按语义逐 key 指定, 而不是按 key 的一级前缀 —— comm./led. 前缀下同时混着
-    // "协议能力参数"(属协议页)与"键盘映射/状态指示灯"(属通信系统 Tab), 前缀分不开。
+    // "协议能力参数"(属协议页)与"键盘映射/状态指示灯"(属设备设置 Tab), 前缀分不开。
     let group = match key {
         // mai2serial: 串口、节流、延迟聚合与 {E}RSET 善后 → 协议页 mai2serial 块。
         "comm.serial_baud"
@@ -312,11 +312,9 @@ pub(crate) fn parse_config_label(key: &str) -> (String, String, String) {
         // 「触控映射仅协议启动时生效」的判定依据就是 mai2serial 的实际发送态,
         // 语义上属协议能力而非键盘映射本身, 故归到协议页 mai2serial 块。
         | "comm.keyboard_map_serial_only" => "mai2serial 协议参数",
-        // PSoC 启动流水线与主机侧补正开关都在协议页集中持久化。
-        "calib.boot_idac"
-        | "calib.boot_channel"
-        | "calib.boot_baseline"
-        | "comm.latency_correction_en" => "启动校准与延迟补正",
+        // PSoC 启动流水线开关属于设备设置；主机侧延迟补正保留在协议页。
+        "calib.boot_idac" | "calib.boot_channel" | "calib.boot_baseline" => "开机校准",
+        "comm.latency_correction_en" => "延迟补正",
         // mai2light: 灯板串口 + 节点号 + 灯珠总数 → 协议页 mai2light 块
         "comm.light_baud" | "led.node_id" | "led.count" => "mai2light 协议参数",
         // 触控 → 键盘映射: 虽在 comm. 前缀下, 语义与协议无关
@@ -329,7 +327,7 @@ pub(crate) fn parse_config_label(key: &str) -> (String, String, String) {
         | "led.color_link_error"
         | "led.color_healthy" => "状态指示灯",
         "mode.work" => "工作模式",
-        // 未收录 key 的兜底: 按前缀落到通信系统 Tab 的"其他"组, 不会凭空消失。
+        // 未收录 key 的兜底: 按前缀落到设备设置 Tab 的"其他"组, 不会凭空消失。
         _ => match parts.first().copied().unwrap_or("") {
             "bind" => "绑区",
             _ => "其他",
@@ -371,14 +369,17 @@ pub(crate) fn parse_config_label(key: &str) -> (String, String, String) {
             "收到 mai2serial 重启指令({E} RSET)后，自动执行一次全通道基线复位",
         ),
         "calib.boot_idac" => (
-            "启动时 IDAC 校准",
-            "每颗 PSoC 完成 provisioning 且采样可信后，本启动代次只执行一次全通道 IDAC 校准",
+            "开机 IDAC 校准",
+            "设备每次上电并完成 PSoC provisioning 后，执行一次全通道 IDAC 重校准（等同触控全局调整→通道操作的全通道校准）",
         ),
         "calib.boot_channel" => (
-            "启动时通道自适应",
-            "IDAC 阶段结束后异步执行一次全通道频率自适应，不在失败时循环重试",
+            "开机通道频率自适应",
+            "IDAC 阶段之后执行一次全通道频率自适应，按校准频率偏好档位落档；失败不重试",
         ),
-        "calib.boot_baseline" => ("启动时基线复位", "启动校准流水线末尾执行一次全通道基线复位"),
+        "calib.boot_baseline" => (
+            "开机基线复位",
+            "校准流水线末尾执行一次全通道基线复位",
+        ),
         "comm.latency_correction_en" => (
             "启用延迟样本补正",
             "用 0x20 三段最近非零且新鲜的实测值补齐异步窗口缺段；不包含也不改变触控延迟线",
@@ -405,9 +406,8 @@ pub(crate) fn parse_config_label(key: &str) -> (String, String, String) {
     (group, label, desc.to_string())
 }
 
-/// 把 Cp(fF) 缓存值换算成两位小数 pF 文本，语义与曲线页一致：
 /// None=本会话尚未测量(无任何自动获取)，Some(0)=设备尚未给出结果(测量中)，
-/// Some(CP_MEASURE_FAILED)=★唯一的失败判据★(MEASURE_CP 后设备回读 0x00FFFFFF)，其余=正常测量值。
+/// Some(CP_MEASURE_FAILED)=测量真实失败，Some(CP_NOT_MEASURED)=禁用通道本轮未测量，其余=正常测量值。
 ///
 /// ★不从别处推断 Cp 失败★: 非激活电极接法、railed 通道数、采样率这些都不是 Cp 失败的证据,
 /// 历史上按它们猜出来的警告只会把用户引到错误的排查方向。
@@ -416,6 +416,7 @@ pub(crate) fn cp_display_text(cp: Option<u32>) -> String {
         None => "未测量".to_string(),
         Some(0) => "测量中…".to_string(),
         Some(CP_MEASURE_FAILED) => CP_FAILURE_TEXT.to_string(),
+        Some(CP_NOT_MEASURED) => "未测量（通道已禁用）".to_string(),
         Some(value) => format!("{:.2} pF", value as f64 / 1000.0),
     }
 }
@@ -727,7 +728,7 @@ pub(crate) fn param_display_name(param_id: u8) -> String {
     }
 }
 
-/// 主页"工作模式"一行文案。草稿优先(与通信系统 Tab 的 ComboBox 同源), 未回读到 mode.work
+/// 主页"工作模式"一行文案。草稿优先(与设备设置 Tab 的 ComboBox 同源), 未回读到 mode.work
 /// 就显示"未知" —— 拿默认值 0 冒充设备真值会让人以为设备在 Serial 模式。
 /// 草稿与设备值不同时追加提示: 该项要整机重启重枚举才生效, 复用 draft_needs_reboot 判定。
 pub(crate) fn work_mode_text(ctrl: &AppController) -> String {

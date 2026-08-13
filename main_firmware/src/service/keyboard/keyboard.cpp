@@ -17,6 +17,7 @@ KeyboardService::KeyboardService()
       _touch_active(0), _gpio_ready(false), _pol_high_mask(0),
       _boot_level_mask(0), _boot_level_valid(false),
       _edge_last_raw(0), _edge_last_deb(0), _edge_last_out(0) {
+    _diag.clear();
     _edges.clear();
     for (uint8_t i = 0; i < KEY_COUNT; i++) {
         _pol_cfg[i] = 2;   // 默认 AUTO
@@ -408,6 +409,26 @@ void KeyboardService::task() {
         _apply_touch(area_out);
     }
 
+    // ★链路诊断快照(纯读, 不参与上面任何判定)★ 逐环取实测值而不是复用上面短路后的结果:
+    // 上面的 map_active 一旦在前一环就被否掉, 后面几环根本没被求值 —— 而排查恰恰需要知道
+    // "后面那些环本来是什么值"。这些访问器全是无副作用的成员读(见各自声明), 放在这里安全。
+    {
+        Psoc* diag_psoc = Psoc::getInstance();
+        uint8_t flags = 0;
+        if (_kbd_map_en) flags |= DIAG_MAP_EN;
+        if (_kbd_map_serial_only) flags |= DIAG_SERIAL_ONLY;
+        if (GameIoService::getInstance()->mai2_touch_sending()) flags |= DIAG_MAI2_SENDING;
+        if (SensorLink::getInstance()->output_suppressed()) flags |= DIAG_SUPPRESSED;
+        if (diag_psoc->touch_hold_ok()) flags |= DIAG_TOUCH_HOLD;
+        if (map_active) flags |= DIAG_MAP_ACTIVE;
+        if (_combo_active()) flags |= DIAG_COMBO_ACTIVE;
+        if (HID::getInstance()->is_initialized()) flags |= DIAG_HID_INIT;
+        _diag.flags = flags;
+        _diag.touch_mask = diag_psoc->touch_mask();
+        _diag.area_raw = area_raw;
+        _diag.bound_zones = BindingService::getInstance()->bound_zone_count();
+    }
+
     HID::getInstance()->task();
 }
 
@@ -422,13 +443,44 @@ void KeyboardService::_handle_get_state(const HostFrame& frame, uint8_t* resp, u
     // [phys_state(u16 LE), raw(u16 LE), out(u16 LE)]。
     // ★尾部追加而非新命令★: 旧上位机只读前 2 字节, 兼容不变; 新上位机据 raw/out 直接看出
     // "去抖前 / 实际输出" 两态, 不必再猜防抖与长按到底生效没有。
-    r.len = 6;
     r.payload[0] = (uint8_t)(self->_phys_state & 0xFF);
     r.payload[1] = (uint8_t)((self->_phys_state >> 8) & 0xFF);
     r.payload[2] = (uint8_t)(self->_edge_last_raw & 0xFF);
     r.payload[3] = (uint8_t)((self->_edge_last_raw >> 8) & 0xFF);
     r.payload[4] = (uint8_t)(self->_phys_out & 0xFF);
     r.payload[5] = (uint8_t)((self->_phys_out >> 8) & 0xFF);
+    // ★第二段尾部追加: 触控→键盘链路诊断★(同 raw/out 那次追加的先例, 只读前 6 字节的
+    // 旧上位机逐字节不受影响)。布局固定, 变长的键码集合放最后:
+    //   [6]  diag_ver = 1(以后再追加就 +1, 上位机据此判断能读到哪些字段)
+    //   [7]  flags(见 keyboard.h DIAG_*)
+    //   [8]  combo_out_count       [9]  bound_zones
+    //   [10..17] touch_mask(u64 LE)  [18..25] area_raw(u64 LE)
+    //   [26..29] hid 键盘报文实发数(u32 LE)  [30..33] 发送失败数(u32 LE)
+    //   [34..]   combo 输出键码 × combo_out_count
+    uint16_t off = 6;
+    r.payload[off++] = 1;
+    r.payload[off++] = self->_diag.flags;
+    r.payload[off++] = self->_combo_out_count;
+    r.payload[off++] = self->_diag.bound_zones;
+    for (uint8_t b = 0; b < 8; b++) {
+        r.payload[off++] = (uint8_t)((self->_diag.touch_mask >> (8u * b)) & 0xFFu);
+    }
+    for (uint8_t b = 0; b < 8; b++) {
+        r.payload[off++] = (uint8_t)((self->_diag.area_raw >> (8u * b)) & 0xFFu);
+    }
+    HID* hid = HID::getInstance();
+    const uint32_t sent = hid->kbd_send_count();
+    const uint32_t failed = hid->kbd_send_fail();
+    for (uint8_t b = 0; b < 4; b++) {
+        r.payload[off++] = (uint8_t)((sent >> (8u * b)) & 0xFFu);
+    }
+    for (uint8_t b = 0; b < 4; b++) {
+        r.payload[off++] = (uint8_t)((failed >> (8u * b)) & 0xFFu);
+    }
+    for (uint8_t n = 0; n < self->_combo_out_count; n++) {
+        r.payload[off++] = self->_combo_out_keys[n];
+    }
+    r.len = off;
     *resp_len = HostCmdCodec::encode_frame(r, resp, HOST_CMD_RESP_BUF_MAX);
 }
 

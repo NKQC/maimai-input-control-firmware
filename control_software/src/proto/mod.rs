@@ -1335,6 +1335,146 @@ pub struct KbdEdgeBatch {
     pub recs: Vec<KbdEdgeRec>,
 }
 
+/// 触控→键盘链路诊断: `KBD_GET_STATE` 尾部**第二段**追加字段(固件 diag_ver=1)。
+///
+/// ★每一项都是设备实测读数, 没有任何本地推算★ 门控链条有 6 环(总开关 → 仅协议发送 →
+/// 扫描抑制 → 掩码可信 → 分区绑定 → 组合判定), 任一环断掉现象都是同一个"完全不输出";
+/// 拿不到这些中间态就只能猜。响应里没有该段(旧固件/响应截断)时整体为 `None`, 界面必须显示
+/// "诊断字段不可用", 不许在数据不足时给结论。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct KbdLinkDiag {
+    /// 固件诊断块版本(当前 1)。0 视为无效, 解码直接判失败。
+    pub ver: u8,
+    /// `comm.keyboard_map_en` 总开关。
+    pub map_en: bool,
+    /// `comm.keyboard_map_serial_only`: 仅 mai2serial 真在发触控数据时才生效。
+    pub serial_only: bool,
+    /// mai2serial 此刻是否真在发触控数据。
+    pub mai2_sending: bool,
+    /// 触控扫描会话正在改写通道参数, 掩码无意义 ⇒ 固件按全松开处理。
+    pub output_suppressed: bool,
+    /// PSoC 触摸掩码是否仍在可信窗口内。
+    pub touch_hold_ok: bool,
+    /// 固件本轮**实际**算出的 map_active(不是上位机按上面几位重算的)。
+    pub map_active: bool,
+    /// 组合映射表是否有有效条目(为假时固件走 per-zone 回落路径)。
+    pub combo_active: bool,
+    /// 固件 HID 子系统是否已初始化。为假时任何按键都发不出去。
+    pub hid_initialized: bool,
+    /// 本轮组合判定实际输出的 HID 键码集合。
+    pub combo_out_keys: Vec<u8>,
+    /// PSoC 实时触摸掩码(36 位物理通道)。
+    pub touch_mask: u64,
+    /// `map_to_areas` 结果(34 位逻辑分区)。
+    pub area_raw: u64,
+    /// 已绑定分区数(绑定表里落在合法通道范围内的项数)。
+    pub bound_zones: u8,
+    /// HID 键盘报文累计实发数。
+    pub hid_sent: u32,
+    /// HID 键盘报文累计发送失败数(端点忙 ⇒ 报文被静默丢弃)。
+    pub hid_failed: u32,
+}
+
+/// 诊断块的固定部分字节数(变长的键码集合在其后)。
+const KBD_DIAG_FIXED_BYTES: usize = 34;
+
+impl KbdLinkDiag {
+    /// 一行人话结论: **只由实测位推出**, 按门控链条自上而下取第一个成立的断点。
+    /// 数据不足的情形由调用方在 `None` 分支处理, 这里不会出现"猜"的分支。
+    pub fn summary(&self) -> String {
+        let readings = format!(
+            "触摸=0x{:X} 分区=0x{:X} 已绑定{}区 输出{}键 发送{}/失败{}",
+            self.touch_mask,
+            self.area_raw,
+            self.bound_zones,
+            self.combo_out_keys.len(),
+            self.hid_sent,
+            self.hid_failed
+        );
+        let verdict = if !self.hid_initialized {
+            "设备 HID 未初始化 ⇒ 任何按键都发不出去".to_string()
+        } else if !self.map_en {
+            "总开关未启用 ⇒ 不输出".to_string()
+        } else if self.serial_only && !self.mai2_sending {
+            "已限定“仅协议发送时生效”，但 mai2serial 当前无消费者 ⇒ 不输出".to_string()
+        } else if self.output_suppressed {
+            "触控扫描会话进行中，输出被抑制 ⇒ 不输出".to_string()
+        } else if !self.touch_hold_ok {
+            "PSoC 触摸掩码不可信(近期无合法触控帧) ⇒ 不输出".to_string()
+        } else if !self.map_active {
+            // 上面每一环都成立却仍不生效: 只能如实报"设备实测与门控不一致", 不替设备编解释。
+            "设备实测 map_active=0，但上列各环均正常 ⇒ 原因未知".to_string()
+        } else if self.bound_zones == 0 {
+            "分区绑定表为空(已绑定 0 个分区) ⇒ 触摸无法映射成分区".to_string()
+        } else if self.touch_mask != 0 && self.area_raw == 0 {
+            "触摸已检测到，但分区绑定表没把这些通道映射到分区 ⇒ 不输出".to_string()
+        } else if !self.combo_active {
+            "组合映射表为空，正走 per-zone 回落路径(按分区键码表判定)".to_string()
+        } else if self.area_raw != 0 && self.combo_out_keys.is_empty() {
+            "分区已触发，但组合判定未输出(检查触发延时是否已按满、分区集合是否全部命中)"
+                .to_string()
+        } else if !self.combo_out_keys.is_empty() && self.hid_failed != 0 {
+            format!(
+                "已输出按键但 HID 发送失败 {} 次(端点忙，报文被丢弃)",
+                self.hid_failed
+            )
+        } else if self.touch_mask == 0 {
+            "链路正常 · 当前无触摸".to_string()
+        } else {
+            "链路正常".to_string()
+        };
+        format!("{} · {}", verdict, readings)
+    }
+}
+
+/// 解码 `KBD_GET_STATE` 尾部的链路诊断段。段缺失/截断/版本为 0 一律返回 `None` ——
+/// 不拿零值冒充读数, 那会把"读不到"伪装成"各环都为假"。
+pub fn decode_kbd_link_diag(payload: &[u8]) -> Option<KbdLinkDiag> {
+    if payload.len() < KBD_DIAG_FIXED_BYTES {
+        return None;
+    }
+    let ver = payload[6];
+    if ver == 0 {
+        return None;
+    }
+    let flags = payload[7];
+    let bit = |mask: u8| (flags & mask) != 0;
+    let u64_at = |at: usize| {
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&payload[at..at + 8]);
+        u64::from_le_bytes(buf)
+    };
+    let u32_at = |at: usize| {
+        let mut buf = [0u8; 4];
+        buf.copy_from_slice(&payload[at..at + 4]);
+        u32::from_le_bytes(buf)
+    };
+    let out_count = payload[8] as usize;
+    Some(KbdLinkDiag {
+        ver,
+        map_en: bit(0x01),
+        serial_only: bit(0x02),
+        mai2_sending: bit(0x04),
+        output_suppressed: bit(0x08),
+        touch_hold_ok: bit(0x10),
+        map_active: bit(0x20),
+        combo_active: bit(0x40),
+        hid_initialized: bit(0x80),
+        // 键码集合被响应截断时只取拿得到的那些: 计数字段单独保留在 combo_out_keys.len() 之外
+        // 没有意义, 上位机以实际拿到的键为准。
+        combo_out_keys: payload[KBD_DIAG_FIXED_BYTES..]
+            .iter()
+            .take(out_count)
+            .copied()
+            .collect(),
+        touch_mask: u64_at(10),
+        area_raw: u64_at(18),
+        bound_zones: payload[9],
+        hid_sent: u32_at(26),
+        hid_failed: u32_at(30),
+    })
+}
+
 /// 编码 KBD_SET_KEYCFG 请求载荷: n×[idx(u8), pol(u8), debounce_us(u16 LE)]。
 /// 越界值不在这里夹取 —— 固件会 NAK, 静默夹取只会让界面与设备不一致。
 pub fn encode_kbd_set_keycfg(items: &[(u8, KbdKeyCfg)]) -> Vec<u8> {

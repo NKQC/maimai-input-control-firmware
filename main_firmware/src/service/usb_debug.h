@@ -101,6 +101,27 @@ struct UsbDebugCounters {
     // 发射器手里, 无上位机时永不清零), 会 latch 在历史最坏值上 —— 而这件事在设备外部完全不可见,
     // 只能靠读源码推断。留出这一格, 补偿量就成了可复核的实测读数。
     uint32_t gio_emit_cost_us;
+
+    // ★开机校准流水线的运行时可见性★(末尾追加, 见本结构顶部的"只能末尾追加"约定)
+    // 实测到"三档 KV 全为 true 但流水线一步不动", 而 core0 侧的每一个判据(provisioned /
+    // output_suppressed / heavy_busy / link_alive / stage)在设备外部**全都不可观测** ——
+    // 只能靠读源码推断。一个字节把五个判据一起摊开, 排查就不必再猜。
+    //   bit0..3 = BootCalibrationStage(0=WAIT_TRUST .. 8=DONE)
+    //   bit4 = Core0State::provisioned
+    //   bit5 = SensorLink::output_suppressed()
+    //   bit6 = Psoc::heavy_busy()
+    //   bit7 = Psoc::link_alive()
+    uint8_t boot_cal_diag;
+
+    // 开机校准各档的**结局**位图(编码见 boot_calibration.h 的 BOOT_CAL_SKIP_*/FAIL_*)。
+    // stage=DONE 只说明流水线走完了, 说不出"到底做了没有" —— 实测两档被一次入队失败判死时,
+    // 外部看到的同样是 DONE。这一格是"开机校准有没有真的执行"的唯一外部读数。
+    //   bit0/1 = IDAC   跳过(KV 关) / 启动失败
+    //   bit2/3 = 频率自适应 跳过 / 启动失败
+    //   bit4/5 = 基线复位  跳过 / 启动失败
+    //   bit6   = 末尾快照/基线验收失败
+    //   bit7   = 至少有一档真的把重操作交给了 PSoC
+    uint8_t boot_cal_fail_mask;
 };
 
 // EP0 DEBUG_READ 固定尾部：P0..P7 的 GPIO drive mode(PC) 与 HSIOM PORT_SEL 快照。
@@ -287,6 +308,22 @@ static inline void loop_prof_total(uint32_t start_us) {
         g_usb_dbg.loop_max_us = dt;
         _pm_set_peak_ms(dt);
     }
+}
+
+/// 经 EP0 请求 0x54 清除"上次复位的死前遗言"。
+/// ★为什么必须能清★ 这些字段由 setup() 从 scratch 取出后**一直保留到下次复位**, 上位机每次连接都会
+/// 读到同一份旧遗言, 于是一次崩溃会在之后每一次启动都告警一遍, 真正的新崩溃反而分辨不出来。
+/// 只清遗言字段, 不碰 scratch —— scratch 已由 setup() 自行清零, 这里再写等于抹掉本次运行的现场标记。
+static inline void crash_postmortem_clear(void) {
+    g_usb_dbg.last_crash_stage = 0u;
+    g_usb_dbg.last_boot_was_wd = 0u;
+    g_usb_dbg.last_boot_was_fault = 0u;
+    // 0xFF = "上次不是 hardfault", 与 setup() 里的哨兵取值保持一致(0 会被读成 core0)。
+    g_usb_dbg.last_boot_fault_core = 0xFFu;
+    g_usb_dbg.last_reset_reason = 0u;
+    g_usb_dbg.last_boot_stage_at_ms = 0u;
+    g_usb_dbg.last_boot_peak_ms = 0u;
+    g_usb_dbg.last_boot_loop_max_us = 0u;
 }
 
 /// 经 EP0 请求 0x53 清零, 使压测能在干净窗口内测峰值(峰值不可差分, 必须能复位)。

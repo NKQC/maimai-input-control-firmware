@@ -240,8 +240,24 @@ inline void core0_psoc_lifecycle(Core0State& st) {
 
     // provisioning 成功后启动一次；DONE 后本代次不再进入，只有明确的新 PSoC 代次会 clear()。
     // 启动基础架构只做被动健康观察，不调用扫描专属或运行时参数应用 API。
+    // 五个判据摊到一个诊断字节(见 usb_debug.h)。★无条件每轮更新★: 若只在下面那个 if 内部填,
+    // 恰好"因为 if 不成立所以流水线不动"这种情形就永远读不出来 —— 那正是要查的那一种。
+    {
+        const bool suppressed = SensorLink::getInstance()->output_suppressed();
+        uint8_t diag = (uint8_t)st.boot_calibration.stage & 0x0Fu;
+        if (st.provisioned)      diag |= 0x10u;
+        if (suppressed)          diag |= 0x20u;
+        if (psoc->heavy_busy())  diag |= 0x40u;
+        if (psoc->link_alive())  diag |= 0x80u;
+        g_usb_dbg.boot_cal_diag = diag;
+        g_usb_dbg.boot_cal_fail_mask = st.boot_calibration.fail_mask;
+    }
     if (st.provisioned && !SensorLink::getInstance()->output_suppressed()) {
         boot_calibration_tick(psoc, csd, st.boot_calibration);
+        // "采样质量抽检存疑"是运行态**建议**, 必须能在问题消失后自己撤销 —— 否则它就退化成
+        // 永久的历史判定(实测: 全通道启用且状态良好时面板仍在报存疑)。内部自带 10s 节流,
+        // 且只在标志已置位时才真的去抽检, 健康设备上这一行是一次布尔比较。
+        csd->tick_trust_recheck(psoc);
     }
 
     // 持续断开 >400ms 视为真复位 → 清 provisioned, 链路恢复后重下发(算法/CSD 在 PSoC RAM, 复位丢失)。

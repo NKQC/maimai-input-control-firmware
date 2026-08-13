@@ -11,6 +11,7 @@
 //!   - 仅在虚拟摄像头启用(`state.enabled`)时累积; 每串数据提交后清空缓冲, 保证只用一次。
 //!   - Raw Input 是**旁路监听**, 不吞按键, 扫码器输入照常进入前台窗口。
 
+use super::driver_pkg::WINUSB_SERVICE;
 use super::{VcamState, interception, winusb_scanner};
 
 /// WinUSB 直读模式的运行状态文案。★必须把副作用写在状态里★ 用户看到的"已吞键"是因为
@@ -50,8 +51,12 @@ const HID_USAGE_GENERIC_KEYBOARD: u16 = 0x06;
 #[derive(Clone, Debug)]
 pub struct KeyboardDevice {
     /// Raw Input 设备名 `\\?\HID#VID_xxxx&PID_xxxx#...`。
+    /// ★Raw Input 看不见的节点这里是**按实例 ID 换算出的规范路径**★, 不是系统给的真路径;
+    /// 此类节点 `selectable()` 为假, 不可被选作捕获目标(见 `set_target_device` 的调用侧保护)。
     pub path: String,
     /// 本项(HID 集合)显示名: 集合/接口标识, 单集合设备直接用产品名。
+    /// ★不含任何状态前缀★ 前缀由渲染侧按状态拼(见 ui_callbacks/virtual_camera.rs);
+    /// 烧进 label 会污染持久化比较、排序与日志。
     pub label: String,
     /// 本项副文案: VID/PID + 实例后缀。
     pub detail: String,
@@ -63,6 +68,31 @@ pub struct KeyboardDevice {
     pub product: String,
     /// 二级分组副文案: 厂商。
     pub vendor: String,
+    /// 该设备树节点是否出现在 `GetRawInputDeviceList` 的列表里。
+    ///
+    /// ★这是本模块最重要的诊断位★ 设备树里在位、Raw Input 里却没有 = 键盘栈没有把该节点公开给
+    /// Raw Input 子系统。实测本工程固件的 HID 接口(MI_05 的三个 &COL0x 键盘集合)正是这种状态:
+    /// SetupAPI 报 PRESENT OK, `GetRawInputDeviceList` 一个都不返回。**根因尚未定位**,
+    /// 这里只负责把矛盾如实暴露出来, 不做任何补偿或掩盖。
+    pub rawinput_visible: bool,
+    /// 端点/接口实测读数单行文案(集合标识 · service · Raw Input 可见性 · 实例/USB 父节点)。
+    /// 拿不到的项写"未知", 不留空、不编造。
+    pub endpoint_text: String,
+    /// 本节点的 `SPDRP_SERVICE`(功能驱动名, 如 `kbdhid` / `WinUSB`); 读不到为空串。
+    pub service: String,
+    /// 该物理设备是否已被本应用改绑 WinUSB(按 USB 父节点的功能驱动实测)。
+    /// ★改绑后 HID 节点会整体消失★, 故判定只能落在 USB 父节点上。
+    pub rebound: bool,
+}
+
+impl KeyboardDevice {
+    /// 能否被选作捕获目标。
+    ///
+    /// Raw Input 看不见 ⇒ 旁路监听收不到任何数据; 唯一例外是已改绑 WinUSB 的设备 ——
+    /// 它本来就不走键盘栈, 由 WinUSB 直读拿数据。除此之外选中即注定静默失效, 必须拦住并说明原因。
+    pub fn selectable(&self) -> bool {
+        self.rawinput_visible || self.rebound
+    }
 }
 
 /// 一个设备节点的各路文案。SetupAPI 的 DeviceDesc 对 HID 键盘一律是
@@ -208,9 +238,116 @@ pub fn restart_current_capture() -> anyhow::Result<bool> {
     Ok(true)
 }
 
-/// 枚举系统中所有 HID 键盘设备, 供 UI 下拉选择。
+/// 键盘设备类 GUID。设备树枚举的入口, 与 `interception::present_keyboard_nodes()` 同一个类。
+const GUID_DEVCLASS_KEYBOARD: windows::core::GUID =
+    windows::core::GUID::from_u128(0x4d36e96b_e325_11ce_bfc1_08002be10318);
+/// 规范路径尾部的接口类 GUID。HID 节点用 HID 接口类, 其余(ACPI/PS2)用键盘接口类。
+/// 只用于给 Raw Input 看不见的节点合成路径, 比较时一律忽略该尾段。
+const IFACE_GUID_HID: &str = "{4d1e55b2-f16f-11cf-88cb-001111000030}";
+const IFACE_GUID_KEYBOARD: &str = "{884b96c3-56ef-11d1-bc8c-00a0c91405dd}";
+
+/// 枚举系统中所有键盘类设备节点, 供 UI 下拉选择。
+///
+/// ★主枚举必须走设备树, 不能走 Raw Input★ Raw Input 只公开"键盘栈已向它注册的"节点;
+/// 实测本工程固件的三个 HID 键盘集合在设备树里 PRESENT OK, 而 `GetRawInputDeviceList`
+/// 一个都不返回 —— 只用 Raw Input 枚举就等于**看不见自己的 HID 端点**, 用户无从选择也无从排查。
+/// 现在 Raw Input 列表退化为一个**标注来源**: 只用来给每个设备树节点判定 `rawinput_visible`。
 /// 过滤掉远程桌面虚拟键盘(`RDP_KBD`)——它不是物理输入源, 选它必然收不到数据。
 pub fn list_keyboards() -> Vec<KeyboardDevice> {
+    // Raw Input 路径按实例 ID 建索引: 同一节点在两处的写法不同(`#` vs `\` 且带接口 GUID 尾段),
+    // 统一换算成实例 ID(大写)再比, 免得两套字符串规则各自漂移。
+    let visible: HashMap<String, String> = rawinput_keyboard_paths()
+        .into_iter()
+        .filter_map(|path| {
+            instance_id_from_path(&path).map(|id| (id.to_ascii_uppercase(), path))
+        })
+        .collect();
+    let mut out: Vec<KeyboardDevice> = present_keyboard_instances()
+        .into_iter()
+        .filter(|instance_id| !instance_id.to_ascii_uppercase().contains("RDP_KBD"))
+        .map(|instance_id| {
+            let key = instance_id.to_ascii_uppercase();
+            match visible.get(&key) {
+                Some(path) => describe_device(path.clone(), instance_id, true),
+                None => {
+                    let path = path_from_instance_id(&instance_id);
+                    describe_device(path, instance_id, false)
+                }
+            }
+        })
+        .collect();
+    // 同类相邻、同物理设备相邻: 分类 → 产品名 → 父设备实例 → 集合。
+    out.sort_by(|a, b| {
+        category_rank(&a.category)
+            .cmp(&category_rank(&b.category))
+            .then_with(|| a.product.cmp(&b.product))
+            .then_with(|| a.parent_key.cmp(&b.parent_key))
+            .then_with(|| a.label.cmp(&b.label))
+            .then_with(|| a.path.cmp(&b.path))
+    });
+    out
+}
+
+/// 设备树里**在位**的键盘类设备节点实例 ID。查不到返回空 Vec(调用方据此得到空列表, 不伪造条目)。
+fn present_keyboard_instances() -> Vec<String> {
+    _present_instances(Some(&GUID_DEVCLASS_KEYBOARD), windows::core::PCWSTR::null())
+}
+
+/// 设备树里**在位**的 `USB\...` 节点实例 ID。
+/// ★改绑恢复的最后一层兜底用★ 改绑后 HID 节点整体消失, "Raw Input 路径 → HID → USB 父节点"
+/// 这条换算也断了; 所有权记录里的实例 ID 又可能缺失, 那时只剩"按 VID/PID 从 USB 枚举里反查"。
+/// 与键盘枚举共用同一份 SetupAPI 开关箱, 不另写第二套错误路径。
+pub fn present_usb_instances() -> Vec<String> {
+    _present_instances(None, w!("USB"))
+}
+
+/// 在位设备节点实例 ID 枚举。`class` 为 None 时按枚举器(`enumerator`)取全类设备。
+fn _present_instances(
+    class: Option<*const windows::core::GUID>,
+    enumerator: windows::core::PCWSTR,
+) -> Vec<String> {
+    use windows::Win32::Devices::DeviceAndDriverInstallation::{
+        DIGCF_ALLCLASSES, DIGCF_PRESENT, SP_DEVINFO_DATA, SetupDiDestroyDeviceInfoList,
+        SetupDiEnumDeviceInfo, SetupDiGetClassDevsW, SetupDiGetDeviceInstanceIdW,
+    };
+    let mut out = Vec::new();
+    let flags = if class.is_some() {
+        DIGCF_PRESENT
+    } else {
+        DIGCF_PRESENT | DIGCF_ALLCLASSES
+    };
+    // SAFETY: 按类 GUID / 枚举器取在位设备集合, 逐个枚举取实例 ID; 出口统一 Destroy。
+    unsafe {
+        let Ok(handle) = SetupDiGetClassDevsW(class, enumerator, None, flags) else {
+            return out;
+        };
+        let mut index = 0u32;
+        let mut data = SP_DEVINFO_DATA {
+            cbSize: std::mem::size_of::<SP_DEVINFO_DATA>() as u32,
+            ..Default::default()
+        };
+        // MAX_DEVICE_ID_LEN = 200; 上限 4096 个节点只是防御, 正常机器是两位数。
+        let mut buf = [0u16; 256];
+        while SetupDiEnumDeviceInfo(handle, index, &mut data).is_ok() && index < 4096 {
+            index += 1;
+            let mut needed = 0u32;
+            if SetupDiGetDeviceInstanceIdW(handle, &data, Some(&mut buf), Some(&mut needed)).is_err()
+            {
+                continue;
+            }
+            let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+            let id = String::from_utf16_lossy(&buf[..end]);
+            if !id.is_empty() {
+                out.push(id);
+            }
+        }
+        let _ = SetupDiDestroyDeviceInfoList(handle);
+    }
+    out
+}
+
+/// `GetRawInputDeviceList` 里所有键盘项的设备名。★只作标注来源★, 不再充当主枚举。
+fn rawinput_keyboard_paths() -> Vec<String> {
     let mut out = Vec::new();
     // SAFETY: 两段式调用(先问数量再取数据), 缓冲按返回数量分配。
     unsafe {
@@ -229,25 +366,26 @@ pub fn list_keyboards() -> Vec<KeyboardDevice> {
             if entry.dwType != RIM_TYPEKEYBOARD {
                 continue;
             }
-            let Some(path) = device_name(entry.hDevice) else {
-                continue;
-            };
-            if path.to_ascii_uppercase().contains("RDP_KBD") {
-                continue;
+            if let Some(path) = device_name(entry.hDevice) {
+                out.push(path);
             }
-            out.push(describe_device(path));
         }
     }
-    // 同类相邻、同物理设备相邻: 分类 → 产品名 → 父设备实例 → 集合。
-    out.sort_by(|a, b| {
-        category_rank(&a.category)
-            .cmp(&category_rank(&b.category))
-            .then_with(|| a.product.cmp(&b.product))
-            .then_with(|| a.parent_key.cmp(&b.parent_key))
-            .then_with(|| a.label.cmp(&b.label))
-            .then_with(|| a.path.cmp(&b.path))
-    });
     out
+}
+
+/// 设备实例 ID → Raw Input 规范路径(`instance_id_from_path` 的逆运算)。
+/// `HID\VID_x&PID_y\inst` → `\\?\HID#VID_x&PID_y#inst#{接口类 GUID}`。
+///
+/// ★只给 Raw Input 看不见的节点用★ 系统从未公开过它们的真路径, 这里合成一个规范写法只为让
+/// `path` 字段保持"唯一可持久化标识"的语义; 此类节点不可被选为捕获目标。
+fn path_from_instance_id(instance_id: &str) -> String {
+    let guid = if instance_id.to_ascii_uppercase().starts_with("HID\\") {
+        IFACE_GUID_HID
+    } else {
+        IFACE_GUID_KEYBOARD
+    };
+    format!(r"\\?\{}#{}", instance_id.replace('\\', "#"), guid)
 }
 
 /// 分类展示顺序: 外接 HID 在前(扫码器基本都在这一类), 内置/虚拟靠后。
@@ -265,9 +403,10 @@ pub const CAT_BT: &str = "蓝牙键盘";
 pub const CAT_BUILTIN: &str = "内置键盘 (PS/2 · ACPI)";
 pub const CAT_OTHER: &str = "其他键盘";
 
-/// 用 Raw Input 路径反查设备树信息: 自身 + 父设备文案, 产品名优先取总线上报名。
-fn describe_device(path: String) -> KeyboardDevice {
-    let instance_id = instance_id_from_path(&path);
+/// 用设备实例 ID 取设备树信息: 自身 + 父设备文案, 产品名优先取总线上报名。
+/// `path` 是该节点的 Raw Input 路径(不可见节点为合成的规范路径), `rawinput_visible` 即其来源。
+fn describe_device(path: String, node_id: String, rawinput_visible: bool) -> KeyboardDevice {
+    let instance_id = Some(node_id);
     let (me, parent_id) = instance_id
         .as_deref()
         .and_then(query_node)
@@ -358,7 +497,26 @@ fn describe_device(path: String) -> KeyboardDevice {
         parts.push(tail);
     }
 
+    let node = instance_id.as_deref().unwrap_or_default();
+    let service = device_service(node).unwrap_or_default();
+    // 改绑判定必须落在 USB 父节点: 改绑成功后 HID 节点整体消失, 只有 USB 节点还在。
+    let usb_parent = usb_ancestor(node);
+    let rebound = usb_parent
+        .as_deref()
+        .and_then(device_service)
+        .is_some_and(|s| s.eq_ignore_ascii_case(WINUSB_SERVICE));
+
     KeyboardDevice {
+        endpoint_text: endpoint_text(
+            node,
+            usb_parent.as_deref(),
+            &service,
+            &collection,
+            rawinput_visible,
+        ),
+        service,
+        rebound,
+        rawinput_visible,
         path,
         label,
         detail: parts.join("  ·  "),
@@ -371,6 +529,48 @@ fn describe_device(path: String) -> KeyboardDevice {
         product,
         vendor,
     }
+}
+
+/// 端点/接口实测读数单行。★本模块的核心诊断价值★: 让"设备树有、Raw Input 没有"这个矛盾
+/// 在界面上一眼可见。任何拿不到的项写"未知", 不留空也不编造。
+fn endpoint_text(
+    node_id: &str,
+    usb_parent: Option<&str>,
+    service: &str,
+    collection: &str,
+    rawinput_visible: bool,
+) -> String {
+    let unknown = "未知";
+    format!(
+        "{} · service={} · RawInput={} · 实例={} · USB父={}",
+        if collection.is_empty() {
+            "无接口/集合标识"
+        } else {
+            collection
+        },
+        if service.is_empty() { unknown } else { service },
+        if rawinput_visible {
+            "可见"
+        } else {
+            "不可见"
+        },
+        if node_id.is_empty() { unknown } else { node_id },
+        usb_parent.unwrap_or(unknown),
+    )
+}
+
+/// 向上找最近的 USB 设备节点实例 ID(`USB\...`)。HID 集合到 USB 接口节点通常两三层, 上限 4 层足够,
+/// 同时兜住"设备树被外部改动导致父链成环"这种不可控情形。
+fn usb_ancestor(instance_id: &str) -> Option<String> {
+    let mut current = instance_id.to_string();
+    for _ in 0..4 {
+        let parent = parent_of(&current)?;
+        if parent.to_ascii_uppercase().starts_with("USB\\") {
+            return Some(parent);
+        }
+        current = parent;
+    }
+    None
 }
 
 /// 通用名判定: 这些名字每个 HID 键盘都一样, 认不出设备, 只能当兜底。
@@ -528,7 +728,8 @@ pub(crate) fn parent_of(instance_id: &str) -> Option<String> {
 
 /// 读设备节点的功能驱动服务名(`SPDRP_SERVICE`)。这是"到底绑到哪个驱动"的**唯一实测证据**:
 /// 命令退出码 0 只说明命令跑完了, 不代表 PnP 真的换了绑定。
-pub(crate) fn device_service(instance_id: &str) -> Option<String> {
+/// ★对 UI 侧也开放★ 已改绑设备的合成行拿不到 HID 节点, 只能直接读 USB 节点的 service 出读数。
+pub fn device_service(instance_id: &str) -> Option<String> {
     with_devnode(instance_id, |h, data| reg_prop(h, data, PROP_SERVICE))
 }
 

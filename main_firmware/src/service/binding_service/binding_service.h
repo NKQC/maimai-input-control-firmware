@@ -28,6 +28,17 @@ public:
     // 按当前绑定表把 36 位物理通道 mask 转成 34 位逻辑分区 mask
     uint64_t map_to_areas(uint64_t touch_mask) const;
 
+    // 已绑定分区数(_bind_ch[z] 落在合法通道范围内的计数)。
+    // ★诊断专用★ 触控→键盘链路里"摸到了但映射不出分区"这一环, 外部只能靠它与
+    // map_to_areas 的结果对照才能区分"没触摸"与"绑定表是空的"; 判定路径不使用本值。
+    inline uint8_t bound_zone_count() const {
+        uint8_t n = 0;
+        for (uint8_t z = 0; z < ZONE_COUNT; z++) {
+            if (_bind_ch[z] < 36u) n++;
+        }
+        return n;
+    }
+
     // 每轮主循环调用一次：WAIT_TOUCH 态下检测首个触发通道，完成绑定
     void tick(uint64_t touch_mask, bool link_ok);
 

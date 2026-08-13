@@ -164,6 +164,10 @@ enum class HostCmd : uint8_t {
     // 物理键盘 / 触控键盘映射域 + mai2 串口状态 0x70-0x7D
     // 空 → [phys_state(u16 LE), raw(u16 LE), out(u16 LE)]: 去抖后 / 去抖前 / 实际输出 HID 三态。
     // 后两个字段为后续追加, 旧上位机只读前 2 字节仍然正确。
+    // 再往后是第二段追加 —— 触控→键盘链路诊断(布局见 keyboard.cpp::_handle_get_state):
+    //   [6]diag_ver=1 [7]flags [8]combo_out_count [9]bound_zones
+    //   [10..17]touch_mask u64 LE [18..25]area_raw u64 LE
+    //   [26..29]hid 键盘实发数 u32 LE [30..33]发送失败数 u32 LE [34..]输出键码×count
     KBD_GET_STATE    = 0x70,
     KBD_GET_MAP      = 0x71,  // 空 → [count(u8)=12, keycode(u8)×12] 物理键 HID 键码表
     KBD_SET_MAP      = 0x72,  // [idx(u8),keycode(u8)]×n 设物理键 HID 键码 → ACK

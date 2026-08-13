@@ -1,6 +1,6 @@
 import { Button, ComboBox, HorizontalBox, CheckBox, SpinBox, ScrollView } from "std-widgets.slint";
 import { ConfigRow, ConfigGroupCount, LedUnitRow } from "../common/types.slint";
-import { CollapsibleSection, GuardedSpinBox, GuardedComboBox } from "../common/widgets.slint";
+import { CollapsibleSection, GuardedSpinBox, GuardedComboBox, GuardedCheckBox } from "../common/widgets.slint";
 import { ConfigGroupSection } from "./config.slint";
 import { Theme } from "../common/theme.slint";
 
@@ -18,7 +18,7 @@ global LedCols {
 // ============================================================================
 
 export component ProtocolPage inherits Rectangle {
-    // ---- 协议能力参数(与"通信系统"Tab 同一份 config_rows / 同一套草稿写入回调) ----
+    // ---- 协议能力参数(与"设备设置"Tab 同一份 config_rows / 同一套草稿写入回调) ----
     // 行的归属由 Rust 侧 group 字段决定, 本页只挂两个协议组; 同一 KV 不会在两处出现。
     in property <[ConfigRow]> config_rows: [];
     // 各分组行数: 组为空时就地自报原因(未取到配置 / 归组异常), 不留一片空白让人猜。
@@ -97,9 +97,11 @@ export component ProtocolPage inherits Rectangle {
                 HorizontalBox {
                     padding: 4px;
                     spacing: 10px;
-                    CheckBox {
+                    // ★必须用 GuardedCheckBox★ 这是设备真值(MAI2_GET_STATE 持续回读), 裸 CheckBox
+                    // 点一次就再也回填不进来, 之后显示的是"上次点成什么样"而非设备实际状态。
+                    GuardedCheckBox {
                         text: "启用发送";
-                        checked: root.mai2_send_en;
+                        model_checked: root.mai2_send_en;
                         enabled: root.mai2_send_en_known;
                         toggled => { root.mai2_set_send_en(self.checked); }
                     }
@@ -134,7 +136,7 @@ export component ProtocolPage inherits Rectangle {
             }
 
             // mai2serial 协议参数(串口波特率 / 触控上报延迟 / 发送节流 / {E}RSET 善后行为)。
-            // 编辑仅入草稿, 点左下角"保存到设备"才写 flash, 与通信系统 Tab 完全同一条路径。
+            // 编辑仅入草稿, 点左下角"保存到设备"才写 flash, 与设备设置 Tab 完全同一条路径。
             ConfigGroupSection {
                 vertical-stretch: 0;
                 group_title: "mai2serial 协议参数";
@@ -147,10 +149,10 @@ export component ProtocolPage inherits Rectangle {
                 set_string(k, v) => { root.cfg_set_string(k, v); }
             }
 
-            // 四个开关均走同一份配置草稿与“保存到设备”路径；启动校准失败不会在本代次循环重试。
+            // 延迟补正开关走同一份配置草稿与“保存到设备”路径。
             ConfigGroupSection {
                 vertical-stretch: 0;
-                group_title: "启动校准与延迟补正";
+                group_title: "延迟补正";
                 rows: root.config_rows;
                 group_counts: root.config_group_counts;
                 set_bool(k, v) => { root.cfg_set_bool(k, v); }

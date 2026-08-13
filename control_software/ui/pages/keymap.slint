@@ -3,7 +3,7 @@
 // ============================================================================
 
 import { VerticalBox, HorizontalBox, CheckBox, SpinBox, ScrollView, Button, ComboBox } from "std-widgets.slint";
-import { KeyCaptureBox, CollapsibleSection, PlotPath, GuardedSpinBox } from "../common/widgets.slint";
+import { KeyCaptureBox, CollapsibleSection, PlotPath, GuardedSpinBox, GuardedCheckBox } from "../common/widgets.slint";
 import { Theme } from "../common/theme.slint";
 
 // 逻辑通道池里的一个分区块。选中 = 该分区进入"待新建映射"的分区集合。
@@ -83,9 +83,10 @@ component ComboRow inherits Rectangle {
             overflow: elide;
         }
         // 就地重录按键: 与新建区用同一个 KeyCaptureBox, 因此覆盖/累加语义天然一致。
-        // ★列宽 150px 必须与 ComboHeader 的「按键组合」列一致★。
+        // ★列宽必须与 ComboHeader 的「按键组合」列一致★。280px = KeyCaptureBox 右侧固定预留
+        // 146px + 键组合显示区 134px; 原来的 200px 在「应用」按钮加宽后只剩 54px 显示区。
         KeyCaptureBox {
-            width: 200px;
+            width: 280px;
             display: root.keys_text;
             capture_started() => { root.key_capture_started(); }
             captured(t, c, s, a, g) => { root.key_captured(t, c, s, a, g); }
@@ -136,7 +137,7 @@ component ComboHeader inherits HorizontalLayout {
     }
     Text {
         text: @tr("按键组合 / HID");
-        width: 200px;
+        width: 280px;
         font-size: Theme.fs-small;
         color: Theme.text-sub;
         vertical-alignment: center;
@@ -160,6 +161,9 @@ component ComboHeader inherits HorizontalLayout {
 
 export component KeyMapPage inherits Rectangle {
     in property <bool> keyboard_map_en: false;
+    // 链路诊断一行(由设备实测位推出, 见 proto::KbdLinkDiag::summary)。读不到诊断字段时
+    // Rust 侧填"诊断字段不可用…", 本页只显示, 不做任何推断。
+    in property <string> link_diag: "";
     in property <[string]> zone_names: [];   // 34 分区名 A1-E8
     // ---- 组合映射(多分区 → 多键) ----
     // 真相源在 AppController::kbd_combo_*; 本页只展示与转发事件。
@@ -196,6 +200,16 @@ export component KeyMapPage inherits Rectangle {
         padding: 8px;
         spacing: 6px;
 
+        // 链路诊断行。★不套 Rectangle★: Rectangle 在 VerticalBox 里没有内在高度, 里面放
+        // 换行 Text 会算不出高度并与下一个元素重叠。单行 + elide 即可, 完整读数在日志里。
+        // 条件子项而非空串占位: 还没收到 KBD_GET_STATE 响应时本行整体不存在, 不留一条空缝。
+        if root.link_diag != "": Text {
+            text: root.link_diag;
+            font-size: Theme.fs-small;
+            color: Theme.text-title;
+            overflow: elide;
+        }
+
         HorizontalBox {
             padding: 0px;
             spacing: 8px;
@@ -215,9 +229,10 @@ export component KeyMapPage inherits Rectangle {
         HorizontalBox {
             padding: 0px;
             spacing: 10px;
-            CheckBox {
+            // ★必须用 GuardedCheckBox★ 设备真值回填, 裸 CheckBox 点一次即失去回填。
+            GuardedCheckBox {
                 text: @tr("启用触控键盘映射");
-                checked: root.keyboard_map_en;
+                model_checked: root.keyboard_map_en;
                 toggled => { root.set_keyboard_map_en(self.checked); }
             }
             Text {
@@ -600,7 +615,14 @@ export component PhysKbdPage inherits Rectangle {
     callback la_window_set(int);
     callback la_clear();
 
+    // 根组件不得引用 parent(Slint 禁止): 尺寸由 settings.slint 的 Tab 视口给定。
+    // 只声明 min-height: 0px, 让内容自然高度可被外层裁切视口正确反推。
+    min-height: 0px;
+
     VerticalBox {
+        width: parent.width;
+        height: parent.height;
+        min-height: 0px;
         padding: 8px;
         spacing: 6px;
 
@@ -617,8 +639,10 @@ export component PhysKbdPage inherits Rectangle {
         }
 
         ScrollView {
+            min-height: 0px;
             vertical-stretch: 1;
             VerticalLayout {
+                vertical-stretch: 0;
                 padding: 0px;
                 spacing: 6px;
                 alignment: start;

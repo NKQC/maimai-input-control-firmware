@@ -344,8 +344,9 @@ void UsbComm::update() {
             if (static_cast<int32_t>(now - _reboot.deadline_ms) < 0) break;
 
             if (_reboot.mode == RebootState::Mode::APP) {
-                // 主动重启回 app：清运行态标记，避免启动时被判为死锁而进 BOOTSEL。
-                watchdog_hw->scratch[7] = 0u;
+                // 主动重启回 app：清运行态标记 + 崩溃现场 + DEBUG_BOOTSEL 武装标志，避免被误判为崩溃。
+                watchdog_hw->scratch[7] = 0u;  // WD_RUNNING_MAGIC
+                watchdog_hw->scratch[6] = 0u;  // DEBUG_BOOTSEL_MAGIC: 主动重启必须解除武装，否则 setup() 误判崩溃
                 // ★同时清 scratch[0]/[1]★: setup() 用 scratch[0]==CRASH_RUN_MAGIC 判"上次是否运行中
                 // 崩溃", 而 watchdog_reboot 会保留它 ⇒ 主机主动 REBOOT 也被报成 last_boot_was_wd=1
                 // 且带一个陈旧 stage(实测 nv-soak 重启后恒报 USB_UPDATE 崩溃)。这会把"设备是否真卡住"

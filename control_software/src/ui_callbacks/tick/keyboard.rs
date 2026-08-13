@@ -42,6 +42,16 @@
         ui.set_kbd_phys_raw(slint::ModelRc::new(slint::VecModel::from(raw_bits)));
         let out_bits: Vec<bool> = (0..12u8).map(|i| (out >> i) & 1 != 0).collect();
         ui.set_kbd_phys_out(slint::ModelRc::new(slint::VecModel::from(out_bits)));
+        // 触控→键盘链路诊断行: 与实时三态同一份 KBD_GET_STATE 响应, 因此复用同一个 version
+        // 门控与既有的 ~3Hz 轮询, 不新增任何轮询源。
+        // ★读不到诊断段就明说不可用★ 不拿零值推结论 —— 那会把"旧固件不回传"说成"各环都为假"。
+        ui.set_kbd_link_diag(
+            match ctrl.kbd_link_diag() {
+                Some(diag) => diag.summary(),
+                None => "诊断字段不可用（设备固件未回传链路诊断段）".to_string(),
+            }
+            .into(),
+        );
     }
     // 每键触发极性 + 防抖(version 门控, 草稿优先值)。
     if ctrl.kbd_keycfg_version() != last_kbd_keycfg_version {

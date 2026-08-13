@@ -5,6 +5,7 @@
 #include "../../hal/usb/hal_usb.h"
 #include <cstring>
 #include "../usb_debug.h"
+#include "../self_heal/self_heal.h"   // tick_trust_recheck 撤销建议时记 SH_BASELINE_TRUST_RESTORED
 
 #ifdef PICO_PLATFORM
 #include "LittleFS.h"
@@ -396,6 +397,22 @@ bool CsdConfig::sampling_trustworthy(Psoc* psoc) {
         if (again != first[i]) moved++;
     }
     return moved > 0;   // 全部抽样通道两次完全一致 = 扫描停滞
+}
+
+// 采样质量建议的自愈重评估。见 csd_config.h 处说明。
+// 节流 10s: sampling_trustworthy() 会做若干次同步 get_raw(读类阻塞), 不能每轮都付这个成本;
+// 而它只在标志已置位时才被调用, 所以健康设备上这个函数是一条比较后立即返回的空路径。
+void CsdConfig::tick_trust_recheck(Psoc* psoc) {
+    if (!_baseline_untrusted) return;                 // 常态: 零 SPI 事务
+    if (psoc == nullptr || !psoc->link_alive()) return;
+    // 重操作在途时抽检读到的 raw 不代表稳态(校准/基线复位期间 PSoC 主循环不在正常扫描)。
+    if (psoc->heavy_busy()) return;
+    const uint32_t now_ms = millis();
+    if (_trust_recheck_ms != 0u && (uint32_t)(now_ms - _trust_recheck_ms) < 10000u) return;
+    _trust_recheck_ms = now_ms;
+    if (!sampling_trustworthy(psoc)) return;          // 仍然存疑: 保留建议, 下个窗口再看
+    _baseline_untrusted = false;
+    SelfHeal::getInstance()->note(SH_BASELINE_TRUST_RESTORED, 0u);
 }
 
 bool CsdConfig::capture_from_psoc(Psoc* psoc) {

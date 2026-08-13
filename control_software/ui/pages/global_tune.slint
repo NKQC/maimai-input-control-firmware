@@ -2,7 +2,7 @@ import { Button, ComboBox, VerticalBox, HorizontalBox, CheckBox, SpinBox, Scroll
 // 输入框/下拉一律用带守卫的版本: 全局项与 CSD 参数都在持续回读, 裸 SpinBox/ComboBox 会被
 // 回填冲掉正在进行的编辑(输入一下就失焦)或被自身赋值摧毁回填绑定。详见 widgets.slint 内注释。
 // 分区一律用 SectionCard(替代视觉过弱的 std GroupBox), 带标签的控件行一律用 FormRow。
-import { GuardedSpinBox, GuardedComboBox, SectionCard, FormRow } from "../common/widgets.slint";
+import { GuardedSpinBox, GuardedComboBox, GuardedCheckBox, SectionCard, FormRow } from "../common/widgets.slint";
 import { GlobalFences } from "../common/types.slint";
 import { Theme } from "../common/theme.slint";
 
@@ -441,10 +441,11 @@ export component GlobalTunePage inherits Rectangle {
                 FormRow {
                     label: "自动校准:";
                     hint: "保存后生效。";
-                    CheckBox {
+                    // ★必须用 GuardedCheckBox★ 这是设备全局真值(GLOBAL_GET 持续回读)。
+                    GuardedCheckBox {
                         horizontal-stretch: 0;
                         text: "启用 (IDAC auto-calibration)";
-                        checked: root.g_auto_calibrate == 1;
+                        model_checked: root.g_auto_calibrate == 1;
                         toggled => { root.algo_global_set(8, self.checked ? 1 : 0); }
                     }
                 }

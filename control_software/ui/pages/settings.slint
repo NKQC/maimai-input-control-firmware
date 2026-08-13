@@ -19,7 +19,7 @@ export component SettingsPage inherits Rectangle {
     // 显式绑定 TabWidget current-index，供通道卡点击后切到“单通道精调”。
     in-out property <int> settings_tab: 0;
     in property <[ConfigRow]> config_rows: [];
-    // 未归类("其他"组)行数: 为 0 时通信系统 Tab 不渲染该组, 避免空标题框。
+    // 未归类("其他"组)行数: 为 0 时设备设置 Tab 不渲染该组, 避免空标题框。
     in property <int> config_other_count: 0;
     // 各分组行数, 透传给两页的 ConfigGroupSection 供空组自报原因。
     in property <[ConfigGroupCount]> config_group_counts: [];
@@ -212,6 +212,8 @@ export component SettingsPage inherits Rectangle {
     in property <string> combo_pending_keys_text: "";
     in property <string> combo_status: "";
     in property <int> combo_count: 0;
+    // 触控→键盘链路诊断一行(由设备实测位推出; 读不到诊断字段时为"诊断字段不可用…")。
+    in property <string> kbd_link_diag: "";
     callback combo_zone_toggled(int);
     callback combo_zones_clear();
     callback combo_captured(string, bool, bool, bool, bool);
@@ -383,7 +385,7 @@ export component SettingsPage inherits Rectangle {
     // 并且两种模式的页面同时出现。★不要再引入 tab_index/page_id 折算函数★: 唯一真相是
     // "Tab 顺序 == main.rs 的 SETTINGS_PAGE_* 常量", 加/删 Tab 必须同步 main.rs 的常量。
     // 顺序: 0分区绑定|HID触控点位 1协议 2触控通道调整 3触控全局调整 4单通道精调
-    //       5触控键盘映射 6物理键盘 7通信系统 8算法。
+    //       5触控键盘映射 6物理键盘 7设备设置 8算法。
 
     // 设置页内容视口与保存栏解耦：所有子页的自然最小尺寸仅在此裁切视口内处理，
     // 不能再反向撑大 SettingsPage、把底部操作栏推到客户区外。
@@ -464,7 +466,7 @@ export component SettingsPage inherits Rectangle {
             title: "协议";
 
             ProtocolPage {
-                // 协议能力参数与通信系统 Tab 共用同一份 config_rows 与草稿写入回调。
+                // 协议能力参数与设备设置 Tab 共用同一份 config_rows 与草稿写入回调。
                 config_rows: root.config_rows;
                 config_group_counts: root.config_group_counts;
                 device_summary_text: root.device_summary_text;
@@ -687,6 +689,7 @@ export component SettingsPage inherits Rectangle {
 
             KeyMapPage {
                 keyboard_map_en: root.keyboard_map_en;
+                link_diag: root.kbd_link_diag;
                 zone_names: root.kbd_zone_names;
                 combo_zones_text: root.combo_zones_text;
                 combo_keys_text: root.combo_keys_text;
@@ -751,7 +754,7 @@ export component SettingsPage inherits Rectangle {
         }
 
         Tab {
-            title: "通信系统";
+            title: "设备设置";
 
             ConfigPage {
                 rows: root.config_rows;

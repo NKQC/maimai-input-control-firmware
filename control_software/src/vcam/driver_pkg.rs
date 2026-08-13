@@ -29,7 +29,7 @@ const CERT_SUBJECT: &str = "CN=mai2control vcam WinUSB (self-signed)";
 /// 与 INF 的 `DeviceInterfaceGUIDs` 同一个值: 既供 WinUSB 公开设备接口, 也是"哪一份 oemN.inf
 /// 是我们发布的"这一判定的唯一稳定标记(pnputil 的输出是本地化文案, 不可作为判定依据)。
 const DEVICE_INTERFACE_GUID: &str = "{B7A0F1C2-4E3D-4A5B-9C6D-8E7F00112233}";
-const WINUSB_SERVICE: &str = "WinUSB";
+pub(crate) const WINUSB_SERVICE: &str = "WinUSB";
 /// 设备栈重建(restart-device / 驱动换绑)需要重新枚举, 实测秒级; 给足余量但必须有上限。
 const REBIND_TIMEOUT: Duration = Duration::from_secs(25);
 
@@ -78,8 +78,9 @@ fn _safe_device_text(value: &str) -> bool {
 }
 
 /// 从 `VID_xxxx`/`PID_xxxx` 字段取 4 位十六进制。缺一个就判定这不是 USB 硬件 ID。
-/// WinUSB 直读侧也用同一份解析(见 `winusb_scanner`), 不再另写第二套。
-pub(crate) fn hex_field(text: &str, key: &str) -> Option<String> {
+/// WinUSB 直读侧与 UI 的合成设备行也用同一份解析(见 `winusb_scanner` / `ui_callbacks`),
+/// 不再另写第二套。★`pub` 而非 `pub(crate)`★: `ui_callbacks` 属 bin crate, 看不见 `pub(crate)`。
+pub fn hex_field(text: &str, key: &str) -> Option<String> {
     let at = text.find(key)? + key.len();
     let value: String = text[at..]
         .chars()
@@ -125,17 +126,29 @@ fn _resolve_target(raw_input_path: &str) -> Result<_Target> {
 }
 
 /// 本应用改绑的所有权记录。
-/// ★只卸载自己装的东西★ 没有这份记录就绝不删除任何驱动包或证书, 也不声称清理过。
+///
+/// ★这份记录只能是"更好的线索", 不能是唯一依据★ 恢复路径曾经在 `published` 为空时整体拒绝执行,
+/// 于是一旦这个字段被写坏, 用户就永远回不到 hidusb。现在缺字段一律走降级(自行找回 / 跳过该步),
+/// 每一层都如实报告做到了哪一步, 见 `unbind_and_uninstall`。
+///
+/// 后三项是改绑前登记的**原始设备文案**: 改绑后该设备从键盘枚举里整体消失, 界面上要显示原名
+/// 只能从这里恢复。老记录没有这些字段时为空串, 界面显示"未知", 不编造。
 struct _Owner {
     _published: String,
     _thumbprint: String,
     _instance: String,
+    _product: String,
+    _label: String,
+    _vendor: String,
 }
 
 fn _owner_record() -> Option<_Owner> {
     let text = std::fs::read(_dir().join(OWNER_FILE))
         .ok()
         .map(|bytes| String::from_utf8_lossy(&bytes).to_string())?;
+    // 记录文件现按 UTF-8 写(设备产品名可能含非 ASCII)。PowerShell 5.1 的 UTF8 一定带 BOM,
+    // 不剥掉首行就永远匹配不上 marker ⇒ 整份记录被判为"不存在"。
+    let text = text.trim_start_matches('\u{feff}');
     let mut lines = text.lines();
     if lines.next()?.trim() != OWNER_MARKER {
         return None;
@@ -149,7 +162,43 @@ fn _owner_record() -> Option<_Owner> {
         _published: field("published="),
         _thumbprint: field("thumbprint="),
         _instance: field("instance="),
+        _product: field("product="),
+        _label: field("label="),
+        _vendor: field("vendor="),
     })
+}
+
+/// 改绑前登记的原始设备身份。改绑后目标从键盘枚举里消失, 界面上那条合成行的名字与端点读数
+/// 都只能从这里恢复; 拿不到的项一律留空, 由渲染侧显示"未知"。
+pub struct ReboundIdentity {
+    /// 总线上报的产品名(设备管理器"总线报告的设备说明"), 即用户认得的那个名字。
+    pub product: String,
+    /// HID 集合行显示名(接口/集合标识)。
+    pub label: String,
+    pub vendor: String,
+    /// 改绑时登记的 USB 节点实例 ID。
+    pub instance: String,
+}
+
+/// 取所有权记录里登记的原始设备身份。没有记录返回 None(渲染侧据此如实显示"未知")。
+pub fn rebound_identity() -> Option<ReboundIdentity> {
+    let owner = _owner_record()?;
+    Some(ReboundIdentity {
+        product: owner._product,
+        label: owner._label,
+        vendor: owner._vendor,
+        instance: owner._instance,
+    })
+}
+
+/// 写进所有权记录的一行文案。记录是行分隔的 `key=value`, 因此换行/回车必须去掉;
+/// 过长的名字截断到 128 字符(设备产品串远短于此, 截断只是防御畸形描述符)。
+fn _owner_text(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| !ch.is_control())
+        .take(128)
+        .collect()
 }
 
 /// 三档签名状态。★`Set-AuthenticodeSignature` 那一步会返回 `UnknownError`, 那不是失败★:
@@ -352,6 +401,22 @@ fn _run_elevated_script(label: &str, build: impl FnOnce(&str) -> String) -> Resu
     }
 }
 
+/// "哪一份 `oemN.inf` 是本应用发布的"这一判定的**唯一**实现: 按 INF 正文里的设备接口 GUID 命中
+/// (`pnputil` 的输出是本地化文案, 不可作为判定依据)。
+///
+/// ★安装与恢复必须共用同一份★ 恢复路径原先根本没有这一步, 只认所有权记录里的 `published`;
+/// 该字段一旦被写空, 用户就再也删不掉驱动包、回不到 hidusb。生成的 PowerShell 片段把命中的
+/// 文件名写进变量 `var`(找不到则保持原值不变, 由调用侧先置空)。
+fn _ps_find_published(var: &str) -> String {
+    format!(
+        "$hit = Get-ChildItem -LiteralPath (Join-Path $env:SystemRoot 'INF') -Filter 'oem*.inf' -ErrorAction SilentlyContinue | \
+         Where-Object {{ (Get-Content -LiteralPath $_.FullName -Raw -ErrorAction SilentlyContinue) -like {guid_like} }} | Select-Object -First 1\n\
+         if ($hit) {{ {var} = $hit.Name }}\n",
+        guid_like = _ps(&format!("*{}*", DEVICE_INTERFACE_GUID)),
+        var = var,
+    )
+}
+
 fn _marker(lines: &[String], key: &str) -> String {
     lines
         .iter()
@@ -496,6 +561,11 @@ fn _inf_ps_array(hardware_id: &str) -> String {
 /// 允许任何标准用户建目录 —— 于是别人可以先把 `...\vcam\winusb` 建成指向自己可控位置的联接，
 /// 让我们的管理员脚本把 INF/CAT 写进去、再由 `pnputil` 以管理员身份读回来。见到重解析点即中止。
 ///
+/// ★签名这一步绝不覆盖 `published`/`instance`★ 旧实现把整份所有权记录重写一遍, 只从旧文件里
+/// "读回来保留"那两个字段 —— 于是"先改绑、后再点一次签名"在旧文件缺字段时会把发布名写成空串,
+/// 而恢复路径当年只认这个字段, 用户就此被锁死在 WinUSB 上。现在只替换 `thumbprint=` 那一行,
+/// 其余行逐字保留; 只有记录不存在(或首行不是本应用的 marker)时才创建完整骨架。
+///
 /// 这是一个独立的用户动作: 它会向本机"受信任的根证书颁发机构"与"受信任的发布者"各写入一张
 /// 由本应用自签发的代码签名证书 —— 这是 Windows 10 起驱动包强制签名的唯一无内核代价的满足方式。
 /// 硬件 ID 取当前已选定的扫码器(只读查设备树, 不改设备栈)。
@@ -513,11 +583,8 @@ pub fn sign_and_trust() -> Result<String> {
              try {{\n\
              $pkg = {pkg}\n\
              $owner = {owner}\n\
-             $published = ''\n\
-             $instance = ''\n\
-             if (Test-Path -LiteralPath $owner) {{ foreach ($l in (Get-Content -LiteralPath $owner)) {{ \
-             if ($l -like 'published=*') {{ $published = $l.Substring(10) }}\n\
-             if ($l -like 'instance=*') {{ $instance = $l.Substring(9) }} }} }}\n\
+             $prev = @()\n\
+             if (Test-Path -LiteralPath $owner) {{ $prev = @(Get-Content -LiteralPath $owner) }}\n\
              if (-not (Test-Path -LiteralPath $pkg)) {{ $null = New-Item -ItemType Directory -Path $pkg -Force }}\n\
              foreach ($probe in @({dir}, $pkg)) {{ $item = Get-Item -LiteralPath $probe -Force\n\
              if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {{ throw ('refuse reparse point: ' + $probe) }} }}\n\
@@ -535,7 +602,13 @@ pub fn sign_and_trust() -> Result<String> {
              $null = Import-Certificate -FilePath {cer} -CertStoreLocation Cert:\\LocalMachine\\Root\n\
              $null = Import-Certificate -FilePath {cer} -CertStoreLocation Cert:\\LocalMachine\\TrustedPublisher\n\
              $lines += 'FINAL=' + (Get-AuthenticodeSignature -LiteralPath {cat}).Status.ToString()\n\
-             Set-Content -LiteralPath $owner -Value @({marker}, 'published=' + $published, 'thumbprint=' + $cert.Thumbprint, 'instance=' + $instance) -Encoding ASCII\n\
+             $thumbline = 'thumbprint=' + $cert.Thumbprint\n\
+             if ($prev.Count -gt 0 -and $prev[0].Trim() -eq {marker}) {{ \
+             $kept = @(); $done = $false\n\
+             foreach ($l in $prev) {{ if ($l -like 'thumbprint=*') {{ $kept += $thumbline; $done = $true }} else {{ $kept += $l }} }}\n\
+             if (-not $done) {{ $kept += $thumbline }}\n\
+             Set-Content -LiteralPath $owner -Value $kept -Encoding UTF8 }}\n\
+             else {{ Set-Content -LiteralPath $owner -Value @({marker}, 'published=', $thumbline, 'instance=') -Encoding UTF8 }}\n\
              $lines += 'OK=1'\n\
              }} catch {{ $lines += 'ERROR=' + $_.Exception.Message }}\n\
              Set-Content -LiteralPath {result} -Value $lines -Encoding UTF8\n",
@@ -643,6 +716,19 @@ pub fn install_and_bind(raw_input_path: &str) -> Result<String> {
         return Ok(existing.detail());
     }
     let target = _resolve_target(raw_input_path)?;
+    // ★原始设备文案必须在改绑**之前**登记★ 改绑一旦生效, 该设备就从键盘枚举里整体消失,
+    // 此后再也查不到它的产品名/厂商 —— 界面上那条合成行只能靠这份登记显示原名。
+    let identity = keyboard::list_keyboards()
+        .into_iter()
+        .find(|device| device.path.eq_ignore_ascii_case(raw_input_path));
+    let (product, label, vendor) = match &identity {
+        Some(device) => (
+            _owner_text(&device.product),
+            _owner_text(&device.label),
+            _owner_text(&device.vendor),
+        ),
+        None => (String::new(), String::new(), String::new()),
+    };
     let dir = _dir();
     let owner = dir.join(OWNER_FILE);
     let lines = _run_elevated_script("bind", |result| {
@@ -654,21 +740,24 @@ pub fn install_and_bind(raw_input_path: &str) -> Result<String> {
              $pub = ''\n\
              $m = [regex]::Matches(($out | Out-String), 'oem[0-9]+\\.inf')\n\
              if ($m.Count -gt 0) {{ $pub = $m[0].Value }}\n\
-             if ($pub -eq '') {{ $hit = Get-ChildItem -LiteralPath (Join-Path $env:SystemRoot 'INF') -Filter 'oem*.inf' -ErrorAction SilentlyContinue | Where-Object {{ (Get-Content -LiteralPath $_.FullName -Raw -ErrorAction SilentlyContinue) -like {guid_like} }} | Select-Object -First 1\n\
-             if ($hit) {{ $pub = $hit.Name }} }}\n\
+             if ($pub -eq '') {{ {find_pub} }}\n\
              $lines += 'PUBLISHED=' + $pub\n\
              $null = & pnputil.exe /restart-device {instance} 2>&1\n\
              $lines += 'RESTART_EXIT=' + $LASTEXITCODE\n\
              $thumb = ''\n\
              if (Test-Path -LiteralPath {owner}) {{ foreach ($l in (Get-Content -LiteralPath {owner})) {{ \
              if ($l -like 'thumbprint=*') {{ $thumb = $l.Substring(11) }} }} }}\n\
-             Set-Content -LiteralPath {owner} -Value @({marker}, 'published=' + $pub, 'thumbprint=' + $thumb, 'instance=' + {instance}) -Encoding ASCII\n\
+             Set-Content -LiteralPath {owner} -Value @({marker}, 'published=' + $pub, 'thumbprint=' + $thumb, \
+             'instance=' + {instance}, 'product=' + {product}, 'label=' + {label}, 'vendor=' + {vendor}) -Encoding UTF8\n\
              Set-Content -LiteralPath {result} -Value $lines -Encoding UTF8\n",
             inf = _ps_path(&_pkg_dir().join(INF_FILE)),
-            guid_like = _ps(&format!("*{}*", DEVICE_INTERFACE_GUID)),
+            find_pub = _ps_find_published("$pub"),
             instance = _ps(&target._usb_instance),
             owner = _ps_path(&owner),
             marker = _ps(OWNER_MARKER),
+            product = _ps(&product),
+            label = _ps(&label),
+            vendor = _ps(&vendor),
             result = _ps(result),
         )
     })?;
@@ -694,6 +783,55 @@ pub fn install_and_bind(raw_input_path: &str) -> Result<String> {
     ))
 }
 
+/// 按所选路径的 VID/PID 从设备树反查"当前绑在 WinUSB 上的那个 USB 节点"。
+///
+/// ★恢复路径的最后一层兜底★ 改绑后 HID 节点消失, "Raw Input 路径 → HID → USB 父节点"这条换算
+/// 已断; 所有权记录里的 `instance=` 又可能缺失/被写空。此时只剩这一条路。
+/// 同型号有多台都在 WinUSB 上时**必须停下**: 猜错一台就会把用户另一台设备一起改回去。
+fn _scan_winusb_instance(raw_input_path: &str) -> Result<String> {
+    let selected = raw_input_path.to_ascii_uppercase();
+    let (vid, pid) = match (hex_field(&selected, "VID_"), hex_field(&selected, "PID_")) {
+        (Some(vid), Some(pid)) => (vid, pid),
+        _ => {
+            return Err(anyhow!(
+                "所选设备路径里没有合法的 VID/PID（读到 {}），无法从设备树反查 USB 节点",
+                raw_input_path
+            ));
+        }
+    };
+    let mut hits: Vec<String> = Vec::new();
+    for instance in keyboard::present_usb_instances() {
+        let upper = instance.to_ascii_uppercase();
+        if hex_field(&upper, "VID_").as_deref() != Some(vid.as_str())
+            || hex_field(&upper, "PID_").as_deref() != Some(pid.as_str())
+            || !_safe_device_text(&upper)
+        {
+            continue;
+        }
+        if keyboard::device_service(&instance)
+            .is_some_and(|service| service.eq_ignore_ascii_case(WINUSB_SERVICE))
+        {
+            hits.push(upper);
+        }
+    }
+    match hits.len() {
+        1 => Ok(hits.remove(0)),
+        0 => Err(anyhow!(
+            "设备树里没有 VID_{}&PID_{} 且功能驱动为 {} 的 USB 节点（设备可能已拔出，或早已不在 WinUSB 上）",
+            vid,
+            pid,
+            WINUSB_SERVICE
+        )),
+        n => Err(anyhow!(
+            "设备树里有 {} 个 VID_{}&PID_{} 的节点都绑在 {} 上，无法判定该恢复哪一个；请只保留目标设备后重试",
+            n,
+            vid,
+            pid,
+            WINUSB_SERVICE
+        )),
+    }
+}
+
 /// 发布名必须形如 `oem123.inf`。这个串会进 `pnputil /delete-driver`，
 /// 一旦被污染就可能删掉别人的驱动包，因此宁可拒绝也不猜。
 fn _valid_published(name: &str) -> bool {
@@ -707,78 +845,146 @@ fn _valid_published(name: &str) -> bool {
         && lower.len() > "oem.inf".len()
 }
 
-/// 步骤 ③：卸载本应用的驱动包并让 Windows 自动回落原 HID 驱动，同时移除本应用装的证书。
-/// 只处理本应用登记过的东西；没有所有权记录就什么都不删，也不声称清理过。
+/// 步骤 ③：把设备恢复成普通 HID 键盘，并尽可能清掉本应用发布的驱动包与证书。
+///
+/// ★分层降级, 绝不单点依赖所有权记录★ 旧实现在 `published` 不合法时整体 `return Err`, 一步都不做
+/// —— 而那个字段恰恰会被"先改绑、后再点签名"写空(见 `sign_and_trust`), 于是用户永远回不到 hidusb。
+/// 现在的层次是:
+///   ① 发布名: 记录里合法就用它; 不合法就用与安装侧同一份 GUID 扫描(`_ps_find_published`)自行找回;
+///   ② 仍找不到 ⇒ **跳过** `/delete-driver`, 但照旧恢复设备绑定(restart-device, 必要时
+///      remove-device + scan-devices 解除绑定让 Windows 重新匹配 inbox `hidusb`);
+///   ③ USB 实例 ID 记录里也没有 ⇒ 按所选路径的 VID/PID 从设备树反查(`_scan_winusb_instance`),
+///      反查不到才停止;
+///   ④ 结局分三种如实报告, 不许把"包没找到但设备已恢复"说成"包已删除"。
+/// 恢复成功与否一律以 `SPDRP_SERVICE` 实测判定, 退出码不作证据。
 pub fn unbind_and_uninstall(raw_input_path: &str) -> Result<String> {
-    let owner = _owner_record().ok_or_else(|| {
-        anyhow!("没有本应用的 WinUSB 改绑记录；为避免误删他人驱动包与证书，未做任何改动")
-    })?;
-    if !_valid_published(&owner._published) {
-        return Err(anyhow!(
-            "所有权记录里的发布名不合法（读到 {:?}）；拒绝执行 pnputil /delete-driver",
-            owner._published
-        ));
-    }
+    let owner = _owner_record();
+    let recorded_published = owner
+        .as_ref()
+        .map(|owner| owner._published.clone())
+        .unwrap_or_default();
+    let thumbprint = owner
+        .as_ref()
+        .map(|owner| owner._thumbprint.clone())
+        .unwrap_or_default();
+    // 记录里的发布名不合法(空串/被污染)时传空串进脚本, 由脚本按 GUID 自行找回。
+    let published_hint = if _valid_published(&recorded_published) {
+        recorded_published.clone()
+    } else {
+        String::new()
+    };
     let instance = match binding_status(raw_input_path).instance() {
         Some(instance) => instance.to_string(),
-        None => return Err(anyhow!("目标 USB 节点不可读，无法核验恢复结果，已停止")),
+        None => _scan_winusb_instance(raw_input_path)
+            .map_err(|error| anyhow!("无法定位要恢复的 USB 节点：{}", error))?,
     };
     let dir = _dir();
     let lines = _run_elevated_script("unbind", |result| {
         format!(
             "$ErrorActionPreference = 'Continue'\n\
              $lines = @()\n\
-             $null = & pnputil.exe /delete-driver {published} /uninstall /force 2>&1\n\
-             $lines += 'DELETE_EXIT=' + $LASTEXITCODE\n\
+             $pub = {published}\n\
+             if ($pub -eq '') {{ {find_pub} }}\n\
+             $lines += 'PUBLISHED=' + $pub\n\
+             if ($pub -ne '') {{ $null = & pnputil.exe /delete-driver $pub /uninstall /force 2>&1\n\
+             $lines += 'DELETE_EXIT=' + $LASTEXITCODE }}\n\
+             else {{ $lines += 'DELETE_SKIPPED=1' }}\n\
              $null = & pnputil.exe /restart-device {instance} 2>&1\n\
              $lines += 'RESTART_EXIT=' + $LASTEXITCODE\n\
+             if ($pub -eq '') {{ \
+             $null = & pnputil.exe /remove-device {instance} 2>&1\n\
+             $lines += 'REMOVE_EXIT=' + $LASTEXITCODE\n\
+             $null = & pnputil.exe /scan-devices 2>&1\n\
+             $lines += 'SCAN_EXIT=' + $LASTEXITCODE }}\n\
              $thumb = {thumb}\n\
              if ($thumb -ne '') {{ foreach ($p in @('Cert:\\LocalMachine\\Root\\' + $thumb, 'Cert:\\LocalMachine\\TrustedPublisher\\' + $thumb)) {{ \
              if (Test-Path -LiteralPath $p) {{ Remove-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue }}\n\
              if (Test-Path -LiteralPath $p) {{ $lines += 'CERT_LEFT=' + $p }} }}\n\
              $mine = 'Cert:\\CurrentUser\\My\\' + $thumb\n\
              if (Test-Path -LiteralPath $mine) {{ Remove-Item -LiteralPath $mine -Force -DeleteKey -ErrorAction SilentlyContinue }} }}\n\
+             $left = ''\n\
+             {find_left}\n\
+             $lines += 'LEFT_PUBLISHED=' + $left\n\
+             if ($pub -ne '' -and $left -eq '') {{ \
              Remove-Item -LiteralPath {pkg} -Recurse -Force -ErrorAction SilentlyContinue\n\
              Remove-Item -LiteralPath {cer} -Force -ErrorAction SilentlyContinue\n\
              Remove-Item -LiteralPath {owner} -Force -ErrorAction SilentlyContinue\n\
+             $lines += 'CLEANED=1' }}\n\
              $lines += 'OK=1'\n\
              Set-Content -LiteralPath {result} -Value $lines -Encoding UTF8\n",
-            published = _ps(&owner._published),
+            published = _ps(&published_hint),
+            find_pub = _ps_find_published("$pub"),
+            find_left = _ps_find_published("$left"),
             instance = _ps(&instance),
-            thumb = _ps(&owner._thumbprint),
+            thumb = _ps(&thumbprint),
             pkg = _ps_path(&_pkg_dir()),
             cer = _ps_path(&dir.join(CER_FILE)),
             owner = _ps_path(&dir.join(OWNER_FILE)),
             result = _ps(result),
         )
     })?;
+    let published = _marker(&lines, "PUBLISHED=");
+    let left_published = _marker(&lines, "LEFT_PUBLISHED=");
+    // ★唯一的成败判据★: 设备节点的功能驱动实测已不是 WinUSB。退出码只进失败时的排查文案。
     let service = _await_binding(&instance, false).map_err(|error| {
         anyhow!(
-            "{}；pnputil 退出码 delete={} restart={}",
+            "设备仍绑在 {} 上，恢复失败（{}）；驱动包发布名 {}，pnputil 退出码 delete={} restart={} remove={} scan={}",
+            WINUSB_SERVICE,
             error,
+            if published.is_empty() {
+                "未找到".to_string()
+            } else {
+                published.clone()
+            },
             _marker(&lines, "DELETE_EXIT="),
-            _marker(&lines, "RESTART_EXIT=")
+            _marker(&lines, "RESTART_EXIT="),
+            _marker(&lines, "REMOVE_EXIT="),
+            _marker(&lines, "SCAN_EXIT=")
         )
     })?;
+    // 三种真实结局分开报告。★"包未找到但设备已恢复"绝不能说成"包已删除"★:
+    // 那份包还在系统里, 下次安装会直接撞上它, 用户必须知道。
+    let mut report = if published.is_empty() {
+        format!(
+            "驱动包未找到，但设备已恢复（{} 的功能驱动实测为 {}）；本应用发布的驱动包**未删除**\
+             （%SystemRoot%\\INF 下没有带本应用设备接口 GUID 的 oem*.inf），已保留改绑记录供重试",
+            instance, service
+        )
+    } else if left_published.is_empty() {
+        format!(
+            "驱动包已删除 + 设备已恢复（{} 的功能驱动实测为 {}，已删除本应用发布的 {}）",
+            instance, service, published
+        )
+    } else {
+        format!(
+            "设备已恢复（{} 的功能驱动实测为 {}），但驱动包 {} 删除后仍在 %SystemRoot%\\INF 里\
+             （复查命中 {}）；已保留改绑记录供重试",
+            instance, service, published, left_published
+        )
+    };
+    // 发布名到底是记录给的还是自己扫出来的, 必须写清楚: 后者说明记录已损坏, 用户下次仍会踩到。
+    if !published.is_empty() && published_hint.is_empty() {
+        report.push_str(&format!(
+            "；发布名由 INF 内设备接口 GUID 扫描找回（所有权记录里的发布名不可用，读到 {:?}）",
+            recorded_published
+        ));
+    }
     // 目录/证书是否真的清掉了必须复核; 只有 pkg 目录已空时才顺手收掉空目录。
-    let left: Vec<&String> = lines
+    let left_certs: Vec<&String> = lines
         .iter()
         .filter(|line| line.starts_with("CERT_LEFT="))
         .collect();
-    let _ = std::fs::remove_dir(&dir);
-    let residue = signing_status();
-    let mut report = format!(
-        "已恢复原驱动并实测确认（{} 的功能驱动读作 {}，已删除本应用发布的 {}）",
-        instance, service, owner._published
-    );
-    if residue.inf_present || residue.catalog_status != "Missing" {
-        report.push_str(&format!(
-            "；⚠ 驱动包文件仍有残留（{}）",
-            residue.detail()
-        ));
+    if _marker(&lines, "CLEANED=") == "1" {
+        let _ = std::fs::remove_dir(&dir);
+        let residue = signing_status();
+        if residue.inf_present || residue.catalog_status != "Missing" {
+            report.push_str(&format!("；⚠ 驱动包文件仍有残留（{}）", residue.detail()));
+        }
+    } else {
+        report.push_str("；本地驱动包文件与改绑记录已保留（未确认驱动包已从系统删除）");
     }
-    if left.is_empty() {
-        if owner._thumbprint.is_empty() {
+    if left_certs.is_empty() {
+        if thumbprint.is_empty() {
             report.push_str("；未登记证书指纹，故未移除任何证书");
         } else {
             report.push_str("；已移除本应用装入受信任根与受信任发布者的证书");
@@ -786,7 +992,8 @@ pub fn unbind_and_uninstall(raw_input_path: &str) -> Result<String> {
     } else {
         report.push_str(&format!(
             "；⚠ 以下证书未能移除：{}",
-            left.iter()
+            left_certs
+                .iter()
                 .map(|line| line.trim_start_matches("CERT_LEFT="))
                 .collect::<Vec<_>>()
                 .join("、")

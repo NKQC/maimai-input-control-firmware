@@ -160,7 +160,7 @@ export component DashboardPage inherits Rectangle {
                             vertical-stretch: 1;
                         }
 
-                        // 工作模式只读展示(唯一修改入口在设置 → 通信系统 Tab)。文案由 Rust 侧
+                        // 工作模式只读展示(唯一修改入口在设置 → 设备设置 Tab)。文案由 Rust 侧
                         // 按草稿优先口径给出, 未回读到就是"未知", 不拿默认值冒充设备真值。
                         Text {
                             text: @tr("工作模式: ") + root.work_mode_text;

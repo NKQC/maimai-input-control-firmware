@@ -2792,7 +2792,7 @@ const DBG_OFF_RESP_FAIL_REQ_LEN: usize = 163;
 /// 于是尾部整体读偏 2 字节(实测 read_ok/status/PC 全是错位垃圾值)。改固件结构必须同步这里。
 /// sizeof(UsbDebugCounters) 的旧前缀长度，旧固件仍可按此前缀解析。
 const DBG_LEN_LEGACY_COUNTERS: usize = 165;
-const DBG_LEN_COUNTERS: usize = 190;
+const DBG_LEN_COUNTERS: usize = 191;
 /// 新增 HostCmd 分发观测字段(紧随 UsbDebugCounters 原有 165B 前缀)。
 const DBG_OFF_HOST_DISPATCH_COUNT: usize = 165;
 const DBG_OFF_HOST_ALGO_INFO_DISPATCH_COUNT: usize = 169;
@@ -2811,6 +2811,11 @@ const DBG_OFF_CORE1_INT1_ARMED: usize = 185;
 /// 读数★: 补偿量被高估多少, `comm.touch_delay_100us` 就被削短多少。
 const DBG_OFF_GIO_EMIT_COST: usize = 186;
 const DBG_LEN_WITH_EMIT_COST: usize = 190;
+/// 开机校准流水线的五判据诊断字节(见固件 usb_debug.h::boot_cal_diag)。
+const DBG_OFF_BOOT_CAL_DIAG: usize = 190;
+/// 开机校准各档结局位图(见固件 usb_debug.h::boot_cal_fail_mask)。
+const DBG_OFF_BOOT_CAL_FAIL: usize = 191;
+const DBG_LEN_WITH_BOOT_CAL: usize = 192;
 const DBG_LEN_WITH_INT1: usize = 186;
 /// EP0 DEBUG_READ 的固定 GPIO/HSIOM 尾部(见 UsbDebugGpioTail)。
 const DBG_OFF_GPIO_PC: usize = DBG_LEN_COUNTERS;
@@ -4775,6 +4780,54 @@ fn main() {
                 }
                 // ★门槛必须是"这组字段自己的末端长度"★ 原先写的是 DBG_LEN_COUNTERS, 而它每次
                 // 追加新字段都会变大 —— 追加一格就把这组早就存在的字段对旧固件整体判成不可解析。
+                if report_len >= DBG_LEN_WITH_BOOT_CAL {
+                    let d = b[DBG_OFF_BOOT_CAL_DIAG];
+                    let stage = match d & 0x0F {
+                        0 => "WAIT_TRUST",
+                        1 => "IDAC_START",
+                        2 => "IDAC_WAIT",
+                        3 => "CHANNEL_START",
+                        4 => "CHANNEL_WAIT",
+                        5 => "BASELINE_START",
+                        6 => "BASELINE_WAIT",
+                        7 => "VERIFY_WAIT",
+                        8 => "DONE",
+                        other => {
+                            println!("[DBG] 开机校准: 未知 stage 编码 {}", other);
+                            "?"
+                        }
+                    };
+                    println!(
+                        "[DBG] 开机校准: stage={} provisioned={} 输出被抑制={} heavy_busy={} link_alive={}",
+                        stage,
+                        (d & 0x10) != 0,
+                        (d & 0x20) != 0,
+                        (d & 0x40) != 0,
+                        (d & 0x80) != 0
+                    );
+                    // 结局位图: stage=DONE 只说明流水线走完, 说不出"到底做了没有"。
+                    let m = b[DBG_OFF_BOOT_CAL_FAIL];
+                    let mut notes: Vec<&str> = Vec::new();
+                    if m & 0x01 != 0 { notes.push("IDAC=跳过(开关关)"); }
+                    if m & 0x02 != 0 { notes.push("IDAC=启动失败"); }
+                    if m & 0x04 != 0 { notes.push("频率自适应=跳过(开关关)"); }
+                    if m & 0x08 != 0 { notes.push("频率自适应=启动失败"); }
+                    if m & 0x10 != 0 { notes.push("基线复位=跳过(开关关)"); }
+                    if m & 0x20 != 0 { notes.push("基线复位=启动失败"); }
+                    if m & 0x40 != 0 { notes.push("末尾验收=失败"); }
+                    if m & 0x80 != 0 { notes.push("至少一档已真正执行"); }
+                    // mask 只有 RAN_SOMETHING 一位 = 三档都下达成功、没有任何一档被跳过或失败,
+                    // 且末尾验收通过。这是"开机校准完全成功"的判据, 与"什么都没做"必须区分开。
+                    println!(
+                        "[DBG] 开机校准结局: mask=0x{:02X} {}",
+                        m,
+                        match m {
+                            0x80 => "三档全部真正执行、验收通过".to_string(),
+                            0 => "流水线未推进(尚未开始或全部开关关闭)".to_string(),
+                            _ => notes.join(" | "),
+                        }
+                    );
+                }
                 if report_len >= DBG_LEN_WITH_HOST_DISPATCH {
                     println!(
                         "[DBG] dispatch_count={} algo_dispatch_count={} last_cmd=0x{:02X} last_seq={} last_resp_len={}",
@@ -7143,6 +7196,18 @@ fn main() {
             "[SELFTEST] 2.5s 后 config_entries = {}",
             ctrl.config_entries().len()
         );
+        // 可选按前缀 dump 键值: `--cfg-only <前缀>`。用于核对某个 KV 的**设备真值**(而不是界面上
+        // 的草稿态) —— 例如开机校准三档到底是 true 还是 false, 那决定固件流水线要不要动手。
+        if let Some(prefix) = args.iter().skip(1).find(|a| !a.starts_with("--")) {
+            let mut hit = 0usize;
+            for entry in ctrl.config_entries() {
+                if entry.key.starts_with(prefix.as_str()) {
+                    println!("[CFG] {} = {:?}", entry.key, entry.value);
+                    hit += 1;
+                }
+            }
+            println!("[CFG] 前缀 '{}' 命中 {} 项", prefix, hit);
+        }
         std::process::exit(0);
     }
 

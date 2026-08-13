@@ -206,6 +206,10 @@ public:
     
     // 状态查询
     uint32_t get_report_rate() const;
+    // 键盘报文累计实发数 / 发送失败数(只增不减, 主机取差值)。
+    // ★为什么必须暴露失败数★ 见 kbd_send_fail_ 的说明: 失败原先是静默的。
+    uint32_t kbd_send_count() const { return kbd_send_count_; }
+    uint32_t kbd_send_fail() const { return kbd_send_fail_; }
 
     void task();
     
@@ -443,6 +447,26 @@ private:
 
     inline void report_keyboard();
     inline void report_touch(uint32_t _now);
+    // 键盘报文的**唯一**出口: 只有这一处记发送成败。report_keyboard() 里有三个发送点,
+    // 各自计数必然漏掉一个。
+    inline void report_keyboard_send(HID_ReportID id, const uint8_t* data) {
+        if (hal_usb_->send_hid_report(id, data, 8)) {
+            kbd_send_count_++;
+        } else {
+            kbd_send_fail_++;
+        }
+    }
+
+    // 键盘报文实发 / 发送失败累计。
+    // ★send_hid_report 的返回值原先被整个丢掉★: tud_hid_report 在端点忙(上一份还没被主机取走)
+    // 时返回 false, 那份报文就此消失且不留任何痕迹 —— "按键已经输出了但主机收不到"这一环
+    // 在设备外完全不可观测, 只能靠猜。计数只增不减, 跨 init/deinit 不清零。
+    uint32_t kbd_send_count_;
+    uint32_t kbd_send_fail_;
+
+    // 上一轮键盘报文实际铺到了几个 report 集合(0..KEYBOARD_NUM)。松开或按键数收缩时据此补清
+    // 多出来的集合 —— 主机只会按 report id 各自维护按下态, 没收到抬起报文就一直算按着。
+    uint8_t kbd_reports_used_;
     
     // 触发式发送相关
     bool keyboard_needs_send_;     // 键盘是否需要发送报文

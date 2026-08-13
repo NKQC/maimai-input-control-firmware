@@ -5,7 +5,7 @@
 import { Button, CheckBox, VerticalBox, HorizontalBox, ScrollView, SpinBox, ComboBox } from "std-widgets.slint";
 import { ChannelStatus, ParamRow } from "../common/types.slint";
 import { Theme } from "../common/theme.slint";
-import { GuardedSpinBox, GuardedComboBox, HelpDot, HelpOverlay } from "../common/widgets.slint";
+import { GuardedSpinBox, GuardedComboBox, GuardedCheckBox, HelpDot, HelpOverlay } from "../common/widgets.slint";
 
 // 批量应用抽屉的宽度。★只定义一次★: 抽屉自身宽度与"算通道网格列数时要扣掉的宽度"必须是同一个
 // 常量, 两处各写一个数就会出现"展开后右边一列被抽屉盖住"。
@@ -181,9 +181,11 @@ component BatchParamRow inherits Rectangle {
     height: Theme.row-height;
     HorizontalLayout {
         spacing: 6px;
-        CheckBox {
+        // ★必须用 GuardedCheckBox★ 同 config.slint: Repeater 复用行实例, 裸 CheckBox 点一次就
+        // 失去回填, 勾选状态会跟着行号而不是跟着通道数据。
+        GuardedCheckBox {
             width: 22px;
-            checked: root.checked;
+            model_checked: root.checked;
             toggled => { root.toggled(); }
         }
         HelpDot {

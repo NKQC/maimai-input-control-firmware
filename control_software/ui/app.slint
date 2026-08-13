@@ -180,6 +180,8 @@ export component AppWindow inherits Window {
     in property <string> combo_pending_keys_text: "";
     in property <string> combo_status: "";
     in property <int> combo_count: 0;
+    // 触控→键盘链路诊断一行(由设备实测位推出; 读不到诊断字段时为"诊断字段不可用…")。
+    in property <string> kbd_link_diag: "";
     callback combo_zone_toggled(int);
     callback combo_zones_clear();
     callback combo_captured(string, bool, bool, bool, bool);
@@ -901,6 +903,7 @@ export component AppWindow inherits Window {
                 combo_pending_keys_text: root.combo_pending_keys_text;
                 combo_status: root.combo_status;
                 combo_count: root.combo_count;
+                kbd_link_diag: root.kbd_link_diag;
                 combo_zone_toggled(z) => { root.combo_zone_toggled(z); }
                 combo_zones_clear() => { root.combo_zones_clear(); }
                 combo_captured(t, c, s, a, g) => { root.combo_captured(t, c, s, a, g); }

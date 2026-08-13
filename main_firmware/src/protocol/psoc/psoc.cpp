@@ -1018,6 +1018,16 @@ bool Psoc::baseline_reset(uint8_t ch) {
     return _submit(SpiOp::BASELINE_RESET, ch, 0, 0, &completed, nullptr, 10000000u);
 }
 
+// 开机校准流水线专用的非阻塞入队(见 psoc.h 处说明)。out=nullptr ⇒ _submit 走写类分支立即返回;
+// 入队时 _heavy_enq 已递增, 故调用方在下一轮就能看到 heavy_busy()==true, 直到 core1 真正执行完。
+// 入队自旋预算给 100ms 默认值即可: 本流水线只在 heavy_busy()==false 时才发起, 环必然有空位。
+bool Psoc::start_boot_calibrate(uint8_t ch) {
+    return _submit(SpiOp::CALIBRATE, ch, 0, 0, nullptr);
+}
+bool Psoc::start_boot_baseline_reset(uint8_t ch) {
+    return _submit(SpiOp::BASELINE_RESET, ch, 0, 0, nullptr);
+}
+
 bool Psoc::_start_runtime_param_apply(uint8_t ch, uint8_t gain, uint8_t div) {
     if (_runtime_apply.active != 0u || _runtime_apply.pending != 0u ||
         _runtime_apply.complete != 0u || heavy_busy()) return false;

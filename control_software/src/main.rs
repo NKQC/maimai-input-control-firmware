@@ -72,7 +72,10 @@ const ALGO_LED_DEMO_TEMPLATE: &str = include_str!(concat!(
     "/../psoc_firmware/algo/psoc_algo_led_demo.c"
 ));
 
+/// Cp 测量的真实失败：通道已参与测量，但结果无效。
 const CP_MEASURE_FAILED: u32 = 0x00FF_FFFF;
+/// Cp 未测量：通道本轮被禁用，固件刻意跳过测量。
+const CP_NOT_MEASURED: u32 = 0x00FF_FFFD;
 
 /// 项目仓库地址(关于页展示 + 一键复制到剪贴板)。
 const REPO_URL: &str = "https://github.com/NKQC/maimai-input-control-firmware/tree/v4";

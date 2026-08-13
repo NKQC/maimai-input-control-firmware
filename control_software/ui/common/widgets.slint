@@ -19,10 +19,13 @@ export component CollapsibleSection inherits Rectangle {
     in property <string> summary;
     in-out property <bool> expanded: false;
 
+    // 折叠态靠这层 clip 吃掉 max-height 归零后溢出的内容(见下方内容区说明)。
+    clip: true;
     border-radius: Theme.radius;
     border-width: 1px;
     border-color: Theme.border;
     background: Theme.panel;
+    vertical-stretch: 0;
 
     // 与 SectionCard 共用同一套卡片度量(内边距/行距/标题行高), 折叠区块与常规分区卡片
     // 在同一页里并排时才不会一高一矮、一疏一密。
@@ -65,16 +68,21 @@ export component CollapsibleSection inherits Rectangle {
             }
         }
 
-        // 内容区。Slint 不允许把 @children 放进条件元素(if), 故折叠用"高度归零 + clip 裁切"实现,
-        // 展开时高度取内容自身首选高度 ——效果等价于条件实例化, 且外层布局会随之伸缩。
-        Rectangle {
-            clip: true;
-            height: root.expanded ? body.preferred-height : 0px;
-            body := VerticalLayout {
-                padding: 0px;
-                spacing: Theme.gap;
-                @children
-            }
+        // 内容区。Slint 不允许把 @children 放进条件元素(if), 所以折叠只能靠"高度归零 + 裁切"。
+        // ★但绝不能为此在布局里套一层 Rectangle★ 这正是本工程记过的那一课: Rectangle 在布局里
+        // 没有内在高度, 拿 `body.preferred-height` 反推时, 只要 body 里有 `wrap: word-wrap` 的
+        // Text(它的高度依赖尚未确定的宽度), 反推值就会偏小 —— 于是内容被裁掉一截, 而 body 仍按
+        // 自己的真实高度绘制并向上溢出, 压到上一个区块的标题上面去。
+        // 实测症状(物理键盘页): "当前按键触发状态"展开后只剩最后两行可见, 且那两行画到了下一个
+        // 折叠区标题"每键参数"之上, 底部同时被裁。
+        // 现在: 内容直接就是布局(有内在高度, 由子项自然反推, 不做任何 preferred-height 反推),
+        // 折叠时用 max-height 归零, 溢出部分由 root 自身的 clip 吃掉。
+        body := VerticalLayout {
+            padding: 0px;
+            spacing: Theme.gap;
+            // 展开: 不设上限, 取自然高度。折叠: 归零, 子项溢出交给 root 的 clip。
+            max-height: root.expanded ? 100000px : 0px;
+            @children
         }
     }
 }
@@ -172,9 +180,22 @@ export component GuardedSpinBox inherits SpinBox {
             self._committed_value = self.value;
         }
     }
-    // 失焦时才按围栏校验并提交；编辑中的字符只留在控件草稿中。
-    // 标准 SpinBox 未向外暴露 Enter 回调；其内部 accepted 动作仍会处理文本，
-    // 业务提交统一留给失焦，避免逐键回写模型。
+    // ★编辑当场就入草稿, 不必等失焦★
+    // 原先只有下面那个 `changed has-focus` 会 `_commit()`, 于是"改完一个输入框必须再去点下一个
+    // 输入框, 上一个的值才算数"(实测反馈) —— 只填一格然后直接点"保存到设备"的人会把刚填的值
+    // 丢掉, 而界面上那一格明明显示着新数字。本组件顶部注释一直声称"编辑过程中仍逐次抛出、维持
+    // 改了就入草稿的行为", 实现里却没有, 这里把它补上。
+    // ★为什么现在安全★ 外部回填只在 `!has-focus` 时才同步(见 `changed model_value`), 所以逐次
+    // 上抛不会与回读互相打断; 而 `_apply()` 制造的那个中间值只在无焦点路径与失焦提交里出现,
+    // 被这里的 has-focus 守卫挡掉, 不会漏抛一个越界中间值。
+    // 越界文本仍由失焦时的围栏夹取回显负责, 草稿侧另有 Rust 的统一夹取兜底。
+    changed value => {
+        if (self.has-focus && self.value != self._committed_value) {
+            self._committed_value = self.value;
+            root.committed(self.value);
+        }
+    }
+    // 失焦时按围栏校验并回显；此时若值已由上面那条即时上抛过, 则不会重复抛出。
     function _commit() {
         self._apply(self.value);
         if (self.value != self._committed_value) {
@@ -208,6 +229,24 @@ export component GuardedComboBox inherits ComboBox {
 
     init => { self.current-index = root.model_index; }
     changed model_index => { self.current-index = root.model_index; }
+}
+
+// 带回填守卫的复选框。
+// ★同一处坑的复选框版本★ 这是三件套里最后补上的一个, 而它造成的现象最难看懂:
+// std-widgets 的 CheckBox 在被点击时会给自己的 `checked` **赋值**, 而 Slint 里一次赋值就永久
+// 摧毁该属性上的声明式绑定 ⇒ 用户手点过一次之后, `checked: <外部真值>` 这条绑定便不再存在,
+// 此后 Rust 侧无论怎么回填都推不进这个框。
+// 实测症状(单通道精调页): 点过一次"通道启用"开关后再切通道, 复选框就永远停在上次的样子 ——
+// 同一页里按钮文案/禁用红字/参数区都按真值走(它们是 Text/enabled, 没有被赋值摧毁的问题),
+// 只有复选框自己不跟, 于是"复选框说禁用、旁边按钮却全部可用"。
+// Repeater 里更隐蔽: 行实例会被复用(换通道/换页只换 entry 不重建元素), 所以一行被点过之后,
+// 那一行对所有后续数据都失去回填 —— 表现为"某一格的勾选状态跟着行号而不是跟着数据"。
+// 用法: 不写 `checked:`, 改写 `model_checked:`, 并在 `toggled` 里上抛意图。
+export component GuardedCheckBox inherits CheckBox {
+    in property <bool> model_checked: false;
+
+    init => { self.checked = root.model_checked; }
+    changed model_checked => { self.checked = root.model_checked; }
 }
 
 // 参数说明的"左侧悬浮问号"。
@@ -544,9 +583,11 @@ export component SeriesRow inherits HorizontalLayout {
         vertical-alignment: center;
         horizontal-alignment: center;
     }
-    CheckBox {
+    // ★必须用 GuardedCheckBox★ 这一行由模型驱动(算法上报变量组是 Repeater, 行实例会被复用),
+    // 裸 CheckBox 点一次就摧毁 `checked` 绑定, 之后换算法/换声明再也回填不进来。
+    GuardedCheckBox {
         text: root.label;
-        checked: root.checked;
+        model_checked: root.checked;
         horizontal-stretch: 1;
         toggled => { root.toggled(self.checked); }
     }
@@ -616,8 +657,16 @@ export component KeyCaptureBox inherits Rectangle {
     property <bool> _recording: false;
     property <bool> _acted: false;
     property <duration> _capture_idle_timeout: 500ms;
+    // 右侧固定预留 = 4px 留白 + HID 直填框 72px + 间距 6px + 「应用」按钮 60px + 4px 留白。
+    // ★原先只留 98px★: 按钮宽 30px, 而 fluent Button 左右内边距合计就有 ~24px, 留给文字仅 6px,
+    // 于是「应用」被压成一个残缺的字(界面上看到的那个孤零零的"用"就是这么来的)。
+    // 三处 x/width 与本常量同源, 改一处必须一起改。
+    property <length> _tail_width: 146px;
     forward-focus: fs;
     height: 28px;
+    // 右侧 146px 是固定预留, 再窄下去左侧键组合显示区就归零了。90px 是"Ctrl + Shift + F12"
+    // 这类常见组合还能看清的下限。
+    min-width: root._tail_width + 90px;
     border-width: 1px;
     border-radius: Theme.radius-small;
     border-color: root._recording ? #4a90d9 : Theme.border-light;
@@ -633,7 +682,7 @@ export component KeyCaptureBox inherits Rectangle {
     idle_focus := FocusScope { }
     // 录制焦点只覆盖左侧区域，直填框获得焦点后不会被 key-pressed 捕获。
     fs := FocusScope {
-        width: parent.width - 98px;
+        width: parent.width - root._tail_width;
         height: parent.height;
         key-pressed(e) => {
             root._begin();
@@ -671,19 +720,20 @@ export component KeyCaptureBox inherits Rectangle {
         color: root._recording ? Theme.accent : #d0d6dd;
     }
     hid_input := LineEdit {
-        x: parent.width - 94px;
+        x: parent.width - root._tail_width + 4px;
         y: 3px;
-        width: 56px;
+        // 72px: 占位文本 "HID" 加 fluent LineEdit 自身内边距后仍看得全, 也够填 "0x1E" 这类输入。
+        width: 72px;
         height: parent.height - 6px;
         placeholder-text: "HID";
         accepted(t) => { root.hid_submitted(t); }
     }
     Button {
-        x: parent.width - 34px;
+        x: parent.width - 64px;
         y: 3px;
-        width: 30px;
+        width: 60px;
         height: parent.height - 6px;
-        text: @tr("用");
+        text: @tr("应用");
         clicked => { root.hid_submitted(hid_input.text); }
     }
 }

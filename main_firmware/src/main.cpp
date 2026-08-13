@@ -126,7 +126,10 @@ void setup() {
     watchdog_hw->scratch[CRASH_SCRATCH_RUN] = 0u;
     watchdog_hw->scratch[CRASH_SCRATCH_STAGE] = 0u;
     watchdog_hw->scratch[7] = 0u;
-    if ((boot_flag == WD_RUNNING_MAGIC) && crash_bootsel_armed) {
+    // ★仅当"上次确实运行中崩溃"且"已武装"才进 BOOTSEL★: ran_before 读 scratch[0]=CRASH_RUN_MAGIC(主循环每轮刷),
+    // boot_flag 读 scratch[7]=WD_RUNNING_MAGIC(只在 setup 末写一次)。主动重启会清 scratch[7] 但保留 scratch[0],
+    // 所以判据必须用 ran_before, 否则任何主动重启+武装窗口重合都会误进 BOOTSEL。
+    if (ran_before && crash_bootsel_armed) {
         reset_usb_boot(0, 0);
     }
 

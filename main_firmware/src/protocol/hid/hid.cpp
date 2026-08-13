@@ -9,6 +9,7 @@ HID* HID::instance_ = nullptr;
 // 私有构造函数
 HID::HID() 
     : initialized_(false), hal_usb_(nullptr), report_count_(0), last_report_time_(0), cached_report_rate_(0),
+      kbd_send_count_(0), kbd_send_fail_(0), kbd_reports_used_(0),
       keyboard_needs_send_(false), touch_needs_send_(false), last_keyboard_send_(0), last_touch_send_(0) {
     keyboard_state.clear();
 }
@@ -170,18 +171,22 @@ uint8_t HID::touch_down_count() const {
 void HID::report_keyboard() {
     // HID键盘报文格式: [modifier][reserved][key1][key2][key3][key4][key5][key6]
     // 总共8字节，符合标准HID键盘报文格式
-    static uint8_t keyboard_report[8];
-    static uint8_t keyboard_enum = 0;
-    static uint8_t keys_to_send = 0;
-    static uint8_t key_index = 0;
-    keyboard_enum = 0;
-    keys_to_send = keyboard_state.key_count;
-    key_index = 0;
+    static uint8_t keyboard_report[8];   // 8B 缓冲留静态, 避免每次进栈
+    uint8_t keyboard_enum = 0;
+    uint8_t keys_to_send = keyboard_state.key_count;
+    uint8_t key_index = 0;
     
     // 如果没有按键按下且没有修饰键，发送空报文
     if (keyboard_state.key_count == 0 && keyboard_state.modifier_keys == 0) {
         memset(keyboard_report, 0, 8);
-        hal_usb_->send_hid_report(keyboard_id[0], keyboard_report, 8);
+        // ★必须清掉上一轮用过的**每一个**集合★ NKRO 靠 3 个 report id 各摊 6 键(见 keyboard_id[]),
+        // 原先只向 keyboard_id[0] 发一份空报文 —— 于是当上一轮铺到了 keyboard2/3 时, 那两个集合
+        // 里按着的键再也收不到抬起报文, 在主机端永久卡住。
+        const uint8_t clear_count = (kbd_reports_used_ > 0u) ? kbd_reports_used_ : 1u;
+        for (uint8_t i = 0; i < clear_count && i < KEYBOARD_NUM; i++) {
+            report_keyboard_send(keyboard_id[i], keyboard_report);
+        }
+        kbd_reports_used_ = 0u;
         return;
     }
     
@@ -207,19 +212,22 @@ void HID::report_keyboard() {
         }
         
         // 发送报文
-        hal_usb_->send_hid_report(keyboard_id[keyboard_enum], keyboard_report, 8);
+        report_keyboard_send(keyboard_id[keyboard_enum], keyboard_report);
         
         keyboard_enum++;
         keys_to_send -= report_key_count;
         
     } while (keys_to_send > 0 && keyboard_enum < KEYBOARD_NUM);
     
-    // 如果只有修饰键没有普通按键，确保至少发送一次报文
-    if (keyboard_state.key_count == 0 && keyboard_state.modifier_keys != 0 && keyboard_enum == 0) {
+    // ★收缩时补清★ 上一轮铺到了更多集合(例如按了 8 键用掉 2 个, 本轮只剩 3 键只用 1 个),
+    // 多出来的那些集合若不显式清空, 它们的旧键会留在主机端。与上面的全松开分支同一个道理。
+    for (uint8_t i = keyboard_enum; i < kbd_reports_used_ && i < KEYBOARD_NUM; i++) {
         memset(keyboard_report, 0, 8);
-        keyboard_report[0] = keyboard_state.modifier_keys;
-        hal_usb_->send_hid_report(keyboard_id[0], keyboard_report, 8);
+        report_keyboard_send(keyboard_id[i], keyboard_report);
     }
+    kbd_reports_used_ = keyboard_enum;
+    // 原先此处还有一个 "只有修饰键且 keyboard_enum == 0" 的兜底分支: do-while 至少执行一次,
+    // keyboard_enum 退出时恒 >= 1, 该条件永假 —— modifier-only 早已由循环体正确发出。已删。
 }
 
 void HID::report_touch(uint32_t _now) {

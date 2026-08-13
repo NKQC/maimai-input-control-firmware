@@ -80,15 +80,15 @@ pub(super) fn start(ui: &AppWindow, inputs: TickInputs) -> slint::Timer {
     let mut algo_overlay_dirty = true;
     let mut reconnect_tick = 0u32;
     let mut was_connected = false;
-    // 每个 USB 会话只在基础探针收敛后武装一次。DEBUG_CRASH_BOOTSEL 的 ACK 与
-    // CFG_GET_ALL 共用单响应通道，不能在连接边沿把两条控制帧背靠背塞入首轮握手。
-    let mut crash_bootsel_arm_pending = false;
+    // 基础连接探针是否仍在收敛；下降沿只触发一次后置全通道启用态回读。
+    let mut last_conn_probes_pending = false;
+    // ★DEBUG_CRASH_BOOTSEL 武装已移除★: 每次连接自动武装导致任何主动重启都被误判为崩溃并进 BOOTSEL,
+    // 现仅在显式需要时（selftest --arm-crash-bootsel）才手动武装，日常使用保持解除态（崩溃仅正常重启）。
     // 每个 USB 会话在基础探针收敛后同步一次"设备上真正跑着的算法"(C 源 + ASM)。
-    // 与武装帧同理: 不能在连接边沿就发, 那会和基础探针抢同一条 vendor 单响应通道。
     let mut algo_sync_pending = false;
-    // 武装帧的 ACK 需要先独占一个 vendor 响应轮次；在短暂结算窗内禁止 TELEM_START，
-    // 避免两个控制命令在同一 UI tick 进入固件的单响应通道。
-    let mut crash_bootsel_settle_until: Option<Instant> = None;
+    // 每个 USB 会话在基础探针收敛后读一次"上次复位的死前遗言"并立即清除设备置位。
+    // ★一次性★ 清除成功后本会话不再重复读取, 否则同一次崩溃会被反复告警。
+    let mut crash_report_pending = false;
     // 冷启动首帧可能晚于基础探针数秒；在实际收到 TELEM_DATA 前禁止自愈重发，
     // 以免与固件 provisioning 的正常首帧窗口竞争。
     let mut telemetry_first_frame_seen = false;

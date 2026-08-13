@@ -204,6 +204,28 @@ private:
     // 按 modifier 位图 press/release 修饰键(LCtrl..LGui = HID 0xE0..0xE3)。
     static void _apply_mods(uint8_t mod, bool pressed);
 
+    // ★触控→键盘链路诊断快照★ task() 每轮如实记录各门控的实测值, 由 KBD_GET_STATE 尾部回传。
+    // 门控链条有 6 环(总开关 → 仅协议发送 → 扫描抑制 → 掩码可信 → 分区绑定 → 组合判定),
+    // 任一环断掉在外部看到的都是同一个现象"完全不输出", 而中间态原先一个都读不到, 只能靠猜。
+    // ★只写不读★: 判定路径不使用本结构任何字段, 加它纯为可观测性。
+    struct LinkDiag {
+        uint64_t touch_mask;   // PSoC 实时触摸掩码(36 位物理通道)
+        uint64_t area_raw;     // 本轮 map_to_areas 结果(34 位逻辑分区)
+        uint8_t  flags;        // 见 DIAG_* 位定义
+        uint8_t  bound_zones;  // 已绑定分区数(BindingService::bound_zone_count)
+        void clear() { touch_mask = 0; area_raw = 0; flags = 0; bound_zones = 0; }
+    };
+    // LinkDiag::flags 位定义。写入在 task()、回传在 _handle_get_state, 两处共用同一组常量。
+    static constexpr uint8_t DIAG_MAP_EN       = 0x01;  // _kbd_map_en
+    static constexpr uint8_t DIAG_SERIAL_ONLY  = 0x02;  // _kbd_map_serial_only
+    static constexpr uint8_t DIAG_MAI2_SENDING = 0x04;  // GameIo::mai2_touch_sending()
+    static constexpr uint8_t DIAG_SUPPRESSED   = 0x08;  // SensorLink::output_suppressed()
+    static constexpr uint8_t DIAG_TOUCH_HOLD   = 0x10;  // Psoc::touch_hold_ok()
+    static constexpr uint8_t DIAG_MAP_ACTIVE   = 0x20;  // 本轮实际 map_active
+    static constexpr uint8_t DIAG_COMBO_ACTIVE = 0x40;  // _combo_active()
+    static constexpr uint8_t DIAG_HID_INIT     = 0x80;  // HID::is_initialized()
+    LinkDiag _diag;
+
     uint16_t _phys_state;                // 已去抖的 12 位按下态
     uint16_t _phys_out;                  // 当前实际输出 HID 的 12 位(经长按状态机)
     uint64_t _touch_active;              // 上次驱动键盘的分区 mask(用于差分 press/release)

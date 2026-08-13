@@ -92,8 +92,15 @@ constexpr uint8_t kParamIds[] = {
     0x0C,  // ENABLED(通道启用开关: 0=禁用/电极高阻 1=启用)
 };
 constexpr uint8_t kParamCount = sizeof(kParamIds) / sizeof(kParamIds[0]);
-// Cp 哨兵(与 PSoC/上位机一致): 未测量 / 测量失败 / 读取失败。
+// Cp 哨兵(与 PSoC/上位机一致): 测量失败 / 读取失败都用 0xFFFFFF —— 它就是 PSoC 在 BIST 失败
+// (短接/电容过大)时留下的值。
 constexpr uint32_t CP_UNMEASURED_FF = 0x00FFFFFFu;
+// ★禁用通道 = 未测量, 必须与"测量失败"分开★ PSoC 每次 MEASURE_CP 先把 36 个 cp_value 统一预置成
+// 0xFFFFFF, 再逐通道测量并**跳过禁用通道**(main.c 的 `if (!_ch_is_enabled(w)) continue;`), 于是
+// 禁用通道恒停在与真失败完全相同的哨兵上。上位机据此把"这轮没测它"报成"测量失败: 可能短接或电容
+// 过大", 每次测电容后当次禁用的那组通道必然被点名(实测两次分别是 CH0/3/17/35 与 CH8/25/26)。
+// 0xFFFFFE 不能用(PSoC 拿它表示"超上限已钳位"的真实读数), 故取 0xFFFFFD。
+constexpr uint32_t CP_DISABLED_FF = 0x00FFFFFDu;
 // PARAM_GET_ALL 的"全通道单参数"变体标记(payload = 0xFF + param_id)。
 constexpr uint8_t kAllChannels = 0xFFu;
 
@@ -1498,11 +1505,25 @@ void SensorLink::_handle_sweep_start(const HostFrame& frame, uint8_t* response, 
         return;
     }
     // ★先拿到原值再动手★: 取不到就绝不开扫 —— 否则会话结束时无从写回, 该通道永久停在扫描参数上。
+    // ★但单次读失败不等于读不到★: get_param 走"core0 入队 → core1 独占 SPI 执行"的信箱, 在遥测/
+    // Focus 正在推流时命令环与 SPI 都更忙, 偶发失败是**已知现象** —— 逐格 READBACK 那里早就按
+    // "留在本阶段兜底重试"处理了(见本文件 READBACK 分支注释: 设备完全健康时首格也会读失败)。
+    // 这里却一直是单次尝试、失败即 NAK, 于是无头路径能开扫、UI 推流中点"频谱扫描"却被拒
+    // (实测报错 `PSoC param readback failed (sweep needs original gain/div)`)。同一课要学完。
+    // 重试上限取 3: 每次失败最多已消耗一个 100ms 信箱预算, 再多就该如实告诉用户链路真的不通。
     uint32_t original_gain = 0, original_div = 0;
-    if (!psoc->get_param(channel, SWEEP_PARAM_ID_GAIN, &original_gain) ||
-        !psoc->get_param(channel, SWEEP_PARAM_ID_DIV, &original_div)) {
+    bool gain_ok = false, div_ok = false;
+    for (uint8_t attempt = 0; attempt < 3u && !(gain_ok && div_ok); attempt++) {
+        if (!gain_ok) gain_ok = psoc->get_param(channel, SWEEP_PARAM_ID_GAIN, &original_gain);
+        if (!div_ok)  div_ok  = psoc->get_param(channel, SWEEP_PARAM_ID_DIV, &original_div);
+    }
+    if (!(gain_ok && div_ok)) {
+        // 分别报出哪一项没读到: "两个都没读到"与"只有分频没读到"指向的排查方向不同。
+        const char* detail = gain_ok ? "PSoC param readback failed after 3 tries (sns_clk_div)"
+                           : (div_ok ? "PSoC param readback failed after 3 tries (idac_gain)"
+                                     : "PSoC param readback failed after 3 tries (idac_gain + sns_clk_div)");
         *response_length = HostCmdCodec::encode_nak(frame.seq, HostCmdError::SENSOR_ERROR,
-            "PSoC param readback failed (sweep needs original gain/div)", response, HOST_CMD_RESP_BUF_MAX);
+            detail, response, HOST_CMD_RESP_BUF_MAX);
         return;
     }
 
@@ -1908,6 +1929,11 @@ void SensorLink::_handle_cp_get(const HostFrame& frame, uint8_t* response, uint1
     // NAK 只保留给非法通道(上面已处理)。
     if (!Psoc::getInstance()->get_cp(ch, &cp_ff)) {
         cp_ff = CP_UNMEASURED_FF;
+    }
+    // 禁用通道读回哨兵 ⇒ 改报"未测量"。只在读回值**就是**哨兵时改写: 通道若曾在启用状态下被测过、
+    // 之后才被禁用, PSoC 那份 cp_value 会保留上次的真实读数, 那是真实数据, 不该抹成"未测量"。
+    if (cp_ff == CP_UNMEASURED_FF && !CsdConfig::getInstance()->ch_enabled(ch)) {
+        cp_ff = CP_DISABLED_FF;
     }
 
     // HostFrame 为 4102B；core0 栈只有 8192B 且下界就是堆顶，响应帧必须借共享静态工作帧。

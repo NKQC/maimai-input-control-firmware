@@ -119,6 +119,7 @@ pub(crate) fn register_touch_callbacks(
         }
         let channel = ctrl_clone.borrow().binding_channel_of(zone_idx as usize);
         if channel != 0xFF {
+            let _ = ctrl_clone.borrow_mut().request_params(channel);
             let ui = ui_zone_activated.upgrade().unwrap();
             ui.set_sel_channel(channel as i32);
             // Tab 顺序: 0绑区 1协议 2触控通道 3触控全局 4单通道精调 …(协议页插到索引 1 后全部后移一位)
@@ -195,11 +196,14 @@ pub(crate) fn register_touch_callbacks(
         ctrl_clone.borrow_mut().plot_freeze("用户暂停画面");
     });
 
-    // 从全通道状态卡进入精调：选中物理通道并切换到“单通道精调”子标签(索引 4)。
+    // 从全通道状态卡进入精调：选中物理通道、补发其参数回读并切换到“单通道精调”子标签(索引 4)。
+    let ctrl_clone = controller.clone();
     let ui_channel = ui_weak.clone();
     ui.on_channel_selected(move |channel| {
+        let channel = channel.clamp(0, 35);
+        let _ = ctrl_clone.borrow_mut().request_params(channel as u8);
         let ui = ui_channel.upgrade().unwrap();
-        ui.set_sel_channel(channel.clamp(0, 35));
+        ui.set_sel_channel(channel);
         ui.set_settings_tab(SETTINGS_PAGE_CURVES);
     });
 

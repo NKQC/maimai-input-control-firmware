@@ -303,6 +303,10 @@ impl AppController {
     pub fn kbd_state_version(&self) -> u64 {
         self.kbd_state_version
     }
+    /// 触控→键盘链路诊断的最近一次实测读数。None = 该段读不到, 调用方必须显式说明"不可用"。
+    pub fn kbd_link_diag(&self) -> Option<&crate::proto::KbdLinkDiag> {
+        self.kbd_link_diag.as_ref()
+    }
     pub fn kbd_map(&self, idx: u8) -> u8 {
         if let Some((code, _)) = self.drafts.kbd_map(idx) {
             return code;
@@ -346,6 +350,9 @@ impl AppController {
                 self.kbd_state_raw = (frame.payload[2] as u16) | ((frame.payload[3] as u16) << 8);
                 self.kbd_state_out = (frame.payload[4] as u16) | ((frame.payload[5] as u16) << 8);
             }
+            // 第二段尾部: 触控→键盘链路诊断。读不到就写 None(界面据此显示"诊断字段不可用"),
+            // ★不保留上一次的旧读数★ —— 那会让"固件不回传了"看起来像"链路还正常"。
+            self.kbd_link_diag = crate::proto::decode_kbd_link_diag(&frame.payload);
             self.kbd_state_version = self.kbd_state_version.wrapping_add(1);
         }
     }

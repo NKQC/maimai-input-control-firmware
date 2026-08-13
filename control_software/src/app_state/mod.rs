@@ -470,6 +470,118 @@ enum LedWriteOp {
     Preview,
 }
 
+/// 设备侧"上次复位的死前遗言"(固件 `UsbDebugCounters` 的 last_boot_* / last_crash_* 段)。
+///
+/// ★为什么合成一个 struct★ 这几项只有合起来才能定性(fault=1 → 跑飞; fault=0 且 peak 接近看门狗
+/// 5s → 主循环被拖死; 两者皆 0 → 外部原因), 散成多个返回值必然出现"只取一半就下结论"。
+#[derive(Clone, Copy, Default)]
+pub struct LastCrashReport {
+    /// core0 停在哪个阶段(CrashStage / LOOP_BASE+seg / GAMEIO_BASE+sub); 0xFF = 判据不可信。
+    pub stage: u8,
+    /// 上次复位前主循环确实在跑(即"运行中崩溃")。
+    pub was_watchdog: bool,
+    /// 上次复位由 hardfault 触发(自装 isr_hardfault 留标记后主动软复位)。
+    pub was_fault: bool,
+    /// hardfault 出错核: 0=core0 1=core1 0xFF=上次不是 hardfault。
+    pub fault_core: u8,
+    /// `watchdog_hw->reason` 低位: bit0=TIMER bit1=FORCE。
+    pub reset_reason: u8,
+    /// 最后一次进段时"本轮已耗时"(ms) —— 时间到底花在哪一段。
+    pub stage_at_ms: u16,
+    /// 上次运行期已完成轮的最长耗时(ms)。
+    pub peak_ms: u16,
+}
+
+impl LastCrashReport {
+    /// 是否构成一次需要告警的异常启动。两者皆 0 = 正常启动, 不该占用 WARN 级。
+    pub fn abnormal(&self) -> bool {
+        self.was_watchdog || self.was_fault
+    }
+
+    /// 阶段码 → 可读名。未知码如实写出原值, 绝不猜。
+    /// 名字表与固件 `usb_debug.h` 的 CrashStage / LoopSeg / GameIoSeg / PM_STAGE_* 一一对应。
+    pub fn stage_name(&self) -> String {
+        const CRASH: [&str; 8] = [
+            "NONE(正常/未知)",
+            "CFG_FLASH(ConfigManager::save_config_task)",
+            "CSD_FLASH(CsdConfig::save)",
+            "ALGO_FLASH(PsocAlgo::save)",
+            "PSOC_SUBMIT(等 core1 结果)",
+            "PSOC_ENQUEUE(等命令环空位)",
+            "USB_UPDATE(主机命令分发)",
+            "CORE1_CMD(core1 SPI 命令)",
+        ];
+        const LOOP_SEG: [&str; 8] = [
+            "loop/usb_task",
+            "loop/psoc",
+            "loop/host_cmd",
+            "loop/tx_sched",
+            "loop/game_io",
+            "loop/keyboard",
+            "loop/nv_commit",
+            "loop/led",
+        ];
+        const GAMEIO_SEG: [&str; 8] = [
+            "game_io/binding",
+            "game_io/serial_rx",
+            "game_io/ser_reset",
+            "game_io/light",
+            "game_io/touch_map",
+            "game_io/send_touch",
+            "game_io/light_state",
+            "game_io/ledmap",
+        ];
+        let named = match self.stage {
+            0xFF => Some("不可信(上次并非运行中崩溃, scratch 内容随机)".to_string()),
+            code if (code as usize) < CRASH.len() => Some(CRASH[code as usize].to_string()),
+            code if (0x10..0x18).contains(&code) => {
+                Some(LOOP_SEG[(code - 0x10) as usize].to_string())
+            }
+            code if (0x20..0x28).contains(&code) => {
+                Some(GAMEIO_SEG[(code - 0x20) as usize].to_string())
+            }
+            0x30 => Some("light/rx_read(cdc_read)".to_string()),
+            0x31 => Some("light/feed(逐字节 _dispatch)".to_string()),
+            0x32 => Some("light/ack_free(查 TX FIFO 余量)".to_string()),
+            0x33 => Some("light/ack_write(写 TX FIFO)".to_string()),
+            0x34 => Some("light/fade_step".to_string()),
+            0x36 => Some("cdc/write_available".to_string()),
+            0x37 => Some("cdc/write".to_string()),
+            0x38 => Some("cdc/write_flush".to_string()),
+            0x39 => Some("cdc/read".to_string()),
+            0x3A => Some("cdc/read_done".to_string()),
+            0x3B => Some("cdc/rx_done".to_string()),
+            0x3C => Some("tud_task(进入)".to_string()),
+            0x3D => Some("tud_task(已返回)".to_string()),
+            _ => None,
+        };
+        match named {
+            Some(name) => format!("0x{:02X} {}", self.stage, name),
+            None => format!("未知(0x{:02X})", self.stage),
+        }
+    }
+
+    /// 复位原因位含义。固件只保留低 2 位, 故未置位时如实写"无置位"而不是编一个原因。
+    pub fn reset_reason_text(&self) -> String {
+        match self.reset_reason & 0x3 {
+            0 => "无置位(非看门狗硬件复位)".to_string(),
+            1 => "bit0=TIMER(看门狗超时)".to_string(),
+            2 => "bit1=FORCE(软件强制复位)".to_string(),
+            _ => "bit0=TIMER + bit1=FORCE".to_string(),
+        }
+    }
+
+    /// hardfault 出错核。非 fault 时如实说明该位无意义。
+    pub fn fault_core_text(&self) -> String {
+        match (self.was_fault, self.fault_core) {
+            (false, _) => "不适用(上次非 hardfault)".to_string(),
+            (true, 0) => "core0".to_string(),
+            (true, 1) => "core1".to_string(),
+            (true, other) => format!("未知(0x{:02X})", other),
+        }
+    }
+}
+
 // ============================================================================
 // AppController: 纯逻辑状态机,不依赖 Slint
 // ============================================================================
@@ -786,6 +898,9 @@ pub struct AppController {
     /// 旧固件只回 phys_state 时保持 0 —— 不拿 phys_state 冒充 raw/out(那会让防抖效果看不出来)。
     kbd_state_raw: u16,
     kbd_state_out: u16,
+    /// 触控→键盘链路诊断(KBD_GET_STATE 第二段尾部字段)。None = 该段读不到(旧固件/响应截断),
+    /// 界面必须显示"诊断字段不可用"而不是把缺字段当成"各环都为假"。
+    kbd_link_diag: Option<crate::proto::KbdLinkDiag>,
     /// 每键触发极性 + 独立防抖: 设备真值缓存 + 版本号(草稿在 `drafts` 内)。
     kbd_keycfg: [KbdKeyCfg; KBD_HOLD_PHYS_COUNT],
     kbd_keycfg_version: u64,
@@ -1073,6 +1188,7 @@ impl AppController {
             kbd_hold_version: 0,
             kbd_state_raw: 0,
             kbd_state_out: 0,
+            kbd_link_diag: None,
             kbd_keycfg: [KbdKeyCfg::default(); KBD_HOLD_PHYS_COUNT],
             kbd_keycfg_version: 0,
             kbd_pol_resolved_mask: 0,
@@ -5352,7 +5468,9 @@ impl AppController {
         Some(device_on && draft != Some(0))
     }
 
-    pub(super) fn ch_enabled_states_known(&self) -> bool {
+    /// 36 通道的启用**设备真值**是否都已回读到。UI tick 侧据此门控"补一次全通道 PARAM_ENABLED
+    /// 回读"(见 ui_callbacks/tick/connection_protocol.rs), 故必须对外可见, 不能是 pub(super)。
+    pub fn ch_enabled_states_known(&self) -> bool {
         (0..36u8).all(|ch| self.ch_enabled_for_operation(ch).is_some())
     }
 
@@ -6705,6 +6823,48 @@ impl AppController {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("未连接，无法清零主循环剖面"))?
             .clear_loop_profile()
+    }
+
+    /// 读设备侧"上次复位的死前遗言"(EP0 DEBUG_READ 的 last_boot_* / last_crash_* 段)。
+    ///
+    /// 偏移与固件 `UsbDebugCounters`(pack(1)) 同源: stage@48 wd@49 fault@112 reason@113
+    /// stage_at_ms@150 peak_ms@152 fault_core@155。★短于 156B 的回报一律报错而不是补 0★:
+    /// 旧固件没有这些字段, 补 0 会被读成"上次正常启动", 把"读不到"伪装成"没崩过"。
+    pub fn last_crash_report(&self) -> anyhow::Result<LastCrashReport> {
+        const OFF_STAGE: usize = 48;
+        const OFF_WAS_WD: usize = 49;
+        const OFF_WAS_FAULT: usize = 112;
+        const OFF_RESET_REASON: usize = 113;
+        const OFF_STAGE_AT_MS: usize = 150;
+        const OFF_PEAK_MS: usize = 152;
+        const OFF_FAULT_CORE: usize = 155;
+        const MIN_LEN: usize = OFF_FAULT_CORE + 1;
+        let bytes = self.read_debug_counters()?;
+        if bytes.len() < MIN_LEN {
+            return Err(anyhow::anyhow!(
+                "DEBUG_READ 只回报 {} 字节(需 ≥{})，该固件不含跨复位遗言字段",
+                bytes.len(),
+                MIN_LEN
+            ));
+        }
+        let u16_at = |at: usize| u16::from_le_bytes([bytes[at], bytes[at + 1]]);
+        Ok(LastCrashReport {
+            stage: bytes[OFF_STAGE],
+            was_watchdog: bytes[OFF_WAS_WD] != 0,
+            was_fault: bytes[OFF_WAS_FAULT] != 0,
+            fault_core: bytes[OFF_FAULT_CORE],
+            reset_reason: bytes[OFF_RESET_REASON],
+            stage_at_ms: u16_at(OFF_STAGE_AT_MS),
+            peak_ms: u16_at(OFF_PEAK_MS),
+        })
+    }
+
+    /// 清除设备侧死前遗言(EP0 vendor 0x54)。读完必须清, 否则同一次崩溃每次连接都重报一遍。
+    pub fn clear_last_crash(&self) -> anyhow::Result<()> {
+        self.io
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("未连接，无法清除上次崩溃数据"))?
+            .clear_last_crash()
     }
 
     /// 仅在设备已由 DEBUG_CRASH_BOOTSEL 武装时触发既有安全 watchdog BOOTSEL 路径。

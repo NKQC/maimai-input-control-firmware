@@ -8,7 +8,7 @@ import { Theme } from "../common/theme.slint";
 // 配置项模型每次 config 版本变化就整行重推 ⇒ 裸 SpinBox/ComboBox 会打断正在进行的输入
 // 并丢掉回填绑定, 一律用带守卫的版本(见 widgets.slint 内注释)。
 // 分区用 SectionCard(std GroupBox 只有一行标题文字, 分不出组的边界)。
-import { GuardedSpinBox, GuardedComboBox, SectionCard } from "../common/widgets.slint";
+import { GuardedSpinBox, GuardedComboBox, GuardedCheckBox, SectionCard } from "../common/widgets.slint";
 
 // 注:属性名不能叫 `row`,该名字与 GridLayout 子元素自动注入的 row/col
 // 附加属性冲突(编译报 "Cannot override property 'row'")。用 `entry` 代替。
@@ -69,15 +69,18 @@ component ConfigRowItem inherits Rectangle {
         // ★控件一律不拉伸 + 给确定宽度★ 原先每个控件写 horizontal-stretch: 1, 于是数字框/下拉/
         // 单行输入被拉到整页宽: 数字被上下箭头挤到看不全、下拉文本与箭头重叠(用户反馈的"输入框被
         // 异常缩放")。剩余宽度统一由本行末尾的弹性空白吸收。
-        if root.entry.kind == 0: CheckBox {
+        // ★必须用 GuardedCheckBox★ 这一行住在 Repeater 里且行实例会被复用, 裸 CheckBox 被点过
+        // 一次就摧毁 `checked` 绑定, 此后撤销草稿/重新回读/换页都推不进来 —— 勾选状态会跟着行号
+        // 而不是跟着数据。见 widgets.slint 的说明。
+        if root.entry.kind == 0: GuardedCheckBox {
             horizontal-stretch: 0;
-            checked: root.entry.bool_val;
+            model_checked: root.entry.bool_val;
             toggled => {
                 root.set_bool(root.entry.key, self.checked);
             }
         }
 
-        // 通信系统配置一律十进制 SpinBox(hex 口径仅用于需寄存器处理的 CSD 内容, 见触控全局调整页)。
+        // 设备设置配置一律十进制 SpinBox(hex 口径仅用于需寄存器处理的 CSD 内容, 见触控全局调整页)。
         if root.entry.kind == 1: GuardedSpinBox {
             width: Theme.spin-width;
             horizontal-stretch: 0;
@@ -247,6 +250,18 @@ export component ConfigPage inherits Rectangle {
 
                 // ★组标题 = 渲染归属★ mai2serial/mai2light 的协议参数已归到"协议"页的同名组,
                 // 本页只挂剩下的四组, 标题与内容一一对应(不再有名为"通信"却空着的组)。
+                ConfigGroupSection {
+                    group_title: "开机校准";
+                    subtitle: "开机即执行，不依赖 mai2serial 协议初始化；{E} RSET 自动校准/基线复位是协议页的另一条路径。";
+                    rows: root.rows;
+                    group_counts: root.group_counts;
+                    set_bool(k, v) => { root.cfg_set_bool(k, v); }
+                    set_number(k, v) => { root.cfg_set_number(k, v); }
+                    set_number_hex(k, v) => { root.cfg_set_number_hex(k, v); }
+                    set_enum(k, v) => { root.cfg_set_enum(k, v); }
+                    set_string(k, v) => { root.cfg_set_string(k, v); }
+                }
+
                 ConfigGroupSection {
                     group_title: "工作模式";
                     rows: root.rows;

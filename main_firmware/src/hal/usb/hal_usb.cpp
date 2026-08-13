@@ -84,8 +84,11 @@ static const tusb_desc_device_t device_descriptor = {
 // USB 复合枚举拓扑（usb-winusb-config）
 // 恒定：config-WinUSB(vendor)，免驱，host_cmd 上位机协议改走此通道。
 // 按 ConfigManager["mode.work"] 二选一：
-//   0 = Serial 模式：+ serial CDC + light CDC（不出现 HID）
+//   0 = Serial 模式：+ serial CDC + light CDC，并且（MAI2_ENABLE_SERIAL_HID=1 时）**同时**带 HID
 //   1 = HID    模式：+ HID（触摸+键盘，不出现 serial/light CDC）
+// ★这里原先写作"Serial 模式不出现 HID"，与下方变体A的描述符和实测都不符★
+// 实测(SetupAPI 设备树)：MI_01/MI_03 两个 CDC 与 MI_05 的 HID 接口同时在场。
+// 只有 MAI2_ENABLE_SERIAL_HID=0 的诊断回退变体才真的没有 HID。
 // 改动原因：纯 3×CDC 在本 RP2040+Adafruit TinyUSB 3.7.1+Windows 组合下
 // SET_CONFIGURATION 阶段稳定失败（UsbTreeView 实测：Current Config Value=0x00，
 // 复合父设备 Code 10），2×CDC 稳定可用，故把 config 通道从第 3 个 CDC 改为
@@ -390,6 +393,12 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_requ
     // 0x53=清零主循环阻塞剖面(loop_max_us / seg_max_us)。峰值量不可差分, 压测须能开一个干净窗口。
     if (request->bmRequestType_bit.type == TUSB_REQ_TYPE_VENDOR && request->bRequest == 0x53) {
         loop_prof_clear();
+        return tud_control_xfer(rhport, request, NULL, 0);
+    }
+    // 0x54=清除上次复位的死前遗言。遗言字段一经 setup() 填入就保留到下次复位, 不清则每次连接都重复
+    // 告警同一次崩溃, 新崩溃反而分不出来。上位机读到并落警后立刻发本请求。
+    if (request->bmRequestType_bit.type == TUSB_REQ_TYPE_VENDOR && request->bRequest == 0x54) {
+        crash_postmortem_clear();
         return tud_control_xfer(rhport, request, NULL, 0);
     }
     // 0x52=进 BOOTSEL：置请求位，由 loop() 在 ACK 完成后 reset_usb_boot。EP0 通道使得 bulk 死时仍可软件进烧录。

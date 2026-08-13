@@ -18,14 +18,13 @@
         ui.set_cp_text(cp_state.status.clone().into());
         ctrl.push_log("已连接 → 已启动最小握手回读");
         telemetry_first_frame_seen = false;
-        // 基础探针必须先独占 vendor 单响应通道；其完成后再发武装命令并从 ACK 归因。
-        crash_bootsel_arm_pending = true;
         // ★连接后自动把设备上的算法同步到 UI★
         // 连接探针只回读 ALGO_GET_INFO/ROM, 不含 C 源与机器码, 于是 algo_device_src 一直为空 ⇒
         // schema 源回落到编辑器里的初始示例算法(没有任何 META 声明) ⇒ report/setting 声明为空 ⇒
         // 追踪轮询集合为空、从不发 ALGO_GET_TRACE ⇒ 算法页"当前值"永远是"暂无运行值",
         // 单通道精调页则显示"当前算法未声明 ALGO_REPORT"。同步这一步把三者一并补齐。
         algo_sync_pending = true;
+        crash_report_pending = true;
         // 连接阶段只允许三项基础探针独占 vendor 通道；全通道参数预取必须等屏障收敛，
         // 否则它会在探针完成后立即与遥测/页面轮询叠加，造成固件 RX FIFO 溢出和后续探针饥饿。
         ctrl.schedule_conn_probes(ch);
@@ -43,15 +42,13 @@
     // 通道数据是整个设置页的共同底座, 粒度就该是"在不在设置页"。离开设置页(主页/工具箱/日志/关于)
     // 才收回轻档(仅采样率+延迟), 主页延迟卡照常有数据。
     let conn_probes_pending = ctrl.conn_probes_pending();
-    if crash_bootsel_arm_pending && connected && !conn_probes_pending {
-        match ctrl.set_crash_bootsel(true) {
-            Ok(()) => {
-                ctrl.push_log("连接探针完成 → 已提交崩溃自动进入 BOOTSEL 武装");
-                crash_bootsel_settle_until = Some(Instant::now() + Duration::from_millis(250));
-            }
-            Err(error) => ctrl.push_log_warn(format!("崩溃自动 BOOTSEL 武装失败: {}", error)),
-        }
-        crash_bootsel_arm_pending = false;
+    // 基础探针收敛后补齐所有通道的启用真值；下降沿配合已知性门控，每个连接会话最多请求一次。
+    let enable_state_refresh_queued = connected
+        && last_conn_probes_pending
+        && !conn_probes_pending
+        && !ctrl.ch_enabled_states_known();
+    if enable_state_refresh_queued {
+        let _ = ctrl.request_param_all_channels(PARAM_ENABLED);
     }
     // 探针收敛后同步设备算法: C 源 + 机器码。标记为"显式回读"是有意的 —— 此刻编辑器里还是
     // 程序内置的初始示例算法, 用设备真值覆盖它才是用户期望的"连接后看到设备上跑的算法";
@@ -67,13 +64,61 @@
         }
         ctrl.push_log("连接探针完成 → 正在同步设备算法 C 源");
     }
-    let want_channel_stream = connected && ui.get_current_view() == 1;
-    let crash_bootsel_settling = crash_bootsel_settle_until
-        .is_some_and(|deadline| Instant::now() < deadline);
-    if !crash_bootsel_settling {
-        crash_bootsel_settle_until = None;
-        ctrl.telem_set_scope(want_channel_stream);
+    // 上次崩溃遗言: 探针收敛后读一次 → 落日志 → 立刻清除设备置位。
+    // ★不在连接边沿发★ 设备侧 vendor 响应是单槽的, 边沿那一拍已被三项基础探针占满。
+    // ★与算法同步错开一拍★ `!algo_sync_pending` 保证不与 ALGO_GET_SRC 抢同一拍。
+    if crash_report_pending && connected && !conn_probes_pending && !algo_sync_pending {
+        crash_report_pending = false;
+        let read_ok = match ctrl.last_crash_report() {
+            Ok(report) if report.abnormal() => {
+                log::warn!(
+                    "设备上次启动异常: 运行中崩溃={} hardfault={} 出错核={} 阶段={} 进段时已耗时={}ms 上次峰值轮耗时={}ms 复位原因=0x{:02X}({})",
+                    report.was_watchdog,
+                    report.was_fault,
+                    report.fault_core_text(),
+                    report.stage_name(),
+                    report.stage_at_ms,
+                    report.peak_ms,
+                    report.reset_reason,
+                    report.reset_reason_text()
+                );
+                ctrl.push_log_warn(format!(
+                    "设备上次启动异常: 阶段={} 进段时已耗时={}ms 峰值轮={}ms hardfault={}({})",
+                    report.stage_name(),
+                    report.stage_at_ms,
+                    report.peak_ms,
+                    report.was_fault,
+                    report.fault_core_text()
+                ));
+                true
+            }
+            Ok(_) => {
+                log::info!("设备上次为正常启动(无看门狗/hardfault 遗言)");
+                true
+            }
+            Err(error) => {
+                log::warn!("读取设备上次崩溃数据失败: {}", error);
+                ctrl.push_log_warn(format!("读取设备上次崩溃数据失败: {}", error));
+                false
+            }
+        };
+        // ★只在确实读到之后才清★ 读失败就清等于把还没看过的遗言抹掉; 保留不清, 下次连接还能再读一次。
+        // 清除失败必须告警: 不清则同一次崩溃会在之后每次连接重报一遍, 真正的新崩溃被淹没。
+        if read_ok {
+            match ctrl.clear_last_crash() {
+                Ok(()) => log::info!("已清除设备侧上次崩溃数据置位(EP0 0x54)"),
+                Err(error) => {
+                    log::warn!(
+                        "清除设备侧上次崩溃数据失败: {}；下次连接会重复读到同一份遗言",
+                        error
+                    );
+                    ctrl.push_log_warn(format!("清除设备侧上次崩溃数据失败: {}", error));
+                }
+            }
+        }
     }
+    let want_channel_stream = connected && ui.get_current_view() == 1;
+    ctrl.telem_set_scope(want_channel_stream);
     if !telemetry_first_frame_seen && ctrl.telem_frame_count() != 0 {
         telemetry_first_frame_seen = true;
     }
@@ -100,7 +145,13 @@
     // 边沿发一次: 网格本来就靠 param_version 门控重建, 回读到齐后会自然刷新。
     let all_channels_visible =
         connected && ui.get_current_view() == 1 && ui.get_settings_tab() == SETTINGS_PAGE_ALL_CHANNELS;
-    if !conn_probes_pending && all_channels_visible && !last_all_channels_visible && was_connected {
+    if !conn_probes_pending
+        && all_channels_visible
+        && !last_all_channels_visible
+        && was_connected
+        && !enable_state_refresh_queued
+        && !ctrl.ch_enabled_states_known()
+    {
         let _ = ctrl.request_param_all_channels(PARAM_ENABLED);
     }
     last_all_channels_visible = all_channels_visible;
@@ -172,5 +223,6 @@
         };
         ctrl.poll_scheduled(&poll_ctx, reconnect_tick, UI_TICK_MS);
     }
+    last_conn_probes_pending = conn_probes_pending;
     was_connected = connected;
 }
