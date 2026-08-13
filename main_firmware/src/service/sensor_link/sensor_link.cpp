@@ -3,6 +3,7 @@
 #include "../../protocol/psoc/psoc.h"
 #include "../csd_config/csd_config.h"
 #include "../psoc_algo/psoc_algo.h"
+#include "../psoc_algo/psoc_algo_default.h"
 #include "../psoc_updater/psoc_updater.h"
 #include "../tx_scheduler/tx_scheduler.h"
 #include "../latency_stats.h"
@@ -27,31 +28,40 @@ static constexpr uint16_t RESCUE_MAX_TICKS = 300;   // 60s > 最坏总耗时, �
 static constexpr uint32_t FOCUS_SCAN_RENEW_INTERVAL_US = 1000000;
 
 // ---------------- SweepSession(0x36-0x38) ----------------
-// 步进周期 2ms: 一格 = 写参数 + 回读 + settle/sample 快照；扫描期不逐格校准，结束后统一恢复校准，
+// 步进周期 2ms: 一格 = runtime apply + 回读 + settle/sample 快照；恢复只写回原 gain/div，
 // 全程非阻塞单步推进，每周期最多做一件事，绝不在 handler 或 tick 里等设备。
 static constexpr uint32_t SWEEP_INTERVAL_US = 2000;
-// 扫描期租约: 任何主机帧都会 renew_all(3s) 覆盖它, 故上位机在 = 永活; 上位机丢失 ⇒ 到期转入恢复。
-static constexpr uint32_t SWEEP_LEASE_MS = 8000;
-// 阶段硬超时(周期数 × 2ms): 普通等待 5s(参数落地/快照推进), 重操作 40s(单通道 IDAC 校准/基线复位),
-// 终态帧重试 3s(USB 长时间背压/掉线也必须收尾, 否则任务与被抑制的输出永久悬空)。
-static constexpr uint16_t SWEEP_WAIT_TICKS = 2500;
-static constexpr uint16_t SWEEP_HEAVY_TICKS = 20000;
-static constexpr uint16_t SWEEP_TERMINAL_TICKS = 1500;
+// 扫描期租约: 主机 keepalive 正常时持续有效；USB 背压期间也不能让结果发送窗口在 8s 内过期。
+// 扫描状态机在背压时暂停推进，恢复链仍使用无租约任务。
+static constexpr uint32_t SWEEP_LEASE_MS = 30000;
+// 阶段安全兜底(周期数 × 2ms): 所有正常推进均以 PSoC 真实完成、队列排空或快照代次推进为准；
+// 仅在连续 120s 未出现可采信进展时放弃当前格/恢复步骤，避免短暂繁忙被误判为失败。
+static constexpr uint32_t SWEEP_WAIT_TICKS = 60000u;
+static constexpr uint32_t SWEEP_RUNTIME_APPLY_TICKS = 60000u;
+static constexpr uint16_t SWEEP_TERMINAL_TICKS = 15000;
 static constexpr uint8_t  SWEEP_FRAMES_PER_TICK = 2;    // 结果/补发帧的发送预算(背压即停, 下拍续发)
 static constexpr uint8_t  SWEEP_SETTLE_MAX = 64;
 static constexpr uint8_t  SWEEP_SAMPLE_MAX = 64;
-static constexpr uint16_t SWEEP_RAILED_RAW = 0xFFF0u;   // 接近满量程 ⇒ IDAC 补偿不足, 该格无效
+// ★12 位口径★ CapSense raw 是 12 位(满量程 4095), 与 csd_config 的 railed 判据同源。
+// 原先写成 0xFFF0 对 12 位样本永远不可达 ⇒ RAILED 永不触发, 饱和格被错分到别的失败位上。
+static constexpr uint16_t SWEEP_RAILED_RAW = 4090u;     // 接近满量程 ⇒ IDAC 补偿不足, 该格无效
 static constexpr uint16_t SWEEP_INDEX_NONE = 0xFFFFu;   // 非结果帧(RESTORING/终态)的格号占位
 static constexpr uint8_t  SWEEP_FRAME_LEN = 23;
-static constexpr uint8_t  SWEEP_SEGMENT_CELLS = 8;
+// ★单格失败不再毙掉整个会话，但连续失败必须收敛★
+// 一格的 runtime apply / 回读失败只说明"这个 gain/div 组合 PSoC 吃不下"(极端组合下本就会发生),
+// 下一格会重新写入并回读, 状态每格都自行重建, 所以记成空洞继续扫是安全且必要的 ——
+// 原先第一格失败就 _begin_sweep_restore(FAILED), 于是整张表在设备健康时也只能拿到零星几格。
+// 但若 PSoC 真的卡死, 连续失败会一直空转到 448 格; 连续这么多格都失败即判为真故障, 立即回滚。
+static constexpr uint16_t SWEEP_ABORT_FAIL_RUN = 12;
 // 结果位: 低 4 位属该格采样, 高 4 位属恢复阶段, 复用同一 flags 字节回显给上位机。
 static constexpr uint8_t  SWEEP_FLAG_RAILED = 0x01;
-static constexpr uint8_t  SWEEP_FLAG_STALLED = 0x02;      // 全部样本完全不抖动 = 扫描停滞
+// 扫描停滞 = 该格在阶段兜底期内始终等不到新的快照代次(PSoC 没有产出新的扫描结果)。
+// ★不能用"样本不抖动"当停滞判据★: 本扫描的目的就是找噪声最低的 gain/div, pp=0 是最好的结果,
+// 拿它判无效会让整张表在设备完全健康时全军覆没(实测 448 格 valid=0)。
+static constexpr uint8_t  SWEEP_FLAG_STALLED = 0x02;
 static constexpr uint8_t  SWEEP_FLAG_CAL_FAIL = 0x04;
 static constexpr uint8_t  SWEEP_FLAG_MISMATCH = 0x08;     // 回读值 != 期望值(PSoC 侧钳位/拒绝)
 static constexpr uint8_t  SWEEP_RESTORE_FLAG_PARAM = 0x10;
-static constexpr uint8_t  SWEEP_RESTORE_FLAG_CAL = 0x20;
-static constexpr uint8_t  SWEEP_RESTORE_FLAG_BSLN = 0x40;
 static constexpr uint8_t  SWEEP_FLAG_RETRANSMIT = 0x80;   // 该帧为 SWEEP_CTRL 补发
 static constexpr uint8_t  SWEEP_PARAM_ID_DIV = 0x08u;     // SNS_CLK_DIV
 static constexpr uint8_t  SWEEP_PARAM_ID_GAIN = 0x0Bu;    // IDAC_GAIN(0..6)
@@ -59,6 +69,9 @@ static constexpr uint8_t  SWEEP_PARAM_ID_GAIN = 0x0Bu;    // IDAC_GAIN(0..6)
 volatile uint16_t g_lat_spi_us = 0;
 volatile uint16_t g_lat_proc_us = 0;
 volatile uint16_t g_lat_usb_us = 0;
+volatile int16_t  g_delay_dev_min_us = 0;
+volatile int16_t  g_delay_dev_max_us = 0;
+volatile uint8_t  g_delay_dev_flags = 0;
 
 SensorLink* SensorLink::_instance = nullptr;
 
@@ -95,6 +108,18 @@ inline bool heavy_gate_reject(const char* what, const HostFrame& frame,
     Psoc* psoc = Psoc::getInstance();
     if (!psoc->heavy_busy()) return false;
     psoc->note_heavy_reject();
+    *response_length = HostCmdCodec::encode_nak(frame.seq, HostCmdError::DEVICE_BUSY,
+                                                what, response, HOST_CMD_RESP_BUF_MAX);
+    return true;
+}
+
+// Synchronous SPI reads must never wait behind startup provisioning or a long
+// PSoC operation. A bounded DEVICE_BUSY terminal leaves UsbComm free to serve
+// telemetry and lets the host retry the same request after the current step.
+inline bool sync_read_gate_reject(const char* what, const HostFrame& frame,
+                                  uint8_t* response, uint16_t* response_length) {
+    Psoc* psoc = Psoc::getInstance();
+    if (psoc->core1_idle() && !psoc->heavy_busy()) return false;
     *response_length = HostCmdCodec::encode_nak(frame.seq, HostCmdError::DEVICE_BUSY,
                                                 what, response, HOST_CMD_RESP_BUF_MAX);
     return true;
@@ -176,7 +201,7 @@ void SensorLink::init() {
     dispatcher->register_handler(HostCmd::ALGO_RESET_DEFAULT, _handle_algo_reset_default);
     dispatcher->register_handler(HostCmd::ALGO_SET_ROM, _handle_algo_set_rom);
     dispatcher->register_handler(HostCmd::ALGO_GET_ROM, _handle_algo_get_rom);
-    dispatcher->register_handler(HostCmd::ALGO_GET_TRACE, _handle_algo_get_trace);
+
     dispatcher->register_handler(HostCmd::ALGO_SET_CFG, _handle_algo_set_cfg);
     dispatcher->register_handler(HostCmd::ALGO_GET_CFG, _handle_algo_get_cfg);
     dispatcher->register_handler(HostCmd::ALGO_GET_SRC, _handle_algo_get_src);
@@ -184,10 +209,144 @@ void SensorLink::init() {
     dispatcher->register_handler(HostCmd::ALGO_GET_CODE, _handle_algo_get_code);
 }
 
-void SensorLink::_release_focus_scan() {
+void SensorLink::_poll_host_write() {
+    if (!_host_write.active || _host_write.complete) return;
+    bool ok = false;
+    if (!Psoc::getInstance()->take_host_write_result(&ok)) return;
+    if (!ok) {
+        _host_write.ok = false;
+        _host_write.complete = true;
+        return;
+    }
+    if (_host_write.kind == HostWriteState::Kind::ALGO_ROM) {
+        PsocAlgo::getInstance()->set_rom(_host_write.a, static_cast<uint16_t>(_host_write.value));
+        _host_write.rom_index++;
+        if (_host_write.rom_index < _host_write.rom_count) {
+            if (_start_next_host_rom()) return;
+            _host_write.ok = false;
+            _host_write.complete = true;
+            return;
+        }
+        _host_write.ok = true;
+        _host_write.complete = true;
+        return;
+    }
+    _host_write.ok = true;
+    switch (_host_write.kind) {
+        case HostWriteState::Kind::PARAM:
+            CsdConfig::getInstance()->note_param(_host_write.a, _host_write.b, _host_write.value);
+            break;
+        case HostWriteState::Kind::MODE:
+            CsdConfig::getInstance()->note_mode(_host_write.a);
+            break;
+        case HostWriteState::Kind::GLOBAL:
+            CsdConfig::getInstance()->note_global(_host_write.a, _host_write.value);
+            break;
+        case HostWriteState::Kind::ALGO_CFG:
+            PsocAlgo::getInstance()->set_cfg(_host_write.a, _host_write.b);
+            break;
+        default:
+            break;
+    }
+    _host_write.complete = true;
+}
+
+bool SensorLink::_start_next_host_rom() {
+    if (_host_write.rom_index >= _host_write.rom_count) return false;
+    const uint8_t index = _host_write.rom_index;
+    _host_write.a = _host_write.rom_ch[index];
+    _host_write.value = _host_write.rom_value[index];
+    return Psoc::getInstance()->start_host_algo_set_rom(_host_write.a,
+                                                         static_cast<uint16_t>(_host_write.value));
+}
+
+bool SensorLink::_start_host_write(HostWriteState::Kind kind, const HostFrame& frame,
+                                   uint8_t a, uint8_t b, uint32_t value) {
+    if (_host_write.active) return false;
+    _host_write.clear();
+    _host_write.active = true;
+    _host_write.kind = kind;
+    _host_write.cmd = frame.cmd;
+    _host_write.seq = frame.seq;
+    _host_write.a = a;
+    _host_write.b = b;
+    _host_write.value = value;
     Psoc* psoc = Psoc::getInstance();
-    psoc->set_focus_channel(0xFFu);
-    (void)psoc->set_focus_scan(0xFFu);
+    bool accepted = false;
+    switch (kind) {
+        case HostWriteState::Kind::PARAM:
+            accepted = psoc->start_host_param_set(a, b, value);
+            break;
+        case HostWriteState::Kind::MODE:
+            accepted = psoc->start_host_mode_set(a);
+            break;
+        case HostWriteState::Kind::GLOBAL:
+            accepted = psoc->start_host_global_set(a, value);
+            break;
+        case HostWriteState::Kind::GLOBAL_COMMIT:
+            accepted = psoc->start_host_global_commit();
+            break;
+        case HostWriteState::Kind::ALGO_CFG:
+            accepted = psoc->start_host_algo_set_cfg(a, b);
+            break;
+        case HostWriteState::Kind::ALGO_ROM:
+            accepted = psoc->start_host_algo_set_rom(a, static_cast<uint16_t>(value));
+            break;
+        case HostWriteState::Kind::CALIBRATE:
+            accepted = psoc->start_host_calibrate(a);
+            break;
+        case HostWriteState::Kind::BASELINE_RESET:
+            accepted = psoc->start_host_baseline_reset(a);
+            break;
+        case HostWriteState::Kind::CP_MEASURE:
+            accepted = psoc->start_host_measure_cp();
+            break;
+        default:
+            return false;
+    }
+    if (!accepted) {
+        _host_write.clear();
+        return false;
+    }
+    return true;
+}
+
+bool SensorLink::take_host_write_terminal(uint8_t* cmd, uint8_t* seq, bool* ok) {
+    _poll_host_write();
+    if (!_host_write.active || !_host_write.complete) return false;
+    if (cmd) *cmd = _host_write.cmd;
+    if (seq) *seq = _host_write.seq;
+    if (ok) *ok = _host_write.ok;
+    _host_write_last_cmd = _host_write.cmd;
+    _host_write_last_seq = _host_write.seq;
+    _host_write_last_ok = _host_write.ok;
+    _host_write_last_ms = to_ms_since_boot(get_absolute_time());
+    _host_write.clear();
+    return true;
+}
+
+bool SensorLink::replay_host_write(const HostFrame& frame, uint8_t* response, uint16_t* response_length) {
+    if (_host_write.active && frame.cmd == _host_write.cmd && frame.seq == _host_write.seq) {
+        *response_length = 0u;
+        return true;
+    }
+    if (_host_write_last_ms != 0u && frame.cmd == _host_write_last_cmd && frame.seq == _host_write_last_seq &&
+        (uint32_t)(to_ms_since_boot(get_absolute_time()) - _host_write_last_ms) <= 10000u) {
+        *response_length = _host_write_last_ok
+            ? HostCmdCodec::encode_ack(frame.seq, response, HOST_CMD_RESP_BUF_MAX)
+            : HostCmdCodec::encode_nak(frame.seq, HostCmdError::SENSOR_ERROR, "PSoC command failed",
+                                       response, HOST_CMD_RESP_BUF_MAX);
+        return true;
+    }
+    return false;
+}
+
+void SensorLink::_release_focus_scan() {
+    // Focus is a host-side snapshot/output optimization.  The PSoC must keep its
+    // proven continuous all-channel scan loop: device-side FOCUS_SCAN can ACK yet
+    // leave scan_count stalled on the deployed firmware.  Disabling the RP fast
+    // snapshot selector is sufficient to restore broad snapshot paging.
+    Psoc::getInstance()->set_focus_channel(0xFFu);
 }
 
 void SensorLink::stop() {
@@ -203,6 +362,21 @@ void SensorLink::stop() {
     Psoc::getInstance()->set_telemetry_active(false);
     TxScheduler::getInstance()->cancel(TX_TASK_TELEM);
     TxScheduler::getInstance()->cancel(TX_TASK_FOCUS);
+}
+
+void SensorLink::prepare_host_session() {
+    // 命令响应由 UsbComm 独占 vendor TX；这里仅处理遗留的异步输出状态。
+    // 扫描期的 telemetry/focus 是恢复与采样链的一部分，不能因 HELLO 被取消或抢走快照快路。
+    if (_sweep.active()) {
+        _stream.clear();
+        _focus.clear();
+        _saved_stream.clear();
+        _sweep.output_restore = SweepOutputRestore::QUIET;
+        TxScheduler::getInstance()->cancel(TX_TASK_TELEM);
+        TxScheduler::getInstance()->cancel(TX_TASK_FOCUS);
+        return;
+    }
+    stop();
 }
 
 void SensorLink::suspend() {
@@ -225,12 +399,9 @@ void SensorLink::resume() {
     if (_focus.active) {
         if (!_focus.suspended && TxScheduler::getInstance()->active(TX_TASK_FOCUS)) return;
         _focus.suspended = false;
-        Psoc* psoc = Psoc::getInstance();
-        if (!psoc->set_focus_scan(_focus.channel)) {
-            _focus.suspended = true;
-            _release_focus_scan();
-            return;
-        }
+        // Keep the PSoC scan engine in continuous broad-scan mode. Focus narrows
+        // only the RP snapshot/output path, which is sufficient for exclusive
+        // delivery without risking a device-side scan stall.
         _focus.last_focus_scan_ack_us = time_us_32();
         Psoc::getInstance()->set_telemetry_active(true);
         _focus.last_generation = Psoc::getInstance()->snapshot_generation();
@@ -327,6 +498,23 @@ void SensorLink::tick() {
         g_lat_spi_us = 0; g_lat_proc_us = 0; g_lat_usb_us = 0;  // 清零开新窗口
     }
 
+    if ((_fields & TELEM_FIELD_DELAY_DEV) != 0) {
+        const int16_t lo = g_delay_dev_min_us, hi = g_delay_dev_max_us;
+        const uint8_t flags = g_delay_dev_flags;
+        payload[length++] = (uint8_t)lo; payload[length++] = (uint8_t)((uint16_t)lo >> 8);
+        payload[length++] = (uint8_t)hi; payload[length++] = (uint8_t)((uint16_t)hi >> 8);
+        payload[length++] = flags;
+        // 清零开新窗口。flags 的 VALID 位即"本窗口有观测", 故 min/max 归零不会被误读成真实观测。
+        g_delay_dev_min_us = 0; g_delay_dev_max_us = 0; g_delay_dev_flags = 0;
+    }
+
+    // ★触发判定必须是 PSoC 的最终判定★
+    // 快照里的 sample.status 是 CapSense widget 的原始状态, **不经 JIT 算法**。装了改判算法后
+    // 它与设备实际触发不一致(实测界面"触发判定"恒不动)。PSoC 的最终判定唯一真相源是它的 TOUCH
+    // 帧(update_touch_frame 已含算法 out_active), RP 侧即 touch_mask()。
+    // 无算法时该位就是 PSoC 内部基线差判定, 语义同样正确。
+    const uint64_t final_touch = Psoc::getInstance()->touch_mask();
+
     uint8_t channel_count = 0;
     for (uint8_t channel = 0; channel < SENSOR_LINK_CHANNELS; channel++) {
         if (!_channel_selected(_ch_mask, channel)) continue;
@@ -341,7 +529,9 @@ void SensorLink::tick() {
             raw = sample.raw;
             baseline = sample.baseline;
             diff = sample.diff;
-            status = sample.status;
+            // bit0 取最终判定, 其余位保留 CapSense 原始状态位供诊断。
+            status = static_cast<uint8_t>((sample.status & 0xFEu) |
+                (((final_touch >> channel) & 1ull) != 0ull ? 1u : 0u));
         }
 
         payload[length++] = channel;
@@ -403,15 +593,6 @@ void SensorLink::focus_tick() {
 
     Psoc* psoc = Psoc::getInstance();
     const uint32_t now_us = time_us_32();
-    if (static_cast<uint32_t>(now_us - _focus.last_focus_scan_ack_us) >= FOCUS_SCAN_RENEW_INTERVAL_US) {
-        if (!psoc->set_focus_scan(_focus.channel)) {
-            _focus.clear();
-            _release_focus_scan();
-            _restore_broad_after_focus();
-            return;
-        }
-        _focus.last_focus_scan_ack_us = now_us;
-    }
 
     const psoc::SensorSnapshot& snapshot = psoc->snapshot();
     if (!snapshot.valid || snapshot.generation == _focus.last_generation) return;
@@ -450,7 +631,23 @@ void SensorLink::focus_tick() {
         payload[length++] = static_cast<uint8_t>(sample.diff);
         payload[length++] = static_cast<uint8_t>(static_cast<uint16_t>(sample.diff) >> 8);
     }
-    if ((_focus.fields & TELEM_FIELD_STATUS) != 0) payload[length++] = sample.status;
+    if ((_focus.fields & TELEM_FIELD_STATUS) != 0) {
+        // 同全通道路径: bit0 用 PSoC 最终触发判定(含算法改判), 高位保留 CapSense 原始状态。
+        const uint64_t final_touch = psoc->touch_mask();
+        payload[length++] = static_cast<uint8_t>((sample.status & 0xFEu) |
+            (((final_touch >> _focus.channel) & 1ull) != 0ull ? 1u : 0u));
+    }
+    // ★算法运行值随本帧一起走★ 顺序固定在 STATUS 之后、STATS 之前, 与上位机解码一一对应。
+    // 只有该组值确实属于本帧的通道时才算有效, 否则填 0 并把 active 置 0(上位机据此显示无值)。
+    if ((_focus.fields & TELEM_FIELD_ALGO) != 0) {
+        const bool algo_ok = snapshot.algo_channel == _focus.channel;
+        payload[length++] = algo_ok ? snapshot.algo_active : 0u;
+        for (size_t i = 0; i < psoc::ALGO_REPORT_SLOTS; ++i) {
+            const uint16_t value = algo_ok ? snapshot.algo_report[i] : 0u;
+            payload[length++] = static_cast<uint8_t>(value);
+            payload[length++] = static_cast<uint8_t>(value >> 8);
+        }
+    }
     if ((_focus.fields & TELEM_FIELD_STATS) != 0) {
         const uint32_t sps = Psoc::getInstance()->samples_per_sec();
         const uint32_t spu = Psoc::getInstance()->scan_period_us();
@@ -465,6 +662,16 @@ void SensorLink::focus_tick() {
         payload[length++] = static_cast<uint8_t>(lp); payload[length++] = static_cast<uint8_t>(lp >> 8);
         payload[length++] = static_cast<uint8_t>(lu); payload[length++] = static_cast<uint8_t>(lu >> 8);
         g_lat_spi_us = 0; g_lat_proc_us = 0; g_lat_usb_us = 0;
+    }
+    if ((_focus.fields & TELEM_FIELD_DELAY_DEV) != 0) {
+        const int16_t lo = g_delay_dev_min_us, hi = g_delay_dev_max_us;
+        const uint8_t flags = g_delay_dev_flags;
+        payload[length++] = static_cast<uint8_t>(lo);
+        payload[length++] = static_cast<uint8_t>(static_cast<uint16_t>(lo) >> 8);
+        payload[length++] = static_cast<uint8_t>(hi);
+        payload[length++] = static_cast<uint8_t>(static_cast<uint16_t>(hi) >> 8);
+        payload[length++] = flags;
+        g_delay_dev_min_us = 0; g_delay_dev_max_us = 0; g_delay_dev_flags = 0;
     }
 
     _telem_frame.cmd = static_cast<uint8_t>(HostCmd::FOCUS_DATA);
@@ -482,9 +689,8 @@ void SensorLink::emit_sweep_task() {
     getInstance()->sweep_tick();
 }
 
-// ★扫描会话独占该通道的 gain/div 与 PSoC 重操作槽★
-// 期间放行调参/校准/自适应会有两个后果: ① 抢走单一在途重操作槽, 让扫描步进反复失败直至超时;
-// ② 恢复阶段写回的"原值"与上位机中途改出来的值打架, 会话结束后没人知道设备到底是什么状态。
+// ★扫描会话独占目标通道的 gain/div 修改权★
+// 期间放行调参/校准/自适应会与逐格 runtime apply 或原值恢复竞争，导致状态无法证明；
 // DEVICE_BUSY 是上位机既有的可重试语义, 比让两边同时改同一个通道诚实。
 bool SensorLink::_sweep_busy_reject(const char* what, const HostFrame& frame,
                                     uint8_t* response, uint16_t* response_length) {
@@ -533,17 +739,16 @@ uint16_t SensorLink::_sqrt_u32(uint32_t value) {
     return static_cast<uint16_t>(root);
 }
 
-// 单格终结: 把聚合量落进 448 格缓存(留待流式发送与补发); 无论该格有效与否，都只推进当前格。
+// 单格终结: 真实采样点标记为 sampled/resolved；连续前缀中的未采样空洞随后按 index 发送空 CELL。
 void SensorLink::_finish_sweep_cell() {
-    SweepResult& result = _sweep_results[_sweep.cell];
+    const uint16_t index = _sweep.cell;
+    SweepResult& result = _sweep_results[index];
     const SweepStats& stats = _sweep.stats;
     result.samples = static_cast<uint16_t>(stats.count);
     if (stats.count != 0u) {
         const uint32_t mean = static_cast<uint32_t>(stats.sum / stats.count);
         result.mean = static_cast<uint16_t>(mean);
         result.pp = static_cast<uint16_t>((stats.max >= stats.min) ? (stats.max - stats.min) : 0u);
-        // 方差 = E[x²] - E[x]²(u16 输入下 sum_sq/count 与 mean² 都 < 2^32, 不会溢出);
-        // 负值只可能来自整除截断, 钳到 0。q8 定点: 整数部分 + 由余数推出的小数部分, 只用整型开方。
         const uint32_t mean_sq = mean * mean;
         const uint32_t e_sq = static_cast<uint32_t>(stats.sum_sq / stats.count);
         const uint32_t variance = (e_sq > mean_sq) ? (e_sq - mean_sq) : 0u;
@@ -551,15 +756,15 @@ void SensorLink::_finish_sweep_cell() {
         const uint32_t frac = ((variance - root * root) << 8) / (2u * root + 1u);
         const uint32_t std_q8 = (root << 8) + frac;
         result.std_q8 = (std_q8 > 0xFFFFu) ? 0xFFFFu : static_cast<uint16_t>(std_q8);
+        // 出界(饱和或恒零)才是该格不可用; 低噪声(pp=0)是有效且理想的结果, 不再据此判失败。
         if (stats.railed != 0u) result.flags |= SWEEP_FLAG_RAILED;
-        if (stats.max == stats.min) result.flags |= SWEEP_FLAG_STALLED;
     }
 
     const uint8_t invalid_flags = SWEEP_FLAG_CAL_FAIL | SWEEP_FLAG_MISMATCH |
                                   SWEEP_FLAG_STALLED | SWEEP_FLAG_RAILED;
     const uint8_t trigger_flags = result.flags & invalid_flags;
-    if (result.samples == 0u || trigger_flags != 0u) {
-        // RAILED/STALLED 有真实样本，是扫描发现的预期无效点而非状态机故障：不污染会话/单格阶段码。
+    const bool valid = result.samples != 0u && trigger_flags == 0u;
+    if (!valid) {
         const bool expected_invalid = result.samples != 0u &&
             (trigger_flags & static_cast<uint8_t>(~(SWEEP_FLAG_RAILED | SWEEP_FLAG_STALLED))) == 0u;
         if (!expected_invalid) {
@@ -570,38 +775,101 @@ void SensorLink::_finish_sweep_cell() {
         }
         _sweep.failed_cells++;
     }
-    _sweep.cell++;
-    _sweep.produced = _sweep.cell;
-    if (_sweep.cell >= SWEEP_TOTAL) {
+
+    if (! _sweep.sampled[index]) {
+        _sweep.sampled[index] = true;
+    }
+    _sweep.resolved[index] = true;
+    while (_sweep.produced < SWEEP_TOTAL && _sweep.resolved[_sweep.produced]) _sweep.produced++;
+    // 采到样本就算这一格闭合了(railed 也是有效结论, 用户要看到它); 只有压根没采到才算失败连击。
+    if (result.samples != 0u) _sweep.fail_run = 0u;
+    _advance_sweep_cell();
+}
+
+// 会话收尾(扫完 / 取消 / 租约到期 / 真故障)时把剩余未决格判空。
+// 顺序全覆盖下, 只有**被中断**才会留下未测格; 它们以 samples=0 如实发出, 不冒充测过。
+void SensorLink::_resolve_sweep_tail() {
+    for (uint16_t i = _sweep.produced; i < SWEEP_TOTAL; ++i) {
+        if (!_sweep.sampled[i]) _sweep_results[i].clear();
+        _sweep.resolved[i] = true;
+    }
+    _sweep.produced = SWEEP_TOTAL;
+}
+
+// 顺序推进到下一格, 直到 448 格全部实测完。
+//
+// ★为什么不再用"探针 + 两翼扩散"★(那是本轮修掉的根因)
+// 旧策略把 cell 当成一维区间: PROBE 每 10 格试探一次, 试到有效格才向左右扩散, 一侧遇到首个无效
+// 格就封口、并从该点 +10 处重新试探。它有两个致命前提, 而两个都不成立:
+//   ① 有效区是**连续区间** —— 但 cell = gain*64 + (div-1) 是把 7×64 的二维网格压成一维,
+//      gain 行之间的接缝处根本不连续, 一个 gain 行的有效区与下一行毫无关系;
+//   ② 跳过的格子可以不测 —— 而封口/试探跳过的 [边界+1, 边界+10) 会被 `_resolve_sweep_prefix`
+//      直接标成 resolved 且 samples=0, produced 照样推到 448。于是上位机看到"produced=448"
+//      却只有增益 0 附近那一段真的有数据(用户报的"只扫增益0就结束 400+ 点"就是这个)。
+// 这张热图的用途是让用户在整个 gain×div 空间里挑噪声最低的点, 少测一格就是少一个候选;
+// 而"哪些格无效"本身也是要看的结论(极端组合会 railed), 不该由设备提前替用户裁掉。
+// 所以改为全覆盖顺序扫: 唯一的代价是时长, 而这本来就是一次显式发起的长任务。
+void SensorLink::_advance_sweep_cell() {
+    const uint16_t next = static_cast<uint16_t>(_sweep.cell + 1u);
+    if (next >= SWEEP_TOTAL) {
+        _resolve_sweep_tail();
         _begin_sweep_restore(SweepDataState::DONE);
         return;
     }
+    _sweep.cell = next;
     _sweep_enter(SweepPhase::SET_CELL);
 }
 
-// 本会话首个失败阶段只记一次(后续故障不覆盖): 第一个才是根因, 后面的多半是它的连带结果。
 void SensorLink::_sweep_note_fail_phase() {
     if (_sweep.fail_phase == 0u) _sweep.fail_phase = static_cast<uint8_t>(_sweep.phase);
 }
 
-// 扫描期(非恢复链)阶段的有界超时处置。
-// 当前格超时后按其实际回读值保留结果与阶段码；只将当前格标为无效，扫描仍逐格完成全部 448 格后统一走 DONE 恢复链。
-void SensorLink::_sweep_cell_timeout(uint16_t limit) {
-    if (_sweep.phase_ticks <= limit) return;
-    _sweep_note_fail_phase();
-    SweepResult& result = _sweep_results[_sweep.cell];
-    if (static_cast<uint8_t>(_sweep.phase) <= static_cast<uint8_t>(SweepPhase::READBACK)) {
-        result.clear();
-        result.gain = static_cast<uint8_t>(_sweep.cell / SWEEP_DIV_COUNT);
-        result.div = static_cast<uint8_t>((_sweep.cell % SWEEP_DIV_COUNT) + 1u);
-    }
-    result.flags |= SWEEP_FLAG_CAL_FAIL;
+// 当前格无法闭合: 记成协议可见的空洞(samples=0, fail_phase 保留卡住的阶段)并继续下一格。
+//
+// ★单格失败不再毙掉整个会话★(本轮修掉的第二个根因)
+// 原实现在这里直接 _begin_sweep_restore(FAILED): 极端 gain/div 组合下 PSoC 本来就可能吃不下
+// (runtime apply 确认不了 / 回读被钳位), 于是整轮扫描常常在头几格就终止, 热图几乎全空。
+// 每一格都会重新写入 gain/div 并回读确认, 硬件状态每格自行重建 —— 继续下一格并不建立在
+// "未知状态"上。真故障(PSoC 卡死)表现为**连续**失败, 由 SWEEP_ABORT_FAIL_RUN 收敛。
+void SensorLink::_abort_sweep_cell() {
+    const uint16_t index = _sweep.cell;
+    SweepResult& result = _sweep_results[index];
+    const uint8_t gain = static_cast<uint8_t>(index / SWEEP_DIV_COUNT);
+    const uint8_t div = static_cast<uint8_t>((index % SWEEP_DIV_COUNT) + 1u);
+    // ★诊断位必须保住★ 原实现先 clear 再走人, 把 READBACK 刚置上的 MISMATCH、超时刚置上的
+    // STALLED 一起擦掉 —— 上位机于是只看到"samples=0 且 flags=0", 分不清是钳位、停滞还是没下发。
+    const uint8_t kept_flags = result.flags;
+    result.clear();
+    result.flags = kept_flags;
+    result.gain = gain;
+    result.div = div;
     result.fail_phase = static_cast<uint8_t>(_sweep.phase);
-    // 该格没有可信样本: 清空聚合量, 由 _finish_sweep_cell() 以 samples=0 落盘后只推进当前格。
+    _sweep_note_fail_phase();
+    _sweep.failed_cells++;
     _sweep.stats.clear();
-    _finish_sweep_cell();
+    _sweep.sampled[index] = true;
+    _sweep.resolved[index] = true;
+    while (_sweep.produced < SWEEP_TOTAL && _sweep.resolved[_sweep.produced]) _sweep.produced++;
+    if (++_sweep.fail_run >= SWEEP_ABORT_FAIL_RUN) {
+        _begin_sweep_restore(SweepDataState::FAILED);
+        return;
+    }
+    _advance_sweep_cell();
 }
 
+// 扫描期(非恢复链)阶段的有界超时处置: 当前格记空洞后继续下一格(见 _abort_sweep_cell)。
+// SETTLE/SAMPLE 等不到新快照代次属"扫描停滞", 这是该格的真实结论, 必须让上位机看到。
+void SensorLink::_sweep_cell_timeout(uint32_t limit) {
+    if (_sweep.phase_ticks <= limit) return;
+    _sweep_note_fail_phase();
+    if (_sweep.phase == SweepPhase::SETTLE || _sweep.phase == SweepPhase::SAMPLE) {
+        _sweep_results[_sweep.cell].flags |= SWEEP_FLAG_STALLED;
+    }
+    _abort_sweep_cell();
+}
+
+// 扫描不再只发送实际采样点：produced 是从 0 开始连续已判定前缀长度。
+// 已判定但未采样的空洞同样发送 CELL(samples=0, flags=0)，已采样点保留真实结果。
 // SWEEP_DATA(0x38) 定长 23 字节:
 //   [session u16][state u8][ch u8][index u16][total u16][produced u16][flags u8]
 //   [gain u8][div u8][samples u16][mean u16][std_q8 u16][pp u16][fail_phase u8][phase u8]
@@ -610,7 +878,7 @@ void SensorLink::_sweep_cell_timeout(uint16_t limit) {
 // 先例), 只读前 21 字节的旧上位机不受影响; 新增两项让每个阶段都可枚举:
 //   fail_phase = 结果帧→该格卡住的阶段, 非结果帧→本会话首个失败阶段(0=无故障);
 //   phase      = 发帧当刻的会话阶段(SweepPhase), 用于追踪"卡在哪一步"这类未知故障。
-// 返回是否真的发出: 背压丢弃时调用方保持游标不动, 下一周期重发(结果与终态都不允许静默丢失)。
+// 返回是否真的发出: 背压时保持游标；补发允许 resolved 前缀中的空洞。
 bool SensorLink::_emit_sweep_frame(uint16_t index, SweepDataState state, bool retransmit) {
     const bool has_cell = (state == SweepDataState::CELL) && (index < SWEEP_TOTAL);
     const SweepResult& result = _sweep_results[has_cell ? index : 0u];
@@ -658,12 +926,19 @@ bool SensorLink::_emit_sweep_frame(uint16_t index, SweepDataState state, bool re
     return true;
 }
 
-// 取消 / 租约到期 / 任一阶段失败的唯一去处: 先把原 gain/div 写回并重新校准 + 复位基线, 再报终态。
-// ★不允许直接结束会话★: 扫描把该通道的 IDAC 增益与 snsClk 分频改成了中间值, 不写回 + 不校准的话
-// 触控在会话结束后依然是坏的(上位机看不出来, 只会以为"扫描完就坏了")。
+// 取消 / 租约到期 / 扫描结束的唯一去处：仅写回原 gain/div，等待 runtime apply 结果并回读确认。
 void SensorLink::_begin_sweep_restore(SweepDataState terminal) {
     if (!_sweep.active()) return;
-    if (_sweep_phase_is_restore(_sweep.phase)) return;   // 已在恢复链上: 保持首个终因, 不覆盖
+    if (_sweep_phase_is_restore(_sweep.phase) || _sweep.restoring) return;
+    // 恢复链前的结果前缀必须完整判定；扫描结束时把剩余未决尾部判空。
+    _resolve_sweep_tail();
+    // ★恢复期先交还快照快路★ 采样已结束, 恢复只需写回并回读 gain/div。继续武装单通道快路会让
+    // core1 每周期都在做完整锁存(BEGIN+INFO+页), 命令环消费变慢 ⇒ 阻塞读类的 get_param 长期
+    // 超时, 恢复链只能一路等到 120s 阶段兜底(实测会话停在 100% 迟迟不出终态)。
+    _release_focus_scan();
+    // 恢复链接管时显式复位启动闸门，确保只发起一次原 gain/div 的 runtime apply。
+    _sweep.restoring = true;
+    _sweep.restore_started = false;
     _sweep.terminal = terminal;
     _sweep.restore_announced = false;
     _sweep_enter(SweepPhase::RESTORE_WRITE);
@@ -678,8 +953,9 @@ void SensorLink::_finish_sweep_session() {
     _sweep.clear();
     TxScheduler::getInstance()->cancel(TX_TASK_SWEEP);
     _release_focus_scan();
-    if (restore == SweepOutputRestore::STOPPED) {
-        // 会话是被 stop()(TELEM_STOP / 新主机 HELLO)掀掉的: 流状态已在 stop() 里清空, 这里只收尾硬件。
+    if (restore != SweepOutputRestore::BROAD) {
+        // STOPPED = 显式 TELEM_STOP；QUIET = 扫描期间收到 HELLO。两者都必须等原参数
+        // 恢复链结束后再关闭快照慢路，不能在恢复中途抢走 PSoC 的扫描所有权。
         _saved_stream.clear();
         Psoc::getInstance()->set_telemetry_active(false);
         TxScheduler::getInstance()->cancel(TX_TASK_TELEM);
@@ -711,7 +987,8 @@ void SensorLink::sweep_tick() {
     bool tx_blocked = false;
     uint8_t budget = SWEEP_FRAMES_PER_TICK;
     while (!tx_blocked && budget != 0u && _sweep.resend_cursor < _sweep.resend_end) {
-        if (_emit_sweep_frame(_sweep.resend_cursor, SweepDataState::CELL, true)) {
+        const uint16_t index = _sweep.resend_cursor;
+        if (_emit_sweep_frame(index, SweepDataState::CELL, true)) {
             _sweep.resend_cursor++;
             budget--;
         } else {
@@ -719,100 +996,82 @@ void SensorLink::sweep_tick() {
         }
     }
     while (!tx_blocked && budget != 0u && _sweep.stream_cursor < _sweep.produced) {
-        if (_emit_sweep_frame(_sweep.stream_cursor, SweepDataState::CELL, false)) {
+        const uint16_t index = _sweep.stream_cursor;
+        if (_emit_sweep_frame(index, SweepDataState::CELL, false)) {
             _sweep.stream_cursor++;
             budget--;
         } else {
             tx_blocked = true;
         }
     }
-    // ★Bug 3 修复★: 扫描期背压只暂停"发送已产出的结果帧"（stream_cursor/resend_cursor 不前进），
-    // 但允许状态机继续推进（SET_CELL/READBACK/SAMPLE 等阶段产出新结果缓存在 _sweep_results[]）。
-    // 恢复期背压仍照常推进（写回/校准/基线不依赖 USB）。
-    // 删除原有的 "if (tx_blocked && !_sweep_phase_is_restore(_sweep.phase)) return;"，
-    // 让状态机在扫描期背压时继续推进游标产出结果（缓存在数组里），下一 tick USB 空闲后再继续发送。
-    // 这样遥测帧占用 USB 带宽时，扫描状态机不会卡住，只是结果帧暂时积压在缓冲区。
+    // USB 背压时不能继续改 PSoC 参数：否则结果队列积压、IN FIFO 饱和，主机连 keepalive/补发也会收到
+    // Windows ERROR_INVALID_FUNCTION(os error 22)，最终又因租约到期把仍在扫描的会话误取消。
+    if (tx_blocked && !_sweep_phase_is_restore(_sweep.phase)) return;
 
     switch (_sweep.phase) {
-        case SweepPhase::SET_CELL:
-            // gain/div 必须随 QUICK_APPLY 原子下发；扫描 ISR 中先 SET_PARAM 会改当前扫描的
-            // widgetContext，导致这一轮 CapSense 扫描卡死，主循环永远到不了 pending。
-            _sweep_enter(SweepPhase::START_CALIBRATE);
-            return;
-
-        case SweepPhase::WAIT_PARAMS:
-            // 写类指令异步入队 ⇒ 必须等 core1 把它们真正执行完再回读, 否则读到的是上一格的值。
-            if (!psoc->core1_idle()) {
+        case SweepPhase::SET_CELL: {
+            const uint8_t gain = static_cast<uint8_t>(_sweep.cell / SWEEP_DIV_COUNT);
+            const uint8_t div = static_cast<uint8_t>((_sweep.cell % SWEEP_DIV_COUNT) + 1u);
+            SweepResult& result = _sweep_results[_sweep.cell];
+            result.gain = gain;
+            result.div = div;
+            if (!psoc->start_runtime_param_apply(channel, gain, div)) {
                 _sweep_cell_timeout(SWEEP_WAIT_TICKS);
+                return;
+            }
+            _sweep_enter(SweepPhase::WAIT_PARAMS);
+            return;
+        }
+
+        case SweepPhase::WAIT_PARAMS: {
+            bool ok = false;
+            if (!psoc->take_runtime_param_apply_result(&ok)) {
+                _sweep_cell_timeout(SWEEP_RUNTIME_APPLY_TICKS);
+                return;
+            }
+            if (!ok) {
+                SweepResult& result = _sweep_results[_sweep.cell];
+                result.fail_phase = static_cast<uint8_t>(SweepPhase::WAIT_PARAMS);
+                _sweep_note_fail_phase();
+                _abort_sweep_cell();
                 return;
             }
             _sweep_enter(SweepPhase::READBACK);
             return;
+        }
+
 
         case SweepPhase::READBACK: {
-            uint32_t gain = 0, div = 0;
+            uint32_t gain = 0u;
+            uint32_t div = 0u;
+            // ★读不到 ≠ PSoC 拒绝★ get_param 是阻塞读类命令; Sweep 期间 core1 每周期都在推进
+            // 单通道快照锁存, 命令环消费变慢时读类会本地超时。一次超时就把该格判死会让整张表在
+            // 设备完全健康时全部无效(实测首格即 fail_phase=READBACK)。交给阶段兜底重试, 只有
+            // 真的读回了却与期望不符才是 PSoC 侧钳位/拒绝。
             if (!psoc->get_param(channel, SWEEP_PARAM_ID_GAIN, &gain) ||
                 !psoc->get_param(channel, SWEEP_PARAM_ID_DIV, &div)) {
                 _sweep_cell_timeout(SWEEP_WAIT_TICKS);
                 return;
             }
-            // ★该格记录的是设备实际生效值★: PSoC 可能钳位/拒绝, 记期望值会让整张图对不上真相。
-            SweepResult& result = _sweep_results[_sweep.cell];
-            result.clear();
-            result.gain = static_cast<uint8_t>(gain);
-            result.div = static_cast<uint8_t>(div);
-            if (gain != (_sweep.cell / SWEEP_DIV_COUNT) ||
-                div != ((_sweep.cell % SWEEP_DIV_COUNT) + 1u)) {
+            const uint8_t expected_gain = static_cast<uint8_t>(_sweep.cell / SWEEP_DIV_COUNT);
+            const uint8_t expected_div = static_cast<uint8_t>((_sweep.cell % SWEEP_DIV_COUNT) + 1u);
+            if (gain != expected_gain || div != expected_div) {
+                SweepResult& result = _sweep_results[_sweep.cell];
                 result.flags |= SWEEP_FLAG_MISMATCH;
                 result.fail_phase = static_cast<uint8_t>(SweepPhase::READBACK);
                 _sweep_note_fail_phase();
-                _sweep.stats.clear();
-                _finish_sweep_cell();
+                _abort_sweep_cell();
                 return;
             }
-            // readback 已确认 QUICK_APPLY 的设备真值；从新代次开始 settle，绝不采改参前快照。
             _sweep.stats.clear();
-            _sweep.settle_seen = 0;
+            _sweep.settle_seen = 0u;
             _sweep.last_generation = psoc->snapshot_generation();
-            _sweep_enter((_sweep.settle_samples != 0u) ? SweepPhase::SETTLE : SweepPhase::SAMPLE);
-            return;
-        }
-
-        case SweepPhase::START_CALIBRATE: {
-            // 保留旧阶段码供协议兼容：该槽发起携带 gain/div 的 QUICK_APPLY，而非逐格校准。
-            const uint8_t gain = static_cast<uint8_t>(_sweep.cell / SWEEP_DIV_COUNT);
-            const uint8_t div = static_cast<uint8_t>((_sweep.cell % SWEEP_DIV_COUNT) + 1u);
-            if (!psoc->start_sweep_apply(channel, gain, div)) {
-                _sweep_cell_timeout(SWEEP_WAIT_TICKS);
-                return;
-            }
-            _sweep_enter(SweepPhase::WAIT_CALIBRATE);
-            return;
-        }
-
-        case SweepPhase::WAIT_CALIBRATE: {
-            bool ok = false;
-            if (!psoc->take_sweep_result(&ok)) {
-                _sweep_cell_timeout(SWEEP_HEAVY_TICKS);
-                return;
-            }
-            // 参数应用拒绝只标记当前格无效；后续格仍须各自完成 QUICK_APPLY、READBACK、SETTLE 与 SAMPLE。
-            if (!ok) {
-                SweepResult& result = _sweep_results[_sweep.cell];
-                result.flags |= SWEEP_FLAG_CAL_FAIL;
-                result.fail_phase = static_cast<uint8_t>(SweepPhase::WAIT_CALIBRATE);
-                _sweep_note_fail_phase();
-                _sweep.stats.clear();
-                _finish_sweep_cell();
-                return;
-            }
-            // QUICK_APPLY 已完成，先读回确认 PSoC 的真值；只有一致才开始 settle/sample。
-            _sweep_enter(SweepPhase::READBACK);
+            _sweep_enter(SweepPhase::SETTLE);
             return;
         }
 
         case SweepPhase::SETTLE: {
-            // 丢弃校准后前若干帧(基线/滤波仍在收敛)。按快照代次计数, 不按时间猜。
+            // 丢弃运行时参数生效后的前若干帧，按快照代次计数而不按时间猜。
             if (!psoc->snapshot_valid() || psoc->snapshot_generation() == _sweep.last_generation) {
                 _sweep_cell_timeout(SWEEP_WAIT_TICKS);
                 return;
@@ -838,135 +1097,72 @@ void SensorLink::sweep_tick() {
             stats.sum_sq += static_cast<uint64_t>(raw) * raw;
             if (raw < stats.min) stats.min = raw;
             if (raw > stats.max) stats.max = raw;
-            if (raw >= SWEEP_RAILED_RAW && stats.railed < 0xFFu) stats.railed++;
-            // 每 8 格段首是快速锚点，最多采 8 个样本；锚点有效后，段内其余格仍用请求的完整样本数精扫。
-            const uint8_t sample_target = ((_sweep.cell % SWEEP_SEGMENT_CELLS) == 0u &&
-                                           _sweep.sample_count > SWEEP_SEGMENT_CELLS)
-                ? SWEEP_SEGMENT_CELLS : _sweep.sample_count;
-            if (stats.count >= sample_target) _finish_sweep_cell();
+            // 饱和与恒零同属"该 gain/div 下电极不在可用工作区", 两侧出界都记 railed。
+            if ((raw >= SWEEP_RAILED_RAW || raw == 0u) && stats.railed < 0xFFu) stats.railed++;
+            // ★每一格用同一个样本数★ 原先每 8 格的段首只采 8 个样本当"快锚点"(为探针策略服务)。
+            // 全覆盖之后那只会让 1/8 的格子拿 8 样本的标准差、其余拿 32 样本的标准差 —— 而这张图
+            // 的全部用处就是横向比较各格的标准差, 样本数不一致等于把估计误差混进结论里。
+            if (stats.count >= _sweep.sample_count) _finish_sweep_cell();
             return;
         }
 
-        case SweepPhase::RESTORE_WRITE:
-            // 恢复同样禁止先 SET_PARAM：原 gain/div 与 QUICK_APPLY 同帧下发，随后 readback 确认。
-            _sweep_enter(SweepPhase::RESTORE_APPLY);
-            return;
-
-        case SweepPhase::RESTORE_WAIT_PARAMS:
-            // 旧状态码仅为协议诊断兼容保留；新恢复路径不会到达。
-            _sweep_enter(SweepPhase::RESTORE_APPLY);
-            return;
-
-        case SweepPhase::RESTORE_READBACK: {
-            uint32_t gain = 0, div = 0;
-            if (!psoc->get_param(channel, SWEEP_PARAM_ID_GAIN, &gain) ||
-                !psoc->get_param(channel, SWEEP_PARAM_ID_DIV, &div)) {
-                if (_sweep.phase_ticks > SWEEP_WAIT_TICKS) {
-                    _sweep_note_fail_phase();
-                    _sweep.restore_flags |= SWEEP_RESTORE_FLAG_PARAM;
-                    _sweep_enter(SweepPhase::RESTORE_CALIBRATE);
+        case SweepPhase::RESTORE_WRITE: {
+            // 恢复仅执行一次原 gain/div 的 runtime apply，随后在本阶段内等待并回读确认。
+            if (!_sweep.restore_started) {
+                if (psoc->runtime_param_apply_in_progress()) return;
+                bool discarded_result = false;
+                (void)psoc->take_runtime_param_apply_result(&discarded_result);
+                if (!psoc->start_runtime_param_apply(channel, _sweep.original_gain, _sweep.original_div)) {
+                    if (_sweep.phase_ticks > SWEEP_WAIT_TICKS) {
+                        _sweep_note_fail_phase();
+                        _sweep.restore_flags |= SWEEP_RESTORE_FLAG_PARAM;
+                        _sweep.terminal = SweepDataState::FAILED;
+                        _sweep_enter(SweepPhase::TERMINAL);
+                    }
+                    return;
                 }
+                _sweep.restore_started = true;
+                _sweep.phase_ticks = 0u;
                 return;
             }
-            if (gain != _sweep.original_gain || div != _sweep.original_div) {
+
+            bool ok = false;
+            if (!psoc->take_runtime_param_apply_result(&ok)) {
+                if (_sweep.phase_ticks <= SWEEP_RUNTIME_APPLY_TICKS) return;
                 _sweep_note_fail_phase();
                 _sweep.restore_flags |= SWEEP_RESTORE_FLAG_PARAM;
-            }
-            // QUICK_APPLY 已完成；写穿设备真值后只做一次 CALIBRATE + BASELINE 收口。
-            CsdConfig* csd = CsdConfig::getInstance();
-            csd->note_param(channel, SWEEP_PARAM_ID_GAIN, gain);
-            csd->note_param(channel, SWEEP_PARAM_ID_DIV, div);
-            _sweep_enter(SweepPhase::RESTORE_CALIBRATE);
-            return;
-        }
-
-        case SweepPhase::RESTORE_APPLY:
-            // 直接携带会话起始时的原 gain/div；PSoC 在 NOT_BUSY 窗口原子写入后 Initialize。
-            if (!psoc->start_sweep_apply(channel, _sweep.original_gain, _sweep.original_div)) {
-                if (_sweep.phase_ticks > SWEEP_WAIT_TICKS) {
-                    _sweep_note_fail_phase();
-                    _sweep.restore_flags |= SWEEP_RESTORE_FLAG_PARAM;
-                    _sweep_enter(SweepPhase::RESTORE_CALIBRATE);
-                }
+                _sweep.terminal = SweepDataState::FAILED;
+                _sweep_enter(SweepPhase::TERMINAL);
                 return;
             }
-            _sweep_enter(SweepPhase::RESTORE_WAIT_APPLY);
-            return;
-
-        case SweepPhase::RESTORE_WAIT_APPLY: {
-            bool ok = false;
-            if (!psoc->take_sweep_result(&ok)) {
-                if (_sweep.phase_ticks > SWEEP_HEAVY_TICKS) {
-                    _sweep_note_fail_phase();
-                    _sweep.restore_flags |= SWEEP_RESTORE_FLAG_PARAM;
-                    _sweep_enter(SweepPhase::RESTORE_CALIBRATE);
-                }
+            uint32_t gain = 0u;
+            uint32_t div = 0u;
+            // 同 READBACK: 回读本身超时只说明链路正忙, 不能据此宣布"原参数没恢复"。留在本阶段
+            // 重试到兜底期限, 期限内读回不符才是真的恢复失败(设备停在扫描参数上, 必须如实上报)。
+            if (ok && (!psoc->get_param(channel, SWEEP_PARAM_ID_GAIN, &gain) ||
+                       !psoc->get_param(channel, SWEEP_PARAM_ID_DIV, &div))) {
+                if (_sweep.phase_ticks <= SWEEP_WAIT_TICKS) return;
+                _sweep_note_fail_phase();
+                _sweep.restore_flags |= SWEEP_RESTORE_FLAG_PARAM;
+                _sweep.terminal = SweepDataState::FAILED;
+                _sweep_enter(SweepPhase::TERMINAL);
                 return;
             }
-            if (!ok) { _sweep_note_fail_phase(); _sweep.restore_flags |= SWEEP_RESTORE_FLAG_PARAM; }
-            _sweep_enter(SweepPhase::RESTORE_READBACK);
-            return;
-        }
-
-        case SweepPhase::RESTORE_CALIBRATE:
-            if (!psoc->start_sweep_calibrate(channel)) {
-                if (_sweep.phase_ticks > SWEEP_WAIT_TICKS) {
-                    _sweep_note_fail_phase();
-                    _sweep.restore_flags |= SWEEP_RESTORE_FLAG_CAL;
-                    _sweep_enter(SweepPhase::RESTORE_BASELINE);
-                }
-                return;
+            if (!ok || gain != _sweep.original_gain || div != _sweep.original_div) {
+                _sweep_note_fail_phase();
+                _sweep.restore_flags |= SWEEP_RESTORE_FLAG_PARAM;
+                _sweep.terminal = SweepDataState::FAILED;
+            } else {
+                CsdConfig* csd = CsdConfig::getInstance();
+                csd->note_param(channel, SWEEP_PARAM_ID_GAIN, gain);
+                csd->note_param(channel, SWEEP_PARAM_ID_DIV, div);
             }
-            _sweep_enter(SweepPhase::RESTORE_WAIT_CALIBRATE);
-            return;
-
-        case SweepPhase::RESTORE_WAIT_CALIBRATE: {
-            bool ok = false;
-            if (!psoc->take_sweep_result(&ok)) {
-                if (_sweep.phase_ticks > SWEEP_HEAVY_TICKS) {
-                    _sweep_note_fail_phase();
-                    _sweep.restore_flags |= SWEEP_RESTORE_FLAG_CAL;
-                    _sweep_enter(SweepPhase::RESTORE_BASELINE);
-                }
-                return;
-            }
-            if (!ok) { _sweep_note_fail_phase(); _sweep.restore_flags |= SWEEP_RESTORE_FLAG_CAL; }
-            _sweep_enter(SweepPhase::RESTORE_BASELINE);
-            return;
-        }
-
-        case SweepPhase::RESTORE_BASELINE:
-            // 校准后再显式复位一次基线: 扫描期间的中间值已把该通道基线污染, 不复位会留下持续误触。
-            if (!psoc->start_sweep_baseline_reset(channel)) {
-                if (_sweep.phase_ticks > SWEEP_WAIT_TICKS) {
-                    _sweep_note_fail_phase();
-                    _sweep.restore_flags |= SWEEP_RESTORE_FLAG_BSLN;
-                    _sweep_enter(SweepPhase::TERMINAL);
-                }
-                return;
-            }
-            _sweep_enter(SweepPhase::RESTORE_WAIT_BASELINE);
-            return;
-
-        case SweepPhase::RESTORE_WAIT_BASELINE: {
-            bool ok = false;
-            if (!psoc->take_sweep_result(&ok)) {
-                if (_sweep.phase_ticks > SWEEP_HEAVY_TICKS) {
-                    _sweep_note_fail_phase();
-                    _sweep.restore_flags |= SWEEP_RESTORE_FLAG_BSLN;
-                    _sweep_enter(SweepPhase::TERMINAL);
-                }
-                return;
-            }
-            if (!ok) { _sweep_note_fail_phase(); _sweep.restore_flags |= SWEEP_RESTORE_FLAG_BSLN; }
             _sweep_enter(SweepPhase::TERMINAL);
             return;
         }
 
         case SweepPhase::TERMINAL:
-            // 全部格结果与补发都送出后才发终态帧, 背压则下拍重发。★重试窗到点无条件收尾★:
-            // 此刻硬件已经恢复完毕, 若还因为"上位机不收"而不清会话, 输出抑制与任务就永久悬着
-            // (表现为扫描完成后触摸再也不输出), 那比丢一帧终态严重得多。
+            if (_sweep.restore_flags != 0u) _sweep.terminal = SweepDataState::FAILED;
             if (_sweep.phase_ticks <= SWEEP_TERMINAL_TICKS) {
                 if (_sweep.stream_cursor < _sweep.produced ||
                     _sweep.resend_cursor < _sweep.resend_end) return;
@@ -1207,11 +1403,9 @@ void SensorLink::_handle_focus_start(const HostFrame& frame, uint8_t* response, 
 
     SensorLink* self = getInstance();
     const bool replacing = self->_focus.active;
-    if (!Psoc::getInstance()->set_focus_scan(channel)) {
-        *response_length = HostCmdCodec::encode_nak(frame.seq, HostCmdError::SENSOR_ERROR,
-            "PSoC focus_scan was not accepted", response, HOST_CMD_RESP_BUF_MAX);
-        return;
-    }
+    // Do not invoke device-side FOCUS_SCAN here.  On the deployed PSoC image it
+    // can accept the command while pausing scan_count indefinitely; focus is
+    // implemented by the RP snapshot fast path below instead.
     TxScheduler::getInstance()->cancel(TX_TASK_FOCUS);
     if (!replacing) self->_pause_broad_for_focus();
 
@@ -1229,8 +1423,7 @@ void SensorLink::_handle_focus_start(const HostFrame& frame, uint8_t* response, 
     self->_focus.last_focus_scan_ack_us = time_us_32();
     self->_focus.generation_fence = 1u;
     Psoc::getInstance()->set_telemetry_active(true);
-    // 快照转入单通道快路: 独占期只读该通道 ⇒ 每个 core1 拍都能出一份新代数(不再是 16 拍一份),
-    // 精调曲线才拿得到设备的全速采样。FOCUS_STOP / 会话清理时必须还原为 0xFF。
+    // Focus keeps the PSoC continuous scan loop and narrows only the RP snapshot/output path.
     Psoc::getInstance()->set_focus_channel(channel);
     TxScheduler::getInstance()->schedule(TX_TASK_FOCUS, 1000000UL / rate_hz, lease_ms,
                                          &SensorLink::emit_focus_task,
@@ -1295,7 +1488,7 @@ void SensorLink::_handle_sweep_start(const HostFrame& frame, uint8_t* response, 
     }
     if (disabled_ch_reject("该通道已禁用(电极保持高阻), 无法扫描; 请先启用该通道",
                            channel, frame, response, response_length)) return;
-    // 扫描全程独占 PSoC 的重操作槽(每格一次校准), 已有长周期指令在途时如实回绝而不排队。
+    // 扫描会话独占目标通道的 gain/div；已有普通 heavy 操作在途时如实回绝而不排队。
     if (heavy_gate_reject("PSoC 正在执行长周期指令, 请稍后重试(增益/分频扫描)",
                           frame, response, response_length)) return;
     Psoc* psoc = Psoc::getInstance();
@@ -1334,6 +1527,9 @@ void SensorLink::_handle_sweep_start(const HostFrame& frame, uint8_t* response, 
     if (session == 0u) session = 1u;
     self->_sweep_session_counter = session;
     self->_sweep.clear();
+    for (uint16_t i = 0; i < SWEEP_TOTAL; ++i) {
+        self->_sweep_results[i].clear();
+    }
     self->_sweep.id = session;
     self->_sweep.channel = channel;
     self->_sweep.settle_samples = settle_samples;
@@ -1363,8 +1559,8 @@ void SensorLink::_handle_sweep_start(const HostFrame& frame, uint8_t* response, 
 }
 
 // SWEEP_CTRL(0x37): payload = [op(0=取消 / 1=补发 / 2=续租), session u16, first u16, count u8]。
-// 取消只是“请求恢复”(仍要走完写回+校准+基线才报终态)；补发只允许取已缓存的格(index < produced)。
-// 续租必须显式存在：448 格会话远长于 8s，不能假设其它主机命令刚好替它续期。
+    // 取消只是“请求恢复”(仍要走完原 gain/div runtime apply + 回读才报终态)；补发覆盖已判定前缀，
+    // 其中未采样空洞也会以 samples=0 如实发送。
 void SensorLink::_handle_sweep_ctrl(const HostFrame& frame, uint8_t* response, uint16_t* response_length) {
     if (frame.len < 3u) {
         *response_length = HostCmdCodec::encode_nak(frame.seq, HostCmdError::INVALID_PARAM,
@@ -1405,7 +1601,7 @@ void SensorLink::_handle_sweep_ctrl(const HostFrame& frame, uint8_t* response, u
     const uint16_t first = static_cast<uint16_t>(frame.payload[3]) |
                            (static_cast<uint16_t>(frame.payload[4]) << 8);
     const uint8_t count = frame.payload[5];
-    if (count == 0u || first >= self->_sweep.produced) {
+        if (count == 0u || first >= SWEEP_TOTAL || first >= self->_sweep.produced) {
         *response_length = HostCmdCodec::encode_nak(frame.seq, HostCmdError::INVALID_PARAM,
             "sweep_ctrl resend range not cached yet", response, HOST_CMD_RESP_BUF_MAX);
         return;
@@ -1455,13 +1651,14 @@ void SensorLink::_handle_param_set(const HostFrame& frame, uint8_t* response, ui
     }
     if (_sweep_busy_reject("扫描会话进行中, 请先取消或等待完成(调参)", frame, response, response_length)) return;
 
-    if (Psoc::getInstance()->set_param(ch, param_id, value)) {
-        CsdConfig::getInstance()->note_param(ch, param_id, value);  // 写穿 RP2040 真相源
-        *response_length = HostCmdCodec::encode_ack(frame.seq, response, HOST_CMD_RESP_BUF_MAX);
-    } else {
-        *response_length = HostCmdCodec::encode_nak(frame.seq, HostCmdError::SENSOR_ERROR,
-            "PSoC param_set failed", response, HOST_CMD_RESP_BUF_MAX);
+    SensorLink* self = getInstance();
+    if (!self->_start_host_write(HostWriteState::Kind::PARAM, frame, ch, param_id, value)) {
+        *response_length = HostCmdCodec::encode_nak(frame.seq, HostCmdError::DEVICE_BUSY,
+            "PSoC host write slot busy", response, HOST_CMD_RESP_BUF_MAX);
+        return;
     }
+    // Delayed terminal: ACK only after core1/PSoC has executed the command and CsdConfig was written through.
+    *response_length = 0u;
 }
 
 void SensorLink::_handle_param_get(const HostFrame& frame, uint8_t* response, uint16_t* response_length) {
@@ -1473,6 +1670,7 @@ void SensorLink::_handle_param_get(const HostFrame& frame, uint8_t* response, ui
     }
     const uint8_t ch = frame.payload[0];
     const uint8_t param_id = frame.payload[1];
+    if (sync_read_gate_reject("PSoC command queue busy", frame, response, response_length)) return;
     uint32_t value = 0;
     if (!Psoc::getInstance()->get_param(ch, param_id, &value)) {
         *response_length = HostCmdCodec::encode_nak(frame.seq, HostCmdError::SENSOR_ERROR,
@@ -1507,6 +1705,7 @@ void SensorLink::_handle_param_get_all(const HostFrame& frame, uint8_t* response
         return;
     }
     const uint8_t ch = frame.payload[0];
+    if (sync_read_gate_reject("PSoC command queue busy", frame, response, response_length)) return;
     if (ch == kAllChannels) {
         if (frame.len < 2) {
             *response_length = HostCmdCodec::encode_nak(frame.seq, HostCmdError::INVALID_PARAM,
@@ -1583,12 +1782,13 @@ void SensorLink::_handle_calibrate(const HostFrame& frame, uint8_t* response, ui
                            cal_ch, frame, response, response_length)) return;
     if (_sweep_busy_reject("扫描会话进行中, 请先取消或等待完成(校准)", frame, response, response_length)) return;
     if (heavy_gate_reject("PSoC 正在执行长周期指令, 请稍后重试(校准)", frame, response, response_length)) return;
-    if (Psoc::getInstance()->calibrate(cal_ch)) {
-        *response_length = HostCmdCodec::encode_ack(frame.seq, response, HOST_CMD_RESP_BUF_MAX);
-    } else {
-        *response_length = HostCmdCodec::encode_nak(frame.seq, HostCmdError::SENSOR_ERROR,
-            "PSoC calibrate failed", response, HOST_CMD_RESP_BUF_MAX);
+    SensorLink* self = getInstance();
+    if (!self->_start_host_write(HostWriteState::Kind::CALIBRATE, frame, cal_ch, 0u, 0u)) {
+        *response_length = HostCmdCodec::encode_nak(frame.seq, HostCmdError::DEVICE_BUSY,
+            "PSoC host write slot busy", response, HOST_CMD_RESP_BUF_MAX);
+        return;
     }
+    *response_length = 0u;
 }
 
 void SensorLink::_handle_baseline_reset(const HostFrame& frame, uint8_t* response, uint16_t* response_length) {
@@ -1598,12 +1798,13 @@ void SensorLink::_handle_baseline_reset(const HostFrame& frame, uint8_t* respons
                            bsln_ch, frame, response, response_length)) return;
     if (_sweep_busy_reject("扫描会话进行中, 请先取消或等待完成(基线复位)", frame, response, response_length)) return;
     if (heavy_gate_reject("PSoC 正在执行长周期指令, 请稍后重试(基线复位)", frame, response, response_length)) return;
-    if (Psoc::getInstance()->baseline_reset(bsln_ch)) {
-        *response_length = HostCmdCodec::encode_ack(frame.seq, response, HOST_CMD_RESP_BUF_MAX);
-    } else {
-        *response_length = HostCmdCodec::encode_nak(frame.seq, HostCmdError::SENSOR_ERROR,
-            "PSoC baseline reset failed", response, HOST_CMD_RESP_BUF_MAX);
+    SensorLink* self = getInstance();
+    if (!self->_start_host_write(HostWriteState::Kind::BASELINE_RESET, frame, bsln_ch, 0u, 0u)) {
+        *response_length = HostCmdCodec::encode_nak(frame.seq, HostCmdError::DEVICE_BUSY,
+            "PSoC host write slot busy", response, HOST_CMD_RESP_BUF_MAX);
+        return;
     }
+    *response_length = 0u;
 }
 
 void SensorLink::_handle_auto_tune(const HostFrame& frame, uint8_t* response, uint16_t* response_length) {
@@ -1650,18 +1851,19 @@ void SensorLink::_handle_mode_set(const HostFrame& frame, uint8_t* response, uin
             "mode_set payload too short", response, HOST_CMD_RESP_BUF_MAX);
         return;
     }
-    if (Psoc::getInstance()->set_mode(frame.payload[0])) {
-        CsdConfig::getInstance()->note_mode(frame.payload[0]);  // 写穿 RP2040 真相源
-        *response_length = HostCmdCodec::encode_ack(frame.seq, response, HOST_CMD_RESP_BUF_MAX);
-    } else {
-        *response_length = HostCmdCodec::encode_nak(frame.seq, HostCmdError::SENSOR_ERROR,
-            "PSoC mode_set failed", response, HOST_CMD_RESP_BUF_MAX);
+    SensorLink* self = getInstance();
+    if (!self->_start_host_write(HostWriteState::Kind::MODE, frame, frame.payload[0], 0u, 0u)) {
+        *response_length = HostCmdCodec::encode_nak(frame.seq, HostCmdError::DEVICE_BUSY,
+            "PSoC host write slot busy", response, HOST_CMD_RESP_BUF_MAX);
+        return;
     }
+    *response_length = 0u;
 }
 
 void SensorLink::_handle_csd_capture(const HostFrame& frame, uint8_t* response, uint16_t* response_length) {
     // AUTO 的实时参数由 CapSense 自动计算，回读固化会覆盖用户保存的半自动手动参数。
     CsdConfig* csd = CsdConfig::getInstance();
+    if (sync_read_gate_reject("PSoC command queue busy", frame, response, response_length)) return;
     if (csd->mode() != CSD_MODE_SEMI) {
         *response_length = HostCmdCodec::encode_nak(frame.seq, HostCmdError::CONFIG_ERROR,
             "自动模式由 PSoC 接管，禁止捕获以保护手动参数", response, HOST_CMD_RESP_BUF_MAX);
@@ -1682,12 +1884,13 @@ void SensorLink::_handle_cp_measure(const HostFrame& frame, uint8_t* response, u
         return;
     }
     if (heavy_gate_reject("PSoC 正在执行长周期指令, 请稍后重试(Cp 测量)", frame, response, response_length)) return;
-    if (Psoc::getInstance()->measure_cp()) {
-        *response_length = HostCmdCodec::encode_ack(frame.seq, response, HOST_CMD_RESP_BUF_MAX);
-    } else {
-        *response_length = HostCmdCodec::encode_nak(frame.seq, HostCmdError::SENSOR_ERROR,
-            "PSoC cp_measure failed", response, HOST_CMD_RESP_BUF_MAX);
+    SensorLink* self = getInstance();
+    if (!self->_start_host_write(HostWriteState::Kind::CP_MEASURE, frame, 0u, 0u, 0u)) {
+        *response_length = HostCmdCodec::encode_nak(frame.seq, HostCmdError::DEVICE_BUSY,
+            "PSoC host write slot busy", response, HOST_CMD_RESP_BUF_MAX);
+        return;
     }
+    *response_length = 0u;
 }
 
 void SensorLink::_handle_cp_get(const HostFrame& frame, uint8_t* response, uint16_t* response_length) {
@@ -1698,6 +1901,7 @@ void SensorLink::_handle_cp_get(const HostFrame& frame, uint8_t* response, uint1
     }
 
     const uint8_t ch = frame.payload[0];
+    if (sync_read_gate_reject("PSoC command queue busy", frame, response, response_length)) return;
     uint32_t cp_ff = 0;
     // ★不再 NAK★: PSoC 未测量/测量失败本就以哨兵 0xFFFFFF 表达; 读取(SPI 忙/超时)失败时也回同一
     // 哨兵的正常响应, 使上位机显示"未测量/测量失败"而不是刷 NAK 日志(实测 NAK 每秒 8~12 条刷屏)。
@@ -1740,6 +1944,7 @@ void SensorLink::_handle_global_get(const HostFrame& frame, uint8_t* response, u
         return;
     }
     const uint8_t gid = frame.payload[0];
+    if (sync_read_gate_reject("PSoC command queue busy", frame, response, response_length)) return;
     uint32_t value = 0;
     if (!Psoc::getInstance()->get_global(gid, &value)) {
         *response_length = HostCmdCodec::encode_nak(frame.seq, HostCmdError::SENSOR_ERROR,
@@ -1795,16 +2000,14 @@ void SensorLink::_handle_global_set(const HostFrame& frame, uint8_t* response, u
             "global value out of legal range (guarded)", response, HOST_CMD_RESP_BUF_MAX);
         return;
     }
-    Psoc* psoc = Psoc::getInstance();
-    if (!psoc->set_global(gid, value)) {
-        *response_length = HostCmdCodec::encode_nak(frame.seq, HostCmdError::SENSOR_ERROR,
-            "PSoC global_set failed", response, HOST_CMD_RESP_BUF_MAX);
+    SensorLink* self = getInstance();
+    if (!self->_start_host_write(HostWriteState::Kind::GLOBAL, frame, gid, 0u, value)) {
+        *response_length = HostCmdCodec::encode_nak(frame.seq, HostCmdError::DEVICE_BUSY,
+            "PSoC host write slot busy", response, HOST_CMD_RESP_BUF_MAX);
         return;
     }
-    CsdConfig::getInstance()->note_global(gid, value);   // 写穿 RP2040 真相源
-    // ★不再逐项 commit★: 只写影子。由上位机在批量下发全部全局项后发一次 GLOBAL_COMMIT 统一重初始化,
-    // 避免"每项各触发一次完整 Init+Enable 重校准"的风暴(实测会拖垮 core0/USB → 掉线, 见 log.log)。
-    *response_length = HostCmdCodec::encode_ack(frame.seq, response, HOST_CMD_RESP_BUF_MAX);
+    // GLOBAL_SET only mutates the PSoC shadow. The following GLOBAL_COMMIT carries the one-time reinitialization.
+    *response_length = 0u;
 }
 
 // 批量全局项下发完毕后, 单次触发 PSoC 完整重初始化(合并, 防反复重校准漂移/风暴)。
@@ -1812,13 +2015,27 @@ void SensorLink::_handle_global_commit(const HostFrame& frame, uint8_t* response
     // 全局提交会整片重初始化 + 重校准, 与逐格扫描直接冲突(会把已扫的参数与基线一并推翻)。
     if (_sweep_busy_reject("扫描会话进行中, 请先取消或等待完成(全局提交)", frame, response, response_length)) return;
     if (heavy_gate_reject("PSoC 正在执行长周期指令, 请稍后重试(全局提交)", frame, response, response_length)) return;
-    Psoc::getInstance()->global_commit();
-    *response_length = HostCmdCodec::encode_ack(frame.seq, response, HOST_CMD_RESP_BUF_MAX);
+    SensorLink* self = getInstance();
+    if (!self->_start_host_write(HostWriteState::Kind::GLOBAL_COMMIT, frame, 0u, 0u, 0u)) {
+        *response_length = HostCmdCodec::encode_nak(frame.seq, HostCmdError::DEVICE_BUSY,
+            "PSoC global_commit busy", response, HOST_CMD_RESP_BUF_MAX);
+        return;
+    }
+    *response_length = 0u;
 }
 
 void SensorLink::_handle_global_get_all(const HostFrame& frame, uint8_t* response, uint16_t* response_length) {
     // 空 → [count(u8), (gparam_id, value u32 LE)×count]
+    // This is a synchronous multi-read.  Refuse while the core1 FIFO is owned
+    // by provisioning, a delayed host write, or a heavy operation instead of
+    // holding UsbComm inside eight blocking reads and turning a busy PSoC into
+    // a silent six-second host timeout.
     Psoc* psoc = Psoc::getInstance();
+    if (!psoc->core1_idle() || psoc->heavy_busy()) {
+        *response_length = HostCmdCodec::encode_nak(frame.seq, HostCmdError::DEVICE_BUSY,
+            "PSoC command queue busy", response, HOST_CMD_RESP_BUF_MAX);
+        return;
+    }
     // HostFrame 为 4102B；core0 栈只有 8192B 且下界就是堆顶，响应帧必须借共享静态工作帧。
     HostFrame& resp = HostCmdCodec::resp_frame();
     resp.clear();
@@ -1846,9 +2063,23 @@ void SensorLink::_handle_global_get_all(const HostFrame& frame, uint8_t* respons
 void SensorLink::_handle_algo_get_info(const HostFrame& frame, uint8_t* response, uint16_t* response_length) {
     // 空请求 → [is_default(u8), psoc_valid(u8), len(u16 LE), crc16(u16 LE)]
     PsocAlgo* store = PsocAlgo::getInstance();
+    // REST_DEFAULT 的 ACK 仅表示异步请求已受理；先用 RP 侧权威默认元数据回包，避免同一 USB
+    // 批次中紧随其后的 GET_INFO 抢在 core1 完成默认 blob 下发前读到旧 PSoC cache。
+    // 非 pending 的普通查询仍回报 PSoC cache，保持设备真值可见。
+    const bool reset_pending = store->reset_default_pending();
     bool psoc_valid = false;
-    uint16_t psoc_len = 0;
-    Psoc::getInstance()->get_algo_info_cached(&psoc_valid, &psoc_len);
+    uint16_t psoc_len = 0u;
+    const uint16_t reported_len = reset_pending
+        ? static_cast<uint16_t>(PSOC_ALGO_DEFAULT_LEN) : store->len();
+    const uint16_t reported_crc16 = reset_pending
+        ? static_cast<uint16_t>(PSOC_ALGO_DEFAULT_CRC16) : store->crc16();
+    // RESET_DEFAULT ACK 表示恢复已被异步所有者受理；同一 USB 批次里的即时查询据此返回
+    // 目标默认元数据。pending 只会在 core1 cache 已确认 valid+540 后清除，普通查询始终报告真值。
+    if (reset_pending) {
+        psoc_valid = true;
+    } else {
+        Psoc::getInstance()->get_algo_info_cached(&psoc_valid, &psoc_len);
+    }
 
     // HostFrame 为 4102B；core0 栈只有 8192B 且下界就是堆顶，响应帧必须借共享静态工作帧。
     HostFrame& resp = HostCmdCodec::resp_frame();
@@ -1857,12 +2088,12 @@ void SensorLink::_handle_algo_get_info(const HostFrame& frame, uint8_t* response
     resp.flags = HOST_CMD_FLAG_RESPONSE;
     resp.seq = frame.seq;
     uint16_t p = 0;
-    resp.payload[p++] = store->is_default() ? 1u : 0u;
+    resp.payload[p++] = reset_pending || store->is_default() ? 1u : 0u;
     resp.payload[p++] = psoc_valid ? 1u : 0u;
-    resp.payload[p++] = static_cast<uint8_t>(store->len());
-    resp.payload[p++] = static_cast<uint8_t>(store->len() >> 8);
-    resp.payload[p++] = static_cast<uint8_t>(store->crc16());
-    resp.payload[p++] = static_cast<uint8_t>(store->crc16() >> 8);
+    resp.payload[p++] = static_cast<uint8_t>(reported_len);
+    resp.payload[p++] = static_cast<uint8_t>(reported_len >> 8);
+    resp.payload[p++] = static_cast<uint8_t>(reported_crc16);
+    resp.payload[p++] = static_cast<uint8_t>(reported_crc16 >> 8);
     resp.len = p;
     *response_length = HostCmdCodec::encode_frame(resp, response, HOST_CMD_RESP_BUF_MAX);
 }
@@ -1933,41 +2164,66 @@ void SensorLink::_handle_algo_apply(const HostFrame& frame, uint8_t* response, u
 }
 
 void SensorLink::_handle_algo_reset_default(const HostFrame& frame, uint8_t* response, uint16_t* response_length) {
-    // 同 ALGO_UPLOAD: reset_default 会改写 blob, 下发在途时必须先挡住。
-    if (Psoc::getInstance()->algo_download_busy()) {
+    PsocAlgo* store = PsocAlgo::getInstance();
+    Psoc* psoc = Psoc::getInstance();
+    // 恢复请求与上传共享一个异步所有者。若此刻仍在下发，交由 PsocAlgo::tick() 等自然终态后
+    // 自动执行，避免丢弃主机请求或复用已被 core1 持有的 blob 缓冲。
+    if (!store->request_reset_default()) {
         *response_length = HostCmdCodec::encode_nak(frame.seq, HostCmdError::DEVICE_BUSY,
-            "algo download still in progress", response, HOST_CMD_RESP_BUF_MAX);
+            "default algo reset already pending", response, HOST_CMD_RESP_BUF_MAX);
         return;
     }
-    PsocAlgo* store = PsocAlgo::getInstance();
-    store->reset_default();                          // 回退内嵌默认 + 请求持久化
-    store->request_download(Psoc::getInstance());    // 只入队(失败也回 ACK, 启动会重推)
+    // 空闲时立即切换 RP 侧默认元数据：上位机的有序写队列可能与直接 GET_INFO 轮询并行，
+    // 先发布目标状态可避免旧自定义信息覆盖已受理的恢复请求。实际 PSoC 分页下发仍由 tick()
+    // 异步启动；在途上传或命令环非空时绝不改写 core1 可能持有的 blob。
+    if (!psoc->algo_download_busy() && psoc->core1_idle()) {
+        store->reset_default();
+    }
     *response_length = HostCmdCodec::encode_ack(frame.seq, response, HOST_CMD_RESP_BUF_MAX);
 }
 
 void SensorLink::_handle_algo_set_rom(const HostFrame& frame, uint8_t* response, uint16_t* response_length) {
-    // payload = [ch(u8), rom_lo, rom_hi] × count (count = len/3)
-    if (frame.len == 0u || (frame.len % 3u) != 0u) {
+    // Keep the wire format batched, but execute it through the one host-write owner in FIFO order.
+    // ACK is emitted only after every entry completed, so no partial payload can be reported as success.
+    if (frame.len == 0u || (frame.len % 3u) != 0u || frame.len > PSOC_ALGO_CHANNELS * 3u) {
         *response_length = HostCmdCodec::encode_nak(frame.seq, HostCmdError::INVALID_PARAM,
-            "algo_set_rom payload must be 3*N bytes", response, HOST_CMD_RESP_BUF_MAX);
+            "algo_set_rom payload must contain 1..36 entries", response, HOST_CMD_RESP_BUF_MAX);
         return;
     }
-    PsocAlgo* store = PsocAlgo::getInstance();
-    Psoc* psoc = Psoc::getInstance();
-    const uint16_t entries = (uint16_t)(frame.len / 3u);
-    for (uint16_t i = 0; i < entries; ++i) {
-        const uint16_t p = (uint16_t)(i * 3u);
-        const uint8_t ch = frame.payload[p];
-        const uint16_t rom = (uint16_t)frame.payload[p + 1] | ((uint16_t)frame.payload[p + 2] << 8);
-        if (ch >= PSOC_ALGO_CHANNELS) {
+    SensorLink* self = getInstance();
+    if (self->_host_write.active) {
+        *response_length = HostCmdCodec::encode_nak(frame.seq, HostCmdError::DEVICE_BUSY,
+            "PSoC host write slot busy", response, HOST_CMD_RESP_BUF_MAX);
+        return;
+    }
+    const uint8_t count = static_cast<uint8_t>(frame.len / 3u);
+    for (uint8_t i = 0; i < count; ++i) {
+        const uint16_t p = static_cast<uint16_t>(i) * 3u;
+        if (frame.payload[p] >= PSOC_ALGO_CHANNELS) {
             *response_length = HostCmdCodec::encode_nak(frame.seq, HostCmdError::INVALID_PARAM,
                 "algo_set_rom channel out of range", response, HOST_CMD_RESP_BUF_MAX);
             return;
         }
-        store->set_rom(ch, rom);           // 更新 RP 存储 + 请求持久化(真相源)
-        psoc->set_algo_rom(ch, rom);       // 立即下发 PSoC
     }
-    *response_length = HostCmdCodec::encode_ack(frame.seq, response, HOST_CMD_RESP_BUF_MAX);
+    self->_host_write.clear();
+    self->_host_write.active = true;
+    self->_host_write.kind = HostWriteState::Kind::ALGO_ROM;
+    self->_host_write.cmd = frame.cmd;
+    self->_host_write.seq = frame.seq;
+    self->_host_write.rom_count = count;
+    for (uint8_t i = 0; i < count; ++i) {
+        const uint16_t p = static_cast<uint16_t>(i) * 3u;
+        self->_host_write.rom_ch[i] = frame.payload[p];
+        self->_host_write.rom_value[i] = static_cast<uint16_t>(frame.payload[p + 1]) |
+                                         (static_cast<uint16_t>(frame.payload[p + 2]) << 8);
+    }
+    if (!self->_start_next_host_rom()) {
+        self->_host_write.clear();
+        *response_length = HostCmdCodec::encode_nak(frame.seq, HostCmdError::DEVICE_BUSY,
+            "PSoC algo_set_rom enqueue failed", response, HOST_CMD_RESP_BUF_MAX);
+        return;
+    }
+    *response_length = 0u;
 }
 
 void SensorLink::_handle_algo_get_rom(const HostFrame& frame, uint8_t* response, uint16_t* response_length) {
@@ -1989,42 +2245,6 @@ void SensorLink::_handle_algo_get_rom(const HostFrame& frame, uint8_t* response,
     *response_length = HostCmdCodec::encode_frame(resp, response, HOST_CMD_RESP_BUF_MAX);
 }
 
-void SensorLink::_handle_algo_get_trace(const HostFrame& frame, uint8_t* response, uint16_t* response_length) {
-    // payload = [ch(u8), idx(u8)] → 响应 [ch, idx, out_active(u8), report(u16 LE)]
-    if (frame.len < 2u) {
-        *response_length = HostCmdCodec::encode_nak(frame.seq, HostCmdError::INVALID_PARAM,
-            "algo_get_trace payload too short", response, HOST_CMD_RESP_BUF_MAX);
-        return;
-    }
-    const uint8_t ch = frame.payload[0];
-    const uint8_t idx = frame.payload[1];
-    if (ch >= PSOC_ALGO_CHANNELS || idx >= 4u) {
-        *response_length = HostCmdCodec::encode_nak(frame.seq, HostCmdError::INVALID_PARAM,
-            "algo_get_trace ch/idx out of range", response, HOST_CMD_RESP_BUF_MAX);
-        return;
-    }
-    uint8_t active = 0;
-    uint16_t report = 0;
-    if (!Psoc::getInstance()->algo_get_trace(ch, idx, &active, &report)) {
-        *response_length = HostCmdCodec::encode_nak(frame.seq, HostCmdError::SENSOR_ERROR,
-            "PSoC algo_get_trace failed", response, HOST_CMD_RESP_BUF_MAX);
-        return;
-    }
-    // HostFrame 为 4102B；core0 栈只有 8192B 且下界就是堆顶，响应帧必须借共享静态工作帧。
-    HostFrame& resp = HostCmdCodec::resp_frame();
-    resp.clear();
-    resp.cmd = static_cast<uint8_t>(HostCmd::ALGO_GET_TRACE);
-    resp.flags = HOST_CMD_FLAG_RESPONSE;
-    resp.seq = frame.seq;
-    resp.payload[0] = ch;
-    resp.payload[1] = idx;
-    resp.payload[2] = active;
-    resp.payload[3] = static_cast<uint8_t>(report);
-    resp.payload[4] = static_cast<uint8_t>(report >> 8);
-    resp.len = 5;
-    *response_length = HostCmdCodec::encode_frame(resp, response, HOST_CMD_RESP_BUF_MAX);
-}
-
 void SensorLink::_handle_algo_set_cfg(const HostFrame& frame, uint8_t* response, uint16_t* response_length) {
     // payload = [idx(u8), val(u8)]。写 PSoC 共享 cfg[idx] + PsocAlgo 持久化(随算法下发恢复)。
     if (frame.len < 2u) {
@@ -2039,13 +2259,13 @@ void SensorLink::_handle_algo_set_cfg(const HostFrame& frame, uint8_t* response,
             "algo_set_cfg idx out of range", response, HOST_CMD_RESP_BUF_MAX);
         return;
     }
-    if (!Psoc::getInstance()->algo_set_cfg(idx, val)) {
-        *response_length = HostCmdCodec::encode_nak(frame.seq, HostCmdError::SENSOR_ERROR,
-            "PSoC algo_set_cfg failed", response, HOST_CMD_RESP_BUF_MAX);
+    SensorLink* self = getInstance();
+    if (!self->_start_host_write(HostWriteState::Kind::ALGO_CFG, frame, idx, val, 0u)) {
+        *response_length = HostCmdCodec::encode_nak(frame.seq, HostCmdError::DEVICE_BUSY,
+            "PSoC host write slot busy", response, HOST_CMD_RESP_BUF_MAX);
         return;
     }
-    PsocAlgo::getInstance()->set_cfg(idx, val);   // 更新 RP 存储 + 请求持久化(真相源)
-    *response_length = HostCmdCodec::encode_ack(frame.seq, response, HOST_CMD_RESP_BUF_MAX);
+    *response_length = 0u;
 }
 
 void SensorLink::_handle_algo_get_cfg(const HostFrame& frame, uint8_t* response, uint16_t* response_length) {

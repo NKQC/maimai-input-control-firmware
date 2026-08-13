@@ -140,6 +140,18 @@ _Static_assert(FW_VERSION <= 0xFFFFFFFFu, "FW_BUILD_STAMP overflows uint32 (YY >
 #define SPI_CS_NUM                       (3u)
 #define SPI_CS_IRQ                       (ioss_interrupts_gpio_1_IRQn)
 
+/* ★新代数就绪通知线★ P1.4 → RP2040 GPIO23 (SENSOR-INT1, 见 doc/hardware.txt)。
+ * 每发布一份新快照就把电平**翻转**一次, 一次翻转 = 一份新代数。
+ * 为什么是翻转而不是脉冲: RP2040 侧只需比较"电平与上次采到的是否不同"即可判定有新代数 ——
+ * 不依赖脉宽(窄脉冲会被采样错过)、不需要任何清中断/握手、也不会因为漏采一次就永久失步。
+ * 有了它, RP2040 的 core1 不必再以固定间隔空转轮询 SPI: 没有新代数时它什么都不做,
+ * PSoC 的 CapSense 中间件因此拿回被 SPI DMA ISR 抢走的临界区时间。
+ * P1.4 由 BSP 生成为强推挽输出(CYBSP_LED_SLD2, 生成代码只初始化、从不引用), 这里仍显式
+ * FastInit 一次, 免得 BSP 重新生成时把驱动模式漂掉。P1.5(INT2) 两端都还没有约定事件语义,
+ * 故不在此声明 —— 不留没人驱动的常量。 */
+#define SENSOR_INT1_PORT                 (GPIO_PRT1)
+#define SENSOR_INT1_NUM                  (4u)
+
 #define CAPSENSE_INTR_PRIORITY           (3u)
 #define CY_ASSERT_FAILED                 (0u)
 #define STATUS_LED_PORT                  (CYBSP_LED_SLD3_PORT)
@@ -794,6 +806,11 @@ static void publish_capsense_snapshot(void)
         published_snapshot_valid = true;
         Cy_SysLib_ExitCriticalSection(interrupt_state);
     }
+
+    /* ★通知必须在发布之后★ 翻转即"这一代已经可读"。本函数只在 CapSense NOT_BUSY 分支里、
+     * 且在 update_touch_frame() 之后被调用, 所以翻转时触控快帧与完整快照都已是新的一份 ——
+     * RP2040 看到翻转就可以直接取, 不会取到半新半旧。 */
+    Cy_GPIO_Inv(SENSOR_INT1_PORT, SENSOR_INT1_NUM);
 }
 
 /* 用可加载算法 blob 逐通道计算激活位。返回 0/1。仅在 algo_valid 时被调用；
@@ -1977,6 +1994,11 @@ int main(void)
     initialize_common_cfg_shadow();   /* 必须在 initialize_capsense 前: 重定向 ptrCommonConfig 到 RAM 影子 */
     initialize_capsense();
     spi_slave_init();
+    /* 新代数通知线: 显式定成强推挽输出并从低电平起步。BSP 生成代码已经初始化过 P1.4,
+     * 但那是"顺带"的(它把这脚当 LED), 显式一次才不会随 BSP 重新生成漂掉。
+     * 起始电平不重要 —— RP2040 只看变化, 它自己会记住第一次采到的电平。 */
+    Cy_GPIO_Pin_FastInit(SENSOR_INT1_PORT, SENSOR_INT1_NUM, CY_GPIO_DM_STRONG_IN_OFF, 0u,
+                         HSIOM_SEL_GPIO);
     // hardware.txt: P1.6 -> LED -> R -> GND，因此高电平明确为点亮。
     // 白灯启动即点亮作为 bring-up 指示；800ms 后仅由已加载 JIT 算法的判定结果驱动，
     // 原始 CapSense 触控不会触发白灯，避免把非 JIT 模式误呈现为算法已触发。

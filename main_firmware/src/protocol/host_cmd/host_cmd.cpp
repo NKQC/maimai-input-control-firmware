@@ -8,6 +8,7 @@
 #include "../../service/sensor_link/sensor_link.h"
 #include "../../service/hid_touch_mapper/hid_touch_mapper.h"
 #include "../../service/led_map/led_map.h"
+#include "../../service/persistence_txn/persistence_txn.h"
 #include <cstring>
 #include <cstdio>
 #include <map>
@@ -429,6 +430,23 @@ void HostCmdDispatcher::dispatch(const HostFrame& frame, uint8_t* resp_buf, uint
     if (!resp_buf || !resp_len) return;
     
     *resp_len = 0;
+
+    // SWD bring-up owns the PSoC until run() releases the session. _keepalive()
+    // must still service HELLO/DEVICE_INFO so the host can establish USB state,
+    // but every other command can touch runtime services or schedule work that
+    // conflicts with the active SWD transaction. Return a retryable terminal
+    // instead of silently dropping it, so the host never converts startup work
+    // into a command timeout.
+    const PsocBringupStage stage = PsocUpdater::getInstance()->report().last_stage;
+    const bool swd_session_active =
+        stage >= PsocBringupStage::SWD_READY && stage < PsocBringupStage::RUN;
+    if (swd_session_active && frame.cmd != static_cast<uint8_t>(HostCmd::HELLO) &&
+        frame.cmd != static_cast<uint8_t>(HostCmd::PING)) {
+        *resp_len = HostCmdCodec::encode_nak(frame.seq, HostCmdError::DEVICE_BUSY,
+                                              "psoc bring-up active", resp_buf,
+                                              HOST_CMD_RESP_BUF_MAX);
+        return;
+    }
     
     uint8_t cmd_code = frame.cmd;
     
@@ -457,10 +475,10 @@ void HostCmdDispatcher::clear_pending_stream() {
 }
 
 void HostCmdDispatcher::_handle_hello(const HostFrame& frame, uint8_t* resp_buf, uint16_t* resp_len) {
-    // ★新会话先停遗留遥测流★：上一会话若未 TELEM_STOP(如 UI 崩溃/直接关闭),设备会持续
-    // 狂发 TELEM_DATA 淹没 vendor 端点,导致本次 HELLO 的 DEVICE_INFO 响应挤不出去→UI 卡在
-    // "等待设备信息"。收到 HELLO=新主机连接,先停流使端点安静,DEVICE_INFO 得以送达。
-    SensorLink::getInstance()->stop();
+    // ★新会话只静默遗留输出，不得中断扫描恢复★：扫描已独占 PSoC 的 gain/div 与快照快路；
+    // 若在 HELLO 里走 stop()，会取消会话并把 PSoC 留在恢复长操作的竞争路径上。命令响应本身
+    // 已由 UsbComm::begin_command_response() 抑制异步流，扫描中不需要停 PSoC 即可优先发送 DEVICE_INFO。
+    SensorLink::getInstance()->prepare_host_session();
 
     // Bytes 0..14 preserve the legacy DEVICE_INFO layout. A versioned report follows.
     // 借共享工作帧: 4102B 绝不能放 core0 的 8KB 栈(见 HostCmdCodec::resp_frame 注释)。
@@ -541,12 +559,19 @@ void HostCmdDispatcher::_handle_hello(const HostFrame& frame, uint8_t* resp_buf,
     }
     // CSD 真正运行模式由 RP2040 store 持有；追加在诊断尾部，旧上位机按 report_length 自然忽略。
     resp.payload[resp.len++] = CsdConfig::getInstance()->mode();
-    // PSoC 运行态 SWD 调试块：无论读取是否成功均固定追加 37B，便于上位机稳定解析。
+    // PSoC 运行态 SWD 调试块：bring-up 期间 SWD 会话正由 updater 独占，HELLO 只能返回零快照；
+    // run()/release_swd() 完成后再按既有路径读取，避免 DEVICE_INFO 反向扰动正在进行的校验/烧录。
     uint32_t spi_dbg_counters[SwdProgrammer::DEBUG_COUNTER_WORDS] = {};
     Psoc* psoc = Psoc::getInstance();
-    (void)psoc->psoc_debug_counters(spi_dbg_counters);
-    resp.payload[resp.len++] = static_cast<uint8_t>(psoc->psoc_debug_status());
-    append_u32(psoc->psoc_debug_block_addr());
+    const PsocBringupStage stage = report.last_stage;
+    const bool swd_session_active =
+        stage >= PsocBringupStage::SWD_READY && stage < PsocBringupStage::RUN;
+    const uint8_t debug_status = swd_session_active
+        ? 0u : static_cast<uint8_t>(psoc->psoc_debug_status());
+    const uint32_t debug_block_addr = swd_session_active ? 0u : psoc->psoc_debug_block_addr();
+    if (!swd_session_active) (void)psoc->psoc_debug_counters(spi_dbg_counters);
+    resp.payload[resp.len++] = debug_status;
+    append_u32(debug_block_addr);
     for (uint8_t i = 0; i < SwdProgrammer::DEBUG_COUNTER_WORDS; ++i) append_u32(spi_dbg_counters[i]);
     resp.payload[report_start + 1] = static_cast<uint8_t>(resp.len - report_start);
 
@@ -1007,11 +1032,19 @@ static void _handle_cfg_set_batch(const HostFrame& frame, uint8_t* resp_buf, uin
 }
 
 static void _handle_save_config(const HostFrame& frame, uint8_t* resp_buf, uint16_t* resp_len) {
-    // SAVE_CONFIG(0x0E): 仅置保存信号，实际 flash 落地延迟到主循环安全窗口(写后重新枚举恢复 USB)。
-    // 避免在 handler 上下文(正处理命令/待发 ACK)flash 写禁中断数十 ms 打断 USB 事务→vendor 失步。
-    ConfigManager::save_config();               // 置 config 保存信号
-    CsdConfig::getInstance()->request_save();   // 置 CSD store 保存信号
-    *resp_len = HostCmdCodec::encode_ack(frame.seq, resp_buf, HOST_CMD_RESP_BUF_MAX);
+    // SAVE_CONFIG is a deferred completion barrier. The response is produced by
+    // UsbComm only after NvStore has verified every dirty region by readback.
+    PersistenceTxn* txn = PersistenceTxn::getInstance();
+    const PersistenceTxn::Result accepted = txn->begin(frame.seq);
+    if (accepted == PersistenceTxn::Result::BUSY) {
+        *resp_len = HostCmdCodec::encode_nak(frame.seq, HostCmdError::DEVICE_BUSY,
+            "another save transaction is active", resp_buf, HOST_CMD_RESP_BUF_MAX);
+        return;
+    }
+    // The main-loop transaction owner consumes this one-time request before it
+    // copies service snapshots into NvStore. Replaying the same sequence only
+    // observes the original terminal and cannot start a second write.
+    *resp_len = 0u;
 }
 
 // PSoC 重启请求(定义于 hal_usb.cpp): 置 1 → 主循环脉冲 XRES 重启 PSoC。

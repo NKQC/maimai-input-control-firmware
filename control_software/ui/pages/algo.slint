@@ -1,339 +1,361 @@
 import { Button, ComboBox, VerticalBox, HorizontalBox, ScrollView, TextEdit } from "std-widgets.slint";
 import { AlgoMetadataRow, AlgoSettingRow } from "../common/types.slint";
+import { LineEdit } from "std-widgets.slint";
 import { AlgoSettingEditorRow } from "../common/widgets.slint";
 import { Theme } from "../common/theme.slint";
 
-
 // ============================================================================
-// 算法页:JIT 触控算法管理 + C→ASM 编译器 + 全局 CSD 设置
+// JIT 算法页：左侧代码编辑器，右侧设备状态、变量声明与交互。
 // ============================================================================
 
 export component AlgoPage inherits Rectangle {
     in property <string> algo_info_text: "算法信息未读取";
     in-out property <string> algo_c_source;
-    in property <string> algo_line_numbers: "1";   // 行号列(由 main.rs 随源码行数回填)
+    in property <string> algo_line_numbers: "1";
     in property <string> algo_status: "";
-    // 编译/上传同步执行时的阶段反馈；忙碌期间锁定一键操作以避免重入。
     in property <bool> algo_busy: false;
     in property <string> algo_phase: "";
-    in property <string> algo_asm: "";   // 编译产物反汇编(objdump -d .text)
-    in property <int> algo_asm_bytes: 0;      // 最近一次编译产物字节数(进度条用)
-    in property <int> algo_asm_capacity: 1024; // PSoC 可执行槽容量(字节)
-    // C 源占用: 字节数 = 编辑器内容去注释后的 UTF-8 字节数(= 编译器实际看到的有效内容),
-    // 容量 = 设备 ALGO_SRC 区上限。超限时编译/上传都会被拒, 故这里必须先红着提醒。
+    in property <string> algo_asm: "";
+    in property <int> algo_asm_bytes: 0;
+    in property <int> algo_asm_capacity: 1024;
     in property <int> algo_c_bytes: 0;
     in property <int> algo_c_capacity: 32768;
-    property <int> editor_tab: 0;        // 0=C 源 1=反汇编 ASM(复用同一编辑面板)
-    // 右侧子标签: 0=原生(C源/反汇编) 1=算法上报(report[]折线+触发判定追踪) 2=可调变量(cfg[8])
-    property <int> content_tab: 0;
+    property <int> editor_tab: 0; // 0=C 源，1=ASM
+    in-out property <float> split_ratio: 0.66;
+    property <float> split_drag_start_ratio: 0.66;
+
     callback algo_refresh();
     callback algo_reset_default();
-    callback algo_compile(string);       // 仅编译(算 ASM 大小/塞得下校验), 不上传(保留供内部/兼容)
-    callback algo_upload();              // 上传最近一次编译产物(保留供内部/兼容)
-    callback algo_build_upload(string);  // ★一键: 编译+校验+成功则上传★
-    callback algo_load_template(int);    // 载入内置算法模板到编辑器: 0=v3.1 HDR, 1=纯白灯演示
-    callback algo_source_edited(string); // 编辑时回传, main.rs 据此刷新行号
-
-    // 算法源码声明的变量元数据；UI 不轮询/绘制 report 折线。
+    callback algo_compile(string);
+    callback algo_upload();
+    callback algo_build_upload(string);
+    callback algo_load_template(int);
+    callback algo_source_edited(string);
     in property <[AlgoMetadataRow]> algo_metadata_rows: [];
     in property <[AlgoSettingRow]> algo_setting_rows: [];
     callback algo_setting_edited(int, int);
+    callback algo_metadata_edited(int, int, string, string);
 
-    // ★整页装进 ScrollView★ 本页(标题 + 两行标签栏 + 编辑区下限 140px + 编译栏 + 容量条)的
-    // min-height 约 420px, 与设置页底部 46px 保存栏在 520px 高窗口里贴得极近; TabWidget 的
-    // min 覆盖只保证保存栏留在视口内, 页内溢出仍会画到它上面。ScrollView 自身 min 只有 50px,
-    // 且 viewport-height = max(视口高, 子布局 min-height): 窗口矮时页内滚动, 窗口高时照常铺满。
-    ScrollView {
+    VerticalBox {
+        padding: 10px;
+        spacing: 8px;
+
         VerticalBox {
-            padding: 10px;
-            spacing: 8px;
-
-            Text { text: "JIT 触控算法"; color: Theme.text; font-size: Theme.fs-page; }
-            HorizontalLayout {
-                height: Theme.row-height;
+            // ★顶部两行不能钉死高度★ 原先用 height: Theme.row-height(34px) 固定, 而 ComboBox 与
+            // Button 在原生样式下的自然高度更大, 于是控件被压扁(文字贴边、下拉箭头挤掉)。
+            // 改成 min-height 让控件按自身需要撑开; 同时嵌套 Box 显式 padding: 0, 避免内外层
+            // 默认内边距叠加后又把行内可用高度吃掉。
+            padding: 0px;
+            spacing: 6px;
+            HorizontalBox {
+                padding: 0px;
+                min-height: Theme.row-height;
                 spacing: Theme.gap;
+                Text {
+                    text: "JIT 触控算法";
+                    color: Theme.text;
+                    font-size: Theme.fs-page;
+                    vertical-alignment: center;
+                }
                 Button {
                     min-width: Theme.button-min-width;
-                    horizontal-stretch: 0;
                     text: "读取信息";
                     clicked => { root.algo_refresh(); }
                 }
+                Text {
+                    text: root.algo_info_text;
+                    color: Theme.text-sub;
+                    min-width: 0px;
+                    overflow: elide;
+                    horizontal-stretch: 1;
+                    vertical-alignment: center;
+                }
+            }
+            HorizontalBox {
+                padding: 0px;
+                min-height: Theme.row-height;
+                spacing: Theme.gap;
+                alignment: start;
                 Text { text: "模板:"; color: Theme.text-sub; vertical-alignment: center; }
                 tpl_sel := ComboBox {
-                    // 最长选项"纯白灯演示(触摸点亮)": 不给宽度时它会按剩余空间被摊开或被裁。
-                    width: Theme.combo-wide;
+                    // 用 min/max 而不是 width: 在 HorizontalBox 内 width 会被布局重新分配,
+                    // 表现为下拉框被拉到半屏宽; min/max 才能真正固定成设计宽度。
+                    min-width: 300px;
+                    max-width: 300px;
                     horizontal-stretch: 0;
                     model: ["v3.1 HDR 默认", "纯白灯演示(触摸点亮)"];
                     current-index: 0;
                 }
                 Button {
                     min-width: Theme.button-min-width;
-                    horizontal-stretch: 0;
                     text: "加载模板";
                     clicked => { root.algo_load_template(tpl_sel.current-index); }
                 }
-                Text { text: root.algo_info_text; color: Theme.text-sub; overflow: elide; horizontal-stretch: 1; vertical-alignment: center; }
             }
+        }
 
-            // 右侧三子标签: 原生 / 算法上报 / 可调变量, 明确分界线与顶部工具栏分离。
-            HorizontalBox {
-                spacing: 6px;
-                Rectangle {
-                    // min-width 而非 width: 标签行末尾有 stretch 空白吸收多余宽度, 视觉与固定宽一致,
-                    // 但字体/文案变长时按钮会自己变宽而不是把字裁掉。
-                    min-width: 90px; height: 30px; border-radius: 4px;
-                    background: root.content_tab == 0 ? #2b7de9 : #23282e;
-                    Text { text: "原生"; color: #ffffff; horizontal-alignment: center; vertical-alignment: center; }
-                    TouchArea { clicked => { root.content_tab = 0; } }
-                }
-                Rectangle {
-                    min-width: 110px; height: 30px; border-radius: 4px;
-                    background: root.content_tab == 1 ? #2b7de9 : #23282e;
-                    Text { text: "算法上报"; color: #ffffff; horizontal-alignment: center; vertical-alignment: center; }
-                    TouchArea { clicked => { root.content_tab = 1; } }
-                }
-                Rectangle {
-                    min-width: 110px; height: 30px; border-radius: 4px;
-                    background: root.content_tab == 2 ? #2b7de9 : #23282e;
-                    Text { text: "可调变量"; color: #ffffff; horizontal-alignment: center; vertical-alignment: center; }
-                    TouchArea { clicked => { root.content_tab = 2; } }
-                }
-                Rectangle { horizontal-stretch: 1; }
-            }
-            Rectangle { height: 1px; background: #3a434c; }
+        // 与单通道精调一致：可拖拽的左右面板，编辑器永远占左列，运行态与交互永远在右列。
+        body := Rectangle {
+            vertical-stretch: 1;
+            min-height: 240px;
 
-            if root.content_tab == 0: VerticalBox {
-                padding: 0px;
-                spacing: 8px;
+            left := Rectangle {
+                x: 0;
+                y: 0;
+                width: parent.width * root.split_ratio - 10px;
+                height: parent.height;
+                background: #14181c;
+                border-width: 1px;
+                border-color: #3a434c;
+                clip: true;
 
-                // C 源 / 反汇编 子标签(复用下方同一编辑面板, 而非上下两块)。
-                HorizontalBox {
+                VerticalBox {
+                    padding: 8px;
                     spacing: 6px;
-                    Rectangle {
-                        min-width: 90px; height: 30px; border-radius: 4px;
-                        background: root.editor_tab == 0 ? #2b7de9 : #23282e;
-                        Text { text: "C 源"; color: #ffffff; horizontal-alignment: center; vertical-alignment: center; }
-                        TouchArea { clicked => { root.editor_tab = 0; } }
+                    HorizontalBox {
+                        spacing: 6px;
+                        Rectangle {
+                            min-width: 88px;
+                            height: 30px;
+                            border-radius: 4px;
+                            background: root.editor_tab == 0 ? #2b7de9 : #23282e;
+                            Text { text: "C 源"; color: #ffffff; horizontal-alignment: center; vertical-alignment: center; }
+                            TouchArea { clicked => { root.editor_tab = 0; } }
+                        }
+                        Rectangle {
+                            min-width: 112px;
+                            height: 30px;
+                            border-radius: 4px;
+                            background: root.editor_tab == 1 ? #2b7de9 : #23282e;
+                            Text { text: "反汇编 ASM"; color: #ffffff; horizontal-alignment: center; vertical-alignment: center; }
+                            TouchArea { clicked => { root.editor_tab = 1; } }
+                        }
+                        Text {
+                            text: root.editor_tab == 0 ? "编辑 C 源；右侧显示设备状态与变量交互。" : "只读查看最近一次本地或设备算法产物。";
+                            color: #8a939c;
+                            overflow: elide;
+                            horizontal-stretch: 1;
+                            vertical-alignment: center;
+                        }
                     }
                     Rectangle {
-                        min-width: 120px; height: 30px; border-radius: 4px;
-                        background: root.editor_tab == 1 ? #2b7de9 : #23282e;
-                        Text { text: "反汇编 ASM"; color: #ffffff; horizontal-alignment: center; vertical-alignment: center; }
-                        TouchArea { clicked => { root.editor_tab = 1; } }
-                    }
-                    Rectangle { horizontal-stretch: 1; }
-                }
-                Text {
-                    text: root.editor_tab == 0
-                        ? "编辑触控算法源代码。"
-                        : "查看只读反汇编。";
-                    color: #b0b8c0; wrap: word-wrap;
-                }
-
-                // 编辑面板: C 源(行号 gutter + 可编辑) 与 ASM(只读) 共用此区域。
-                // ★★这里必须是固定 height, 不能用 min-height + vertical-stretch★★
-                // 本 Rectangle 内部的 TextEdit/Flickable 用 `parent.width/height` 绑自身尺寸。
-                // 一旦本 Rectangle 不再是固定高, 它的 layout info 就改为取子元素的 min, 于是
-                // TextEdit.min ← TextEdit.width ← parent.width ← 本 Rectangle 的 min ← TextEdit.min
-                // 形成闭环, Slint 布局求值无限递归 → 一进设置页就
-                // "thread 'main' has overflowed its stack"(TabWidget 实例化所有子页, 一页有环全崩;
-                // 实测二分定位到本页)。整页已装进 ScrollView, 固定高不会再撑破保存栏 —— 窗口矮时页内滚动。
-                Rectangle {
-                    height: 300px;
-                    background: #14181c;
-                    border-width: 1px;
-                    border-color: #3a3a3a;
-                    clip: true;
-
-                    // C 源: Flickable 内 gutter + TextInput 同步滚动, 行号与代码始终对齐。
-                    Flickable {
-                        visible: root.editor_tab == 0;
-                        HorizontalLayout {
-                            spacing: 6px;
-                            alignment: start;
-                            Rectangle {
-                                width: 48px;
-                                background: #1c2228;
-                                Text {
-                                    x: 0; y: 4px; width: parent.width - 8px;
-                                    text: root.algo_line_numbers;
-                                    color: #6b7680;
+                        vertical-stretch: 1;
+                        min-height: 160px;
+                        background: #101418;
+                        border-width: 1px;
+                        border-color: #303840;
+                        clip: true;
+                        Flickable {
+                            visible: root.editor_tab == 0;
+                            HorizontalLayout {
+                                spacing: 6px;
+                                alignment: start;
+                                Rectangle {
+                                    width: 48px;
+                                    background: #1c2228;
+                                    Text {
+                                        x: 0px;
+                                        y: 4px;
+                                        width: parent.width - 8px;
+                                        text: root.algo_line_numbers;
+                                        color: #6b7680;
+                                        font-size: 13px;
+                                        font-family: "Consolas";
+                                        horizontal-alignment: TextHorizontalAlignment.right;
+                                    }
+                                }
+                                TextInput {
+                                    text <=> root.algo_c_source;
+                                    single-line: false;
+                                    wrap: no-wrap;
+                                    color: #d8e0e8;
                                     font-size: 13px;
                                     font-family: "Consolas";
-                                    horizontal-alignment: right;
+                                    edited => { root.algo_source_edited(self.text); }
                                 }
                             }
-                            TextInput {
-                                text <=> root.algo_c_source;
-                                single-line: false;
-                                wrap: no-wrap;
-                                color: #d8e0e8;
-                                font-size: 13px;
-                                font-family: "Consolas";
-                                edited => { root.algo_source_edited(self.text); }
-                            }
+                        }
+                        TextEdit {
+                            visible: root.editor_tab == 1;
+                            width: parent.width;
+                            height: parent.height;
+                            read-only: true;
+                            text: root.algo_asm;
+                            font-size: 12px;
                         }
                     }
-                    // 反汇编: 只读 TextEdit(自带滚动条, 可查看全部指令)。
-                    TextEdit {
-                        visible: root.editor_tab == 1;
-                        width: parent.width;
-                        height: parent.height;
-                        read-only: true;
-                        text: root.algo_asm;
-                        font-size: 12px;
-                    }
-                }
-
-                // ★编译与上传合并为一个按钮★: 一次点击=编译+容量校验+(成功则)下发, 不再分两步。
-                HorizontalBox {
-                    spacing: 8px;
-                    Button {
-                        text: root.algo_busy ? root.algo_phase : "编译并上传";
-                        enabled: !root.algo_busy;
-                        clicked => { root.algo_build_upload(root.algo_c_source); }
-                    }
-                    Text {
-                        text: root.algo_busy ? root.algo_phase : root.algo_status;
-                        color: root.algo_busy ? #8fd6ff : #e0e6ee;
-                        wrap: word-wrap;
-                        horizontal-stretch: 1;
-                        vertical-alignment: center;
-                    }
-                }
-
-                // C 源空间占用进度条(在 ASM 条正上方): 占用 = 去注释后 C 字节 / 设备存储上限。
-                // 超限=红(编译与上传都会被拒), 接近满=橙, 富余=绿。
-                VerticalBox {
-                    padding: 0px;
-                    spacing: 3px;
-                    Text {
-                        text: "C 源：" + root.algo_c_bytes + " / " + root.algo_c_capacity + " 字节"
-                            + (root.algo_c_capacity > 0
-                                ? ("  (" + Math.round(root.algo_c_bytes * 100 / root.algo_c_capacity) + "%)")
-                                : "")
-                            + (root.algo_c_bytes > root.algo_c_capacity ? "  超出上限, 无法编译/上传" : "");
-                        color: root.algo_c_bytes > root.algo_c_capacity ? #ff6b6b : #b0b8c0;
-                        font-size: 11px;
-                    }
-                    Rectangle {
-                        height: 10px;
-                        // 同 ASM 条: 显式 min-width 断开 "parent.width ← min ← 子 min" 的布局环。
-                        min-width: 120px;
-                        border-radius: 5px;
-                        background: #23282e;
-                        clip: true;
-                        Rectangle {
-                            x: 0;
-                            width: root.algo_c_capacity > 0
-                                ? (parent.width * Math.min(1.0, root.algo_c_bytes / root.algo_c_capacity))
-                                : 0px;
-                            height: parent.height;
-                            border-radius: 5px;
-                            background: root.algo_c_bytes > root.algo_c_capacity
-                                ? #d64545
-                                : ((root.algo_c_bytes * 10 > root.algo_c_capacity * 9) ? #f5a623 : #2b8a3e);
+                    HorizontalBox {
+                        spacing: 8px;
+                        Button {
+                            text: root.algo_busy ? root.algo_phase : "编译并上传";
+                            enabled: !root.algo_busy && root.editor_tab == 0;
+                            clicked => { root.algo_build_upload(root.algo_c_source); }
                         }
-                    }
-                }
-
-                // ASM 空间占用进度条: 占用 = 编译产物字节 / PSoC 槽容量。满槽=红, 富余=绿。
-                VerticalBox {
-                    padding: 0px;
-                    spacing: 3px;
-                    Text {
-                        text: "ASM：" + root.algo_asm_bytes + " / " + root.algo_asm_capacity + " 字节"
-                            + (root.algo_asm_capacity > 0
-                                ? ("  (" + Math.round(root.algo_asm_bytes * 100 / root.algo_asm_capacity) + "%)")
-                                : "")
-                            + (root.algo_asm_bytes > 0 ? "  可上传" : "  未编译");
-                        color: #b0b8c0;
-                        font-size: 11px;
-                    }
-                    Rectangle {
-                        height: 10px;
-                        // ★显式 min-width 是断环所必需★: 内层进度条宽度按 parent.width 取比例, 若本
-                        // Rectangle 不给 min-width, 它的 min 就去取子元素 min → 子 min ← 子 width ←
-                        // parent.width ← 本 Rectangle 的 min, 闭环 → 布局无限递归栈溢出。给常量下限后
-                        // 本 Rectangle 的 min 与子元素无关, 实际宽度仍由布局按 stretch 分配。
-                        min-width: 120px;
-                        border-radius: 5px;
-                        background: #23282e;
-                        clip: true;
-                        Rectangle {
-                            x: 0;
-                            width: root.algo_asm_capacity > 0
-                                ? (parent.width * Math.min(1.0, root.algo_asm_bytes / root.algo_asm_capacity))
-                                : 0px;
-                            height: parent.height;
-                            border-radius: 5px;
-                            background: (root.algo_asm_bytes * 10 > root.algo_asm_capacity * 9) ? #f5a623 : #2b8a3e;
+                        Text {
+                            text: root.algo_busy ? root.algo_phase : root.algo_status;
+                            color: root.algo_busy ? #8fd6ff : #e0e6ee;
+                            wrap: no-wrap;
+                            overflow: elide;
+                            horizontal-stretch: 1;
+                            vertical-alignment: center;
                         }
                     }
                 }
             }
 
-            if root.content_tab == 1: VerticalBox {
-                padding: 0px;
-                spacing: 6px;
-                Text { text: "算法变量元数据"; color: #b0b8c0; font-size: 12px; }
-                Text {
-                    text: "以下信息来自当前算法源码声明；设备协议与运行时算法不变。";
-                    color: #77828c;
-                    wrap: word-wrap;
+            divider := Rectangle {
+                x: parent.width * root.split_ratio - 8px;
+                y: 0;
+                width: 8px;
+                height: parent.height;
+                background: splitter.pressed ? #8fd6ff : (splitter.has-hover ? #3a4149 : #2a2f37);
+                Rectangle { x: 3px; width: 2px; height: parent.height; background: splitter.pressed ? #8fd6ff : #4a5560; }
+                splitter := TouchArea {
+                    width: parent.width;
+                    height: parent.height;
+                    mouse-cursor: ew-resize;
+                    pointer-event(e) => {
+                        if (e.kind == PointerEventKind.down) { root.split_drag_start_ratio = root.split_ratio; }
+                    }
+                    moved => {
+                        if (self.pressed) {
+                            root.split_ratio = Math.max(0.42, Math.min(0.78,
+                                root.split_drag_start_ratio + (self.mouse-x - self.pressed-x) / body.width));
+                        }
+                    }
+                    double-clicked => { root.split_ratio = 0.66; }
                 }
-                if root.algo_metadata_rows.length == 0: Text {
-                    text: "当前算法未声明变量元数据。可使用 ALGO_REPORT_META / ALGO_SETTING_META。";
-                    color: #77828c;
-                }
+            }
+
+            right := Rectangle {
+                x: parent.width * root.split_ratio;
+                y: 0;
+                width: parent.width * (1 - root.split_ratio);
+                height: parent.height;
+                background: Theme.panel;
+                border-width: 1px;
+                border-color: #3a434c;
+                clip: true;
                 ScrollView {
-                    vertical-stretch: 1;
+                    width: parent.width;
+                    height: parent.height;
                     VerticalBox {
-                        padding: 0px;
-                        spacing: 4px;
+                        padding: 10px;
+                        spacing: 8px;
+                        Text { text: "状态与交互"; color: Theme.text-title; font-size: Theme.fs-title; }
+                        Text { text: root.algo_info_text; color: #8fd6ff; wrap: word-wrap; }
+                        Text {
+                            text: root.algo_busy ? root.algo_phase : root.algo_status;
+                            color: root.algo_busy ? #8fd6ff : #d8e0e8;
+                            wrap: word-wrap;
+                        }
+                        Button {
+                            text: "恢复设备默认算法";
+                            enabled: !root.algo_busy;
+                            clicked => { root.algo_reset_default(); }
+                        }
+                        Rectangle { height: 1px; background: #3a4149; }
+                        Text {
+                            text: "C 源：" + root.algo_c_bytes + " / " + root.algo_c_capacity + " 字节";
+                            color: root.algo_c_bytes > root.algo_c_capacity ? #ff6b6b : #b0b8c0;
+                            font-size: 11px;
+                        }
+                        Rectangle {
+                            height: 10px;
+                            min-width: 120px;
+                            border-radius: 5px;
+                            background: #23282e;
+                            clip: true;
+                            Rectangle {
+                                width: root.algo_c_capacity > 0 ? parent.width * Math.min(1.0, root.algo_c_bytes / root.algo_c_capacity) : 0px;
+                                height: parent.height;
+                                border-radius: 5px;
+                                background: root.algo_c_bytes > root.algo_c_capacity ? #d64545 : #2b8a3e;
+                            }
+                        }
+                        Text {
+                            text: "ASM：" + root.algo_asm_bytes + " / " + root.algo_asm_capacity + " 字节";
+                            color: #b0b8c0;
+                            font-size: 11px;
+                        }
+                        Rectangle {
+                            height: 10px;
+                            min-width: 120px;
+                            border-radius: 5px;
+                            background: #23282e;
+                            clip: true;
+                            Rectangle {
+                                width: root.algo_asm_capacity > 0 ? parent.width * Math.min(1.0, root.algo_asm_bytes / root.algo_asm_capacity) : 0px;
+                                height: parent.height;
+                                border-radius: 5px;
+                                background: root.algo_asm_bytes * 10 > root.algo_asm_capacity * 9 ? #f5a623 : #2b8a3e;
+                            }
+                        }
+                        Rectangle { height: 1px; background: #3a4149; }
+                        Text { text: "算法变量元数据"; color: Theme.text-title; font-size: Theme.fs-title; }
+                        if root.algo_metadata_rows.length == 0: Text {
+                            text: "当前算法未声明 ALGO_REPORT_META / ALGO_SETTING_META。";
+                            color: #77828c;
+                            wrap: word-wrap;
+                        }
                         for row in root.algo_metadata_rows: Rectangle {
-                            height: 72px;
+                            // ★不能钉死高度★ 卡片里有 4 行(标题/当前值/别名/注释), 原先固定 116px
+                            // 装不下, "注释"输入框整行被裁掉(表现为说明输入框被掩盖)。
+                            // 用 min-height + 让内部 VerticalBox 决定实际高度。
+                            min-height: 150px;
                             border-width: 1px;
                             border-color: #303840;
                             background: #171c21;
                             VerticalBox {
                                 padding: 6px;
-                                spacing: 2px;
+                                spacing: 4px;
                                 HorizontalBox {
-                                    spacing: 8px;
-                                    Text { text: row.kind + "  " + row.name; color: #e0e6ee; horizontal-stretch: 1; }
-                                    Text { text: row.alias == "" ? "" : "别名: " + row.alias; color: #8fd6ff; }
+                                    spacing: 6px;
+                                    Text { text: row.kind + "  " + (row.alias == "" ? row.name : row.alias); color: #e0e6ee; horizontal-stretch: 1; overflow: elide; }
                                     Text { text: row.value_type + "  " + row.range; color: #b0b8c0; }
-                                    Text { text: "当前值: " + row.current_value; color: #d8e0e8; }
                                 }
-                                Text { text: row.description; color: #8a939c; overflow: elide; }
+                                Text { text: "当前值: " + row.current_value; color: #d8e0e8; }
+                                HorizontalBox {
+                                    padding: 0px;
+                                    spacing: 4px;
+                                    Text { text: "别名"; color: #8a939c; width: 36px; vertical-alignment: center; }
+                                    alias := LineEdit {
+                                        text: row.alias;
+                                        horizontal-stretch: 1;
+                                        changed has-focus => {
+                                            if (!self.has-focus) {
+                                                root.algo_metadata_edited(row.idx, row.kind == "可调变量" ? 1 : 0, self.text, desc.text);
+                                            }
+                                        }
+                                        accepted(t) => { root.algo_metadata_edited(row.idx, row.kind == "可调变量" ? 1 : 0, t, desc.text); }
+                                    }
+                                }
+                                HorizontalBox {
+                                    padding: 0px;
+                                    spacing: 4px;
+                                    Text { text: "注释"; color: #8a939c; width: 36px; vertical-alignment: center; }
+                                    desc := LineEdit {
+                                        text: row.description;
+                                        horizontal-stretch: 1;
+                                        changed has-focus => {
+                                            if (!self.has-focus) {
+                                                root.algo_metadata_edited(row.idx, row.kind == "可调变量" ? 1 : 0, alias.text, self.text);
+                                            }
+                                        }
+                                        accepted(t) => { root.algo_metadata_edited(row.idx, row.kind == "可调变量" ? 1 : 0, alias.text, t); }
+                                    }
+                                }
                             }
                         }
-                    }
-                }
-            }
-
-
-            if root.content_tab == 2: VerticalBox {
-                padding: 0px;
-                spacing: 6px;
-                Text {
-                    text: "可调变量";
-                    color: #b0b8c0;
-                    wrap: word-wrap;
-                }
-                if root.algo_setting_rows.length == 0: Text {
-                    text: "当前源码未声明任何 ALGO_SETTING(idx,\"name\",defval)。";
-                    color: #77828c;
-                }
-                ScrollView {
-                    vertical-stretch: 1;
-                    VerticalBox {
-                        padding: 0px;
-                        spacing: 2px;
+                        Rectangle { height: 1px; background: #3a4149; }
+                        Text { text: "可调变量"; color: Theme.text-title; font-size: Theme.fs-title; }
+                        if root.algo_setting_rows.length == 0: Text {
+                            text: "当前源码未声明 ALGO_SETTING。";
+                            color: #77828c;
+                        }
                         for row in root.algo_setting_rows: AlgoSettingEditorRow {
                             entry: row;
-                            edited(idx, v) => { root.algo_setting_edited(idx, v); }
+                            edited(idx, value) => { root.algo_setting_edited(idx, value); }
                         }
                     }
                 }

@@ -56,14 +56,26 @@ public:
     // 消费者(绑定捕获/键盘映射)用它, 不要自行用 link_ok() 重新组合判据。
     bool touch_hold_ok() const { return _pub_touch_hold; }
     uint32_t touch_read_us() const { return _pub_touch_read_us; }  // 最近触控读取耗时(us,原子)
+    // 当前 touch_mask() 这份掩码到手的时刻(time_us_32 口径, seqlock 与掩码同批发布)。
+    // 延迟补偿的时间基准: core0 据此让"采样 → 实际入队"的真实间隔等于用户设定的延迟,
+    // 而不是在处理时刻之后再叠加一段设定延迟(那样链路耗时会全额附加到设定值上)。
+    uint32_t touch_sample_us() const;
     // 低成本诊断计数(core1 单写者, 只增不减; 不打日志, 由上位机/压测按差值判断链路质量):
     //   touch_bad_frames() = read_touch 未取到合法帧的周期数(含重试用尽);
     //   touch_releases()   = 因持续失败而优雅释放掩码的次数(每次故障只记一次)。
     uint32_t touch_bad_frames() const { return _pub_touch_bad; }
     uint32_t touch_releases() const { return _pub_touch_releases; }
 
+    // ---------- 新代数通知线 INT1(PSoC P1.4 → GPIO23) 的实证读数 ----------
+    // ★这几个计数是"core1 到底在按通知走还是在自由跑"的唯一判据★
+    // 没有它们, INT 改造与旧的固定间隔轮询在所有外部指标上长得一模一样(帧率/丢帧/延迟都不变),
+    // 无法证明改造真的生效, 也无法在通知线出问题时看出已经退回兜底。core1 单写者、core0 只读搬运。
+    uint32_t int1_edges() const { return _pub_int1_edges; }        // 累计电平翻转数 = 观测到的新代数
+    uint32_t int1_timeouts() const { return _pub_int1_timeouts; }  // armed 后等待超时次数(通知迟到/丢失)
+    bool int1_armed() const { return _pub_int1_armed; }            // true = 已确认通知线活跃, 正按通知推进
+
     // ---------- 失效兜底(core1 检测, core0 执行 XRES 复位) ----------
-    // 返回复位原因: 0=无, 1=SPI 链路持续丢失(PSoC 崩溃/掉线), 2=主循环卡死(scan_count 长时间不推进, 疑似坏算法)。
+    // 返回复位原因: 0=无, 1=SPI 链路持续丢失, 2=运行期主循环卡死。
     uint8_t needs_reset() const { return _pub_reset_reason; }
     void clear_reset_request() { _pub_reset_reason = 0; }
     // 宽限期内(XRES 启动中 / 正在执行重操作)链路失败不代表 PSoC 真的掉线或被复位。
@@ -72,11 +84,10 @@ public:
 
     // ---------- Phase A：CSD 运行时指令（core0 调用→命令信箱→core1 独占 SPI 执行；签名不变）----------
     bool set_param(uint8_t ch, uint8_t param_id, uint32_t value);
+    bool start_host_param_set(uint8_t ch, uint8_t param_id, uint32_t value);
     bool get_param(uint8_t ch, uint8_t param_id, uint32_t* out);
     bool get_raw(uint8_t ch, uint16_t* out);
     bool measure_cp();                          // 触发逐电极寄生电容测量；返回 true 表示 BIST 与固件 CSD 恢复已完成
-    bool get_cp(uint8_t ch, uint32_t* out);     // 读指定通道 Cp：测量中=0，成功=fF，失败/未测量=0xFFFFFF
-
     // ---------- JIT 算法引擎：下发/查询(core0→信箱→core1 独占 SPI) ----------
     // data 必须持续有效直到下发完成(调用方持久缓冲, 见 PsocAlgo::_blob)。
     // ★异步入队(修 USB 掉线 + 遥测永久冻结)★: core1 单次下发 = 256 页 SPI 事务 + PSoC commit 轮询
@@ -93,7 +104,8 @@ public:
     /// 前者把普通读写命令也算忙(过严, 正常轮询就会被拒), 后者是 30s 宽限窗(过宽, 会把设备锁死半分钟)。
     /// 判据 = 两个单写者计数器之差 —— core0 只写 _heavy_enq, core1 只写 _heavy_done, 故无跨核 RMW 竞态
     /// (与 _cmd_head/_cmd_tail 同一手法); 用单个 bool 会在"内部 APPLY 与主机指令先后入队"时被提前清掉。
-    bool heavy_busy() const { return _heavy_enq != _heavy_done; }
+    bool heavy_busy() const { return _heavy_enq != _heavy_done || _spi.operation_busy() ||
+        _algo_upload_async.active != 0u; }
     /// 因"忙"被拒的长周期指令累计次数。压测据此**确证**堆叠真实发生过, 而不是靠推断。
     uint32_t heavy_reject_count() const { return _heavy_rejects; }
     void note_heavy_reject() { _heavy_rejects++; }
@@ -111,14 +123,21 @@ public:
     // 只读 core1 周期刷新结果；不会投递或同步等待 SPI 命令。返回 true 表示缓存可用。
     bool get_algo_info_cached(bool* out_valid, uint16_t* out_len) const;
     bool set_algo_rom(uint8_t ch, uint16_t rom);              // 设每通道 16 位只读 ROM
+    bool start_host_algo_set_rom(uint8_t ch, uint16_t rom);
+    bool start_host_calibrate(uint8_t ch);
+    bool start_host_baseline_reset(uint8_t ch);
+    bool start_host_measure_cp();
     bool get_algo_rom(uint8_t ch, uint16_t* out_rom);         // 读每通道 16 位 ROM
     // 算法运行时追踪(report[]/out_active)与可调变量(cfg[8], 见 psoc_algo_abi.h)
     bool algo_get_trace(uint8_t ch, uint8_t idx, uint8_t* out_active, uint16_t* out_report);
     bool algo_set_cfg(uint8_t idx, uint8_t val);
+    bool start_host_algo_set_cfg(uint8_t idx, uint8_t val);
     bool algo_get_cfg(uint8_t idx, uint8_t* out_val);
     bool set_global(uint8_t gparam_id, uint32_t value);       // 写全局 CSD 配置(仅影子, 不重初始化)
+    bool start_host_global_set(uint8_t gparam_id, uint32_t value);
     bool get_global(uint8_t gparam_id, uint32_t* out_value);  // 读全局 CSD 配置
     bool global_commit();                                     // 全局项设完后触发一次完整重初始化
+    bool start_host_global_commit();
 
     // ---------- 采样率统计（每 ~500ms 由 update() 用 PSoC 自由递增 scan_count 折算）----------
     uint32_t samples_per_sec() const { return _samples_per_sec; }
@@ -129,13 +148,14 @@ public:
     bool calibrate(uint8_t ch = 0xFFu);
     // 基线复位。ch: 0..35=仅该通道, 0xFF=全通道。
     bool baseline_reset(uint8_t ch = 0xFFu);
-    // SweepSession 专用的非阻塞重操作: 仅允许单个在途操作；完成结果由 take_sweep_result() 取走。
-    // ★start_sweep_apply 走 QUICK_APPLY(0x3F) 而非 APPLY★: 逐格把 gain/div 随帧原子下发，绝不先
-    // SET_PARAM 改 widgetContext；PSoC 仅在 NOT_BUSY 窗口写入并 Initialize。
-    bool start_sweep_apply(uint8_t ch, uint8_t gain, uint8_t div);
-    bool start_sweep_calibrate(uint8_t ch);
-    bool start_sweep_baseline_reset(uint8_t ch);
-    bool take_sweep_result(bool* out_ok);
+    // 运行时参数硬件应用：仅向 PSoC 发送已存在的 RUNTIME_PARAM_APPLY 指令并由 RP2040 单步轮询
+    // “参数回显一致 + scan_count 恢复推进”。它不校准、不复位基线、不触发 XRES，也不占用长任务槽。
+    // 这是 gain/div 真正载入 CSD 硬件的唯一只读 PSoC 原语；SET_PARAM 本身仅更新 shadow RAM。
+    bool start_runtime_param_apply(uint8_t ch, uint8_t gain, uint8_t div);
+    bool take_runtime_param_apply_result(bool* out_ok);
+    bool runtime_param_apply_in_progress() const {
+        return _runtime_apply.pending != 0u || _runtime_apply.active != 0u;
+    }
     // 频率自适应下探(阻塞至完成, 最多~10s): ch 0..35=单通道 / 0xFF=全通道;
     // pref 灵敏度档位 1..7(越高越灵敏, 落档时往低频多让分频);
     // out_result 0进行中/1成功/2失败, out_div 最终写入的分频;
@@ -150,9 +170,18 @@ public:
     uint32_t autotune_req() const { return _at_req; }
     psoc::AutoTuneProgress autotune_status() const;   // seqlock 一致读(core1 发布)
     bool set_mode(uint8_t mode);   // 0=自动校准/标准完整处理，1=半自动手动
+    bool start_host_mode_set(uint8_t mode);
+    // Host 写入只在 core1 命令环已排空且没有重操作时受理。这样延迟 ACK 不会被启动
+    // provisioning 或长校准排到数秒后，调用方可立即回 DEVICE_BUSY 并由主机退避重试。
+    bool host_write_ready() const {
+        return core1_idle() && !heavy_busy() &&
+            _host_write.pending == 0u && _host_write.complete == 0u;
+    }
+    bool take_host_write_result(bool* out_ok);
     const psoc::SensorSnapshot& snapshot() const;   // seqlock 拷贝到 _snapshot_ro 后返回引用
     bool snapshot_valid() const { return _snapshot.valid; }        // bool 原子, 直读
     uint16_t snapshot_generation() const { return _snapshot.generation; }  // u16 原子, 直读
+    bool get_cp(uint8_t ch, uint32_t* out);
 
     // 烧录前白灯准备：先复位旧 PSoC，使 0.4.0/0.4.1 generated 启动态确定为 P1.6 高，
     // 再发向后兼容命令确认 SPI。返回失败只影响指示诊断，不阻止烧录。
@@ -226,6 +255,7 @@ private:
     bool _telem_active = false;       // 遥测慢路是否激活（TELEM_START/STOP 控制）
     volatile uint8_t _focus_ch = 0xFF;   // 独占单通道目标(0xFF = 无, 走全通道分块慢路)
     uint32_t _last_update_ms;
+    uint32_t _snapshot_last_ms = 0u;
     psoc::SensorSnapshot _snapshot;
     uint64_t _touch_mask = 0;
     uint32_t _touch_read_us = 0;
@@ -239,7 +269,7 @@ private:
 
     // ---------- 双核: core1 独占 SPI, seqlock 发布共享态 + 命令信箱投递低频指令 ----------
     // RP2040 无 cache, 跨核共享用 volatile + __dmb() 内存屏障即可保证可见性与顺序。
-    enum class SpiOp : uint8_t { NONE, SET_PARAM, GET_PARAM, GET_RAW, SET_MODE, APPLY, QUICK_APPLY, FOCUS_SCAN, CALIBRATE, BASELINE_RESET, MEASURE_CP, GET_CP,
+    enum class SpiOp : uint8_t { NONE, SET_PARAM, GET_PARAM, GET_RAW, SET_MODE, APPLY, RUNTIME_PARAM_APPLY, FOCUS_SCAN, CALIBRATE, BASELINE_RESET, MEASURE_CP, GET_CP,
                                  UPLOAD_ALGO, GET_ALGO_INFO, SET_ALGO_ROM, GET_ALGO_ROM,
                                  ALGO_GET_TRACE, ALGO_SET_CFG, ALGO_GET_CFG,
                                  SET_GLOBAL, GET_GLOBAL, GLOBAL_COMMIT, AUTO_TUNE };
@@ -252,9 +282,17 @@ private:
     volatile bool     _pub_touch_hold = false;   // 掩码可信(见 touch_hold_ok)
     volatile uint32_t _pub_link_ok_ms = 0;   // 最近一次 read_touch 成功时刻(ms), 0=从未成功
     volatile uint32_t _pub_touch_read_us = 0;
+    volatile uint32_t _pub_touch_sample_us = 0;  // 掩码到手时刻(延迟补偿的时间基准)
     volatile uint32_t _pub_touch_bad = 0;        // 累计无合法触控帧的周期数(诊断)
     volatile uint32_t _pub_touch_releases = 0;   // 累计优雅释放次数(诊断)
     uint32_t _touch_fail_run = 0;                // 连续无合法帧周期数(core1 独占, 与掉线判据分开计)
+
+    // 新代数通知线 INT1: core1 唯一写者。_pub_* 供 core0 只读搬进调试上报, 其余为 core1 私有。
+    volatile uint32_t _pub_int1_edges = 0;       // 累计电平翻转数
+    volatile uint32_t _pub_int1_timeouts = 0;    // armed 后等待超时次数
+    volatile bool     _pub_int1_armed = false;   // 已确认通知线活跃
+    bool     _int1_level = false;                // 上次采到的电平(翻转判据的基准)
+    uint32_t _int1_timeout_run = 0;              // 连续超时数, 达阈值即解除 armed 退回自由跑
 
     // 失效兜底检测态(core1 唯一写者, core0 只读 _pub_reset_reason / 清零)
     volatile uint8_t  _pub_reset_reason = 0;   // 0/1/2, core1 置位, core0 处理后清零
@@ -271,6 +309,13 @@ private:
     uint32_t _hang_intervals = 0;               // 连续 scan_count 不推进的统计间隔数
     // 算法信息缓存：仅 core1 刷新/失效，core0 通过 seqlock 只读；epoch 由 core0 在复位时递增。
     static constexpr uint32_t ALGO_INFO_CACHE_MAX_AGE_MS = 500u;
+    // ★算法运行值缓存(core1 独占写)★ 与快照同批经 seqlock 发布, 见 _spi_service 的 focus 分支。
+    // 每份 Focus 快照只读一个 report 槽并轮转, 避免为 4 个槽各做一次 SPI 事务把 core1 占满。
+    uint16_t _algo_trace_report[psoc::ALGO_REPORT_SLOTS] = {};
+    uint8_t _algo_trace_active = 0;
+    uint8_t _algo_trace_channel = 0xFFu;
+    uint8_t _algo_trace_slot = 0;
+
     volatile uint32_t _algo_info_seq = 0;
     volatile uint8_t _algo_info_available = 0;
     volatile uint8_t _algo_info_valid = 0;
@@ -301,7 +346,49 @@ private:
     };
     AlgoDownloadState _algo_dl { 0u, 0u };
 
-    struct SweepAsyncState {
+    struct AlgoUploadAsyncState {
+        volatile uint8_t active = 0u;
+        uint32_t started_ms = 0u;
+        uint32_t last_poll_ms = 0u;
+        uint32_t last_touch_ms = 0u;
+        uint16_t response_fail_run = 0u;
+
+        void clear() {
+            active = 0u; started_ms = 0u; last_poll_ms = 0u;
+            last_touch_ms = 0u; response_fail_run = 0u;
+        }
+    };
+    AlgoUploadAsyncState _algo_upload_async;
+
+    struct RuntimeParamApplyState {
+        volatile uint8_t pending = 0u;
+        volatile uint8_t complete = 0u;
+        volatile uint8_t ok = 0u;
+        volatile uint8_t token = 0u;
+        volatile uint8_t active = 0u;
+        volatile uint8_t response_fail_run = 0u;
+        volatile uint8_t params_confirmed = 0u;
+        volatile uint8_t scan_seen = 0u;
+        volatile uint8_t scan_progress_polls = 0u;
+        volatile uint8_t target_ch = 0u;
+        volatile uint8_t target_gain = 0u;
+        volatile uint8_t target_div = 0u;
+        volatile uint32_t started_ms = 0u;
+        volatile uint32_t last_poll_ms = 0u;
+        volatile uint32_t last_param_poll_ms = 0u;
+        volatile uint32_t last_touch_ms = 0u;
+        volatile uint32_t last_scan_count = 0u;
+
+        void clear() {
+            pending = 0u; complete = 0u; ok = 0u; token = 0u; active = 0u;
+            response_fail_run = 0u; params_confirmed = 0u; scan_seen = 0u;
+            scan_progress_polls = 0u; target_ch = 0u; target_gain = 0u; target_div = 0u;
+            started_ms = 0u; last_poll_ms = 0u; last_param_poll_ms = 0u;
+            last_touch_ms = 0u; last_scan_count = 0u;
+        }
+    };
+    enum class AsyncOwner : uint8_t { NONE, RUNTIME_PARAM, HOST_WRITE };
+    struct HostWriteState {
         volatile uint8_t pending = 0;
         volatile uint8_t complete = 0;
         volatile uint8_t ok = 0;
@@ -309,7 +396,26 @@ private:
 
         void clear() { pending = 0; complete = 0; ok = 0; token = 0; }
     };
-    SweepAsyncState _sweep_async;
+    struct HeavyAsyncState {
+        volatile uint8_t active = 0;
+        volatile uint8_t seen_busy = 0;
+        volatile uint8_t response_fail_run = 0;
+        volatile uint8_t scan_seen = 0;
+        volatile uint8_t scan_progress_polls = 0;
+        volatile uint32_t last_scan_count = 0;
+        volatile uint32_t started_ms = 0;
+        volatile uint32_t last_poll_ms = 0;
+        volatile uint32_t last_touch_ms = 0;
+
+        void clear() {
+            active = 0; seen_busy = 0; response_fail_run = 0; scan_seen = 0;
+            scan_progress_polls = 0; last_scan_count = 0; started_ms = 0;
+            last_poll_ms = 0; last_touch_ms = 0;
+        }
+    };
+    HeavyAsyncState _heavy_async;
+    RuntimeParamApplyState _runtime_apply;
+    HostWriteState _host_write;
 
     // 命令 SPSC 环形队列(core0 生产, core1 消费, 单拷贝, 无锁):
     //   写类指令(set_param/set_mode/apply) 入队即返回(异步), core0 不再每条阻塞 ~1ms;
@@ -327,7 +433,8 @@ private:
         uint32_t       result = 0;
         bool           ok = false;
         volatile bool  done = false;   // core1 执行完置真(读类 core0 等此位)
-        uint8_t        async_token = 0; // Sweep 非阻塞重操作的完成归属(0=普通命令)
+        AsyncOwner     async_owner = AsyncOwner::NONE;
+        uint8_t        async_token = 0;
     };
     SpiCmd            _cmd_ring[CMD_RING_SIZE];
     volatile uint32_t _cmd_head = 0;   // core0 生产位置(生产者独占推进)
@@ -340,11 +447,22 @@ private:
     static bool _op_is_heavy(SpiOp op);
 
     void _spi_service();   // core1 每周期: 命令队列 + 触控快路 + 快照慢路 + 采样率统计
+
+    void _int1_init();                    // 把 GPIO23 配成输入并记下初始电平(core1 启动时一次)
+    void _int1_wait_generation();         // 采样/等待 PSoC 的"新代数已发布"翻转, 见实现处说明
+    bool _int1_free_run_needed() const;   // core1 尚有活要干 ⇒ 本轮不许停下来等通知
+    bool _poll_heavy_async();
+    void _complete_heavy_async(bool ok);
+    bool _poll_runtime_param_apply();
+    void _complete_runtime_param_apply(bool ok);
+    bool _poll_algo_upload_async();
     bool _refresh_algo_info_cache();       // core1 安全位置直接读取 PSoC
     void _invalidate_algo_info_cache();   // core1 写者：链路失效时清空
-    bool _start_sweep_op(SpiOp op, uint8_t ch, uint8_t pid = 0u, uint32_t val = 0u);
+    void _publish_algo_info_cache(bool valid, uint16_t len);
+    bool _start_runtime_param_apply(uint8_t ch, uint8_t gain, uint8_t div);
+    bool _start_host_write(SpiOp op, uint8_t ch, uint8_t pid = 0u, uint32_t val = 0u);
     bool _submit(SpiOp op, uint8_t ch, uint8_t pid, uint32_t val, uint32_t* out, const uint8_t* data = nullptr,
-                 uint32_t timeout_us = 0u, uint8_t async_token = 0u);
+                 uint32_t timeout_us = 0u, AsyncOwner async_owner = AsyncOwner::NONE, uint8_t async_token = 0u);
     bool _exec_cmd(SpiOp op, uint8_t ch, uint8_t pid, uint32_t val, uint32_t* out, const uint8_t* data = nullptr); // 实际执行(core1 或 setup 直调)
 
     static Psoc* _instance;

@@ -293,7 +293,7 @@ export component KeyMapPage inherits Rectangle {
                 HorizontalLayout {
                     spacing: 8px;
                     Button {
-                        text: @tr("清空已选分区");
+                        text: @tr("清空分区");
                         clicked => { root.combo_zones_clear(); }
                     }
                     Text {
@@ -322,7 +322,7 @@ export component KeyMapPage inherits Rectangle {
                         value <=> root.new_max_hold_ms;
                     }
                     Button {
-                        text: @tr("添加为一条映射");
+                        text: @tr("添加映射");
                         primary: true;
                         clicked => { root.combo_add(root.new_delay_ms, root.new_max_hold_ms); }
                     }

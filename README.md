@@ -1,6 +1,6 @@
 # mai2control v4
 
-> 仓库：<https://github.com/NKQC/project-mai2control.git>
+> 仓库：<https://github.com/NKQC/maimai-input-control-firmware/tree/v4>
 > design huhuzhu
 
 ## 免责声明

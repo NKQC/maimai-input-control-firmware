@@ -10,10 +10,6 @@ class HAL_PIO;
 /**
  * PsocSpi - RP2040 <-> PSoC 的 PIO SPI 主机（非单例，由门面持有）
  *
- * 为什么用 PIO 而非硬件 SPI1：本板物理连线的 MOSI/MISO 与 RP2040 硬件 SPI1
- * 固定引脚(TX=GPIO27/RX=GPIO28)相反，硬件外设无法交换 TX/RX，只能用 PIO 任意指定引脚。
- *   MOSI(数据输出)=GPIO28, MISO(数据输入)=GPIO27, SCK=GPIO26, CS=GPIO29。
- *
  * 协议：SPI MODE0(CPOL0/CPHA0)、8bit、MSB first、全双工。占用 HAL_PIO1（PIO1）。
  * CS 用普通 GPIO 手动管理，一次事务内保持拉低。
  *
@@ -49,10 +45,14 @@ public:
     bool get_stats(uint32_t* out_scan_count, uint8_t* out_busy = nullptr);
     bool measure_cp();                                             // 发送命令并等待 BIST 后固件恢复正常 CSD 扫描
     bool get_cp(uint8_t ch, uint32_t* out_cp);                     // 测量中=0，成功=fF，失败/未测量=0xFFFFFF
-    bool apply();                                                   // 应用硬件参数(重扫/重校准)
-    // ★Sweep 专用轻量应用★帧 [magic, QUICK_APPLY, ch, gain, div, 0, 0]；PSoC 主循环在
-    // NOT_BUSY 窗口原子写入 gain/div 后 Initialize + 准备 CSD，不重校准/不重基线。
-    bool quick_apply(uint8_t ch, uint8_t gain, uint8_t div);
+    bool apply();                                                   // 兼容同步应用硬件参数
+    // 通用生命周期专用：仅发送 APPLY 并确认 PSoC 已受理，完成由 Psoc 低频 GET_STATS 自适应轮询。
+    bool begin_apply();
+    // Runtime parameter apply: one existing command applies gain/div and confirms the
+    // result through parameter readback and scan-count progress; it is not a heavy op.
+    bool begin_runtime_param_apply(uint8_t ch, uint8_t gain, uint8_t div);
+    // One bounded GET_STATS probe used by runtime parameter apply.
+    bool runtime_param_apply_poll(uint32_t* out_scan_count = nullptr, uint8_t* out_raw_busy = nullptr);
     // 请求 PSoC 只扫描一个已启用通道；0xFF 立即回到全通道。返回 true 仅代表 PSoC 明确确认当前目标。
     bool focus_scan(uint8_t ch);
     // 真正的 IDAC 重校准 + 基线复位。ch(帧字节2): 0..35=只校准该 widget 并只初始化该 widget 基线,
@@ -77,7 +77,10 @@ public:
     bool algo_page(uint8_t page, const uint8_t four[4]);           // 写第 page 页(4 字节)
     bool algo_end(uint16_t crc16, bool* out_ok, uint16_t* out_len);// 触发 commit；回读 ok/len 回显
     bool algo_info(bool* out_valid, uint16_t* out_len);            // 读 PSoC 端算法 valid/len
-    // 完整下发: begin→逐页→end→轮询 info 直到 valid 且 len 一致(内部含 commit 等待)。
+    // 异步完整下发：begin_upload_algo() 只受理并锁定 blob，poll_upload_algo() 每次最多执行一笔
+    // SPI 事务，直至 PSoC commit 真正回读 valid+len。调用方必须在完成前保持 data 不变。
+    bool begin_upload_algo(const uint8_t* data, uint16_t len, uint16_t crc16);
+    bool poll_upload_algo(bool* out_complete, bool* out_ok, bool* out_valid, uint16_t* out_len);
     bool upload_algo(const uint8_t* data, uint16_t len, uint16_t crc16);
     bool set_algo_rom(uint8_t ch, uint16_t rom);                   // 设每通道 16 位只读 ROM(回显校验)
     bool get_algo_rom(uint8_t ch, uint16_t* out_rom);              // 读每通道 16 位 ROM
@@ -97,6 +100,10 @@ public:
     // 流水读取一份由 PSoC BEGIN 锁存的完整不可变 CapSense 快照（阻塞，~10ms；调试/一次性用）。
     bool read_snapshot(psoc::SensorSnapshot* snapshot);
 
+    // 分块全通道快照是否还有页没读完。core1 据此判断"能不能停下来等新代数通知": 一份要 16 次
+    // 调用才凑齐, 若在中途停下等通知, 广谱流帧率会被压到 1/16。
+    bool snapshot_pump_busy() const { return _snap_active; }
+
     // ★Phase C 全通道 raw 慢路（分块）★：每次调用只读 max_pages 页，与触控快路交织，避免阻塞。
     // 状态机自动 BEGIN→逐页→完成。完成时把整份快照写入 *out 并返回 true（该次为最后一块）；
     // 未完成返回 false。中途出错自动回到空闲，下次重新开始。
@@ -109,6 +116,11 @@ public:
     // 成功返回 true 并已把该通道写入 *out(含 generation/valid)。
     bool snapshot_pump_channel(uint8_t channel, psoc::SensorSnapshot* out);
 
+    // 最近一次合法 GET_STATS 回显的 PSoC 主循环 busy 真值。所有同步/异步重操作共用此闸门，
+    // 避免同步 API 本地超时后 RP 队列已空、但 PSoC 仍忙时叠加下一条操作。
+    // 若 busy 位残留但 scan_count 已在连续 GET_STATS 间推进，PSoC 主循环实际健康运行，
+    // 不让残留位永久冻结快照/推流；异步操作的完成仍严格以原始 busy=0 判定。
+    bool operation_busy() const { return _operation_busy != 0u; }
     bool ready() const { return _ready; }
 
 private:
@@ -120,7 +132,7 @@ private:
     static bool _response_matches(const psoc::Frame& response, psoc::Cmd command, uint8_t sequence);
     static uint16_t _read_u16(const uint8_t* bytes);
     // 轮询 GET_STATS 的 busy 字节(resp[2])至 PSoC 主循环真正完成重操作(busy 1→0)或超时。
-    // 用于 calibrate/apply/baseline_reset 的真实完成反馈, 替代原固定 sleep 盲等。返回 true=真实完成。
+    // 用于 host 的阻塞 calibrate/apply/baseline_reset 完成反馈；运行时参数应用单独使用低频探针。
     // on_progress != nullptr 时额外每 PROGRESS_POLL_MS 读一次 AUTO_TUNE 进度回吐(busy 语义不变)。
     // progress_tag: 本轮请求标签(0=不校验)。回吐进度前先比对 PSoC 回显的标签, 不匹配即不回吐 ——
     // 否则上一轮的阶段进度会被当成本轮的显示出去。
@@ -128,10 +140,17 @@ private:
                        void* progress_ctx = nullptr, uint8_t progress_tag = 0u);
     // 把 PSoC 的默认响应换回实时触控帧(流水线收尾)，见 psoc_spi.cpp 实现处说明。
     void _restore_touch_response();
+    // 锁存一份不可变 PSoC 快照并让 transfer_snapshot 可读: BEGIN 与取 INFO 必须相邻(否则 INFO
+    // 被中间事务吞掉), 随后留一个 PSoC 主循环迭代完成延迟 memcpy。见实现处的时序契约说明。
+    bool _snapshot_latch(uint16_t* out_generation, bool* out_valid);
+    // 连续读取 page_count 页到 dst。页应答比请求晚一个事务, 故一个分块必须在同一次调用内连续
+    // 完成; 中途插入触控事务会吞掉待取的 SNAPSHOT_DATA。全通道/单通道/调试三条路共用本原语。
+    bool _snapshot_pages(uint16_t first_page, uint16_t page_count, uint8_t* dst);
     // 直发一条"重操作"命令(APPLY/CALIBRATE/BASELINE_RESET/AUTO_TUNE)并**确认 PSoC 真的收到**。
     // 返回 false = 未受理(调用方直接失败, 不要进 _wait_op_done)。见实现处的残帧/假成功说明。
     // b4 = 帧字节4(val24 低字节): 目前只有 AUTO_TUNE 用它带请求标签, 其余重操作传 0。
     bool _send_heavy(uint8_t cmd, uint8_t b2, uint8_t b3, uint8_t b4 = 0u);
+    bool _send_runtime_param_apply(uint8_t ch, uint8_t gain, uint8_t div);
     static constexpr uint32_t PROGRESS_POLL_MS = 100;   // 进度读取降频周期(busy 轮询仍为 3ms)
 
     uint8_t _sck_pin;
@@ -145,6 +164,9 @@ private:
     uint8_t _offset;
     bool _ready;
     uint8_t _seq;
+    volatile uint8_t _operation_busy = 0u;
+    uint32_t _last_stats_scan = 0u;
+    uint8_t _stats_seen = 0u;
 
     // 一份快照的完成期限: 超期即丢弃进度重新 BEGIN。快照跨多次 pump 续读且中途失败原地重试,
     // 若某种应答流水失步让某页永远读不出来, 就会无限重试同一页 → 快照永不发布 → 上位机看到
@@ -155,8 +177,21 @@ private:
     bool _snap_active = false;                     // 是否正在读一份快照
     uint32_t _snap_start_us = 0;                   // 本份快照的起始时刻(完成期限用)
     uint16_t _snap_page = 0;                       // 下一个待请求的页号(1..PAGE_COUNT)
-    uint8_t _snap_expected_seq = 0;                // 期望的流水应答序号
     uint16_t _snap_generation = 0;
     bool _snap_valid = false;
     uint8_t _snap_packed[psoc::SNAPSHOT_SIZE];     // 累积的原始快照字节
+
+    struct AlgoUploadState {
+        const uint8_t* data = nullptr;
+        uint16_t len = 0;
+        uint16_t crc16 = 0;
+        uint16_t page = 0;
+        uint8_t phase = 0;       // 1=pages, 2=commit wait, 3=done
+        uint8_t confirmed = 0;
+        uint32_t started_ms = 0;
+        uint32_t last_info_ms = 0;
+        void clear() { data = nullptr; len = 0; crc16 = 0; page = 0; phase = 0;
+                       confirmed = 0; started_ms = 0; last_info_ms = 0; }
+    };
+    AlgoUploadState _algo_upload;
 };

@@ -89,9 +89,11 @@ impl ConfigDrafts {
 
     #[inline]
     fn _mark(&mut self, key: String) {
-        if self.dirty_keys.insert(key) {
-            self.version = self.version.wrapping_add(1);
-        }
+        self.dirty_keys.insert(key);
+        // Every accepted draft write advances the transaction generation, even
+        // when it updates an already-dirty key. SAVE_CONFIG uses this to avoid
+        // clearing an edit made while an earlier snapshot is in flight.
+        self.version = self.version.wrapping_add(1);
     }
 
     /// 撤稿: 某项值回到设备真值时清掉它的脏标记。集合空即整体不脏(派生, 无需另置标志)。

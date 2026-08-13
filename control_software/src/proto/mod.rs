@@ -36,7 +36,9 @@ pub use telemetry::{
     AutoTuneProgress,
     BATCH_PARAM_IDS,
     ChannelSample,
+    FIELD_ALGO,
     FIELD_BASELINE,
+    FIELD_DELAY_DEV,
     FIELD_DIFF,
     FIELD_LATENCY,
     FIELD_RAW,
@@ -158,6 +160,8 @@ pub enum HostCmd {
     RebootBootloader = 0x05,
     RebootPsoc = 0x06,
     DebugCrashBootsel = 0x07,
+    /// 仅在已武装且设备空闲时触发一次安全 watchdog_reboot，进入既有崩溃 BOOTSEL 路径。
+    DebugTriggerCrash = 0x0A,
     /// PSoC 救砖: 空 payload → 立即 ACK("已受理"), 设备经 SWD 强制重刷 + 重新下发算法/CSD。
     PsocRescue = 0x08,
     /// 设备主动推送(flags=STREAM): 救砖阶段进度/终态, 见 `decode_psoc_rescue_progress`。
@@ -236,7 +240,8 @@ pub enum HostCmd {
     AlgoGetSrc = 0x66,
     AlgoSetSrc = 0x67,
     AlgoGetCode = 0x68,
-    AlgoGetTrace = 0x69,
+    // 0x69 已退役(原 AlgoGetTrace 逐项轮询)。算法运行值改随遥测帧的 FIELD_ALGO 上报。
+    // ★不要复用该码★: 旧固件仍会把它当追踪请求处理。
     AlgoSetCfg = 0x6A,
     AlgoGetCfg = 0x6B,
 
@@ -286,6 +291,7 @@ impl TryFrom<u8> for HostCmd {
             0x05 => Ok(RebootBootloader),
             0x06 => Ok(RebootPsoc),
             0x07 => Ok(DebugCrashBootsel),
+            0x0A => Ok(DebugTriggerCrash),
             0x08 => Ok(PsocRescue),
             0x09 => Ok(PsocRescueProgressPush),
             0x0E => Ok(SaveConfig),
@@ -338,7 +344,7 @@ impl TryFrom<u8> for HostCmd {
             0x66 => Ok(AlgoGetSrc),
             0x67 => Ok(AlgoSetSrc),
             0x68 => Ok(AlgoGetCode),
-            0x69 => Ok(AlgoGetTrace),
+
             0x6A => Ok(AlgoSetCfg),
             0x6B => Ok(AlgoGetCfg),
             0x70 => Ok(KbdGetState),

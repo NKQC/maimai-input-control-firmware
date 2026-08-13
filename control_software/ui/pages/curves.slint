@@ -1,6 +1,6 @@
 import { Button, VerticalBox, HorizontalBox, CheckBox, SpinBox, ScrollView } from "std-widgets.slint";
 import { ParamRow, AlgoReportLine, AlgoSettingRow, SpectrumCell } from "../common/types.slint";
-import { CollapsibleSection, ParamEditorRow, AlgoSettingEditorRow, PlotPath, SeriesRow, GuardedSpinBox, HelpOverlay } from "../common/widgets.slint";
+import { CollapsibleSection, ParamEditorRow, AlgoSettingEditorRow, PlotPath, SeriesRow, AlgoSeriesRow, GuardedSpinBox, HelpOverlay } from "../common/widgets.slint";
 import { Theme } from "../common/theme.slint";
 
 
@@ -1022,13 +1022,9 @@ export component CurvesPage inherits Rectangle {
                                 // 而不是摆一个空标签的勾选框 —— 沿用 CollapsibleSection 的收起手法。
                                 height: line.name != "" ? srow.preferred-height : 0px;
                                 clip: true;
-                                srow := SeriesRow {
+                                srow := AlgoSeriesRow {
                                     width: parent.width;
-                                    label: "report[" + line.idx + "] " + line.name;
-                                    tint: line.line_color;
-                                    checked: line.visible;
-                                    has_norm: line.is_binary;
-                                    norm: line.norm_amp;
+                                    entry: line;
                                     toggled(on) => { root.report_toggle(line.idx, on); }
                                     norm_changed(v) => { root.report_norm_set(line.idx, v); }
                                 }

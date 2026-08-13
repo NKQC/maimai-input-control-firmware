@@ -46,9 +46,9 @@ enum class Cmd : uint8_t {
     BASELINE_RESET = 0x3C, // 仅重置全部通道基线(主循环执行)// 全部全局项设完后触发一次完整重初始化(合并, 防反复重校准漂移)
     AUTO_TUNE = 0x3D,      // 频率自适应下探(主循环逐档升 snsClk 分频重校准, 耗时数秒)
     GET_AUTO_TUNE = 0x3E,  // 读自适应结果: [magic,GET_AUTO_TUNE,result(0进行中/1成功/2失败),0,div24]
-    // ★Sweep 专用轻量应用★ [magic,QUICK_APPLY,ch,gain,div,0,0]: ISR 仅保存合法参数并置 pending；
-    // PSoC 主循环在 NOT_BUSY 窗口写 widgetContext 后 Initialize，不重校准 IDAC、不重置基线。
-    QUICK_APPLY = 0x3F,
+    // Runtime parameter apply: b2=channel, b3=gain, b4=divider. The PSoC applies the
+    // shadow values without calibration or baseline reset and reports the command result.
+    RUNTIME_PARAM_APPLY = 0x3F,
     // Focus 扫描控制: b2=0..35 启用/续租指定已启用通道, 0xFF=立即恢复全通道;
     // 响应 b2=实际目标(0xFF=全通道), b3=1 接受 / 0 拒绝。
     FOCUS_SCAN = 0x49,
@@ -84,6 +84,9 @@ struct Frame {
 };
 static_assert(sizeof(Frame) == 3 + FRAME_PAYLOAD_SIZE, "psoc::Frame must be 7 bytes");
 static_assert((SNAPSHOT_SIZE % FRAME_PAYLOAD_SIZE) == 0, "snapshot must use complete pages");
+
+// JIT 算法 ABI 的 report 槽数(见 psoc_algo_abi.h 的 algo_io_t::report[4])。
+static constexpr size_t ALGO_REPORT_SLOTS = 4;
 
 struct SensorSample {
     uint16_t raw = 0;
@@ -138,11 +141,22 @@ struct SensorSnapshot {
     uint16_t generation = 0;
     bool valid = false;
     SensorSample channels[SENSOR_CHANNEL_COUNT] = {};
+    // ★算法运行值与采样同批发布★
+    // report[0..3] 与 out_active 是 JIT 算法的运行输出, PSoC 只提供 ALGO_GET_TRACE 逐项读取,
+    // 没有并入 252B 快照。放在这里由 core1 顺带取回并与快照同批经 seqlock 发布, 使上位机可以
+    // 随遥测帧一次拿走 —— 取代原先"core0 阻塞读类命令 + 单响应槽"那条抢不到窗口的老路。
+    // algo_channel = 这组值属于哪个通道(独占流即 Focus 通道); 0xFF = 尚无有效算法运行值。
+    uint8_t algo_channel = 0xFFu;
+    uint8_t algo_active = 0;
+    uint16_t algo_report[ALGO_REPORT_SLOTS] = {};
 
     void clear() {
         generation = 0;
         valid = false;
         for (auto& channel : channels) channel.clear();
+        algo_channel = 0xFFu;
+        algo_active = 0;
+        for (auto& value : algo_report) value = 0;
     }
 
     uint64_t active_mask() const {

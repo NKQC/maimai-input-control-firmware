@@ -214,22 +214,86 @@ pub fn registration_status() -> String {
             format!("摄像头部分安装（{} 未通过核验）", missing.join("、"))
         }
     };
-    match interception::driver_status() {
-        interception::DriverStatus::Ready => {
-            format!("{}；{}", camera, interception::DriverStatus::Ready.detail())
-        }
-        // 待重启是"安装成功但还没生效", 与真失败分开表述: 不说失败, 也不谎称已能拦截。
-        status @ interception::DriverStatus::PendingReboot => format!(
-            "{}；{}。重启前扫码只能旁路监听, 不会拦截目标设备输入",
-            camera,
-            status.detail()
-        ),
-        status => format!(
-            "{}；目标设备吞键未确认：{}。将降级且不会声称拦截成功",
-            camera,
-            status.detail()
-        ),
+    // ★键盘过滤驱动已退居备用★ 吞键现在由「WinUSB 改绑」承担(见 `driver_pkg`), 它没有键盘槽上限、
+    // 不引入内核二进制。所以这里只留一句结论 —— 完整诊断(注册与否/待重启/槽位是否超限/内核代码
+    // 完整性)一律落日志。旧版把整段诊断摊在界面上, 用户据此去排查了根本不存在的兼容性问题。
+    let status = interception::driver_status();
+    log::info!("虚拟摄像头: 键盘过滤驱动诊断: {}", status.detail());
+    // 只有 `Ready` 算可用: `SlotsExhausted` 是"驱动活着但目标拿不到槽", 那对拦截等于不可用。
+    let filter = if matches!(status, interception::DriverStatus::Ready) {
+        "键盘过滤驱动可用（已被 WinUSB 改绑取代，一般无需使用）"
+    } else {
+        "键盘过滤驱动未就绪（改用下方 WinUSB 改绑，不需要它）"
+    };
+    format!("{}；{}", camera, filter)
+}
+
+/// 对选定 Raw Input HID 设备执行精确设备栈热重启，并确认 Interception 目标槽位恢复。
+pub fn hot_restart_selected_device(raw_input_path: &str) -> Result<String> {
+    if !embedded_available() || !interception::deployed_assets_match() {
+        return Err(anyhow!(
+            "Interception 驱动注册/运行资产未通过核验，拒绝热重启"
+        ));
     }
+    if !interception::registration_present() {
+        return Err(anyhow!("Interception 驱动尚未完成注册，拒绝热重启"));
+    }
+    let instance_id = hid_instance_id(raw_input_path)?;
+    if interception::target_ready(raw_input_path)? {
+        return Ok("目标设备已在 Interception 槽位就绪，无需热重启".to_string());
+    }
+    let exit = run_elevated(
+        "pnputil.exe",
+        &format!("/restart-device {}", cmd_quote_text(&instance_id)),
+    )
+    .map_err(|error| anyhow!("目标设备热重启未完成：{}", error))?;
+    if exit != 0 {
+        return Err(anyhow!(
+            "pnputil /restart-device 失败，退出码 {}（{}）",
+            exit,
+            _exit_reason(exit)
+        ));
+    }
+    interception::wait_target_ready(raw_input_path, std::time::Duration::from_secs(20))?;
+    Ok(format!(
+        "已热重启选定设备并确认 Interception 槽位就绪：{}",
+        instance_id
+    ))
+}
+
+/// Raw Input HID 路径 → HID 设备实例 ID，含命令行注入字符拒绝。
+/// WinUSB 改绑路径复用同一份校验，避免出现第二套宽松的路径解析。
+pub(crate) fn hid_instance_id(raw_input_path: &str) -> Result<String> {
+    let path = raw_input_path.trim();
+    if path.is_empty() || path.len() > 4096 {
+        return Err(anyhow!("拒绝空或过长的 Raw Input HID 路径"));
+    }
+    if path.chars().any(|ch| {
+        matches!(
+            ch,
+            '|' | '<' | '>' | '"' | '\'' | '`' | ';' | '%' | '\r' | '\n'
+        )
+    }) {
+        return Err(anyhow!("Raw Input HID 路径含危险命令字符，已拒绝"));
+    }
+    let upper = path.to_ascii_uppercase();
+    let body = upper
+        .strip_prefix(r"\\?\HID#")
+        .or_else(|| upper.strip_prefix(r"\\.\HID#"))
+        .ok_or_else(|| anyhow!("目标路径不是 HID Raw Input 设备路径"))?;
+    let body = body
+        .split("#{")
+        .next()
+        .ok_or_else(|| anyhow!("目标 HID 路径缺少设备实例"))?;
+    let instance = format!("HID\\{}", body.replace('#', "\\"));
+    if instance.len() <= 4 {
+        return Err(anyhow!("目标 HID 路径无法转换为设备实例 ID"));
+    }
+    Ok(instance)
+}
+
+pub(crate) fn cmd_quote_text(value: &str) -> String {
+    format!("\"{}\"", value)
 }
 
 /// 启动前的摄像头注册核验。目标设备过滤另由 `interception::Capture::open` 精确验证，
@@ -315,8 +379,9 @@ pub fn install() -> Result<String> {
         interception::DriverStatus::Ready => Ok(registration_status()),
         // 已注册但没加载 ⇒ 上一次安装其实成功了, 只差重启; 不再重跑安装器。
         interception::DriverStatus::PendingReboot => Ok(registration_status()),
-        interception::DriverStatus::DriverUnavailable => {
-            // 只有 API 已正确加载却无驱动设备时，才执行归档内唯一的官方安装器。
+        interception::DriverStatus::NotInstalled => {
+            // 只有 API 已加载、且注册表实测确认"从来没装上"时，才执行归档内唯一的官方安装器。
+            // ★SlotsExhausted 不走这里★ 槽位是该驱动的结构性上限，重装不解决，落到下面的错误分支。
             let marker = staging.join(interception::OWNER_FILE);
             std::fs::write(&marker, interception::owner_marker())
                 .map_err(|error| anyhow!("写入 Interception 所有权标记失败：{}", error))?;
@@ -464,7 +529,7 @@ pub fn uninstall() -> Result<String> {
         ));
     }
     if owned_driver {
-        if interception::driver_status_from_api(&probe_api).is_ready() {
+        if interception::driver_status_from_api(&probe_api).is_loaded() {
             return Err(anyhow!(
                 "官方 Interception 卸载器已返回成功，但驱动仍可枚举；不会声称卸载完成"
             ));
@@ -789,13 +854,15 @@ fn _run_elevated_steps(steps: &[String]) -> Result<u32> {
     let body = format!("@echo off\r\n{}\r\nexit /b 0\r\n", steps.join("\r\n"));
     std::fs::write(&script, body)
         .map_err(|error| anyhow!("创建提权脚本 {} 失败：{}", script.display(), error))?;
-    let result = _run_elevated("cmd.exe", &format!("/d /c {}", _cmd_quote(&script)));
+    let result = run_elevated("cmd.exe", &format!("/d /c {}", _cmd_quote(&script)));
     std::fs::remove_file(&script)
         .map_err(|error| anyhow!("清理提权脚本 {} 失败：{}", script.display(), error))?;
     result
 }
 
-fn _run_elevated(file: &str, parameters: &str) -> Result<u32> {
+/// 以管理员身份同步执行一条命令并取回退出码（ShellExecuteExW + "runas" + 等进程结束）。
+/// 全工程只有这一份提权实现；WinUSB 驱动包也复用它，不另起一套。
+pub(crate) fn run_elevated(file: &str, parameters: &str) -> Result<u32> {
     use windows::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
     use windows::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject};
     use windows::Win32::UI::Shell::{SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW};

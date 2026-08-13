@@ -16,7 +16,7 @@
 use mai2control_ui::app_state::{AppController, ConnState};
 use mai2control_ui::io;
 use mai2control_ui::proto::{
-    BRINGUP_FLAG_CHECKSUM, BRINGUP_FLAG_LINK, BRINGUP_FLAG_SNAPSHOT, CfgValue,
+    BRINGUP_FLAG_CHECKSUM, BRINGUP_FLAG_LINK, BRINGUP_FLAG_SNAPSHOT, CfgValue, ConfigEntry,
     EXPECTED_PSOC_S455_ID, LED_PREVIEW_ALL, LED_UNIT_COUNT, LedRegion, RP_BUILD_ID_DIAGNOSTIC_V1,
 };
 use std::thread;
@@ -34,6 +34,338 @@ const CP_FAILURE_VALUE: u32 = 0x00FF_FFFF;
 const LED_STATE_TIMEOUT_MS: u64 = 1_000;
 const LED_APPLY_TIMEOUT_MS: u64 = 1_000;
 const LED_PREVIEW_FALLBACK_MS: u64 = 3_300;
+const ACCEPTANCE_READY_TIMEOUT_MS: u64 = 2_000;
+const ACCEPTANCE_REQUEST_TIMEOUT_MS: u64 = 4_000;
+const ACCEPTANCE_ROUNDS: usize = 60;
+const ACCEPTANCE_PERIOD_MS: u64 = 90;
+const REVIEW_CONFIG_TIMEOUT_MS: u64 = 15_000;
+const REVIEW_SAVE_TIMEOUT_MS: u64 = 15_000;
+const REVIEW_READBACK_TIMEOUT_MS: u64 = 12_000;
+const REVIEW_ALGO_TIMEOUT_MS: u64 = 12_000;
+
+fn _cfg_u32(value: &CfgValue) -> Option<u32> {
+    match value {
+        CfgValue::U8(value) => Some(u32::from(*value)),
+        CfgValue::U16(value) => Some(u32::from(*value)),
+        CfgValue::U32(value) => Some(*value),
+        _ => None,
+    }
+}
+
+fn _review_pump<F>(ctrl: &mut AppController, timeout_ms: u64, mut done: F) -> Result<(), String>
+where
+    F: FnMut(&AppController) -> bool,
+{
+    // ★必须驱动 poll_scheduled★ 连接探针队列(schedule_conn_probes 排好的那串)只由它提交,
+    // `poll()` 只负责排空 IO 事件。此前本泵只调 poll(), 于是 `conn_probes_pending()` 永远为真 ——
+    // `--review-closure` 第一步"等待配置真值"必然走满 15s 超时, 整条验收路径实际是断的。
+    // 上下文取值与 `_run_acceptance` 同形(无头场景无 UI 页面态)。
+    let context = mai2control_ui::app_state::PollContext {
+        connected: true,
+        current_view: 1,
+        settings_tab: 8,
+        hid_mode: false,
+        sel_channel: 0,
+        light_panel_expanded: false,
+        phys_la_expanded: false,
+    };
+    let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms);
+    let mut tick = 0u32;
+    while std::time::Instant::now() < deadline {
+        ctrl.poll();
+        tick = tick.wrapping_add(1);
+        ctrl.poll_scheduled(&context, tick, 16);
+        ctrl.csd_diag_tick();
+        if ctrl.state() == ConnState::Disconnected {
+            return Err("设备断开".to_string());
+        }
+        if done(ctrl) {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(16));
+    }
+    Err(format!("{}ms 内未收敛", timeout_ms))
+}
+
+fn _review_truth_u32(ctrl: &AppController, key: &str) -> Option<u32> {
+    ctrl.config_truth(key)
+        .and_then(|entry| _cfg_u32(&entry.value))
+}
+
+fn _review_save_value(
+    ctrl: &mut AppController,
+    key: &str,
+    entry: ConfigEntry,
+    expected: u32,
+) -> Result<(), String> {
+    let before_version = ctrl.config_version();
+    ctrl.set_config(entry)
+        .map_err(|error| format!("暂存 {} 失败: {}", key, error))?;
+    ctrl.save_config()
+        .map_err(|error| format!("保存 {} 失败: {}", key, error))?;
+    _review_pump(ctrl, REVIEW_SAVE_TIMEOUT_MS, |ctrl| {
+        ctrl.cfg_tx_pending() == 0 && !ctrl.is_config_dirty()
+    })
+    .map_err(|error| format!("{} 保存终态: {}", key, error))?;
+    _review_pump(ctrl, REVIEW_READBACK_TIMEOUT_MS, |ctrl| {
+        ctrl.config_version() > before_version && _review_truth_u32(ctrl, key) == Some(expected)
+    })
+    .map_err(|error| {
+        format!(
+            "{} 保存后真值回读: {} (期望 {}, 实得 {:?})",
+            key,
+            error,
+            expected,
+            _review_truth_u32(ctrl, key)
+        )
+    })
+}
+
+fn _run_review_closure(ctrl: &mut AppController) -> Result<(), String> {
+    const KEY: &str = "comm.touch_delay_100us";
+    println!("[REVIEW] 等待配置真值...");
+    ctrl.schedule_conn_probes(0);
+    _review_pump(ctrl, REVIEW_CONFIG_TIMEOUT_MS, |ctrl| {
+        !ctrl.conn_probes_pending() && ctrl.config_truth(KEY).is_some()
+    })?;
+
+    let original_entry = ctrl
+        .config_truth(KEY)
+        .cloned()
+        .ok_or_else(|| format!("设备未返回 {}", KEY))?;
+    let original =
+        _cfg_u32(&original_entry.value).ok_or_else(|| format!("{} 类型不是无符号整数", KEY))?;
+    let (minimum, maximum) = original_entry
+        .range
+        .as_ref()
+        .and_then(|(minimum, maximum)| Some((_cfg_u32(minimum)?, _cfg_u32(maximum)?)))
+        .unwrap_or((0, u32::MAX));
+    let preferred = 20u32.clamp(minimum, maximum);
+    let test_value = if preferred != original {
+        preferred
+    } else if original < maximum {
+        original + 1
+    } else if original > minimum {
+        original - 1
+    } else {
+        return Err(format!(
+            "{} 的合法范围只有当前值 {}，无法往返",
+            KEY, original
+        ));
+    };
+    println!(
+        "[REVIEW] SAVE 测试: {} 原值={} 临时值={}",
+        KEY, original, test_value
+    );
+
+    let test_entry = ConfigEntry {
+        key: KEY.to_string(),
+        value: match &original_entry.value {
+            CfgValue::U8(_) => CfgValue::U8(test_value as u8),
+            CfgValue::U16(_) => CfgValue::U16(test_value as u16),
+            CfgValue::U32(_) => CfgValue::U32(test_value),
+            _ => return Err(format!("{} 类型无法安全往返", KEY)),
+        },
+        range: original_entry.range.clone(),
+    };
+
+    let closure = (|| -> Result<(), String> {
+        _review_save_value(ctrl, KEY, test_entry, test_value)?;
+        println!("[REVIEW] SAVE 临时值设备回读={}", test_value);
+
+        ctrl.start_telemetry(20, 0, 0)
+            .map_err(|error| format!("启动延迟遥测失败: {}", error))?;
+        let lat_before = ctrl.lat_version();
+        let telem_deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut next_start = std::time::Instant::now();
+        while std::time::Instant::now() < telem_deadline
+            && !(ctrl.lat_version() > lat_before && ctrl.telem_lat_corrected_us().is_some())
+        {
+            if std::time::Instant::now() >= next_start {
+                ctrl.start_telemetry(20, 0, 0)
+                    .map_err(|error| format!("启动延迟遥测失败: {}", error))?;
+                next_start = std::time::Instant::now() + Duration::from_millis(500);
+            }
+            ctrl.poll();
+            ctrl.csd_diag_tick();
+            if ctrl.state() == ConnState::Disconnected {
+                return Err("延迟遥测期间设备断开".to_string());
+            }
+            thread::sleep(Duration::from_millis(16));
+        }
+        if ctrl.lat_version() <= lat_before || ctrl.telem_lat_corrected_us().is_none() {
+            return Err("延迟遥测未形成补正值: 10000ms 内未收敛".to_string());
+        }
+        // ★口径核验按"主页实际画的那一条"来★ 此前核验的是"画的 = 实测链路耗时 − 延迟线目标",
+        // 而那个式子本身就是缺陷(把端到端目标当成链路耗时的期望值去相减), 于是它反过来把缺陷
+        // 锁成了验收标准。现在主页两种口径二选一: 启用补偿画偏差, 关闭画链路耗时原值。
+        let link = ctrl
+            .telem_lat_corrected_us()
+            .ok_or_else(|| "链路耗时为空".to_string())?;
+        let floor = ctrl
+            .latency_compensable_us()
+            .ok_or_else(|| "可补偿段为空".to_string())?;
+        let target = ctrl.touch_delay_target_us();
+        if floor > link {
+            return Err(format!(
+                "可补偿段 {}us 不该大于链路耗时 {}us(SPI 段必须被排除在外)",
+                floor, link
+            ));
+        }
+        let plotted_link = ctrl
+            .lat_link_series()
+            .last()
+            .copied()
+            .ok_or_else(|| "链路耗时序列为空".to_string())?;
+        if (plotted_link - link as f32).abs() > 0.5 {
+            return Err(format!(
+                "链路耗时口径不一致: link={} plotted={}",
+                link, plotted_link
+            ));
+        }
+        let plotted_dev = ctrl
+            .lat_dev_series()
+            .last()
+            .copied()
+            .ok_or_else(|| "偏差序列为空".to_string())?;
+        let dev = ctrl.telem_delay_dev_us();
+        // 图上画的是区间里"偏得更狠"的那一端(见 LatObs::dev_worst_us)。
+        let worst = dev
+            .map(|(lo, hi)| if hi.unsigned_abs() >= lo.unsigned_abs() { hi } else { lo })
+            .unwrap_or(0);
+        if (plotted_dev - worst as f32).abs() > 0.5 {
+            return Err(format!(
+                "偏差口径不一致: dev={:?} worst={} plotted={}",
+                dev, worst, plotted_dev
+            ));
+        }
+        if let Some((lo, hi)) = dev {
+            if lo > hi {
+                return Err(format!("偏差区间倒挂: min={} max={}", lo, hi));
+            }
+            // 偏差的物理上界: 它等于 (实际写出耗时 − 预测耗时) + 延迟线 100us 时间片截断量, 而两个
+            // 耗时都不超过遥测窗口内测到的链路耗时峰值 ⇒ |偏差| 必然被 link + 一片有余量地框住。
+            // 超出即说明解码错位、符号弄反, 或采样零点取错(那才是真缺陷, 不是抖动)。
+            let bound = link as i64 + 200;
+            if (lo as i64).abs() > bound || (hi as i64).abs() > bound {
+                return Err(format!(
+                    "偏差区间 {}..{}us 超出物理上界(链路耗时 {}us + 一个 100us 时间片): 口径或解码有误",
+                    lo, hi, link
+                ));
+            }
+        }
+        println!(
+            "[REVIEW] LATENCY 链路耗时={}us 可补偿段={}us 延迟线目标={}us 目标可达={} | 偏差={:?}us plotted_dev={:.0} plotted_link={:.0}",
+            link,
+            floor,
+            target,
+            target == 0 || target >= floor,
+            dev,
+            plotted_dev,
+            plotted_link
+        );
+        let _ = ctrl.stop_telemetry();
+
+        let baseline = ctrl
+            .algo_info()
+            .ok_or_else(|| "连接探针未取得算法信息".to_string())?;
+        if baseline.is_default || !baseline.psoc_valid || baseline.len == 0 {
+            return Err(format!("当前用户算法状态不适合原样闭环: {:?}", baseline));
+        }
+        let code_before = ctrl.algo_device_code_version();
+        let code_deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut next_code_request = std::time::Instant::now();
+        while std::time::Instant::now() < code_deadline
+            && !(ctrl.algo_device_code_version() > code_before
+                && !ctrl.algo_device_code().is_empty())
+        {
+            if std::time::Instant::now() >= next_code_request {
+                ctrl.request_algo_code()
+                    .map_err(|error| format!("回读算法机器码失败: {}", error))?;
+                next_code_request = std::time::Instant::now() + Duration::from_millis(750);
+            }
+            ctrl.poll();
+            ctrl.csd_diag_tick();
+            if ctrl.state() == ConnState::Disconnected {
+                return Err("算法机器码回读期间设备断开".to_string());
+            }
+            thread::sleep(Duration::from_millis(16));
+        }
+        if ctrl.algo_device_code_version() <= code_before || ctrl.algo_device_code().is_empty() {
+            return Err("算法机器码回读 10000ms 内未收敛".to_string());
+        }
+        let code = ctrl.algo_device_code().to_vec();
+        let code_crc = mai2control_ui::proto::algo::crc16_ccitt(&code);
+        if code.len() != usize::from(baseline.len) || code_crc != baseline.crc16 {
+            return Err(format!(
+                "算法回读 blob 与设备信息不符: info len={} crc=0x{:04X}, blob len={} crc=0x{:04X}",
+                baseline.len,
+                baseline.crc16,
+                code.len(),
+                code_crc
+            ));
+        }
+        println!(
+            "[REVIEW] ALGO baseline is_default={} valid={} len={} crc16=0x{:04X}",
+            baseline.is_default, baseline.psoc_valid, baseline.len, baseline.crc16
+        );
+        ctrl.algo_upload(&code)
+            .map_err(|error| format!("原样重传算法失败: {}", error))?;
+        _review_pump(ctrl, REVIEW_ALGO_TIMEOUT_MS, |ctrl| {
+            ctrl.algo_upload_status().contains("已装上并正在运行")
+                || ctrl.algo_upload_status().contains("终态不匹配")
+                || ctrl.algo_upload_status().contains("上传被设备拒绝(NAK)")
+                || ctrl.algo_upload_status().contains("上传超时")
+        })?;
+        let upload_status = ctrl.algo_upload_status().to_string();
+        if !upload_status.contains("已装上并正在运行") {
+            return Err(format!("算法上传未获运行终态: {}", upload_status));
+        }
+        let final_info = ctrl
+            .algo_info()
+            .ok_or_else(|| "算法上传后未收到设备真值".to_string())?;
+        if !final_info.psoc_valid
+            || final_info.len != baseline.len
+            || final_info.crc16 != baseline.crc16
+        {
+            return Err(format!(
+                "算法重传后真值不一致: valid={} len={} crc=0x{:04X}",
+                final_info.psoc_valid, final_info.len, final_info.crc16
+            ));
+        }
+        println!("[REVIEW] ALGO status={}", upload_status);
+        println!(
+            "[REVIEW] ALGO final valid={} len={} crc16=0x{:04X}",
+            final_info.psoc_valid, final_info.len, final_info.crc16
+        );
+
+        let bad_messages: Vec<String> = ctrl
+            .diagnostic_event_messages()
+            .into_iter()
+            .filter(|message| message.contains('�') || message.contains("没有装上"))
+            .collect();
+        if !bad_messages.is_empty() {
+            return Err(format!(
+                "日志含乱码或误导文案: {}",
+                bad_messages.join(" | ")
+            ));
+        }
+        println!("[REVIEW] TEXT PASS replacement-char=0 misleading-fallback=0");
+        Ok(())
+    })();
+
+    println!("[REVIEW] 恢复 {}={}...", KEY, original);
+    let restore_result = _review_save_value(ctrl, KEY, original_entry, original);
+    match (closure, restore_result) {
+        (Ok(()), Ok(())) => {
+            println!("[REVIEW] RESTORE PASS device_truth={}", original);
+            Ok(())
+        }
+        (Err(error), Ok(())) => Err(format!("{}；原配置已恢复", error)),
+        (Ok(()), Err(restore)) => Err(format!("闭环通过，但恢复原配置失败: {}", restore)),
+        (Err(error), Err(restore)) => Err(format!("{}；且恢复原配置失败: {}", error, restore)),
+    }
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // --vcam-probe 的过滤器侧覆盖: MSBuild 产物的 PE 校验 + x64 DLL 的真实 COM 构造路径。
@@ -2460,13 +2792,26 @@ const DBG_OFF_RESP_FAIL_REQ_LEN: usize = 163;
 /// 于是尾部整体读偏 2 字节(实测 read_ok/status/PC 全是错位垃圾值)。改固件结构必须同步这里。
 /// sizeof(UsbDebugCounters) 的旧前缀长度，旧固件仍可按此前缀解析。
 const DBG_LEN_LEGACY_COUNTERS: usize = 165;
-const DBG_LEN_COUNTERS: usize = 177;
+const DBG_LEN_COUNTERS: usize = 190;
 /// 新增 HostCmd 分发观测字段(紧随 UsbDebugCounters 原有 165B 前缀)。
 const DBG_OFF_HOST_DISPATCH_COUNT: usize = 165;
 const DBG_OFF_HOST_ALGO_INFO_DISPATCH_COUNT: usize = 169;
 const DBG_OFF_HOST_LAST_DISPATCH_CMD: usize = 173;
 const DBG_OFF_HOST_LAST_DISPATCH_SEQ: usize = 174;
 const DBG_OFF_HOST_LAST_DISPATCH_RESP_LEN: usize = 175;
+const DBG_LEN_WITH_HOST_DISPATCH: usize = 177;
+
+/// core1 新代数通知线(PSoC P1.4 → GPIO23)实证。armed=1 = core1 已停止固定间隔空转轮询,
+/// 改为等 PSoC 的"新代数已发布"翻转; edges 应约等于扫描速率 × 观测时长。
+/// ★这三个字段是该改造唯一的外部证据★: 通知驱动与轮询在帧率/丢帧/延迟上完全同形。
+const DBG_OFF_CORE1_INT1_EDGES: usize = 177;
+const DBG_OFF_CORE1_INT1_TIMEOUTS: usize = 181;
+const DBG_OFF_CORE1_INT1_ARMED: usize = 185;
+/// 触控延迟线的补偿量(GameIoService::_emit_cost_us, us)。★这是"设定延迟是否被削短"的唯一外部
+/// 读数★: 补偿量被高估多少, `comm.touch_delay_100us` 就被削短多少。
+const DBG_OFF_GIO_EMIT_COST: usize = 186;
+const DBG_LEN_WITH_EMIT_COST: usize = 190;
+const DBG_LEN_WITH_INT1: usize = 186;
 /// EP0 DEBUG_READ 的固定 GPIO/HSIOM 尾部(见 UsbDebugGpioTail)。
 const DBG_OFF_GPIO_PC: usize = DBG_LEN_COUNTERS;
 const DBG_OFF_HSIOM_PORT_SEL: usize = DBG_OFF_GPIO_PC + 8 * 4;
@@ -2513,7 +2858,23 @@ struct LoopProfile {
     heavy_rejects: u32,
     heavy_busy: u8,
     nv_commit_fail: u32,
+    /// 触控延迟线补偿量(us)。`None` = 固件尚无该字段(旧固件), 与"补偿量为 0"必须分开表达。
+    emit_cost_us: Option<u32>,
+    /// flash 落地次数 / NvStore 成功提交次数。★这两项是延迟尖峰的头号嫌疑★:
+    /// XIP 擦写期间 USB 与主循环都停摆, 一次提交就能造出一簇尖峰。差分即知窗口内是否发生过。
+    flash_writes: u32,
+    nv_commit_ok: u32,
     seg2_max_us: [u32; 8],
+    /// core1 新代数通知线实证。`None` = 固件尚无该字段(旧固件), 与"armed=0"必须分开表达。
+    int1: Option<Int1Witness>,
+}
+
+/// core1 是按 PSoC 的通知走, 还是退回了固定间隔自由跑。
+#[derive(Clone, Copy, Default)]
+struct Int1Witness {
+    edges: u32,
+    timeouts: u32,
+    armed: bool,
 }
 
 /// 上次复位的死前遗言。定性三分: fault=1 → 跑飞; fault=0 且 last_loop_max 接近 5s → 主循环真被拖死;
@@ -2611,6 +2972,29 @@ fn print_post_mortem(tag: &str, b: &[u8]) {
     );
 }
 
+/// 延迟剖面的一格窗口。窗口内先清零、再累积, 于是段峰值是**该窗口内**的最坏值。
+/// ★峰值必须分窗★: 单调最大值只答得出"史上最坏是多少", 答不出"多久来一次" —— 而
+/// "每隔数秒一簇尖峰"要找的恰恰是周期。
+#[derive(Clone)]
+struct LatWindow {
+    /// 窗口结束时刻(自探测开始, ms)。
+    t_ms: u64,
+    /// 本窗口内收到的逐帧延迟观测(三段 + 延迟线补偿偏差)。
+    lat: Vec<mai2control_ui::app_state::LatObs>,
+    prof: LoopProfile,
+    /// 本窗口内 core0 主循环轮数(loop_count 差分)。
+    loops: u32,
+}
+
+/// 升序数组的百分位(线性下标, 不插值 —— 这里只需要量级判断)。
+fn _pct(sorted: &[u32], p: f64) -> u32 {
+    if sorted.is_empty() {
+        return 0;
+    }
+    let idx = ((sorted.len() - 1) as f64 * p).round() as usize;
+    sorted[idx.min(sorted.len() - 1)]
+}
+
 fn read_loop_profile(ctrl: &AppController) -> Option<LoopProfile> {
     let bytes = ctrl.read_debug_counters().ok()?;
     if bytes.len() < DBG_LEN_WITH_PROFILE {
@@ -2628,6 +3012,15 @@ fn read_loop_profile(ctrl: &AppController) -> Option<LoopProfile> {
             *slot = u32_at(DBG_OFF_SEG2_MAX_US + i * 4);
         }
     }
+    let int1 = if bytes.len() >= DBG_LEN_WITH_INT1 {
+        Some(Int1Witness {
+            edges: u32_at(DBG_OFF_CORE1_INT1_EDGES),
+            timeouts: u32_at(DBG_OFF_CORE1_INT1_TIMEOUTS),
+            armed: bytes[DBG_OFF_CORE1_INT1_ARMED] != 0,
+        })
+    } else {
+        None
+    };
     Some(LoopProfile {
         seg2_max_us: seg2,
         loop_count: u32_at(4),
@@ -2637,7 +3030,402 @@ fn read_loop_profile(ctrl: &AppController) -> Option<LoopProfile> {
         heavy_rejects: u32_at(DBG_OFF_HEAVY_REJECTS),
         heavy_busy: bytes[DBG_OFF_HEAVY_BUSY],
         nv_commit_fail: u32_at(59),
+        flash_writes: u32_at(32),
+        nv_commit_ok: u32_at(55),
+        emit_cost_us: (bytes.len() >= DBG_LEN_WITH_EMIT_COST)
+            .then(|| u32_at(DBG_OFF_GIO_EMIT_COST)),
+        int1,
     })
+}
+
+/// 剖面结论。★结论必须自带判据★: 只贴一堆数字等于把排查原样推回给人。
+/// 判据链: ① 三段各自的分位数 → 基线在哪、抖的是哪一段; ② 超阈值样本按时间聚簇 → 周期;
+/// ③ 尖峰窗口与平静窗口的段峰值中位数对比 → 那一刻最坏的代码段是谁。
+fn _report_lat_probe(windows: &[LatWindow], lost: u64, base: &LoopProfile) -> i32 {
+    let mut seq: Vec<(u64, u32, u32, u32)> = Vec::new();
+    // 延迟线补偿偏差单独收: 它是带符号量, 也不参与"总延迟"的求和。
+    let mut devs: Vec<i32> = Vec::new();
+    for w in windows {
+        for s in &w.lat {
+            seq.push((w.t_ms, s.spi_us as u32, s.proc_us as u32, s.usb_us as u32));
+            if let Some((lo, hi)) = s.dev_us {
+                devs.push(lo as i32);
+                devs.push(hi as i32);
+            }
+        }
+    }
+    if seq.len() < 20 {
+        println!("[LAT] FAIL 有效样本仅 {} 个, 不足以判周期", seq.len());
+        return 1;
+    }
+    let col = |k: usize| -> Vec<u32> {
+        let mut v: Vec<u32> = seq
+            .iter()
+            .map(|s| match k {
+                0 => s.1,
+                1 => s.2,
+                2 => s.3,
+                _ => s.1 + s.2 + s.3,
+            })
+            .collect();
+        v.sort_unstable();
+        v
+    };
+    println!(
+        "[LAT] 样本 {} 个 / 窗口 {} 个 / 环溢出丢样 {}",
+        seq.len(),
+        windows.len(),
+        lost
+    );
+    println!("[LAT] 段              p50      p90      p99      max");
+    let mut p50 = [0u32; 4];
+    let mut p90 = [0u32; 4];
+    for (k, name) in ["SPI(core1)", "RP处理", "USB写", "总延迟"].iter().enumerate() {
+        let v = col(k);
+        p50[k] = _pct(&v, 0.50);
+        p90[k] = _pct(&v, 0.90);
+        println!(
+            "[LAT]   {:<12} {:>6}us {:>6}us {:>6}us {:>6}us",
+            name,
+            p50[k],
+            p90[k],
+            _pct(&v, 0.99),
+            v[v.len() - 1]
+        );
+    }
+    // 阈值: 中位数 + 3 倍"p90 与中位数之差", 下限 150us。★不用固定绝对阈★: 基线随负载变,
+    // 固定阈在轻载时把正常波动判成尖峰、在重载时又一个都抓不到。
+    let spread = p90[3].saturating_sub(p50[3]);
+    let thresh = p50[3] + (3 * spread).max(150);
+    let hot: Vec<&(u64, u32, u32, u32)> = seq
+        .iter()
+        .filter(|s| s.1 + s.2 + s.3 > thresh)
+        .collect();
+    println!(
+        "[LAT] 尖峰阈值 {}us (中位 {} + max(3×{}, 150)); 超阈样本 {} 个 ({:.1}%)",
+        thresh,
+        p50[3],
+        spread,
+        hot.len(),
+        hot.len() as f64 * 100.0 / seq.len() as f64
+    );
+    // 聚簇: 相邻超阈样本间隔 ≤300ms 归一簇。周期性事件的表现是"一簇", 逐个样本列出会淹没周期。
+    let mut clusters: Vec<(u64, u64, u32, [u32; 3], usize)> = Vec::new();
+    for s in &hot {
+        let total = s.1 + s.2 + s.3;
+        match clusters.last_mut() {
+            Some(c) if s.0.saturating_sub(c.1) <= 300 => {
+                c.1 = s.0;
+                c.4 += 1;
+                if total > c.2 {
+                    c.2 = total;
+                    c.3 = [s.1, s.2, s.3];
+                }
+            }
+            _ => clusters.push((s.0, s.0, total, [s.1, s.2, s.3], 1)),
+        }
+    }
+    println!("[LAT] 尖峰簇 {} 个:", clusters.len());
+    for (i, c) in clusters.iter().enumerate() {
+        println!(
+            "[LAT]   #{:<2} t={:>6}..{:<6}ms 样本{} 峰值总计{}us (SPI {} / RP {} / USB {})",
+            i, c.0, c.1, c.4, c.2, c.3[0], c.3[1], c.3[2]
+        );
+    }
+    if clusters.len() >= 2 {
+        let mut gaps: Vec<u32> = clusters
+            .windows(2)
+            .map(|w| (w[1].0 - w[0].0) as u32)
+            .collect();
+        gaps.sort_unstable();
+        println!(
+            "[LAT] 簇间隔: 中位 {}ms 最小 {}ms 最大 {}ms ⇒ {}",
+            _pct(&gaps, 0.50),
+            gaps[0],
+            gaps[gaps.len() - 1],
+            if gaps[gaps.len() - 1] as f64 <= _pct(&gaps, 0.50) as f64 * 1.6 {
+                "间隔集中 = 周期性事件"
+            } else {
+                "间隔分散 = 事件驱动而非固定周期"
+            }
+        );
+    }
+    // 分窗段峰值分布 + 各段自己的"超阈窗"周期。★这张表才是点名用的★:
+    // 逐帧延迟只看得到 game_io 里那两段, 而周期性最坏路径可能在任何一段; 段峰值按窗分布后,
+    // "某段每隔 N 个窗就冒一次" 直接可读, 不必再靠与尖峰窗求交集去猜。
+    let mut picks: Vec<(String, Vec<u32>)> = Vec::new();
+    picks.push((
+        "loop 整轮".to_string(),
+        windows.iter().map(|w| w.prof.loop_max_us).collect(),
+    ));
+    for i in 0..8usize {
+        picks.push((
+            format!("seg {}", LOOP_SEG_NAMES[i]),
+            windows.iter().map(|w| w.prof.seg_max_us[i]).collect(),
+        ));
+        picks.push((
+            format!("gio {}", GAMEIO_SEG_NAMES[i]),
+            windows.iter().map(|w| w.prof.seg2_max_us[i]).collect(),
+        ));
+    }
+    println!("[LAT] 分窗段峰值(窗宽 100ms, 每窗清零后重测) + 该段自身的超阈窗周期:");
+    println!("[LAT]   段                    p50      p90      p99      max   超阈窗数  间隔中位");
+    for (name, raw) in &picks {
+        let mut v = raw.clone();
+        v.sort_unstable();
+        let (a, b) = (_pct(&v, 0.50), _pct(&v, 0.90));
+        let th = a + (3 * b.saturating_sub(a)).max(150);
+        let idx: Vec<usize> = raw
+            .iter()
+            .enumerate()
+            .filter(|(_, x)| **x > th)
+            .map(|(i, _)| i)
+            .collect();
+        let gap = if idx.len() >= 2 {
+            let mut g: Vec<u32> = idx.windows(2).map(|w| (w[1] - w[0]) as u32 * 100).collect();
+            g.sort_unstable();
+            format!("{}ms", _pct(&g, 0.50))
+        } else {
+            "-".to_string()
+        };
+        println!(
+            "[LAT]   {:<16} {:>7} {:>8} {:>8} {:>8} {:>9} {:>9}",
+            name,
+            a,
+            b,
+            _pct(&v, 0.99),
+            v[v.len() - 1],
+            idx.len(),
+            gap
+        );
+    }
+    // 最大的几个尖峰簇: 逐条打出覆盖窗(含前一窗)的整套段峰值 —— 单条现场比任何统计都直接。
+    // ★为什么要带前一窗★: g_lat_* 是上一个遥测窗口(50ms)内的滚动峰值, 发帧才清零, 造成该峰值的
+    // 那次执行可能落在前一个 100ms 剖面窗里。
+    let mut top: Vec<&(u64, u64, u32, [u32; 3], usize)> = clusters.iter().collect();
+    top.sort_by_key(|c| std::cmp::Reverse(c.2));
+    for c in top.iter().take(3) {
+        println!(
+            "[LAT] 现场 t={}ms 峰值{}us (SPI {} / RP {} / USB {}):",
+            c.0, c.2, c.3[0], c.3[1], c.3[2]
+        );
+        for w in windows.iter().filter(|w| w.t_ms + 100 >= c.0 && w.t_ms <= c.1 + 100) {
+            let mut hot: Vec<String> = Vec::new();
+            for i in 0..8usize {
+                if w.prof.seg_max_us[i] >= 300 {
+                    hot.push(format!("{}={}us", LOOP_SEG_NAMES[i], w.prof.seg_max_us[i]));
+                }
+                if w.prof.seg2_max_us[i] >= 300 {
+                    hot.push(format!(
+                        "gio/{}={}us",
+                        GAMEIO_SEG_NAMES[i], w.prof.seg2_max_us[i]
+                    ));
+                }
+            }
+            println!(
+                "[LAT]     窗 t={:>6}ms loop_max={}us 轮数={} | {}",
+                w.t_ms,
+                w.prof.loop_max_us,
+                w.loops,
+                hot.join(" ")
+            );
+        }
+    }
+    // flash / NvStore 是"整机停摆"级嫌疑: 一次 XIP 擦写就能造出一簇尖峰。有没有发生过必须看得见。
+    let last = windows.last().map(|w| w.prof).unwrap_or_default();
+    println!(
+        "[LAT] 全程 flash 落地 {} 次 / NvStore 提交 {} 次(失败 {}) — {}",
+        last.flash_writes.wrapping_sub(base.flash_writes),
+        last.nv_commit_ok.wrapping_sub(base.nv_commit_ok),
+        last.nv_commit_fail.wrapping_sub(base.nv_commit_fail),
+        if last.flash_writes == base.flash_writes && last.nv_commit_ok == base.nv_commit_ok {
+            "全程无 flash 活动 ⇒ 尖峰与落盘无关"
+        } else {
+            "★存在 flash 活动, 需按上表核对是否与尖峰窗重合"
+        }
+    );
+    let mut loops: Vec<u32> = windows.iter().map(|w| w.loops).collect();
+    loops.sort_unstable();
+    println!(
+        "[LAT] core0 主循环轮数/窗: 中位 {} 最少 {} 最多 {}(窗宽 100ms)",
+        _pct(&loops, 0.50),
+        loops[0],
+        loops[loops.len() - 1]
+    );
+    if let (Some(b), Some(a)) = (base.int1, last.int1) {
+        println!(
+            "[LAT] core1 通知线: armed={} 翻转 {} 次 等待超时 {} 次",
+            a.armed,
+            a.edges.wrapping_sub(b.edges),
+            a.timeouts.wrapping_sub(b.timeouts)
+        );
+    }
+    // 延迟线补偿量与"可补偿段"的实测值对照: 补偿量应贴近 RP处理+USB写 的典型值。
+    // 明显大于它 = 过补偿 ⇒ 用户设的 comm.touch_delay_100us 被削短同样多。
+    // 延迟线补偿量的合理性判据。★注意两个量的统计口径不同★: 遥测里的 RP处理+USB写 是**遥测窗
+    // (50ms)内的滚动峰值**, 即单拍真实耗时的上界; 补偿量要预测的是"这一拍"的耗时, 因此它**应当
+    // 低于**那个上界。补偿量一旦超过上界, 只可能是它 latch 在了历史最坏值上(即本轮修掉的缺陷),
+    // 而补偿量高出多少, 用户设的 comm.touch_delay_100us 就被削短多少。
+    match last.emit_cost_us {
+        Some(cost) => {
+            let mut pu: Vec<u32> = seq.iter().map(|s| s.2 + s.3).collect();
+            pu.sort_unstable();
+            let bound = _pct(&pu, 0.50);
+            println!(
+                "[LAT] 延迟线补偿量 {}us / 可补偿段峰值上界(遥测口径中位) {}us ⇒ {}",
+                cost,
+                bound,
+                if cost <= bound {
+                    "未超上界: 设定触控延迟不被削短"
+                } else {
+                    "★过补偿: 设定触控延迟被削短约两者之差"
+                }
+            );
+        }
+        None => println!("[LAT] 延迟线补偿量: 固件无该诊断字段(旧固件)"),
+    }
+    // 补偿偏差本身: 这是"设定的触控延迟兑现了没有"的直接读数, 0 = 正好兑现。
+    // ★没有观测的窗口不计入★ 那些窗口里没有触控帧真正发出(串口无消费者/被限速), 谈不上偏差。
+    if devs.is_empty() {
+        println!("[LAT] 延迟线补偿偏差: 全程无观测(没有触控帧真正发出, 串口无消费者)");
+    } else {
+        let mut abs: Vec<u32> = devs.iter().map(|d| d.unsigned_abs()).collect();
+        abs.sort_unstable();
+        let mut signed = devs.clone();
+        signed.sort_unstable();
+        println!(
+            "[LAT] 延迟线补偿偏差: 观测 {} 个区间端点, 带符号 {}..{}us 中位 {}us | |偏差| p50 {}us p99 {}us max {}us",
+            devs.len(),
+            signed[0],
+            signed[signed.len() - 1],
+            signed[signed.len() / 2],
+            _pct(&abs, 0.50),
+            _pct(&abs, 0.99),
+            abs[abs.len() - 1]
+        );
+    }
+    0
+}
+
+/// 总延迟抖动剖面(`--lat-probe`)。逐帧三段延迟与分窗主循环剖面落在同一时间轴上:
+/// 前者答"抖了多少、多久来一次", 后者答"那一刻是哪一段最坏"。缺任何一半都只能靠猜。
+/// ★遥测档位必须与仪表盘一致(20Hz / fields=0 / ch_mask=0)★: 主页那张"总延迟历史"就是这条流
+/// 画出来的, 换档位量出来的抖动代表不了用户看到的那张图。
+fn run_lat_probe(
+    ctrl: &mut AppController,
+    secs: u64,
+    per_window_clear: bool,
+    read_each_window: bool,
+) -> i32 {
+    const WIN_MS: u64 = 100;
+    // ★只在首尾读剖面的模式是"测量自身是否就是扰动源"的对照★: EP0 控制传输本身要经 tud_task
+    // 处理, 每 100ms 两条(读+清)相当于给设备加了一份周期性负载。若关掉它之后逐帧延迟的尖峰
+    // 随之消失, 那这些尖峰就是脚手架自造的, 与用户在 GUI 上看到的不是同一件事。
+    if !read_each_window {
+        println!("[LAT] 剖面只在首尾各读一次(全程无周期性 EP0 传输), 作为测量扰动的对照");
+    }
+    // ★不清零模式是交叉验证用的★: 段峰值不清零即为全程单调上界, 它必然 ≥ 任何 50ms 遥测窗内
+    // 测到的同一段耗时。若 g_lat_* 报出的尖峰在单调上界里根本不存在, 那两个读数就不是在量同一
+    // 件事, 必须先解决口径矛盾再谈周期。
+    if !per_window_clear {
+        println!("[LAT] 段峰值不分窗(全程单调上界), 用于与逐帧延迟交叉验证口径");
+    }
+    println!(
+        "[LAT] 档位=仪表盘同形(20Hz / fields=0 → 仅 STATS|LATENCY / ch_mask=0), 时长 {}s, 剖面窗 {}ms",
+        secs, WIN_MS
+    );
+    if let Err(e) = ctrl.start_telemetry(20, 0, 0) {
+        println!("[LAT] FAIL start_telemetry: {}", e);
+        return 1;
+    }
+    let warm = std::time::Instant::now();
+    while ctrl.lat_version() == 0 && warm.elapsed() < Duration::from_secs(5) {
+        ctrl.poll();
+        thread::sleep(Duration::from_millis(5));
+    }
+    if ctrl.lat_version() == 0 {
+        println!("[LAT] FAIL 5s 内没有收到任何带 LATENCY 的遥测帧");
+        return 1;
+    }
+    let Some(base) = read_loop_profile(ctrl) else {
+        println!("[LAT] FAIL 固件无主循环剖面段(需带剖面的新固件)");
+        return 1;
+    };
+    let _ = ctrl.clear_loop_profile();
+    let started = std::time::Instant::now();
+    let mut last_ver = ctrl.lat_version();
+    let mut last_loops = base.loop_count;
+    let mut windows: Vec<LatWindow> = Vec::new();
+    let mut next_win = started + Duration::from_millis(WIN_MS);
+    let mut lost = 0u64;
+    while started.elapsed() < Duration::from_secs(secs) {
+        ctrl.poll();
+        if std::time::Instant::now() < next_win {
+            thread::sleep(Duration::from_millis(2));
+            continue;
+        }
+        // ★续租★ 遥测租约 3s(TELEM_LEASE_MS), 靠"任意主机命令帧"续期。EP0 的剖面读走的是
+        // vendor 控制请求, **不经** UsbComm::update ⇒ 不续租, 实测流在第 3s 静默停掉(样本只有
+        // 头 60 个)。GUI 天然每帧都有命令流量, 本脚手架必须自己补。每窗一条最轻的读命令即可,
+        // 且 100ms 的固定节奏会均匀落在所有窗口里, 不会伪造出"数秒一簇"的周期性扰动。
+        let _ = ctrl.request_param(0, 0x0B);
+        // 逐帧延迟: 版本差 = 本窗口新到的帧数, 取环尾同样多个即为本窗口样本。
+        // 环容量 512 而 20Hz × 100ms ≈ 2 帧/窗 ⇒ 正常不会溢出; 真溢出则如实计入 lost。
+        let ver = ctrl.lat_version();
+        let fresh = ver.saturating_sub(last_ver) as usize;
+        let all = ctrl.lat_obs_series();
+        lost += fresh.saturating_sub(all.len()) as u64;
+        let take = fresh.min(all.len());
+        let lat = all[all.len() - take..].to_vec();
+        last_ver = ver;
+        let prof = if read_each_window {
+            read_loop_profile(ctrl).unwrap_or_default()
+        } else {
+            LoopProfile::default()
+        };
+        let loops = prof.loop_count.wrapping_sub(last_loops);
+        last_loops = prof.loop_count;
+        if read_each_window && per_window_clear {
+            let _ = ctrl.clear_loop_profile();
+        }
+        windows.push(LatWindow {
+            t_ms: started.elapsed().as_millis() as u64,
+            lat,
+            prof,
+            loops,
+        });
+        next_win += Duration::from_millis(WIN_MS);
+    }
+    if !read_each_window {
+        // 首尾对照模式: 结束时补读一次, 使全程单调段峰值仍然可见(它是判"哪一段被拖过"的唯一凭据)。
+        if let (Some(end), Some(w)) = (read_loop_profile(ctrl), windows.last_mut()) {
+            w.prof = end;
+        }
+    }
+    let _ = ctrl.stop_telemetry();
+    _report_lat_probe(&windows, lost, &base)
+}
+
+/// core1 新代数通知线的一句话结论。供 `--soak` 等压测在结束时打印, 使"通知驱动真的生效"
+/// 成为可复核的实测证据而不是推断。
+fn int1_witness_text(before: &LoopProfile, after: &LoopProfile, elapsed_s: f32) -> String {
+    let (Some(b), Some(a)) = (before.int1, after.int1) else {
+        return "core1 通知线: 固件无该诊断字段(旧固件)".to_string();
+    };
+    let edges = a.edges.wrapping_sub(b.edges);
+    let timeouts = a.timeouts.wrapping_sub(b.timeouts);
+    let hz = if elapsed_s > 0.0 {
+        edges as f32 / elapsed_s
+    } else {
+        0.0
+    };
+    format!(
+        "core1 通知线: armed={} 新代数通知 {} 次({:.1}/s) 等待超时 {} 次",
+        if a.armed { "是(已停止空转轮询)" } else { "否(退回自由跑兜底)" },
+        edges,
+        hz,
+        timeouts
+    )
 }
 
 #[derive(Default)]
@@ -3354,10 +4142,346 @@ fn run_mai2_load(
     std::process::exit(1);
 }
 
+/// 验收模式的统一轮询等待器：只把控制器实际回读版本作为完成判据，不读取乐观草稿。
+fn _acceptance_wait<F>(ctrl: &mut AppController, timeout_ms: u64, mut done: F) -> Result<(), String>
+where
+    F: FnMut(&mut AppController) -> bool,
+{
+    let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms);
+    while std::time::Instant::now() < deadline {
+        ctrl.poll();
+        ctrl.csd_diag_tick();
+        if ctrl.state() == ConnState::Disconnected {
+            return Err("设备断开".to_string());
+        }
+        if let Some(error) = ctrl.last_error() {
+            return Err(format!("控制器错误: {}", error));
+        }
+        if done(ctrl) {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    Err(format!("{}ms 内未收到设备回读", timeout_ms))
+}
+
+fn _acceptance_request<F, R>(
+    ctrl: &mut AppController,
+    label: &str,
+    request: R,
+    mut done: F,
+) -> Result<(), String>
+where
+    F: FnMut(&mut AppController) -> bool,
+    R: FnOnce(&mut AppController) -> anyhow::Result<()>,
+{
+    request(ctrl).map_err(|error| format!("{} 请求失败: {}", label, error))?;
+    _acceptance_wait(ctrl, ACCEPTANCE_REQUEST_TIMEOUT_MS, |ctrl| done(ctrl))
+        .map_err(|error| format!("{}: {}", label, error))
+}
+fn _run_acceptance(ctrl: &mut AppController, connect_started: std::time::Instant) -> bool {
+    let started = connect_started;
+    let context = mai2control_ui::app_state::PollContext {
+        connected: true,
+        current_view: 1,
+        settings_tab: 8,
+        hid_mode: false,
+        sel_channel: 0,
+        light_panel_expanded: false,
+        phys_la_expanded: false,
+    };
+    ctrl.schedule_conn_probes(0);
+    let mut tick = 0u32;
+    let ready = _acceptance_wait(ctrl, ACCEPTANCE_READY_TIMEOUT_MS, |ctrl| {
+        tick = tick.wrapping_add(1);
+        ctrl.poll_scheduled(&context, tick, 5);
+        !ctrl.conn_probes_pending()
+            && ctrl.config_version() > 0
+            && ctrl.algo_version() > 0
+            && ctrl.globals_version() > 0
+    });
+    let ready_ms = started.elapsed().as_millis();
+    if let Err(error) = ready {
+        println!("[ACCEPTANCE] READY FAIL elapsed_ms={} {}", ready_ms, error);
+        return false;
+    }
+    println!("[ACCEPTANCE] READY PASS elapsed_ms={}", ready_ms);
+
+    let param_id = mai2control_ui::proto::PARAM_ON_DEBOUNCE;
+    let baseline_version = ctrl.param_version();
+    if let Err(error) = ctrl.request_param(0, param_id) {
+        println!("[ACCEPTANCE] PARAM baseline FAIL: {}", error);
+        return false;
+    }
+    if let Err(error) = _acceptance_wait(ctrl, ACCEPTANCE_REQUEST_TIMEOUT_MS, |ctrl| {
+        ctrl.param_version() > baseline_version && ctrl.param(0, param_id).is_some()
+    }) {
+        println!("[ACCEPTANCE] PARAM baseline FAIL: {}", error);
+        return false;
+    }
+    let Some(original) = ctrl.param(0, param_id) else {
+        println!("[ACCEPTANCE] PARAM baseline FAIL: 无设备回读值");
+        return false;
+    };
+    let alternate = if original < 0xFF {
+        original + 1
+    } else {
+        original - 1
+    };
+    let io_before = ctrl.io_stats();
+    let roundtrip_start = std::time::Instant::now();
+    let mut rounds = 0usize;
+    let mut max_cycle_ms = 0u128;
+    let mut failures = Vec::new();
+    for round in 0..ACCEPTANCE_ROUNDS {
+        let expected = if round % 2 == 0 { alternate } else { original };
+        let cycle_start = std::time::Instant::now();
+        if let Err(error) = ctrl.debug_param_now(0, param_id, expected) {
+            failures.push(format!("第{}轮 SET: {}", round + 1, error));
+            break;
+        }
+        if let Err(error) = _acceptance_wait(ctrl, 1_000, |ctrl| ctrl.cfg_tx_pending() == 0) {
+            failures.push(format!("第{}轮 ACK: {}", round + 1, error));
+            break;
+        }
+        let before_get = ctrl.param_version();
+        if let Err(error) = ctrl.request_param(0, param_id) {
+            failures.push(format!("第{}轮 GET: {}", round + 1, error));
+            break;
+        }
+        if let Err(error) = _acceptance_wait(ctrl, 1_000, |ctrl| {
+            ctrl.param_version() > before_get && ctrl.param(0, param_id) == Some(expected)
+        }) {
+            failures.push(format!(
+                "第{}轮回读: {} 实际={:?}",
+                round + 1,
+                error,
+                ctrl.param(0, param_id)
+            ));
+            break;
+        }
+        rounds += 1;
+        max_cycle_ms = max_cycle_ms.max(cycle_start.elapsed().as_millis());
+        let elapsed = cycle_start.elapsed();
+        if elapsed < Duration::from_millis(ACCEPTANCE_PERIOD_MS) {
+            thread::sleep(Duration::from_millis(ACCEPTANCE_PERIOD_MS) - elapsed);
+        }
+    }
+    let roundtrip_ms = roundtrip_start.elapsed().as_millis();
+    let io_after = ctrl.io_stats();
+    let hz = if roundtrip_ms == 0 {
+        0.0
+    } else {
+        rounds as f64 * 1000.0 / roundtrip_ms as f64
+    };
+    let io_clean = io_after.queue_dropped == io_before.queue_dropped
+        && io_after.stall_recoveries == io_before.stall_recoveries;
+    println!(
+        "[ACCEPTANCE] PARAM rounds={} duration_ms={} hz={:.2} max_cycle_ms={} queue_dropped_delta={} stall_recoveries_delta={}",
+        rounds,
+        roundtrip_ms,
+        hz,
+        max_cycle_ms,
+        io_after
+            .queue_dropped
+            .saturating_sub(io_before.queue_dropped),
+        io_after
+            .stall_recoveries
+            .saturating_sub(io_before.stall_recoveries)
+    );
+    if let Err(error) = ctrl.debug_param_now(0, param_id, original) {
+        failures.push(format!("恢复原值 SET: {}", error));
+    } else if let Err(error) = _acceptance_wait(ctrl, 1_000, |ctrl| ctrl.cfg_tx_pending() == 0) {
+        failures.push(format!("恢复原值 ACK: {}", error));
+    } else {
+        let before_restore = ctrl.param_version();
+        let _ = ctrl.request_param(0, param_id);
+        if let Err(error) = _acceptance_wait(ctrl, 1_000, |ctrl| {
+            ctrl.param_version() > before_restore && ctrl.param(0, param_id) == Some(original)
+        }) {
+            failures.push(format!("恢复原值回读: {}", error));
+        }
+    }
+    if rounds != ACCEPTANCE_ROUNDS || hz < 10.0 || !io_clean {
+        failures.push("10Hz 零错误门限未满足".to_string());
+    }
+
+    let mut matrix = Vec::new();
+    let before = ctrl.config_version();
+    if let Err(error) = _acceptance_request(
+        ctrl,
+        "CFG_GET_ALL",
+        |ctrl| ctrl.request_config_all(),
+        |ctrl| ctrl.config_version() > before && !ctrl.config_entries().is_empty(),
+    ) {
+        matrix.push(error);
+    }
+    for (label, request, version) in [
+        ("KBD_GET_STATE", 0u8, 0u8),
+        ("KBD_GET_MAP", 1, 0),
+        ("KBD_GET_TOUCHMAP", 2, 0),
+        ("KBD_GET_HOLD", 3, 0),
+        ("KBD_GET_KEYCFG", 4, 0),
+        ("KBD_GET_COMBO", 5, 0),
+    ] {
+        let before_version = match version {
+            0 => ctrl.kbd_state_version(),
+            _ => 0,
+        };
+        let result = match request {
+            0 => _acceptance_request(
+                ctrl,
+                label,
+                |ctrl| ctrl.kbd_request_state(),
+                |ctrl| ctrl.kbd_state_version() > before_version,
+            ),
+            1 => {
+                let v = ctrl.kbd_map_version();
+                _acceptance_request(
+                    ctrl,
+                    label,
+                    |ctrl| ctrl.kbd_request_map(),
+                    |ctrl| ctrl.kbd_map_version() > v,
+                )
+            }
+            2 => {
+                let v = ctrl.kbd_touchmap_version();
+                _acceptance_request(
+                    ctrl,
+                    label,
+                    |ctrl| ctrl.kbd_request_touchmap(),
+                    |ctrl| ctrl.kbd_touchmap_version() > v,
+                )
+            }
+            3 => {
+                let v = ctrl.kbd_hold_version();
+                _acceptance_request(
+                    ctrl,
+                    label,
+                    |ctrl| ctrl.kbd_request_hold(),
+                    |ctrl| ctrl.kbd_hold_version() > v,
+                )
+            }
+            4 => {
+                let v = ctrl.kbd_keycfg_version();
+                _acceptance_request(
+                    ctrl,
+                    label,
+                    |ctrl| ctrl.kbd_request_keycfg(),
+                    |ctrl| ctrl.kbd_keycfg_version() > v,
+                )
+            }
+            _ => {
+                let v = ctrl.kbd_combo_version();
+                _acceptance_request(
+                    ctrl,
+                    label,
+                    |ctrl| ctrl.kbd_request_combo(),
+                    |ctrl| ctrl.kbd_combo_version() > v,
+                )
+            }
+        };
+        if let Err(error) = result {
+            matrix.push(error);
+        }
+    }
+    for id in mai2control_ui::proto::KNOWN_PARAM_IDS {
+        let before = ctrl.param_version();
+        if let Err(error) = _acceptance_request(
+            ctrl,
+            &format!("PARAM_GET_ALL 0x{:02X}", id),
+            |ctrl| ctrl.request_param_all_channels(*id),
+            |ctrl| ctrl.param_version() > before,
+        ) {
+            matrix.push(error);
+        }
+    }
+    let before = ctrl.globals_version();
+    if let Err(error) = _acceptance_request(
+        ctrl,
+        "GLOBAL_GET_ALL",
+        |ctrl| ctrl.global_get_all(),
+        |ctrl| ctrl.globals_version() > before,
+    ) {
+        matrix.push(error);
+    }
+    let before = ctrl.algo_version();
+    if let Err(error) = _acceptance_request(
+        ctrl,
+        "ALGO_GET_INFO",
+        |ctrl| ctrl.algo_get_info(),
+        |ctrl| ctrl.algo_version() > before,
+    ) {
+        matrix.push(error);
+    }
+    let before = ctrl.algo_rom_version();
+    if let Err(error) = _acceptance_request(
+        ctrl,
+        "ALGO_GET_ROM",
+        |ctrl| ctrl.algo_get_rom(),
+        |ctrl| ctrl.algo_rom_version() > before && !ctrl.algo_rom().is_empty(),
+    ) {
+        matrix.push(error);
+    }
+    for idx in 0..8u8 {
+        let before = ctrl.algo_cfg_version();
+        if let Err(error) = _acceptance_request(
+            ctrl,
+            &format!("ALGO_GET_CFG {}", idx),
+            |ctrl| ctrl.request_algo_cfg(idx),
+            |ctrl| ctrl.algo_cfg_version() > before,
+        ) {
+            matrix.push(error);
+        }
+    }
+    let before = ctrl.algo_device_src_version();
+    if let Err(error) = _acceptance_request(
+        ctrl,
+        "ALGO_GET_SRC",
+        |ctrl| ctrl.request_algo_src(),
+        |ctrl| ctrl.algo_device_src_version() > before && !ctrl.algo_src_transfer_pending(),
+    ) {
+        matrix.push(error);
+    }
+    let before = ctrl.algo_device_code_version();
+    if let Err(error) = _acceptance_request(
+        ctrl,
+        "ALGO_GET_CODE",
+        |ctrl| ctrl.request_algo_code(),
+        |ctrl| ctrl.algo_device_code_version() > before && !ctrl.algo_device_code_hex().is_empty(),
+    ) {
+        matrix.push(error);
+    }
+    println!(
+        "[ACCEPTANCE] MATRIX {}",
+        if matrix.is_empty() { "PASS" } else { "FAIL" }
+    );
+    for error in &matrix {
+        println!("[ACCEPTANCE] MATRIX-ERROR {}", error);
+    }
+    failures.extend(matrix);
+    if failures.is_empty() {
+        println!("[ACCEPTANCE] PASS");
+        true
+    } else {
+        println!("[ACCEPTANCE] FAIL {}", failures.join(" | "));
+        false
+    }
+}
+
 fn main() {
     env_logger::init();
 
     let args: Vec<String> = std::env::args().collect();
+    // 只读枚举 Raw Input 与 Interception 槽位：不连接下位机、不改驱动、不启用过滤器。
+    if let Some(probe_index) = args.iter().position(|arg| arg == "--interception-probe") {
+        let filter = args
+            .get(probe_index + 1)
+            .filter(|value| !value.starts_with("--"))
+            .map(String::as_str);
+        println!("{}", mai2control_ui::vcam::interception_diagnostic(filter));
+        std::process::exit(0);
+    }
     // 虚拟摄像头探测不依赖 WinUSB 固件，必须在设备枚举之前独立退出。
     if args.iter().any(|a| a == "--vcam-probe") {
         std::process::exit(if _run_vcam_probe() { 0 } else { 1 });
@@ -3387,6 +4511,8 @@ fn main() {
             }
         }
     }
+    let acceptance = args.iter().any(|a| a == "--acceptance");
+    let review_closure = args.iter().any(|a| a == "--review-closure");
     let reboot_bootloader = args.iter().any(|a| a == "--reboot-bootloader");
     let reboot_bootloader_only = args.iter().any(|a| a == "--reboot-bootloader-only");
     let smoke_only = args.iter().any(|a| a == "--smoke");
@@ -3428,6 +4554,7 @@ fn main() {
     let debug_read = args.iter().any(|a| a == "--debug-read");
     let algo_info_only = args.iter().any(|a| a == "--algo-info-only");
     let ctrl_bootsel = args.iter().any(|a| a == "--ctrl-bootsel");
+    let trigger_crash_bootsel = args.iter().any(|a| a == "--trigger-crash-bootsel");
     // 只请求配置并观测：每 200ms 打印 config_entries 数，持续 ~2.5s，看是否/何时到达及项数。
     let cfg_only = args.iter().any(|a| a == "--cfg-only");
     // 只读遥测: 握手后直接 TELEM_START, 打印全 36 通道 raw/bsln/diff/status, 排查"计数打满"。
@@ -3640,7 +4767,15 @@ fn main() {
                         ])
                     );
                 }
-                if report_len >= DBG_LEN_COUNTERS {
+                if report_len >= DBG_LEN_WITH_EMIT_COST {
+                    println!(
+                        "[DBG] 延迟线补偿量 gio_emit_cost_us={}us (应贴近 RP处理+USB写 的典型值; 偏大即过补偿, 设定触控延迟会被削短)",
+                        le32(DBG_OFF_GIO_EMIT_COST)
+                    );
+                }
+                // ★门槛必须是"这组字段自己的末端长度"★ 原先写的是 DBG_LEN_COUNTERS, 而它每次
+                // 追加新字段都会变大 —— 追加一格就把这组早就存在的字段对旧固件整体判成不可解析。
+                if report_len >= DBG_LEN_WITH_HOST_DISPATCH {
                     println!(
                         "[DBG] dispatch_count={} algo_dispatch_count={} last_cmd=0x{:02X} last_seq={} last_resp_len={}",
                         le32(DBG_OFF_HOST_DISPATCH_COUNT),
@@ -3701,7 +4836,7 @@ fn main() {
     ctrl.refresh_devices();
     let index = selected_index;
 
-    // 手动连接(不通过 on_connect_clicked,直接调 connect)
+    let connect_started = std::time::Instant::now();
     match ctrl.connect(index) {
         Ok(_) => println!("[SELFTEST] 已连接"),
         Err(e) => {
@@ -3760,6 +4895,48 @@ fn main() {
             std::process::exit(1);
         }
         thread::sleep(Duration::from_millis(50));
+    }
+
+    if trigger_crash_bootsel {
+        println!("[DBG] 请求已由 UI 自动武装的 DEBUG_TRIGGER_CRASH...");
+        if let Err(error) = ctrl.debug_trigger_crash() {
+            println!("[DBG] trigger-crash-bootsel 发送失败: {}", error);
+            std::process::exit(1);
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while std::time::Instant::now() < deadline && !ctrl.debug_trigger_crash_acknowledged() {
+            ctrl.poll();
+            thread::sleep(Duration::from_millis(20));
+        }
+        let acknowledged = ctrl.debug_trigger_crash_acknowledged();
+        println!(
+            "[DBG] DEBUG_TRIGGER_CRASH ACK={}{}",
+            acknowledged,
+            if acknowledged {
+                "，设备将进入 BOOTSEL"
+            } else {
+                "，未确认 ACK"
+            }
+        );
+        std::process::exit(if acknowledged { 0 } else { 1 });
+    }
+
+    if acceptance {
+        let pass = _run_acceptance(&mut ctrl, connect_started);
+        std::process::exit(if pass { 0 } else { 1 });
+    }
+
+    if review_closure {
+        match _run_review_closure(&mut ctrl) {
+            Ok(()) => {
+                println!("[REVIEW] PASS");
+                std::process::exit(0);
+            }
+            Err(error) => {
+                println!("[REVIEW] FAIL {}", error);
+                std::process::exit(1);
+            }
+        }
     }
 
     if algo_info_only {
@@ -3951,6 +5128,24 @@ fn main() {
     // ★为什么按"设备代数"判定而不是只看帧率★ 固件只在快照代数推进时才发 FOCUS_DATA, 所以
     // 帧/s 的上限就是设备扫描速率; 只报帧率会把"设备只扫这么快"误读成"链路带宽不够"。
     // 这里同时取 samples_per_sec(设备自报扫描速率), 用交付率/扫描率的比值判断链路是否漏帧。
+    // --lat-probe [秒]: 排查"总延迟每隔数秒一簇尖峰"。见 run_lat_probe 的判据链说明。
+    if args.iter().any(|a| a == "--lat-probe") {
+        let secs = args
+            .iter()
+            .position(|a| a == "--lat-probe")
+            .and_then(|i| args.get(i + 1))
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(60);
+        let per_window_clear = !args.iter().any(|a| a == "--no-prof-clear");
+        let read_each_window = !args.iter().any(|a| a == "--prof-endonly");
+        std::process::exit(run_lat_probe(
+            &mut ctrl,
+            secs,
+            per_window_clear,
+            read_each_window,
+        ));
+    }
+
     if args.iter().any(|a| a == "--focus-band") {
         let position = args.iter().position(|a| a == "--focus-band");
         let channel = position
@@ -6828,6 +8023,8 @@ struct SoakPhaseStart {
     debug: Option<SoakDebugCounters>,
     // 设备侧 SelfHeal 计数在 DEVICE_INFO 诊断里就是 u16，这里保持同宽度，避免无意义的类型放大。
     self_heal: Option<(u16, u16)>,
+    // core1 新代数通知线的起点读数(见 int1_witness_text)。压测窗口本身就是最好的观测窗口。
+    profile: Option<LoopProfile>,
 }
 
 fn read_self_heal(ctrl: &AppController) -> Option<(u16, u16)> {
@@ -6887,6 +8084,13 @@ fn print_soak_summary(
             after.1.wrapping_sub(before.1)
         ),
         _ => println!("[SOAK] SelfHeal delta: unavailable (DEVICE_INFO diagnostics absent)"),
+    }
+    match (start.profile, read_loop_profile(ctrl)) {
+        (Some(before), Some(after)) => println!(
+            "[SOAK] {}",
+            int1_witness_text(&before, &after, elapsed_secs as f32)
+        ),
+        _ => println!("[SOAK] core1 通知线: unavailable (EP0 剖面读取失败)"),
     }
 }
 
@@ -7001,6 +8205,7 @@ fn run_soak(
         io: ctrl.io_stats(),
         debug: read_soak_debug(ctrl),
         self_heal: read_self_heal(ctrl),
+        profile: read_loop_profile(ctrl),
     };
     let mut last_debug_at = phase_start - Duration::from_secs(1);
     let mut last_ping_at = phase_start;

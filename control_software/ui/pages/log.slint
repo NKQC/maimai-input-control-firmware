@@ -13,7 +13,11 @@ export component LogPage inherits Rectangle {
     property <bool> _log_at_bottom: true;
 
     in-out property <bool> log_auto_scroll: true;
-    in property <bool> log_file_on: true;
+    in-out property <int> log_page_start: 0;
+    in property <int> log_page_size: 500;
+    in property <int> log_total_lines: 0;
+    in property <bool> log_has_older: false;
+    in property <bool> log_has_newer: false;
     in property <string> log_file_path: "";
     in property <string> log_stats: "";
     callback set_log_filter(int);
@@ -21,8 +25,8 @@ export component LogPage inherits Rectangle {
     callback clear_log();
     callback copy_log_all();
     callback open_log_dir();
-    callback set_log_file_enabled(bool);
     background: Theme.panel-deep;
+    visible: true;
 
     VerticalBox {
         padding: 12px;
@@ -50,10 +54,11 @@ export component LogPage inherits Rectangle {
                     }
                 }
             }
-            CheckBox {
-                text: @tr("落盘到 logs/");
-                checked: root.log_file_on;
-                toggled => { root.set_log_file_enabled(self.checked); }
+            Text {
+                text: @tr("日志始终写入文件");
+                color: Theme.text-sub;
+                font-size: Theme.fs-normal;
+                vertical-alignment: center;
             }
             Text {
                 text: @tr("过滤等级:");
@@ -68,8 +73,37 @@ export component LogPage inherits Rectangle {
             }
         }
 
+        HorizontalBox {
+            padding: 0px;
+            spacing: 8px;
+            Button {
+                text: @tr("较早");
+                enabled: root.log_has_older;
+                clicked => { root.log_page_start = Math.max(0, root.log_page_start - root.log_page_size); }
+            }
+            Text {
+                text: root.log_total_lines == 0
+                    ? @tr("无日志")
+                    : ((root.log_page_start + 1) + "–" + Math.min(root.log_page_start + root.log_page_size, root.log_total_lines)
+                        + " / " + root.log_total_lines + @tr(" 行"));
+                color: Theme.text-dim;
+                font-size: Theme.fs-normal;
+                vertical-alignment: center;
+            }
+            Button {
+                text: @tr("较新");
+                enabled: root.log_has_newer;
+                clicked => { root.log_page_start = Math.min(Math.max(0, root.log_total_lines - root.log_page_size), root.log_page_start + root.log_page_size); }
+            }
+            Button {
+                text: @tr("最新");
+                enabled: root.log_has_newer;
+                clicked => { root.log_page_start = Math.max(0, root.log_total_lines - root.log_page_size); }
+            }
+            Rectangle { horizontal-stretch: 1; }
+        }
+
         Rectangle {
-            border-radius: 8px;
             background: #1a1e23;
             border-color: Theme.border;
             border-width: 1px;
@@ -135,7 +169,7 @@ export component LogPage inherits Rectangle {
                 horizontal-stretch: 1;
             }
             Text {
-                text: @tr("可拖选复制；清空仅影响当前视图。");
+                text: @tr("可拖选复制；清空仅影响当前显示，历史仍在日志文件中。");
                 color: Theme.text-dim;
                 font-size: Theme.fs-normal;
                 vertical-alignment: center;
@@ -160,7 +194,7 @@ export component LogPage inherits Rectangle {
         }
 
         Text {
-            text: root.log_file_path == "" ? @tr("日志落盘已关闭") : @tr("当前日志文件: ") + root.log_file_path;
+            text: @tr("日志始终写入文件 · 当前路径: ") + root.log_file_path;
             color: #5c6773;
             font-size: Theme.fs-small;
             overflow: elide;

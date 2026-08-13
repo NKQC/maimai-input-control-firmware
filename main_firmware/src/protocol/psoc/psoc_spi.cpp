@@ -5,6 +5,7 @@
 #include <hardware/clocks.h>
 #include <hardware/gpio.h>
 #include <hardware/pio.h>
+#include <Arduino.h>
 #include <cstring>
 
 // ============================================================
@@ -53,6 +54,13 @@ constexpr uint32_t XFER_TIMEOUT_US = 2000;
 // "ISR 入口延迟(可被主循环临界区推迟) + 装帧(最坏 = SNAPSHOT_BEGIN 的 36×7B 整份锁存)"。
 // 150us 为长期实测稳定值，此处沿用；★它不再兼作"传输是否结束"的估时★，传输结束由 DMA 标志判定。
 constexpr uint32_t PSOC_ISR_FRAME_US = 150;
+// Snapshot BEGIN is acknowledged by the ISR immediately, but its 252-byte immutable copy
+// intentionally happens in the PSoC main loop (spi_snapshot_latch_task).  PAGE requests
+// issued before that copy return an all-zero transfer buffer while INFO still reports the
+// generation as valid.  The latch task runs once per main-loop iteration and the loop spins
+// tightly while waiting for the scan, so one bounded window covers it; this is paid once
+// per snapshot, not per page.
+constexpr uint32_t PSOC_SNAPSHOT_LATCH_GAP_US = 400;
 }  // namespace
 
 PsocSpi::PsocSpi(uint8_t sck_pin, uint8_t mosi_pin, uint8_t miso_pin, uint8_t cs_pin)
@@ -259,11 +267,17 @@ bool PsocSpi::get_stats(uint32_t* out_scan_count, uint8_t* out_busy) {
     uint8_t resp[7];
     if (!_cmd_txn((uint8_t)psoc::Cmd::GET_STATS, 0, 0, 0, resp)) return false;
     if (resp[1] != (uint8_t)psoc::Cmd::GET_STATS) return false;
-    if (out_busy) *out_busy = resp[2];   // PSoC 主循环重操作进行中标志
-    if (out_scan_count) {
-        *out_scan_count = (uint32_t)resp[3] | ((uint32_t)resp[4] << 8) |
-                          ((uint32_t)resp[5] << 16) | ((uint32_t)resp[6] << 24);
-    }
+    const uint32_t scan_count = (uint32_t)resp[3] | ((uint32_t)resp[4] << 8) |
+                                ((uint32_t)resp[5] << 16) | ((uint32_t)resp[6] << 24);
+    const bool scan_advanced = _stats_seen != 0u && scan_count != _last_stats_scan;
+    _last_stats_scan = scan_count;
+    _stats_seen = 1u;
+    // A genuine heavy operation stops the PSoC main scan loop.  Some deployed
+    // PSoC builds can leave the busy bit asserted after recovery despite a
+    // advancing scan counter; do not let that stale bit freeze host snapshots.
+    _operation_busy = (resp[2] != 0u && !scan_advanced) ? 1u : 0u;
+    if (out_busy) *out_busy = resp[2];   // Raw device flag remains available to lifecycle polling.
+    if (out_scan_count) *out_scan_count = scan_count;
     return true;
 }
 
@@ -404,18 +418,44 @@ bool PsocSpi::_send_heavy(uint8_t cmd, uint8_t b2, uint8_t b3, uint8_t b4) {
 }
 
 bool PsocSpi::apply() {
-    if (!_ready) return false;
-    // 发 APPLY（PSoC 主循环异步重扫/重初始化）；轮询 busy 至真实完成而非盲等固定时间。
-    if (!_send_heavy((uint8_t)psoc::Cmd::APPLY, 0, 0)) return false;
-    return _wait_op_done(800);   // 真实完成反馈(重初始化+首扫), 超时上限 800ms
+    if (!begin_apply()) return false;
+    return _wait_op_done(800);
 }
 
-bool PsocSpi::quick_apply(uint8_t ch, uint8_t gain, uint8_t div) {
+bool PsocSpi::begin_apply() {
     if (!_ready) return false;
-    // Sweep 逐格应用: gain/div 与 QUICK_APPLY 同帧下发，不能先 SET_PARAM 在扫描 ISR 中改 widgetContext。
-    // ★预算 2000ms 而非 apply() 的 800ms★: 本命令必须等主循环走到 NOT_BUSY 窗口才会真正执行。
-    if (!_send_heavy((uint8_t)psoc::Cmd::QUICK_APPLY, ch, gain, div)) return false;
-    return _wait_op_done(2000u);
+    // 仅确认 APPLY 已受理；完成由上层 GET_STATS 自适应观察，不能在 core1 内用短窗口阻塞。
+    if (!_send_heavy((uint8_t)psoc::Cmd::APPLY, 0, 0)) return false;
+    _operation_busy = 1u;
+    return true;
+}
+
+bool PsocSpi::_send_runtime_param_apply(uint8_t ch, uint8_t gain, uint8_t div) {
+    if (!_ready) return false;
+    const uint8_t cmd = (uint8_t)psoc::Cmd::RUNTIME_PARAM_APPLY;
+    uint8_t tx[7] = { psoc::FRAME_MAGIC, cmd, ch, gain, div, 0, 0 };
+    uint8_t rx[7] = {0};
+    if (!transfer(tx, rx, sizeof(tx))) return false;
+    busy_wait_us_32(PSOC_ISR_FRAME_US);
+    uint8_t fetch[7] = { psoc::FRAME_MAGIC, (uint8_t)psoc::Cmd::TOUCH, 0, 0, 0, 0, 0 };
+    if (!transfer(fetch, rx, sizeof(fetch))) return false;
+    if (rx[0] != psoc::FRAME_MAGIC || rx[1] != cmd) return false;
+    // 与 APPLY 共用相同的设备命令传输确认，但不写普通 heavy 的本地 busy 状态；
+    // 完成由上层以参数回读一致和 scan_count 推进独立判定。
+    return true;
+}
+
+bool PsocSpi::begin_runtime_param_apply(uint8_t ch, uint8_t gain, uint8_t div) {
+    return _send_runtime_param_apply(ch, gain, div);
+}
+
+bool PsocSpi::runtime_param_apply_poll(uint32_t* out_scan_count, uint8_t* out_raw_busy) {
+    uint32_t scan_count = 0u;
+    uint8_t busy = 0u;
+    const bool ok = get_stats(&scan_count, &busy);
+    if (out_scan_count) *out_scan_count = scan_count;
+    if (out_raw_busy) *out_raw_busy = busy;
+    return ok;
 }
 
 bool PsocSpi::focus_scan(uint8_t ch) {
@@ -428,8 +468,8 @@ bool PsocSpi::focus_scan(uint8_t ch) {
 
 bool PsocSpi::calibrate(uint8_t ch) {
     if (!_ready) return false;
-    // CALIBRATE 的完成预算必须覆盖最慢分频。Sweep 扫描期不再逐格调用它，因此单通道 30s
-    // 只覆盖最终恢复与手动单通道校准，不会放大扫描占用；全通道逐个校准仍给 60s 覆盖高分频与
+    // CALIBRATE 的完成预算必须覆盖最慢分频。runtime sweep 不再逐格调用它，因此单通道 30s
+    // 仅服务普通手动单通道校准；全通道逐个校准仍给 60s 覆盖高分频与
     // SPI 中断抖动。
     if (!_send_heavy((uint8_t)psoc::Cmd::CALIBRATE, ch, 0)) return false;
     return _wait_op_done((ch < 36u) ? 30000u : 60000u);
@@ -437,7 +477,7 @@ bool PsocSpi::calibrate(uint8_t ch) {
 
 bool PsocSpi::baseline_reset(uint8_t ch) {
     if (!_ready) return false;
-    // 基线初始化本身很快，但它只能在前一轮校准真正清 busy 后执行；5s 允许最慢扫描收尾，
+    // 基线初始化本身很快；5s 允许最慢扫描收尾，
     // 避免旧 500ms 窗口把“仍在收尾”误报成恢复失败。
     if (!_send_heavy((uint8_t)psoc::Cmd::BASELINE_RESET, ch, 0)) return false;
     return _wait_op_done(5000u);
@@ -509,34 +549,84 @@ bool PsocSpi::algo_info(bool* out_valid, uint16_t* out_len) {
     return true;
 }
 
-bool PsocSpi::upload_algo(const uint8_t* data, uint16_t len, uint16_t crc16) {
-    if (!_ready || data == nullptr || len == 0 || len > 1024) return false;
+bool PsocSpi::begin_upload_algo(const uint8_t* data, uint16_t len, uint16_t crc16) {
+    if (!_ready || data == nullptr || len == 0u || len > 1024u || _algo_upload.phase != 0u) return false;
     if (!algo_begin(len)) return false;
+    _algo_upload.data = data;
+    _algo_upload.len = len;
+    _algo_upload.crc16 = crc16;
+    _algo_upload.page = 0u;
+    _algo_upload.phase = 1u;
+    _algo_upload.confirmed = 0u;
+    _algo_upload.started_ms = millis();
+    _algo_upload.last_info_ms = _algo_upload.started_ms - 100u;
+    return true;
+}
 
-    const uint16_t pages = (uint16_t)((len + 3u) / 4u);   // 向上取整到 4 字节页
-    for (uint16_t p = 0; p < pages; ++p) {
+bool PsocSpi::poll_upload_algo(bool* out_complete, bool* out_ok, bool* out_valid, uint16_t* out_len) {
+    if (out_complete) *out_complete = false;
+    if (out_ok) *out_ok = false;
+    if (out_valid) *out_valid = false;
+    if (out_len) *out_len = 0u;
+    if (_algo_upload.phase == 0u) return true;
+
+    if (_algo_upload.phase == 1u) {
         uint8_t four[4] = {0, 0, 0, 0};
-        for (uint16_t b = 0; b < 4u; ++b) {
-            const uint32_t idx = (uint32_t)p * 4u + b;
-            if (idx < len) four[b] = data[idx];          // 末页不足 4 字节补 0
+        const uint32_t base = (uint32_t)_algo_upload.page * 4u;
+        for (uint16_t b = 0; b < 4u && base + b < _algo_upload.len; ++b) four[b] = _algo_upload.data[base + b];
+        if (!algo_page((uint8_t)_algo_upload.page, four)) {
+            _algo_upload.clear();
+            if (out_complete) *out_complete = true;
+            return false;
         }
-        if (!algo_page((uint8_t)p, four)) return false;
+        _algo_upload.page++;
+        const uint16_t pages = (uint16_t)((_algo_upload.len + 3u) / 4u);
+        if (_algo_upload.page < pages) return true;
+        bool end_ok = false;
+        uint16_t end_len = 0u;
+        if (!algo_end(_algo_upload.crc16, &end_ok, &end_len) || !end_ok || end_len != _algo_upload.len) {
+            _algo_upload.clear();
+            if (out_complete) *out_complete = true;
+            return false;
+        }
+        _algo_upload.phase = 2u;
+        _algo_upload.last_info_ms = millis() - 100u;
+        return true;
     }
 
-    bool end_ok = false;
-    uint16_t end_len = 0;
-    if (!algo_end(crc16, &end_ok, &end_len)) return false;
-
-    // PSoC commit 在其主循环执行(CRC16 校验+拷入槽); 轮询 ALGO_INFO 直到 valid 且 len 一致。
-    // 采样异常时 PSoC 主循环可能慢到 ~15Hz(≈66ms/圈), commit 需跨多圈才落地; 仅轮询 40ms 会
-    // 误判 "download failed"。放宽到 ~600ms(300×2ms)覆盖多个慢圈, 仍远短于用户可感知阻塞。
-    for (uint16_t i = 0; i < 300u; ++i) {
-        sleep_us(2000);
-        bool valid = false;
-        uint16_t vlen = 0;
-        if (algo_info(&valid, &vlen) && valid && vlen == len) return true;
+    const uint32_t now_ms = millis();
+    if ((uint32_t)(now_ms - _algo_upload.started_ms) >= 120000u) {
+        _algo_upload.clear();
+        if (out_complete) *out_complete = true;
+        return false;
     }
-    return false;
+    if ((uint32_t)(now_ms - _algo_upload.last_info_ms) < 100u) return true;
+    _algo_upload.last_info_ms = now_ms;
+    bool valid = false;
+    uint16_t len = 0u;
+    if (!algo_info(&valid, &len)) return true;
+    if (out_valid) *out_valid = valid;
+    if (out_len) *out_len = len;
+    if (valid && len == _algo_upload.len) {
+        if (++_algo_upload.confirmed < 2u) return true;
+        _algo_upload.clear();
+        if (out_complete) *out_complete = true;
+        if (out_ok) *out_ok = true;
+    } else {
+        _algo_upload.confirmed = 0u;
+    }
+    return true;
+}
+
+bool PsocSpi::upload_algo(const uint8_t* data, uint16_t len, uint16_t crc16) {
+    if (!begin_upload_algo(data, len, crc16)) return false;
+    bool complete = false;
+    bool ok = false;
+    while (!complete) {
+        if (!poll_upload_algo(&complete, &ok, nullptr, nullptr)) return false;
+        sleep_ms(1);
+    }
+    return ok;
 }
 
 bool PsocSpi::set_algo_rom(uint8_t ch, uint16_t rom) {
@@ -624,195 +714,167 @@ bool PsocSpi::indicator_on() {
     return _response_matches(response, psoc::Cmd::PONG, request.seq);
 }
 
+// Latch one immutable PSoC snapshot generation and leave the transfer buffer readable.
+//
+// Wire contract (psoc_firmware .../main.c): SNAPSHOT_BEGIN is served in the SPI DMA ISR,
+// which loads the SNAPSHOT_INFO frame straight into the single transmit slot.  That frame
+// is therefore only retrievable by the *immediately following* transaction — any touch or
+// command transfer squeezed in between consumes it and the whole snapshot is lost.  BEGIN
+// and the INFO read must stay adjacent, so they are one indivisible step here.
+//
+// The 252-byte copy into transfer_snapshot is deliberately deferred by the PSoC to
+// spi_snapshot_latch_task() in its main loop.  INFO is fetched with PING rather than
+// PAGE(0) because a PAGE request would latch a page out of that buffer before the copy
+// has run.  The bounded window afterwards covers exactly one PSoC main-loop iteration.
+bool PsocSpi::_snapshot_latch(uint16_t* out_generation, bool* out_valid) {
+    psoc::Frame begin = _make_request(psoc::Cmd::SNAPSHOT_BEGIN);
+    psoc::Frame ignored;
+    if (!transfer(reinterpret_cast<const uint8_t*>(&begin),
+                  reinterpret_cast<uint8_t*>(&ignored), sizeof(begin))) return false;
+    busy_wait_us_32(PSOC_ISR_FRAME_US);
+
+    psoc::Frame fetch = _make_request(psoc::Cmd::PING);
+    psoc::Frame info;
+    if (!transfer(reinterpret_cast<const uint8_t*>(&fetch),
+                  reinterpret_cast<uint8_t*>(&info), sizeof(fetch)) ||
+        !_response_matches(info, psoc::Cmd::SNAPSHOT_INFO, begin.seq) ||
+        info.payload[3] != psoc::SENSOR_CHANNEL_COUNT) {
+        _restore_touch_response();
+        return false;
+    }
+
+    const uint16_t generation = _read_u16(info.payload);
+    const bool valid = info.payload[2] != 0u;
+    if (out_generation != nullptr) *out_generation = generation;
+    if (out_valid != nullptr) *out_valid = valid;
+    if (valid) busy_wait_us_32(PSOC_SNAPSHOT_LATCH_GAP_US);
+    return true;
+}
+
+// Read page_count consecutive snapshot pages starting at first_page into dst.
+//
+// PSoC page responses are pipelined one transaction behind the request, so the first
+// request only primes; every later request both fetches the previous page and primes the
+// next one.  A chunk must therefore be contiguous within a single call — an interleaved
+// touch transfer would consume the pending SNAPSHOT_DATA frame.
+bool PsocSpi::_snapshot_pages(uint16_t first_page, uint16_t page_count, uint8_t* dst) {
+    if (page_count == 0u || dst == nullptr) return false;
+
+    psoc::Frame prime = _make_request(psoc::Cmd::SNAPSHOT_PAGE);
+    prime.payload[0] = static_cast<uint8_t>(first_page);
+    psoc::Frame discard;
+    if (!transfer(reinterpret_cast<const uint8_t*>(&prime),
+                  reinterpret_cast<uint8_t*>(&discard), sizeof(prime))) return false;
+
+    uint8_t expected_seq = prime.seq;
+    for (uint16_t i = 0u; i < page_count; ++i) {
+        busy_wait_us_32(PSOC_SNAPSHOT_PAGE_DELAY_US);
+        const uint16_t next_page = (uint16_t)(first_page + i + 1u);
+        psoc::Frame request;
+        if (next_page < psoc::SNAPSHOT_PAGE_COUNT) {
+            request = _make_request(psoc::Cmd::SNAPSHOT_PAGE);
+            request.payload[0] = static_cast<uint8_t>(next_page);
+        } else {
+            request = _make_request(psoc::Cmd::PING);
+        }
+        psoc::Frame response;
+        if (!transfer(reinterpret_cast<const uint8_t*>(&request),
+                      reinterpret_cast<uint8_t*>(&response), sizeof(request)) ||
+            !_response_matches(response, psoc::Cmd::SNAPSHOT_DATA, expected_seq)) return false;
+        const size_t offset = (size_t)i * psoc::FRAME_PAYLOAD_SIZE;
+        for (size_t b = 0; b < psoc::FRAME_PAYLOAD_SIZE; ++b) {
+            dst[offset + b] = response.payload[b];
+        }
+        expected_seq = request.seq;
+    }
+    return true;
+}
+
 bool PsocSpi::snapshot_pump(uint8_t max_pages, psoc::SensorSnapshot* out) {
     if (!_ready || max_pages == 0) return false;
 
-    // ★单次 BEGIN 锁存、跨调用续读★：PSoC 的 transfer_snapshot 锁存缓冲仅被新的 BEGIN 覆盖，
-    // 触控读不会动它。故整份快照只在第一块 BEGIN 一次，后续各块无需 re-BEGIN——只要重新"引导"
-    // (prime)目标页令 PSoC 把它装入 TX FIFO(其响应是触控残帧，丢弃)，随后流水线读该块页范围。
-    // 好处：全程单一锁存→数据一致；每份快照仅 1 个 BEGIN→故障点极少，杜绝多块 re-BEGIN 偶发失败。
-    uint8_t expected_seq;
-
-    // ★卡死兜底(修"采样永久冻结")★：原地重试是无上限的，一旦某页因应答流水失步永远读不出来，
-    // 这份快照就永不完成 → 发布态一直是旧值 → 上位机看到全通道 raw/baseline/diff 冻结。
-    // 超过完成期限即丢弃已读进度，改为重新 BEGIN 一份干净快照，使遥测必然能自行恢复。
+    // A stale incomplete snapshot must not monopolize paging forever; the next call
+    // then restarts from a freshly published immutable PSoC generation.
     if (_snap_active && (time_us_32() - _snap_start_us) > SNAP_COMPLETE_TIMEOUT_US) {
         _snap_active = false;
     }
 
     if (!_snap_active) {
-        // 新快照：BEGIN 锁存 + 请求 page0 取回 INFO(generation/valid/count)。
-        psoc::Frame begin = _make_request(psoc::Cmd::SNAPSHOT_BEGIN);
-        psoc::Frame ignored;
-        if (!transfer(reinterpret_cast<const uint8_t*>(&begin),
-                      reinterpret_cast<uint8_t*>(&ignored), sizeof(begin))) return false;
-        busy_wait_us_32(PSOC_SNAPSHOT_PAGE_DELAY_US);
-
-        psoc::Frame req0 = _make_request(psoc::Cmd::SNAPSHOT_PAGE);
-        req0.payload[0] = 0;
-        psoc::Frame info;
-        if (!transfer(reinterpret_cast<const uint8_t*>(&req0),
-                      reinterpret_cast<uint8_t*>(&info), sizeof(req0)) ||
-            !_response_matches(info, psoc::Cmd::SNAPSHOT_INFO, begin.seq) ||
-            info.payload[3] != psoc::SENSOR_CHANNEL_COUNT) {
-            _restore_touch_response();
-            return false;
-        }
-        _snap_generation = _read_u16(info.payload);
-        _snap_valid = info.payload[2] != 0;
-        _snap_page = 0;
-        _snap_active = true;
+        if (!_snapshot_latch(&_snap_generation, &_snap_valid)) return false;
+        _snap_page = 0u;
         _snap_start_us = time_us_32();
-        expected_seq = req0.seq;   // req0 已令 PSoC 装载 page[0]
-    } else {
-        // 续读：不 BEGIN。prime 请求当前页令 PSoC 装载它；prime 的响应是触控残帧，丢弃不校验。
-        busy_wait_us_32(PSOC_SNAPSHOT_PAGE_DELAY_US);
-        psoc::Frame prime = _make_request(psoc::Cmd::SNAPSHOT_PAGE);
-        prime.payload[0] = static_cast<uint8_t>(_snap_page);
-        psoc::Frame discard;
-        if (!transfer(reinterpret_cast<const uint8_t*>(&prime),
-                      reinterpret_cast<uint8_t*>(&discard), sizeof(prime))) {
+        if (!_snap_valid) {
+            // The PSoC has not published a generation yet.  Report the invalid
+            // generation now instead of paging 252 known-zero bytes for 16 cycles.
             _restore_touch_response();
-            return false;
+            if (out != nullptr) {
+                out->clear();
+                out->generation = _snap_generation;
+                out->valid = false;
+            }
+            return true;
         }
-        expected_seq = prime.seq;
+        _snap_active = true;
     }
 
-    // 读本块页范围：请求 PAGE[p] 取回 page[p-1] 数据（流水线）；末页用 PING 收尾。
     const uint16_t last_page = (uint16_t)((_snap_page + max_pages < psoc::SNAPSHOT_PAGE_COUNT)
                                           ? (_snap_page + max_pages) : psoc::SNAPSHOT_PAGE_COUNT);
-    for (uint16_t p = (uint16_t)(_snap_page + 1); p <= last_page; p++) {
-        busy_wait_us_32(PSOC_SNAPSHOT_PAGE_DELAY_US);
-        psoc::Frame preq;
-        if (p < psoc::SNAPSHOT_PAGE_COUNT) {
-            preq = _make_request(psoc::Cmd::SNAPSHOT_PAGE);
-            preq.payload[0] = static_cast<uint8_t>(p);
-        } else {
-            preq = _make_request(psoc::Cmd::PING);   // 收尾取最后一页
-        }
-        psoc::Frame resp;
-        if (!transfer(reinterpret_cast<const uint8_t*>(&preq),
-                      reinterpret_cast<uint8_t*>(&resp), sizeof(preq)) ||
-            !_response_matches(resp, psoc::Cmd::SNAPSHOT_DATA, expected_seq)) {
-            _restore_touch_response();
-            return false;
-        }
-        const size_t offset = (size_t)(p - 1) * psoc::FRAME_PAYLOAD_SIZE;   // 携带 page[p-1] 数据
-        for (size_t b = 0; b < psoc::FRAME_PAYLOAD_SIZE; b++) {
-            _snap_packed[offset + b] = resp.payload[b];
-        }
-        expected_seq = preq.seq;
-    }
-
-    // 收尾恢复：发一次 TOUCH 令 PSoC 把默认响应换回实时触控帧（读掉本块残留页数据）。
-    // 这样下一个 update 的 read_touch 立即命中触控帧(ok=true)，消除"交替空转"——
-    // 使快照读每个 update 都推进(约 2× 速度)，同时触控快路始终新鲜。
-    {
-        uint8_t trestore[7] = { psoc::FRAME_MAGIC, static_cast<uint8_t>(psoc::Cmd::TOUCH),
-                                0, 0, 0, 0, 0 };
-        uint8_t tdiscard[7];
-        transfer(trestore, tdiscard, 7);
-    }
-
+    const bool chunk_ok = _snapshot_pages(_snap_page, (uint16_t)(last_page - _snap_page),
+                                          &_snap_packed[(size_t)_snap_page * psoc::FRAME_PAYLOAD_SIZE]);
+    _restore_touch_response();
+    if (!chunk_ok) return false;
     _snap_page = last_page;
-    if (_snap_page < psoc::SNAPSHOT_PAGE_COUNT) {
-        return false;   // 还有页未读，下次继续（锁存持久，续读无需 BEGIN）
-    }
+    if (_snap_page < psoc::SNAPSHOT_PAGE_COUNT) return false;
 
-    // 全部页已读齐 → 解包输出一份来自单一锁存的一致完整快照。
     _snap_active = false;
-    if (out) {
+    if (out != nullptr) {
         out->clear();
         out->generation = _snap_generation;
         out->valid = _snap_valid;
         if (_snap_valid) {
-            for (size_t ch = 0; ch < psoc::SENSOR_CHANNEL_COUNT; ch++) {
-                const size_t o = ch * psoc::SENSOR_BYTES_PER_CHANNEL;
-                auto& s = out->channels[ch];
-                s.raw = _read_u16(&_snap_packed[o]);
-                s.baseline = _read_u16(&_snap_packed[o + 2]);
-                s.diff = static_cast<int16_t>(_read_u16(&_snap_packed[o + 4]));
-                s.status = _snap_packed[o + 6];
+            for (size_t ch = 0; ch < psoc::SENSOR_CHANNEL_COUNT; ++ch) {
+                const size_t offset = ch * psoc::SENSOR_BYTES_PER_CHANNEL;
+                auto& sample = out->channels[ch];
+                sample.raw = _read_u16(&_snap_packed[offset]);
+                sample.baseline = _read_u16(&_snap_packed[offset + 2u]);
+                sample.diff = static_cast<int16_t>(_read_u16(&_snap_packed[offset + 4u]));
+                sample.status = _snap_packed[offset + 6u];
             }
         }
     }
     return true;
 }
 
-// 单通道快照快路: 只读目标通道占用的那 2-3 页, 一次调用完成一份。
-// ★为什么不复用分块状态机★ 分块机是为"读满 63 页才算一份"设计的, 每份必然横跨 16 个 tick。
-// 独占流只要 7 个字节, 沿用它等于为 1 个通道付 36 个通道的代价(实测封顶 62 份/s)。这里独立走完
-// BEGIN→取页→恢复触控, 全程不触碰 _snap_* 分块状态, 因此与全通道慢路可以并存互不干扰。
+// 单通道快照快路: 一次调用取一份完整样本(锁存 + 该通道占用的 2-3 页), 不跨 core1 周期保持
+// BEGIN/INFO 相邻, 也不因分块而让页应答被触控事务吞掉。
 bool PsocSpi::snapshot_pump_channel(uint8_t channel, psoc::SensorSnapshot* out) {
-    if (!_ready || out == nullptr) return false;
-    if (channel >= psoc::SENSOR_CHANNEL_COUNT) return false;
+    if (!_ready || out == nullptr || channel >= psoc::SENSOR_CHANNEL_COUNT) return false;
 
-    // 目标通道的字节区间 → 覆盖它的页区间(闭区间)。
+    uint16_t generation = 0u;
+    bool valid = false;
+    if (!_snapshot_latch(&generation, &valid)) return false;
+    out->generation = generation;
+    out->valid = valid;
+    if (!valid) {
+        _restore_touch_response();
+        return true;
+    }
+
     const size_t first_byte = (size_t)channel * psoc::SENSOR_BYTES_PER_CHANNEL;
     const size_t last_byte = first_byte + psoc::SENSOR_BYTES_PER_CHANNEL - 1u;
     const uint16_t first_page = (uint16_t)(first_byte / psoc::FRAME_PAYLOAD_SIZE);
     const uint16_t last_page = (uint16_t)(last_byte / psoc::FRAME_PAYLOAD_SIZE);
-
-    // BEGIN 锁存一份一致数据, 并借 page0 的响应取回 INFO(generation/valid/count)。
-    psoc::Frame begin = _make_request(psoc::Cmd::SNAPSHOT_BEGIN);
-    psoc::Frame ignored;
-    if (!transfer(reinterpret_cast<const uint8_t*>(&begin),
-                  reinterpret_cast<uint8_t*>(&ignored), sizeof(begin))) return false;
-    busy_wait_us_32(PSOC_SNAPSHOT_PAGE_DELAY_US);
-
-    psoc::Frame req_info = _make_request(psoc::Cmd::SNAPSHOT_PAGE);
-    req_info.payload[0] = static_cast<uint8_t>(first_page);   // 顺带令 PSoC 装载首个目标页
-    psoc::Frame info;
-    if (!transfer(reinterpret_cast<const uint8_t*>(&req_info),
-                  reinterpret_cast<uint8_t*>(&info), sizeof(req_info)) ||
-        !_response_matches(info, psoc::Cmd::SNAPSHOT_INFO, begin.seq) ||
-        info.payload[3] != psoc::SENSOR_CHANNEL_COUNT) {
-        _restore_touch_response();
-        return false;
-    }
-    const uint16_t generation = _read_u16(info.payload);
-    const bool valid = info.payload[2] != 0;
-
-    // 流水线取页: 请求 PAGE[p+1] 的响应携带 page[p] 数据; 末页用 PING 收尾。
     uint8_t bytes[3u * psoc::FRAME_PAYLOAD_SIZE] = {};
-    const uint16_t page_count = (uint16_t)(last_page - first_page + 1u);
-    uint8_t expected_seq = req_info.seq;
-    for (uint16_t i = 0; i < page_count; i++) {
-        busy_wait_us_32(PSOC_SNAPSHOT_PAGE_DELAY_US);
-        const uint16_t next = (uint16_t)(first_page + i + 1u);
-        psoc::Frame preq;
-        if (i + 1u < page_count && next < psoc::SNAPSHOT_PAGE_COUNT) {
-            preq = _make_request(psoc::Cmd::SNAPSHOT_PAGE);
-            preq.payload[0] = static_cast<uint8_t>(next);
-        } else {
-            preq = _make_request(psoc::Cmd::PING);
-        }
-        psoc::Frame resp;
-        if (!transfer(reinterpret_cast<const uint8_t*>(&preq),
-                      reinterpret_cast<uint8_t*>(&resp), sizeof(preq)) ||
-            !_response_matches(resp, psoc::Cmd::SNAPSHOT_DATA, expected_seq)) {
-            _restore_touch_response();
-            return false;
-        }
-        for (size_t b = 0; b < psoc::FRAME_PAYLOAD_SIZE; b++) {
-            bytes[i * psoc::FRAME_PAYLOAD_SIZE + b] = resp.payload[b];
-        }
-        expected_seq = preq.seq;
-    }
-
-    // 恢复默认响应为实时触控帧, 使下一拍 read_touch 立即命中(与全通道慢路同一收尾约定)。
+    const bool pages_ok = _snapshot_pages(first_page, (uint16_t)(last_page - first_page + 1u), bytes);
     _restore_touch_response();
-
-    out->generation = generation;
-    out->valid = valid;
-    if (valid) {
-        // 目标通道在本次取回字节流中的偏移 = 它的绝对字节位 - 首页起始字节位。
-        const size_t o = first_byte - (size_t)first_page * psoc::FRAME_PAYLOAD_SIZE;
-        auto& s = out->channels[channel];
-        s.raw = _read_u16(&bytes[o]);
-        s.baseline = _read_u16(&bytes[o + 2]);
-        s.diff = static_cast<int16_t>(_read_u16(&bytes[o + 4]));
-        s.status = bytes[o + 6];
+    if (!pages_ok) return false;
+    {
+        const size_t offset = first_byte - (size_t)first_page * psoc::FRAME_PAYLOAD_SIZE;
+        auto& sample = out->channels[channel];
+        sample.raw = _read_u16(&bytes[offset]);
+        sample.baseline = _read_u16(&bytes[offset + 2u]);
+        sample.diff = static_cast<int16_t>(_read_u16(&bytes[offset + 4u]));
+        sample.status = bytes[offset + 6u];
     }
     return true;
 }
@@ -821,59 +883,23 @@ bool PsocSpi::read_snapshot(psoc::SensorSnapshot* snapshot) {
     if (!_ready || snapshot == nullptr) return false;
 
     snapshot->clear();
+    uint16_t generation = 0u;
+    bool valid = false;
+    if (!_snapshot_latch(&generation, &valid)) return false;
+    snapshot->generation = generation;
+    snapshot->valid = valid;
+    if (!valid) {
+        _restore_touch_response();
+        return true;
+    }
+
     uint8_t packed[psoc::SNAPSHOT_SIZE] = {};
-    psoc::Frame ignored;
-    psoc::Frame response;
-    psoc::Frame begin = _make_request(psoc::Cmd::SNAPSHOT_BEGIN);
-
-    if (!transfer(reinterpret_cast<const uint8_t*>(&begin),
-                  reinterpret_cast<uint8_t*>(&ignored), sizeof(begin))) return false;
-    busy_wait_us_32(PSOC_ISR_FRAME_US);
-
-    psoc::Frame page_request = _make_request(psoc::Cmd::SNAPSHOT_PAGE);
-    page_request.payload[0] = 0;
-    if (!transfer(reinterpret_cast<const uint8_t*>(&page_request),
-                  reinterpret_cast<uint8_t*>(&response), sizeof(page_request)) ||
-        !_response_matches(response, psoc::Cmd::SNAPSHOT_INFO, begin.seq) ||
-        response.payload[3] != psoc::SENSOR_CHANNEL_COUNT) {
-        return false;
-    }
-
-    snapshot->generation = _read_u16(response.payload);
-    snapshot->valid = response.payload[2] != 0;
-    uint8_t expected_sequence = page_request.seq;
-
-    for (size_t page = 1; page < psoc::SNAPSHOT_PAGE_COUNT; page++) {
-        busy_wait_us_32(PSOC_ISR_FRAME_US);
-        psoc::Frame next_request = _make_request(psoc::Cmd::SNAPSHOT_PAGE);
-        next_request.payload[0] = static_cast<uint8_t>(page);
-        if (!transfer(reinterpret_cast<const uint8_t*>(&next_request),
-                      reinterpret_cast<uint8_t*>(&response), sizeof(next_request)) ||
-            !_response_matches(response, psoc::Cmd::SNAPSHOT_DATA, expected_sequence)) {
-            snapshot->clear();
-            return false;
-        }
-        const size_t offset = (page - 1) * psoc::FRAME_PAYLOAD_SIZE;
-        for (size_t byte = 0; byte < psoc::FRAME_PAYLOAD_SIZE; byte++) {
-            packed[offset + byte] = response.payload[byte];
-        }
-        expected_sequence = next_request.seq;
-    }
-
-    busy_wait_us_32(PSOC_ISR_FRAME_US);
-    psoc::Frame finish = _make_request(psoc::Cmd::PING);
-    if (!transfer(reinterpret_cast<const uint8_t*>(&finish),
-                  reinterpret_cast<uint8_t*>(&response), sizeof(finish)) ||
-        !_response_matches(response, psoc::Cmd::SNAPSHOT_DATA, expected_sequence)) {
+    const bool pages_ok = _snapshot_pages(0u, psoc::SNAPSHOT_PAGE_COUNT, packed);
+    _restore_touch_response();
+    if (!pages_ok) {
         snapshot->clear();
         return false;
     }
-    const size_t last_offset = (psoc::SNAPSHOT_PAGE_COUNT - 1) * psoc::FRAME_PAYLOAD_SIZE;
-    for (size_t byte = 0; byte < psoc::FRAME_PAYLOAD_SIZE; byte++) {
-        packed[last_offset + byte] = response.payload[byte];
-    }
-
-    if (!snapshot->valid) return true;
 
     for (size_t channel = 0; channel < psoc::SENSOR_CHANNEL_COUNT; channel++) {
         const size_t offset = channel * psoc::SENSOR_BYTES_PER_CHANNEL;

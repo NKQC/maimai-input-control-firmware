@@ -3,7 +3,7 @@
 // ==========================================================================
 
 import { HorizontalBox, SpinBox, CheckBox, LineEdit, ComboBox, Button } from "std-widgets.slint";
-import { ParamRow, AlgoSettingRow } from "types.slint";
+import { ParamRow, AlgoSettingRow, AlgoReportLine } from "types.slint";
 import { Theme } from "theme.slint";
 
 // ============================================================================
@@ -389,7 +389,12 @@ export component ParamEditorRow inherits HorizontalBox {
     param_value := GuardedSpinBox {
         visible: root.entry.choices.length == 0 && root.mode_known && !root.auto_mode;
         // ★必须同时收掉占位★: 只 visible:false 仍占布局宽度, 会把单选框挤出参数区。
-        width: root.entry.choices.length == 0 ? Theme.spin-width : 0px;
+        // ★条件必须与 visible 完全一致★(照 param_choice 的写法): 原先只判 choices.length==0,
+        // 于是 AUTO / 未读取真值时这个隐藏的数字框仍占一个 spin-width, 加上右侧"AUTO"标签
+        // 又占一个, 标签被挤到放不下 —— overflow: elide 把参数名整条省略成"…", 表现为
+        // "AUTO 时通道参数全变成省略号"。
+        width: (root.entry.choices.length == 0 && root.mode_known && !root.auto_mode)
+            ? Theme.spin-width : 0px;
         horizontal-stretch: 0;
         minimum: root.entry.min;
         maximum: root.entry.max;
@@ -399,7 +404,36 @@ export component ParamEditorRow inherits HorizontalBox {
 }
 
 
-// 算法可调变量编辑行: 0..255(u8)，同时显示别名、类型与范围。
+// 声明类型标签。文本只来自 C 源 META 的类型参数; 空串 = 该声明没带类型(旧式 ALGO_REPORT),
+// 如实显示"未声明"而不是补一个看起来很确定的 u16。
+// ★按族配色, 不按具体类型配色★: 要一眼分清的只有"布尔 / 有符号 / 无符号 / 未声明"四档,
+// 逐类型一个色会让色表比类型表还难记。族判定用穷举等值比较, 不依赖字符串下标。
+export component TypeTag inherits Rectangle {
+    in property <string> value_type;
+    property <string> _t: root.value_type.to-lowercase();
+    property <color> _tint: root._t == "" ? Theme.text-dim
+        : (root._t == "bool" ? #b98fd6
+        : ((root._t == "i8" || root._t == "i16" || root._t == "i32") ? Theme.warn
+        : Theme.accent));
+
+    horizontal-stretch: 0;
+    border-radius: 3px;
+    border-width: 1px;
+    border-color: root._tint;
+    background: #00000000;
+    HorizontalLayout {
+        padding-left: 4px;
+        padding-right: 4px;
+        Text {
+            text: root._t == "" ? "未声明" : root._t;
+            color: root._tint;
+            font-size: Theme.fs-small;
+            vertical-alignment: center;
+        }
+    }
+}
+
+// 算法可调变量编辑行: 0..255(u8)，同时显示别名、类型标签与范围。
 export component AlgoSettingEditorRow inherits HorizontalBox {
     in property <AlgoSettingRow> entry;
     callback edited(int, int);
@@ -410,16 +444,19 @@ export component AlgoSettingEditorRow inherits HorizontalBox {
 
     Text {
         text: (root.entry.alias != "" ? root.entry.alias : root.entry.name)
-            + " (cfg[" + root.entry.idx + "] / " + root.entry.value_type + ")";
+            + " (cfg[" + root.entry.idx + "])";
         horizontal-stretch: 1;
         overflow: elide;
         wrap: no-wrap;
         vertical-alignment: center;
         color: Theme.text-strong;
     }
+    // ★可调变量的类型/范围一律有确定结论★: 设备 cfg[8] 就是 8 个 u8, 旧式 ALGO_SETTING 缺
+    // META 时退回的 u8/0..255 是协议事实(不是猜的), 所以这里不需要"未声明"分支。
+    TypeTag { value_type: root.entry.value_type; }
     Text {
         text: root.entry.range;
-        width: 100px;
+        width: 92px;
         color: Theme.text-sub;
         vertical-alignment: center;
         overflow: elide;
@@ -516,6 +553,57 @@ export component SeriesRow inherits HorizontalLayout {
     if root.has_norm: BinAmpEditor {
         value: root.norm;
         changed(v) => { root.norm_changed(v); }
+    }
+}
+
+// 曲线页"算法变量(右轴)"的一行: 勾选行 + 声明详情行(类型标签 · 声明范围 · 当前运行值)。
+// ★为什么不把详情塞进 SeriesRow★: 上面那组是设备原生量, 它们没有 C 源声明也没有声明范围,
+// 给 SeriesRow 加一堆恒为空的属性只会让两组行结构名义相同、实际各用一半。
+// 详情行在无任何可显示内容时高度归零(沿用本文件其它收起手法), 不留空行。
+export component AlgoSeriesRow inherits VerticalLayout {
+    in property <AlgoReportLine> entry;
+    callback toggled(bool);
+    callback norm_changed(float);
+
+    property <bool> _has_detail: root.entry.value_type != "" || root.entry.current_value != "";
+
+    spacing: 0px;
+    SeriesRow {
+        label: "report[" + root.entry.idx + "] " + root.entry.name;
+        tint: root.entry.line_color;
+        checked: root.entry.visible;
+        // 二值性来自声明(见 ui_plot.rs: 声明优先, 无声明才按数据反推), 所以倍率框不会闪跳。
+        has_norm: root.entry.is_binary;
+        norm: root.entry.norm_amp;
+        toggled(on) => { root.toggled(on); }
+        norm_changed(v) => { root.norm_changed(v); }
+    }
+    Rectangle {
+        height: root._has_detail ? detail.preferred-height : 0px;
+        clip: true;
+        detail := HorizontalLayout {
+            // 与上一行的线标列对齐: 详情属于该变量, 不该顶到最左边与勾选行抢起点。
+            padding-left: 18px;
+            spacing: 5px;
+            width: parent.width;
+            TypeTag { value_type: root.entry.value_type; }
+            Text {
+                text: root.entry.range != "" ? root.entry.range : "范围未声明";
+                color: Theme.text-dim;
+                font-size: Theme.fs-small;
+                vertical-alignment: center;
+                overflow: elide;
+            }
+            Text {
+                // 运行值这一栏只在真有值时出现: 无值时写"当前 —"会让人以为设备回了 0。
+                text: root.entry.current_value != "" ? "当前 " + root.entry.current_value : "暂无运行值";
+                color: root.entry.current_value != "" ? Theme.text-strong : Theme.text-dim;
+                font-size: Theme.fs-small;
+                horizontal-stretch: 1;
+                vertical-alignment: center;
+                overflow: elide;
+            }
+        }
     }
 }
 

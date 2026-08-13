@@ -67,20 +67,31 @@ public:
     // "恢复默认→良好半自动基线"专用: 请求在 PSoC 重启并以出厂强制好全局(增益4/目标85%)自动校准就绪后,
     // 由主循环回读校准好的默认值 → 切 SEMI 快速模式 → 重下发生效 → 持久化。
     // 使"正常的半自动基线"成为默认(RP2040 持有, PSoC 无状态), 且避免落到慢速 AUTO / 全 0。
-    void request_recapture() { _recapture_pending = true; _baseline_untrusted = false; }
+    void request_recapture();
     bool has_pending_recapture() const { return _recapture_pending; }
-    void clear_recapture() { _recapture_pending = false; }
+    void clear_recapture();
+    // 启动恢复默认的增量捕获：每次最多执行一条同步 PSoC 读取。
+    // 返回 0=仍在推进，1=已捕获并切到 SEMI，-1=采样/回读失败。
+    int8_t tick_recapture(Psoc* psoc);
 
     // ★采样可信度抽检(恢复默认专用)★: 抽样若干通道(覆盖 Cp 两极)的 raw, 判定 PSoC 当前是否真的
     // "校准好了"。不可信 = 任一抽样通道 raw 满量程(railed, IDAC 校准发散) 或 全部抽样通道两次读取
-    // 完全不抖动(扫描/测量停滞)。用于阻止把异常状态回读固化成新默认(否则"恢复默认"越点越坏)。
+    // 完全不抖动(扫描/测量停滞)。禁用通道不参与抽检(它的 raw 恒回 0, 照旧计入会被误判成停滞)。
+    // ★结论仅用于提示★ 调用方一律不得据此拒绝固化或清空配置, 只能记标志上报。
     bool sampling_trustworthy(Psoc* psoc);
-    // 上次恢复默认是否因采样不可信而拒绝固化(经 DEVICE_INFO 上报, 供上位机提示改用 PSoC 救砖)。
+    // 最近一次采样质量抽检是否存疑(经 DEVICE_INFO 上报, 上位机显示成**建议**)。
+    // ★这只是建议, 不是门禁★ 它不再阻止任何固化/捕获: 电极空闲导致 raw 不抖、手调过 IDAC/snsClk
+    // 导致读数偏高, 在高阶用户与预配置面板上都是正常形态, 拿它驳回用户的明确意图或抹掉既有配置
+    // 得不偿失。判定逻辑保留, 只用于提示。
     bool baseline_untrusted() const { return _baseline_untrusted; }
     void note_baseline_untrusted(bool untrusted) { _baseline_untrusted = untrusted; }
 
-    // PSoC 同步
-    void download_to_psoc(Psoc* psoc);   // 启动下发：SET_MODE + (semi 且 valid 时)全部参数 + APPLY
+    // PSoC 同步。启动期由主循环单步推进，每次最多入队一条 SPI 命令。
+    bool download_to_psoc(Psoc* psoc);
+    void abort_provisioning();
+    void tick_provisioning(Psoc* psoc);
+    bool provisioning_active() const;
+    bool provisioning_complete() const;
     // 仅半自动手动模式允许回读：AUTO 的实时值由 CapSense 自动计算，固化会毁掉用户手动参数。
     bool capture_from_psoc(Psoc* psoc);  // 从 PSoC 读当前参数入 store 并标记 valid
 
@@ -118,11 +129,34 @@ private:
         return (gparam_id >= CSD_GLOBAL_ID_MIN) && (gparam_id < (CSD_GLOBAL_ID_MIN + CSD_GLOBAL_COUNT));
     }
 
+    enum class ProvisionStage : uint8_t {
+        IDLE,
+        MODE,
+        ENABLED,
+        RELEASE_APPLY,
+        WAIT_RELEASE_APPLY,
+        GLOBALS,
+        PARAMS,
+        GLOBAL_COMMIT,
+        DONE,
+    };
+    ProvisionStage _provision_stage = ProvisionStage::IDLE;
+    uint8_t _provision_ch = 0u;
+    uint8_t _provision_index = 0u;
+    bool _provision_need_global_commit = false;
+
     uint8_t  _mode;
+    enum class RecaptureStage : uint8_t { IDLE, SAMPLE_FIRST, SAMPLE_SECOND, PARAMS, GLOBALS };
+    RecaptureStage _recapture_stage = RecaptureStage::IDLE;
+    uint16_t _recapture_index = 0u;
+    uint16_t _recapture_first[6] = {0u};
+    bool     _recapture_moved = false;
+    bool     _recapture_has_enabled = false;
+    uint32_t _recapture_started_ms = 0u;
     bool     _valid;
     bool     _save_pending = false;
     bool     _recapture_pending = false;   // 恢复默认: 重启就绪后回读校准好的默认→切SEMI
-    bool     _baseline_untrusted = false;  // 上次恢复默认拒绝固化(采样异常); 运行态标志, 不持久化
+    bool     _baseline_untrusted = false;  // 采样质量抽检存疑(仅建议, 不拦截); 运行态标志, 不持久化
     bool     _global_valid = false;   // host 设过或从 PSoC 捕获过全局配置
     uint16_t _param[CSD_CHANNELS][CSD_PARAM_COUNT];
     uint16_t _global[CSD_GLOBAL_COUNT];

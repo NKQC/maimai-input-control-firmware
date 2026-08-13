@@ -157,6 +157,12 @@ export struct AlgoReportLine {
     is_binary: bool,
     norm_amp: float,
     line_color: color,
+    // ★以下三项一律来自 C 源声明, 不是按运行数据反推的★: value_type/range 取
+    // ALGO_REPORT_META 的类型与 min..max, 旧式 ALGO_REPORT 没有声明时给空串(整块不显示,
+    // 而不是编一个 "u16 0..65535" 冒充声明事实)。current_value 是该槽最近一次运行值。
+    value_type: string,
+    range: string,
+    current_value: string,
 }
 
 // 算法变量元数据行：由源码声明生成，AlgoPage 展示名称、类型、范围、当前值、介绍与别名。
@@ -166,8 +172,8 @@ export struct AlgoMetadataRow {
     value_type: string,
     range: string,
     current_value: string,
-    description: string,
     alias: string,
+    description: string,
     kind: string,
 }
 
@@ -179,8 +185,8 @@ export struct AlgoSettingRow {
     value: int,
     value_type: string,
     range: string,
-    description: string,
     alias: string,
+    description: string,
 }
 // 虚拟摄像头输入源设备树的一行: 组头(分类)或设备项。
 // 日志页一行。no=全局行号(跨过滤稳定, 便于指位与去重), level: 0错误 1警告 2信息 3调试。

@@ -113,6 +113,13 @@ private:
     SerialPublishSettings _serial_publish_settings;
     SerialPublishState _serial_publish;
     uint16_t _touch_delay_units;
+    // 延迟线的补偿量: "本段起点 → 帧真正写出 CDC" 的实测耗时(us), 单指数平滑。
+    // ★不得复用 g_lat_proc_us / g_lat_usb_us★ 那两个是**滚动峰值**, 且清零权在遥测发射器手里
+    // (SensorLink::tick 组完 LATENCY 块才清)。没有上位机连着时它们永不清零, 会一路 latch 住历史
+    // 最坏值(实测可达 1.5ms + 1.2ms), 于是 emit_us 被高估数毫秒 ⇒ 延迟线读到比应读更新的片
+    // ⇒ 实际端到端延迟比设定值短几毫秒, 且随运行时间单调变短、不会自己恢复。
+    // 平滑值也比峰值更贴近"这一拍要花多久"这个待预测量: 用峰值等于系统性过补偿。
+    uint32_t _emit_cost_us;
     uint32_t _delay_refresh_us;
     uint8_t _serial_reset_requests;
 };

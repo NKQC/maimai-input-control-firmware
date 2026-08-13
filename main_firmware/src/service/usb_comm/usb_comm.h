@@ -28,6 +28,8 @@ private:
     bool _pump_pending_tx(HAL_USB_Device* usb);
     void _clear_pending_tx(HAL_USB_Device* usb);
     void _dispatch_frame(HAL_USB_Device* usb, const HostFrame& frame);
+    void _pump_persistence_terminal(HAL_USB_Device* usb);
+    void _pump_sensor_terminal(HAL_USB_Device* usb);
     // dispatch 后 resp_len==0 的取证(= encode_* 拒绝组帧, 见 usb_debug.h 的 resp_encode_fail)。
     void _note_resp_encode_fail(const HostFrame& frame);
     HostCmdCodec _codec;
@@ -35,13 +37,6 @@ private:
     uint16_t _pending_resp_len = 0;
     uint16_t _pending_resp_off = 0;
     HostFrame _frame;  // Reuse codec output across loop iterations to avoid stack bloat
-    // ★单槽暂存 + 槽满即停止解析★(已实测稳定: 0 告警 / 25 分钟无复位)
-    // 上一响应占用 _resp_buf 期间仍须把 RX 环里已完整的帧取走, 否则环会溢出丢字节。
-    // 槽满后立刻 break 停止解析 —— 于是绝不会覆盖已暂存的帧, 剩余字节留在环里下一轮再取。
-    // (曾改成 4 槽队列试图让 ALGO_GET_SRC 续片不被挤掉, 实测引发设备反复重枚举 + os error 22,
-    //  已回退。那条路要走必须先弄清 dispatch 与 TinyUSB IN stream 的确切时序, 不能靠加槽位猜。)
-    HostFrame _deferred_frame;
-    bool _deferred_frame_pending = false;
     uint32_t _frame_open_since = 0;  // 当前半帧起始 millis(0=空闲), 供陈旧半帧超时复位
     
     struct RebootState {
@@ -51,13 +46,19 @@ private:
             DETACHED,
         };
 
+        enum class Mode : uint8_t {
+            APP = 0,
+            BOOTLOADER = 1,
+            DEBUG_TRIGGER = 2,
+        };
+
         Stage stage = Stage::IDLE;
-        uint8_t mode = 0;
+        Mode mode = Mode::APP;
         uint32_t deadline_ms = 0;
 
         void clear() {
             stage = Stage::IDLE;
-            mode = 0;
+            mode = Mode::APP;
             deadline_ms = 0;
         }
     };

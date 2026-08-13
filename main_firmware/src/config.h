@@ -39,6 +39,13 @@ constexpr uint32_t DEBUG_BOOTSEL_MAGIC = 0xDEB6B007u;
 constexpr uint32_t PSOC_SNAPSHOT_PAGE_DELAY_US = 60;   // 每页请求-应答间隔（< 旧 150us，仍留 ISR 余量）
 constexpr uint8_t  PSOC_SNAPSHOT_PAGES_PER_PUMP = 4;   // 每次 update 读取的页数（4×~80us≈320us < 触控预算，与触控快路交织）
 
+// PSoC → RP2040 通知线（权威来源 hardware.txt：P1.4→GPIO23，P1.5→GPIO22，经电平移位器中继）
+// INT1 = "已发布新一代快照"：PSoC 每发布一份就翻转一次电平（不是脉冲，见 psoc.cpp 的
+// _int1_wait_generation 说明）。core1 据此从"固定间隔空转轮询"改为"等通知再取"，
+// 把原本白占的 SPI 事务还给 PSoC 的 CapSense 中间件。
+// INT2(GPIO22 ↔ P1.5) 两端都还没有约定事件语义，故此处不声明——不留没人驱动的常量。
+constexpr uint8_t PIN_SENSOR_INT1 = 23;
+
 // RGB 状态灯（普通 GPIO，非 WS2812）
 // 实测映射（顺序蓝红绿）：GPIO20=蓝 / GPIO19=红 / GPIO18=绿（hardware.txt 标注有误，以实测为准）
 constexpr uint8_t PIN_LED_G = 18;

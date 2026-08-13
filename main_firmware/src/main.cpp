@@ -1,4 +1,20 @@
-﻿#include "config.h"   // 必须在 Arduino.h 之前，避免 PIN_SPI1_* 宏冲突
+﻿
+// ======================================================================
+// 固件入口
+//
+// 本文件只负责三件事:
+//   1) 启动取证(死前遗言 / 崩溃恢复策略);
+//   2) setup() 的初始化顺序 —— 存储注册→load→各服务 init→SWD bring-up→拉起 core1;
+//   3) 每轮编排的调用点。
+// 两个核的每轮内容各自单列:
+//   core0(协议核)  → app/core0_loop.h   : 各阶段 inline 函数 + core0_loop_step()
+//   core1(传感器核) → app/core1_loop.h  : 拉起 + 交出 SPI 所有权给 Psoc::core1_run()
+//   启动可用性状态机 → app/boot_calibration.h
+// ======================================================================
+
+// ★config.h 必须在 <Arduino.h> 之前★: 它用 constexpr 定义 PIN_SPI1_* 等,
+// 而 arduino-pico 的变体头把同名标识符宏化, 顺序颠倒会让 constexpr 名字被替换成数字常量。
+#include "config.h"
 
 #include <Arduino.h>
 #include <pico/stdlib.h>
@@ -7,7 +23,9 @@
 #include <hardware/watchdog.h>
 #include <hardware/structs/watchdog.h>
 #include <pico/bootrom.h>
-#include "config.h"
+
+#include "app/core0_loop.h"
+#include "app/core1_loop.h"
 
 #include "hal/usb/hal_usb.h"
 #include "service/usb_comm/usb_comm.h"
@@ -21,181 +39,24 @@
 #include "service/csd_config/csd_config.h"
 #include "service/psoc_algo/psoc_algo.h"
 #include "service/self_heal/self_heal.h"
-#include "service/tx_scheduler/tx_scheduler.h"
 #include "service/keyboard/keyboard.h"
 #include "service/hid_touch_mapper/hid_touch_mapper.h"
-#include "service/tx_scheduler/tx_scheduler.h"
 #include "service/bus/bus_core.h"
 #include "service/bus/bus_usb_link.h"
 #include "service/usb_debug.h"
 #include "protocol/psoc/psoc.h"
 #include "protocol/hid/hid.h"
 
+#include "service/nv_store/nv_store.h"   // NvStore::enable_lockout()
+
 extern "C" {
 #include "hal/global_irq.h"
-#include "service/nv_store/nv_store.h"   // NvStore::enable_lockout()
 }
 
 static constexpr uint32_t WATCHDOG_TIMEOUT_MS = 5000;
 
-namespace {
-// 每个 provisioning 代次只走一遍。所有重操作都只负责入队，core0 每轮仅轮询一次状态。
-enum class BootCalibrationStage : uint8_t {
-    WAIT_TRUST,
-    IDAC_START,
-    IDAC_WAIT,
-    CHANNEL_START,
-    CHANNEL_WAIT,
-    BASELINE_START,
-    BASELINE_WAIT,
-    VERIFY_WAIT,
-    DONE,
-};
-
-struct BootCalibrationState {
-    BootCalibrationStage stage = BootCalibrationStage::WAIT_TRUST;
-    uint32_t autotune_req = 0u;
-    uint32_t verify_generation = 0u;
-    uint32_t verify_started_ms = 0u;
-    uint8_t baseline_retry = 0u;
-
-    void clear() {
-        stage = BootCalibrationStage::WAIT_TRUST;
-        autotune_req = 0u;
-        verify_generation = 0u;
-        verify_started_ms = 0u;
-        baseline_retry = 0u;
-    }
-};
-
-BootCalibrationState _boot_calibration;
-constexpr uint32_t BOOT_CAL_FAILURE_FLAG = 0x80000000u;
-
-void _boot_calibration_fail(uint8_t stage) {
-    // 复用既有 SH_REPROVISIONED 事件；bit31 区分普通重下发 detail(0/1)，不新增事件码。
-    SelfHeal::getInstance()->note(SH_REPROVISIONED, BOOT_CAL_FAILURE_FLAG | stage);
-}
-
-void _boot_calibration_tick(Psoc* psoc, CsdConfig* csd) {
-    if (psoc == nullptr || csd == nullptr || !psoc->link_alive()) return;
-
-    switch (_boot_calibration.stage) {
-        case BootCalibrationStage::WAIT_TRUST:
-            // provisioning 尾部的 APPLY 尚在 core1 执行时绝不抢占重操作槽。
-            if (psoc->heavy_busy()) return;
-            // ★校准前不能要求“采样可信”★ IDAC/通道/基线三项的职责正是修复 railed、停滞和坏基线；
-            // 旧代码在这里调用 sampling_trustworthy，raw=4095 或基线未拉回时立即 DONE，等于“越需要
-            // 校准越不执行”。启动前置只要求链路已建立；采样可信度门禁放到三项完成后的 VERIFY_WAIT。
-            _boot_calibration.stage = BootCalibrationStage::IDAC_START;
-            return;
-
-        case BootCalibrationStage::IDAC_START:
-            if (!ConfigManager::get_bool("calib.boot_idac")) {
-                _boot_calibration.stage = BootCalibrationStage::CHANNEL_START;
-                return;
-            }
-            if (psoc->heavy_busy()) return;
-            if (!psoc->start_sweep_calibrate(0xFFu)) {
-                _boot_calibration_fail(2u);
-                _boot_calibration.stage = BootCalibrationStage::CHANNEL_START;
-                return;
-            }
-            _boot_calibration.stage = BootCalibrationStage::IDAC_WAIT;
-            return;
-
-        case BootCalibrationStage::IDAC_WAIT: {
-            bool ok = false;
-            if (!psoc->take_sweep_result(&ok)) return;
-            if (!ok) _boot_calibration_fail(2u);
-            _boot_calibration.stage = BootCalibrationStage::CHANNEL_START;
-            return;
-        }
-
-        case BootCalibrationStage::CHANNEL_START:
-            if (!ConfigManager::get_bool("calib.boot_channel")) {
-                _boot_calibration.stage = BootCalibrationStage::BASELINE_START;
-                return;
-            }
-            if (psoc->heavy_busy()) return;
-            if (!psoc->auto_tune_start(0xFFu, ConfigManager::get_uint8("calib.pref"), 0x3Eu)) {
-                _boot_calibration_fail(3u);
-                _boot_calibration.stage = BootCalibrationStage::BASELINE_START;
-                return;
-            }
-            _boot_calibration.autotune_req = psoc->autotune_req();
-            _boot_calibration.stage = BootCalibrationStage::CHANNEL_WAIT;
-            return;
-
-        case BootCalibrationStage::CHANNEL_WAIT: {
-            // 请求代次被别的调用覆盖时，本轮已失去归属；记失败并继续，绝不重新启动形成循环。
-            if (psoc->autotune_req() != _boot_calibration.autotune_req) {
-                _boot_calibration_fail(3u);
-                _boot_calibration.stage = BootCalibrationStage::BASELINE_START;
-                return;
-            }
-            const psoc::AutoTuneProgress status = psoc->autotune_status();
-            if (status.req != _boot_calibration.autotune_req || status.state != 2u) return;
-            if (status.result != 1u) _boot_calibration_fail(3u);
-            _boot_calibration.stage = BootCalibrationStage::BASELINE_START;
-            return;
-        }
-
-        case BootCalibrationStage::BASELINE_START:
-            if (!ConfigManager::get_bool("calib.boot_baseline")) {
-                _boot_calibration.stage = BootCalibrationStage::DONE;
-                return;
-            }
-            if (psoc->heavy_busy()) return;
-            if (!psoc->start_sweep_baseline_reset(0xFFu)) {
-                _boot_calibration_fail(4u);
-                _boot_calibration.stage = BootCalibrationStage::DONE;
-                return;
-            }
-            _boot_calibration.stage = BootCalibrationStage::BASELINE_WAIT;
-            return;
-
-        case BootCalibrationStage::BASELINE_WAIT: {
-            bool ok = false;
-            if (!psoc->take_sweep_result(&ok)) return;
-            if (!ok) {
-                _boot_calibration_fail(4u);
-                _boot_calibration.stage = BootCalibrationStage::DONE;
-                return;
-            }
-            // “命令完成”不等于“传感器恢复”：必须看到校准后的新快照代次并通过 raw/抖动门禁。
-            // 旧实现到这里直接 DONE，底层 500ms 误超时后自然把失败链当成“启动三项已执行”。
-            _boot_calibration.verify_generation = psoc->snapshot_generation();
-            _boot_calibration.verify_started_ms = millis();
-            _boot_calibration.stage = BootCalibrationStage::VERIFY_WAIT;
-            return;
-        }
-
-        case BootCalibrationStage::VERIFY_WAIT:
-            if (psoc->heavy_busy()) return;
-            if (psoc->snapshot_valid() &&
-                psoc->snapshot_generation() != _boot_calibration.verify_generation &&
-                csd->sampling_trustworthy(psoc)) {
-                _boot_calibration.stage = BootCalibrationStage::DONE;
-                return;
-            }
-            if ((uint32_t)(millis() - _boot_calibration.verify_started_ms) < 3000u) return;
-            // 基线是用户手动操作能恢复的最小动作；验收失败时只自动补做一次，禁止形成启动循环。
-            if (_boot_calibration.baseline_retry == 0u &&
-                ConfigManager::get_bool("calib.boot_baseline")) {
-                _boot_calibration.baseline_retry = 1u;
-                _boot_calibration.stage = BootCalibrationStage::BASELINE_START;
-                return;
-            }
-            _boot_calibration_fail(5u);   // 三项已跑完但快照/基线验收仍失败
-            csd->note_baseline_untrusted(true);
-            _boot_calibration.stage = BootCalibrationStage::DONE;
-            return;
-
-        case BootCalibrationStage::DONE:
-            return;
-    }
-}
-}  // namespace
+// core0 的跨轮状态。阶段实现全在 app/core0_loop.h。
+static app::Core0State g_core0;
 
 // ★hardfault 兜底 + 取证★
 // pico-sdk 的默认 isr_hardfault 落进 while(1), 于是"跑飞"最终也表现为看门狗超时复位 ——
@@ -209,26 +70,6 @@ extern "C" void isr_hardfault(void) {
     watchdog_hw->scratch[CRASH_SCRATCH_FAULT] = crash_fault_word(get_core_num());
     watchdog_reboot(0u, 0u, 0u);
     while (true) { tight_loop_contents(); }
-}
-
-// ★主机租约超时★：上位机每~1s PING 续期(刷新 g_last_host_cmd_ms)。超过本时长未收到任何
-// 主机指令 = 上位机已丢失(关闭/崩溃)→ 固件自停遥测流,避免遗留流淹没下次连接的 DEVICE_INFO。
-static constexpr uint32_t HOST_LEASE_TIMEOUT_MS = 3000;
-
-// ★双核 flash 竞态根治(照抄 v3.1)★：core0 跑 Arduino setup/loop(USB+触控快路+flash 落地)，
-// core1 仅注册为 lockout victim 并空转。config_manager 的 flash 写用
-// save_and_disable_interrupts()+multicore_lockout_start_blocking() 暂停 core1，
-// 使 XIP 擦写期间两核都不取指/访问总线→flash 安全完成、USB 快速恢复。
-// 前提是 core1 必须已 multicore_lockout_victim_init()，否则 lockout 永久死锁。
-#define CORE1_STACK_SIZE_BYTES 0x2000u
-static uint32_t __attribute__((aligned(8))) core1_stack[CORE1_STACK_SIZE_BYTES / sizeof(uint32_t)];
-
-static void core1_entry() {
-    // 注册本核为 lockout 受害者：core0 flash 写时经 SIO IRQ 暂停本核(IRQ 抢占, 与下面死循环无关)。
-    multicore_lockout_victim_init();
-    // ★core1 接管 PSoC SPI★：固定 1ms 周期独占传感器循环(触控快路 + 快照慢路 + 命令队列消费),
-    // 保证传感器/键盘总延迟每周期一致。core0 自此不再触碰 SPI, 只经 seqlock 读共享态、经队列投递指令。
-    Psoc::getInstance()->core1_run();   // 永不返回
 }
 
 // 隔离测试：SWDIO/SWDCLK 高阻，XRES 上拉，让外部 DAP-LINK 独占目标。
@@ -320,33 +161,20 @@ void setup() {
     Psoc* psoc = Psoc::getInstance();
     psoc->init();
 
-    // USB 枚举前完成阻塞式 SWD bring-up；结果由 PsocUpdater 统一保存并经 HostCmd 上报。
-    PsocUpdater::getInstance()->run(psoc);
-
-    // 枚举前取得首份真实快照，使 DEVICE_INFO 的运行态字段立即可用。
-    psoc->update();
-    PsocUpdater::getInstance()->update();
-
-    // ★无状态 PSoC★：RP2040 为唯一真相源。从 flash 载入 CSD 配置；实际下发延到 loop()
-    // 首次 SPI 链路稳定(psoc->link_ok())后一次性执行——setup 单次 update 时链路可能尚未就绪。
-    CsdConfig::getInstance()->init();
-    // JIT 触控算法 store：从 flash 载入自定义算法(若有)，否则用内嵌默认(v3.1 HDR)；同样延到 loop() 下发。
-    PsocAlgo::getInstance()->init();
-
+    // USB 与最小 HostCmd 服务先完成注册，使 SWD bring-up 期间仍能处理 HELLO/DEVICE_INFO。
     HAL_USB_Device::getInstance()->init();
+    CsdConfig::getInstance()->init();
+    PsocAlgo::getInstance()->init();
     UsbComm::getInstance()->init();
     Mai2Bus::getInstance()->init();
     BusUsbLink::getInstance()->init();
     SensorLink::getInstance()->init();
     BindingService::getInstance()->init();
 
-    // ★HID 键盘★：两种 USB 模式都枚举 HID(serial 也带键盘 report), 使 触控→键盘映射
-    // 与物理键盘 GPIO1-12 在游戏(serial)模式下也能输出 HID 键。诊断开关可整体禁用做二分。
+    // ★HID 键盘★：两种 USB 模式都枚举 HID(serial 也带键盘 report)。
 #if MAI2_ENABLE_SERIAL_HID
     HID::getInstance()->init(HAL_USB_Device::getInstance());
     KeyboardService::getInstance()->init();
-    // ★HID 触摸屏点位映射★: 物理通道 → 固定屏幕坐标, 只在 WORK_HID 生效(模式在 init 里锁存)。
-    // 必须在 ConfigManager::initialize() 之后 —— 它要读 mode.work 与 hid.* 的运行值。
     HidTouchMapper::getInstance()->init(HID::getInstance());
 #endif
 
@@ -356,12 +184,18 @@ void setup() {
     if (work_mode == UsbWorkMode::WORK_SERIAL) {
         GameIoService::getInstance()->init(work_mode);
     }
-    // mai2 串口状态命令与工作模式无关(HID 模式如实回 STOPPED), 故无条件注册。
     GameIoService::getInstance()->register_host_cmds();
 
-    // ★启动 core1★：必须在任何 flash 写(loop 的 save_config_task)之前完成，
+    // 启动期 SWD bring-up；此时 USB/HostCmd 已可服务 HELLO 与 DEVICE_INFO。
+    PsocUpdater::getInstance()->run(psoc);
+
+    // 取得首份真实快照，使 DEVICE_INFO 的运行态字段立即可用。
+    psoc->update();
+    PsocUpdater::getInstance()->update();
+
+    // ★启动 core1★：必须在任何 flash 写(loop 的落盘窗口)之前完成，
     // 使 multicore_lockout_start_blocking() 有已注册的 victim 可暂停，而非永久死锁。
-    multicore_launch_core1_with_stack(core1_entry, core1_stack, sizeof(core1_stack));
+    app::core1_launch();
     // core1 已启动并会在 core1_entry 首行注册 lockout victim ⇒ 此后 NvStore 的 flash 写才允许
     // lockout。在此之前(ConfigManager::initialize 首次上电写默认配置)必须不 lockout, 否则永久死锁。
     NvStore::enable_lockout();
@@ -371,394 +205,7 @@ void setup() {
     watchdog_hw->scratch[7] = WD_RUNNING_MAGIC;
 }
 
+// 每轮内容见 app/core0_loop.h::core0_loop_step —— 本文件不再夹带任何阶段实现。
 void loop() {
-    g_usb_dbg.loop_count++;
-    // ★阻塞剖面★: loop_t0 量整轮(= 与 5s 看门狗竞争的真实量), seg_t 量各段。纯测量, 不改控制流。
-    const uint32_t loop_t0 = loop_prof_begin();
-    uint32_t seg_t = loop_seg_begin(LOOP_SEG_USB_TASK);
-    HAL_USB_Device::getInstance()->task();
-    Mai2Bus::getInstance()->task();
-    loop_prof_mark(LOOP_SEG_USB_TASK, seg_t);
-
-    // ★控制通道 BOOTSEL★：EP0 请求 0x52 置位后，泵几轮 task 让 ACK 发出，再进烧录。
-    // 因 EP0 在 bulk vendor 死后仍存活，此路径免去 vendor 卡死时的物理 BOOTSEL。
-    if (g_bootsel_request) {
-        for (uint8_t i = 0; i < 32; i++) { HAL_USB_Device::getInstance()->task(); sleep_ms(2); }
-        watchdog_hw->scratch[7] = 0u;
-        reset_usb_boot(0, 0);
-    }
-
-    if (SWD_RELEASE_TO_EXTERNAL) {
-        UsbComm::getInstance()->update();
-        SensorLink::getInstance()->tick();
-        static uint32_t last = 0;
-        static bool on = false;
-        if (millis() - last > 500) {
-            last = millis();
-            on = !on;
-            LedService::getInstance()->set_rgb(false, false, on);
-        }
-        watchdog_update();
-        return;
-    }
-
-    seg_t = loop_seg_begin(LOOP_SEG_PSOC);
-    Psoc* psoc = Psoc::getInstance();
-    // ★不再在 core0 调 psoc->update()★：SPI 已由 core1 (core1_run) 固定周期独占;
-    // core0 只经 seqlock 读 touch_mask()/snapshot()、经命令队列投递 CSD 指令。
-    PsocUpdater* updater = PsocUpdater::getInstance();
-    updater->update();
-
-    // provisioning 状态(算法 + CSD 是否已下发到当前这颗运行中的 PSoC)。救砖与失效兜底都要清它，
-    // 故在此提前声明(其语义与去抖逻辑见下方 provisioning 段)。
-    static bool provisioned = false;
-    static uint32_t link_down_since_ms = 0;
-    // 主机主动重启后的事件抑制窗(见下方 g_psoc_reboot_request 分支): 窗内不把链路丢失型复位
-    // 上报为"固件自行救自己", 否则上位机会看到自己发起的重启被描述成设备异常。
-    static uint32_t host_reboot_quiet_until_ms = 0u;
-
-    // ★PSoC 救砖(PSOC_RESCUE)★：命令已回 ACK，重活在此(主循环安全窗口)执行——经 SWD 强制全片
-    // 擦写内嵌镜像+校验+复位运行。擦写数秒期间由 SwdProgrammer 的保活钩子喂狗/泵 USB/推送进度。
-    // 完成后清 provisioned，交由下方既有 provisioning 重新下发算法 + CSD(即"重新应用")。
-    if (updater->rescue_step(psoc)) {
-        provisioned = false;
-        _boot_calibration.clear();
-        psoc->clear_reset_request();   // 重刷期间 core1 必然判过链路丢失，清掉避免刚恢复就被 XRES
-        SelfHeal::getInstance()->note(SH_PSOC_RESCUED, 0u);
-    }
-
-    // ★失效兜底★：core1 检测到 PSoC 崩溃/掉线(reason=1)或主循环卡死(reason=2, 疑似坏算法)后，
-    // core0 在此脉冲 XRES 硬复位 PSoC。算法/CSD 参数在 PSoC RAM，复位即丢失，故 provisioned 归零
-    // 令链路恢复后重新下发。reason=2(卡死)且当前为自定义算法 → 判定该算法致命，回退内嵌默认防复位环。
-    // 救砖进行中不介入: 此时 PSoC 被 halt 在 SWD 会话里, XRES 会打断擦写。
-    const uint8_t reset_reason = updater->rescue_active() ? 0u : psoc->needs_reset();
-    if (reset_reason != 0u) {
-        if (reset_reason == 2u && !PsocAlgo::getInstance()->is_default()) {
-            PsocAlgo::getInstance()->reset_default();
-            // 用户算法被判定致命并回退 —— 这是最容易让人误判"我的算法还在跑"的一步, 必须上报。
-            SelfHeal::getInstance()->note(SH_ALGO_FALLBACK, 0u);
-        }
-        psoc->reset_run();
-        psoc->clear_reset_request();
-        // ★确知复位 ⇒ 显式清 provisioned★, 不再依赖"链路断开>400ms"去反推。
-        // 反推那条路现在有重操作宽限窗守着(APPLY 12s 期间链路必然抖动, 不能判成掉线),
-        // 若仍只靠它, 我们自己发起的复位就可能因宽限而不触发重新下发 → 算法/CSD 永久丢失。
-        provisioned = false;
-        _boot_calibration.clear();
-        // 卡死型(reason=2)永远上报; 链路丢失型(reason=1)在主机主动重启的抑制窗内跳过, 免得把
-        // "上位机自己发起的重启"报成"固件自行复位"。
-        if (reset_reason == 2u) {
-            SelfHeal::getInstance()->note(SH_PSOC_RESET_HANG, reset_reason);
-        } else if (millis() >= host_reboot_quiet_until_ms) {
-            SelfHeal::getInstance()->note(SH_PSOC_RESET_LINK, reset_reason);
-        }
-    }
-
-    // ★主机请求重启 PSoC★(REBOOT_PSOC=0x06): 脉冲 XRES 复位 PSoC 进运行态, 使"需重启生效"的
-    // 改动(如全局 CSD 重初始化)真正生效。复位后链路短暂丢失→下方 provisioned 逻辑自动重新下发算法/CSD。
-    // ★主机主动重启不算"固件自行救自己"★: 它必然带来一次链路丢失, core1 随后会把它当成 PSoC 掉线
-    // 再报一次复位事件, 上位机就会看到"固件已自行 XRES 复位"这种误导文案。故在此开一个短抑制窗,
-    // 窗内的链路丢失型复位事件不上报(重启本身由上位机发起, 它自己知道)。
-    if (g_psoc_reboot_request) {
-        g_psoc_reboot_request = 0u;
-        psoc->reset_run();
-        // 同上: 主机请求的重启是"确知复位", 显式清 provisioned 保证 RESET_DEFAULTS 后
-        // 清空的 store 一定会被重新下发(否则 PSoC 仍留着复位前推下去的旧参数, 恢复默认等于没生效)。
-        provisioned = false;
-        _boot_calibration.clear();
-        host_reboot_quiet_until_ms = millis() + 3000u;
-    }
-
-    // ★无状态 PSoC 启动/复位后下发★：SPI 链路(重新)就绪后一次性把 RP2040 持有的算法与 CSD 配置
-    // 下发 PSoC——先下发 JIT 触控算法(ALGO_*)到其 1KB 可执行槽，再下发 CSD 参数(SET_MODE+参数+APPLY)。
-    // provisioned 在失效复位后被清零，链路恢复即自动重新下发(算法在 PSoC RAM，复位丢失必须重推)。
-    // ★链路抖动去抖★：download_to_psoc 内含 Init+Enable 等重初始化, 期间 PSoC SPI 会短暂无响应,
-    // 使 link_ok 瞬时 false。若一有 false 就清 provisioned 会触发"重下发→重初始化→又瞬断"的
-    // provision 死循环(表现为状态灯白/绿反复闪 + 周期性重扫扰动 Cp/时序)。仅当链路【持续】断开
-    // 超过阈值(真正 PSoC 复位)才判为未就绪重新下发, 忽略重初始化期间的瞬时抖动。
-    const bool link_now = psoc->link_ok();
-    if (link_now) {
-        link_down_since_ms = 0;
-    } else if (link_down_since_ms == 0u) {
-        link_down_since_ms = millis();
-    }
-    if (!provisioned && link_now) {
-        PsocAlgo::getInstance()->download_to_psoc(psoc);
-        CsdConfig* csd = CsdConfig::getInstance();
-        csd->download_to_psoc(psoc);
-        provisioned = true;
-        // ★恢复默认→良好半自动基线★: RESET_DEFAULTS 后 store 已清空, PSoC 此刻带出厂强制好全局
-        // (增益4/目标85%) 且 Enable 已自动校准好 IDAC(raw≈目标, 未 railed)。回读这些校准好的值作默认,
-        // 切 SEMI 快速模式并立即重下发生效 → 得到"正常半自动基线"作为默认; RP2040 持有, PSoC 无状态。
-        // ★可信度校验(修"恢复默认救不回来")★: 若 PSoC 此刻本身就异常(raw 满量程 railed / 完全不抖动
-        // = 扫描停滞), 无条件回读就会把坏状态固化成新默认, 越点越回不去(实机已复现)。故先抽检采样,
-        // 不可信则【不固化】: 保持 store 空(AUTO + invalid)让 PSoC 跑自己的出厂默认链, 并置标志
-        // 经 DEVICE_INFO 上报, 由上位机提示改用"PSoC 救砖"。
-        if (csd->has_pending_recapture()) {
-            if (csd->mode() != CSD_MODE_SEMI) {
-                // AUTO 的实时参数由 CapSense 自动计算；即使采样可信也绝不能回读固化，
-                // 否则会覆盖用户原先保存的手动阈值/snsClk，切回 SEMI 时无法恢复。
-            } else if (csd->capture_from_psoc(psoc)) {   // 可信度门禁已内置于 capture_from_psoc
-                csd->download_to_psoc(psoc);       // set_mode(SEMI)+参数+APPLY: 手动参数即时生效
-                csd->request_save();               // 持久化, 成为下次开机默认
-            } else {
-                csd->clear();                      // 空 store(含 request_save): 真正回到出厂默认链
-                csd->download_to_psoc(psoc);       // set_mode(AUTO): PSoC 走标准完整处理 + 自动校准
-                csd->note_baseline_untrusted(true);
-                // 整个 CSD store 被清空并落盘 —— 用户所有逐通道调参就此消失, 不上报等于骗人。
-                SelfHeal::getInstance()->note(SH_STORE_CLEARED, 0u);
-            }
-            csd->clear_recapture();
-        }
-        // 救砖的"重新应用"以此为完成点: 算法 + CSD 已重新下发到刚刷好的 PSoC。
-        updater->rescue_note_reapplied();
-        // 该标志只记录当前运行态的不可信采样；PSoC 重启/救砖重新应用后必须再次实测，
-        // 已恢复才清除，避免无条件隐藏仍存在的硬件或扫描异常。
-        if (csd->baseline_untrusted() && csd->sampling_trustworthy(psoc)) {
-            csd->note_baseline_untrusted(false);
-            SelfHeal::getInstance()->note(SH_BASELINE_TRUST_RESTORED, 0u);
-        }
-        // 重新下发完成 → 上位机据此重新回读设备真值(PSoC 的 CSD 配置活在 RAM, 复位后必然换了一套)。
-        SelfHeal::getInstance()->note(SH_REPROVISIONED, csd->mode());
-        // PSoC 启动时若强制改写过生成配置(IDAC 增益档抬到下限 / 非法校准目标% 回退 85), 一并上报,
-        // 使"设备实际值 != 下发值"永远有据可查, 不再是静默不同步。
-        {
-            // PSoC 侧 GPARAM_BOOT_OVERRIDE(0x09): 只读位掩码, 见 psoc_firmware main.c。
-            constexpr uint8_t GPARAM_ID_BOOT_OVERRIDE = 0x09u;
-            uint32_t override_bits = 0u;
-            if (psoc->get_global(GPARAM_ID_BOOT_OVERRIDE, &override_bits) && override_bits != 0u) {
-                SelfHeal::getInstance()->note(SH_PSOC_BOOT_OVERRIDE, override_bits);
-            }
-        }
-    }
-
-    // provisioning 成功后启动一次；DONE 后本代次不再进入，只有明确的新 PSoC 代次会 clear()。
-    // ★扫描会话期间必须让位★：启动校准与 SweepSession 共用 PSoC 的单个非阻塞重操作槽
-    // (start_sweep_calibrate/take_sweep_result)，且它做的是全通道校准 —— 在扫描中途插进去会
-    // 抢掉槽位把扫描逼到阶段超时，还会推翻正在测的那一格。信号是粘性的，推迟到会话结束再走。
-    if (provisioned && !SensorLink::getInstance()->output_suppressed()) {
-        _boot_calibration_tick(psoc, CsdConfig::getInstance());
-    }
-
-    // 持续断开 >400ms 视为真复位 → 清 provisioned, 链路恢复后重下发(算法/CSD 在 PSoC RAM, 复位丢失)。
-    // ★但"正在执行重操作"不算掉线★: APPLY/CALIBRATE/GLOBAL_COMMIT/AUTO_TUNE 由 PSoC 主循环同步跑,
-    // provision 后的 APPLY 实测 12.4s(36 通道逐个重校准), 期间 CapSense 内部临界区推迟 SPI DMA 中断,
-    // read_touch 成批失败、链路"断开"远超 400ms。旧逻辑据此清 provisioned → 链路一恢复就重新下发
-    // 396 条 SET_PARAM(把 36 通道全部重新置脏) + APPLY → 又一次 12.4s 重校准 → 永久 provision 风暴。
-    // 实测(带外 SWD 读 PSoC 计数): setparam 约 428/s、apply 约 1.1/s、apply_dirty 恒 36、
-    // scan_count 每 14s 才 +1 ⇒ 扫描被彻底压住, raw 全 0、scan_period_us=0。
-    // 宽限窗由 Psoc 在派发重操作时开启(见 psoc.cpp 的 HEAVY_OP_GRACE_MS)。
-    if (!link_now && link_down_since_ms != 0u && (millis() - link_down_since_ms) > 400u &&
-        !psoc->busy_grace_active()) {
-        provisioned = false;
-        _boot_calibration.clear();
-    }
-    // ★运行期掉枚举: 如实宣判失效, 不做救援★
-    // 主机一旦拆掉接口, 设备这边任何"重新武装/重开"都改变不了主机的判断, 只会把主循环搅乱。
-    // 事件是粘性的(队列 + note_rearm 兜底), 故即使掉枚举期间无人可发, 重新连上后仍会送达 ——
-    // 于是"上次运行期间掉过枚举"永远有据可查, 而不是只剩用户一句"它自己断了"。
-    {
-        static bool usb_was_up = false;
-        const bool usb_up = HAL_USB_Device::getInstance()->is_ready();
-        if (usb_was_up && !usb_up) {
-            // detail: bit0=serial 协议在跑, bit1=灯板协议已就绪 —— 便于分辨掉的是哪一侧的负载。
-            uint32_t detail = 0u;
-            GameIoService* gio = GameIoService::getInstance();
-            if (gio->mai2_touch_sending()) detail |= 0x1u;
-            if (gio->is_ready()) detail |= 0x2u;
-            SelfHeal::getInstance()->note(SH_CDC_LOST, detail);
-        }
-        usb_was_up = usb_up;
-    }
-
-    // ★自持恢复事件必达兜底★: note() 只在事件发生那一刻拉起推送任务, 若当时上位机没连(或租约过期
-    // 自取消), 队列里的事件就再也没人推 → 用户永远看不到"设备被固件改过"。故只要队列非空且任务不在,
-    // 就重新拉起(有上位机时 10Hz 排空, 无上位机时靠租约自灭, 不常驻)。
-    if (!SelfHeal::getInstance()->empty() && !TxScheduler::getInstance()->active(TX_TASK_SELFHEAL)) {
-        SelfHeal::getInstance()->note_rearm();
-    }
-    loop_prof_mark(LOOP_SEG_PSOC, seg_t);
-
-    // ★每轮重写运行标记★: 判定"上次是否运行中崩溃"依赖 scratch[7]==WD_RUNNING_MAGIC。setup 里只
-    // 设一次的话, 任何把它冲掉的路径都会让判定失真。每轮一条 store, 代价可忽略。
-    // 这样下次崩溃后若仍读到 last_boot_was_wd=0, 就**确证**复位清掉了 scratch —— 看门狗复位与
-    // hardfault 都会保留 scratch, 只有上电复位(POR)会清。即: 供电跌落, 而非软件问题。
-    watchdog_hw->scratch[7] = WD_RUNNING_MAGIC;
-    crash_run_mark();
-    seg_t = loop_seg_begin(LOOP_SEG_HOST_CMD);
-    crash_stage_set(CRASH_STAGE_USB_UPDATE);
-    UsbComm::getInstance()->update();
-    crash_stage_set(CRASH_STAGE_NONE);
-    loop_prof_mark(LOOP_SEG_HOST_CMD, seg_t);
-
-    // ★主机租约★：ping 续期。超时未续期即认定上位机丢失,暂停遥测(自洽:绿灯亦据此判连接)。
-    // ★只挂起、不永久停★: core0 可能只是被长设备操作(JIT 算法下发/校准/flash 落地)按在
-    // UsbComm::update() 之外几秒 —— 上位机其实一直在, 但租约照样过期。旧实现在这里调 stop(),
-    // 把 _streaming 清掉且没有任何恢复路径 → 上位机不会再发 TELEM_START → 全通道 raw/baseline/diff
-    // 永久冻结, 只能复位设备。改为挂起, 主机命令一到即用原参数自动续推。
-    if ((millis() - g_last_host_cmd_ms) > HOST_LEASE_TIMEOUT_MS) {
-        SensorLink::getInstance()->suspend();
-    } else {
-        SensorLink::getInstance()->resume();
-    }
-
-    // ★算法下发结果上报★: 下发已异步化(core1 执行), 失败只有 core1 知道。在此取走标志上报,
-    // 使"算法没真正装上"永远有据可查, 而不是让用户以为自定义算法正在跑。
-    if (psoc->algo_download_take_failure()) {
-        SelfHeal::getInstance()->note(SH_ALGO_FALLBACK, 1u);
-    }
-    // 代码下发完成后补推每通道 ROM 与 cfg[8](不可放进 USB 命令处理器, 会拖住 ACK)。
-    PsocAlgo::getInstance()->tick(psoc);
-
-    // ★大吞吐统一走定时任务队列★: 遥测等周期发送由 TxScheduler 按各自频率+租约驱动(续期制),
-    // 帧经非阻塞 config_write 入 vendor TX FIFO, 由 HAL_USB task() 泵出。不再在此直接 tick 遥测。
-    seg_t = loop_seg_begin(LOOP_SEG_TX_SCHED);
-    TxScheduler::getInstance()->tick();
-    loop_prof_mark(LOOP_SEG_TX_SCHED, seg_t);
-
-    seg_t = loop_seg_begin(LOOP_SEG_GAME_IO);
-    {
-        const uint32_t gio_t = gio_seg_begin(GIO_SEG_BINDING);
-        // 掩码与"是否可信"都取 Psoc 的统一裁决(见 psoc.h touch_mask/touch_hold_ok):
-        // 瞬时 link_ok 在遥测分页期间频繁为假, 用它清零会让指触绑定在按着的时候突然丢采样。
-        // 扫描会话期间掩码无意义(见 SensorLink::output_suppressed): 按"不可信"喂给绑定捕获,
-        // 免得把逐格改参数产生的噪声采成用户的指触样本。
-        const bool touch_trusted = psoc->touch_hold_ok() &&
-                                   !SensorLink::getInstance()->output_suppressed();
-        const uint64_t touch_now = psoc->touch_mask();
-        BindingService::getInstance()->tick(touch_now, touch_trusted);
-        // ★HID 触摸屏点位: 复用同一对 (掩码, 可信) 裁决★
-        // 不自行重算 touch_hold_ok/output_suppressed —— 两处各算一遍必然漂移出"绑定看得见触摸、
-        // 触摸屏却不动"这类分叉。HID 模式外本调用内部直接返回, serial 模式零开销、零副作用。
-#if MAI2_ENABLE_SERIAL_HID
-        HidTouchMapper::getInstance()->tick(touch_now, touch_trusted);
-#endif
-        gio_seg_mark(GIO_SEG_BINDING, gio_t);
-    }
-    GameIoService::getInstance()->task();
-    loop_prof_mark(LOOP_SEG_GAME_IO, seg_t);
-    // 物理键盘(GPIO1-12) + 触控→键盘映射 → HID(内部 task HID 发报文)。
-#if MAI2_ENABLE_SERIAL_HID
-    seg_t = loop_seg_begin(LOOP_SEG_KEYBOARD);
-    KeyboardService::getInstance()->task();
-    loop_prof_mark(LOOP_SEG_KEYBOARD, seg_t);
-#endif
-
-    // ★flash 落地安全窗口★：命令 handler 只置保存信号，实际 flash 写在此(命令已处理完、ACK 已发)执行。
-    // flash 写内部已用 disable_interrupts()+multicore_lockout(暂停 core1)保护 XIP 擦写窗口，
-    // 两核都不访问总线→写后 USB 自动恢复，无需重新枚举(照抄 v3.1，不再 reconnect)。
-    // ★每轮最多落一份★: 单份 LittleFS 写要禁中断 + 停 XIP + lockout core1 数十~上百 ms, 期间
-    // TinyUSB 的 USB 中断完全得不到服务。一次"保存到设备"会同时置起 config/csd/algo 三个信号,
-    // 三份背靠背写 = 数百 ms 连续 USB 黑洞, 主机侧待处理的 OUT 传输会被 Windows 直接 abort
-    // (实测 kind=ConnectionAborted → 拆端点 → 判断开)。分轮落地, 每份之间必有一次完整 USB 服务轮。
-    {
-        seg_t = loop_seg_begin(LOOP_SEG_NV_COMMIT);
-        // ★必须等 core1 空闲才落盘★: flash 写内部 multicore_lockout_start_blocking(core1), 而
-        // core1 若正在执行重操作(PSoC 重初始化 / 全通道校准, _wait_op_done 轮询数秒), 期间它不进
-        // wfe 也就响应不了 lockout ⇒ core0 死等、不喂狗 ⇒ 5s 看门狗复位整机。实测正是"保存后约
-        // 8.5 秒掉线 + 设备重新枚举 + LED 重启"。落盘信号是粘性的, 推迟一轮没有任何副作用。
-        // ★本层绝对不要再套 lockout / 关中断★
-        // save_config_task / CsdConfig::save / PsocAlgo::save **内部已经**有完整的
-        // FlashWriteGuard + save_and_disable_interrupts() + multicore_lockout_start_blocking()
-        // (见 config_manager.cpp:1313)。在这里再包一层 = 嵌套 lockout: core1 已被内层锁住,
-        // 响应不了外层请求, core0 永久死等。本层只负责"什么时候允许落盘"这个门控。
-        // ★命令信封关闭后才允许擦 flash★：200ms 足以吸收同一批 host 命令的正常帧间抖动，
-        // 同时避免命令洪流期间反复进入 flash 黑洞；脏标记保持粘性，门未开时只延后本轮。
-        constexpr uint32_t NV_COMMIT_QUIET_MS = 200u;
-        // ★安静窗口只管"起片", 不管"续片"★: 落盘已按扇区分片跨轮进行(见 NvStore 的分片注释)。
-        // 若续片也要等安静窗口, 命令洪流下一个区会长时间停在半成品状态 —— 单份存储下那正是最该
-        // 缩短的窗口。core1_idle 仍是硬条件(它关系到 lockout 死锁, 不能让)。
-        const bool commit_window_open = psoc->core1_idle() &&
-            (NvStore::getInstance()->commit_in_progress() ||
-             (static_cast<uint32_t>(millis() - g_last_host_cmd_ms) >= NV_COMMIT_QUIET_MS &&
-              !UsbComm::getInstance()->has_pending_response()));
-        if (commit_window_open) {
-            // ★先把各服务的"待保存"信号收进 NvStore 镜像(纯内存), 再由 commit_step 落一个区★
-            // 这三步都不擦写 flash, 只更新镜像 + 置脏; 真正的擦写只有下面 commit_step 一处。
-            if (ConfigManager::has_pending_save()) {
-                ConfigManager::save_config_task();
-            }
-            if (CsdConfig::getInstance()->has_pending_save()) {
-                CsdConfig::getInstance()->save();
-            }
-            if (PsocAlgo::getInstance()->has_pending_save()) {
-                PsocAlgo::getInstance()->save();
-            }
-            // 每轮最多落一个脏区: 一次"保存到设备"通常脏了 KV + 若干 blob, 背靠背写会连续几百 ms
-            // 停 XIP/关中断, 主机在途传输被 abort。摊到多轮, 每轮之间 USB 正常服务。
-            if (NvStore::getInstance()->dirty()) {
-                crash_stage_set(CRASH_STAGE_CFG_FLASH);
-                if (NvStore::getInstance()->commit_step()) {
-                    g_usb_dbg.flash_write_count++;
-                    g_usb_dbg.loop_at_last_flash = g_usb_dbg.loop_count;
-                }
-                crash_stage_set(CRASH_STAGE_NONE);
-            }
-        }
-        loop_prof_mark(LOOP_SEG_NV_COMMIT, seg_t);
-    }
-
-    {
-        NvStore* nv = NvStore::getInstance();
-        g_usb_dbg.nv_dirty_mask = nv->dirty_mask();
-        g_usb_dbg.nv_commit_ok = nv->commit_ok_count();
-        g_usb_dbg.nv_commit_fail = nv->commit_fail_count();
-        g_usb_dbg.nv_algo_src_len = nv->algo_src_len();
-        g_usb_dbg.nv_valid_mask = nv->valid_mask();
-        g_usb_dbg.psoc_heavy_rejects = psoc->heavy_reject_count();
-        g_usb_dbg.psoc_heavy_busy = psoc->heavy_busy() ? 1u : 0u;
-        // core1 阶段码镜像进上报结构(core1 写 g_core1_stage, core0 只读搬运)。
-        g_usb_dbg.core1_stage = g_core1_stage;
-    }
-
-    // ★vendor OUT 自愈★：每轮检查 config vendor OUT 是否仍处 arm 态，若因 flash 扰动等
-    // 掉出则重新武装。放在 flash 落地之后，确保刚写完 flash 即可立即恢复 host→device 接收。
-    HAL_USB_Device::getInstance()->vendor_service();
-
-    // ★主循环心跳★：LED 每 150ms 亮灭翻转 = loop 在跑；若卡住则 LED 停在某态(不再闪)。
-    // 状态优先级保持既有语义：主机连接常亮优先，其余依次为 flash 未就绪、SPI 链路断、健康。
-    seg_t = loop_seg_begin(LOOP_SEG_LED);
-    const PsocBringupReport& report = updater->report();
-    LedService* led = LedService::getInstance();
-    const uint8_t status_brightness = std::min<uint8_t>(
-        ConfigManager::get_uint8("led.status_brightness"), 255u);
-    const uint8_t connected_color = std::min<uint8_t>(
-        ConfigManager::get_uint8("led.color_connected"), 7u);
-    const uint8_t flash_error_color = std::min<uint8_t>(
-        ConfigManager::get_uint8("led.color_flash_error"), 7u);
-    const uint8_t link_error_color = std::min<uint8_t>(
-        ConfigManager::get_uint8("led.color_link_error"), 7u);
-    const uint8_t healthy_color = std::min<uint8_t>(
-        ConfigManager::get_uint8("led.color_healthy"), 7u);
-    const bool led_enabled = ConfigManager::get_bool("led.enable");
-    // 近 2s 内收到过 host_cmd 帧 = 已连接；沿用现有租约语义。
-    const bool host_connected = (millis() - g_last_host_cmd_ms) < 2000u;
-    static uint32_t hb_last = 0;
-    static bool hb_on = false;
-    if (!led_enabled) {
-        led->set_color(0u, 0u);
-        hb_on = false;
-        hb_last = millis();
-    } else if (!provisioned) {
-        // ★PSoC 启动/重启加载指示★：链路(重新)建立、CSD/算法尚未下发完成前状态灯常亮(白),
-        // provisioned 置真(进入正常工作)即转入下方常规状态逻辑, 便于肉眼清晰分辨 PSoC 重启窗口。
-        led->set_color(7u /* 白 */, status_brightness);
-        hb_on = false;
-        hb_last = millis();
-    } else if (host_connected) {
-        led->set_color(connected_color, status_brightness);
-        hb_on = false;
-        hb_last = millis();
-    } else if (millis() - hb_last >= 150) {
-        hb_last = millis();
-        hb_on = !hb_on;
-        const uint8_t status_color = !report.flash_ok()
-            ? flash_error_color
-            : (!report.link_ok ? link_error_color : healthy_color);
-        led->set_color(status_color, hb_on ? status_brightness : 0u);
-    }
-    loop_prof_mark(LOOP_SEG_LED, seg_t);
-
-    loop_prof_total(loop_t0);
-    watchdog_update();
+    app::core0_loop_step(g_core0);
 }

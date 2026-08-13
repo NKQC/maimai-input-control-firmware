@@ -9,7 +9,29 @@
 #include "../../service/usb_debug.h"   // crash_stage_set(): 阻塞等待期间记录阶段码
 
 namespace {
-constexpr uint32_t CORE1_CYCLE_US = 1000;        // core1 固定周期 1ms(1kHz), 保证传感器时序恒定
+// ★core1 改为动态响应式★
+// 原实现每轮把时间补齐到固定 1ms。那让"响应延迟"恒等于一个完整周期: 触控帧最坏要等 1ms 才被
+// 取走, 命令环里的读类命令同样按 1ms 的粒度排队。而 PSoC 侧与 RP 侧都带时间戳、时序由 PSoC 自己
+// 的扫描周期决定 —— RP 这边并不需要靠"恒定轮询节拍"来维持时序一致性, 各子任务(快照按扫描周期、
+// GET_STATS 按 250ms)本就各自节流。
+// 现在: 做完即进入下一轮, 只保留一个最小间隔下限。下限的作用是给 PSoC 的 CapSense 留出 SPI 空窗
+// (它的 DMA ISR 会推迟中间件的临界区), 而不是为了对齐节拍。
+// 效果: 触控与命令响应的最坏等待从 1ms 降到 CORE1_MIN_GAP_US。
+constexpr uint32_t CORE1_MIN_GAP_US = 150;        // 相邻两轮之间给 PSoC 留的最小 SPI 空窗
+// ★再进一步: 由 PSoC 主动通知取代"按最小间隔不停试"★
+// 最小间隔只是把空转变慢, 并没有消除空转: PSoC 每 scan_period(实测约 6.1ms)才产出一份新代数,
+// 而 core1 每 150us 就去读一次触控 —— 约 40 次里只有 1 次拿到的是新数据, 其余 39 次纯粹是白发
+// SPI 事务, 每一次都让 PSoC 的 DMA ISR 抢走一小段 CapSense 中间件的临界区时间。
+// PSoC 现在每发布一份新快照就翻转 P1.4(SENSOR-INT1 → GPIO23), core1 等这个翻转再干活。
+// 门限/兜底(缺一不可, 否则通知线一有问题整机就哑了):
+//   · 先自由跑, 累计观测到 INT1_ARM_EDGES 次翻转才认定通知线可信(armed);
+//   · armed 后等待上限取实测扫描周期的两倍 + 1ms 余量, 迟到即算这一轮通知丢失;
+//   · 连续 INT1_DISARM_TIMEOUTS 次超时就解除 armed 退回自由跑(等价于改造前的行为),
+//     之后一旦重新观测到翻转会自动再 arm —— 旧 PSoC 固件、通知线断线、PSoC 复位期间都能自愈。
+constexpr uint32_t INT1_ARM_EDGES        = 4;      // 认定通知线可信所需的翻转次数
+constexpr uint32_t INT1_DISARM_TIMEOUTS  = 3;      // 连续超时到此即退回自由跑
+constexpr uint32_t INT1_WAIT_FALLBACK_US = 3000;   // 扫描周期尚未测出时的等待上限
+constexpr uint32_t INT1_WAIT_CAP_US      = 20000;  // 等待上限硬顶(保证 250ms 级周期任务不被拖死)
 constexpr uint32_t SPI_CMD_TIMEOUT_US = 100000;  // core0 命令信箱等待上限 100ms
 // 失效兜底阈值:
 //   链路丢失: 连续 ~200 个 1ms 周期(≈200ms)read_touch 失败 = PSoC 崩溃/掉线。
@@ -17,6 +39,7 @@ constexpr uint32_t SPI_CMD_TIMEOUT_US = 100000;  // core0 命令信箱等待上�
 //     阈值刻意高于最长合法主循环停顿(MEASURE_CP 逐电极测量 ~1.5s), 避免测量期间误复位。
 constexpr uint32_t LINK_FAIL_RESET_CYCLES = 200;
 constexpr uint32_t HANG_STATS_INTERVALS   = 8;
+constexpr uint32_t RUNTIME_PARAM_APPLY_TIMEOUT_MS = 3000u;
 // ★XRES 复位后 PSoC 启动宽限★: XRES 复位(手动 REBOOT_PSOC 或失效兜底)后 PSoC 需重跑
 // initialize_capsense(含 Cy_CapSense_Enable 全通道自动校准)才恢复 SPI 应答, 耗时可达数百 ms,
 // 远超 LINK_FAIL_RESET_CYCLES(200ms)。若不设宽限, 兜底会在 PSoC 启动完成前又发 XRES →
@@ -65,9 +88,6 @@ bool Psoc::init() {
 bool Psoc::_op_is_heavy(SpiOp op) {
     switch (op) {
         case SpiOp::APPLY:
-        // QUICK_APPLY 虽只做 Initialize(百 ms 量级), 仍由 PSoC 主循环同步执行且期间不应答扫描 ⇒
-        // 必须与其它重操作共用同一条反堆叠闸门, 否则 Sweep 的逐格应用会与主机指令互相插队。
-        case SpiOp::QUICK_APPLY:
         case SpiOp::CALIBRATE:
         case SpiOp::BASELINE_RESET:
         case SpiOp::GLOBAL_COMMIT:
@@ -80,12 +100,173 @@ bool Psoc::_op_is_heavy(SpiOp op) {
     }
 }
 
+bool Psoc::_poll_heavy_async() {
+    if (_heavy_async.active == 0u) return false;
+    const uint32_t now_ms = millis();
+    // 状态探针与触控保活各 20ms，错开半周期。PSoC 只有在无 SPI 中断窗口才会消费 pending，
+    // 因此不能在这里高频自旋 GET_STATS，否则会把“等待完成”本身变成完成不了的原因。
+    if ((uint32_t)(now_ms - _heavy_async.last_poll_ms) < 20u) return true;
+    _heavy_async.last_poll_ms = now_ms;
+    uint32_t scan_count = 0u;
+    uint8_t busy = 0u;
+    const bool response_ok = _spi.get_stats(&scan_count, &busy);
+    if (!response_ok) {
+        if (_heavy_async.response_fail_run < 0xFFu) _heavy_async.response_fail_run++;
+    } else {
+        _heavy_async.response_fail_run = 0u;
+        const bool scan_advanced = _heavy_async.scan_seen != 0u &&
+                                   scan_count != _heavy_async.last_scan_count;
+        _heavy_async.last_scan_count = scan_count;
+        _heavy_async.scan_seen = 1u;
+        if (busy != 0u) {
+            _heavy_async.seen_busy = 1u;
+            if (scan_advanced) {
+                if (_heavy_async.scan_progress_polls < 2u) _heavy_async.scan_progress_polls++;
+                // 部署版 PSoC 可残留 busy=1；APPLY 后参数/算法已由 provisioning 队列写完，
+                // 连续 scan_count 推进才是主循环重新健康的终态。仅一次推进可能是受理前扫描收尾。
+                if (_heavy_async.scan_progress_polls >= 2u) {
+                    _complete_heavy_async(true);
+                    return false;
+                }
+            }
+        } else if (_heavy_async.seen_busy != 0u || scan_advanced) {
+            _complete_heavy_async(true);
+            return false;
+        }
+    }
+    // 生命周期只以 PSoC busy 真值闭合；120s 是失联/固件卡死的长兜底，不是正常完成时间。
+    if ((uint32_t)(now_ms - _heavy_async.started_ms) >= 120000u) {
+        _complete_heavy_async(false);
+        return false;
+    }
+    return true;
+}
+
+void Psoc::_complete_heavy_async(bool ok) {
+    _heavy_async.clear();
+    _heavy_done = _heavy_done + 1u;
+    if (!ok && _pub_reset_reason == 0u) _pub_reset_reason = 2u;
+}
+
+void Psoc::_complete_runtime_param_apply(bool ok) {
+    _runtime_apply.ok = ok ? 1u : 0u;
+    _runtime_apply.active = 0u;
+    _runtime_apply.pending = 0u;
+    _runtime_apply.complete = 1u;
+    // Runtime parameter apply is deliberately outside the heavy lifecycle.
+    // Failure is reported to SensorLink, which records a hole and restores RAM state.
+}
+
+bool Psoc::_poll_runtime_param_apply() {
+    if (_runtime_apply.active == 0u) return false;
+    const uint32_t now_ms = millis();
+    if ((uint32_t)(now_ms - _runtime_apply.last_poll_ms) < 20u) return true;
+    _runtime_apply.last_poll_ms = now_ms;
+
+    uint32_t scan_count = 0u;
+    if (!_spi.runtime_param_apply_poll(&scan_count, nullptr)) {
+        if (_runtime_apply.response_fail_run < 0xFFu) _runtime_apply.response_fail_run++;
+        if (_runtime_apply.response_fail_run < 25u &&
+            (uint32_t)(now_ms - _runtime_apply.started_ms) < RUNTIME_PARAM_APPLY_TIMEOUT_MS) return true;
+        _complete_runtime_param_apply(false);
+        return false;
+    }
+    _runtime_apply.response_fail_run = 0u;
+
+    if (_runtime_apply.scan_seen != 0u && scan_count != _runtime_apply.last_scan_count &&
+        _runtime_apply.params_confirmed != 0u) {
+        _runtime_apply.scan_progress_polls = 1u;
+    }
+    _runtime_apply.last_scan_count = scan_count;
+    _runtime_apply.scan_seen = 1u;
+
+    if (_runtime_apply.params_confirmed == 0u &&
+        (uint32_t)(now_ms - _runtime_apply.last_param_poll_ms) >= 100u) {
+        _runtime_apply.last_param_poll_ms = now_ms;
+        uint32_t gain = 0u;
+        uint32_t div = 0u;
+        if (_spi.get_param(_runtime_apply.target_ch, 0x0Bu, &gain) &&
+            _spi.get_param(_runtime_apply.target_ch, 0x08u, &div) &&
+            gain == _runtime_apply.target_gain && div == _runtime_apply.target_div) {
+            _runtime_apply.params_confirmed = 1u;
+            _runtime_apply.last_scan_count = scan_count;
+            _runtime_apply.scan_progress_polls = 0u;
+        }
+    }
+
+    if (_runtime_apply.params_confirmed != 0u && _runtime_apply.scan_progress_polls != 0u) {
+        _complete_runtime_param_apply(true);
+        return false;
+    }
+    if ((uint32_t)(now_ms - _runtime_apply.started_ms) >= RUNTIME_PARAM_APPLY_TIMEOUT_MS) {
+        _complete_runtime_param_apply(false);
+        return false;
+    }
+    return true;
+}
+
+bool Psoc::_poll_algo_upload_async() {
+    if (_algo_upload_async.active == 0u) return false;
+    const uint32_t now_ms = millis();
+    // 页阶段由 core1 的 1ms 周期自然推进；commit 阶段的 INFO 节流由 SPI 状态机自身保证。
+    // 不在这里再限频，否则默认 135 页会被人为拉长到数秒，错过主机的即时回读窗口。
+    _algo_upload_async.last_poll_ms = now_ms;
+    bool complete = false;
+    bool ok = false;
+    bool valid = false;
+    uint16_t len = 0u;
+    const bool response_ok = _spi.poll_upload_algo(&complete, &ok, &valid, &len);
+    if (!response_ok) {
+        if (_algo_upload_async.response_fail_run < 0xFFFFu) _algo_upload_async.response_fail_run++;
+        if (!complete && _algo_upload_async.response_fail_run < 200u &&
+            (uint32_t)(now_ms - _algo_upload_async.started_ms) < 120000u) return true;
+        _algo_upload_async.clear();
+        _algo_dl.failed = 1u;
+        _algo_dl.busy = 0u;
+        _heavy_done = _heavy_done + 1u;
+        _invalidate_algo_info_cache();
+        return false;
+    }
+    _algo_upload_async.response_fail_run = 0u;
+    if (!complete) {
+        if (valid || len != 0u) _publish_algo_info_cache(valid, len);
+        if ((uint32_t)(now_ms - _algo_upload_async.started_ms) < 120000u) return true;
+        _algo_upload_async.clear();
+        _algo_dl.failed = 1u;
+        _algo_dl.busy = 0u;
+        _heavy_done = _heavy_done + 1u;
+        _invalidate_algo_info_cache();
+        return false;
+    }
+    if (!ok) {
+        _algo_upload_async.clear();
+        _algo_dl.failed = 1u;
+        _algo_dl.busy = 0u;
+        _heavy_done = _heavy_done + 1u;
+        _invalidate_algo_info_cache();
+        return false;
+    }
+    _publish_algo_info_cache(true, len);
+    _algo_upload_async.clear();
+    _algo_dl.busy = 0u;
+    _heavy_done = _heavy_done + 1u;
+    return true;
+}
+
 // core1 每周期执行体: 命令信箱 → 触控快路 → 快照慢路 → 采样率统计。
 void Psoc::_spi_service() {
     if (!_spi_ready) return;
 
+    const bool heavy_poll_cycle = _heavy_async.active != 0u;
+    const bool heavy_still_active = _poll_heavy_async();
+    const bool runtime_apply_poll_cycle = _runtime_apply.active != 0u;
+    const bool algo_poll_cycle = _algo_upload_async.active != 0u;
+    _poll_runtime_param_apply();
+    _poll_algo_upload_async();
     // 1) 命令队列: 每周期最多消费 CMD_DRAIN_PER_CYCLE 条(限制周期抖动), FIFO 顺序执行。
     for (uint32_t n = 0; n < CMD_DRAIN_PER_CYCLE; ++n) {
+        if (heavy_poll_cycle || heavy_still_active || _heavy_async.active != 0u ||
+            runtime_apply_poll_cycle || _runtime_apply.active != 0u || algo_poll_cycle || _algo_upload_async.active != 0u) break;
         if (_cmd_tail == _cmd_head) break;          // 队空
         SpiCmd& c = _cmd_ring[_cmd_tail];
         uint32_t r = 0;
@@ -99,91 +280,153 @@ void Psoc::_spi_service() {
         // core1 会把 7 盖到 core0 的真实阶段上 —— "死前遗言"恒报 CORE1_CMD, 排查被引到错误的核。
         core1_stage_set(CRASH_STAGE_CORE1_CMD);
         __dmb();
-        const bool ok = _exec_cmd(c.op, c.ch, c.pid, c.val, &r, c.data);
-        c.result = r;
-        c.ok = ok;
-        __dmb();
-        c.done = true;                              // 发布结果(读类 core0 在等)
-        if (c.async_token != 0u && c.async_token == _sweep_async.token) {
-            _sweep_async.ok = ok ? 1u : 0u;
+        const bool runtime_apply_cmd = c.async_owner == AsyncOwner::RUNTIME_PARAM &&
+                                       c.async_token != 0u && c.async_token == _runtime_apply.token;
+        if (runtime_apply_cmd) {
+            bool ok = false;
+            if (c.op == SpiOp::RUNTIME_PARAM_APPLY) {
+                ok = _spi.begin_runtime_param_apply(c.ch, c.pid, (uint8_t)c.val);
+            }
+            c.result = 0u;
+            c.ok = ok;
             __dmb();
-            _sweep_async.pending = 0u;
-            _sweep_async.complete = 1u;
+            c.done = true;
+            if (ok) {
+                // Runtime apply is not a heavy operation and must not extend the heavy grace window.
+                _reset_grace_until_ms = millis();
+                _hang_intervals = 0u;
+                _runtime_apply.active = 1u;
+                _runtime_apply.started_ms = millis();
+                _runtime_apply.last_poll_ms = _runtime_apply.started_ms;
+                _runtime_apply.last_touch_ms = _runtime_apply.started_ms - 10u;
+                _runtime_apply.response_fail_run = 0u;
+                _runtime_apply.scan_progress_polls = 0u;
+                _runtime_apply.params_confirmed = 0u;
+                _runtime_apply.last_param_poll_ms = 0u;
+                _runtime_apply.last_scan_count = 0u;
+                _runtime_apply.scan_seen = 0u;
+                __dmb();
+            } else {
+                _complete_runtime_param_apply(false);
+            }
+        } else {
+            const bool exec_ok = _exec_cmd(c.op, c.ch, c.pid, c.val, &r, c.data);
+            c.result = r;
+            c.ok = exec_ok;
+            __dmb();
+            c.done = true;
+            if (c.async_owner == AsyncOwner::HOST_WRITE &&
+                c.async_token != 0u && c.async_token == _host_write.token) {
+                _host_write.ok = exec_ok ? 1u : 0u;
+                __dmb();
+                _host_write.pending = 0u;
+                _host_write.complete = 1u;
+            }
+            if (_op_is_heavy(c.op)) {
+                if (c.op == SpiOp::APPLY && exec_ok) {
+                    // APPLY 只确认受理，之后由低频 GET_STATS 观察 PSoC busy 自然归还。
+                    _heavy_async.active = 1u;
+                    _heavy_async.seen_busy = 0u;
+                    _heavy_async.started_ms = millis();
+                    _heavy_async.last_poll_ms = _heavy_async.started_ms - 20u;
+                    _heavy_async.last_touch_ms = _heavy_async.started_ms - 10u;
+                    _heavy_async.response_fail_run = 0u;
+                    _heavy_async.scan_seen = 0u;
+                    _heavy_async.scan_progress_polls = 0u;
+                    _heavy_async.last_scan_count = 0u;
+                    _reset_grace_until_ms = _heavy_async.started_ms + 130000u;
+                } else if (c.op == SpiOp::UPLOAD_ALGO && exec_ok) {
+                    // 代码上传由独立状态机推进，直到 commit 的双次 INFO 确认后才归还 heavy 槽。
+                } else {
+                    _heavy_done = _heavy_done + 1u;
+                }
+            }
         }
         __dmb();
-        _cmd_tail = (_cmd_tail + 1) % CMD_RING_SIZE; // 消费者推进 tail, 释放槽位
-        // 长周期指令出清: core1 是本计数器的唯一写者, 与 core0 的 _heavy_enq 配对(见 heavy_busy)。
-        if (_op_is_heavy(c.op)) _heavy_done = _heavy_done + 1u;
+        _cmd_tail = (_cmd_tail + 1u) % CMD_RING_SIZE;
         __dmb();
         _core1_in_cmd = 0u;
         core1_stage_set(CRASH_STAGE_NONE);   // 本条执行完即复位, 阶段码不再"粘住"
     }
 
-    // 2) 触控快路: 单次 7 字节事务读 36 区位图, 实测耗时。seqlock 发布防 u64 撕裂。
+    // 2) 触控快路：常态 1kHz；普通 heavy 与 runtime apply 异步生命周期中降为 50Hz。
+    // PSoC 只在 CapSense NOT_BUSY 时消费 pending；若仍每 1ms 触发 SPI ISR，它可能永远抢不到
+    // 主循环空窗。降频期间跳过的周期不是链路失败，不更新失败连击；真实保活帧仍按既有逻辑发布。
+    const uint32_t touch_now_ms = millis();
+    const bool async_active = _heavy_async.active != 0u || _runtime_apply.active != 0u ||
+                              _algo_upload_async.active != 0u;
+    const uint32_t async_last_touch_ms = (_algo_upload_async.active != 0u)
+        ? _algo_upload_async.last_touch_ms
+        : ((_runtime_apply.active != 0u) ? _runtime_apply.last_touch_ms : _heavy_async.last_touch_ms);
+    const bool touch_due = !async_active ||
+        (uint32_t)(touch_now_ms - async_last_touch_ms) >= 20u;
     uint64_t mask = 0;
-    const uint32_t t0 = time_us_32();
-    const bool ok = _spi.read_touch(&mask);
-    const uint32_t tr = time_us_32() - t0;
-    latency_note(&g_lat_spi_us, tr);
+    uint32_t tr = 0u;
+    bool ok = _pub_link_ok;
+    if (touch_due) {
+        if (_algo_upload_async.active != 0u) _algo_upload_async.last_touch_ms = touch_now_ms;
+        if (_runtime_apply.active != 0u) _runtime_apply.last_touch_ms = touch_now_ms;
+        if (_heavy_async.active != 0u) _heavy_async.last_touch_ms = touch_now_ms;
+        const uint32_t t0 = time_us_32();
+        ok = _spi.read_touch(&mask);
+        const uint32_t t1 = time_us_32();
+        tr = t1 - t0;
+        latency_note(&g_lat_spi_us, tr);
 
-    // 算法信息只在本周期触控事务完成后、命令环排空且无长周期操作时刷新，避免嵌套 SPI。
+        // ★触发式更新 + 有限保留 + 到期优雅释放★(掩码即真相, 见 psoc.h touch_mask 注释)
+        _pub_seq++;
+        __dmb();
+        if (ok) {
+            _pub_touch_mask = mask;
+            _touch_fail_run = 0;
+            _pub_touch_hold = true;
+        } else {
+            _pub_touch_bad = _pub_touch_bad + 1u;
+            if (_touch_fail_run < TOUCH_RELEASE_FAIL_CYCLES) {
+                _touch_fail_run++;
+            } else if (_pub_touch_hold) {
+                _pub_touch_mask = 0;
+                _pub_touch_hold = false;
+                _pub_touch_releases = _pub_touch_releases + 1u;
+            }
+        }
+        _pub_link_ok = ok;
+        if (ok) _pub_link_ok_ms = touch_now_ms;
+        _pub_touch_read_us = tr;
+        // 掩码到手的时刻。core0 的延迟补偿以此为基准计算"采样 → 实际发出"的真实间隔;
+        // 失败周期保留上一次的时间戳，因为此时对外发布的仍是上一份掩码。
+        if (ok) _pub_touch_sample_us = t1;
+        __dmb();
+        _pub_seq++;
+
+        if (ok) {
+            _link_established = true;
+            _link_fail_run = 0;
+        } else if (_link_established) {
+            _invalidate_algo_info_cache();
+            if ((int32_t)(_reset_grace_until_ms - touch_now_ms) > 0) {
+                _link_fail_run = 0;
+            } else if (++_link_fail_run >= LINK_FAIL_RESET_CYCLES && _pub_reset_reason == 0) {
+                _pub_reset_reason = 1;
+            }
+        }
+    }
+
+    // 算法信息只在本周期真实完成触控事务、命令环排空且无长周期操作时刷新，避免嵌套 SPI。
     const uint32_t algo_now_ms = millis();
-    if (_cmd_tail == _cmd_head && _core1_in_cmd == 0u && !heavy_busy() &&
+    if (touch_due && _cmd_tail == _cmd_head && _core1_in_cmd == 0u && !heavy_busy() &&
         (uint32_t)(algo_now_ms - _algo_info_last_poll_ms) >= 100u) {
         _algo_info_last_poll_ms = algo_now_ms;
         if (_link_established && ok) {
             _refresh_algo_info_cache();
+            // Algorithm cache is refreshed only; runtime parameter failures are reported to SensorLink.
         } else {
             _invalidate_algo_info_cache();
         }
     }
 
-    // ★触发式更新 + 有限保留 + 到期优雅释放★(掩码即真相, 见 psoc.h touch_mask 注释)
-    //   合法帧            → 更新掩码, 清失败连击, 置可信;
-    //   短暂失败(窗口内)   → 保留最后一份合法掩码(不制造假抬起), 仍视为可信;
-    //   持续失败(窗口外)   → 一次性释放为 0 并置不可信, 交由既有兜底走 XRES/重连,
-    //                       绝不把"按下"永久保持到用户重启设备。
-    _pub_seq++;                       // 进入写临界区(奇)
-    __dmb();
-    if (ok) {
-        _pub_touch_mask = mask;
-        _touch_fail_run = 0;
-        _pub_touch_hold = true;
-    } else {
-        _pub_touch_bad = _pub_touch_bad + 1u;
-        if (_touch_fail_run < TOUCH_RELEASE_FAIL_CYCLES) {
-            _touch_fail_run++;        // 保留窗口内: 掩码不动
-        } else if (_pub_touch_hold) {
-            // 越过窗口的第一拍才动手: 每次故障只释放/只计一次, 不在故障期间反复刷计数。
-            _pub_touch_mask = 0;
-            _pub_touch_hold = false;
-            _pub_touch_releases = _pub_touch_releases + 1u;
-        }
-    }
-    _pub_link_ok = ok;
-    if (ok) _pub_link_ok_ms = millis();   // link_alive() 的去抖依据
-    _pub_touch_read_us = tr;
-    __dmb();
-    _pub_seq++;                       // 离开写临界区(偶)
-
-    // 失效兜底(链路丢失): 链路曾就绪后连续多周期失败 = PSoC 崩溃/掉线 → 请求 XRES 复位。
-    // 复位窗口内 PSoC 短暂无响应(~数周期)远低于阈值, 不会误触发。
-    if (ok) {
-        _link_established = true;
-        _link_fail_run = 0;
-    } else if (_link_established) {
-        _invalidate_algo_info_cache();
-        // XRES 复位后的启动宽限期内: 不累计失败、不触发复位, 让 PSoC 有时间跑完 initialize_capsense
-        // 并恢复 SPI 应答, 避免"启动未完成→又复位"的死循环。宽限过后仍失败才判为真崩溃。
-        if ((int32_t)(_reset_grace_until_ms - millis()) > 0) {
-            _link_fail_run = 0;
-        } else if (++_link_fail_run >= LINK_FAIL_RESET_CYCLES && _pub_reset_reason == 0) {
-            _pub_reset_reason = 1;
-        }
-    }
-
-    // 链路存活指示(遥测未激活时): 仅 bump generation/valid 单字段(原子, 无需 seqlock)。
-    if (ok && !_telem_active) {
+    // 链路存活指示(遥测未激活时): 仅在真实触控保活成功时 bump generation/valid。
+    if (touch_due && ok && !_telem_active) {
         _snapshot.valid = true;
         uint16_t g = _snapshot.generation + 1;
         if (g == 0) g = 1;
@@ -194,15 +437,73 @@ void Psoc::_spi_service() {
     // ★为什么独占时必须换路★ 全通道分块泵每份要 16 个 1ms tick(63页/4页), 上限 62 份/s;
     // 而独占精调只关心这一个通道, 上位机根本不消费其余通道。只读它 ⇒ 单份约 0.5ms, 每拍一份,
     // 实测可达数百份/s, 精调曲线才能不丢细节。全通道流仍走 3b 的分块慢路(30Hz 足够)。
-    if (_telem_active && ok && _focus_ch < psoc::SENSOR_CHANNEL_COUNT) {
+    // 任意异步操作期间均暂停快照搬运：启动 provisioning 的 APPLY 与运行时参数应用一样，
+    // 都只能在 PSoC 的 NOT_BUSY 窗口消费 pending；只按单一异步状态门控会让启动 APPLY 仍被
+    // snapshot page 流饿死，heavy 计数长期不归还，最终连扫描入口也一直 DEVICE_BUSY。
+    // 触控快路和重操作自身的 GET_STATS 仍继续运行，用真实 busy 终态恢复快照。
+    // Full snapshots move 63 PSoC pages, so keep a wide SPI-free window for
+    // CapSense between broad-stream chunks.  The exclusive RP-only focus path
+    // fetches just the selected channel (2-3 pages) and can safely use the
+    // 3ms cadence required for >300Hz delivery without invoking FOCUS_SCAN.
+    const uint32_t snapshot_now_ms = millis();
+    // Snapshot paging itself is a bounded core1 state machine.  Throttling every
+    // chunk to the host stream period multiplies 63 pages into ~3Hz; run one
+    // bounded chunk per core1 cycle and let TxScheduler independently choose the
+    // USB emission rate.  Focus BEGIN/read split then yields one sample per ~3ms.
+    // ★Focus 必须按 PSoC 的扫描节奏取, 不能每拍都取★
+    // 单通道快路一次调用要走完 BEGIN + 取 INFO + 主循环锁存窗 + 2~3 页, 约 0.8ms; 而 core1 周期
+    // 只有 1ms ⇒ 每拍都做就等于把整个核占满, 命令环几乎没有消费窗口。后果是所有**阻塞读类**
+    // 命令(ALGO_GET_TRACE / GET_PARAM / GET_CFG)严重迟滞: 上位机 5s 超时释放后设备响应才迟到,
+    // 于是算法变量永远"暂无运行值"(日志里是成片的 ALGO_GET_TRACE 超时释放)。
+    // 而 PSoC 每 scan_period_us(实测约 5.8ms)才产出一份新代数, 更快地取只是把同一份重复搬运。
+    // 按扫描周期的一半取: 既不丢任何一份新代数(奈奎斯特留一倍余量), 又把 core1 占用降到约 1/3,
+    // 命令环因此恢复正常消费。scan_period 尚未测出时退回 1ms(保持原行为, 不影响建链)。
+    const uint32_t focus_active = (_focus_ch < psoc::SENSOR_CHANNEL_COUNT) ? 1u : 0u;
+    const uint32_t scan_period_ms = _scan_period_us / 1000u;
+    const uint32_t focus_interval_ms = (focus_active != 0u && scan_period_ms >= 2u)
+        ? (scan_period_ms / 2u) : 1u;
+    const uint32_t snapshot_interval_ms = focus_interval_ms;
+    const bool snapshot_due = (uint32_t)(snapshot_now_ms - _snapshot_last_ms) >= snapshot_interval_ms;
+    // Runtime parameter application has to receive an SPI-free PSoC main-loop window,
+    // otherwise its pending command can never be consumed.  Snapshot paging resumes as
+    // soon as the RP-owned apply lifecycle observes parameter readback and scan progress.
+    const bool snapshot_allowed = _telem_active && ok && !heavy_busy() &&
+                                  _runtime_apply.active == 0u && snapshot_due;
+    if (snapshot_allowed) {
+        _snapshot_last_ms = snapshot_now_ms;
+    }
+    if (snapshot_allowed && _focus_ch < psoc::SENSOR_CHANNEL_COUNT) {
         if (_spi.snapshot_pump_channel(_focus_ch, &_snap_work)) {
+            // ★算法运行值在这里顺带取回★
+            // PSoC 没把 report[] 并进 252B 快照, 只能用 ALGO_GET_TRACE 逐项读。每份快照只读**一个**
+            // 槽并轮转: 单份仅多一次约 0.2ms 的 SPI 事务, 4 份凑齐 4 个槽; 独占流上百帧/s 下每个槽
+            // 仍有数十 Hz 刷新, 足够"当前值"显示, 又不会像每份读 4 项那样把 core1 占满。
+            // 只有算法真的有效时才读; 无效时保持 0xFF 通道标记, 上位机据此显示"无上报变量"。
+            if (_algo_info_valid != 0u) {
+                uint8_t active = 0u;
+                uint16_t report = 0u;
+                const uint8_t slot = _algo_trace_slot;
+                if (_spi.algo_get_trace(_focus_ch, slot, &active, &report)) {
+                    _algo_trace_report[slot] = report;
+                    _algo_trace_active = active;
+                    _algo_trace_channel = _focus_ch;
+                }
+                _algo_trace_slot = (uint8_t)((slot + 1u) % psoc::ALGO_REPORT_SLOTS);
+            } else {
+                _algo_trace_channel = 0xFFu;
+            }
+            _snap_work.algo_channel = _algo_trace_channel;
+            _snap_work.algo_active = _algo_trace_active;
+            for (size_t i = 0; i < psoc::ALGO_REPORT_SLOTS; ++i) {
+                _snap_work.algo_report[i] = _algo_trace_report[i];
+            }
             _snap_seq++;              // 进入写临界区(奇)
             __dmb();
             _snapshot = _snap_work;
             __dmb();
             _snap_seq++;              // 离开写临界区(偶)
         }
-    } else if (_telem_active && ok) {
+    } else if (snapshot_allowed) {
     // 3b) 快照慢路: 遥测激活时分块流水读全通道 → 工作缓冲, 读满一份经 seqlock 发布到 _snapshot。
         if (_spi.snapshot_pump(PSOC_SNAPSHOT_PAGES_PER_PUMP, &_snap_work)) {
             _snap_seq++;              // 进入写临界区(奇)
@@ -213,27 +514,33 @@ void Psoc::_spi_service() {
         }
     }
 
-    // 4) 采样率统计: 每 ~500ms 读 PSoC scan_count 折算采样率/刷新周期。
+    // 4) 采样率统计: 每 ~250ms 读 PSoC scan_count 折算采样率/刷新周期。
+    // 两个连续窗口即可在遥测启动后约 500ms 内建立真实速率，满足首帧/建链的 1s 目标；
+    // GET_STATS 仍为低频探针，不与快照流水高频争抢 PSoC 空窗。
     const uint32_t stats_now_us = time_us_32();
-    if (stats_now_us - _stats_last_us >= 500000u) {
-        // ★XRES 启动宽限同样适用于"卡死"检测★: 复位后 PSoC 要重跑 initialize_capsense(数百 ms),
-        // 期间 scan_count 天然不推进。若此时不清零, 上一轮已攒到阈值的 _hang_intervals 会让兜底在
-        // PSoC 尚未启动完成时立刻再发一次 XRES → 反复复位 → 采样永远起不来(只能整机复位才恢复)。
-        // 同时清 primed: 跨复位的 scan_count 从 0 重新开始, 与旧值相减毫无意义。
-        if ((int32_t)(_reset_grace_until_ms - millis()) > 0) {
-            _hang_intervals = 0;
-            _stats_primed = false;
-            _stats_last_us = stats_now_us;
-            return;
-        }
+    if (stats_now_us - _stats_last_us >= 250000u) {
+        // A heavy-operation grace window prevents reset escalation, but it must
+        // never suppress GET_STATS itself: telemetry readiness and Focus use the
+        // fresh scan_count rate as their health contract.  Resetting primed on
+        // every grace tick previously forced samples_per_sec to remain zero for
+        // the entire 70s recovery allowance even while the PSoC was scanning.
+        const bool stats_grace_active = (int32_t)(_reset_grace_until_ms - millis()) > 0;
         uint32_t sc = 0;
         uint8_t psoc_busy = 0;
         if (ok && _spi.get_stats(&sc, &psoc_busy)) {
             if (_stats_primed) {
                 const uint32_t dt = stats_now_us - _stats_last_us;
                 const uint32_t dcount = sc - _stats_last_scan;
-                _samples_per_sec = (uint32_t)(((uint64_t)dcount * 1000000ULL) / dt);
-                _scan_period_us = (_samples_per_sec > 0u) ? (1000000u / _samples_per_sec) : 0u;
+                if (dcount != 0u) {
+                    const uint32_t rate = (uint32_t)(((uint64_t)dcount * 1000000ULL) / dt);
+                    if (rate != 0u) {
+                        _samples_per_sec = rate;
+                        _scan_period_us = 1000000u / rate;
+                    }
+                }
+                // 一个短统计窗读到相同 scan_count 只说明该窗未观察到推进：保留上一份
+                // 已验证速率，健康检测仍使用 dcount/busy 的独立真值，不能把临时空窗伪装成
+                // 扫描速率为零并让刚建立的遥测会话错误失败。
                 // 失效兜底(主循环卡死): scan_count 长时间不推进 = PSoC 主循环卡死(疑似坏算法死循环)。
                 // 注意 read_touch 仍由 PSoC SPI ISR 应答, 故 link_ok 不掉, 只能靠 scan_count 检测。
                 // ★"忙"不等于"卡死": PSoC 报告 busy 时不得累计卡死计数★
@@ -244,7 +551,9 @@ void Psoc::_spi_service() {
                 // raw 全 0, SelfHeal 累计上百次)。真正的卡死(坏算法死循环)不会置 busy, 仍能被抓到;
                 // 重操作本身另有 _wait_op_done 的超时兜底, 不依赖这里。
                 if (_link_established) {
-                    if (dcount == 0u && psoc_busy == 0u) {
+                    if (stats_grace_active) {
+                        _hang_intervals = 0;
+                    } else if (dcount == 0u && psoc_busy == 0u) {
                         if (++_hang_intervals >= HANG_STATS_INTERVALS && _pub_reset_reason == 0) {
                             _pub_reset_reason = 2;
                         }
@@ -268,18 +577,89 @@ bool Psoc::link_alive(uint32_t within_ms) const {
     return (uint32_t)(millis() - last) <= within_ms;
 }
 
-// core1 入口: 置运行标志后进入固定 1ms 周期循环, 永不返回。
+// core1 入口: 置运行标志后进入"做完即下一轮 + 等 PSoC 通知"的循环, 永不返回。
 // 注意: 调用方(core1_entry)必须已先调 multicore_lockout_victim_init(), 否则 flash 写入会死锁。
 void Psoc::core1_run() {
     _core1_running = true;
+    _int1_init();
     __dmb();
     while (true) {
         const uint32_t cycle_start = time_us_32();
         _spi_service();
-        // 恒定周期: 补足到 CORE1_CYCLE_US, 保证传感器时序每周期一致。
-        while ((time_us_32() - cycle_start) < CORE1_CYCLE_US) {
+        // 最小 SPI 空窗: 无论走通知还是自由跑都必须给 PSoC 留出来(它的 DMA ISR 会推迟 CapSense
+        // 中间件的临界区)。忙(有快照分页/命令要跑)时这段几乎不等待。
+        while ((time_us_32() - cycle_start) < CORE1_MIN_GAP_US) {
             tight_loop_contents();
         }
+        // 之后要么立刻返回(还有活干 / 通知线不可信 / 已经有新代数), 要么在此等下一份新代数。
+        _int1_wait_generation();
+    }
+}
+
+// GPIO23 = PSoC P1.4 的新代数通知线。只读, 不装中断: core1 本来就是个独占循环, 在它的等待段里
+// 直接比较电平即可, 比 GPIO IRQ + 清标志少一整套状态。
+// ★不加内部上下拉★: 这条线经板上电平移位器中继(见 doc/hardware.txt), 自动方向型移位器明确
+// 不允许挂比 50k 更强的上下拉, 而 RP2040 内部上下拉正好落在这个量级。悬空/PSoC 复位期间可能
+// 读到乱翻转, 但那只会让 core1 提前醒 —— 等价于改造前的自由跑, 不产生错误行为。
+void Psoc::_int1_init() {
+    gpio_init(PIN_SENSOR_INT1);
+    gpio_set_dir(PIN_SENSOR_INT1, GPIO_IN);
+    gpio_disable_pulls(PIN_SENSOR_INT1);
+    _int1_level = gpio_get(PIN_SENSOR_INT1);
+}
+
+// core1 本轮还有确定要干的活 ⇒ 绝不能停下来等通知。
+// 这几项都是"等下去就会掉指标"的:
+//   · 命令环非空: core0 正卡在 _submit 上等结果(上限 100ms), 等通知会把命令延迟抬到扫描周期;
+//   · 三条异步生命周期: 它们靠周期性轮询推进(GET_STATS / 参数回读 / 上传确认);
+//   · 全通道快照正在分页: 一份 63 页要 16 次调用, 中途停下等通知会把广谱流帧率压到 1/16;
+//   · 链路还没建起来: 此时 PSoC 可能还没跑到会翻转 P1.4 的地方, 必须自由跑把链路先拉起来。
+bool Psoc::_int1_free_run_needed() const {
+    return _cmd_tail != _cmd_head ||
+           _heavy_async.active != 0u ||
+           _runtime_apply.active != 0u ||
+           _algo_upload_async.active != 0u ||
+           !_link_established ||
+           _spi.snapshot_pump_busy();
+}
+
+// 采样并(必要时)等待 PSoC 的"新代数已发布"翻转。
+// 自由跑期间也照样采样计数 —— 否则永远攒不够 arm 门限, 通知机制无法自行启用。
+void Psoc::_int1_wait_generation() {
+    const bool level_now = gpio_get(PIN_SENSOR_INT1);
+    if (level_now != _int1_level) {
+        _int1_level = level_now;
+        _pub_int1_edges = _pub_int1_edges + 1u;
+        _int1_timeout_run = 0u;
+        if (!_pub_int1_armed && _pub_int1_edges >= INT1_ARM_EDGES) _pub_int1_armed = true;
+        return;                       // 已有新代数, 立刻去取, 不必等
+    }
+    if (!_pub_int1_armed || _int1_free_run_needed()) return;
+
+    uint32_t budget = (_scan_period_us != 0u) ? (_scan_period_us * 2u + 1000u)
+                                              : INT1_WAIT_FALLBACK_US;
+    if (budget > INT1_WAIT_CAP_US) budget = INT1_WAIT_CAP_US;
+    const uint32_t wait_start = time_us_32();
+    while (true) {
+        const bool level = gpio_get(PIN_SENSOR_INT1);
+        if (level != _int1_level) {
+            _int1_level = level;
+            _pub_int1_edges = _pub_int1_edges + 1u;
+            _int1_timeout_run = 0u;
+            return;
+        }
+        // 等待期间 core0 可能投进命令、也可能有异步生命周期被启动: 立刻回去干活, 不把它们压在
+        // 一个扫描周期后面。等待段是 tight loop 且开中断, multicore lockout(flash 落盘)照常生效。
+        if (_int1_free_run_needed()) return;
+        if ((uint32_t)(time_us_32() - wait_start) >= budget) {
+            _pub_int1_timeouts = _pub_int1_timeouts + 1u;
+            if (++_int1_timeout_run >= INT1_DISARM_TIMEOUTS) {
+                _pub_int1_armed = false;   // 通知线不可信 → 退回自由跑; 再见到翻转会自动重新 arm
+                _int1_timeout_run = 0u;
+            }
+            return;
+        }
+        tight_loop_contents();
     }
 }
 
@@ -295,7 +675,6 @@ bool Psoc::_exec_cmd(SpiOp op, uint8_t ch, uint8_t pid, uint32_t val, uint32_t* 
     // 形成永久 provision 风暴。宽限只影响"是否判定 PSoC 已死", 不影响任何真实完成判据。
     switch (op) {
         case SpiOp::APPLY:
-        case SpiOp::QUICK_APPLY:
         case SpiOp::CALIBRATE:
         case SpiOp::BASELINE_RESET:
         case SpiOp::GLOBAL_COMMIT:
@@ -327,9 +706,9 @@ bool Psoc::_exec_cmd(SpiOp op, uint8_t ch, uint8_t pid, uint32_t val, uint32_t* 
         case SpiOp::SET_MODE:
             return _spi.set_mode(ch);   // mode 复用 ch 字段
         case SpiOp::APPLY:
-            return _spi.apply();
-        case SpiOp::QUICK_APPLY:
-            return _spi.quick_apply(ch, pid, (uint8_t)val);  // ch/gain/div 复用既有信箱字段
+            return _spi.begin_apply();
+        case SpiOp::RUNTIME_PARAM_APPLY:
+            return _spi.begin_runtime_param_apply(ch, pid, (uint8_t)val);
         case SpiOp::FOCUS_SCAN:
             return _spi.focus_scan(ch);
         case SpiOp::CALIBRATE:
@@ -345,15 +724,19 @@ bool Psoc::_exec_cmd(SpiOp op, uint8_t ch, uint8_t pid, uint32_t val, uint32_t* 
             return ok;
         }
         case SpiOp::UPLOAD_ALGO: {
-            // val 打包 crc16<<16 | len; data 为 blob 指针(调用方持久缓冲)
+            // 上传由 core1 每拍推进一笔 SPI 事务；这里仅启动状态机，不等待 PSoC commit。
             const uint16_t len = (uint16_t)(val & 0xFFFFu);
             const uint16_t crc = (uint16_t)((val >> 16) & 0xFFFFu);
-            const bool ok = _spi.upload_algo(data, len, crc);
-            // 异步下发的真实结果只能在这里得知: 失败置标志由 core0 取走上报(SH_ALGO_FALLBACK detail=1),
-            // 忙标志同时释放, 允许下一次上传改写 blob。
-            if (!ok) _algo_dl.failed = 1u;
-            __dmb();
-            _algo_dl.busy = 0u;
+            const bool ok = _spi.begin_upload_algo(data, len, crc);
+            if (ok) {
+                _algo_upload_async.active = 1u;
+                _algo_upload_async.started_ms = millis();
+                _algo_upload_async.last_poll_ms = _algo_upload_async.started_ms - 1u;
+                // 与首个分页事务错开约 10ms，随后上传期间仅按 20ms 保活触控。
+                _algo_upload_async.last_touch_ms = _algo_upload_async.started_ms - 10u;
+                _algo_upload_async.response_fail_run = 0u;
+                _reset_grace_until_ms = _algo_upload_async.started_ms + 130000u;
+            }
             return ok;
         }
         case SpiOp::GET_ALGO_INFO: {
@@ -429,7 +812,7 @@ bool Psoc::_exec_cmd(SpiOp op, uint8_t ch, uint8_t pid, uint32_t val, uint32_t* 
 // core0 侧: 入队一条 SPI 指令。写类(out==null)异步立即返回; 读类阻塞等本条结果。
 // core1 未接管(setup 阶段)时本核直执行, 避免死等无人消费的队列。
 bool Psoc::_submit(SpiOp op, uint8_t ch, uint8_t pid, uint32_t val, uint32_t* out, const uint8_t* data,
-                   uint32_t timeout_us, uint8_t async_token) {
+                   uint32_t timeout_us, AsyncOwner async_owner, uint8_t async_token) {
     if (!_spi_ready) return false;
     if (!_core1_running) {
         return _exec_cmd(op, ch, pid, val, out, data);
@@ -467,6 +850,7 @@ bool Psoc::_submit(SpiOp op, uint8_t ch, uint8_t pid, uint32_t val, uint32_t* ou
     c.result = 0;
     c.ok = false;
     c.done = false;
+    c.async_owner = async_owner;
     c.async_token = async_token;
     // ★必须在推进 head 之前置★: 否则 core1 可能先执行完并递增 _heavy_done, 之后 core0 再递增
     // _heavy_enq, heavy_busy() 就会在指令早已完成后仍报忙(且永不复位)。
@@ -513,6 +897,11 @@ bool Psoc::_refresh_algo_info_cache() {
         _invalidate_algo_info_cache();
         return false;
     }
+    _publish_algo_info_cache(valid, len);
+    return true;
+}
+
+void Psoc::_publish_algo_info_cache(bool valid, uint16_t len) {
     _algo_info_seq++;
     __dmb();
     _algo_info_valid = valid ? 1u : 0u;
@@ -522,7 +911,6 @@ bool Psoc::_refresh_algo_info_cache() {
     _algo_info_available = 1u;
     __dmb();
     _algo_info_seq++;
-    return true;
 }
 
 bool Psoc::get_algo_info_cached(bool* out_valid, uint16_t* out_len) const {
@@ -567,6 +955,18 @@ uint64_t Psoc::touch_mask() const {
         s2 = _pub_seq;
     } while ((s1 & 1u) || (s1 != s2));   // 写入中或期间被改写则重读
     return m;
+}
+
+uint32_t Psoc::touch_sample_us() const {
+    uint32_t s1, s2, t;
+    do {
+        s1 = _pub_seq;
+        __dmb();
+        t = _pub_touch_sample_us;
+        __dmb();
+        s2 = _pub_seq;
+    } while ((s1 & 1u) || (s1 != s2));
+    return t;
 }
 
 const psoc::SensorSnapshot& Psoc::snapshot() const {
@@ -618,37 +1018,106 @@ bool Psoc::baseline_reset(uint8_t ch) {
     return _submit(SpiOp::BASELINE_RESET, ch, 0, 0, &completed, nullptr, 10000000u);
 }
 
-bool Psoc::_start_sweep_op(SpiOp op, uint8_t ch, uint8_t pid, uint32_t val) {
-    if (_sweep_async.pending != 0u || heavy_busy()) return false;
-    uint8_t token = static_cast<uint8_t>(_sweep_async.token + 1u);
+bool Psoc::_start_runtime_param_apply(uint8_t ch, uint8_t gain, uint8_t div) {
+    if (_runtime_apply.active != 0u || _runtime_apply.pending != 0u ||
+        _runtime_apply.complete != 0u || heavy_busy()) return false;
+    uint8_t token = static_cast<uint8_t>(_runtime_apply.token + 1u);
     if (token == 0u) token = 1u;
-    _sweep_async.token = token;
-    _sweep_async.ok = 0u;
-    _sweep_async.complete = 0u;
-    _sweep_async.pending = 1u;
+    _runtime_apply.token = token;
+    _runtime_apply.ok = 0u;
+    _runtime_apply.complete = 0u;
+    _runtime_apply.response_fail_run = 0u;
+    _runtime_apply.params_confirmed = 0u;
+    _runtime_apply.scan_seen = 0u;
+    _runtime_apply.scan_progress_polls = 0u;
+    _runtime_apply.target_ch = ch;
+    _runtime_apply.target_gain = gain;
+    _runtime_apply.target_div = div;
+    _runtime_apply.started_ms = 0u;
+    _runtime_apply.last_param_poll_ms = 0u;
+    _runtime_apply.last_poll_ms = 0u;
+    _runtime_apply.last_touch_ms = 0u;
+    _runtime_apply.last_scan_count = 0u;
+    _runtime_apply.pending = 1u;
     __dmb();
-    if (_submit(op, ch, pid, val, nullptr, nullptr, 0u, token)) return true;
-    _sweep_async.pending = 0u;
+    if (_submit(SpiOp::RUNTIME_PARAM_APPLY, ch, gain, div, nullptr, nullptr, 0u,
+                AsyncOwner::RUNTIME_PARAM, token)) return true;
+    _runtime_apply.pending = 0u;
     return false;
 }
 
-bool Psoc::start_sweep_apply(uint8_t ch, uint8_t gain, uint8_t div) {
-    return _start_sweep_op(SpiOp::QUICK_APPLY, ch, gain, div);
-}
-
-bool Psoc::start_sweep_calibrate(uint8_t ch) {
-    return _start_sweep_op(SpiOp::CALIBRATE, ch);
-}
-
-bool Psoc::start_sweep_baseline_reset(uint8_t ch) {
-    return _start_sweep_op(SpiOp::BASELINE_RESET, ch);
-}
-
-bool Psoc::take_sweep_result(bool* out_ok) {
-    if (_sweep_async.complete == 0u) return false;
+bool Psoc::_start_host_write(SpiOp op, uint8_t ch, uint8_t pid, uint32_t val) {
+    // Host delayed ACK has a bounded ownership window.  Do not place it behind
+    // provisioning or a heavy PSoC operation: UsbComm deliberately holds RX
+    // until this terminal is sent, so queueing here would make every following
+    // host command appear to disappear.  A caller receives DEVICE_BUSY and can
+    // retry after the competing operation reaches a real terminal state.
+    if (!host_write_ready()) return false;
+    uint8_t token = static_cast<uint8_t>(_host_write.token + 1u);
+    if (token == 0u) token = 1u;
+    _host_write.token = token;
+    _host_write.ok = 0u;
+    _host_write.complete = 0u;
+    _host_write.pending = 1u;
     __dmb();
-    if (out_ok) *out_ok = _sweep_async.ok != 0u;
-    _sweep_async.complete = 0u;
+    if (_submit(op, ch, pid, val, nullptr, nullptr, 0u, AsyncOwner::HOST_WRITE, token)) return true;
+    _host_write.pending = 0u;
+    return false;
+}
+
+bool Psoc::take_host_write_result(bool* out_ok) {
+    if (_host_write.complete == 0u) return false;
+    __dmb();
+    if (out_ok) *out_ok = _host_write.ok != 0u;
+    _host_write.complete = 0u;
+    return true;
+}
+
+bool Psoc::start_host_param_set(uint8_t ch, uint8_t param_id, uint32_t value) {
+    return _start_host_write(SpiOp::SET_PARAM, ch, param_id, value);
+}
+
+bool Psoc::start_host_mode_set(uint8_t mode) {
+    return _start_host_write(SpiOp::SET_MODE, mode);
+}
+
+bool Psoc::start_host_global_set(uint8_t gparam_id, uint32_t value) {
+    return _start_host_write(SpiOp::SET_GLOBAL, gparam_id, 0u, value);
+}
+
+bool Psoc::start_host_global_commit() {
+    return _start_host_write(SpiOp::GLOBAL_COMMIT, 0u);
+}
+
+bool Psoc::start_host_algo_set_cfg(uint8_t idx, uint8_t val) {
+    return _start_host_write(SpiOp::ALGO_SET_CFG, idx, 0u, val);
+}
+
+bool Psoc::start_host_algo_set_rom(uint8_t ch, uint16_t rom) {
+    return _start_host_write(SpiOp::SET_ALGO_ROM, ch, 0u, rom);
+}
+
+bool Psoc::start_host_calibrate(uint8_t ch) {
+    return _start_host_write(SpiOp::CALIBRATE, ch);
+}
+
+bool Psoc::start_host_baseline_reset(uint8_t ch) {
+    return _start_host_write(SpiOp::BASELINE_RESET, ch);
+}
+
+bool Psoc::start_host_measure_cp() {
+    return _start_host_write(SpiOp::MEASURE_CP, 0u);
+}
+
+bool Psoc::start_runtime_param_apply(uint8_t ch, uint8_t gain, uint8_t div) {
+    return _start_runtime_param_apply(ch, gain, div);
+}
+
+bool Psoc::take_runtime_param_apply_result(bool* out_ok) {
+    if (_runtime_apply.complete == 0u) return false;
+    __dmb();
+    if (out_ok) *out_ok = _runtime_apply.ok != 0u;
+    _runtime_apply.complete = 0u;
     return true;
 }
 
@@ -817,6 +1286,8 @@ bool Psoc::busy_grace_active() const {
 
 void Psoc::reset_run() {
     _swd.reset_target_run();   // 脉冲 XRES 复位 PSoC 进运行态
+    // Runtime apply 结果与恢复闸门由 core1/SensorLink 消费；XRES 不能在 core0 侧清掉，
+    // 否则当前格结果与 heavy 所有权失配，且下一格会越过 provisioning 提前下发。
     // 复位后旧算法信息不能跨 PSoC 实例复用；递增 epoch 令 core0 读缓存时立即失效。
     _algo_info_epoch++;
     if (_algo_info_epoch == 0u) _algo_info_epoch = 1u;

@@ -652,6 +652,18 @@ pub const FIELD_STATUS: u8 = 0x08;
 pub const FIELD_STATS: u8 = 0x10;
 /// 触控输出流水线延迟(帧级)：STATS 后附 spi/proc/usb 三个 u16 LE 滚动最大值
 pub const FIELD_LATENCY: u8 = 0x20;
+/// JIT 算法运行值(逐通道)：STATUS 之后附 out_active(u8) + report[0..3](u16 LE ×4) = 9B。
+/// 与采样同帧同源，取代 ALGO_GET_TRACE 轮询(阻塞读类命令抢不到设备单响应槽)。
+pub const FIELD_ALGO: u8 = 0x40;
+/// 触控延迟线的补偿偏差(帧级)：LATENCY 之后附 dev_min(i16 LE) + dev_max(i16 LE) + flags(u8) = 5B。
+/// dev = (实际发出时刻 − 该掩码的采样时刻) − `comm.touch_delay_100us`，正=发晚、负=发早。
+/// ★这是"设定的触控延迟兑现了没有"的唯一直接读数★：采样零点取自延迟线**实际读出的那一片**，
+/// 主机手上没有这个量；用链路耗时去减目标只是把两种不同量纲相减(那正是主页此前的缺陷)。
+/// flags: bit0=本窗口真的发出过帧(有观测)，bit1=目标低于物理下限、延迟线已钳到最新采样。
+pub const FIELD_DELAY_DEV: u8 = 0x80;
+/// ★fields 的 8 个 bit 已全部用尽★：再要新字段必须先扩宽 fields 宽度(协议两侧同步)，
+/// 不得复用任何已定义位，也不得把新数据挂到既有块尾部 —— 那会让不知情的解码方整片读偏。
+pub const FIELD_ALL_ASSIGNED: u8 = 0xFF;
 
 // ============================================================================
 // 遥测编码函数(T3)
@@ -1014,7 +1026,30 @@ pub struct TelemFrame {
     pub lat_spi_us: u16,
     pub lat_proc_us: u16,
     pub lat_usb_us: u16,
+    /// 延迟线补偿偏差区间 (min, max)(us, 带符号)。`None` = 本窗口没有真正发出过触控帧,
+    /// 无从判定偏差 —— 与"偏差恰为 0"是两件事, 不能合并成一个 0。
+    pub delay_dev_us: Option<(i16, i16)>,
+    /// 目标低于物理下限, 延迟线已钳到最新采样(设定延迟物理上达不到)。
+    pub delay_dev_clamped: bool,
     pub samples: Vec<ChannelSample>,
+}
+
+/// 解析 DELAY_DEV 块(i16 min + i16 max + u8 flags)。返回 (偏差区间, 是否被钳制, 新读取位置)。
+fn _decode_delay_dev(
+    payload: &[u8],
+    pos: usize,
+) -> Result<(Option<(i16, i16)>, bool, usize), String> {
+    if pos + 5 > payload.len() {
+        return Err("truncated at DELAY_DEV block".to_string());
+    }
+    let lo = i16::from_le_bytes([payload[pos], payload[pos + 1]]);
+    let hi = i16::from_le_bytes([payload[pos + 2], payload[pos + 3]]);
+    let flags = payload[pos + 4];
+    Ok((
+        ((flags & 0x01) != 0).then_some((lo, hi)),
+        (flags & 0x02) != 0,
+        pos + 5,
+    ))
 }
 
 /// 解码 TELEM_DATA 响应载荷
@@ -1072,6 +1107,15 @@ pub fn decode_telem_data(payload: &[u8]) -> Result<TelemFrame, String> {
         (a, b, c)
     } else {
         (0u16, 0u16, 0u16)
+    };
+
+    let (delay_dev_us, delay_dev_clamped) = if (fields & FIELD_DELAY_DEV) != 0 {
+        let (dev, clamped, next) = _decode_delay_dev(payload, pos)
+            .map_err(|e| format!("TELEM_DATA {}", e))?;
+        pos = next;
+        (dev, clamped)
+    } else {
+        (None, false)
     };
 
     let mut samples = Vec::new();
@@ -1148,6 +1192,8 @@ pub fn decode_telem_data(payload: &[u8]) -> Result<TelemFrame, String> {
         lat_spi_us,
         lat_proc_us,
         lat_usb_us,
+        delay_dev_us,
+        delay_dev_clamped,
         samples,
     })
 }
@@ -1165,6 +1211,10 @@ pub struct FocusFrame {
     pub sample_seq: u16,
     /// 该样本所属的 PSoC 快照代数(设备只在代数推进时才发帧)。
     pub generation: u16,
+    /// JIT 算法运行值(FIELD_ALGO)：`(out_active, report[0..3])`；字段未请求或设备无有效算法时为 None。
+    /// ★与采样同帧同源★ 取代原先的 ALGO_GET_TRACE 轮询: 那是阻塞读类命令, 在独占流推送期间
+    /// 抢不到设备的单响应槽, 请求会成片超时(既无响应也无 NAK)。
+    pub algo: Option<(u8, [u16; 4])>,
     pub frame: TelemFrame,
 }
 
@@ -1224,6 +1274,23 @@ pub fn decode_focus_data(payload: &[u8]) -> Result<FocusFrame, String> {
         pos += 1;
     }
 
+    // 算法运行值: out_active(u8) + report[4](u16 LE)。次序与固件组帧一致(STATUS 之后、STATS 之前)。
+    let algo = if (fields & FIELD_ALGO) != 0 {
+        if pos + 9 > payload.len() {
+            return Err("FOCUS_DATA truncated at ALGO block".to_string());
+        }
+        let active = payload[pos];
+        let mut report = [0u16; 4];
+        for (slot, value) in report.iter_mut().enumerate() {
+            let at = pos + 1 + slot * 2;
+            *value = u16::from_le_bytes([payload[at], payload[at + 1]]);
+        }
+        pos += 9;
+        Some((active, report))
+    } else {
+        None
+    };
+
     let (samples_per_sec, scan_period_us) = if (fields & FIELD_STATS) != 0 {
         if pos + 8 > payload.len() {
             return Err("FOCUS_DATA truncated at STATS block".to_string());
@@ -1250,19 +1317,32 @@ pub fn decode_focus_data(payload: &[u8]) -> Result<FocusFrame, String> {
         if pos + 6 > payload.len() {
             return Err("FOCUS_DATA truncated at LATENCY block".to_string());
         }
-        (
+        let three = (
             u16::from_le_bytes([payload[pos], payload[pos + 1]]),
             u16::from_le_bytes([payload[pos + 2], payload[pos + 3]]),
             u16::from_le_bytes([payload[pos + 4], payload[pos + 5]]),
-        )
+        );
+        // ★这里必须推进 pos★: LATENCY 原先是最后一个块, 读完不推进也没人受害;
+        // DELAY_DEV 接在它后面之后, 不推进就会把 LATENCY 的头两字节当成偏差再读一遍。
+        pos += 6;
+        three
     } else {
         (0u16, 0u16, 0u16)
+    };
+
+    let (delay_dev_us, delay_dev_clamped) = if (fields & FIELD_DELAY_DEV) != 0 {
+        let (dev, clamped, _next) =
+            _decode_delay_dev(payload, pos).map_err(|e| format!("FOCUS_DATA {}", e))?;
+        (dev, clamped)
+    } else {
+        (None, false)
     };
 
     Ok(FocusFrame {
         session,
         sample_seq,
         generation,
+        algo,
         frame: TelemFrame {
             ts_us: t_us,
             fields,
@@ -1271,6 +1351,8 @@ pub fn decode_focus_data(payload: &[u8]) -> Result<FocusFrame, String> {
             lat_spi_us,
             lat_proc_us,
             lat_usb_us,
+            delay_dev_us,
+            delay_dev_clamped,
             samples: vec![sample],
         },
     })

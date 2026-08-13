@@ -87,6 +87,20 @@ struct UsbDebugCounters {
     uint8_t  host_last_dispatch_cmd;          // 最近一次分发的 HostCmd 命令码
     uint8_t  host_last_dispatch_seq;          // 最近一次分发的帧序号
     uint16_t host_last_dispatch_resp_len;     // 最近一次分发返回的响应长度
+    // ★只能追加在末尾★(前面任何插入都会整体挪偏移, 旧上位机随即错位解析)。
+    // core1 新代数通知线(PSoC P1.4 → GPIO23)的实证读数。core1 改成"等 PSoC 通知再取"之后,
+    // 它与旧的固定间隔轮询在所有外部指标(帧率/丢帧/延迟)上完全一样, 没有这三个字段就无法证明
+    // 改造真的生效, 也看不出它是否已经退回兜底自由跑。
+    uint32_t core1_int1_edges;      // 累计电平翻转数 = core1 观测到的新代数份数
+    uint32_t core1_int1_timeouts;   // armed 后等待超时次数(通知迟到/丢失, 该轮退回自由跑)
+    uint8_t  core1_int1_armed;      // 1 = 已确认通知线活跃, core1 正按通知推进; 0 = 自由跑兜底
+    // ★只能追加在末尾★(前面任何插入都会整体挪偏移, 旧上位机随即错位解析)。
+    // 触控延迟线的补偿量(GameIoService::_emit_cost_us, us): "映射 → 帧写出 CDC"的平滑实测耗时。
+    // 它直接决定"实际发出 − 采样"能不能等于 comm.touch_delay_100us: 补偿量被高估多少,
+    // 用户设的延迟就被削短多少。此前该量取自 g_lat_proc/usb 两个**滚动峰值**(且清零权在遥测
+    // 发射器手里, 无上位机时永不清零), 会 latch 在历史最坏值上 —— 而这件事在设备外部完全不可见,
+    // 只能靠读源码推断。留出这一格, 补偿量就成了可复核的实测读数。
+    uint32_t gio_emit_cost_us;
 };
 
 // EP0 DEBUG_READ 固定尾部：P0..P7 的 GPIO drive mode(PC) 与 HSIOM PORT_SEL 快照。

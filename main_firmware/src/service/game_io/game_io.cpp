@@ -102,6 +102,7 @@ GameIoService::GameIoService()
       _led_map_ready(false),
       _initialized(false),
       _touch_delay_units(0),
+      _emit_cost_us(0),
       _delay_refresh_us(0),
       _serial_reset_requests(0) {
     _serial_publish_settings.clear();
@@ -356,16 +357,13 @@ void GameIoService::_process_serial_reset() {
     if (_serial_reset_requests == 0u) return;
     _serial_reset_requests--;
 
-    uint32_t actions = 0u;
-    Psoc* psoc = Psoc::getInstance();
-    if (ConfigManager::get_bool("comm.serial_reset_calibrate") && psoc->calibrate()) {
-        actions |= 0x01u;
-    }
-    if (ConfigManager::get_bool("comm.serial_reset_baseline") && psoc->baseline_reset()) {
-        actions |= 0x02u;
-    }
-    if (actions != 0u) {
-        SelfHeal::getInstance()->note(SH_SERIAL_RESET_ACTIONS, actions);
+    // RSET is received on the latency-critical game serial path.  Calibration and
+    // baseline reset are explicit host maintenance operations; running either here
+    // used to block core0 for seconds and starve USB/game I/O.  Keep only a bounded
+    // diagnostic notification, then let continuous PSoC scanning recover naturally.
+    if (ConfigManager::get_bool("comm.serial_reset_calibrate") ||
+        ConfigManager::get_bool("comm.serial_reset_baseline")) {
+        SelfHeal::getInstance()->note(SH_SERIAL_RESET_ACTIONS, 0u);
     }
 }
 
@@ -440,23 +438,52 @@ void GameIoService::task() {
         _refresh_serial_publish_settings();
         _delay_refresh_us = _lt0;
     }
+    // ★延迟补偿★ 入环用掩码的真实采样时刻, 取值用"预计实际发出时刻", 使
+    //   实际发出 − 采样 ≡ comm.touch_delay_100us
+    // 本段映射 + CDC 写出的耗时因此被自动扣除, 而不是叠加在设定值上。
+    // 发出时刻的预测量 = 本段起点 + _emit_cost_us(上一次真正写出时实测的 本段起点→写完 耗时,
+    // 单指数平滑)。★不用 g_lat_proc_us/g_lat_usb_us★ 见 game_io.h 里 _emit_cost_us 的说明:
+    // 那两个是滚动峰值且清零权在遥测发射器, 无上位机时永不清零, 会把补偿量 latch 在历史最坏值上。
+    // 注意 sample_us 取自 SPI 事务**结束**时刻(Psoc::_pub_touch_sample_us = t1), 故 SPI 读耗时
+    // 本就在补偿口径之外, 这里不该、也不能把它算进 emit 预测。
+    const uint32_t sample_us = psoc->touch_sample_us();
+    const uint32_t emit_us = _lt0 + _emit_cost_us;
     const Mai2Serial_TouchState delayed_touch(
-        _touch_delay.tick(_lt0, _touch_delay_units, area_now));
+        _touch_delay.tick(sample_us, emit_us, _touch_delay_units, area_now));
     _serial_publish.record(_lt0, delayed_touch);
     gio_seg_mark(GIO_SEG_TOUCH_MAP, _lt0);
     const uint32_t _lt1 = gio_seg_begin(GIO_SEG_SEND_TOUCH);
+    bool emitted = false;
     if (!_serial_publish.rate_limited(_lt0, _serial_publish_settings)) {
         Mai2Serial_TouchState publish_touch(
             _serial_publish.value(_lt0, _serial_publish_settings.aggregation_delay_ms));
         if (_serial_publish.should_send(publish_touch, _serial_publish_settings) &&
             _serial.send_touch_data(publish_touch)) {
             _serial_publish.note_send_success(publish_touch, _lt0, _serial_publish_settings);
+            emitted = true;
         }
     }
     const uint32_t _lt2 = time_us_32();
     gio_seg_mark(GIO_SEG_SEND_TOUCH, _lt1);
     latency_note(&g_lat_proc_us, _lt1 - _lt0);
     latency_note(&g_lat_usb_us, _lt2 - _lt1);
+    // ★只在真的把帧写出去的那一拍更新补偿量★ 没写出去的拍里写出段几乎为 0, 混进来会把补偿量
+    // 压低; 而这个量要预测的恰恰是"真发出去要多久"。首次直接取实测值, 之后 α=1/4 单指数平滑
+    // (整数运算, 无浮点): 既跟得上负载变化, 又不被单次尖峰带偏。
+    if (emitted) {
+        const uint32_t cost = _lt2 - _lt0;
+        _emit_cost_us = (_emit_cost_us == 0u) ? cost : ((_emit_cost_us * 3u + cost) / 4u);
+        // ★补偿偏差 = 真实达成 − 设定值★ 达成量用延迟线**实际读出那一片**的时刻做采样零点,
+        // 而不是用上面那个预测量 —— 拿预测值算偏差只会恒得 0(自证)。
+        // 正 = 发晚了(补偿量估小/被外部拖延), 负 = 发早了(补偿量估大, 设定延迟被削短)。
+        // 残余里必然含延迟线 100us 时间片的截断量, 这是该机制的固有粒度, 如实体现不做修饰。
+        const int32_t achieved = (int32_t)(_lt2 - _touch_delay.last_read_slice_us());
+        const int32_t target = (int32_t)_touch_delay_units * 100;
+        delay_dev_note(achieved - target, _touch_delay.last_clamped());
+    }
+    // 补偿量对外可见(见 usb_debug.h 的 gio_emit_cost_us): 它被高估多少, 用户设的延迟就短多少,
+    // 而这件事在设备外部原本完全观测不到。每拍一条 store, 热路径开销可忽略。
+    g_usb_dbg.gio_emit_cost_us = _emit_cost_us;
 
     gio_t = gio_seg_begin(GIO_SEG_LIGHT_STATE);
     _consume_light_state();

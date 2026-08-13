@@ -29,10 +29,13 @@ export component DashboardPage inherits Rectangle {
     in property <int> latency_proc_us: 0;
     in property <int> latency_usb_us: 0;
     in property <int> latency_sensor_us: 0;
-    in property <string> latency_corrected_text: "补正后延迟: 未启用";
+    in property <string> latency_corrected_text: "链路耗时: 补正显示未启用";
     in-out property <bool> measure_latency: false;
-    // 延迟历史折线(总延迟 us): SVG path(viewbox 1000x1000) + 量程 + 点数, 由 main.rs 回填。
+    // 延迟历史折线: SVG path(viewbox 1000x1000) + 量程 + 点数。口径由补偿开关决定, 见标题。
     in property <string> lat_path: "";
+    in property <string> lat_chart_title: "链路耗时历史 (SPI + RP处理 + USB写，µs)";
+    // 图右上角的紧凑徽标(108px 槽位)。完整口径说明在 latency_corrected_text, 不共用一份文本。
+    in property <string> lat_dev_badge: "未启用";
     in property <float> lat_y_max: 1;
     in property <float> lat_y_min: 0;
     in property <int> lat_point_count: 0;
@@ -272,7 +275,7 @@ export component DashboardPage inherits Rectangle {
                         // 固定高度的明细区允许按卡片宽度分成两列；所有动态数值文本仍用明确 width + elide，
                         // 因此每帧位数变化不会重新分配父布局。外层有固定 height，子项读取 parent.width 不会形成布局环。
                         Rectangle {
-                            height: 52px;
+                            height: 76px;
                             Text {
                                 x: 0px;
                                 y: 2px;
@@ -283,10 +286,14 @@ export component DashboardPage inherits Rectangle {
                                 horizontal-alignment: left;
                                 color: Theme.accent;
                             }
+                            // ★偏差说明独占整宽的一整行★ 原先它挤在左列 200px 里, 而右列 x:212 起
+                            // 是四格链路明细 —— 于是"偏差 +12 .. +343 us | 期望 24000 us | 实测端到端 …"
+                            // 恒被 elide 成半句, 用户看不到期望值与实测区间。改为放在明细区下方
+                            // 自成一行(明细区随之 52px→76px), 宽度取父宽, 与两列都不再抢位置。
                             Text {
                                 x: 0px;
-                                y: 34px;
-                                width: 200px;
+                                y: 56px;
+                                width: parent.width;
                                 height: 18px;
                                 overflow: elide;
                                 text: root.latency_corrected_text;
@@ -360,7 +367,8 @@ export component DashboardPage inherits Rectangle {
                     spacing: Theme.gap;
 
                     Text {
-                        text: @tr("总延迟历史 (us)");
+                        // 标题随口径变(见 tick/keyboard.rs): 启用补偿画偏差, 否则画链路耗时。
+                        text: root.lat_chart_title;
                         font-weight: 700;
                         color: Theme.text-title;
                     }
@@ -402,29 +410,31 @@ export component DashboardPage inherits Rectangle {
                         }
                         Text {
                             x: 4px; y: 2px;
-                            text: Math.round(root.lat_y_max) + "us";
+                            text: (Math.round(root.lat_y_max) >= 0 ? "+" : "") + Math.round(root.lat_y_max) + "us";
                             color: Theme.text-dim;
                             font-size: Theme.fs-small;
                         }
                         Text {
                             x: 4px; y: parent.height / 2 - 6px;
-                            text: Math.round((root.lat_y_max + root.lat_y_min) / 2) + "us";
+                            text: (Math.round((root.lat_y_max + root.lat_y_min) / 2) >= 0 ? "+" : "") + Math.round((root.lat_y_max + root.lat_y_min) / 2) + "us";
                             color: #5f6a73;
                             font-size: 9px;
                         }
                         Text {
                             x: 4px; y: parent.height - 14px;
-                            text: Math.round(root.lat_y_min) + "us";
+                            text: (Math.round(root.lat_y_min) >= 0 ? "+" : "") + Math.round(root.lat_y_min) + "us";
                             color: #5f6a73;
                             font-size: 9px;
                         }
                         Text {
-                            // 固定 108px 槽位 + 右对齐: 原来只留 90px 且宽度随内容自适应, 四位数
-                            // ("当前 1234us")会顶出绘图区右边被裁; 现在槽位够宽且位数变化不移动元素。
+                            // 固定 108px 槽位 + 右对齐: 位数变化不移动元素。
+                            // ★这里只能放徽标, 不能放 latency_corrected_text★ 那是一整行完整口径说明
+                            // (偏差区间 + 期望 + 实测端到端 + 钳制告警), 108px 里必被 elide 成省略号。
+                            // 徽标由 tick/health.rs 单独生成: "偏差 +343us" / "等待中" / "未启用"。
                             x: parent.width - 112px; y: 2px;
                             width: 108px;
                             horizontal-alignment: right;
-                            text: @tr("当前 ") + root.latency_total_us + "us";
+                            text: root.lat_dev_badge;
                             color: Theme.accent;
                             font-size: Theme.fs-small;
                         }

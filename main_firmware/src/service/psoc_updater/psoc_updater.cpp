@@ -8,6 +8,7 @@
 #include "../../protocol/psoc/psoc_fw_image.h"
 #include "../../hal/usb/hal_usb.h"
 #include "../tx_scheduler/tx_scheduler.h"
+#include "../usb_comm/usb_comm.h"
 
 namespace {
 constexpr uint16_t FLAG_INDICATOR_APP = 1u << 0;
@@ -82,10 +83,14 @@ bool PsocUpdater::_fail(Psoc* psoc, PsocBringupStage stage) {
         psoc->reset_run();
         psoc->release_swd();
     }
+    SwdProgrammer::set_keepalive(nullptr);
     return false;
 }
 
 bool PsocUpdater::run(Psoc* psoc, bool force_flash) {
+    // setup() may call this before loop() exists. Keep TinyUSB responsive while
+    // SWD verify/program operations poll so enumeration is not delayed by PSoC bring-up.
+    SwdProgrammer::set_keepalive(&PsocUpdater::_keepalive);
     init();
     _report.last_stage = PsocBringupStage::SWD_READY;
     if (!psoc || !psoc->swd_ready()) {
@@ -144,6 +149,7 @@ bool PsocUpdater::run(Psoc* psoc, bool force_flash) {
         psoc->release_swd();
         sleep_ms(50);
         _report.last_stage = PsocBringupStage::RUN;
+        SwdProgrammer::set_keepalive(nullptr);
         return true;
     }
     // 内容不一致 → 需要烧录, 记录首个不符地址供诊断。
@@ -203,6 +209,7 @@ bool PsocUpdater::run(Psoc* psoc, bool force_flash) {
     psoc->release_swd();
     sleep_ms(50);
     _report.last_stage = PsocBringupStage::RUN;
+    SwdProgrammer::set_keepalive(nullptr);
     return true;
 }
 
@@ -223,12 +230,15 @@ uint8_t PsocUpdater::rescue_state() const {
     }
 }
 
-// SWD 擦写/校验内层循环的保活: 喂狗 + 泵 USB(否则主机写超时拆 vendor 端点=掉线) + 推送阶段进度。
-// TxScheduler::tick 自带 200ms 节流, 故此处高频调用不会刷爆端点; 与主循环共用同一发送路径。
+// SWD 擦写/校验内层循环的保活: 喂狗 + 泵完整 HostCmd 收发 + 推送阶段进度。
+// setup() 尚未进入 loop() 时，只有 UsbComm::update() 会解码 HELLO 并生成 DEVICE_INFO；
+// 单独调用 TinyUSB task 只能完成枚举，不能服务 vendor 命令。
 void PsocUpdater::_keepalive() {
     watchdog_update();
     HAL_USB_Device::getInstance()->task();
+    UsbComm::getInstance()->update();
     TxScheduler::getInstance()->tick();
+    HAL_USB_Device::getInstance()->task();
 }
 
 bool PsocUpdater::rescue_step(Psoc* psoc) {

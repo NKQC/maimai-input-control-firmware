@@ -21,8 +21,11 @@ void app_config_register_schema() {
         // 与 touch_delay_100us 的人工串口延迟线完全独立，默认关闭以保持既有显示口径。
         config_map["comm.latency_correction_en"] = ConfigValue(false);
         // ★这两个是唯一真正"平移上报"的延迟★: 100us 时间片, 0..1000 片 = 0..100ms。
-        // touch_delay_100us 由 GameIoService::task() 的 DelayLine 消费(game_io.cpp:323 刷新档位,
-        // :328 取延迟后的值送 mai2serial) —— 它把触控上报整体往后平移, 不改变上报频率。
+        // touch_delay_100us 由 GameIoService::task() 的 DelayLine 消费, 语义是**端到端对齐**:
+        // 保证"实际发出时刻 − 该掩码的采样时刻 = 设定值", 而不是在处理时刻之后再叠加设定值。
+        // 链路耗时(SPI 取掩码 + 映射 + CDC 写出, 实测数百 us 且随负载浮动)由 DelayLine 自动扣除,
+        // 因此设 20ms 得到的就是 20ms, 不会变成 20ms + 链路耗时, 延迟响应稳定可预期。
+        // 设定值小于链路耗时时物理上无法达标, 此时退化为"尽可能快"(给最新采样)。
         // 触控延迟仅作用于串口上报; 触控->键盘映射走原始触控, 不加键盘延迟。
         config_map["comm.touch_delay_100us"]     = ConfigValue(uint16_t(0), uint16_t(0), uint16_t(1000));
         config_map["comm.keyboard_delay_100us"]  = ConfigValue(uint16_t(0), uint16_t(0), uint16_t(1000));

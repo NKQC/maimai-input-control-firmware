@@ -69,7 +69,8 @@ enum class HostCmd : uint8_t {
     REBOOT_BOOTLOADER = 0x05,
     REBOOT_PSOC     = 0x06,  // 脉冲 XRES 重启 PSoC 使"需重启生效"的改动生效
     DEBUG_CRASH_BOOTSEL = 0x07,  // 运行时武装/解除"崩溃→进BOOTSEL"(自持debug); payload[0]: 1=武装 0=解除
-    // ★PSoC 救砖★: 空 payload → 立即 ACK("已受理"), 主循环随后经 SWD 强制全片擦写内嵌镜像 + 校验 +
+    DEBUG_TRIGGER_CRASH = 0x0A,  // 已武装且空闲时安全触发 watchdog_reboot, 复用既有崩溃→BOOTSEL路径
+    // ★PSoC 救砖★: 空 payload → 立即 ACK("已受理"), 主循环随后经 SWD 强制全片擦写内嵌镜像 + 校验 + 校验 +
     // 复位运行, 再由 provisioning 重新下发算法 + CSD。阶段进度经 PSOC_RESCUE_PROGRESS(0x09) 推送。
     PSOC_RESCUE     = 0x08,
     // ★设备主动推送(flags=STREAM)★: 救砖受理后 5Hz 上报, 完成帧发出即自取消任务。
@@ -155,7 +156,8 @@ enum class HostCmd : uint8_t {
     //      (offset+chunk==total)才更新有效长度并持久化。total=0 = 清空源。→ ACK / NAK
     ALGO_SET_SRC       = 0x67,
     ALGO_GET_CODE      = 0x68,  // 空 → 响应 [len(u16 LE), asm bytes] RP 存的算法 ASM 机器码回读
-    ALGO_GET_TRACE     = 0x69,  // payload=[ch(u8),idx(u8)] → 响应 [ch,idx,out_active(u8),report(u16 LE)]
+    // 0x69 已退役(原 ALGO_GET_TRACE 逐项轮询)。算法运行值改随遥测帧的 TELEM_FIELD_ALGO 上报,
+    // 不再有对应的请求/响应。★不要复用该码★: 旧上位机仍可能发它, 复用会被误解为追踪请求。
     ALGO_SET_CFG       = 0x6A,  // payload=[idx(u8),val(u8)] 设共享 cfg[idx]+持久化+下发 → ACK
     ALGO_GET_CFG       = 0x6B,  // payload=[idx(u8)] → 响应 [idx,cfg(u8)]
 

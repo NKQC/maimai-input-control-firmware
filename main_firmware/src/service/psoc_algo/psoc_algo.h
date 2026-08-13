@@ -63,12 +63,17 @@ public:
 
     // host 上传：校验 crc16(CCITT-FALSE, 覆盖 data[0,len)) 一致后存入 RAM，标记非默认并请求持久化。
     bool set_algo(const uint8_t* src, uint16_t src_len, uint16_t src_crc16);
+    // 请求异步恢复出厂算法；若当前上传尚未释放 SPI 槽位，先挂起请求，待 tick() 安全收口。
+    bool request_reset_default();
+    bool reset_default_pending() const { return _reset_default_pending; }
     // 回退出厂默认(v3.1 HDR)并请求持久化(下次启动用默认)。用于坏算法致复位后的自动回退。
     void reset_default();
 
-    // 下发当前算法到 PSoC(经 SPI ALGO_* 分页事务)。返回下发+PSoC commit 校验是否成功。
-    // 完整下发(代码 + 每通道 ROM + cfg[8])。仅用于 core1 空闲的场合: 启动/复位后的 provision。
+    // 下发当前算法到 PSoC(经 SPI ALGO_* 分页事务)。启动/复位调用只启动有界流程；
+    // main loop 经 tick() 每轮推进一个运行时参数，完成前 provisioning_active() 保持为真。
     bool download_to_psoc(Psoc* psoc);
+    void abort_provisioning();
+    bool provisioning_active() const { return _params_pending || _runtime_sync_active; }
     // 只把代码下发入队即返回, ROM/cfg 交给 tick() 补推。USB 命令处理器必须走这个, 否则 ACK 被拖住。
     bool request_download(Psoc* psoc);
     // 主循环每轮调用: core1 写完代码后补推 ROM/cfg。
@@ -92,15 +97,21 @@ private:
     void _sync_src_storage();
 
     void _load_src();                    // 从 /algo_src.bin 载入算法 C 源(init() 调用)
-    void _push_runtime_params(Psoc* psoc);   // 推 36 条 ROM + 8 条 cfg
+    void _push_runtime_params(Psoc* psoc);   // 推送一个待同步的 ROM/cfg 项
+    bool _start_runtime_sync(Psoc* psoc);
 
     uint8_t  _blob[PSOC_ALGO_MAX_LEN];
     uint16_t _len;
     uint16_t _crc16;
     bool     _is_default;
     bool     _save_pending = false;
+    bool     _reset_default_pending = false;
+    // pending 已安全切换为默认 blob 并入队；仍需等待 PSoC INFO 真正确认默认长度后才结束请求。
+    bool     _reset_default_started = false;
     // true = 代码下发已入队, 等 core1 写完后还要补推 ROM/cfg(见 tick)。
-    bool     _params_pending = false;   // 代码已入队, 待 tick() 补推 ROM/cfg
+    bool     _params_pending = false;
+    uint8_t  _runtime_index = 0u;       // 0..35=ROM, 36..43=cfg; 0=idle or first ROM
+    bool     _runtime_sync_active = false;
     uint16_t _rom[PSOC_ALGO_CHANNELS];   // 每通道 16 位只读 ROM(默认 0)
     uint8_t  _cfg[8] = {0u};             // 共享算法可设置变量(ABI cfg[8], 默认 0)
     uint8_t  _src[PSOC_ALGO_SRC_MAX];    // 算法 C 源(已滤注释), 映射表回读用

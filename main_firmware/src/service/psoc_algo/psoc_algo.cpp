@@ -125,52 +125,128 @@ bool PsocAlgo::set_algo(const uint8_t* src, uint16_t src_len, uint16_t src_crc16
     // 内容等于内嵌默认(v3.1 HDR)则标记为默认: 使上位机"读取信息"能正确识别并载入默认 C 源,
     // 而非误判为无源可还原的自定义算法。
     _is_default = (src_len == (uint16_t)PSOC_ALGO_DEFAULT_LEN && src_crc16 == PSOC_ALGO_DEFAULT_CRC16);
+    // ★用户显式上传 ⇒ 作废尚未完成的"恢复默认"请求★
+    // reset_default 的推进分支会在 tick 里把 _blob 换回内嵌默认并重新下发。若此刻还留着那个
+    // pending, 用户刚上传的算法会在随后的某一轮 tick 被默认算法静默覆盖(实测表现为上传即刻
+    // ACK 且终态确认成功, 紧接着回读却变成 psoc_valid=false / 又变回默认)。
+    // 上传是比"恢复默认"更晚的用户意图, 必须赢。
+    _reset_default_pending = false;
+    _reset_default_started = false;
     _sync_bin_storage();
     request_save();
     return true;
 }
 
+// ★本函数只切 blob, 不动 C 源★
+// 它由 tick 延迟推进(要等 core1 交还 blob), 而"恢复默认"在上位机那边是两步:
+//   ① 发 ALGO_RESET_DEFAULT;  ② 紧接着把默认源文本 send_algo_src 写进来(设备不内置源文本)。
+// 若在这里清 _src_len, 清空动作会**晚于**②落地, 把上位机刚写好的源又抹掉 ——
+// 实测表现为: 上传/恢复默认当时一切正常, 重开上位机却报"设备未存该算法 C 源", 编辑器退回内置示例。
+// 因此 C 源的清空改由 request_reset_default() 在受理命令的那一刻同步完成(见其注释)。
 void PsocAlgo::reset_default() {
     _load_default();
+    _sync_bin_storage();
+    request_save();
+}
+
+bool PsocAlgo::request_reset_default() {
+    if (_reset_default_pending) return false;
+    // ★C 源在此立即清空★: 与 blob 的延迟切换不同, 清源必须发生在受理命令的这一刻, 这样上位机
+    // 随后补写的默认源才是最终生效的那份(顺序: 清空 → 上位机写入 → 结束)。
     _src_len = 0;
     _src_wr = 0;
-    _sync_bin_storage();
     _sync_src_storage();
-    request_save();
+    // 仅登记恢复请求；当前 _blob 可能仍被 core1 的上传状态机持有，不能在这里改写。
+    _reset_default_pending = true;
+    _reset_default_started = false;
+    return true;
 }
 
 bool PsocAlgo::request_download(Psoc* psoc) {
     // 判据用去抖后的 link_alive(): 遥测流式期间瞬时 link_ok 频繁为 false, 拿它当门禁会永远下发不了。
     if (psoc == nullptr || !psoc->link_alive() || _len == 0u) return false;
+    // ★不能用 provisioning_active() 当门禁★
+    // 它含 _runtime_sync_active —— 那是"逐条补推 36 个 ROM + 8 个 cfg"的阶段, 共 44 轮且每轮都要
+    // core1_idle()。补推阶段**并不持有 blob**: 真正的 blob 保护是 Psoc::_algo_dl.busy(在
+    // upload_algo() 内, 且 ALGO_UPLOAD handler 更早也挡了一次)。
+    // 用它挡上传的后果(实测): 上位机停在算法页时会持续读 cfg/追踪, core1 频繁非空 ⇒ 补推迟迟
+    // 走不完 ⇒ 用户此刻点"编译并上传"必被回 DEVICE_BUSY(cmd=0x61 NAK), 且越是盯着算法页越必然。
+    // 新代码上传本就要按新算法重推一遍 ROM/cfg, 打断旧补推是正确且必要的。
     if (!psoc->upload_algo(_blob, _len, _crc16)) return false;
+    // 旧补推作废, 由本次下发完成后重新走一遍(_params_pending → _start_runtime_sync)。
+    _runtime_sync_active = false;
+    _runtime_index = 0u;
     _params_pending = true;
     return true;
 }
 
+bool PsocAlgo::_start_runtime_sync(Psoc* psoc) {
+    if (psoc == nullptr || !psoc->core1_idle() || psoc->heavy_busy()) return false;
+    _runtime_index = 0u;
+    _runtime_sync_active = true;
+    return true;
+}
+
 void PsocAlgo::tick(Psoc* psoc) {
-    if (!_params_pending) return;
-    if (psoc == nullptr) { _params_pending = false; return; }
-    if (psoc->algo_download_busy()) return;   // 代码还在写, 等下一轮
-    _params_pending = false;
-    _push_runtime_params(psoc);
+    if (psoc == nullptr) {
+        _params_pending = false;
+        _runtime_sync_active = false;
+        return;
+    }
+    if (_reset_default_pending) {
+        // 先等旧上传释放 blob；切换后 pending 持续到 PSoC 的异步 INFO cache 确认默认代码真实生效。
+        if (!_reset_default_started) {
+            if (psoc->algo_download_busy() || !psoc->core1_idle()) return;
+            _params_pending = false;
+            _runtime_sync_active = false;
+            reset_default();
+            if (!request_download(psoc)) return;
+            _reset_default_started = true;
+            return;
+        }
+        if (psoc->algo_download_busy()) return;
+        bool valid = false;
+        uint16_t len = 0u;
+        if (!psoc->get_algo_info_cached(&valid, &len) || !valid ||
+            len != static_cast<uint16_t>(PSOC_ALGO_DEFAULT_LEN)) return;
+        _reset_default_pending = false;
+        _reset_default_started = false;
+        return;
+    }
+    if (_params_pending) {
+        if (psoc->algo_download_busy() || !psoc->core1_idle()) return;
+        _params_pending = false;
+        (void)_start_runtime_sync(psoc);
+        return;
+    }
+    if (!_runtime_sync_active || !psoc->core1_idle() || psoc->heavy_busy()) return;
+
+    if (_runtime_index < PSOC_ALGO_CHANNELS) {
+        const uint8_t ch = _runtime_index++;
+        if (_rom[ch] != 0u) (void)psoc->set_algo_rom(ch, _rom[ch]);
+        return;
+    }
+    const uint8_t cfg_index = static_cast<uint8_t>(_runtime_index - PSOC_ALGO_CHANNELS);
+    if (cfg_index < 8u) {
+        _runtime_index++;
+        (void)psoc->algo_set_cfg(cfg_index, _cfg[cfg_index]);
+        return;
+    }
+    _runtime_sync_active = false;
 }
 
 void PsocAlgo::_push_runtime_params(Psoc* psoc) {
-    // 每通道 ROM: 非零才推, 省事务; 失败不阻断。
-    for (uint8_t ch = 0; ch < PSOC_ALGO_CHANNELS; ++ch) {
-        if (_rom[ch] != 0u) { (void)psoc->set_algo_rom(ch, _rom[ch]); }
-    }
-    // cfg[8] 全量推: cfg[idx]=0 是合法设定值, 不能按非零省略。
-    for (uint8_t idx = 0; idx < 8u; ++idx) {
-        (void)psoc->algo_set_cfg(idx, _cfg[idx]);
-    }
+    (void)_start_runtime_sync(psoc);
 }
 
 bool PsocAlgo::download_to_psoc(Psoc* psoc) {
-    if (!request_download(psoc)) return false;
+    return request_download(psoc);
+}
+
+void PsocAlgo::abort_provisioning() {
     _params_pending = false;
-    _push_runtime_params(psoc);
-    return true;
+    _runtime_sync_active = false;
+    _runtime_index = 0u;
 }
 
 void PsocAlgo::_sync_bin_storage() {

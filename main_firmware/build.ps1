@@ -1,6 +1,6 @@
 ﻿# mai2control fixed autonomous build/flash/validation entry.
 # Change only this constant between "Build" and "Flash"; invocation stays fixed.
-$WorkflowMode = "Build"
+$WorkflowMode = "Flash"
 
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"

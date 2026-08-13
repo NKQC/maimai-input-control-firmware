@@ -105,7 +105,6 @@ impl UiConfig {
 pub mod keys {
     pub const LOG_FILTER: &str = "log_filter";
     pub const LOG_AUTO_SCROLL: &str = "log_auto_scroll";
-    pub const LOG_FILE_ON: &str = "log_file_on";
     pub const VCAM_ENABLED: &str = "vcam_enabled";
     pub const VCAM_SUBMIT_SECS: &str = "vcam_submit_secs";
     pub const VCAM_DISPLAY_SECS: &str = "vcam_display_secs";

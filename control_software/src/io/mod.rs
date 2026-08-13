@@ -565,7 +565,7 @@ pub fn spawn(device_selector: &str) -> Result<IoHandle> {
                                 {
                                     busy_notified = true;
                                     warn!(
-                                        "WinUSB 设备疑似忙(写 flash/CSD 重初始化)，等待恢复: 连续 {} 次 os error 22",
+                                        "WinUSB 设备报告忙态: 连续 {} 次 os error 22",
                                         busy_error_streak
                                     );
                                     let _ = evt_tx.send(IoEvent::DeviceBusy {
@@ -584,7 +584,7 @@ pub fn spawn(device_selector: &str) -> Result<IoHandle> {
                                 match selected_device_present(&thread_selector) {
                                     Ok(true) => {
                                         warn!(
-                                            "WinUSB 写入恢复预算达到 {}，但设备仍在枚举；继续重建端点等待恢复",
+                                            "WinUSB 端点已重建 {} 次，设备仍在枚举",
                                             WRITE_MAX_REBUILDS
                                         );
                                         rebuild_streak = 0;

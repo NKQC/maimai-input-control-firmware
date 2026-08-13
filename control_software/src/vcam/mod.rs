@@ -20,9 +20,29 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 pub mod backend;
+pub mod driver_pkg;
 mod interception;
 pub mod keyboard;
 pub mod share;
+mod winusb_scanner;
+
+/// 一句话说明本机能不能走"自写内核过滤驱动"这条路。
+/// UI 的诊断行与日志共用这一个出口，避免两处口径漂移。
+pub fn kernel_driver_feasibility() -> String {
+    interception::kernel_driver_feasibility()
+}
+
+/// 在位键盘类设备节点数 / Interception 键盘槽上限。查不到返回 None（绝不用 0 冒充）。
+pub fn keyboard_slot_pressure() -> Option<(usize, usize)> {
+    interception::present_keyboard_nodes()
+        .map(|present| (present, interception::MAX_KEYBOARD as usize))
+}
+
+/// 输出当前 Raw Input 键盘与 Interception 槽位的只读关联诊断。
+/// 该入口不会安装、卸载、重启设备，也不会设置拦截过滤器。
+pub fn interception_diagnostic(target_filter: Option<&str>) -> String {
+    interception::diagnostic_report(target_filter, &keyboard::list_keyboards())
+}
 
 /// 输出帧尺寸(RGB24)。多数摄像头消费端支持 640x480@RGB。
 pub const FRAME_W: usize = 640;

@@ -14,13 +14,13 @@ use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 /// 内存环形缓冲上限(条)。约 20000 × ~120B ≈ 2.4MB 上界。
 pub const RING_MAX: usize = 20_000;
-/// UI 视图一次最多渲染的行数(取尾部)。再长也不会撑爆 UI 模型。
-pub const VIEW_MAX: usize = 2_000;
+/// UI 模型的单次日志页不再以固定 2000 行截断；只保留一个安全上限，数据量超过时由 Slint ScrollView 自适应滚动。
+pub const VIEW_MAX: usize = 20_000;
 /// logs 目录里保留的历史文件个数, 超出删最旧, 避免长期运行把目录堆满。
 const KEEP_FILES: usize = 20;
 /// 单个日志文件字节上限, 超出即换下一份(便于用编辑器打开)。
@@ -39,10 +39,15 @@ pub struct LogHub {
     /// 每次写入 +1, UI 据此判断是否需要重建模型(避免每帧重建)。
     version: AtomicU64,
     next_no: AtomicU64,
+    /// 显示边界：`no < view_start_no` 的记录仍保留在内存环和日志文件中，但不再属于当前视图。
+    /// 只单调推进，不重置 `next_no`，避免清空与并发写入之间出现重号或丢行。
+    view_start_no: AtomicU64,
+    /// 内存环溢出丢弃的历史记录总数。
     dropped: AtomicU64,
+    /// 当前显示边界对应的内存环丢弃数基线；`dropped() - dropped_at_view_start` 即清空后的统计。
+    dropped_at_view_start: AtomicU64,
     file: Mutex<Option<BufWriter<File>>>,
     file_path: Mutex<Option<PathBuf>>,
-    file_enabled: AtomicBool,
     file_bytes: AtomicU64,
     /// 写入文件的最高等级(0错误..3调试), 跟随日志页选择的过滤等级。默认 2=信息。
     file_level: std::sync::atomic::AtomicU8,
@@ -56,22 +61,19 @@ pub fn hub() -> &'static LogHub {
         ring: Mutex::new(VecDeque::with_capacity(1024)),
         version: AtomicU64::new(0),
         next_no: AtomicU64::new(1),
+        view_start_no: AtomicU64::new(1),
         dropped: AtomicU64::new(0),
+        dropped_at_view_start: AtomicU64::new(0),
         file: Mutex::new(None),
         file_path: Mutex::new(None),
-        file_enabled: AtomicBool::new(false),
         file_bytes: AtomicU64::new(0),
         file_level: std::sync::atomic::AtomicU8::new(2),
     })
 }
 
-/// 安装为全局 logger。`file_enabled`=启动即落盘(在程序所在目录建 logs/)。
+/// 安装为全局 logger，并在启动时无条件初始化日志文件。
 /// 等级仍尊重 `RUST_LOG`(缺省 debug 全收: 过滤交给 UI, 这样切"调试"等级不必重启)。
-pub fn init(file_enabled: bool) {
-    let h = hub();
-    if file_enabled {
-        h.set_file_enabled(true);
-    }
+pub fn init() {
     let max = match std::env::var("RUST_LOG").ok().as_deref() {
         Some("error") => log::LevelFilter::Error,
         Some("warn") => log::LevelFilter::Warn,
@@ -82,14 +84,24 @@ pub fn init(file_enabled: bool) {
     // 已装过(例如测试进程重复调用)就别再装, set_logger 只允许一次。
     let _ = log::set_logger(&HubLogger);
     log::set_max_level(max);
+    // 文件落盘没有关闭入口；创建失败时 logger 仍完整收集内存日志并记录 warning。
+    hub().ensure_file();
 }
 
 struct HubLogger;
 
 impl log::Log for HubLogger {
-    fn enabled(&self, _m: &log::Metadata) -> bool {
-        // 收录与否只由日志等级决定(不按 target 区别对待): 内存缓冲全收, 落盘门槛见 file_level。
-        true
+    fn enabled(&self, metadata: &log::Metadata) -> bool {
+        let level = match metadata.level() {
+            log::Level::Error => 0u8,
+            log::Level::Warn => 1,
+            log::Level::Info => 2,
+            _ => 3,
+        };
+        // One production threshold governs the in-memory ring, file and debug
+        // console. Filtering only in snapshot() lets hidden Debug flood the ring
+        // and evict visible Info records before the user can inspect them.
+        level <= hub().level()
     }
 
     fn log(&self, record: &log::Record) {
@@ -143,11 +155,10 @@ impl LogHub {
         }
         self.version.fetch_add(1, Ordering::Relaxed);
 
-        // 落盘门槛 = 当前日志等级(与日志页的过滤等级同一个值)。选"信息"时 io 层每帧的十六进制
-        // 转储(Debug 级、遥测 30Hz、实测约 1MB/分钟)不落盘; 选"调试"则连同这些一起写入文件。
-        if self.file_enabled.load(Ordering::Relaxed)
-            && level <= self.file_level.load(Ordering::Relaxed)
-        {
+        // File writes use the same threshold as the in-memory production gate.
+        // Keep the explicit guard so direct callers remain safe if this logger is
+        // ever reused outside the log facade.
+        if level <= self.level() {
             let mut rotate = false;
             if let Ok(mut guard) = self.file.lock() {
                 if let Some(w) = guard.as_mut() {
@@ -172,17 +183,14 @@ impl LogHub {
         self.version.load(Ordering::Relaxed)
     }
 
-    /// 清空内存视图(日志页"清空视图"用)。
-    /// 为什么只清内存不动文件: 落盘的意义在于事后取证, 界面上嫌刷屏而清视图不该销毁证据;
-    /// 文件继续在当前那一份后面追加。行号 next_no 复位到 1, 使清空后视图从第 1 行重新计数
-    /// (否则续着几万号往下走, 用户会以为没清干净); dropped 一并归零, 免得统计行还挂着
-    /// "已滚出内存 N 条"这类清空前的旧账。
+    /// 清空当前显示视图：不修改内存环、文件内容或全局序号，只推进显示边界。
+    /// `next_no` 的当前值是下一条将分配的序号，因此边界设置为该值后，清空前已分配的记录
+    /// 都被隐藏；并发写入若在边界之后分配序号，则自然保留在新视图中，不会重号或漏行。
     pub fn clear(&self) {
-        if let Ok(mut ring) = self.ring.lock() {
-            ring.clear();
-        }
-        self.next_no.store(1, Ordering::Relaxed);
-        self.dropped.store(0, Ordering::Relaxed);
+        let boundary = self.next_no.load(Ordering::Acquire);
+        self.view_start_no.store(boundary, Ordering::Release);
+        self.dropped_at_view_start
+            .store(self.dropped.load(Ordering::Acquire), Ordering::Release);
         self.version.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -203,16 +211,19 @@ impl LogHub {
     }
 
     pub fn dropped(&self) -> u64 {
-        self.dropped.load(Ordering::Relaxed)
+        self.dropped
+            .load(Ordering::Acquire)
+            .saturating_sub(self.dropped_at_view_start.load(Ordering::Acquire))
     }
 
     /// 取尾部最多 `max_lines` 条、等级不高于 `min_level`(数值越大越啰嗦)的记录。
     pub fn snapshot(&self, level_filter: u8, max_lines: usize) -> Vec<LogEntry> {
         let ring = self.ring.lock().unwrap();
         let mut out: Vec<LogEntry> = Vec::with_capacity(max_lines.min(ring.len()));
-        // 从尾往前收集, 收满即停(长日志下不遍历全量)。
+        let view_start_no = self.view_start_no.load(Ordering::Acquire);
+        // 从尾往前收集, 收满即停(长日志下不遍历全量)。清空只推进边界，环内历史仍保留。
         for e in ring.iter().rev() {
-            if e.level > level_filter {
+            if e.no < view_start_no || e.level > level_filter {
                 continue;
             }
             out.push(e.clone());
@@ -243,10 +254,7 @@ impl LogHub {
         }
     }
 
-    pub fn file_enabled(&self) -> bool {
-        self.file_enabled.load(Ordering::Relaxed)
-    }
-
+    /// 当前强制日志文件路径；文件不可用时为空，内存日志仍继续工作。
     pub fn file_path_text(&self) -> String {
         match self.file_path.lock().unwrap().as_ref() {
             Some(p) => p.display().to_string(),
@@ -254,29 +262,21 @@ impl LogHub {
         }
     }
 
-    /// 换下一份日志文件(达到单文件上限时调用)。
+    /// 换下一份日志文件(达到单文件上限时调用)。不经过关闭开关，直接创建下一文件。
     fn rotate_file(&self) {
         self.flush();
         *self.file.lock().unwrap() = None;
-        self.file_enabled.store(false, Ordering::Relaxed);
         self.file_bytes.store(0, Ordering::Relaxed);
-        self.set_file_enabled(true);
+        self.ensure_file();
     }
 
-    /// 开/关文件落盘。开启时在程序目录的 logs/ 下按启动时刻新建一个文件(每次启动一份)。
-    pub fn set_file_enabled(&self, on: bool) {
-        if !on {
-            self.flush();
-            *self.file.lock().unwrap() = None;
-            self.file_enabled.store(false, Ordering::Relaxed);
-            return;
-        }
-        if self.file_enabled.load(Ordering::Relaxed) && self.file.lock().unwrap().is_some() {
+    /// 确保强制落盘文件存在；失败时仅保留内存日志并由 warning 留下诊断。
+    fn ensure_file(&self) {
+        if self.file.lock().unwrap().is_some() {
             return;
         }
         let dir = logs_dir();
         if let Err(e) = std::fs::create_dir_all(&dir) {
-            // 落盘失败不能拖死程序: 记一条(进内存缓冲)并保持关闭。
             log::warn!("无法创建日志目录 {}: {}", dir.display(), e);
             return;
         }
@@ -296,8 +296,7 @@ impl LogHub {
                 *self.file.lock().unwrap() = Some(w);
                 *self.file_path.lock().unwrap() = Some(path.clone());
                 self.file_bytes.store(0, Ordering::Relaxed);
-                self.file_enabled.store(true, Ordering::Relaxed);
-                log::info!("日志落盘已开启: {}", path.display());
+                log::info!("日志始终写入文件: {}", path.display());
             }
             Err(e) => {
                 log::warn!("无法创建日志文件 {}: {}", path.display(), e);

@@ -2,6 +2,8 @@
 #include "../../hal/usb/hal_usb.h"
 #include "../../config.h"
 #include "../tx_scheduler/tx_scheduler.h"
+#include "../persistence_txn/persistence_txn.h"
+#include "../sensor_link/sensor_link.h"
 #include "../usb_debug.h"
 #include <Arduino.h>
 #include <hardware/watchdog.h>
@@ -19,8 +21,9 @@ UsbComm* UsbComm::_instance = nullptr;
 UsbComm::UsbComm() = default;
 
 UsbComm* UsbComm::getInstance() {
-    if (!_instance) {
-        _instance = new UsbComm();
+    if (_instance == nullptr) {
+        static UsbComm instance;
+        _instance = &instance;
     }
     return _instance;
 }
@@ -35,7 +38,7 @@ bool UsbComm::init() {
             UsbComm* comm = UsbComm::getInstance();
             if (comm->_reboot.stage == RebootState::Stage::IDLE) {
                 comm->_reboot.stage = RebootState::Stage::ACK_DRAIN;
-                comm->_reboot.mode = 0;
+                comm->_reboot.mode = UsbComm::RebootState::Mode::APP;
                 comm->_reboot.deadline_ms = 0;
             }
         });
@@ -46,7 +49,7 @@ bool UsbComm::init() {
             UsbComm* comm = UsbComm::getInstance();
             if (comm->_reboot.stage == RebootState::Stage::IDLE) {
                 comm->_reboot.stage = RebootState::Stage::ACK_DRAIN;
-                comm->_reboot.mode = 1;
+                comm->_reboot.mode = UsbComm::RebootState::Mode::BOOTLOADER;
                 comm->_reboot.deadline_ms = 0;
             }
         });
@@ -59,13 +62,46 @@ bool UsbComm::init() {
         });
 
     // DEBUG_CRASH_BOOTSEL(0x07): 运行时武装/解除"运行中崩溃→进 BOOTSEL"。payload[0]:1=武装 0=解除。
-    // 武装标志写 watchdog scratch[6](跨复位存活、掉电清零), 由 setup() 启动决策读取。默认解除:
-    // 崩溃只正常重启; 自持 debug 连上后武装, 崩溃即进烧录便于 dev.ps1 自动重烧。
+    // 武装标志写 watchdog scratch[6](跨复位存活、掉电清零), 由 setup() 启动决策读取。
     dispatcher->register_handler(HostCmd::DEBUG_CRASH_BOOTSEL,
         [](const HostFrame& frame, uint8_t* resp_buf, uint16_t* resp_len) {
-            const bool arm = (frame.len >= 1) && (frame.payload[0] != 0u);
-            watchdog_hw->scratch[6] = arm ? DEBUG_BOOTSEL_MAGIC : 0u;
+            if (frame.len != 1u || (frame.payload[0] != 0u && frame.payload[0] != 1u)) {
+                *resp_len = HostCmdCodec::encode_nak(frame.seq, HostCmdError::INVALID_PARAM,
+                                                     "arm payload must be 0 or 1", resp_buf,
+                                                     HOST_CMD_RESP_BUF_MAX);
+                return;
+            }
+            watchdog_hw->scratch[6] = frame.payload[0] != 0u ? DEBUG_BOOTSEL_MAGIC : 0u;
             *resp_len = HostCmdCodec::encode_ack(frame.seq, resp_buf, HOST_CMD_RESP_BUF_MAX);
+        });
+
+    // DEBUG_TRIGGER_CRASH(0x0A): 仅允许已武装、设备空闲、空 payload。ACK 完成后复用主动重启
+    // 的 detach/drain 状态机，保留 scratch[6]/运行标记，让 setup() 进入既有崩溃 BOOTSEL 路径。
+    dispatcher->register_handler(HostCmd::DEBUG_TRIGGER_CRASH,
+        [](const HostFrame& frame, uint8_t* resp_buf, uint16_t* resp_len) {
+            UsbComm* comm = UsbComm::getInstance();
+            if (frame.len != 0u) {
+                *resp_len = HostCmdCodec::encode_nak(frame.seq, HostCmdError::INVALID_PARAM,
+                                                     "trigger payload must be empty", resp_buf,
+                                                     HOST_CMD_RESP_BUF_MAX);
+                return;
+            }
+            if (watchdog_hw->scratch[6] != DEBUG_BOOTSEL_MAGIC) {
+                *resp_len = HostCmdCodec::encode_nak(frame.seq, HostCmdError::INVALID_PARAM,
+                                                     "crash BOOTSEL is not armed", resp_buf,
+                                                     HOST_CMD_RESP_BUF_MAX);
+                return;
+            }
+            if (comm->_reboot.stage != RebootState::Stage::IDLE) {
+                *resp_len = HostCmdCodec::encode_nak(frame.seq, HostCmdError::DEVICE_BUSY,
+                                                     "reboot already in progress", resp_buf,
+                                                     HOST_CMD_RESP_BUF_MAX);
+                return;
+            }
+            *resp_len = HostCmdCodec::encode_ack(frame.seq, resp_buf, HOST_CMD_RESP_BUF_MAX);
+            comm->_reboot.stage = RebootState::Stage::ACK_DRAIN;
+            comm->_reboot.mode = UsbComm::RebootState::Mode::DEBUG_TRIGGER;
+            comm->_reboot.deadline_ms = 0;
         });
 
     return true;
@@ -82,6 +118,42 @@ bool UsbComm::has_pending_response() const {
         HostCmdDispatcher::getInstance()->has_pending_stream();
 }
 
+void UsbComm::_pump_persistence_terminal(HAL_USB_Device* usb) {
+    if (has_pending_response()) return;
+    uint8_t seq = 0u;
+    PersistenceTxn::Result result = PersistenceTxn::Result::NONE;
+    if (!PersistenceTxn::getInstance()->take_terminal(&seq, &result)) return;
+    uint16_t response_len = 0u;
+    if (result == PersistenceTxn::Result::OK) {
+        response_len = HostCmdCodec::encode_ack(seq, _resp_buf, HOST_CMD_RESP_BUF_MAX);
+    } else {
+        const char* detail = result == PersistenceTxn::Result::BUSY
+            ? "save transaction busy" : "persistent commit failed";
+        response_len = HostCmdCodec::encode_nak(seq, HostCmdError::CONFIG_ERROR,
+                                                detail, _resp_buf, HOST_CMD_RESP_BUF_MAX);
+    }
+    if (response_len == 0u) return;
+    _pending_resp_len = response_len;
+    _pending_resp_off = 0u;
+    usb->begin_command_response();
+}
+
+void UsbComm::_pump_sensor_terminal(HAL_USB_Device* usb) {
+    if (has_pending_response()) return;
+    uint8_t cmd = 0u;
+    uint8_t seq = 0u;
+    bool ok = false;
+    if (!SensorLink::getInstance()->take_host_write_terminal(&cmd, &seq, &ok)) return;
+    uint16_t response_len = ok
+        ? HostCmdCodec::encode_ack(seq, _resp_buf, HOST_CMD_RESP_BUF_MAX)
+        : HostCmdCodec::encode_nak(seq, HostCmdError::SENSOR_ERROR, "PSoC command failed",
+                                   _resp_buf, HOST_CMD_RESP_BUF_MAX);
+    if (response_len == 0u) return;
+    _pending_resp_len = response_len;
+    _pending_resp_off = 0u;
+    usb->begin_command_response();
+}
+
 void UsbComm::_dispatch_frame(HAL_USB_Device* usb, const HostFrame& frame) {
     uint16_t resp_len = 0;
     g_usb_dbg.host_dispatch_count++;
@@ -90,12 +162,32 @@ void UsbComm::_dispatch_frame(HAL_USB_Device* usb, const HostFrame& frame) {
     }
     g_usb_dbg.host_last_dispatch_cmd = frame.cmd;
     g_usb_dbg.host_last_dispatch_seq = frame.seq;
+    if (SensorLink::getInstance()->replay_host_write(frame, _resp_buf, &resp_len)) {
+        g_usb_dbg.host_last_dispatch_resp_len = resp_len;
+        if (resp_len > 0u) {
+            _pending_resp_len = resp_len;
+            _pending_resp_off = 0u;
+            usb->begin_command_response();
+        }
+        return;
+    }
     HostCmdDispatcher::getInstance()->dispatch(frame, _resp_buf, &resp_len);
     g_usb_dbg.host_last_dispatch_resp_len = resp_len;
     if (resp_len > 0) {
         _pending_resp_len = resp_len;
         _pending_resp_off = 0;
         usb->begin_command_response();
+        return;
+    }
+    // SAVE_CONFIG deliberately has no immediate response: its terminal ACK/NAK
+    // is generated only after the verified persistence barrier completes.
+    if (frame.cmd == static_cast<uint8_t>(HostCmd::SAVE_CONFIG) &&
+        (PersistenceTxn::getInstance()->awaiting_response(frame.seq) ||
+         PersistenceTxn::getInstance()->completed(frame.seq))) {
+        return;
+    }
+    // Delayed terminal commands intentionally return no immediate payload; UsbComm owns their final ACK/NAK.
+    if (SensorLink::getInstance()->host_write_active()) {
         return;
     }
     // ★resp_len==0 只有一个语义: 组帧被拒★ 每个已注册 handler 都必然写 resp_len, 未注册命令走
@@ -158,22 +250,28 @@ void UsbComm::update() {
         _clear_pending_tx(usb);
         HostCmdDispatcher::getInstance()->clear_pending_stream();
         _codec.reset();
-        _deferred_frame_pending = false;
         _frame_open_since = 0u;
         if (_reboot.stage != RebootState::Stage::DETACHED) {
             _reboot.clear();
             return;
         }
     }
-    // 入口处若无在途响应，说明上一响应已在上一轮写完；_resp_buf 已空闲整整一轮，
-    // 此刻派发暂存帧可安全改写缓冲，不会在刚 flush 的同一轮覆盖 TinyUSB 仍引用的数据。
-    if (_deferred_frame_pending && !has_pending_response()) {
-        _deferred_frame_pending = false;
-        _dispatch_frame(usb, _deferred_frame);
-    }
+    // Complete a deferred SAVE_CONFIG terminal before accepting another frame.
+    // Normal commands are explicitly flow-controlled by leaving unread bytes in
+    // the USB FIFO while a response is in flight; this keeps RAM bounded without
+    // cloning 4 KiB HostFrames and never silently overwrites a request.
+    _pump_persistence_terminal(usb);
+    _pump_sensor_terminal(usb);
 
     // 再泵 TX：可能是刚上面派发出的响应，也可能是续传的大响应分片。
     _pump_pending_tx(usb);
+    // A response buffer is single-owner. Stop before decoding another complete
+    // request so RX remains the bounded backpressure queue supplied by TinyUSB.
+    if (has_pending_response()) return;
+    // SAVE_CONFIG owns the transport until its verified terminal response has
+    // been queued. This is intentional endpoint backpressure, not a drop: the
+    // host keeps later bytes in its FIFO and retries the same sequence safely.
+    if (PersistenceTxn::getInstance()->active() || SensorLink::getInstance()->host_write_active()) return;
 
     const size_t available = usb->config_available();
     uint8_t read_byte;
@@ -204,13 +302,16 @@ void UsbComm::update() {
             // → 租约到期 → 大吞吐任务自动取消。上位机的 ~1s PING 天然维持续租。
             TxScheduler::getInstance()->renew_all(3000);
 
-            if (!has_pending_response() && !_deferred_frame_pending) {
+            if (!has_pending_response()) {
                 _dispatch_frame(usb, _frame);
+                // 响应缓冲为单所有者：当前帧一旦生成响应，必须立刻停止读取 RX。
+                // 若继续解码到下一完整帧才检查 has_pending_response，该帧的字节已经从
+                // TinyUSB FIFO 被取走，却既不能分发也没有软件队列承接，结果就是静默丢命令。
+                // 主机允许把直接查询与有序写队列帧连续提交，因此这里必须在帧边界施加背压。
+                if (has_pending_response() || PersistenceTxn::getInstance()->active() ||
+                    SensorLink::getInstance()->host_write_active()) break;
             } else {
-                // 上一响应占用 _resp_buf 时仍须从 RX 环取走已完整的帧；单槽暂存首帧，
-                // 随后暂停解析，避免生成新响应覆盖正在由 TinyUSB 发送的缓冲。
-                _deferred_frame = _frame;
-                _deferred_frame_pending = true;
+                // 正常入口不会在已有响应时读取 RX；保留防御分支，避免未来调用顺序变化时吞帧。
                 break;
             }
         }
@@ -242,7 +343,7 @@ void UsbComm::update() {
             usb->task();
             if (static_cast<int32_t>(now - _reboot.deadline_ms) < 0) break;
 
-            if (_reboot.mode == 0) {
+            if (_reboot.mode == RebootState::Mode::APP) {
                 // 主动重启回 app：清运行态标记，避免启动时被判为死锁而进 BOOTSEL。
                 watchdog_hw->scratch[7] = 0u;
                 // ★同时清 scratch[0]/[1]★: setup() 用 scratch[0]==CRASH_RUN_MAGIC 判"上次是否运行中
@@ -251,6 +352,12 @@ void UsbComm::update() {
                 // 的判据污染成永远为真, 故主动重启必须一并清掉。
                 watchdog_hw->scratch[CRASH_SCRATCH_RUN] = 0u;
                 watchdog_hw->scratch[CRASH_SCRATCH_STAGE] = 0u;
+                watchdog_reboot(0, 0, 10);
+                while (true) tight_loop_contents();
+            }
+            if (_reboot.mode == RebootState::Mode::DEBUG_TRIGGER) {
+                // 不清 scratch[6] 或 scratch[7]/运行标记: watchdog_reboot 后 setup() 的既有判据
+                // 会把这次安全触发当作运行中崩溃并转入 BOOTSEL。
                 watchdog_reboot(0, 0, 10);
                 while (true) tight_loop_contents();
             }

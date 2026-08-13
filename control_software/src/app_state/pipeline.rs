@@ -9,7 +9,7 @@
 //! 处理（保留其批量 owner/generation 等既有正确设计），但它们的 seq 也会登记进
 //! 统一注册表供 _handle_ack/_handle_nak 统一查询。
 
-use crate::proto::Frame;
+use crate::proto::HostCmd;
 use std::collections::HashMap;
 use std::time::Instant;
 
@@ -27,7 +27,7 @@ pub struct PendingRequest {
 /// 请求类别枚举，涵盖当前 12 种归因场景 + 新增的统一轮询类。
 ///
 /// **迁移说明**：
-/// - 已迁移到统一表：`algo_get_info`/`request_algo_trace` 以及所有当前"直发"的只读轮询
+/// - 已迁移到统一表：`algo_get_info` 以及所有当前"直发"的只读轮询
 ///   （ping/request_params/global_get_all/kbd_*/mai2_request_state/led_request_state 等）
 /// - 尚未迁移（仍由原专属字段归因，因其与领域状态机强耦合）：
 ///   - cfg_tx_inflight.seq（写类命令队列，保留其 owner/generation 语义）
@@ -58,13 +58,19 @@ pub enum RequestKind {
     Mai2RequestState,
     LedRequestState,
     AlgoGetInfo,
+    /// 某次算法上传 ACK 后的真值确认；会话元数据随 seq 原子注册，旧响应不能命中新会话。
+    AlgoUploadVerify {
+        session_id: u64,
+        expected_len: u16,
+        expected_crc: u16,
+        attempt: u8,
+    },
     AlgoGetRom,
-    RequestAlgoSrc,
-    RequestAlgoCode,
-    RequestAlgoTrace {
-        ch: u8,
+    AlgoGetCfg {
         idx: u8,
     },
+    RequestAlgoSrc,
+    RequestAlgoCode,
     BusXfer,
 
     /// 连接成功后的顺序回读探针（响应按 cmd 分发，ACK/NAK 仅用于统一归因）。
@@ -100,14 +106,65 @@ impl RequestKind {
             Self::Mai2RequestState => "MAI2_GET_STATE".to_string(),
             Self::LedRequestState => "LED_GET".to_string(),
             Self::AlgoGetInfo => "ALGO_GET_INFO".to_string(),
+            Self::AlgoUploadVerify {
+                session_id,
+                expected_len,
+                expected_crc,
+                attempt,
+            } => format!(
+                "ALGO_GET_INFO(upload_session={} len={} crc=0x{:04X} attempt={})",
+                session_id, expected_len, expected_crc, attempt
+            ),
             Self::AlgoGetRom => "ALGO_GET_ROM".to_string(),
+            Self::AlgoGetCfg { idx } => format!("ALGO_GET_CFG(idx={})", idx),
             Self::RequestAlgoSrc => "ALGO_GET_SRC".to_string(),
             Self::RequestAlgoCode => "ALGO_GET_CODE".to_string(),
-            Self::RequestAlgoTrace { ch, idx } => format!("ALGO_GET_TRACE(ch={}, idx={})", ch, idx),
+
             Self::BusXfer => "BUS_XFER".to_string(),
             Self::ConnProbe { name } => format!("连接探针({})", name),
             Self::CfgTx { cmd } => format!("CFG_TX(cmd=0x{:02X})", cmd),
         }
+    }
+
+    /// 该请求期待的数据响应 cmd；`None` = 结局只由 ACK/NAK 或专属状态机给出。
+    ///
+    /// ★这里禁止 `_` 通配★
+    /// 原先这份映射内联在 `_confirm_data_pending` 里并以 `_ => false` 兜底，
+    /// 结果 `LedRequestState` 从未配上一臂：设备正确应答了 LED_GET、主机也解出了
+    /// 96B 快照，却没人注销在途登记 ⇒ 窗口=1 的连接探针队列被占死，只能等 6s 超时
+    /// 才推进（用户可见表现：每次连接必卡 6s，算法 C 源回读被推到连接后 ~8.4s，
+    /// 首次进单通道精调不出数）。改为穷尽匹配后，任何新增 RequestKind 都会在
+    /// 编译期被逼着表态，不会再退化成静默故障。
+    pub fn expected_response_cmd(&self) -> Option<u8> {
+        let cmd = match self {
+            Self::RequestParams { .. } | Self::RequestParamAllChannels { .. } => {
+                HostCmd::ParamGetAll
+            }
+            Self::ConfigGetAll => HostCmd::CfgGetAll,
+            Self::GlobalGetAll => HostCmd::GlobalGetAll,
+            Self::KbdRequestState => HostCmd::KbdGetState,
+            Self::KbdRequestMap => HostCmd::KbdGetMap,
+            Self::KbdRequestTouchmap => HostCmd::KbdGetTouchmap,
+            Self::KbdRequestHold => HostCmd::KbdGetHold,
+            Self::KbdRequestEdges => HostCmd::KbdGetEdges,
+            Self::KbdRequestKeycfg => HostCmd::KbdGetKeycfg,
+            Self::KbdGetCombo => HostCmd::KbdGetCombo,
+            Self::Mai2RequestState => HostCmd::Mai2GetState,
+            Self::LedRequestState => HostCmd::LedGet,
+            Self::AlgoGetInfo => HostCmd::AlgoGetInfo,
+            Self::AlgoGetRom => HostCmd::AlgoGetRom,
+            Self::AlgoGetCfg { .. } => HostCmd::AlgoGetCfg,
+            Self::RequestAlgoSrc => HostCmd::AlgoGetSrc,
+            Self::RequestAlgoCode => HostCmd::AlgoGetCode,
+            Self::BusXfer => HostCmd::BusXfer,
+            // 以下没有"数据响应"这一步：PING/写类只有 ACK/NAK；上传确认与连接探针
+            // 由各自状态机归因，不能在通用路径上被提前注销。
+            Self::Ping
+            | Self::AlgoUploadVerify { .. }
+            | Self::ConnProbe { .. }
+            | Self::CfgTx { .. } => return None,
+        };
+        Some(cmd as u8)
     }
 }
 
@@ -138,9 +195,50 @@ impl PendingRegistry {
         self.map.remove(&seq)
     }
 
+    /// 在途请求的可读清单(供延迟尖峰现场记录)。★按类别去重并排序★: 同类多条在途时只需知道
+    /// "它在跑"; 排序使日志行可直接横向比对, 不受 HashMap 迭代顺序影响。
+    pub fn inflight_labels(&self) -> Vec<String> {
+        let mut v: Vec<String> = self.map.values().map(|req| req.kind.label()).collect();
+        v.sort_unstable();
+        v.dedup();
+        v
+    }
+
     /// 是否已有同类请求在途，轮询任务用它实现窗口=1。
     pub fn contains_kind(&self, kind: &RequestKind) -> bool {
         self.map.values().any(|req| &req.kind == kind)
+    }
+
+    /// 取消指定类别的在途请求。用于写入持久化屏障前丢弃旧读请求，避免保存后的回读被旧响应占用窗口。
+    pub fn cancel_kind(&mut self, kind: &RequestKind) -> Vec<u8> {
+        let seqs: Vec<u8> = self
+            .map
+            .iter()
+            .filter_map(|(seq, req)| (&req.kind == kind).then_some(*seq))
+            .collect();
+        for seq in &seqs {
+            self.map.remove(seq);
+        }
+        seqs
+    }
+
+    /// 清除所有指定类别的在途请求。
+    pub fn cancel_kinds(&mut self, kinds: &[RequestKind]) -> Vec<u8> {
+        let mut seqs = Vec::new();
+        for kind in kinds {
+            seqs.extend(self.cancel_kind(kind));
+        }
+        seqs
+    }
+
+    /// 是否有任意 ALGO_GET_INFO 请求在途；普通刷新与上传确认共享设备端单一读窗口。
+    pub fn contains_algo_info_request(&self) -> bool {
+        self.map.values().any(|req| {
+            matches!(
+                req.kind,
+                RequestKind::AlgoGetInfo | RequestKind::AlgoUploadVerify { .. }
+            )
+        })
     }
 
     /// 超时检查（返回所有超时的 seq）
@@ -173,100 +271,6 @@ pub struct PollContext {
     pub sel_channel: u8,
     pub light_panel_expanded: bool,
     pub phys_la_expanded: bool,
-    /// 算法追踪轮询的 report idx；None 表示当前没有声明可读的上报项。
-    pub algo_trace_idx: Option<u8>,
-}
-
-/// 轮询规则：声明式"页面可见性 → 周期任务"映射
-pub struct PollRule {
-    /// 规则名（用于日志/调试）
-    pub name: &'static str,
-    /// 可见性判定（输入上下文快照，返回是否应该执行）
-    pub condition: Box<dyn Fn(&PollContext) -> bool>,
-    /// 周期（毫秒）；0 = 每 tick 都执行（只要条件满足）
-    pub period_ms: u32,
-    /// 要提交的任务构造器（根据上下文构造 RequestKind + 要发送的帧）
-    pub task: Box<dyn Fn(&PollContext) -> (RequestKind, Frame)>,
-    /// 上一次执行的墙钟 tick（用于周期判定）
-    last_tick: u32,
-}
-
-impl PollRule {
-    /// 判定本 tick 是否应该执行（条件满足 + 周期到点）
-    pub fn should_run(&mut self, ctx: &PollContext, now_tick: u32, tick_ms: u32) -> bool {
-        if !(self.condition)(ctx) {
-            return false;
-        }
-        if self.period_ms == 0 {
-            return true; // 每 tick 都执行
-        }
-        let period_ticks = if tick_ms == 0 {
-            1
-        } else {
-            self.period_ms
-                .saturating_add(tick_ms.saturating_sub(1))
-                .checked_div(tick_ms)
-                .unwrap_or(1)
-                .max(1)
-        };
-        if now_tick.wrapping_sub(self.last_tick) >= period_ticks {
-            self.last_tick = now_tick;
-            true
-        } else {
-            false
-        }
-    }
-}
-
-/// 轮询规则表（由 AppController 持有并在每 tick 里评估）
-pub struct PollRules {
-    rules: Vec<PollRule>,
-}
-
-impl PollRules {
-    pub fn new() -> Self {
-        Self { rules: Vec::new() }
-    }
-
-    /// 添加一条规则
-    pub fn add(
-        &mut self,
-        name: &'static str,
-        condition: Box<dyn Fn(&PollContext) -> bool>,
-        period_ms: u32,
-        task: Box<dyn Fn(&PollContext) -> (RequestKind, Frame)>,
-    ) {
-        self.rules.push(PollRule {
-            name,
-            condition,
-            period_ms,
-            task,
-            last_tick: 0,
-        });
-    }
-
-    /// 每 tick 评估所有规则，返回需要提交的任务列表
-    pub fn evaluate(
-        &mut self,
-        ctx: &PollContext,
-        now_tick: u32,
-        tick_ms: u32,
-    ) -> Vec<(&'static str, RequestKind, Frame, u8)> {
-        let mut tasks = Vec::new();
-        for rule in &mut self.rules {
-            if rule.should_run(ctx, now_tick, tick_ms) {
-                let (kind, frame) = (rule.task)(ctx);
-                // seq 由调用方统一分配，避免规则表持有 AppController 的可变引用。
-                tasks.push((rule.name, kind, frame, 0u8));
-            }
-        }
-        tasks
-    }
-
-    /// 清空所有规则（用于测试或重建规则表）
-    pub fn clear(&mut self) {
-        self.rules.clear();
-    }
 }
 
 /// 未连接时被跳过的请求记录（供 UI 展示或日志）
@@ -301,11 +305,6 @@ impl SkippedLog {
             reason,
             at: Instant::now(),
         });
-    }
-
-    /// 获取最近 N 条记录
-    pub fn recent(&self, n: usize) -> Vec<SkippedRequest> {
-        self.entries.iter().rev().take(n).cloned().collect()
     }
 
     /// 清空记录

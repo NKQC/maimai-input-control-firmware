@@ -37,6 +37,12 @@ export component ToolboxPage inherits Rectangle {
     in property <string> vcam_runtime_status: "未运行";
     // 安装/卸载正在进行中(提权 + 改注册表/文件): 两个按钮共用这一个标志一起禁用。
     in property <bool> vcam_deploy_busy: false;
+    // WinUSB 改绑的三档状态(签名 / 绑定)与本机内核驱动可行性诊断, 全部由 Rust 侧实测后回填。
+    in property <string> vcam_signing_status: "未签名";
+    in property <string> vcam_binding_status: "未改绑";
+    in property <string> vcam_kernel_diag: "";
+    // 只在动作失败时非空: 成功的结论由上面两行状态承担, 重复说一遍就是啰嗦。
+    in property <string> vcam_winusb_note: "";
     // 输入源设备树(组头 + 设备项), 由 Rust 侧按分类展平后填充。
     in property <[VcamKbdRow]> vcam_kbd_rows;
     in property <int> vcam_device_index: 0;
@@ -52,6 +58,13 @@ export component ToolboxPage inherits Rectangle {
     callback refresh_vcam_devices();
     callback install_vcam();
     callback uninstall_vcam();
+    callback sign_vcam_driver();
+    callback bind_vcam_winusb();
+    callback unbind_vcam_winusb();
+
+    // 「签名并信任」的二次确认闸: 第一次点击只展开告知文案, 必须再点一次专门的确认按钮才真的执行。
+    // 往受信任根证书存储里写东西是不可当作顺手操作的, 所以确认状态放在 UI 本地, 不参与持久化。
+    property <bool> sign_confirm: false;
 
     // ★整页装进 ScrollView★ 本页内容(权限提示 + 设备树 + 若干参数行 + 说明)的 min-height 约 660px,
     // 在 520px 高的窗口里会溢出并把底部说明/预览挤出可视区。ScrollView 自身 min 只有 50px, 且其
@@ -240,8 +253,107 @@ export component ToolboxPage inherits Rectangle {
                                     }
                                 }
                                 Text {
-                                    text: "注册摄像头组件，需要管理员权限。";
+                                    text: "可对选定设备执行热重启；若未执行则不会拦截目标设备输入。";
                                     color: #7f8c96;
+                                    font-size: 10px;
+                                    wrap: word-wrap;
+                                }
+                                // 内核过滤驱动到底可不可行 + 在位键盘节点/槽上限, 都是实测读数。
+                                // 旧版只给一句笼统文案, 用户会被误导去排查根本不存在的兼容性问题。
+                                if root.vcam_kernel_diag != "": Text {
+                                    text: root.vcam_kernel_diag;
+                                    color: #c8a24a;
+                                    font-size: 10px;
+                                    wrap: word-wrap;
+                                }
+                            }
+                        }
+
+                        // WinUSB 改绑: 把扫码器的 USB 节点从 hidusb 换到微软已签名的 winusb.sys。
+                        // 之后 Windows 不再把它当键盘 ⇒ 天然 100% 吞键, 没有键盘槽上限。
+                        Rectangle {
+                            background: #1a1e23;
+                            border-color: #2b3238;
+                            border-width: 1px;
+                            border-radius: 4px;
+                            VerticalBox {
+                                padding: 7px;
+                                spacing: 5px;
+                                Text {
+                                    text: "WinUSB 改绑（100% 吞键）";
+                                    color: #e0e6ec;
+                                    font-weight: 700;
+                                }
+                                Text {
+                                    text: "① 签名 " + root.vcam_signing_status
+                                        + "    ② 绑定 " + root.vcam_binding_status;
+                                    color: #8fd6ff;
+                                    font-size: 11px;
+                                    wrap: word-wrap;
+                                }
+                                // 三个动作并排一行。★不要再把它们拆成三个各自带 stretch 的 HorizontalBox★
+                                // 那样每行都要独立分配高度, 与下面的条件确认块一起把布局撑得七零八落。
+                                HorizontalBox {
+                                    padding: 0px;
+                                    spacing: 8px;
+                                    Button {
+                                        text: "① 签名并信任";
+                                        enabled: !root.vcam_deploy_busy && !root.sign_confirm;
+                                        clicked => { root.sign_confirm = true; }
+                                    }
+                                    Button {
+                                        text: "② 安装并改绑";
+                                        enabled: !root.vcam_deploy_busy;
+                                        clicked => { root.bind_vcam_winusb(); }
+                                    }
+                                    Button {
+                                        text: "恢复原驱动";
+                                        enabled: !root.vcam_deploy_busy;
+                                        clicked => { root.unbind_vcam_winusb(); }
+                                    }
+                                    Rectangle { horizontal-stretch: 1; }
+                                }
+                                // 二次确认: 必须显式再点一次「确认执行」才会往证书存储写入任何东西。
+                                // ★这里不能再套一层 Rectangle 当告知面板★ Rectangle 在 VerticalBox 里没有
+                                // 内在高度, 里面又是会换行的文本 ⇒ 高度算不出来, 实测会与下一个按钮压在一起
+                                // (用户截图里的"确认键重叠"就是这么来的)。直接做 VerticalBox 的条件子项即可。
+                                if root.sign_confirm: Text {
+                                    text: "将向本机「受信任的根证书颁发机构」与「受信任的发布者」写入一张本应用自签名证书，"
+                                        + "仅用于满足 Windows 10 起对驱动包的强制签名；不安装任何内核驱动。「恢复原驱动」会把它一并移除。";
+                                    color: #f5c469;
+                                    font-size: 10px;
+                                    wrap: word-wrap;
+                                }
+                                if root.sign_confirm: HorizontalBox {
+                                    padding: 0px;
+                                    spacing: 8px;
+                                    Button {
+                                        text: root.vcam_deploy_busy ? "签名中…" : "确认执行";
+                                        enabled: !root.vcam_deploy_busy;
+                                        clicked => {
+                                            root.sign_confirm = false;
+                                            root.sign_vcam_driver();
+                                        }
+                                    }
+                                    Button {
+                                        text: "取消";
+                                        enabled: !root.vcam_deploy_busy;
+                                        clicked => { root.sign_confirm = false; }
+                                    }
+                                    Rectangle { horizontal-stretch: 1; }
+                                }
+                                // 只在动作真的失败时出现: 状态行说不出"为什么没成", 那句必须留在界面上。
+                                if root.vcam_winusb_note != "": Text {
+                                    text: root.vcam_winusb_note;
+                                    color: #ff9a8a;
+                                    font-size: 10px;
+                                    wrap: word-wrap;
+                                }
+                                // ★这段副作用必须出现在界面上★ 吞键就是靠"它不再是键盘"实现的,
+                                // 用户必须事先知道代价, 而不是事后发现扫码器在别处也不工作了。
+                                Text {
+                                    text: "⚠ 改绑后该扫码器在所有程序里都不再是键盘（吞键就是这么实现的），要恢复请点「恢复原驱动」。";
+                                    color: #f5c469;
                                     font-size: 10px;
                                     wrap: word-wrap;
                                 }

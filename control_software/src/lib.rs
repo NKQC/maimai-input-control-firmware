@@ -3,6 +3,8 @@
 //! 本库暴露的公共模块可被 main.rs 与 src/bin/* 自测程序复用,
 //! 避免代码重复。Slint UI 相关只在 main.rs 中,不进库。
 
+/// JIT 算法变量的中文别名/简介（纯 UI 侧资产，不进固件）。
+pub mod algo_i18n;
 pub mod app_state;
 pub mod comport;
 pub mod elevation;

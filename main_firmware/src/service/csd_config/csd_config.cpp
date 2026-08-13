@@ -16,6 +16,10 @@
 namespace {
 constexpr uint32_t CSD_BLOB_MAGIC = 0x31445343u;  // "CSD1"
 constexpr const char* CSD_BLOB_PATH = "/csd.bin";
+constexpr uint8_t RECAPTURE_PROBE_CH[] = {0u, 7u, 8u, 17u, 34u, 35u};
+constexpr uint8_t RECAPTURE_PROBE_COUNT =
+    static_cast<uint8_t>(sizeof(RECAPTURE_PROBE_CH) / sizeof(RECAPTURE_PROBE_CH[0]));
+constexpr uint16_t RECAPTURE_RAW_RAILED = 4090u;
 
 }  // namespace
 
@@ -68,8 +72,31 @@ void CsdConfig::clear() {
     _valid = false;
     _global_valid = false;
     _mode = CSD_MODE_AUTO;
+    _recapture_stage = RecaptureStage::IDLE;
+    _recapture_index = 0u;
+    _recapture_moved = false;
     _sync_storage();
     request_save();
+}
+
+void CsdConfig::request_recapture() {
+    _recapture_pending = true;
+    _baseline_untrusted = false;
+    _recapture_stage = RecaptureStage::SAMPLE_FIRST;
+    _recapture_index = 0u;
+    _recapture_moved = false;
+    _recapture_has_enabled = false;
+    _recapture_started_ms = 0u;
+    std::memset(_recapture_first, 0, sizeof(_recapture_first));
+}
+
+void CsdConfig::clear_recapture() {
+    _recapture_pending = false;
+    _recapture_stage = RecaptureStage::IDLE;
+    _recapture_index = 0u;
+    _recapture_moved = false;
+    _recapture_has_enabled = false;
+    _recapture_started_ms = 0u;
 }
 
 // ★落盘由 NvStore 单点负责★
@@ -128,56 +155,212 @@ bool CsdConfig::save() {
 #endif
 }
 
-void CsdConfig::download_to_psoc(Psoc* psoc) {
-    if (psoc == nullptr || !psoc->link_ok()) return;
-    psoc->set_mode(_mode);
-    bool need_apply = false;
+bool CsdConfig::download_to_psoc(Psoc* psoc) {
+    if (psoc == nullptr || !psoc->link_alive() || provisioning_active()) return false;
+    _provision_stage = ProvisionStage::MODE;
+    _provision_ch = 0u;
+    _provision_index = 0u;
+    _provision_need_global_commit = _global_valid;
+    return true;
+}
 
-    // 全局 CSD 配置(未激活传感器连接/IDAC/MFS 等)与扫描模式无关, 有则先全部下发到 RAM 影子,
-    // 再 global_commit() 触发【一次】完整重初始化(合并, 防每项重初始化的反复重校准漂移)。
-    if (_global_valid) {
-        for (uint8_t i = 0; i < CSD_GLOBAL_COUNT; i++) {
-            psoc->set_global((uint8_t)(CSD_GLOBAL_ID_MIN + i), _global[i]);
-        }
-        psoc->global_commit();
-    }
+void CsdConfig::abort_provisioning() {
+    _provision_stage = ProvisionStage::IDLE;
+    _provision_ch = 0u;
+    _provision_index = 0u;
+    _provision_need_global_commit = false;
+}
 
-    // ★通道启用开关与扫描模式无关, 必须无条件下发★
-    // 它是硬件开关(禁用 = 该 widget 永久退出扫描序列、电极保持模拟高阻), 不是"手动调参项"。
-    // 若跟着下面的 `_mode == SEMI && _valid` 一起被门控, 那么 AUTO 模式下、或 store 尚未 valid 时,
-    // PSoC 复位后会带着"36 通道全启用"的出厂默认跑起来 —— 用户明确关掉的通道会静默复活。
-    // PSoC 侧的 PARAM_ENABLED 会在 provision gate 放行后统一落实；紧随其后的 APPLY 同时是
-    // 首扫完成屏障，不能因为仅修改 enabled 而省略。
-    for (uint8_t ch = 0; ch < CSD_CHANNELS; ch++) {
-        psoc->set_param(ch, CSD_PARAM_ENABLED,
-                        _param[ch][_param_index(CSD_PARAM_ENABLED)] != 0u ? 1u : 0u);
-    }
-    /* 完整 enabled 位图之后无条件排入既有 APPLY。PSoC 启动 gate 仅在这条 FIFO 屏障真正
-     * 完成后才允许首次 ScanAllWidgets，因此 AUTO/空 store 路径也不能省略。 */
-    need_apply = true;
+bool CsdConfig::provisioning_active() const {
+    return _provision_stage != ProvisionStage::IDLE && _provision_stage != ProvisionStage::DONE;
+}
 
-    // 半自动手动模式才需要下发手动参数；自动校准模式由 PSoC 运行标准完整处理链。
-    if (_mode == CSD_MODE_SEMI && _valid) {
-        for (uint8_t ch = 0; ch < CSD_CHANNELS; ch++) {
-            for (uint8_t i = 0; i < CSD_PARAM_COUNT; i++) {
-                const uint8_t param_id = (uint8_t)(CSD_PARAM_ID_MIN + i);
-                if (param_id == CSD_PARAM_ENABLED) continue;   // 已在上面无条件下发过
-                // ★0 不是合法工作值的项一律跳过★: 分辨率/分频/模态IDAC/IDAC增益 为 0 表示
-                // "store 里没有有效值"(旧 blob、被污染、或从未校准过), 硬把 0 下发会直接毁掉
-                // PSoC 自动校准算出的结果 —— 实测 IDAC=0 下发后全通道 raw 卡满量程 4095 不可用。
-                // 阈值类为 0 仍照发: 0 阈值虽不推荐但语义明确(用户可能真想关掉某项判定)。
-                if (_param[ch][i] == 0u && _param_zero_invalid(param_id)) {
-                    continue;
-                }
-                psoc->set_param(ch, param_id, _param[ch][i]);
+bool CsdConfig::provisioning_complete() const {
+    return _provision_stage == ProvisionStage::DONE;
+}
+
+void CsdConfig::tick_provisioning(Psoc* psoc) {
+    if (!provisioning_active() || psoc == nullptr || !psoc->core1_idle() || psoc->heavy_busy()) return;
+
+    switch (_provision_stage) {
+        case ProvisionStage::MODE:
+            // Restore shadows while the PSoC startup gate still holds all widgets
+            // disabled.  Hardware fields must not be written into a live scan;
+            // the single release APPLY below is the barrier that makes the whole
+            // prepared image active.
+            if (psoc->set_mode(_mode)) {
+                _provision_ch = 0u;
+                _provision_index = 0u;
+                _provision_stage = _global_valid ? ProvisionStage::GLOBALS :
+                    ((_mode == CSD_MODE_SEMI && _valid) ? ProvisionStage::PARAMS : ProvisionStage::ENABLED);
             }
-        }
-        need_apply = true;
-    }
+            return;
 
-    // 全局配置(改 RAM 影子)与硬件参数均需 APPLY 重初始化生效。
-    if (need_apply) {
-        psoc->apply_params();
+        case ProvisionStage::GLOBALS:
+            if (_provision_index >= CSD_GLOBAL_COUNT) {
+                _provision_ch = 0u;
+                _provision_index = 0u;
+                _provision_stage = (_mode == CSD_MODE_SEMI && _valid)
+                    ? ProvisionStage::PARAMS : ProvisionStage::ENABLED;
+                return;
+            }
+            if (psoc->set_global(static_cast<uint8_t>(CSD_GLOBAL_ID_MIN + _provision_index),
+                                 _global[_provision_index])) {
+                _provision_index++;
+            }
+            return;
+
+        case ProvisionStage::GLOBAL_COMMIT:
+            if (psoc->global_commit()) _provision_stage = ProvisionStage::ENABLED;
+            return;
+
+        case ProvisionStage::ENABLED:
+            if (_provision_ch >= CSD_CHANNELS) {
+                _provision_ch = 0u;
+                _provision_index = 0u;
+                _provision_stage = ProvisionStage::RELEASE_APPLY;
+                return;
+            }
+            if (psoc->set_param(_provision_ch, CSD_PARAM_ENABLED,
+                                _param[_provision_ch][_param_index(CSD_PARAM_ENABLED)] != 0u ? 1u : 0u)) {
+                _provision_ch++;
+            }
+            return;
+
+        case ProvisionStage::RELEASE_APPLY:
+            // This single APPLY is the PSoC's documented startup release barrier,
+            // not a shadow replay commit.  It is queued asynchronously and the
+            // next stage observes busy until the PSoC has really resumed scanning.
+            if (psoc->apply_params()) _provision_stage = ProvisionStage::WAIT_RELEASE_APPLY;
+            return;
+
+        case ProvisionStage::WAIT_RELEASE_APPLY:
+            if (psoc->heavy_busy()) return;
+            _provision_stage = ProvisionStage::DONE;
+            return;
+
+        case ProvisionStage::PARAMS:
+            while (_provision_ch < CSD_CHANNELS) {
+                while (_provision_index < CSD_PARAM_COUNT) {
+                    const uint8_t param_id = static_cast<uint8_t>(CSD_PARAM_ID_MIN + _provision_index);
+                    const uint16_t value = _param[_provision_ch][_param_index(param_id)];
+                    if (param_id == CSD_PARAM_ENABLED || (value == 0u && _param_zero_invalid(param_id))) {
+                        _provision_index++;
+                        continue;
+                    }
+                    if (!psoc->set_param(_provision_ch, param_id, value)) return;
+                    _provision_index++;
+                    return;
+                }
+                _provision_ch++;
+                _provision_index = 0u;
+            }
+            _provision_stage = ProvisionStage::DONE;
+            return;
+
+        case ProvisionStage::IDLE:
+        case ProvisionStage::DONE:
+        default:
+            return;
+    }
+}
+
+int8_t CsdConfig::tick_recapture(Psoc* psoc) {
+    if (!_recapture_pending) return -1;
+    if (psoc == nullptr || !psoc->link_ok()) return 0;
+    if (!psoc->core1_idle() || psoc->heavy_busy()) return 0;
+
+    switch (_recapture_stage) {
+        case RecaptureStage::SAMPLE_FIRST:
+            while (_recapture_index < RECAPTURE_PROBE_COUNT &&
+                   !ch_enabled(RECAPTURE_PROBE_CH[_recapture_index])) {
+                _recapture_index++;
+            }
+            if (_recapture_index >= RECAPTURE_PROBE_COUNT) {
+                _recapture_index = 0u;
+                _recapture_started_ms = millis();
+                _recapture_stage = RecaptureStage::SAMPLE_SECOND;
+                return 0;
+            }
+            _recapture_has_enabled = true;
+            // ★采样质量只作建议, 不再当门禁★ 读不到/railed 以前会 return -1, 而调用方对 -1 的处理是
+            // clear() 把整个 store 连同用户全部调参与启用集一起清空 —— 高阶用户与预配置面板正常会
+            // 出现"电极空闲 raw 不抖""个别通道读数偏高"这类形态, 却被当成故障把配置抹掉, 代价远大于
+            // 它想防的问题。现在一律记标志继续走完捕获, 由上位机把它显示成建议。
+            if (!psoc->get_raw(RECAPTURE_PROBE_CH[_recapture_index],
+                               &_recapture_first[_recapture_index]) ||
+                _recapture_first[_recapture_index] >= RECAPTURE_RAW_RAILED) {
+                _baseline_untrusted = true;
+                _recapture_first[_recapture_index] = 0u;
+            }
+            _recapture_index++;
+            return 0;
+
+        case RecaptureStage::SAMPLE_SECOND: {
+            if (static_cast<uint32_t>(millis() - _recapture_started_ms) < 10u) return 0;
+            while (_recapture_index < RECAPTURE_PROBE_COUNT &&
+                   !ch_enabled(RECAPTURE_PROBE_CH[_recapture_index])) {
+                _recapture_index++;
+            }
+            if (_recapture_index >= RECAPTURE_PROBE_COUNT) {
+                // 两次读数完全不抖 ⇒ 只记建议标志, 照旧固化。原先这里 return -1 会让调用方清空 store。
+                if (_recapture_has_enabled && !_recapture_moved) _baseline_untrusted = true;
+                _recapture_index = 0u;
+                _recapture_stage = RecaptureStage::PARAMS;
+                return 0;
+            }
+            uint16_t value = 0u;
+            if (!psoc->get_raw(RECAPTURE_PROBE_CH[_recapture_index], &value) ||
+                value >= RECAPTURE_RAW_RAILED) {
+                _baseline_untrusted = true;
+                _recapture_index++;
+                return 0;
+            }
+            if (value != _recapture_first[_recapture_index]) _recapture_moved = true;
+            _recapture_index++;
+            return 0;
+        }
+
+        case RecaptureStage::PARAMS: {
+            constexpr uint16_t PARAM_TOTAL = CSD_CHANNELS * CSD_PARAM_COUNT;
+            if (_recapture_index >= PARAM_TOTAL) {
+                _recapture_index = 0u;
+                _recapture_stage = RecaptureStage::GLOBALS;
+                return 0;
+            }
+            const uint8_t ch = static_cast<uint8_t>(_recapture_index / CSD_PARAM_COUNT);
+            const uint8_t index = static_cast<uint8_t>(_recapture_index % CSD_PARAM_COUNT);
+            uint32_t value = 0u;
+            if (!psoc->get_param(ch, static_cast<uint8_t>(CSD_PARAM_ID_MIN + index), &value)) {
+                return -1;
+            }
+            _param[ch][index] = static_cast<uint16_t>(value);
+            _recapture_index++;
+            return 0;
+        }
+
+        case RecaptureStage::GLOBALS: {
+            if (_recapture_index >= CSD_GLOBAL_COUNT) {
+                _valid = true;
+                _global_valid = true;
+                _mode = CSD_MODE_SEMI;
+                _sync_storage();
+                clear_recapture();
+                return 1;
+            }
+            uint32_t value = 0u;
+            if (!psoc->get_global(static_cast<uint8_t>(CSD_GLOBAL_ID_MIN + _recapture_index),
+                                  &value)) {
+                return -1;
+            }
+            _global[_recapture_index] = static_cast<uint16_t>(value);
+            _recapture_index++;
+            return 0;
+        }
+
+        case RecaptureStage::IDLE:
+        default:
+            return -1;
     }
 }
 
@@ -221,12 +404,12 @@ bool CsdConfig::capture_from_psoc(Psoc* psoc) {
     // 需要防的是**自动路径**的静默固化(掉线恢复/恢复默认后自行回读), 那个卡在调用方 main.cpp 的
     // recapture 分支里 —— 静默固化会把用户手动阈值/snsClk 无声覆盖, 而显式捕获是用户自己要的。
     if (psoc == nullptr || !psoc->link_ok()) return false;
-    // ★不固化坏采样★: 显式捕获的语义是"把设备当前这套值收作我的基线", 前提是这套值【真的在工作】。
-    // PSoC 处于 railed(raw 卡满量程 4095)/扫描停滞时, 读回来的是一套自毁配置, 一旦固化就会在每次
-    // 开机 provision 时被重新下发, 把面板永久钉死在不可用状态 —— 实测正是这条路把 snsClk=8 +
-    // IDAC_MOD=127 反复写回 store(恢复默认清掉后, 一跑显式捕获又被写回来), 即"DIV 异常固化"。
-    // 这不是按模式设卡(用户想在 AUTO 下收种子仍然允许), 而是数据有效性门禁: 明知是坏值就不该存。
-    if (!sampling_trustworthy(psoc)) return false;
+    // ★采样质量只作建议, 不再拦截显式捕获★ 这里原先 `return false` 直接否掉用户下发的 CSD_CAPTURE。
+    // 但"raw 不抖/偏高"在高阶用户与预配置面板上是正常形态(电极空闲、手调过 IDAC/snsClk), 拿它当
+    // 门禁就把"我要把当前这套值收作基线"这个明确意图给驳回了, 而用户往往看不出被驳回的原因。
+    // 现在照旧捕获, 只把结论记成标志经 DEVICE_INFO 上报, 由上位机显示成建议。
+    // 直接赋值而不是只置位: 这次捕获的实测结论比之前任何一次都新, 采样已恢复正常时必须把建议撤掉。
+    _baseline_untrusted = !sampling_trustworthy(psoc);
     for (uint8_t ch = 0; ch < CSD_CHANNELS; ch++) {
         for (uint8_t i = 0; i < CSD_PARAM_COUNT; i++) {
             uint32_t v = 0;

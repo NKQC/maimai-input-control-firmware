@@ -25,19 +25,26 @@ use crate::proto::{
     HostCmd, decode_entries,
 };
 use crate::proto::{
-    HoldParam, KBD_DEBOUNCE_US_MAX, KBD_HOLD_KIND_PHYS, KBD_HOLD_KIND_ZONE, KBD_HOLD_PHYS_COUNT,
-    KBD_HOLD_ZONE_COUNT, KbdEdgeRec, KbdHoldItem, KbdKeyCfg, Mai2State,
+    HoldParam, KBD_HOLD_KIND_ZONE, KBD_HOLD_PHYS_COUNT, KBD_HOLD_ZONE_COUNT, KbdEdgeRec,
+    KbdHoldItem, KbdKeyCfg, Mai2State,
 };
-use crate::proto::{
-    LED_CH_UNMAPPED, LED_PREVIEW_ALL, LED_UNIT_COUNT, LedRegion, LedState, PARAM_IDAC_GAIN,
-};
+use crate::proto::{LedState, PARAM_IDAC_GAIN};
 use std::collections::{BTreeMap, VecDeque};
 
 mod drafts;
 use drafts::ConfigDrafts;
+mod core;
+use core::conn::ConnProbeStep;
+pub use core::types::{CompiledAlgo, ConnState, DeviceEntry, LogLevel, PsocLinkEvidence};
+pub use core::utils::{
+    HID_COORD_MAX, HID_POINT_COUNT, binding_channel_mask, binding_device_mask, hid_en_key,
+    hid_x_key, hid_y_key, make_binding, zone_key, zone_label,
+};
+mod features;
+use features::algo::{AlgoSrcRx, AlgoSrcTx, TracePoint};
 mod pipeline;
 pub use pipeline::PollContext;
-use pipeline::{PendingRegistry, PendingRequest, PollRules, RequestKind, SkippedLog};
+use pipeline::{PendingRegistry, PendingRequest, RequestKind, SkippedLog};
 /// 逐通道 CSD 操作的 host 侧编排(批量串行队列 / 噪声频谱扫描 / 绘图冻结)。
 /// ★为什么单独一个文件★ 三者都是"跨若干 tick 的状态机 + 自己的数据结构", 塞回本文件只会让
 /// AppController 再长几百行而与其余职责纠缠; 它们对外只暴露少量方法, 内部状态不被别处读写。
@@ -62,15 +69,8 @@ pub const TELEM_RETAIN_US: u32 = 31_000_000;
 /// 16384 条覆盖到 ~528Hz 仍满 31s; 36 通道满载约 9MB, 可接受。
 pub const TELEM_CAP: usize = 16384;
 
-/// UI 日志等级。数值越大越"啰嗦": Error(0) < Warn(1) < Info(2) < Debug(3)。
-/// 过滤规则: 仅显示 `level as u8 <= log_filter` 的条目(选 Debug 显示全部, 选 Info 隐藏 Debug)。
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum LogLevel {
-    Error = 0,
-    Warn = 1,
-    Info = 2,
-    Debug = 3,
-}
+/// 算法上报槽位数, 与固件 `psoc_types.h::ALGO_REPORT_SLOTS` 及遥测 ALGO 块布局同源。
+pub const ALGO_REPORT_SLOTS: usize = 4;
 
 /// cfg 队列帧的唯一归属。批量 prime 只可清理自己的 generation，外部保存/诊断帧永不被误删。
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -107,10 +107,12 @@ struct LatencyCorrectionSamples {
 /// “本窗口没有观察到该段”，绝不是 0us。只用非零值刷新各段样本，并借同源 `TelemFrame.ts_us`
 /// 判定设备时钟下的新鲜度；三段都在 2s 内才给出补正值：fresh_spi + fresh_proc + fresh_usb。
 /// 本公式只修补异步窗口造成的缺段，不包含也不改写 `comm.touch_delay_100us` 人工串口延迟线。
+/// ★返回三段而不是只返回和★: 延迟线能扣掉的只有 proc+usb(SPI 读发生在采样时刻之前, 见
+/// `Psoc::touch_sample_us`), 只留一个和就没法回答"目标是否可达"。
 fn _latency_correction_us(
     samples: &mut LatencyCorrectionSamples,
     frame: &crate::proto::TelemFrame,
-) -> Option<u32> {
+) -> Option<[u16; 3]> {
     const FRESH_US: u32 = 2_000_000;
     let values = [frame.lat_spi_us, frame.lat_proc_us, frame.lat_usb_us];
     for (slot, value_us) in samples.components.iter_mut().zip(values) {
@@ -121,24 +123,43 @@ fn _latency_correction_us(
             });
         }
     }
-    let mut total = 0u32;
-    for sample in samples.components.iter().copied() {
+    let mut out = [0u16; 3];
+    for (slot, sample) in out.iter_mut().zip(samples.components.iter().copied()) {
         let sample = sample?;
         if frame.ts_us.wrapping_sub(sample.ts_us) > FRESH_US {
             return None;
         }
-        total = total.saturating_add(sample.value_us as u32);
+        *slot = sample.value_us;
     }
-    Some(total)
+    Some(out)
 }
 
-// ============================================================================
-// 绑区辅助 (#6f):34 区 index ↔ bind.mapNN key/label 映射,与 u32 编码工具
-// ============================================================================
+/// 一帧的延迟观测。三段链路耗时 + 延迟线补偿偏差, 同一帧同源, 故合成一个样本而不是散成
+/// 多个平行环 —— 平行环必然在丢帧/清缓冲时错位对齐。无头剖面直接消费本类型, 不另造快照结构。
+#[derive(Clone, Copy)]
+pub struct LatObs {
+    /// PSoC SPI 触控读、RP 处理(掩码→区映射→组帧)、CDC 写出, 各为遥测窗口内的滚动峰值(us)。
+    pub spi_us: u16,
+    pub proc_us: u16,
+    pub usb_us: u16,
+    /// 延迟线补偿偏差区间 (min, max)(us, 带符号)。`None` = 该窗口没有真正发出过触控帧, 无从判定。
+    pub dev_us: Option<(i16, i16)>,
+}
 
-/// 34 区固定顺序(与 protocol_design.md 修订2 C5 一致):
-/// A1..A8(0..7) B1..B8(8..15) C1..C2(16..17) D1..D8(18..25) E1..E8(26..33)
-const ZONE_RINGS: [(char, usize); 5] = [('A', 8), ('B', 8), ('C', 2), ('D', 8), ('E', 8)];
+impl LatObs {
+    /// 链路耗时 = 三段之和(掩码从 PSoC 到串口的传输成本)。
+    pub fn link_us(&self) -> u32 {
+        self.spi_us as u32 + self.proc_us as u32 + self.usb_us as u32
+    }
+
+    /// 偏差区间里"偏得更狠"的那一端(带符号)。折线图取它 ⇒ 曲线自然成为偏差包络,
+    /// 正负两侧都画得出; 若只取 max, 负侧(发早了)在图上永远不出现。
+    pub fn dev_worst_us(&self) -> Option<i16> {
+        self.dev_us
+            .map(|(lo, hi)| if hi.unsigned_abs() >= lo.unsigned_abs() { hi } else { lo })
+    }
+}
+
 const LISTEN_HOLD_MS: u64 = 1000;
 
 /// 全通道页"批量应用"的选择态: 目标通道集 + 待应用参数集。
@@ -187,26 +208,6 @@ impl BatchApplySel {
     }
 }
 
-/// 算法 C 源分片上传的在途状态。整份字节 + 已确认字节数 + 在途片的 seq 必须成组存在,
-/// 否则"发到哪了/在等谁的 ACK"就成了两个可能不一致的事实。
-struct AlgoSrcTx {
-    bytes: Vec<u8>,
-    /// 已被设备 ACK 的字节数(= 下一片的 offset)。
-    acked: usize,
-    /// None 表示等待普通写队列排空；Some(seq) 表示当前片已发出并在等 ACK/NAK。
-    seq: Option<u8>,
-    waited: u32,
-}
-
-/// 算法 C 源分片回读的聚合状态。收满 total 才替换缓存/版本 —— 半份源灌进编辑器比不灌更坏。
-struct AlgoSrcRx {
-    total: usize,
-    buf: Vec<u8>,
-    /// 当前请求片的序号与等待 tick，用于拒绝迟到响应并处理丢帧超时。
-    seq: u8,
-    waited: u32,
-}
-
 /// 侦听绑定的候选通道与起始时刻必须成对清除，避免跨分区继承按住时长。
 struct ListenHold {
     channel: Option<u8>,
@@ -220,12 +221,15 @@ impl ListenHold {
     }
 }
 
-/// 已发出 FOCUS_START、尚未收到响应的在途请求。三项必须成组存在: 少了 generation 就无法判断
-/// 迟到响应属于哪一次切换, 少了 seq 就无法把 NAK 归因到本次请求。
+/// 已发出 FOCUS_START、尚未收到响应的在途请求。四项必须成组存在: 少了 generation 就无法判断
+/// 迟到响应属于哪一次切换, 少了 seq 就无法把 NAK 归因到本次请求, 少了 at 就无法区分
+/// "刚发出去还在路上"与"响应丢了得重发"。
 struct FocusPending {
     seq: u8,
     generation: u16,
     channel: u8,
+    /// 下发时刻。★幂等判定必须把在途算上★ 见 `FocusState::start_inflight`。
+    at: std::time::Instant,
 }
 
 /// 单通道独占流(FOCUS_START/STOP/DATA)的主机侧会话状态。
@@ -307,9 +311,29 @@ impl FocusRate {
 }
 
 impl FocusState {
+    /// FOCUS_START 回执的等待上限。实测握手拥塞期最慢约 200ms; 给 1.5s 余量后仍无回执即
+    /// 认定响应丢失, 下一拍重发(设备侧那条无主会话会在 `FOCUS_LEASE_MS` 后自行到期)。
+    const START_DEADLINE: std::time::Duration = std::time::Duration::from_millis(1500);
+
     /// 目标通道(含在途请求)是否已经是 `ch`。
     fn targets(&self, ch: Option<u8>) -> bool {
         self.channel == ch
+    }
+
+    /// 是否有一条 FOCUS_START 还在合理等待窗口内。
+    ///
+    /// ★这是 `focus_stop session is not current` 连发的根因★
+    /// 幂等判定原先只看 `session.is_some()`, 完全没把"START 已发、响应还没回"算作已达目标。
+    /// UI 每 16ms 调一次 `focus_set_target`, 而连接握手期链路正被探针占满, 一次 START 的响应
+    /// 要上百毫秒才回来 —— 于是同一个目标通道被连发十几条 FOCUS_START, 设备侧真的开了十几个
+    /// 会话; 最后只有末条的响应代次相符, 其余全部走"迟到响应"分支各补一条 FOCUS_STOP, 而它们
+    /// 携带的 session 早已不是当前会话 ⇒ 成片 NAK。不是丢包也不是设备的锅, 是主机侧自己刷的。
+    ///
+    /// 超过 `START_DEADLINE` 仍无回执才允许重发: 响应真丢了必须能自愈, 不能被在途标记锁死。
+    fn start_inflight(&self) -> bool {
+        self.pending
+            .as_ref()
+            .is_some_and(|pending| pending.at.elapsed() < Self::START_DEADLINE)
     }
 
     /// 清除独占流的会话计数锚点；开始新流/会话时绝不把旧 sample_seq 或已结算带宽带过去。
@@ -388,19 +412,6 @@ impl DevClock {
     }
 }
 
-/// 算法追踪的一个采样点: 值 + 采样时刻(展开后的设备时间 us)。
-///
-/// ★时间是设备真值, 不再是近似★ 协议已统一给设备→主机的每一帧追加 `time_us_32()` 尾戳
-/// (`proto::FLAG_TS`, 由 `Frame::device_t_us` 承载), 因此这里直接用**设备组帧那一刻**的时刻,
-/// 经 `DevClock::unwrap_us` 折进与遥测同一条展开时间轴。
-/// ⇒ 触发判定/上报线与 TELEM_DATA 从此是同一个时钟, 横向对位精确到设备侧组帧时刻,
-/// 不再受主机轮询周期(16ms)、USB 往返抖动、GUI tick 漂移影响。
-#[derive(Debug, Clone, Copy)]
-struct TracePoint {
-    t_us: u64,
-    val: f32,
-}
-
 /// ★掉线重连要自动恢复的"期望运行态"★
 ///
 /// 震动导致 USB 掉线后触控必须自己恢复, 不能等人手动点。因此这里记录的是"用户显式设置过的
@@ -451,115 +462,6 @@ impl RestoreVerify {
     }
 }
 
-/// 把绑区 index(0..33)转成 maimai 分区标签,如 0→"A1"、16→"C1"、33→"E8"。
-/// index 越界时返回 "?<index>" 便于排查,而不是 panic。
-pub fn zone_label(index: usize) -> String {
-    let mut idx = index;
-    for (letter, count) in ZONE_RINGS {
-        if idx < count {
-            return format!("{}{}", letter, idx + 1);
-        }
-        idx -= count;
-    }
-    format!("?{}", index)
-}
-
-/// 把绑区 index(0..33)转成配置 key,如 0→"bind.map00"、33→"bind.map33"。
-pub fn zone_key(index: usize) -> String {
-    format!("bind.map{:02}", index)
-}
-
-// ============================================================================
-// HID 触摸屏点位辅助: 36 物理通道 ↔ hid.enNN / hid.xNN / hid.yNN
-// ============================================================================
-
-/// HID 触摸点位的通道数(= 物理通道数)。
-pub const HID_POINT_COUNT: usize = 36;
-/// HID 触屏坐标域上限。★与固件描述符 usage 0x30/0x31 的 LOGICAL_MAXIMUM 同源★
-/// (见 hal_usb_hid.h 的 `TOUCH_LOGICAL_MAX` / `0x26,0xFF,0x7F`)。上位机存归一坐标即用此域,
-/// 固件不再做任何缩放; 两侧若各写一个数, 点位会被主机按满量程截断到屏幕边缘。
-pub const HID_COORD_MAX: u16 = 32767;
-
-/// 通道 ch 的"是否输出该点位"配置键。
-pub fn hid_en_key(ch: usize) -> String {
-    format!("hid.en{:02}", ch)
-}
-/// 通道 ch 的 X 归一坐标配置键(0..HID_COORD_MAX)。
-pub fn hid_x_key(ch: usize) -> String {
-    format!("hid.x{:02}", ch)
-}
-/// 通道 ch 的 Y 归一坐标配置键(0..HID_COORD_MAX)。
-pub fn hid_y_key(ch: usize) -> String {
-    format!("hid.y{:02}", ch)
-}
-
-/// 从 bind.mapNN 的 u32 值中取出低 24 位通道 bitmap。
-pub fn binding_channel_mask(v: u32) -> u32 {
-    v & 0x00FF_FFFF
-}
-
-/// 从 bind.mapNN 的 u32 值中取出高 8 位设备掩码。
-pub fn binding_device_mask(v: u32) -> u8 {
-    (v >> 24) as u8
-}
-
-/// 把设备掩码(高8位)与通道 bitmap(低24位)组合成 bind.mapNN 的 u32 值。
-pub fn make_binding(dev: u8, ch: u32) -> u32 {
-    ((dev as u32) << 24) | (ch & 0x00FF_FFFF)
-}
-
-// ============================================================================
-// 连接状态
-// ============================================================================
-
-/// 与设备的连接状态
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ConnState {
-    Disconnected,
-    Connecting,
-    Connected,
-}
-
-/// PSoC SPI 链路活性证据 —— 链路是否联通的**唯一判定结论**, 判定式与文案同源。
-///
-/// ★为什么要枚举而不是一个 bool★: 原实现直接读 DEVICE_INFO 的 `psoc_link_valid` 布尔位,
-/// 而那个位只在 HELLO 的响应里回一次(见 AppController::psoc_scan_live_at 注释), 于是
-/// "系统状态"的文案与"采样卡"的红字各自去读同一个过期布尔, 一个说通一个说断都发现不了。
-/// 现在只有这一个来源, 携带证据本身, 谁要显示都从它取, 不可能不同步。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PsocLinkEvidence {
-    /// 遥测帧里 samples_per_sec>0 = PSoC 快照代数在推进(最强证据, 随 20~100Hz 遥测持续刷新)。
-    ScanAdvancing { sps: u32 },
-    /// 停流时的唯一证据: DEVICE_INFO 回读 link_ok=1, 或两次回读之间代数推进了。
-    Handshake { generation: u16 },
-    /// 判定窗口内没有任何活性证据。`since_ms=None` = 本次连接从未拿到过证据。
-    Stale {
-        since_ms: Option<u64>,
-        last_generation: Option<u16>,
-    },
-}
-
-// ============================================================================
-// 设备候选(合并 io::list_devices + comport::identify_ports)
-// ============================================================================
-
-/// 一条可供 UI 下拉选择的设备候选
-#[derive(Debug, Clone)]
-pub struct DeviceEntry {
-    pub port_name: String,
-    pub function: CdcFunction,
-    /// 展示文本,如 "COM5  [config]"
-    pub label: String,
-}
-
-/// 一次算法编译的全部产物。纯数据(Send), 故可由后台线程算好再送回 UI 线程写入状态。
-pub struct CompiledAlgo {
-    /// .text 裸二进制(待上传 PSoC 算法槽)。
-    pub blob: Vec<u8>,
-    /// objdump 反汇编文本(制表符已换成空格)。
-    pub asm: String,
-}
-
 /// 正在等待设备 ACK/NAK 的灯效写操作类型。只决定回执文案,与 `led_apply_seq` 同格存放:
 /// 灯效写操作彼此互斥(下一次下发即覆盖上一次待办),不另开第二套等待状态机。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -572,12 +474,6 @@ enum LedWriteOp {
 // AppController: 纯逻辑状态机,不依赖 Slint
 // ============================================================================
 
-#[derive(Clone)]
-struct ConnProbeStep {
-    kind: RequestKind,
-    frame: Frame,
-}
-
 ///
 /// 生命周期由 `main.rs` 用 `Rc<RefCell<AppController>>` 持有,在 Slint 单线程
 /// 事件循环中于各 callback 与 `Timer` 轮询闭包间共享。
@@ -585,7 +481,6 @@ pub struct AppController {
     /// 统一轮询请求归因注册表与声明式轮询规则。
     pending_registry: PendingRegistry,
     skipped_log: SkippedLog,
-    poll_rules: PollRules,
     /// 连接后顺序回读探针：窗口=1，逐项收到数据响应后推进。
     conn_probe_queue: VecDeque<ConnProbeStep>,
     conn_probe_inflight: Option<(u8, ConnProbeStep)>,
@@ -607,6 +502,9 @@ pub struct AppController {
     psoc_info_live_at: Option<std::time::Instant>,
     /// 上一次 DEVICE_INFO 读到的代数: 两次读之间推进过 = 活着(即便 link_ok 那一帧恰好抖动为 0)。
     psoc_gen_seen: Option<u16>,
+    /// DEBUG_TRIGGER_CRASH 的本地 ACK 归因；仅匹配本控制器最后发出的请求。
+    crash_trigger_pending: Option<u8>,
+    crash_trigger_acknowledged: bool,
     seq: u8,
     last_error: Option<String>,
     status_text: String,
@@ -696,12 +594,22 @@ pub struct AppController {
     telem_lat_usb_us: u16,
     /// 三段最后一次非零且未过期的样本；0x20 的 0 是“本窗口无观测”，不能冲掉有效样本。
     latency_correction_samples: LatencyCorrectionSamples,
-    /// 最近一次按设备 ts_us 判为三段齐全且新鲜的补正值；配置开关只控制是否对 UI 暴露。
-    telem_lat_corrected_us: Option<u32>,
-    /// 延迟历史(总延迟 = spi+proc+usb, us),供仪表盘折线图。容量 LAT_CAP。
-    lat_total_hist: VecDeque<f32>,
+    /// 最近一次按设备 ts_us 判为三段齐全且新鲜的补正样本 [spi, proc, usb](us)；
+    /// 配置开关只控制是否对 UI 暴露。总链路耗时与"延迟线可补偿段"都从这一份派生, 不另存。
+    telem_lat_corrected: Option<[u16; 3]>,
+    /// 逐帧延迟样本, 供仪表盘折线图与无头剖面。容量 LAT_CAP。
+    /// ★存分项而不是只存和★: 总延迟抖动时"是哪一段在抖"才是可行动的结论, 只存和等于把唯一
+    /// 有用的那一位信息在入库时就丢掉。折线图取的两条曲线都从这一份派生, 不另存派生量。
+    lat_hist: VecDeque<LatObs>,
     /// 延迟历史版本号,每次 push 自增,供 UI 判断重绘。
     lat_version: u64,
+    /// 总延迟的慢基线(EWMA, us)。★用 EWMA 而不是均值/中位数★: 尖峰自己会把均值抬上去,
+    /// 用它当判据等于亲手抹掉判据; 而对 512 点每帧排一次序纯属白烧 CPU。
+    lat_ewma_us: f32,
+    /// 最近一次尖峰现场落日志的时刻(限速, 免得一簇尖峰刷满日志)。
+    lat_spike_log_at: Option<std::time::Instant>,
+    /// 最近一帧: 延迟线被钳到最新采样(设定的触控延迟低于物理下限, 达不到)。
+    telem_delay_dev_clamped: bool,
 
     // 参数缓存 (#6g-1)
     /// 36 个通道,每通道 param_id → value 映射
@@ -723,23 +631,30 @@ pub struct AppController {
     algo_rom: Vec<u16>,
     algo_rom_version: u64,
 
-    /// 算法运行时追踪(ALGO_GET_TRACE): 当前追踪的通道(None=未追踪) + 上次请求的 report idx
-    /// (响应不带 idx, 靠请求时序单条在途假设配对, 镜像 cp_poll_timer 单条在途轮询模式)。
+    /// 算法运行值当前归属的通道(None=尚无数据)。值随 FOCUS_DATA 的 FIELD_ALGO 块同帧到达,
+    /// 该字段只用于"通道切换即清缓冲", 防止新旧通道数据混线。
     algo_trace_channel: Option<u8>,
-    algo_trace_pending_idx: u8,
     /// 4 个上报变量(io->report[0..3])的时间序列环形缓冲 + 触发判定(out_active)序列 + 版本号。
     /// 每点带时刻(TracePoint), 才能与遥测曲线画在同一条真实时间轴上。
-    algo_trace_report: [VecDeque<TracePoint>; 4],
+    algo_trace_report: [VecDeque<TracePoint>; ALGO_REPORT_SLOTS],
     algo_trace_active: VecDeque<TracePoint>,
     algo_trace_version: u64,
-    /// 最近一次 ALGO_GET_TRACE 请求的 seq(用于把 NAK 回执配对到追踪请求)。
-    algo_trace_last_seq: Option<u8>,
-    /// 追踪轮询退避计数(>0 表示还要跳过 N 次轮询)。设备无算法时 NAK 触发退避, 抑制刷屏。
-    algo_trace_backoff: u32,
     /// 算法上传沿用灯效写入的 seq→ACK/NAK 归因；附带起始时刻以明确区分无回执超时。
     algo_upload_seq: Option<u8>,
     algo_upload_started_at: Option<std::time::Instant>,
     algo_upload_status: String,
+    /// 上传终态对账的期望值 (len, crc16)。★ACK 不是终态★: 它只代表设备"已受理并下发",
+    /// 算法是否真的装上必须由 ALGO_GET_INFO 回读的 psoc_valid/len/crc16 判定。
+    /// 缺了这一步, UI 会永远停在"正在刷新设备真值…", 用户无从知道下发到底成没成。
+    algo_upload_expect: Option<(u16, u16)>,
+    /// 剩余对账次数: 设备 commit 是异步的, 首次回读可能仍是在途态(psoc_valid=0)。
+    /// 有界重试而不是无限等待, 用尽仍不符即如实报"终态不匹配"。
+    algo_upload_verify_left: u8,
+    /// 用户显式点了"读取信息" ⇒ 本轮回读到的设备 C 源/ASM 必须**覆盖**编辑器。
+    /// 与自动回读区分开: 自动回读(连接建立/版本变化)不能冲掉用户正在写的草稿, 但显式回读的
+    /// 意图就是"我要看设备里真正存的那份", 此时保留草稿反而是答非所问。
+    algo_explicit_readback_src: bool,
+    algo_explicit_readback_asm: bool,
     /// 上传 ACK 后延时再读一次 ALGO_GET_INFO 的倒计时(16ms/tick)。
     /// 固件把算法下发改成异步(整段 1KB 分页 + PSoC commit 校验最坏 ~700ms 在 core1 执行),
     /// ACK 只代表"已受理"; 立刻回读会拿到 psoc_valid=0 的在途态, 故延时再对账一次设备真值。
@@ -961,7 +876,15 @@ pub struct AppController {
     /// schema(ALGO_REPORT/ALGO_SETTING 声明)来源的版本号: `algo_device_src` 或 `algo_source`
     /// 任一变化即自增, 供 UI 门控重建算法面板与 report idx 轮询集合(不必每帧比整段源码字符串)。
     algo_schema_version: u64,
+    /// 各 report 槽的**声明层**二值性缓存(`None` = 该槽无声明或声明未带类型)。
+    /// 随 `_bump_algo_schema` 一起刷新: 曲线页每帧都要用它, 而现算它要解析整段 C 源(~6KB)。
+    algo_report_binary_decl: [Option<bool>; ALGO_REPORT_SLOTS],
+    /// 算法 schema 的 UI-only 元数据覆盖层；键为 schema 指纹+kind(0=report,1=setting)+声明索引。
+    algo_metadata_overrides: BTreeMap<(String, u8, u8), (String, String)>,
+    algo_metadata_version: u64,
     /// 从设备回读的算法 ASM 机器码(hex dump 文本)+ 版本, 供无本地编译产物时在反汇编页查看。
+    /// 从设备回读的原始算法机器码；hex 文本仅用于 UI 展示。
+    algo_device_code: Vec<u8>,
     algo_device_code_hex: String,
     algo_device_code_version: u64,
     /// C 源分片上传/回读状态机(源最大 32KB, 单帧 payload 只有 4096)。
@@ -1001,7 +924,6 @@ impl AppController {
         AppController {
             pending_registry: PendingRegistry::new(),
             skipped_log: SkippedLog::new(128),
-            poll_rules: PollRules::new(),
             conn_probe_queue: VecDeque::new(),
             conn_probe_inflight: None,
             devices: Vec::new(),
@@ -1012,6 +934,8 @@ impl AppController {
             psoc_scan_live_at: None,
             psoc_info_live_at: None,
             psoc_gen_seen: None,
+            crash_trigger_pending: None,
+            crash_trigger_acknowledged: false,
             seq: 0,
             last_error: None,
             status_text: "未连接".to_string(),
@@ -1057,9 +981,12 @@ impl AppController {
             telem_lat_proc_us: 0,
             telem_lat_usb_us: 0,
             latency_correction_samples: LatencyCorrectionSamples::default(),
-            telem_lat_corrected_us: None,
-            lat_total_hist: VecDeque::new(),
+            telem_lat_corrected: None,
+            lat_hist: VecDeque::new(),
             lat_version: 0,
+            lat_ewma_us: 0.0,
+            lat_spike_log_at: None,
+            telem_delay_dev_clamped: false,
             params,
             param_version: 0,
             cp: vec![None; 36],
@@ -1070,7 +997,6 @@ impl AppController {
             algo_rom: vec![0u16; 36],
             algo_rom_version: 0,
             algo_trace_channel: None,
-            algo_trace_pending_idx: 0,
             algo_trace_report: [
                 VecDeque::new(),
                 VecDeque::new(),
@@ -1079,11 +1005,13 @@ impl AppController {
             ],
             algo_trace_active: VecDeque::new(),
             algo_trace_version: 0,
-            algo_trace_last_seq: None,
-            algo_trace_backoff: 0,
             algo_upload_seq: None,
             algo_upload_started_at: None,
             algo_upload_status: String::new(),
+            algo_upload_expect: None,
+            algo_upload_verify_left: 0,
+            algo_explicit_readback_src: false,
+            algo_explicit_readback_asm: false,
             algo_info_refresh_in: None,
             algo_upload_version: 0,
             algo_cfg: [0u8; 8],
@@ -1189,6 +1117,10 @@ impl AppController {
             algo_src_tx: None,
             algo_src_rx: None,
             algo_schema_version: 0,
+            algo_report_binary_decl: [None; ALGO_REPORT_SLOTS],
+            algo_metadata_overrides: BTreeMap::new(),
+            algo_metadata_version: 0,
+            algo_device_code: Vec::new(),
             algo_device_code_hex: String::new(),
             algo_device_code_version: 0,
             event_log: VecDeque::new(),
@@ -1245,6 +1177,13 @@ impl AppController {
     /// 日志版本号(每追加一条自增),供 UI 判断是否刷新日志文本。
     pub fn log_seq(&self) -> u64 {
         self.log_seq
+    }
+    /// 无头诊断读取控制器事件消息；UI 仍只使用统一 LogHub。
+    pub fn diagnostic_event_messages(&self) -> Vec<String> {
+        self.event_log
+            .iter()
+            .map(|(_, message)| message.clone())
+            .collect()
     }
 
     /// 已处理 TELEM_DATA 帧计数。
@@ -1529,6 +1468,8 @@ impl AppController {
         self.pending_registry.clear();
         self.conn_probe_queue.clear();
         self.conn_probe_inflight = None;
+        self.crash_trigger_pending = None;
+        self.crash_trigger_acknowledged = false;
         self.restore_verify.clear();
         self.post_save_refetch_channels.clear();
         // 灯效映射草稿按设备灯链长度校验, 换设备/重连后必须重来, 否则会拿旧链长的区段去 NAK。
@@ -1561,8 +1502,9 @@ impl AppController {
         self.telem_lat_proc_us = 0;
         self.telem_lat_usb_us = 0;
         self.latency_correction_samples = LatencyCorrectionSamples::default();
-        self.telem_lat_corrected_us = None;
-        self.lat_total_hist.clear();
+        self.telem_lat_corrected = None;
+        self.lat_hist.clear();
+        self.telem_delay_dev_clamped = false;
         self.lat_version = self.lat_version.wrapping_add(1);
         // 链路活性证据必须随缓存一起清: 换设备/重连后旧设备的"活着"不能算新链路的证据。
         self.psoc_scan_live_at = None;
@@ -1581,7 +1523,6 @@ impl AppController {
         }
         self.cp_version = self.cp_version.wrapping_add(1);
         self.algo_trace_channel = None;
-        self.algo_trace_pending_idx = 0;
         for buf in &mut self.algo_trace_report {
             buf.clear();
         }
@@ -1752,6 +1693,41 @@ impl AppController {
         if !ctx.connected || self.state != ConnState::Connected {
             return;
         }
+        // ★在途登记必须能超时释放★
+        // pending_registry 原先只在收到"匹配的响应"时才 confirm, 而 `_submit_poll` 用
+        // contains_kind 实现窗口=1 去重 ⇒ 任何一次响应丢失/被覆盖, 那个 seq 就永久滞留,
+        // 该类型的**所有后续轮询**从此被静默阻断(返回 seq=0, 调用方看不到任何错误)。
+        // 设备侧 vendor 响应是单槽的(见固件 UsbComm::has_pending_response), 同一 tick 连发两条
+        // 只读命令就足以丢掉一条 —— 于是:
+        //   · ALGO_GET_SRC 一次失败后 C 源再也读不回来(日志刷"收到无在途请求的响应");
+        //   · ALGO_GET_TRACE 同理停摆 ⇒ 算法变量永远显示"暂无运行值"。
+        // check_timeouts 早已实现却从未被调用; 在此按各自 timeout_secs 释放, 使轮询可自愈。
+        // ★绝不能碰连接探针当前在途的那个 seq★
+        // 探针的超时判定靠下面那段的 `pending_registry.lookup(seq)`; 若在此提前把它移除,
+        // lookup 返回 None ⇒ 判不出超时 ⇒ conn_probe_inflight 永不清除 ⇒ 整条探针队列卡死,
+        // conn_probes_pending 永远为真(实测: LED_GET 无响应后, 其后所有探针与依赖探针收敛的
+        // 算法同步全部停摆)。探针有它自己的超时路径, 这里只负责非探针的普通轮询。
+        let probe_seq = self.conn_probe_inflight.as_ref().map(|(seq, _)| *seq);
+        let expired = self.pending_registry.check_timeouts(std::time::Instant::now());
+        for seq in expired {
+            if Some(seq) == probe_seq {
+                continue;
+            }
+            let Some(req) = self.pending_registry.confirm(seq) else {
+                continue;
+            };
+            // 分片回读的接收状态必须一并作废, 否则迟到的分片会被判成"无在途请求"并再次报错。
+            if matches!(req.kind, RequestKind::RequestAlgoSrc) {
+                self.algo_src_rx = None;
+            }
+            self.skipped_log
+                .push(req.kind.clone(), "响应超时, 已释放在途登记");
+            log::warn!(
+                "只读轮询超时释放: kind={} seq={} (已恢复该类型的后续请求)",
+                req.kind.label(),
+                seq
+            );
+        }
         if let Some(seq) = self.conn_probe_inflight.as_ref().map(|(seq, _)| *seq) {
             let timed_out = self
                 .pending_registry
@@ -1804,17 +1780,6 @@ impl AppController {
         if self.conn_probes_pending() {
             return;
         }
-        if !self.conn_probes_pending() {
-            if let Some(idx) = ctx.algo_trace_idx {
-                let _ = self._submit_poll(
-                    RequestKind::RequestAlgoTrace {
-                        ch: ctx.sel_channel,
-                        idx,
-                    },
-                    crate::proto::algo::encode_algo_get_trace(0, ctx.sel_channel, idx),
-                );
-            }
-        }
     }
 
     fn _data_response_decode_ok(frame: &Frame) -> bool {
@@ -1834,9 +1799,6 @@ impl AppController {
             }
             x if x == HostCmd::AlgoGetRom as u8 => {
                 frame.payload.len() == crate::proto::algo::ALGO_CHANNELS * 2
-            }
-            x if x == HostCmd::AlgoGetTrace as u8 => {
-                crate::proto::algo::decode_algo_get_trace(&frame.payload).is_some()
             }
             x if x == HostCmd::AlgoGetSrc as u8 => {
                 crate::proto::algo::decode_algo_src_chunk(&frame.payload).is_some()
@@ -1894,29 +1856,10 @@ impl AppController {
         let Some(req) = self.pending_registry.lookup(frame.seq).cloned() else {
             return;
         };
-        let matches = match req.kind {
-            RequestKind::AlgoGetInfo => frame.cmd == HostCmd::AlgoGetInfo as u8,
-            RequestKind::AlgoGetRom => frame.cmd == HostCmd::AlgoGetRom as u8,
-            RequestKind::RequestAlgoSrc => frame.cmd == HostCmd::AlgoGetSrc as u8,
-            RequestKind::RequestAlgoCode => frame.cmd == HostCmd::AlgoGetCode as u8,
-            RequestKind::RequestAlgoTrace { .. } => frame.cmd == HostCmd::AlgoGetTrace as u8,
-            RequestKind::GlobalGetAll => frame.cmd == HostCmd::GlobalGetAll as u8,
-            RequestKind::ConfigGetAll => {
-                frame.cmd == HostCmd::CfgGetAll as u8 && (frame.flags & 0x02) == 0
-            }
-            RequestKind::RequestParams { .. } | RequestKind::RequestParamAllChannels { .. } => {
-                frame.cmd == HostCmd::ParamGetAll as u8
-            }
-            RequestKind::KbdRequestState => frame.cmd == HostCmd::KbdGetState as u8,
-            RequestKind::KbdRequestMap => frame.cmd == HostCmd::KbdGetMap as u8,
-            RequestKind::KbdRequestTouchmap => frame.cmd == HostCmd::KbdGetTouchmap as u8,
-            RequestKind::KbdRequestHold => frame.cmd == HostCmd::KbdGetHold as u8,
-            RequestKind::KbdRequestKeycfg => frame.cmd == HostCmd::KbdGetKeycfg as u8,
-            RequestKind::KbdGetCombo => frame.cmd == HostCmd::KbdGetCombo as u8,
-            RequestKind::KbdRequestEdges => frame.cmd == HostCmd::KbdGetEdges as u8,
-            RequestKind::Mai2RequestState => frame.cmd == HostCmd::Mai2GetState as u8,
-            _ => false,
-        };
+        // 单一映射来源见 `RequestKind::expected_response_cmd`(穷尽匹配, 漏配即编译失败)。
+        // CFG_GET_ALL 是流式分片, 只有末片(flags bit1 清零)才算收敛。
+        let matches = req.kind.expected_response_cmd() == Some(frame.cmd)
+            && !(frame.cmd == HostCmd::CfgGetAll as u8 && (frame.flags & 0x02) != 0);
         if matches {
             let label = req.kind.label();
             self.pending_registry.confirm(frame.seq);
@@ -2095,9 +2038,6 @@ impl AppController {
         } else if frame.cmd == HostCmd::AlgoGetRom as u8 && (frame.flags & 0x01) != 0 {
             self._handle_algo_get_rom_response(&frame);
             self._confirm_data_pending(&frame, Self::_data_response_decode_ok(&frame));
-        } else if frame.cmd == HostCmd::AlgoGetTrace as u8 && (frame.flags & 0x01) != 0 {
-            self._handle_algo_get_trace_response(&frame);
-            self._confirm_data_pending(&frame, Self::_data_response_decode_ok(&frame));
         } else if frame.cmd == HostCmd::AlgoGetCfg as u8 && (frame.flags & 0x01) != 0 {
             self._handle_algo_get_cfg_response(&frame);
         } else if frame.cmd == HostCmd::AlgoGetSrc as u8 && (frame.flags & 0x01) != 0 {
@@ -2110,7 +2050,8 @@ impl AppController {
                     <= frame.payload.len() - 2;
             let bytes = crate::proto::algo::decode_algo_len_prefixed(&frame.payload);
             if len_ok {
-                self.algo_device_code_hex = Self::_hex_dump(&bytes);
+                self.algo_device_code = bytes;
+                self.algo_device_code_hex = Self::_hex_dump(&self.algo_device_code);
                 self.algo_device_code_version = self.algo_device_code_version.wrapping_add(1);
             }
             self._confirm_data_pending(&frame, len_ok);
@@ -3433,8 +3374,12 @@ impl AppController {
         }
         let seq = self.next_seq();
         if let Some(handle) = &self.io {
-            // 始终 OR 上 STATS/LATENCY 位:调用方无需关心该细节,保证实际发出的 fields 带采样率和延迟统计。
-            let fields = fields | crate::proto::FIELD_STATS | crate::proto::FIELD_LATENCY;
+            // 始终 OR 上 STATS/LATENCY/DELAY_DEV 位:调用方无需关心该细节,保证实际发出的 fields
+            // 带采样率、三段延迟与延迟线补偿偏差(主页那三样都是"UI 开着就该有"的东西)。
+            let fields = fields
+                | crate::proto::FIELD_STATS
+                | crate::proto::FIELD_LATENCY
+                | crate::proto::FIELD_DELAY_DEV;
             let payload = crate::proto::encode_telem_start(0, rate_hz, fields, ch_mask);
             let frame = Frame::new(HostCmd::TelemStart as u8, 0, seq, payload);
             handle.send(frame)?;
@@ -3713,10 +3658,13 @@ impl AppController {
             }
             return;
         }
-        // ★修复暂停恢复后带宽统计失效★：即使目标通道相同，如果会话已失效（session=None），
-        // 也必须重建会话，以便重置测量窗口。用户停止流后 telem_user_stop 会清空 session，
-        // 恢复时虽然 channel 记录还在，但没有真实会话，必须重新发 START。
-        if self.focus.targets(ch) && self.focus.session.is_some() {
+        // 幂等判定：目标相同且"已有会话 **或** START 仍在合理等待窗口内"就什么都不发。
+        // 在途也算达标（见 `FocusState::start_inflight`）：否则响应还没回来的这上百毫秒里，
+        // 每个 16ms tick 都会再发一条 START，设备侧被开出十几个会话，多余的会话又各引一条
+        // 对不上号的 FOCUS_STOP，日志里就是成片 `focus_stop session is not current`。
+        // 会话失效（session=None 且无在途）时必须重建：用户停止流后本地 Focus 已清零，
+        // 恢复时要重新 START，测量窗口也要从新会话的首帧重算。
+        if self.focus.targets(ch) && (self.focus.session.is_some() || self.focus.start_inflight()) {
             return;
         }
         // ★先进代次再发命令★: 此后到达的旧 session 数据与旧 START 响应立即失效。
@@ -3749,6 +3697,7 @@ impl AppController {
                     seq,
                     generation,
                     channel: target,
+                    at: std::time::Instant::now(),
                 });
             }
             Some(Err(e)) => self.push_log_warn(format!("单通道流启动下发失败: {}", e)),
@@ -3768,12 +3717,15 @@ impl AppController {
     }
 
     /// 单通道流请求的字段集: 与逐通道档同一套, 外加帧级统计/延迟(主页卡片与自愈判据都靠它)。
-    const FOCUS_FIELDS: u8 = crate::proto::FIELD_RAW
+    // 含 FIELD_ALGO: 算法运行值与采样同帧回来, 不再另发 ALGO_GET_TRACE 轮询。
+    const FOCUS_FIELDS: u8 = crate::proto::FIELD_ALGO
+        | crate::proto::FIELD_RAW
         | crate::proto::FIELD_BASELINE
         | crate::proto::FIELD_DIFF
         | crate::proto::FIELD_STATUS
         | crate::proto::FIELD_STATS
-        | crate::proto::FIELD_LATENCY;
+        | crate::proto::FIELD_LATENCY
+        | crate::proto::FIELD_DELAY_DEV;
     /// 请求速率取固件上限 1000Hz: 单通道帧仅几十字节, 且固件只在快照代数推进时才发帧
     /// (实测 ~171Hz), 所以这里给上限等于"要多快有多快", 不会凭空造出无意义的重复帧。
     const FOCUS_RATE_HZ: u16 = 1000;
@@ -3899,7 +3851,7 @@ impl AppController {
     /// 诊断用: 直接下发单通道参数到设备(不经草稿、不写 flash), 供无头探针实时改参验证时钟生效。
     /// 与 GUI 的 set_param(草稿) 区分: 这条立即经 PARAM_SET 送达设备并同步本地缓存。
     pub fn debug_param_now(&mut self, ch: u8, param_id: u8, value: u32) -> anyhow::Result<()> {
-        // 扫描自身的写 gain/div 走 `_sweep_tx`(own_tx 放行), 其余来源在扫描期间一律拒绝。
+        // 设备侧扫描会话活跃期间，所有主机侧 CSD 写入一律拒绝。
         self._reject_csd_tx_if_batching("直接写入通道参数")?;
         self._reject_csd_tx_if_sweeping("直接写入通道参数")?;
         self._reject_illegal_param(ch, param_id, value)?;
@@ -4165,9 +4117,8 @@ impl AppController {
         Err(anyhow::anyhow!(message))
     }
 
-    /// 频谱扫描互斥守卫: 扫描活跃期间拒绝任何**外部** CSD 操作(扫描自身的下发经 `_sweep_tx` 放行)。
-    /// ★为什么必须挡★ 扫描的每一格都在改本通道的 gain/div 并逐格校准 —— 中途插进来的校准/基线复位/
-    /// 自适应会把那一格的配置换掉, 于是测出来的噪声不是这一格的, 还会踩乱扫描的原值还原路径。
+    /// 频谱扫描互斥守卫: 设备侧会话活跃期间拒绝主机侧 CSD 操作。
+    /// ★为什么必须挡★ 设备正在逐格改参、校准、采样与恢复；主机侧操作插入会破坏该会话。
     /// 与 `_reject_csd_if_locked` 同一约定: 记日志 + 返回 true, 调用方放弃本次操作。
     fn _reject_csd_if_sweeping(&mut self, what: &str) -> bool {
         if !self._sweep_blocks_csd() {
@@ -4533,7 +4484,6 @@ impl AppController {
                 // 超时的那一条若属于逐通道批量, 归因为该通道失败(设备真值未知, 绝不算成功)。
                 if let Some(s) = seq {
                     self._ch_batch_note_op(s, false, "超过 51s 未收到完成回执(设备实际状态未知)");
-                    self._sweep_note_op(s, false, "超过 51s 未收到完成回执(设备实际状态未知)");
                 }
                 self._end_op();
             }
@@ -4700,2168 +4650,9 @@ impl AppController {
     // ------------------------------------------------------------------
     // 键盘 (KBD_*): 物理键盘 GPIO1-12 + 触控→键盘映射
     // ------------------------------------------------------------------
-    pub fn kbd_request_state(&mut self) -> anyhow::Result<()> {
-        let seq = self.next_seq();
-        if let Some(handle) = &self.io {
-            handle.send(Frame::new(HostCmd::KbdGetState as u8, 0, seq, vec![]))?;
-        }
-        Ok(())
-    }
-    // ------------------------------------------------------------------
-    // 触控组合映射(多分区 → 多键)。草稿制: 编辑只进 `drafts` 的组合整表, 由"保存到设备"下发。
-    // 固件侧是整表替换语义, 所以草稿也按整表管理, 不做逐条增删的增量协议。
-    // ------------------------------------------------------------------
-
-    pub fn kbd_combo_version(&self) -> u64 {
-        self.kbd_combo_version
-    }
-
-    /// 待新建条目的分区集合(34 位)与键组合。属于纯编辑态, 但放在这里而不是 Slint:
-    /// "添加"时要与已有表做去重判定, 判定逻辑在 Rust, 状态跟着一起放才不会两边不一致。
-    pub fn kbd_combo_pending_zones(&self) -> Vec<bool> {
-        (0..34u8)
-            .map(|z| (self.kbd_combo_pending_mask & (1u64 << z)) != 0)
-            .collect()
-    }
-
-    /// 34 位: 该分区是否已被某条映射用到(仅 UI 提示, 不禁止复用)。
-    pub fn kbd_combo_zone_used(&self) -> Vec<bool> {
-        let table = self.kbd_combos();
-        let union = table.iter().fold(0u64, |acc, c| acc | c.zone_mask);
-        (0..34u8).map(|z| (union & (1u64 << z)) != 0).collect()
-    }
-
-    pub fn kbd_combo_pending_keys(&self) -> ([u8; crate::proto::KBD_COMBO_KEY_COUNT], u8) {
-        (self.kbd_combo_pending_keys, self.kbd_combo_pending_mods)
-    }
-
-    pub fn kbd_combo_toggle_zone(&mut self, zone: u8) {
-        if zone >= 34 {
-            return;
-        }
-        self.kbd_combo_pending_mask ^= 1u64 << zone;
-        self.kbd_combo_version = self.kbd_combo_version.wrapping_add(1);
-    }
-
-    pub fn kbd_combo_clear_zones(&mut self) {
-        self.kbd_combo_pending_mask = 0;
-        self.kbd_combo_version = self.kbd_combo_version.wrapping_add(1);
-    }
-
-    /// 抓到一个键: 追加到待新建的键位数组(去重, 满 4 个后忽略并提示)。修饰位取并集。
-    /// ★这里的累加是"一次录制会话内"的语义★(用于"同时按住 F5+F6"这类真实和弦):
-    /// 跨会话的覆盖由 UI 侧完成 —— KeyCaptureBox 每次进入录制态先调 kbd_combo_clear_keys(),
-    /// 所以不同时间按下的键不会攒成一条多键映射。本函数因此不需要自己判断会话边界。
-    pub fn kbd_combo_capture_key(&mut self, keycode: u8, mods: u8) {
-        self.kbd_combo_pending_mods |= mods;
-        if keycode != 0 {
-            if self.kbd_combo_pending_keys.contains(&keycode) {
-                // 同一键重复抓取不算错, 静默忽略即可。
-            } else if let Some(slot) = self.kbd_combo_pending_keys.iter_mut().find(|k| **k == 0) {
-                *slot = keycode;
-            } else {
-                self.push_log_warn(format!(
-                    "组合映射: 单条最多 {} 个键, 已忽略新键。",
-                    crate::proto::KBD_COMBO_KEY_COUNT
-                ));
-            }
-        }
-        self.kbd_combo_version = self.kbd_combo_version.wrapping_add(1);
-    }
-
-    pub fn kbd_combo_clear_keys(&mut self) {
-        self.kbd_combo_pending_keys = [0; crate::proto::KBD_COMBO_KEY_COUNT];
-        self.kbd_combo_pending_mods = 0;
-        self.kbd_combo_version = self.kbd_combo_version.wrapping_add(1);
-    }
-
-    /// 把待新建条目提交成一条映射。时间参数由新建区的两个输入框给出(不再硬编码 0/0)。
-    /// 成功后只清空分区与按键; ★两个时间参数留在 UI 侧且刻意不清零★(连续添加同类映射不必重填)。
-    pub fn kbd_combo_commit_pending(&mut self, delay_ms: u16, max_hold_ms: u16) {
-        let mask = self.kbd_combo_pending_mask;
-        let keys = self.kbd_combo_pending_keys;
-        let mods = self.kbd_combo_pending_mods;
-        if self.kbd_combo_add(mask, keys, mods, delay_ms, max_hold_ms) {
-            self.kbd_combo_pending_mask = 0;
-            self.kbd_combo_pending_keys = [0; crate::proto::KBD_COMBO_KEY_COUNT];
-            self.kbd_combo_pending_mods = 0;
-            self.push_log("组合映射: 已加入草稿, 点左下角“保存到设备”才真正下发。".to_string());
-        }
-    }
-
-    /// 当前生效的组合表(草稿优先)。未回读且无草稿时为空表。
-    pub fn kbd_combos(&self) -> Vec<crate::proto::KbdComboItem> {
-        match self.drafts.kbd_combo() {
-            Some(d) => d.to_vec(),
-            None => self.kbd_combo_cache.clone(),
-        }
-    }
-
-    /// 设备是否支持组合映射。None=还没问过; Some(false)=固件回了 NAK(旧固件)。
-    pub fn kbd_combo_supported(&self) -> Option<bool> {
-        self.kbd_combo_supported
-    }
-
-    pub fn kbd_request_combo(&mut self) -> anyhow::Result<()> {
-        let seq = self.next_seq();
-        if let Some(handle) = &self.io {
-            handle.send(Frame::new(HostCmd::KbdGetCombo as u8, 0, seq, vec![]))?;
-            self.kbd_combo_req_seq = Some(seq);
-        }
-        Ok(())
-    }
-
-    /// 新增一条组合。分区集合为空、或与已有条目**完全相同**时拒绝(与固件去重规则一致:
-    /// 只要分区集合不完全一样就允许共存)。返回是否加入成功。
-    pub fn kbd_combo_add(
-        &mut self,
-        zone_mask: u64,
-        keycodes: [u8; crate::proto::KBD_COMBO_KEY_COUNT],
-        modifiers: u8,
-        delay_ms: u16,
-        max_hold_ms: u16,
-    ) -> bool {
-        if zone_mask == 0 {
-            self.push_log_warn("组合映射: 未选择任何触控分区, 未添加。".to_string());
-            return false;
-        }
-        if keycodes.iter().all(|k| *k == 0) && modifiers == 0 {
-            self.push_log_warn("组合映射: 未指定任何按键, 未添加。".to_string());
-            return false;
-        }
-        let mut table = self.kbd_combos();
-        if table.len() >= crate::proto::KBD_COMBO_COUNT {
-            self.push_log_warn(format!(
-                "组合映射: 已达上限 {} 条, 未添加。",
-                crate::proto::KBD_COMBO_COUNT
-            ));
-            return false;
-        }
-        if table.iter().any(|c| c.zone_mask == zone_mask) {
-            self.push_log_warn(
-                "组合映射: 已存在分区集合完全相同的条目, 未添加(改按键请先删除旧条目)。"
-                    .to_string(),
-            );
-            return false;
-        }
-        table.push(crate::proto::KbdComboItem {
-            zone_mask,
-            keycodes,
-            modifiers,
-            delay_ms,
-            max_hold_ms,
-        });
-        self._stage_combo(table);
-        true
-    }
-
-    pub fn kbd_combo_remove(&mut self, index: usize) {
-        let mut table = self.kbd_combos();
-        if index >= table.len() {
-            return;
-        }
-        table.remove(index);
-        // 删除会让后续行号整体前移, 留着旧登记等于把"替换"落到另一行上, 直接撤销。
-        self.kbd_combo_key_edit_row = None;
-        self._stage_combo(table);
-    }
-
-    /// 改某条的时间参数(ms)。分区集合仍然只能删了重加(单一编辑路径); 按键可就地重录, 见下。
-    pub fn kbd_combo_set_hold(&mut self, index: usize, delay_ms: u16, max_hold_ms: u16) {
-        let mut table = self.kbd_combos();
-        if index >= table.len() {
-            return;
-        }
-        table[index].delay_ms = delay_ms;
-        table[index].max_hold_ms = max_hold_ms;
-        self._stage_combo(table);
-    }
-
-    /// 登记"下一次抓到的键整行替换第 index 行"。★只登记, 绝不在这里清空该行按键★:
-    /// 清空会在草稿里留下一条 0 键映射, 用户此刻点"保存到设备"就会把空条目下发出去。
-    /// 改成"抓到键的那一刻才替换", 于是 0 键中间态根本不存在, 也就无从被保存。
-    pub fn kbd_combo_begin_edit_keys(&mut self, index: usize) {
-        if index >= self.kbd_combos().len() {
-            return;
-        }
-        self.kbd_combo_key_edit_row = Some(index);
-    }
-
-    /// 就地重录第 index 行的按键组合。语义与新建区 `kbd_combo_capture_key` 完全同口径 ——
-    /// ★跨会话覆盖、会话内累加★: 本行有待替换登记(由 KeyCaptureBox 的 capture_started 边沿
-    /// 打上, 一次录制会话只打一次)时本键替换整行; 否则累加(同键去重、修饰位取并集、
-    /// 满 KBD_COMBO_KEY_COUNT 忽略并告警)。所以"同时按住 F5+F6"照旧能录成多键。
-    pub fn kbd_combo_capture_key_at(&mut self, index: usize, keycode: u8, mods: u8) {
-        let mut table = self.kbd_combos();
-        if index >= table.len() {
-            return;
-        }
-        if self.kbd_combo_key_edit_row == Some(index) {
-            self.kbd_combo_key_edit_row = None;
-            table[index].keycodes = [0; crate::proto::KBD_COMBO_KEY_COUNT];
-            table[index].modifiers = 0;
-        }
-        table[index].modifiers |= mods;
-        if keycode != 0 {
-            if table[index].keycodes.contains(&keycode) {
-                // 同一键重复抓取不算错, 静默忽略。
-            } else if let Some(slot) = table[index].keycodes.iter_mut().find(|k| **k == 0) {
-                *slot = keycode;
-            } else {
-                self.push_log_warn(format!(
-                    "组合映射: 单条最多 {} 个键, 已忽略新键。",
-                    crate::proto::KBD_COMBO_KEY_COUNT
-                ));
-            }
-        }
-        self._stage_combo(table);
-    }
-
-    /// 用整张表覆盖组合映射草稿(JSON 导入用)。
-    /// ★为什么单独开一个入口★: 导入是"整表替换", 而 `kbd_combo_add` 带一堆交互态校验
-    /// (上限提示/重复分区拒绝/空键拒绝)并逐条追加 —— 拿它做导入会把文件里合法的整表判成冲突。
-    /// 合法性已在导入侧按同一口径过滤(空条目丢弃、超上限丢弃), 这里只负责落草稿。
-    pub fn kbd_combo_replace_table(&mut self, table: Vec<crate::proto::KbdComboItem>) {
-        self.kbd_combo_key_edit_row = None;
-        self._stage_combo(table);
-    }
-
-    /// 组合映射整表入草稿。★与设备缓存完全相等即撤稿★(与 param/keycfg 同口径):
-    /// 脏状态派生自脏键集合, 若不做这一步, "删了又加回原样"会被永久误报为未保存。
-    /// 脏键登记与 version bump 由 `ConfigDrafts::set_kbd_combo` 内部完成, 无从遗漏
-    /// —— 旧实现在这里只插脏键却漏了 `mark_config_dirty()`, 导致"添加组合映射后按钮不亮"。
-    fn _stage_combo(&mut self, table: Vec<crate::proto::KbdComboItem>) {
-        let same_as_device = table == self.kbd_combo_cache;
-        self.drafts.set_kbd_combo(table, same_as_device);
-        self.kbd_combo_version = self.kbd_combo_version.wrapping_add(1);
-    }
-
-    /// 由 save_config 调用: 把草稿整表排入统一写队列。无草稿则什么都不做。
-    fn _commit_combo(&mut self, queued: &mut Vec<Frame>) -> anyhow::Result<()> {
-        let Some(table) = self.drafts.take_kbd_combo() else {
-            return Ok(());
-        };
-        let payload = crate::proto::encode_kbd_set_combo(&table);
-        let seq = self.next_seq();
-        queued.push(Frame::new(HostCmd::KbdSetCombo as u8, 0, seq, payload));
-        // 乐观写缓存: 固件对整表做了去重与空条目丢弃, 真值由随后的回读校正。
-        self.kbd_combo_cache = table;
-        self.kbd_combo_version = self.kbd_combo_version.wrapping_add(1);
-        Ok(())
-    }
-
-    pub fn kbd_request_map(&mut self) -> anyhow::Result<()> {
-        let seq = self.next_seq();
-        if let Some(handle) = &self.io {
-            handle.send(Frame::new(HostCmd::KbdGetMap as u8, 0, seq, vec![]))?;
-        }
-        Ok(())
-    }
-    pub fn kbd_request_touchmap(&mut self) -> anyhow::Result<()> {
-        let seq = self.next_seq();
-        if let Some(handle) = &self.io {
-            handle.send(Frame::new(HostCmd::KbdGetTouchmap as u8, 0, seq, vec![]))?;
-        }
-        Ok(())
-    }
-    /// 暂存物理键 idx(0..11) 的 HID 键码 + 修饰位(bit0 Ctrl/1 Shift/2 Alt/3 Gui)到草稿。
-    pub fn kbd_set_map(&mut self, idx: u8, keycode: u8, modifier: u8) -> anyhow::Result<()> {
-        if idx >= 12 {
-            return Err(anyhow::anyhow!("物理键索引非法: {}", idx));
-        }
-        let i = idx as usize;
-        let same_as_device =
-            self.kbd_map.get(i) == Some(&keycode) && self.kbd_keymod.get(i) == Some(&modifier);
-        self.drafts
-            .set_kbd_map(idx, keycode, modifier, same_as_device);
-        // ★必须 bump★: main.rs 的键码/修饰位/显示文本回填全部由该 version 门控; 只写草稿不 bump
-        // 会让"捕获组合键"在界面上毫无反应(看起来只是退出了录制态), 用户无法确认是否落地。
-        // 撤稿分支同样要 bump: getter 是"草稿优先", 撤回后可见值变回设备真值, UI 必须跟着回填。
-        self.kbd_map_version = self.kbd_map_version.wrapping_add(1);
-        Ok(())
-    }
-    /// 暂存触控分区 zone(0..33) 的 HID 键码 + 修饰位到草稿。
-    pub fn kbd_set_touchmap(&mut self, zone: u8, keycode: u8, modifier: u8) -> anyhow::Result<()> {
-        if zone >= 34 {
-            return Err(anyhow::anyhow!("分区索引非法: {}", zone));
-        }
-        let z = zone as usize;
-        let same_as_device = self.kbd_touchmap.get(z) == Some(&keycode)
-            && self.kbd_zonemod.get(z) == Some(&modifier);
-        self.drafts
-            .set_kbd_touch(zone, keycode, modifier, same_as_device);
-        // ★必须 bump★: 见 kbd_set_map 说明 —— 显示文本/下拉索引/修饰位都由该 version 门控回填。
-        self.kbd_touchmap_version = self.kbd_touchmap_version.wrapping_add(1);
-        Ok(())
-    }
-    pub fn kbd_state(&self) -> u16 {
-        self.kbd_state
-    }
-    pub fn kbd_state_version(&self) -> u64 {
-        self.kbd_state_version
-    }
-    pub fn kbd_map(&self, idx: u8) -> u8 {
-        if let Some((code, _)) = self.drafts.kbd_map(idx) {
-            return code;
-        }
-        *self.kbd_map.get(idx as usize).unwrap_or(&0)
-    }
-    pub fn kbd_keymod(&self, idx: u8) -> u8 {
-        if let Some((_, m)) = self.drafts.kbd_map(idx) {
-            return m;
-        }
-        *self.kbd_keymod.get(idx as usize).unwrap_or(&0)
-    }
-    pub fn kbd_map_version(&self) -> u64 {
-        self.kbd_map_version
-    }
-    pub fn kbd_touch_keycode(&self, zone: u8) -> u8 {
-        if let Some((code, _)) = self.drafts.kbd_touch(zone) {
-            return code;
-        }
-        *self.kbd_touchmap.get(zone as usize).unwrap_or(&0)
-    }
-    pub fn kbd_zone_mod(&self, zone: u8) -> u8 {
-        if let Some((_, m)) = self.drafts.kbd_touch(zone) {
-            return m;
-        }
-        *self.kbd_zonemod.get(zone as usize).unwrap_or(&0)
-    }
-    pub fn kbd_touch_en(&self) -> bool {
-        self.kbd_touch_en
-    }
-    pub fn kbd_touchmap_version(&self) -> u64 {
-        self.kbd_touchmap_version
-    }
-
-    fn _handle_kbd_get_state_response(&mut self, frame: &Frame) {
-        if frame.payload.len() >= 2 {
-            self.kbd_state = (frame.payload[0] as u16) | ((frame.payload[1] as u16) << 8);
-            // 尾部追加的 raw/out 两态(新固件才有)。旧固件没有就保持 0, 不用 phys_state 冒充 ——
-            // 否则界面会显示"原始态与去抖态永远一致", 等于把防抖效果伪装成不存在。
-            if frame.payload.len() >= 6 {
-                self.kbd_state_raw = (frame.payload[2] as u16) | ((frame.payload[3] as u16) << 8);
-                self.kbd_state_out = (frame.payload[4] as u16) | ((frame.payload[5] as u16) << 8);
-            }
-            self.kbd_state_version = self.kbd_state_version.wrapping_add(1);
-        }
-    }
-    fn _handle_kbd_get_map_response(&mut self, frame: &Frame) {
-        if frame.payload.is_empty() {
-            return;
-        }
-        // 每键 2 字节: [keycode, modifier]。
-        let count = frame.payload[0] as usize;
-        for i in 0..count.min(12) {
-            if let Some(&code) = frame.payload.get(1 + i * 2) {
-                self.kbd_map[i] = code;
-            }
-            if let Some(&m) = frame.payload.get(2 + i * 2) {
-                self.kbd_keymod[i] = m;
-            }
-        }
-        self.kbd_map_version = self.kbd_map_version.wrapping_add(1);
-    }
-    fn _handle_kbd_get_touchmap_response(&mut self, frame: &Frame) {
-        if frame.payload.len() < 2 {
-            return;
-        }
-        // [en, count, (keycode, modifier)×count]。
-        self.kbd_touch_en = frame.payload[0] != 0;
-        let count = frame.payload[1] as usize;
-        for z in 0..count.min(34) {
-            if let Some(&code) = frame.payload.get(2 + z * 2) {
-                self.kbd_touchmap[z] = code;
-            }
-            if let Some(&m) = frame.payload.get(3 + z * 2) {
-                self.kbd_zonemod[z] = m;
-            }
-        }
-        self.kbd_touchmap_version = self.kbd_touchmap_version.wrapping_add(1);
-    }
-
-    // ------------------------------------------------------------------
-    // 键盘长按参数 (KBD_GET_HOLD / KBD_SET_HOLD)、mai2 串口运行态 (MAI2_*)
-    // 与掉线重连自动恢复运行态
-    // ------------------------------------------------------------------
-
-    /// 触控→键盘映射总开关的配置 key(重连恢复期望态也按此 key 下发)。
-    const KBD_MAP_EN_KEY: &'static str = "comm.keyboard_map_en";
-
-    /// 物理键 idx(0..11) 的长按参数：草稿优先 → 设备回读兜底。
-    pub fn kbd_hold_phys(&self, idx: u8) -> (u16, u16) {
-        let hold = self
-            .drafts
-            .kbd_hold_phys(idx)
-            .or_else(|| self.kbd_hold_phys.get(idx as usize).copied())
-            .unwrap_or_default();
-        (hold.delay_ms, hold.max_hold_ms)
-    }
-
-    /// 触控分区 zone(0..33) 的长按参数：草稿优先 → 设备回读兜底。
-    pub fn kbd_hold_zone(&self, zone: u8) -> (u16, u16) {
-        let hold = self
-            .drafts
-            .kbd_hold_zone(zone)
-            .or_else(|| self.kbd_hold_zone.get(zone as usize).copied())
-            .unwrap_or_default();
-        (hold.delay_ms, hold.max_hold_ms)
-    }
-
-    /// 长按参数版本号(下发/回读时自增), 供 UI 判断是否刷新。
-    pub fn kbd_hold_version(&self) -> u64 {
-        self.kbd_hold_version
-    }
-
-    /// 暂存长按参数到草稿(不下发)，供 JSON 导入等批量外部写入使用。
-    pub fn stage_kbd_hold(
-        &mut self,
-        kind: u8,
-        idx: u8,
-        delay_ms: u16,
-        max_hold_ms: u16,
-    ) -> anyhow::Result<()> {
-        match kind {
-            KBD_HOLD_KIND_PHYS => self.kbd_set_hold_phys(idx, delay_ms, max_hold_ms),
-            KBD_HOLD_KIND_ZONE => self.kbd_set_hold_zone(idx, delay_ms, max_hold_ms),
-            _ => Err(anyhow::anyhow!("长按参数类型非法: {}", kind)),
-        }
-    }
-
-    /// 暂存物理键长按参数到草稿，不立即下发。
-    pub fn kbd_set_hold_phys(
-        &mut self,
-        idx: u8,
-        delay_ms: u16,
-        max_hold_ms: u16,
-    ) -> anyhow::Result<()> {
-        if (idx as usize) >= KBD_HOLD_PHYS_COUNT {
-            return Err(anyhow::anyhow!("物理键长按索引非法: {}", idx));
-        }
-        let hold = HoldParam {
-            delay_ms,
-            max_hold_ms,
-        };
-        let same_as_device = self.kbd_hold_phys.get(idx as usize) == Some(&hold);
-        self.drafts.set_kbd_hold_phys(idx, hold, same_as_device);
-        self.kbd_hold_version = self.kbd_hold_version.wrapping_add(1);
-        Ok(())
-    }
-
-    /// 暂存触控分区长按参数到草稿，不立即下发。
-    pub fn kbd_set_hold_zone(
-        &mut self,
-        zone: u8,
-        delay_ms: u16,
-        max_hold_ms: u16,
-    ) -> anyhow::Result<()> {
-        if (zone as usize) >= KBD_HOLD_ZONE_COUNT {
-            return Err(anyhow::anyhow!("触控分区长按索引非法: {}", zone));
-        }
-        let hold = HoldParam {
-            delay_ms,
-            max_hold_ms,
-        };
-        let same_as_device = self.kbd_hold_zone.get(zone as usize) == Some(&hold);
-        self.drafts.set_kbd_hold_zone(zone, hold, same_as_device);
-        self.kbd_hold_version = self.kbd_hold_version.wrapping_add(1);
-        Ok(())
-    }
-
-    /// 请求回读全部长按参数(12 物理键 + 34 分区)。
-    pub fn kbd_request_hold(&mut self) -> anyhow::Result<()> {
-        let seq = self.next_seq();
-        if let Some(handle) = &self.io {
-            handle.send(Frame::new(HostCmd::KbdGetHold as u8, 0, seq, vec![]))?;
-        }
-        Ok(())
-    }
-
-    // ------------------------------------------------------------------
-    // 物理键每键配置(触发极性 + 独立防抖)与逻辑分析仪边沿记录
-    // 草稿制与长按参数完全同一套: 编辑只进 `drafts` 的每键配置草稿, "保存到设备"才下发。
-    // ------------------------------------------------------------------
-
-    /// 物理键 idx(0..11) 的触发极性与防抖窗: 草稿优先 → 设备回读兜底。
-    pub fn kbd_keycfg(&self, idx: u8) -> KbdKeyCfg {
-        self.drafts
-            .kbd_keycfg(idx)
-            .or_else(|| self.kbd_keycfg.get(idx as usize).copied())
-            .unwrap_or_default()
-    }
-
-    pub fn kbd_keycfg_version(&self) -> u64 {
-        self.kbd_keycfg_version
-    }
-
-    /// 固件解析后的生效极性掩码(bit i = 1 → 该键按高电平触发判定)。
-    /// AUTO 档的判定结果只能从这里读 —— `kbd_keycfg().pol` 是配置态, 值为 2 时不含判定结论。
-    pub fn kbd_pol_resolved_mask(&self) -> u16 {
-        self.kbd_pol_resolved_mask
-    }
-
-    /// 生效极性掩码是否有真实来源。false = 旧固件未回传 → 生效电平**未知**, UI 显示"未知"。
-    pub fn kbd_pol_resolved_known(&self) -> bool {
-        self.kbd_pol_resolved_known
-    }
-
-    /// 设备是否支持每键配置。None=还没问过; Some(false)=旧固件 NAK。
-    pub fn kbd_keycfg_supported(&self) -> Option<bool> {
-        self.kbd_keycfg_supported
-    }
-
-    /// 暂存每键触发极性 + 防抖窗到草稿(不下发)。
-    /// 防抖上限与固件同源(`KBD_DEBOUNCE_US_MAX`): 越界直接报错, 不下发一个必被 NAK 的值。
-    pub fn kbd_set_keycfg(&mut self, idx: u8, pol: u8, debounce_us: u16) -> anyhow::Result<()> {
-        if (idx as usize) >= KBD_HOLD_PHYS_COUNT {
-            return Err(anyhow::anyhow!("物理键索引非法: {}", idx));
-        }
-        // 极性围栏与固件 _handle_set_keycfg 同源: 越界直接拒绝, 不下发一个必被 NAK 的值。
-        if pol > crate::proto::KBD_POL_AUTO {
-            return Err(anyhow::anyhow!(
-                "触发极性非法: {} (0=低电平 1=高电平 2=自动)",
-                pol
-            ));
-        }
-        if debounce_us > KBD_DEBOUNCE_US_MAX {
-            return Err(anyhow::anyhow!(
-                "防抖时间超出范围: {}us (上限 {}us)",
-                debounce_us,
-                KBD_DEBOUNCE_US_MAX
-            ));
-        }
-        let cfg = KbdKeyCfg { pol, debounce_us };
-        // 改回设备真值即自动撤稿(与 kbd_set_hold_phys 同口径), 免得界面一直挂着"未保存"。
-        let same_as_device = self.kbd_keycfg.get(idx as usize) == Some(&cfg);
-        self.drafts.set_kbd_keycfg(idx, cfg, same_as_device);
-        self.kbd_keycfg_version = self.kbd_keycfg_version.wrapping_add(1);
-        Ok(())
-    }
-
-    /// 请求回读 12 个物理键的极性与防抖窗。
-    pub fn kbd_request_keycfg(&mut self) -> anyhow::Result<()> {
-        if self.kbd_keycfg_supported == Some(false) {
-            return Ok(());
-        }
-        let seq = self.next_seq();
-        if let Some(handle) = &self.io {
-            handle.send(Frame::new(HostCmd::KbdGetKeycfg as u8, 0, seq, vec![]))?;
-            self.kbd_keycfg_req_seq = Some(seq);
-        }
-        Ok(())
-    }
-
-    /// 拉取一批边沿记录。窗口=1(有在途请求就跳过): 逻辑分析仪不能把 vendor 端点抢光,
-    /// 否则会连带影响遥测与按键映射的回读。旧固件已判定不支持时直接返回。
-    pub fn kbd_request_edges(&mut self) -> anyhow::Result<()> {
-        if self.kbd_edges_supported == Some(false) || self.kbd_edge_req_seq.is_some() {
-            return Ok(());
-        }
-        let seq = self.next_seq();
-        if let Some(handle) = &self.io {
-            handle.send(Frame::new(
-                HostCmd::KbdGetEdges as u8,
-                0,
-                seq,
-                crate::proto::encode_kbd_get_edges(0),
-            ))?;
-            self.kbd_edge_req_seq = Some(seq);
-        }
-        Ok(())
-    }
-
-    /// 主机侧留存的边沿记录(最旧在前)。
-    pub fn kbd_edges(&self) -> &VecDeque<KbdEdgeRec> {
-        &self.kbd_edges
-    }
-
-    pub fn kbd_edges_version(&self) -> u64 {
-        self.kbd_edges_version
-    }
-
-    /// 设备是否支持边沿记录。None=还没问过; Some(false)=旧固件 NAK。
-    pub fn kbd_edges_supported(&self) -> Option<bool> {
-        self.kbd_edges_supported
-    }
-
-    /// 累计被设备丢弃(环满)的边沿条数。>0 时 UI 必须显示"有事件丢失", 不能假装波形连续。
-    pub fn kbd_edge_lost(&self) -> u32 {
-        self.kbd_edge_lost
-    }
-
-    /// 上次拉取后设备侧仍剩余的条数(>0 = 拉取跟不上设备产生速度)。
-    pub fn kbd_edge_remaining(&self) -> u16 {
-        self.kbd_edge_remaining
-    }
-
-    /// 清空主机侧留存窗口与丢失计数(UI "清空波形")。
-    pub fn kbd_edges_clear(&mut self) {
-        self.kbd_edges.clear();
-        self.kbd_edge_lost = 0;
-        self.kbd_edge_remaining = 0;
-        self.kbd_edges_version = self.kbd_edges_version.wrapping_add(1);
-    }
-
-    /// 物理键去抖前(raw)的 12 位实时态。旧固件不提供时为 0。
-    pub fn kbd_state_raw(&self) -> u16 {
-        self.kbd_state_raw
-    }
-
-    /// 物理键实际输出 HID 的 12 位实时态(经去抖 + 长按状态机)。旧固件不提供时为 0。
-    pub fn kbd_state_out(&self) -> u16 {
-        self.kbd_state_out
-    }
-
-    fn _handle_kbd_get_keycfg_response(&mut self, frame: &Frame) {
-        self.kbd_keycfg_req_seq = None;
-        match crate::proto::decode_kbd_get_keycfg(&frame.payload) {
-            Ok((list, resolved)) => {
-                self.kbd_keycfg_supported = Some(true);
-                for (i, cfg) in list.iter().take(KBD_HOLD_PHYS_COUNT).enumerate() {
-                    self.kbd_keycfg[i] = *cfg;
-                }
-                // 旧固件不追加 resolved mask: 保持上次读数而不是清 0 —— 清 0 会被 UI 显示成
-                // "全部判定为低电平触发", 那是凭空造出来的结论。
-                if let Some(mask) = resolved {
-                    self.kbd_pol_resolved_mask = mask;
-                    self.kbd_pol_resolved_known = true;
-                }
-                self.kbd_keycfg_version = self.kbd_keycfg_version.wrapping_add(1);
-            }
-            Err(e) => self.push_log_warn(format!("KBD_GET_KEYCFG 解析失败: {}", e)),
-        }
-    }
-
-    fn _handle_kbd_get_edges_response(&mut self, frame: &Frame) {
-        self.kbd_edge_req_seq = None;
-        let batch = match crate::proto::decode_kbd_get_edges(&frame.payload) {
-            Ok(b) => b,
-            Err(e) => {
-                self.push_log_warn(format!("KBD_GET_EDGES 解析失败: {}", e));
-                return;
-            }
-        };
-        self.kbd_edges_supported = Some(true);
-        self.kbd_edge_remaining = batch.remaining;
-        // overflow 是设备累计值(只增, 设备重启才归零)。取差值累加到主机侧丢失计数;
-        // 设备重启导致读数回退时按"重新计数"处理, 不产生天文数字的假丢失量。
-        if batch.overflow >= self.kbd_edge_overflow_last {
-            self.kbd_edge_lost = self
-                .kbd_edge_lost
-                .saturating_add(batch.overflow - self.kbd_edge_overflow_last);
-        } else {
-            self.kbd_edge_lost = self.kbd_edge_lost.saturating_add(batch.overflow);
-        }
-        self.kbd_edge_overflow_last = batch.overflow;
-        if batch.recs.is_empty() {
-            return;
-        }
-        for rec in batch.recs {
-            if self.kbd_edges.len() >= KBD_EDGE_KEEP {
-                self.kbd_edges.pop_front();
-            }
-            self.kbd_edges.push_back(rec);
-        }
-        self.kbd_edges_version = self.kbd_edges_version.wrapping_add(1);
-    }
-
-    /// mai2 串口实际有效发送态；None = 尚未回读。
-    /// 用户期望只用于下发与重连恢复，绝不能覆盖设备状态机的真值。
-    pub fn mai2_send_en(&self) -> Option<bool> {
-        self.mai2_state.map(|s| s.send_en)
-    }
-
-    /// mai2 串口状态: 0=停 1=就绪 2=运行; None = 尚未回读。
-    pub fn mai2_status(&self) -> Option<u8> {
-        self.mai2_state.map(|s| s.status)
-    }
-
-    /// mai2 串口波特率; None = 尚未回读。
-    pub fn mai2_baud(&self) -> Option<u32> {
-        self.mai2_state.map(|s| s.baud)
-    }
-
-    /// mai2 运行态版本号(下发/回读时自增)。
-    pub fn mai2_version(&self) -> u64 {
-        self.mai2_version
-    }
-
-    /// 设置 mai2 串口发送使能: 立即下发 + 写期望值(掉线重连后据此自动恢复)。
-    pub fn mai2_set_send_en(&mut self, en: bool) -> anyhow::Result<()> {
-        self.desired.mai2_send_en = Some(en);
-        self.mai2_version = self.mai2_version.wrapping_add(1);
-        let seq = self.next_seq();
-        if self.io.is_some() {
-            self._queue_tx(Frame::new(
-                HostCmd::Mai2SetSendEn as u8,
-                0,
-                seq,
-                crate::proto::encode_mai2_set_send_en(en),
-            ))?;
-        }
-        self.push_log(format!("mai2 串口发送使能 → {}", Self::_on_off(en)));
-        Ok(())
-    }
-
-    /// 请求回读 mai2 串口运行态。
-    pub fn mai2_request_state(&mut self) -> anyhow::Result<()> {
-        let seq = self.next_seq();
-        if let Some(handle) = &self.io {
-            handle.send(Frame::new(HostCmd::Mai2GetState as u8, 0, seq, vec![]))?;
-        }
-        Ok(())
-    }
-
-    /// 清空日志视图。
-    /// 唯一的可显示数据源是 `logging::hub()` 的环形缓冲(UI 文本只读它), 所以清空必须清它,
-    /// 否则点了没反应; `event_log` 只是本控制器的内部副本, 一并清掉免得留下第二份"真相"。
-    /// 磁盘日志文件不受影响(继续追加), 见 logging::LogHub::clear 的说明。
-    pub fn clear_log(&mut self) {
-        crate::logging::hub().clear();
-        self.event_log.clear();
-        self.log_seq = self.log_seq.wrapping_add(1);
-    }
-
-    /// ★掉线重连自动恢复运行态★
-    ///
-    /// 握手完成(收到 DEVICE_INFO)时由 `handle_frame` 自动调用, 无需 UI 介入: 把用户显式设置过的
-    /// 期望态(mai2 发送使能 / 触控键盘映射总开关 / 长按参数)逐条重新下发, 再拉一次真值回读对账。
-    /// 也公开出来供 UI 手动重试。
-    pub fn restore_after_reconnect(&mut self) -> anyhow::Result<()> {
-        if self.io.is_none() {
-            return Err(anyhow::anyhow!("未连接, 无法恢复运行态"));
-        }
-        if self.desired.is_empty() {
-            // 用户从未显式设置过运行态: 连接探针队列会顺序回读真实状态, 不在握手边沿直发并发请求。
-            return Ok(());
-        }
-        // 1) 长按参数: 全部期望项合并为一帧下发。
-        let mut items: Vec<KbdHoldItem> =
-            Vec::with_capacity(self.desired.hold_phys.len() + self.desired.hold_zone.len());
-        for (idx, hold) in self.desired.hold_phys.iter() {
-            items.push(KbdHoldItem {
-                kind: KBD_HOLD_KIND_PHYS,
-                idx: *idx,
-                hold: *hold,
-            });
-        }
-        for (zone, hold) in self.desired.hold_zone.iter() {
-            items.push(KbdHoldItem {
-                kind: KBD_HOLD_KIND_ZONE,
-                idx: *zone,
-                hold: *hold,
-            });
-        }
-        if !items.is_empty() {
-            let payload = crate::proto::encode_kbd_set_hold(&items);
-            let seq = self.next_seq();
-            self._queue_tx(Frame::new(HostCmd::KbdSetHold as u8, 0, seq, payload))?;
-        }
-        // 2) 触控→键盘映射总开关。
-        if let Some(en) = self.desired.kbd_map_en {
-            let entry = ConfigEntry::new(Self::KBD_MAP_EN_KEY.to_string(), CfgValue::Bool(en));
-            let payload = crate::proto::encode_entry(&entry)
-                .map_err(|e| anyhow::anyhow!("encode_entry failed: {}", e))?;
-            let seq = self.next_seq();
-            self._queue_tx(Frame::new(HostCmd::CfgSet as u8, 0, seq, payload))?;
-        }
-        // 3) mai2 发送使能 —— 震动掉线后要立刻恢复触控, 这一条最关键。
-        if let Some(en) = self.desired.mai2_send_en {
-            let seq = self.next_seq();
-            self._queue_tx(Frame::new(
-                HostCmd::Mai2SetSendEn as u8,
-                0,
-                seq,
-                crate::proto::encode_mai2_set_send_en(en),
-            ))?;
-        }
-        self.push_log(format!(
-            "重连恢复运行态: 长按 {} 项 + 触控键盘映射={} + mai2 发送使能={} 已重新下发, 连接探针将在写队列排空后回读对账",
-            items.len(),
-            Self::_opt_on_off(self.desired.kbd_map_en),
-            Self::_opt_on_off(self.desired.mai2_send_en)));
-        // 4) 回读对账由连接探针队列中的 KBD_GET_HOLD/MAI2_GET_STATE 负责，避免与恢复写入并发。
-        self.restore_verify.hold = true;
-        self.restore_verify.mai2 = true;
-        Ok(())
-    }
-
-    fn _on_off(v: bool) -> &'static str {
-        if v { "开" } else { "关" }
-    }
-
-    fn _opt_on_off(v: Option<bool>) -> &'static str {
-        match v {
-            Some(true) => "开",
-            Some(false) => "关",
-            None => "未设置",
-        }
-    }
-
-    fn _mai2_status_text(status: u8) -> &'static str {
-        match status {
-            0 => "停",
-            1 => "就绪",
-            2 => "运行",
-            _ => "未知",
-        }
-    }
-
-    fn _handle_kbd_get_hold_response(&mut self, frame: &Frame) {
-        let table = match crate::proto::decode_kbd_get_hold(&frame.payload) {
-            Ok(t) => t,
-            Err(e) => {
-                self.push_log_warn(format!("KBD_GET_HOLD 解析失败: {}", e));
-                self.restore_verify.hold = false;
-                return;
-            }
-        };
-        for (i, hold) in table.phys.iter().take(KBD_HOLD_PHYS_COUNT).enumerate() {
-            self.kbd_hold_phys[i] = *hold;
-        }
-        for (i, hold) in table.zone.iter().take(KBD_HOLD_ZONE_COUNT).enumerate() {
-            self.kbd_hold_zone[i] = *hold;
-        }
-        self.kbd_hold_version = self.kbd_hold_version.wrapping_add(1);
-        if self.restore_verify.hold {
-            self.restore_verify.hold = false;
-            self._verify_hold_readback();
-        }
-    }
-
-    /// 重连恢复后的长按参数对账: 期望值 vs 设备真值, 不一致逐条告警(设备未接受/被夹取必须可见)。
-    fn _verify_hold_readback(&mut self) {
-        let mut bad: Vec<String> = Vec::new();
-        for (idx, want) in self.desired.hold_phys.iter() {
-            let got = self
-                .kbd_hold_phys
-                .get(*idx as usize)
-                .copied()
-                .unwrap_or_default();
-            if got != *want {
-                bad.push(format!(
-                    "物理键{}: 期望 {}/{}ms 实际 {}/{}ms",
-                    *idx as u16 + 1,
-                    want.delay_ms,
-                    want.max_hold_ms,
-                    got.delay_ms,
-                    got.max_hold_ms
-                ));
-            }
-        }
-        for (zone, want) in self.desired.hold_zone.iter() {
-            let got = self
-                .kbd_hold_zone
-                .get(*zone as usize)
-                .copied()
-                .unwrap_or_default();
-            if got != *want {
-                bad.push(format!(
-                    "{}: 期望 {}/{}ms 实际 {}/{}ms",
-                    zone_label(*zone as usize),
-                    want.delay_ms,
-                    want.max_hold_ms,
-                    got.delay_ms,
-                    got.max_hold_ms
-                ));
-            }
-        }
-        if bad.is_empty() {
-            self.push_log("重连恢复对账: 长按参数与期望一致");
-        } else {
-            self.push_log_warn(format!(
-                "⚠ 重连恢复对账: {} 项长按参数与期望不一致(设备未接受或已夹取): {}",
-                bad.len(),
-                bad.join("; ")
-            ));
-        }
-    }
-
-    fn _handle_mai2_get_state_response(&mut self, frame: &Frame) {
-        let state = match crate::proto::decode_mai2_get_state(&frame.payload) {
-            Ok(s) => s,
-            Err(e) => {
-                self.push_log_warn(format!("MAI2_GET_STATE 解析失败: {}", e));
-                self.restore_verify.mai2 = false;
-                return;
-            }
-        };
-        self.mai2_state = Some(state);
-        self.mai2_version = self.mai2_version.wrapping_add(1);
-        if !self.restore_verify.mai2 {
-            return;
-        }
-        self.restore_verify.mai2 = false;
-        let status_text = Self::_mai2_status_text(state.status);
-        match self.desired.mai2_send_en {
-            Some(want) if want != state.send_en => self.push_log_warn(format!(
-                "⚠ 重连恢复对账: mai2 发送使能期望 {} 但设备回读 {} (状态={} 波特率={}) → 触控可能未恢复",
-                Self::_on_off(want), Self::_on_off(state.send_en), status_text, state.baud)),
-            Some(want) => self.push_log(format!(
-                "重连恢复对账: mai2 发送使能={} 已生效 (状态={} 波特率={})",
-                Self::_on_off(want), status_text, state.baud)),
-            None => {}
-        }
-        if state.status == 0 {
-            self.push_log_warn(format!(
-                "⚠ 重连恢复对账: mai2 串口状态=停(波特率={}), 游戏触控上报未运行",
-                state.baud
-            ));
-        }
-    }
-    // ------------------------------------------------------------------
-    // mai2light
-
-    /// 灯效运行态版本号(回读/草稿编辑/应用结果变化时自增)。
-    pub fn led_version(&self) -> u64 {
-        self.led_version
-    }
-
-    /// 是否已拿到设备灯效快照(未拿到时 UI 一律显示"未知", 不以 0 冒充真值)。
-    pub fn led_known(&self) -> bool {
-        self.led_state.is_some()
-    }
-
-    /// 灯板协议状态机: 0=停 1=就绪 2=运行; None=尚未回读。
-    pub fn led_status(&self) -> Option<u8> {
-        self.led_state.map(|s| s.status)
-    }
-    /// WS2812 指定链初始化就绪状态; None=尚未回读或索引非法。
-    pub fn led_chain_ready(&self, chain: usize) -> Option<bool> {
-        if chain >= 2 {
-            return None;
-        }
-        self.led_state.map(|s| s.chain_ready[chain])
-    }
-    /// WS2812 初始化失败分档; None=尚未回读。
-    pub fn led_init_fault(&self) -> Option<u8> {
-        self.led_state.map(|s| s.init_fault)
-    }
-    pub fn led_resp_enabled(&self) -> Option<bool> {
-        self.led_state.map(|s| s.resp_enabled)
-    }
-    /// 设备侧预览色是否正在覆盖协议色; None=尚未回读。false 时颜色字段即游戏协议色。
-    pub fn led_preview_active(&self) -> Option<bool> {
-        self.led_state.map(|s| s.preview_active)
-    }
-    /// 设备灯效服务是否已初始化; None=尚未回读。false = 预览色不会被刷到灯链。
-    pub fn led_service_ready(&self) -> Option<bool> {
-        self.led_state.map(|s| s.service_ready)
-    }
-    /// 设备灯效刷新是否至少执行过一次; None=尚未回读。false = 灯服务从未被主循环调用。
-    pub fn led_refresh_seen(&self) -> Option<bool> {
-        self.led_state.map(|s| s.refresh_seen)
-    }
-    /// 设备灯效刷新次数低 4 位; None=尚未回读。两次快照该值不变 = 灯服务已停摆。
-    pub fn led_refresh_ticks(&self) -> Option<u8> {
-        self.led_state.map(|s| s.refresh_ticks)
-    }
-    pub fn led_baud(&self) -> Option<u32> {
-        self.led_state.map(|s| s.baud)
-    }
-    /// 灯板波特率是否可作为 UI 真值展示；判定集中复用协议快照的范围约束。
-    pub fn led_baud_valid(&self) -> bool {
-        self.led_state.map_or(false, |state| state.baud_valid())
-    }
-    pub fn led_rx_frames(&self) -> u32 {
-        self.led_state.map_or(0, |s| s.rx_frames)
-    }
-    /// 收帧计数是否可无损显示，避免 u32 转 Slint int 后翻为负数。
-    pub fn led_rx_frames_valid(&self) -> bool {
-        self.led_state
-            .map_or(false, |state| state.rx_frames_valid())
-    }
-    pub fn led_sum_errors(&self) -> u32 {
-        self.led_state.map_or(0, |s| s.sum_errors)
-    }
-    /// 校验错误计数是否可无损显示，避免异常快照伪装成正常数值。
-    pub fn led_sum_errors_valid(&self) -> bool {
-        self.led_state
-            .map_or(false, |state| state.sum_errors_valid())
-    }
-
-    /// 设备回报的灯链实际灯珠数(chain 0/1); 越界返回 0。
-    pub fn led_ws_count(&self, chain: usize) -> u16 {
-        if chain > 1 {
-            return 0;
-        }
-        self.led_state.map_or(0, |s| s.ws_count[chain])
-    }
-
-    /// 单元当前采样颜色(预览生效时即预览色); 未回读时为全黑。
-    pub fn led_color(&self, unit: usize) -> [u8; 3] {
-        if unit >= LED_UNIT_COUNT {
-            return [0, 0, 0];
-        }
-        self.led_state.map_or([0, 0, 0], |s| s.colors[unit])
-    }
-
-    /// 单元映射: 草稿优先 → 设备回读兜底 → 未映射。
-    pub fn led_region(&self, unit: usize) -> LedRegion {
-        if unit >= LED_UNIT_COUNT {
-            return LedRegion::default();
-        }
-        if let Some(draft) = self.drafts.led_region() {
-            return draft[unit];
-        }
-        self.led_state
-            .map_or(LedRegion::default(), |s| s.regions[unit])
-    }
-
-    /// 最近一次"应用映射"的结果文本(含设备 NAK 原因); 空串=尚未操作。
-    pub fn led_apply_status(&self) -> &str {
-        &self.led_apply_status
-    }
-
-    /// 最近一次尚在等待设备 ACK/NAK 的灯效写操作序号(映射或预览)；None 表示已有结局或尚未下发。
-    pub fn led_apply_seq(&self) -> Option<u8> {
-        self.led_apply_seq.map(|(seq, _)| seq)
-    }
-
-    /// 最近一次 LED_GET 快照中的虚拟单元数量；None 表示尚未取得有效快照。
-    pub fn led_unit_count(&self) -> Option<u8> {
-        self.led_state.map(|s| s.unit_count)
-    }
-
-    /// 最近一次 LED_GET 快照中的设备实际生效亮度；None 表示尚未回读或旧固件未上报。
-    pub fn led_applied_brightness(&self) -> Option<u8> {
-        self.led_state.and_then(|state| state.applied_brightness)
-    }
-
-    /// 本地映射校验结论: Some(原因) = 明知会被设备拒收, 不该发。
-    pub fn led_region_conflict(&self) -> Option<String> {
-        crate::proto::validate_led_regions(&self._led_regions(), self._led_ws_counts())
-    }
-
-    /// 编辑单元映射草稿。`ch` 传 `LED_CH_UNMAPPED` 解除映射。
-    pub fn led_set_region(&mut self, unit: usize, ch: u8, start: u16, count: u8) {
-        if unit >= LED_UNIT_COUNT {
-            return;
-        }
-        let mut regions = self._led_regions();
-        let ch = if ch > 1 { LED_CH_UNMAPPED } else { ch };
-        regions[unit] = LedRegion { ch, start, count };
-        self.drafts.set_led_region(regions);
-        self.led_version = self.led_version.wrapping_add(1);
-    }
-
-    /// 请求回读灯效运行态(LED_GET)。
-    pub fn led_request_state(&mut self) -> anyhow::Result<()> {
-        let seq = self.next_seq();
-        if let Some(handle) = &self.io {
-            handle.send(Frame::new(
-                HostCmd::LedGet as u8,
-                0,
-                seq,
-                crate::proto::encode_led_get(),
-            ))?;
-        }
-        Ok(())
-    }
-
-    /// 整批下发 11 个单元的映射(LED_SET_REGION)。本地校验不通过则不发, 直接给出冲突原因。
-    pub fn led_apply_regions(&mut self) -> anyhow::Result<()> {
-        if self.io.is_none() {
-            self.led_apply_status = "未连接, 无法应用映射".to_string();
-            self.led_version = self.led_version.wrapping_add(1);
-            return Err(anyhow::anyhow!("未连接"));
-        }
-        let regions = self._led_regions();
-        if let Some(reason) = crate::proto::validate_led_regions(&regions, self._led_ws_counts()) {
-            self.led_apply_status = format!("本地校验未通过: {}", reason);
-            self.led_version = self.led_version.wrapping_add(1);
-            self.push_log_warn(format!("灯效映射未下发({})", reason));
-            return Ok(());
-        }
-        // count=0 的区段语义上就是"没占灯珠", 统一折成解除映射后下发, 免得固件把 0 长度当非法参数
-        // 整批 NAK(整批原子失败对用户表现为"什么都没变", 最难排查)。
-        let items: Vec<(u8, LedRegion)> = regions
-            .iter()
-            .enumerate()
-            .map(|(unit, region)| {
-                let mut region = *region;
-                if region.count == 0 {
-                    region = LedRegion::default();
-                }
-                (unit as u8, region)
-            })
-            .collect();
-        self.led_send_regions_raw(&items)?;
-        self.push_log("灯效映射: 已整批下发 LED_SET_REGION(11 单元)");
-        Ok(())
-    }
-
-    /// 无头 `selftest --led` 专用的原始整批 LED_SET_REGION 下发。
-    ///
-    /// 设备侧必须独立验证整批原子校验；若复用 UI 的本地预校验，重叠/越界
-    /// 用例会在主机被拦截而掩盖设备实现。UI 仍必须走 `led_apply_regions` 的
-    /// 本地校验，此接口仅供 selftest 验证路径使用。
-    pub fn led_send_regions_raw(&mut self, items: &[(u8, LedRegion)]) -> anyhow::Result<u8> {
-        if self.io.is_none() {
-            self.led_apply_status = "未连接, 无法下发原始映射".to_string();
-            self.led_version = self.led_version.wrapping_add(1);
-            return Err(anyhow::anyhow!("未连接"));
-        }
-        let seq = self.next_seq();
-        if self.io.is_some() {
-            self._queue_tx(Frame::new(
-                HostCmd::LedSetRegion as u8,
-                0,
-                seq,
-                crate::proto::encode_led_set_region(items),
-            ))?;
-        }
-        self.led_apply_seq = Some((seq, LedWriteOp::ApplyRegions));
-        self.led_apply_status = "已下发, 等待设备确认...".to_string();
-        self.led_version = self.led_version.wrapping_add(1);
-        Ok(seq)
-    }
-
-    /// 发送预览色并返回本次下发的 seq。`unit` 传 `LED_PREVIEW_ALL` 表示全部单元;
-    /// 设备约 3s 无新预览自动回协议色。
-    ///
-    /// 回执与"应用映射"共用 `led_apply_seq` 归因: 预览被设备拒绝(unit 越界/载荷不整)时
-    /// 原因必须能显示出来, 而不是发完就当成功。返回值可忽略(UI 只关心状态文案)。
-    pub fn led_preview(&mut self, unit: u8, rgb: [u8; 3]) -> anyhow::Result<u8> {
-        if self.io.is_none() {
-            self.led_apply_status = "未连接, 无法预览".to_string();
-            self.led_version = self.led_version.wrapping_add(1);
-            return Err(anyhow::anyhow!("未连接"));
-        }
-        let seq = self.next_seq();
-        if self.io.is_some() {
-            self._queue_tx(Frame::new(
-                HostCmd::LedPreview as u8,
-                0,
-                seq,
-                crate::proto::encode_led_preview(&[(unit, rgb)]),
-            ))?;
-        }
-        self.led_apply_seq = Some((seq, LedWriteOp::Preview));
-        self.led_apply_status = "已下发, 等待设备确认...".to_string();
-        self.led_version = self.led_version.wrapping_add(1);
-        let who = if unit == LED_PREVIEW_ALL {
-            "全部单元".to_string()
-        } else {
-            format!("单元 {}", unit)
-        };
-        self.push_log(format!(
-            "灯效预览: {} → RGB({},{},{}), 约 3s 后自动回到协议色",
-            who, rgb[0], rgb[1], rgb[2]
-        ));
-        Ok(seq)
-    }
-
-    /// 当前生效的 11 单元映射(草稿优先), 供校验/下发共用。
-    fn _led_regions(&self) -> [LedRegion; LED_UNIT_COUNT] {
-        if let Some(draft) = self.drafts.led_region() {
-            return *draft;
-        }
-        self.led_state
-            .map_or([LedRegion::default(); LED_UNIT_COUNT], |s| s.regions)
-    }
-
-    fn _led_ws_counts(&self) -> [u16; 2] {
-        self.led_state.map_or([0, 0], |s| s.ws_count)
-    }
-
-    fn _handle_led_get_response(&mut self, frame: &Frame) {
-        // 前 96B 是稳定快照；新版固件可在尾部追加运行态亮度字节，兼容旧固件。
-        if frame.payload.len() < 96 {
-            self.push_log_warn(format!(
-                "LED_GET 响应长度错误: {} 字节 (需 >= 96)",
-                frame.payload.len()
-            ));
-            return;
-        }
-        match crate::proto::decode_led_get(&frame.payload) {
-            Ok(state) => {
-                // 设备真值到达即丢弃草稿: 否则"应用成功"后编辑框仍显示旧草稿, 与色块/设备不同源。
-                if self.drafts.led_region() == Some(&state.regions) {
-                    self.drafts.drop_led_region();
-                }
-                self.led_state = Some(state);
-                self.led_version = self.led_version.wrapping_add(1);
-            }
-            Err(e) => {
-                self.push_log_warn(format!("LED_GET 解析失败: {}", e));
-            }
-        }
-    }
-
     // ------------------------------------------------------------------
     // JIT 算法引擎 (ALGO_*)
     // ------------------------------------------------------------------
-    pub fn algo_get_info(&mut self) -> anyhow::Result<()> {
-        let _ = self._submit_poll(
-            RequestKind::AlgoGetInfo,
-            crate::proto::algo::encode_algo_get_info(0),
-        )?;
-        Ok(())
-    }
-    pub fn algo_apply(&mut self) -> anyhow::Result<()> {
-        let seq = self.next_seq();
-        if self.io.is_some() {
-            self._queue_tx(crate::proto::algo::encode_algo_apply(seq))?;
-        }
-        Ok(())
-    }
-    pub fn algo_reset_default(&mut self) -> anyhow::Result<()> {
-        let seq = self.next_seq();
-        if self.io.is_some() {
-            self._queue_tx(crate::proto::algo::encode_algo_reset_default(seq))?;
-        }
-        // 复位命令与此查询在同一有序链路上：紧随其后取设备真值，避免调用方只能继续显示旧算法信息。
-        self.algo_get_info()?;
-        self.push_log("算法: 请求恢复默认(v3.1 HDR)并自动刷新设备信息");
-        Ok(())
-    }
-    /// 上传算法二进制(≤1024B)。内部计算 CRC16 随帧下发，并按既有灯效写入模式等待 ACK/NAK。
-    pub fn algo_upload(&mut self, data: &[u8]) -> anyhow::Result<()> {
-        if data.is_empty() || data.len() > crate::proto::algo::ALGO_MAX_LEN {
-            return Err(anyhow::anyhow!(
-                "算法长度非法: {} (须 1..=1024)",
-                data.len()
-            ));
-        }
-        let seq = self.next_seq();
-        if self.io.is_none() {
-            return Err(anyhow::anyhow!("未连接，无法上传算法"));
-        }
-        self._queue_tx(crate::proto::algo::encode_algo_upload(seq, data))?;
-        self.algo_upload_seq = Some(seq);
-        self.algo_upload_started_at = Some(std::time::Instant::now());
-        self.algo_upload_status =
-            format!("上传已发送: {} 字节，等待设备 ACK/NAK 确认…", data.len());
-        self.algo_upload_version = self.algo_upload_version.wrapping_add(1);
-        self.push_log(format!(
-            "算法: 上传 {} 字节 (crc16=0x{:04X}, seq={})",
-            data.len(),
-            crate::proto::algo::crc16_ccitt(data),
-            seq
-        ));
-        Ok(())
-    }
-    pub fn algo_get_rom(&mut self) -> anyhow::Result<()> {
-        let seq = self.next_seq();
-        if let Some(handle) = &self.io {
-            handle.send(crate::proto::algo::encode_algo_get_rom(seq))?;
-        }
-        Ok(())
-    }
-    /// 设置每通道 16 位 ROM。entries=(ch, rom) 列表(1..=36 项)。
-    pub fn algo_set_rom(&mut self, entries: &[(u8, u16)]) -> anyhow::Result<()> {
-        if entries.is_empty() || entries.len() > 36 {
-            return Err(anyhow::anyhow!("ROM 条目数非法: {}", entries.len()));
-        }
-        let seq = self.next_seq();
-        if self.io.is_some() {
-            self._queue_tx(crate::proto::algo::encode_algo_set_rom(seq, entries))?;
-        }
-        for &(ch, rom) in entries {
-            if (ch as usize) < self.algo_rom.len() {
-                self.algo_rom[ch as usize] = rom;
-            }
-        }
-        self.algo_rom_version = self.algo_rom_version.wrapping_add(1);
-        Ok(())
-    }
-
-    pub fn algo_info(&self) -> Option<crate::proto::algo::AlgoInfo> {
-        self.algo_info
-    }
-    pub fn algo_version(&self) -> u64 {
-        self.algo_version
-    }
-    /// 最近一次算法上传的设备确认结果(发送中 / ACK / NAK / 超时)，由 main.rs 回填状态行。
-    pub fn algo_upload_status(&self) -> &str {
-        &self.algo_upload_status
-    }
-    pub fn algo_upload_version(&self) -> u64 {
-        self.algo_upload_version
-    }
-    pub fn algo_rom(&self) -> &[u16] {
-        &self.algo_rom
-    }
-    pub fn algo_rom_version(&self) -> u64 {
-        self.algo_rom_version
-    }
-
-    // ------------------------------------------------------------------
-    // 算法运行时追踪(report[]/out_active) + 可调变量(cfg[8])
-    // ------------------------------------------------------------------
-
-    /// 请求某通道某上报变量 idx(0..3) 的一次追踪采样(响应异步入环形缓冲, 供折线图)。
-    /// 切换追踪通道时清空旧通道的缓冲, 避免新旧通道数据混线。
-    pub fn request_algo_trace(&mut self, ch: u8, idx: u8) -> anyhow::Result<()> {
-        if ch >= 36 || idx >= 4 {
-            return Err(anyhow::anyhow!("算法追踪参数非法: ch={} idx={}", ch, idx));
-        }
-        if self.algo_trace_channel != Some(ch) {
-            self.algo_trace_channel = Some(ch);
-            for buf in &mut self.algo_trace_report {
-                buf.clear();
-            }
-            self.algo_trace_active.clear();
-        }
-        // 退避中(设备无算法/上次 NAK): 跳过本次轮询, 逐次递减, 避免 NAK 刷屏。
-        if self.algo_trace_backoff > 0 {
-            self.algo_trace_backoff -= 1;
-            return Ok(());
-        }
-        self.algo_trace_pending_idx = idx;
-        let seq = self._submit_poll(
-            RequestKind::RequestAlgoTrace { ch, idx },
-            crate::proto::algo::encode_algo_get_trace(0, ch, idx),
-        )?;
-        if seq != 0 {
-            self.algo_trace_last_seq = Some(seq);
-        }
-        Ok(())
-    }
-
-    /// 某上报变量(idx 0..3)的值序列(等间距用法, 供算法页窄带)。
-    pub fn algo_trace_report_series(&self, idx: u8) -> Vec<f32> {
-        self.algo_trace_report
-            .get(idx as usize)
-            .map(|buf| buf.iter().map(|p| p.val).collect())
-            .unwrap_or_default()
-    }
-    /// 触发判定(out_active, 0/1)值序列(等间距用法, 供算法页窄带)。
-    pub fn algo_trace_active_series(&self) -> Vec<f32> {
-        self.algo_trace_active.iter().map(|p| p.val).collect()
-    }
-    /// 某上报变量(idx 0..3)的 (设备时间us, 值) 序列: 供与遥测曲线共用真实时间轴的主图。
-    pub fn algo_trace_report_points(&self, idx: u8) -> Vec<(u64, f32)> {
-        let report = match &self.plot_freeze {
-            Some(freeze) => &freeze.algo_report,
-            None => &self.algo_trace_report,
-        };
-        report
-            .get(idx as usize)
-            .map(|buf| buf.iter().map(|p| (p.t_us, p.val)).collect())
-            .unwrap_or_default()
-    }
-    /// 触发判定(out_active)的 (设备时间us, 值) 序列, 同上。
-    pub fn algo_trace_active_points(&self) -> Vec<(u64, f32)> {
-        match &self.plot_freeze {
-            Some(freeze) => &freeze.algo_active,
-            None => &self.algo_trace_active,
-        }
-        .iter()
-        .map(|p| (p.t_us, p.val))
-        .collect()
-    }
-    pub fn algo_trace_version(&self) -> u64 {
-        self.algo_trace_version
-    }
-
-    /// 暂存共享算法可设置变量 cfg[idx](0..7)，点击“保存到设备”后统一下发。
-    pub fn set_algo_cfg(&mut self, idx: u8, val: u8) -> anyhow::Result<()> {
-        if idx >= 8 {
-            return Err(anyhow::anyhow!("算法可调变量索引非法: {}", idx));
-        }
-        let slot = idx as usize;
-        let same_as_device = self.algo_cfg_valid[slot] && self.algo_cfg[slot] == val;
-        self.drafts.set_algo_cfg(idx, val, same_as_device);
-        // 草稿优先 getter 依赖版本号立即回显，不覆盖设备缓存以支持撤销恢复。
-        self.algo_cfg_version = self.algo_cfg_version.wrapping_add(1);
-        Ok(())
-    }
-    pub fn request_algo_cfg(&mut self, idx: u8) -> anyhow::Result<()> {
-        if idx >= 8 {
-            return Err(anyhow::anyhow!("算法可调变量索引非法: {}", idx));
-        }
-        let seq = self.next_seq();
-        if let Some(handle) = &self.io {
-            handle.send(crate::proto::algo::encode_algo_get_cfg(seq, idx))?;
-        }
-        Ok(())
-    }
-    pub fn algo_cfg(&self, idx: u8) -> u8 {
-        let slot = idx as usize;
-        self.drafts.algo_cfg(idx).unwrap_or_else(|| {
-            if self.algo_cfg_valid.get(slot).copied().unwrap_or(false) {
-                self.algo_cfg[slot]
-            } else {
-                self.algo_setting_decls()
-                    .into_iter()
-                    .find(|decl| decl.idx == idx)
-                    .map_or(0, |decl| decl.default)
-            }
-        })
-    }
-    pub fn algo_cfg_version(&self) -> u64 {
-        self.algo_cfg_version
-    }
-
-    /// schema 解析用的 C 源: ★设备回读源优先★, 无设备源时退回本地最近一次编译源。
-    /// 为什么不是编辑器文本: 面板与 report idx 轮询集合描述的是"设备上正在跑的算法",
-    /// 编辑器里可能只是还没编译的草稿; 用草稿当 schema 会去轮询设备根本没有的 idx。
-    pub fn algo_schema_source(&self) -> &str {
-        if self.algo_device_src.trim().is_empty() {
-            &self.algo_source
-        } else {
-            &self.algo_device_src
-        }
-    }
-
-    /// schema 版本号: 设备源或本地源任一变化即自增, 供 UI 门控刷新。
-    pub fn algo_schema_version(&self) -> u64 {
-        self.algo_schema_version
-    }
-
-    fn _bump_algo_schema(&mut self) {
-        self.algo_schema_version = self.algo_schema_version.wrapping_add(1);
-    }
-
-    /// 解析算法上报变量声明(ALGO_REPORT), 供 UI 建折线图例。源见 `algo_schema_source`。
-    pub fn algo_report_decls(&self) -> Vec<crate::proto::algo::AlgoReportDecl> {
-        crate::proto::algo::parse_algo_reports(self.algo_schema_source())
-    }
-    /// 解析算法可设置变量声明(ALGO_SETTING), 供 UI 建可调项列表。源见 `algo_schema_source`。
-    pub fn algo_setting_decls(&self) -> Vec<crate::proto::algo::AlgoSettingDecl> {
-        crate::proto::algo::parse_algo_settings(self.algo_schema_source())
-    }
-
-    fn _handle_algo_get_trace_response(&mut self, frame: &Frame) {
-        // 成功响应: 设备有算法且可读, 清退避恢复正常轮询。
-        self.algo_trace_backoff = 0;
-        self.algo_trace_last_seq = None;
-        let Some((ch, idx, active, report)) =
-            crate::proto::algo::decode_algo_get_trace(&frame.payload)
-        else {
-            return;
-        };
-        if self.algo_trace_channel != Some(ch) || idx >= 4 {
-            return; // 通道已切换或响应索引非法，丢弃过时帧。
-        }
-        const TRACE_CAP: usize = 512;
-        let t_us = match frame.device_t_us {
-            Some(raw) => self.telem_clock.unwrap_us(raw),
-            None => {
-                self.telem_clock.acc_us
-                    + self
-                        .telem_frame_at
-                        .map_or(0, |at| at.elapsed().as_micros() as u64)
-            }
-        };
-        if let Some(buf) = self.algo_trace_report.get_mut(idx as usize) {
-            if buf.len() >= TRACE_CAP {
-                buf.pop_front();
-            }
-            buf.push_back(TracePoint {
-                t_us,
-                val: report as f32,
-            });
-            if self.algo_trace_active.len() >= TRACE_CAP {
-                self.algo_trace_active.pop_front();
-            }
-            self.algo_trace_active.push_back(TracePoint {
-                t_us,
-                val: if active { 1.0 } else { 0.0 },
-            });
-            self.algo_trace_version = self.algo_trace_version.wrapping_add(1);
-        }
-    }
-
-    fn _handle_algo_get_cfg_response(&mut self, frame: &Frame) {
-        if let Some((idx, val)) = crate::proto::algo::decode_algo_get_cfg(&frame.payload) {
-            if (idx as usize) < self.algo_cfg.len() {
-                self.algo_cfg[idx as usize] = val;
-                self.algo_cfg_valid[idx as usize] = true;
-                self.algo_cfg_version = self.algo_cfg_version.wrapping_add(1);
-            }
-        }
-    }
-
-    /// 简易 C→ASM 编译器: 把 C 源写临时文件, 用 arm-none-eabi-gcc(-mcpu=cortex-m0plus
-    /// -mthumb -Os -ffreestanding -nostdlib) 编译 + objcopy 出裸 .text 二进制, 校验无外部符号/
-    /// 无重定位/algo 在偏移 0/≤1024B, 成功则返回二进制供 algo_upload。方案 a: 封装现成工具链。
-    /// abi_header_dir 提供 psoc_algo_abi.h 的 include 路径。
-    pub fn compile_c_to_blob(&mut self, c_source: &str) -> anyhow::Result<Vec<u8>> {
-        let out = Self::compile_blob(c_source)?;
-        let blob = out.blob.clone();
-        self.apply_compiled(c_source, out);
-        Ok(blob)
-    }
-
-    /// 纯编译(无 self): 只吃 C 源、只吐产物, 全程不碰控制器状态。
-    /// ★为什么必须是关联函数★: 编译要顺序阻塞跑 gcc/objcopy/nm/objdump 四个子进程, 首次还要
-    /// 解压 18MB 内置工具链, 在 UI 线程里做会把界面冻死几秒。拆出来后可以丢进 std::thread,
-    /// 而 `Rc<RefCell<AppController>>` 跨线程不安全 —— 后台只搬 String/Vec<u8> 这类纯数据,
-    /// 产物回到 UI 线程再由 `apply_compiled` 写入状态。
-    pub fn compile_blob(c_source: &str) -> anyhow::Result<CompiledAlgo> {
-        use std::io::Write;
-        // 0) C 源容量闸门: 设备只能存 32KB"编译器有效内容"(= 滤注释后的 UTF-8 字节)。超了直接拒,
-        //    绝不先编译再在上传时截断 —— 那会让设备上的映射表源与实际算法脱节且无法还原。
-        let used = Self::algo_src_used(c_source);
-        let cap = Self::algo_src_capacity();
-        if used > cap {
-            return Err(anyhow::anyhow!(
-                "C 源(去注释){} 字节, 超出设备存储上限 {} 字节: 请精简后再编译",
-                used,
-                cap
-            ));
-        }
-        // 1) 定位工具链: 优先程序内置(随 exe 打包, 免各机环境差异), 解压失败再回退本机安装。
-        let gcc_dir = match ensure_bundled_toolchain() {
-            Ok(d) => d,
-            Err(_) => find_toolchain_dir()?,
-        };
-        let gcc = gcc_dir.join("arm-none-eabi-gcc.exe");
-        let objcopy = gcc_dir.join("arm-none-eabi-objcopy.exe");
-        let nm = gcc_dir.join("arm-none-eabi-nm.exe");
-        let objdump = gcc_dir.join("arm-none-eabi-objdump.exe");
-
-        // 2) 临时目录 + 写源文件。ABI 头 include 路径指向工程 PSoC 目录。
-        let tmp = std::env::temp_dir().join(format!("mai2algo_{}", std::process::id()));
-        std::fs::create_dir_all(&tmp)?;
-        let src = tmp.join("algo_user.c");
-        let obj = tmp.join("algo_user.o");
-        let bin = tmp.join("algo_user.bin");
-        {
-            let mut f = std::fs::File::create(&src)?;
-            f.write_all(c_source.as_bytes())?;
-        }
-        // 内嵌 ABI 头写入临时目录, -I 指向它(不依赖本机 PSoC 工程路径)。
-        std::fs::write(tmp.join("psoc_algo_abi.h"), ALGO_ABI_HEADER)?;
-
-        // 3) 编译。
-        let out = std::process::Command::new(&gcc)
-            .args([
-                "-mcpu=cortex-m0plus",
-                "-mthumb",
-                "-Os",
-                "-ffreestanding",
-                "-fno-jump-tables",
-                "-fomit-frame-pointer",
-                "-fno-common",
-                "-nostdlib",
-            ])
-            .arg(format!("-I{}", tmp.display()))
-            .arg("-c")
-            .arg(&src)
-            .arg("-o")
-            .arg(&obj)
-            .output()?;
-        if !out.status.success() {
-            let _ = std::fs::remove_dir_all(&tmp);
-            return Err(anyhow::anyhow!(
-                "编译失败:\n{}",
-                String::from_utf8_lossy(&out.stderr)
-            ));
-        }
-        // 4) objcopy 出 .text 裸二进制。
-        let out2 = std::process::Command::new(&objcopy)
-            .args(["-O", "binary", "-j", ".text"])
-            .arg(&obj)
-            .arg(&bin)
-            .output()?;
-        if !out2.status.success() {
-            let _ = std::fs::remove_dir_all(&tmp);
-            return Err(anyhow::anyhow!(
-                "objcopy 失败:\n{}",
-                String::from_utf8_lossy(&out2.stderr)
-            ));
-        }
-        // 5) nm 校验无未定义(U)符号 + algo 在偏移 0(T 且地址 0)。
-        let nm_out = std::process::Command::new(&nm).arg(&obj).output()?;
-        let nm_txt = String::from_utf8_lossy(&nm_out.stdout);
-        let mut has_undef = false;
-        let mut algo_at_zero = false;
-        for line in nm_txt.lines() {
-            let cols: Vec<&str> = line.split_whitespace().collect();
-            // 形如 "00000000 T algo" 或 "         U extsym"
-            if cols.len() == 2 && cols[0] == "U" {
-                has_undef = true;
-            } else if cols.len() == 2 && cols[0].eq_ignore_ascii_case("U") {
-                has_undef = true;
-            } else if cols.len() == 3 {
-                if cols[1] == "U" {
-                    has_undef = true;
-                }
-                if cols[2] == "algo" && cols[1].eq_ignore_ascii_case("t") && cols[0] == "00000000" {
-                    algo_at_zero = true;
-                }
-            }
-        }
-        // 反汇编 .o 的 .text(编译产物 ASM), 供 UI 子标签查看。清理临时目录前抓取。
-        let asm = std::process::Command::new(&objdump)
-            .args(["-d", "--no-show-raw-insn"])
-            .arg(&obj)
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
-            .unwrap_or_default();
-        let data = std::fs::read(&bin).unwrap_or_default();
-        let _ = std::fs::remove_dir_all(&tmp);
-        if has_undef {
-            return Err(anyhow::anyhow!(
-                "算法含外部符号(禁止 libgcc/除法/64位): 见 nm 输出"
-            ));
-        }
-        if !algo_at_zero {
-            return Err(anyhow::anyhow!(
-                "入口 algo 必须在偏移 0(检查是否首个函数/是否被内联到别处)"
-            ));
-        }
-        if data.is_empty() || data.len() > crate::proto::algo::ALGO_MAX_LEN {
-            return Err(anyhow::anyhow!(
-                "产物大小非法: {} 字节(须 1..=1024)",
-                data.len()
-            ));
-        }
-        // objdump 用制表符对齐, Slint 文本控件会把 \t 渲染成方块; 替换为空格避免乱码。
-        Ok(CompiledAlgo {
-            blob: data,
-            asm: asm.replace('\t', " "),
-        })
-    }
-
-    /// 把后台编译产物落到控制器状态(必须在 UI 线程调用): 保存 C 源与反汇编、留档本地源文件、记日志。
-    pub fn apply_compiled(&mut self, c_source: &str, out: CompiledAlgo) -> usize {
-        let len = out.blob.len();
-        self.algo_source = c_source.to_string();
-        self._bump_algo_schema();
-        self.algo_asm = out.asm;
-        self.algo_asm_version = self.algo_asm_version.wrapping_add(1);
-        self.algo_compiled_blob = Some(out.blob);
-        if let Ok(exe) = std::env::current_exe() {
-            if let Some(dir) = exe.parent() {
-                let _ = std::fs::write(dir.join("last_algo_source.c"), c_source);
-            }
-        }
-        self.push_log(format!(
-            "算法: 编译成功, ASM {} / {} 字节 ({}%)",
-            len,
-            Self::algo_slot_capacity(),
-            (len * 100) / Self::algo_slot_capacity().max(1)
-        ));
-        len
-    }
-
-    pub fn algo_asm(&self) -> String {
-        self.algo_asm.clone()
-    }
-    pub fn algo_source(&self) -> String {
-        self.algo_source.clone()
-    }
-    pub fn algo_asm_version(&self) -> u64 {
-        self.algo_asm_version
-    }
-
-    /// 编译并上传: compile_c_to_blob → algo_upload。
-    pub fn compile_and_upload(&mut self, c_source: &str) -> anyhow::Result<()> {
-        let blob = self.compile_c_to_blob(c_source)?;
-        self.algo_upload(&blob)
-    }
-
-    /// PSoC 可执行算法槽容量(字节)。ASM 产物必须 ≤ 此值, 否则会被截断导致运行异常。
-    pub fn algo_slot_capacity() -> usize {
-        crate::proto::algo::ALGO_MAX_LEN
-    }
-
-    /// 仅编译(不上传, 同步版): 产出 ASM 二进制并缓存, 返回其字节数。
-    /// compile_blob 已在产物 >容量 时报错, 故成功返回的长度必然 ≤ 容量(不会截断)。
-    /// UI 走的是后台线程 + `apply_compiled` 那条路(见 main.rs 算法编译任务), 本函数留给无头场景。
-    pub fn compile_only(&mut self, c_source: &str) -> anyhow::Result<usize> {
-        let out = Self::compile_blob(c_source)?;
-        Ok(self.apply_compiled(c_source, out))
-    }
-
-    /// 上传最近一次成功编译的 ASM 产物, 并把对应 C 源(滤注释后)作为"映射表"存到设备,
-    /// 供后续回读还原可编辑 C。未编译则报错(强制"先编译后上传")。
-    pub fn upload_compiled(&mut self) -> anyhow::Result<()> {
-        let blob = self
-            .algo_compiled_blob
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("尚未编译: 请先点“编译”生成 ASM 再上传"))?;
-        // 发送前再把 C 源容量闸门过一遍: 走到这里的产物可能来自更早一次编译, 而编辑器/模板
-        // 随后被换过, 不能靠"编译时查过了"就免检。
-        let src = Self::strip_c_comments(&self.algo_source);
-        let cap = Self::algo_src_capacity();
-        if src.len() > cap {
-            return Err(anyhow::anyhow!(
-                "C 源(去注释){} 字节, 超出设备存储上限 {} 字节: 未上传",
-                src.len(),
-                cap
-            ));
-        }
-        self.algo_upload(&blob)?;
-        // 随算法上传其 C 源(滤注释)到设备映射表; 失败不阻断上传主流程。
-        let _ = self.send_algo_src(&src);
-        // 设备映射表刚被这次上传覆盖 → 本地那份缓存同步跟上, 否则 schema(设备源优先)会继续
-        // 按上一版算法解析, 面板与 report idx 轮询集合就跟设备上真正跑的算法脱节了。
-        // 只 bump schema/cfg/trace 版本: algo_device_src_version 门控的是"回读→载入编辑器",
-        // 不该由一次上传去触发编辑器回填。
-        self.algo_device_src = src;
-        self._bump_algo_schema();
-        self.algo_cfg_version = self.algo_cfg_version.wrapping_add(1);
-        self.algo_trace_version = self.algo_trace_version.wrapping_add(1);
-        Ok(())
-    }
-
-    /// 最近一次编译产物的字节数(未编译=0), 供 UI 进度条。
-    pub fn algo_compiled_len(&self) -> usize {
-        self.algo_compiled_blob
-            .as_ref()
-            .map(|b| b.len())
-            .unwrap_or(0)
-    }
-
-    /// C 源容量(字节)。编译器实际看到的内容 = 滤注释后的 UTF-8 字节数, 必须 ≤ 此值。
-    pub fn algo_src_capacity() -> usize {
-        crate::proto::algo::ALGO_SRC_MAX
-    }
-
-    /// 某段 C 源"编译器有效内容"的字节数: 复用唯一的注释过滤实现 `strip_c_comments`,
-    /// 不另造一套过滤逻辑(两套一定会漂移, 于是界面显示的占用和真正上传的长度对不上)。
-    pub fn algo_src_used(src: &str) -> usize {
-        Self::strip_c_comments(src).as_bytes().len()
-    }
-
-    /// 是否仍有算法 C 源分片上传或回读在途，供无头工具等待完整传输。
-    pub fn algo_src_transfer_pending(&self) -> bool {
-        self.algo_src_tx.is_some() || self.algo_src_rx.is_some()
-    }
-
-    /// 把算法 C 源存到设备映射表(ALGO_SET_SRC)，按唯一容量口径过滤注释后分片发送。
-    /// 超上限直接报错 —— 截断会把一份编译不过的残源固化到设备上。
-    pub fn send_algo_src(&mut self, src: &str) -> anyhow::Result<()> {
-        let bytes = Self::strip_c_comments(src).into_bytes();
-        let cap = crate::proto::algo::ALGO_SRC_MAX;
-        if bytes.len() > cap {
-            return Err(anyhow::anyhow!(
-                "算法 C 源 {} 字节, 超出设备存储上限 {} 字节",
-                bytes.len(),
-                cap
-            ));
-        }
-        if self.io.is_none() {
-            return Err(anyhow::anyhow!("未连接, 无法上传算法 C 源"));
-        }
-        self.algo_src_tx = Some(AlgoSrcTx {
-            bytes,
-            acked: 0,
-            seq: None,
-            waited: 0,
-        });
-        // 已有普通写帧时只登记待传状态，等队列排空后再发首片；开始后每片仍严格 ACK 驱动。
-        if self.cfg_tx_pending() == 0 {
-            self._algo_src_send_next()?;
-        }
-        Ok(())
-    }
-
-    /// 发出"下一片"(含 total=0 的空源片)。窗口=1: 上一片没回执就不发下一片。
-    fn _algo_src_send_next(&mut self) -> anyhow::Result<()> {
-        let Some(tx) = self.algo_src_tx.as_ref() else {
-            return Ok(());
-        };
-        let total = tx.bytes.len();
-        let offset = tx.acked;
-        let end = (offset + crate::proto::algo::ALGO_SRC_CHUNK).min(total);
-        let chunk = tx.bytes[offset..end].to_vec();
-        let seq = self.next_seq();
-        let frame = crate::proto::algo::encode_algo_set_src_chunk(seq, offset, total, &chunk);
-        let sent = self
-            .io
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("设备已断开, 无法继续上传算法 C 源"))?
-            .send(frame);
-        match sent {
-            Ok(()) => {
-                if let Some(tx) = self.algo_src_tx.as_mut() {
-                    tx.seq = Some(seq);
-                    tx.waited = 0;
-                }
-                Ok(())
-            }
-            Err(e) => {
-                self.algo_src_tx = None;
-                self._record_cfg_tx_failure(
-                    HostCmd::AlgoSetSrc as u8,
-                    seq,
-                    format!("本地发送失败: {}", e),
-                );
-                Err(e)
-            }
-        }
-    }
-
-    /// 收到 ACK/NAK 时推进/终止分片上传。NAK 即放弃并记录可查询失败状态。
-    fn _algo_src_note_reply(&mut self, seq: u8, ok: bool) {
-        let Some((expected_seq, at)) = self.algo_src_tx.as_ref().map(|tx| (tx.seq, tx.acked))
-        else {
-            return;
-        };
-        if expected_seq != Some(seq) {
-            return;
-        }
-        if !ok {
-            self.algo_src_tx = None;
-            self._record_cfg_tx_failure(
-                HostCmd::AlgoSetSrc as u8,
-                seq,
-                format!("设备拒绝分片 offset={}", at),
-            );
-            self.push_log_error(format!("算法 C 源上传被设备拒绝(offset={}), 已放弃", at));
-            return;
-        }
-        let total = {
-            let tx = self.algo_src_tx.as_mut().expect("刚判过 Some");
-            tx.acked = (tx.acked + crate::proto::algo::ALGO_SRC_CHUNK).min(tx.bytes.len());
-            tx.bytes.len()
-        };
-        if self.algo_src_tx.as_ref().map(|tx| tx.acked) == Some(total) {
-            self.algo_src_tx = None; // 末片已 ACK: 设备侧才让新源生效
-            return;
-        }
-        if let Err(e) = self._algo_src_send_next() {
-            self.push_log_error(format!("算法 C 源分片发送失败: {}", e));
-        }
-    }
-
-    /// 每 tick 调一次: 待普通写队列排空后启动首片，并对已发送片做超时兜底。
-    fn _pump_algo_src_tx(&mut self) {
-        const ALGO_SRC_TIMEOUT_TICKS: u32 = 125; // ~2s @16ms/tick, 与保存队列同口径
-        let Some((seq, at)) = self.algo_src_tx.as_ref().map(|tx| (tx.seq, tx.acked)) else {
-            return;
-        };
-        let Some(seq) = seq else {
-            if self.cfg_tx_pending() == 0 {
-                if let Err(e) = self._algo_src_send_next() {
-                    self.push_log_error(format!("算法 C 源首片发送失败: {}", e));
-                }
-            }
-            return;
-        };
-        let timed_out = {
-            let tx = self.algo_src_tx.as_mut().expect("刚判过 Some");
-            tx.waited += 1;
-            tx.waited >= ALGO_SRC_TIMEOUT_TICKS
-        };
-        if !timed_out {
-            return;
-        }
-        self.algo_src_tx = None;
-        self._record_cfg_tx_failure(
-            HostCmd::AlgoSetSrc as u8,
-            seq,
-            format!("offset={} 超过 2s 无 ACK/NAK", at),
-        );
-        self.push_log_error(format!(
-            "算法 C 源上传超时(offset={} 无回执), 已放弃本次上传",
-            at
-        ));
-    }
-
-    /// 每 tick 调一次: 回读请求也必须等待当前片响应，丢帧时清理状态而不是永久卡住。
-    fn _pump_algo_src_rx(&mut self) {
-        const ALGO_SRC_TIMEOUT_TICKS: u32 = 125;
-        let Some(rx) = self.algo_src_rx.as_mut() else {
-            return;
-        };
-        rx.waited += 1;
-        if rx.waited < ALGO_SRC_TIMEOUT_TICKS {
-            return;
-        }
-        let offset = rx.buf.len();
-        self.algo_src_rx = None;
-        self.push_log_error(format!(
-            "算法 C 源回读超时(offset={} 无响应), 已放弃本次回读",
-            offset
-        ));
-    }
-
-    /// 请求回读设备映射表里的算法 C 源(ALGO_GET_SRC), 从第 0 片开始。
-    pub fn request_algo_src(&mut self) -> anyhow::Result<()> {
-        self.algo_src_rx = None;
-        self._algo_src_request_at(0)
-    }
-
-    fn _algo_src_request_at(&mut self, offset: usize) -> anyhow::Result<()> {
-        let seq = self._submit_poll(
-            RequestKind::RequestAlgoSrc,
-            crate::proto::algo::encode_algo_get_src(0, offset),
-        )?;
-        if offset == 0 {
-            self.algo_src_rx = Some(AlgoSrcRx {
-                total: 0,
-                buf: Vec::new(),
-                seq,
-                waited: 0,
-            });
-        } else {
-            let rx = self
-                .algo_src_rx
-                .as_mut()
-                .ok_or_else(|| anyhow::anyhow!("算法 C 源回读状态丢失(offset={})", offset))?;
-            if rx.buf.len() != offset {
-                return Err(anyhow::anyhow!(
-                    "算法 C 源续读偏移错误(期望 {}, 请求 {})",
-                    rx.buf.len(),
-                    offset
-                ));
-            }
-            rx.seq = seq;
-            rx.waited = 0;
-        }
-        if seq == 0 {
-            self.algo_src_rx = None;
-            return Ok(());
-        }
-        if let Some(rx) = self.algo_src_rx.as_mut() {
-            rx.seq = seq;
-        }
-        Ok(())
-    }
-
-    /// ALGO_GET_SRC 响应: [total, offset, chunk]。聚合到齐且 UTF-8 有效才替换缓存/版本。
-    fn _handle_algo_src_chunk(&mut self, frame: &Frame) {
-        let Some((total, offset, chunk)) =
-            crate::proto::algo::decode_algo_src_chunk(&frame.payload)
-        else {
-            self.algo_src_rx = None;
-            self.push_log_error("ALGO_GET_SRC 响应过短, 已放弃本次回读".to_string());
-            return;
-        };
-        if total > crate::proto::algo::ALGO_SRC_MAX {
-            self.algo_src_rx = None;
-            self.push_log_error(format!(
-                "ALGO_GET_SRC 声明长度 {} 超上限, 已放弃本次回读",
-                total
-            ));
-            return;
-        }
-        let Some(expected_seq) = self.algo_src_rx.as_ref().map(|rx| rx.seq) else {
-            self.push_log_error("ALGO_GET_SRC 收到无在途请求的响应, 已忽略".to_string());
-            return;
-        };
-        if expected_seq != frame.seq {
-            self.push_log_error(format!(
-                "ALGO_GET_SRC 响应序号错误(期望 {}, 实收 {}), 已忽略",
-                expected_seq, frame.seq
-            ));
-            return;
-        }
-        let mut next = None;
-        let mut complete = false;
-        let error = {
-            let rx = self.algo_src_rx.as_mut().expect("刚判过 Some");
-            if offset == 0 && rx.buf.is_empty() && rx.total == 0 {
-                rx.total = total;
-                rx.buf = Vec::with_capacity(total);
-            }
-            if rx.total != total || rx.buf.len() != offset {
-                Some(format!(
-                    "ALGO_GET_SRC 分片错位(期望 offset={} total={}, 实收 offset={} total={})",
-                    rx.buf.len(),
-                    rx.total,
-                    offset,
-                    total
-                ))
-            } else if chunk.len() > crate::proto::algo::ALGO_SRC_CHUNK {
-                Some(format!("ALGO_GET_SRC 分片长度 {} 超过上限", chunk.len()))
-            } else if chunk.len() > total.saturating_sub(rx.buf.len()) {
-                Some(format!(
-                    "ALGO_GET_SRC 总长度错误(已收 {} + 本片 {} > {})",
-                    rx.buf.len(),
-                    chunk.len(),
-                    total
-                ))
-            } else {
-                rx.buf.extend_from_slice(chunk);
-                if rx.buf.len() < total {
-                    if chunk.is_empty() {
-                        Some(format!("ALGO_GET_SRC 在 offset={} 收到空中间片", offset))
-                    } else {
-                        next = Some(rx.buf.len());
-                        None
-                    }
-                } else {
-                    complete = true;
-                    None
-                }
-            }
-        };
-        if let Some(error) = error {
-            self.algo_src_rx = None;
-            self.push_log_error(format!("{}, 已放弃本次回读", error));
-            return;
-        }
-        if let Some(offset) = next {
-            if let Err(e) = self._algo_src_request_at(offset) {
-                self.algo_src_rx = None;
-                self.push_log_error(format!("ALGO_GET_SRC 续请求失败: {}", e));
-            }
-            return;
-        }
-        if !complete {
-            return;
-        }
-        let rx = self.algo_src_rx.take().expect("刚判过 Some");
-        let source = match String::from_utf8(rx.buf) {
-            Ok(source) => source,
-            Err(e) => {
-                self.push_log_error(format!(
-                    "ALGO_GET_SRC 完整内容不是有效 UTF-8: {}, 已保留旧缓存",
-                    e
-                ));
-                return;
-            }
-        };
-        self.algo_device_src = source;
-        self.algo_device_src_version = self.algo_device_src_version.wrapping_add(1);
-        // ★不再把设备源灌进 algo_source★: schema 一律走 `algo_schema_source()`(设备源优先),
-        // 编辑器文本与 schema 彻底解耦 —— 连接即按设备上真正跑着的算法填面板/report idx,
-        // 不必先下发一次; 同时用户手上正在改的编辑器内容永远不会被回读覆盖。
-        self._bump_algo_schema();
-        // 同步让 cfg 行和 report 行重建；后者复用既有 trace 版本门控以立即显示声明。
-        self.algo_cfg_version = self.algo_cfg_version.wrapping_add(1);
-        self.algo_trace_version = self.algo_trace_version.wrapping_add(1);
-    }
-
-    /// 请求回读设备算法 ASM 机器码(ALGO_GET_CODE), 用于无本地编译产物时查看真实机器码。
-    pub fn request_algo_code(&mut self) -> anyhow::Result<()> {
-        let seq = self.next_seq();
-        if let Some(handle) = &self.io {
-            handle.send(crate::proto::algo::encode_algo_get_code(seq))?;
-        }
-        Ok(())
-    }
-
-    /// 设备回读的算法 ASM 机器码 hex dump 文本(空表示未回读)。
-    pub fn algo_device_code_hex(&self) -> &str {
-        &self.algo_device_code_hex
-    }
-    pub fn algo_device_code_version(&self) -> u64 {
-        self.algo_device_code_version
-    }
-
-    /// 字节序列 → 每行 16 字节的 hex dump(offset: bytes)文本。
-    fn _hex_dump(data: &[u8]) -> String {
-        if data.is_empty() {
-            return String::new();
-        }
-        let mut out = String::with_capacity(data.len() * 4);
-        for (row, chunk) in data.chunks(16).enumerate() {
-            out.push_str(&format!("{:04X}: ", row * 16));
-            for b in chunk {
-                out.push_str(&format!("{:02X} ", b));
-            }
-            out.push('\n');
-        }
-        out
-    }
-
-    /// 设备回读的算法 C 源(映射表), 空表示设备无存源。
-    pub fn algo_device_src(&self) -> &str {
-        &self.algo_device_src
-    }
-    pub fn algo_device_src_version(&self) -> u64 {
-        self.algo_device_src_version
-    }
-
-    /// 去除 C 注释(// 行注释与 /* */ 块注释), 保留字符串字面量内容与换行结构。
-    /// 用于上传时精简"映射表"源, 不改变代码语义(变量名不必与原始一致)。
-    pub fn strip_c_comments(src: &str) -> String {
-        let bytes = src.as_bytes();
-        let mut out = String::with_capacity(src.len());
-        let mut i = 0usize;
-        // 状态: 0=普通 1=行注释 2=块注释 3=字符串"" 4=字符''
-        let mut state = 0u8;
-        while i < bytes.len() {
-            let c = bytes[i];
-            let n = if i + 1 < bytes.len() { bytes[i + 1] } else { 0 };
-            match state {
-                0 => {
-                    if c == b'/' && n == b'/' {
-                        state = 1;
-                        i += 2;
-                        continue;
-                    }
-                    if c == b'/' && n == b'*' {
-                        state = 2;
-                        i += 2;
-                        continue;
-                    }
-                    if c == b'"' {
-                        state = 3;
-                        out.push('"');
-                        i += 1;
-                        continue;
-                    }
-                    if c == b'\'' {
-                        state = 4;
-                        out.push('\'');
-                        i += 1;
-                        continue;
-                    }
-                    out.push(c as char);
-                }
-                1 => {
-                    if c == b'\n' {
-                        state = 0;
-                        out.push('\n');
-                    }
-                }
-                2 => {
-                    if c == b'*' && n == b'/' {
-                        state = 0;
-                        i += 2;
-                        continue;
-                    }
-                    if c == b'\n' {
-                        out.push('\n');
-                    } // 保留行结构便于阅读
-                }
-                3 => {
-                    out.push(c as char);
-                    if c == b'\\' && n != 0 {
-                        out.push(n as char);
-                        i += 2;
-                        continue;
-                    }
-                    if c == b'"' {
-                        state = 0;
-                    }
-                }
-                4 => {
-                    out.push(c as char);
-                    if c == b'\\' && n != 0 {
-                        out.push(n as char);
-                        i += 2;
-                        continue;
-                    }
-                    if c == b'\'' {
-                        state = 0;
-                    }
-                }
-                _ => {}
-            }
-            i += 1;
-        }
-        // 压缩连续空行(注释删除后常留大量空行)。
-        let mut cleaned = String::with_capacity(out.len());
-        let mut blank_run = 0u32;
-        for line in out.lines() {
-            if line.trim().is_empty() {
-                blank_run += 1;
-                if blank_run <= 1 {
-                    cleaned.push('\n');
-                }
-            } else {
-                blank_run = 0;
-                cleaned.push_str(line.trim_end());
-                cleaned.push('\n');
-            }
-        }
-        cleaned
-    }
-
     fn _handle_global_get_response(&mut self, frame: &Frame) {
         if let Some((id, v)) = crate::proto::algo::decode_global_get(&frame.payload) {
             // 回读防污染先做完再落缓存: 界面回显的是修正值, 且非法值会被回写纠正到设备。
@@ -7222,22 +5013,6 @@ impl AppController {
             self.push_log_debug(format!("设备已确认 {} 项全局设置与下发值一致", ok));
         }
     }
-    fn _handle_algo_info_response(&mut self, frame: &Frame) {
-        if let Some(info) = crate::proto::algo::decode_algo_info(&frame.payload) {
-            self.algo_info = Some(info);
-            self.algo_version = self.algo_version.wrapping_add(1);
-        }
-    }
-    fn _handle_algo_get_rom_response(&mut self, frame: &Frame) {
-        let roms = crate::proto::algo::decode_algo_get_rom(&frame.payload);
-        for (i, r) in roms.iter().enumerate() {
-            if i < self.algo_rom.len() {
-                self.algo_rom[i] = *r;
-            }
-        }
-        self.algo_rom_version = self.algo_rom_version.wrapping_add(1);
-    }
-
     /// 获取单个通道的最新样本。
     /// ★绘图视窗冻结时读快照★ 否则读数会继续跳而曲线不动, 同一屏上出现两个互相矛盾的"现在"。
     /// 设备侧统计(采样率/延迟/停滞判定)不走这里, 仍然是实时的。
@@ -7323,6 +5098,12 @@ impl AppController {
                 FIELD_RAW => sample.raw.map(|v| v as f32),
                 FIELD_BASELINE => sample.bsln.map(|v| v as f32),
                 FIELD_DIFF => sample.diff.map(|v| v as f32),
+                // ★触发判定★ STATUS 的 bit0 是设备的最终触发判定(固件已改为取 touch_mask,
+                // 含 JIT 算法改判; 无算法时即 PSoC 内部基线差判定)。高位是 CapSense 原始状态,
+                // 只作诊断, 不参与曲线, 故这里只取 bit0 并归一成 0/1。
+                // ★必须写全路径★: 裸 `FIELD_STATUS` 未导入时会被当成 match 的**变量绑定**,
+                // 从而把所有其它字段都吞进本分支(编译器只给一个 non_snake_case 警告, 极易漏看)。
+                crate::proto::FIELD_STATUS => sample.status.map(|v| f32::from(v & 1u8)),
                 _ => None,
             };
             if let Some(v) = value {
@@ -7401,7 +5182,8 @@ impl AppController {
         )
     }
 
-    pub fn telem_lat_corrected_us(&self) -> Option<u32> {
+    /// 三段齐全且新鲜的补正样本 [spi, proc, usb](us)。补偿显示开关关闭或遥测过期时为 None。
+    fn _lat_corrected(&self) -> Option<[u16; 3]> {
         if !self.latency_correction_enabled()
             || !self
                 .telem_frame_at
@@ -7409,12 +5191,119 @@ impl AppController {
         {
             return None;
         }
-        self.telem_lat_corrected_us
+        self.telem_lat_corrected
     }
 
-    /// 延迟历史(总延迟 us)序列, 供仪表盘折线图。
-    pub fn lat_total_series(&self) -> Vec<f32> {
-        self.lat_total_hist.iter().copied().collect()
+    /// 实测链路耗时(SPI 读 + RP 处理 + USB 写, us)。这是"掩码从 PSoC 到串口"的传输成本。
+    pub fn telem_lat_corrected_us(&self) -> Option<u32> {
+        self._lat_corrected()
+            .map(|v| v[0] as u32 + v[1] as u32 + v[2] as u32)
+    }
+
+    /// 延迟线**能扣掉**的那一段(RP 处理 + USB 写, us)。
+    /// ★SPI 读不在其中★: 固件的采样时刻取自 SPI 事务结束(见 `Psoc::touch_sample_us` /
+    /// `_pub_touch_sample_us = t1`), SPI 读发生在它之前, 延迟线的 `emit − sample` 口径里根本
+    /// 不含这一段。把它算进"可补偿"会得出偏大的下限, 误判目标不可达。
+    pub fn latency_compensable_us(&self) -> Option<u32> {
+        self._lat_corrected().map(|v| v[1] as u32 + v[2] as u32)
+    }
+
+    /// 串口触控延迟线的**端到端目标**(`comm.touch_delay_100us` × 100, us)。
+    /// ★它不是链路耗时的"期望值"★: 语义是"实际发出时刻 − 采样时刻 = 本值"(见固件
+    /// `DelayLine` 的补偿语义), 链路耗时是它内部被自动扣除的一项。两者相减没有物理含义 ——
+    /// 主页此前正是这么算的, 于是设 24ms 延迟线就显示"误差 −23406us"。
+    pub fn touch_delay_target_us(&self) -> u32 {
+        match self
+            .config_get("comm.touch_delay_100us")
+            .map(|entry| entry.value)
+        {
+            Some(CfgValue::U16(value)) => u32::from(value).saturating_mul(100),
+            Some(CfgValue::U32(value)) => value.saturating_mul(100),
+            _ => 0,
+        }
+    }
+
+    /// 链路耗时历史(三段之和的原值, us)。补偿显示关闭时主页画这一条。
+    /// ★不减延迟线目标★: 减掉一个与它不同量纲的设定值只会把整条曲线平移 −24ms, 要看的抖动被
+    /// 压成一条直线, 纵轴变成一串无意义的负数 —— 那正是主页此前的缺陷。
+    pub fn lat_link_series(&self) -> Vec<f32> {
+        self.lat_hist.iter().map(|v| v.link_us() as f32).collect()
+    }
+
+    /// 延迟线补偿偏差历史(us, 带符号): (实际发出 − 采样) − `comm.touch_delay_100us`。
+    /// 补偿显示启用时主页画这一条 —— 0 线就是"设定延迟正好兑现", 正=发晚、负=发早。
+    /// 每帧取该窗口偏得更狠的那一端 ⇒ 曲线是偏差包络, 正负两侧都看得见。
+    /// ★没有观测的帧按 0 记★: 那些窗口里根本没发出过触控帧, 谈不上偏差; 用 0 使曲线连续,
+    /// 是否真有观测由 `telem_delay_dev_us()` 的 Option 与文本行如实说明, 不在曲线上编造尖峰。
+    pub fn lat_dev_series(&self) -> Vec<f32> {
+        self.lat_hist
+            .iter()
+            .map(|v| v.dev_worst_us().unwrap_or(0) as f32)
+            .collect()
+    }
+
+    /// 最近一帧的延迟线补偿偏差区间 (min, max)(us, 带符号)。
+    /// `None` = 该窗口没有真正发出过触控帧(串口无消费者或被限速), 偏差无从判定。
+    pub fn telem_delay_dev_us(&self) -> Option<(i16, i16)> {
+        if !self
+            .telem_frame_at
+            .is_some_and(|at| at.elapsed() < Self::TELEM_STATS_FRESH)
+        {
+            return None;
+        }
+        self.lat_hist.back().and_then(|v| v.dev_us)
+    }
+
+    /// 最近一帧: 设定的触控延迟低于物理下限, 延迟线已钳到最新采样(目标达不到)。
+    pub fn telem_delay_dev_clamped(&self) -> bool {
+        self.telem_delay_dev_clamped
+    }
+    /// 延迟尖峰现场记录。主页"总延迟历史"上每隔数秒一簇尖峰, 但图上只有幅度、没有归因 ——
+    /// 这里在尖峰发生的**那一帧**把三段拆分与当时的在途请求一并落日志, 于是"周期性最坏路径是谁"
+    /// 从日志时间线上直接读得出, 不必再对着周期表猜。
+    /// 判据: 总延迟 > 慢基线×1.6 + 250us。三段都是"上一个遥测窗口内的滚动峰值"(固件发帧即清零),
+    /// 故这里记的是"那个窗口里出现过一次这么坏", 不是稳态值。
+    fn _note_latency_spike(&mut self, frame: &crate::proto::TelemFrame) {
+        let total =
+            (frame.lat_spi_us as u32 + frame.lat_proc_us as u32 + frame.lat_usb_us as u32) as f32;
+        if self.lat_ewma_us <= 0.0 {
+            self.lat_ewma_us = total;
+            return;
+        }
+        let base = self.lat_ewma_us;
+        // 基线只吃非尖峰样本: 让尖峰参与更新会把阈值一路推高, 越抖越测不到。
+        if total <= base * 1.6 + 250.0 {
+            self.lat_ewma_us += (total - base) * 0.02;
+            return;
+        }
+        if self
+            .lat_spike_log_at
+            .is_some_and(|at| at.elapsed() < std::time::Duration::from_millis(150))
+        {
+            return;
+        }
+        self.lat_spike_log_at = Some(std::time::Instant::now());
+        let inflight = self.pending_registry.inflight_labels();
+        let inflight = if inflight.is_empty() {
+            "无".to_string()
+        } else {
+            inflight.join(",")
+        };
+        self.push_log_debug(format!(
+            "延迟尖峰: 总 {}us (SPI {} / RP处理 {} / USB写 {}), 基线 {:.0}us; 在途请求 {}",
+            total as u32,
+            frame.lat_spi_us,
+            frame.lat_proc_us,
+            frame.lat_usb_us,
+            base,
+            inflight
+        ));
+    }
+
+    /// 逐帧延迟观测原值（三段 + 补偿偏差），供无头剖面定位"哪一段在抖"与"偏差有多大"。
+    /// ★与主页两条折线同一份存储★: 链路耗时与偏差都从这一份派生, 不另存派生量(两份必然漂移)。
+    pub fn lat_obs_series(&self) -> Vec<LatObs> {
+        self.lat_hist.iter().copied().collect()
     }
     pub fn lat_version(&self) -> u64 {
         self.lat_version
@@ -7648,10 +5537,6 @@ impl AppController {
                 names.join(" ")
             );
         }
-        if self.baseline_untrusted() {
-            return "⚠ 恢复默认未获得可信基线(设备抽检到 raw 满量程/数据停滞, 已拒绝把异常状态存为默认) \
-                    → 建议: 直接用「PSoC 救砖(重刷并重新应用)」".to_string();
-        }
         if self.data_all_frozen() {
             return "⚠ 设备处于异常采样(全部通道数据停滞, 扫描/测量已卡死) \
                     → 建议: ① 重启 PSoC; ② 仍无效则用「PSoC 救砖(重刷并重新应用)」"
@@ -7678,19 +5563,33 @@ impl AppController {
         if self.telem_frame_count == 0 {
             return "● 未开启遥测: 采样状态未知(进入曲线页或点开始遥测后自动判定)".to_string();
         }
+        // ★这条降为最低优先级的纯建议★ 设备侧的采样抽检已不再拦截任何固化(见固件
+        // `CsdConfig::sampling_trustworthy` 的说明): 电极空闲导致 raw 不抖、手调过 IDAC/snsClk 导致
+        // 读数偏高, 在高阶用户与预配置面板上都是正常形态。所以它只在**上面所有具体异常都没命中**时
+        // 才露面, 且措辞是建议而非故障 —— 上面那些分支给的是有据可查的通道计数, 比这条笼统判定可靠。
+        if self.baseline_untrusted() {
+            // 不推荐"PSoC 救砖": 抽检存疑指向的是参数不合适, 芯片与链路都在正常应答, 重刷整片
+            // 解决不了参数问题却要擦写全片。救砖只在完全失联时才是优选(由 data_all_frozen 分支提示)。
+            return "● 采样质量抽检存疑(抽检到 raw 满量程或两次读数完全不抖); 已照常保存, 不影响使用 \
+                    → 若面板手感不对可调参数(IDAC 增益 / snsClk 分频 / 分辨率)后重新校准"
+                .to_string();
+        }
         "✓ 采样正常(无满量程通道, 数据持续更新)".to_string()
     }
 
     /// 采样警示等级: 0=正常 1=警告 2=异常。供 UI 着色。
     pub fn sampling_advice_level(&self) -> i32 {
-        if self.baseline_untrusted()
-            || self.data_all_frozen()
+        if self.data_all_frozen()
             || self.railed_channel_count() > 0
             || !self._stale_telem_channels().is_empty()
         {
             return 2;
         }
-        if self.frozen_channel_count() > 0 || self.telem_frame_count == 0 {
+        // 抽检存疑只算"提示"档: 它不再代表任何被拒绝的操作, 用红色渲染会让人以为设备坏了。
+        if self.frozen_channel_count() > 0
+            || self.telem_frame_count == 0
+            || self.baseline_untrusted()
+        {
             return 1;
         }
         0
@@ -7760,17 +5659,21 @@ impl AppController {
         self.telem_lat_proc_us = telem_frame.lat_proc_us;
         self.telem_lat_usb_us = telem_frame.lat_usb_us;
         if (telem_frame.fields & crate::proto::FIELD_LATENCY) != 0 {
-            self.telem_lat_corrected_us =
+            self.telem_lat_corrected =
                 _latency_correction_us(&mut self.latency_correction_samples, &telem_frame);
             const LAT_CAP: usize = 512;
-            if self.lat_total_hist.len() >= LAT_CAP {
-                self.lat_total_hist.pop_front();
+            if self.lat_hist.len() >= LAT_CAP {
+                self.lat_hist.pop_front();
             }
-            let total = telem_frame.lat_spi_us as u32
-                + telem_frame.lat_proc_us as u32
-                + telem_frame.lat_usb_us as u32;
-            self.lat_total_hist.push_back(total as f32);
+            self.lat_hist.push_back(LatObs {
+                spi_us: telem_frame.lat_spi_us,
+                proc_us: telem_frame.lat_proc_us,
+                usb_us: telem_frame.lat_usb_us,
+                dev_us: telem_frame.delay_dev_us,
+            });
+            self.telem_delay_dev_clamped = telem_frame.delay_dev_clamped;
             self.lat_version = self.lat_version.wrapping_add(1);
+            self._note_latency_spike(&telem_frame);
         }
 
         // 把样本装进相应通道的环形缓冲
@@ -7905,6 +5808,12 @@ impl AppController {
             self.focus.diag_pushes = 0;
         }
         self.focus.rate.note(frame.payload.len(), gap_now);
+        // 算法运行值与本帧同源: 用同一个设备时刻入库, 曲线与采样严格对齐。
+        // 必须在 _ingest_telem_frame **之前**取出 ts_us —— 那次调用会消费掉 focus_frame.frame。
+        if let Some((active, report)) = focus_frame.algo {
+            let t_us = self.telem_clock.unwrap_us(focus_frame.frame.ts_us);
+            self._ingest_focus_algo(target, t_us, active, report);
+        }
         self._ingest_telem_frame(focus_frame.frame, frame.payload.len());
     }
 
@@ -8432,6 +6341,11 @@ impl AppController {
         // 数据型轮询必须等对应数据响应确认；ACK 只确认写类/独立状态机，不能清掉 read pending。
         self._cfg_tx_note_reply(frame);
         self._sweep_note_reply(frame.seq, true, "");
+        if self.crash_trigger_pending == Some(frame.seq) {
+            self.crash_trigger_pending = None;
+            self.crash_trigger_acknowledged = true;
+            self.push_log("DEBUG_TRIGGER_CRASH ACK: device entering BOOTSEL");
+        }
         if self.bind_start_seq == Some(frame.seq) {
             log::debug!("BIND_START 已确认 seq={}，继续等待触摸", frame.seq);
         } else {
@@ -8449,8 +6363,6 @@ impl AppController {
             } else {
                 // 这类操作的 ACK = 固件真正做完 ⇒ 若它是逐通道批量发出的那一条, 这里才算它成功。
                 self._ch_batch_note_op(frame.seq, true, "");
-                // 频谱扫描的还原链(校准/基线)同样只认这一条终态回执, 不认"已排队"。
-                self._sweep_note_op(frame.seq, true, "");
                 self._end_op();
             }
         }
@@ -8668,6 +6580,14 @@ impl AppController {
             }
         }
         self._sweep_note_reply(frame.seq, false, &msg);
+        if self.crash_trigger_pending == Some(frame.seq) {
+            self.crash_trigger_pending = None;
+            self.crash_trigger_acknowledged = false;
+            self.push_log_warn(format!(
+                "DEBUG_TRIGGER_CRASH NAK seq={}: {}",
+                frame.seq, msg
+            ));
+        }
         // 组合映射回读被 NAK = 固件不认识 KBD_GET_COMBO(旧固件)。记为"不支持"而不是"空表",
         // 否则 UI 会把旧固件显示成"一条映射都没配", 用户会以为配置丢了。
         if self.kbd_combo_req_seq == Some(frame.seq) {
@@ -8725,20 +6645,12 @@ impl AppController {
                 self.last_error.as_deref().unwrap_or("未知错误")
             );
             self._ch_batch_note_op(frame.seq, false, &reason);
-            // 还原链上的校准/基线被 NAK ⇒ 恢复未确认, 不允许在完成文案里冒充"已还原"。
-            self._sweep_note_op(frame.seq, false, &reason);
             self._end_op();
         }
         // 自适应请求本身被拒(如固件 heavy_gate 拦下) ⇒ 这一轮压根没开始, 清掉在途归属键:
         // 否则它会一直"占着"这个 seq, 让后续任何带同 seq 的旧帧看起来仍是本轮的。
         if self.auto_tune_req_seq == Some(frame.seq) {
             self.auto_tune_req_seq = None;
-        }
-        // 追踪请求被 NAK(设备无算法/该 idx 不可读): 退避 ~3s(约 180 次 16ms 轮询),
-        // 避免每 tick 一次 NAK 刷屏; 成功响应会清零退避恢复正常轮询。
-        if self.algo_trace_last_seq == Some(frame.seq) {
-            self.algo_trace_backoff = 180;
-            self.algo_trace_last_seq = None;
         }
         // 灯效写操作被拒(映射是整批原子失败, 设备什么都没改; 预览是整条没生效):
         // 必须把设备给出的原因显示到面板上, 不能只落日志。
@@ -8795,6 +6707,21 @@ impl AppController {
             .clear_loop_profile()
     }
 
+    /// 仅在设备已由 DEBUG_CRASH_BOOTSEL 武装时触发既有安全 watchdog BOOTSEL 路径。
+    pub fn debug_trigger_crash(&mut self) -> anyhow::Result<()> {
+        let seq = self.next_seq();
+        let handle = self
+            .io
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("未连接，无法触发崩溃 BOOTSEL"))?;
+        handle.send(Frame::new(HostCmd::DebugTriggerCrash as u8, 0, seq, vec![]))?;
+        self.crash_trigger_pending = Some(seq);
+        self.crash_trigger_acknowledged = false;
+        Ok(())
+    }
+    pub fn debug_trigger_crash_acknowledged(&self) -> bool {
+        self.crash_trigger_acknowledged
+    }
     pub fn status_line(&self) -> String {
         self.status_text.clone()
     }
@@ -9862,7 +7789,7 @@ mod tests {
 /// 定位可用的 arm-none-eabi 工具链目录(gcc/objcopy/nm/objdump 都能运行)。
 /// 优先程序自带 tools/arm-none-eabi/bin(随程序分发, 免受各机环境差异), 再回退本机安装路径。
 /// 对每个候选试运行 --version, 跳过缺失或映像损坏(如 PlatformIO nm.exe 0xc000012f)的目录。
-fn find_toolchain_dir() -> anyhow::Result<std::path::PathBuf> {
+pub(crate) fn find_toolchain_dir() -> anyhow::Result<std::path::PathBuf> {
     use std::path::PathBuf;
     let mut candidates: Vec<PathBuf> = Vec::new();
 
@@ -9972,7 +7899,7 @@ fn find_toolchain_dir() -> anyhow::Result<std::path::PathBuf> {
 
 /// ABI 头(psoc_algo_abi.h)随程序内嵌, JIT 编译时写入临时目录并 -I 引用,
 /// 免受"机器上没有 PSoC 工程源码路径"影响, 保证单 exe 可移植。
-static ALGO_ABI_HEADER: &str = include_str!(concat!(
+pub(crate) static ALGO_ABI_HEADER: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../psoc_firmware/CY8C4147AZI-SensorCore/psoc_algo_abi.h"
 ));

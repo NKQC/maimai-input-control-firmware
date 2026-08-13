@@ -99,6 +99,8 @@ pub enum SkipReason {
     OutOfRange,
     /// 该项不经过草稿层，导入不代它下发(算法 C 源与机器码)。
     NotDraftable,
+    /// 算法 schema 与当前算法不匹配，UI 元数据覆盖必须跳过。
+    AlgorithmMismatch,
     /// 该项的 JSON 字段缺失或格式非法。
     Malformed,
 }
@@ -110,6 +112,7 @@ impl SkipReason {
             SkipReason::TypeMismatch => "类型不符",
             SkipReason::OutOfRange => "超出允许范围",
             SkipReason::NotDraftable => "不属于草稿范围, 需在算法页手动上传",
+            SkipReason::AlgorithmMismatch => "算法指纹不匹配",
             SkipReason::Malformed => "字段缺失或格式非法",
         }
     }
@@ -245,7 +248,109 @@ pub fn export_settings(ctrl: &AppController, selected: GroupSelection) -> Result
     Ok(text)
 }
 
-/// 解析并导入用户选择的组。
+pub fn save_jit_metadata(ctrl: &AppController) -> Result<()> {
+    let mut root = BTreeMap::new();
+    root.insert("version".to_string(), JsonValue::Number(1.0));
+    let mut entries = Vec::new();
+    for (fingerprint, kind, index, alias, description) in ctrl.all_algo_metadata_overrides() {
+        let mut item = BTreeMap::new();
+        item.insert(
+            "schema_fingerprint".to_string(),
+            JsonValue::String(fingerprint),
+        );
+        item.insert("kind".to_string(), JsonValue::Number(kind as f64));
+        item.insert("index".to_string(), JsonValue::Number(index as f64));
+        item.insert("alias".to_string(), JsonValue::String(alias));
+        item.insert("description".to_string(), JsonValue::String(description));
+        entries.push(JsonValue::Object(item));
+    }
+    root.insert("entries".to_string(), JsonValue::Array(entries));
+    let mut text = String::new();
+    _write_json(&JsonValue::Object(root), &mut text, 0)?;
+    text.push('\n');
+    std::fs::write(_jit_metadata_path(), text)
+        .map_err(|error| anyhow!("写入 jit_metadata.json 失败: {}", error))
+}
+
+pub fn load_jit_metadata(ctrl: &mut AppController) {
+    let path = _jit_metadata_path();
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+        Err(error) => {
+            log::warn!(
+                "读取 {} 失败，忽略本地算法元数据: {}",
+                path.display(),
+                error
+            );
+            return;
+        }
+    };
+    let root_value = match JsonParser::new(&text).parse() {
+        Ok(value) => value,
+        Err(_) => {
+            log::warn!("解析 {} 失败，忽略本地算法元数据", path.display());
+            return;
+        }
+    };
+    let root = match _object(&root_value, "jit_metadata") {
+        Ok(root) => root,
+        Err(_) => {
+            log::warn!("{} 根对象无效，忽略本地算法元数据", path.display());
+            return;
+        }
+    };
+    let Some(JsonValue::Array(items)) = root.get("entries") else {
+        log::warn!("{} 缺少 entries，忽略本地算法元数据", path.display());
+        return;
+    };
+    let mut entries = Vec::new();
+    for item in items {
+        let Ok(item) = _object(item, "jit_metadata entry") else {
+            continue;
+        };
+        let (
+            Some(JsonValue::String(fingerprint)),
+            Some(kind),
+            Some(index),
+            Some(JsonValue::String(alias)),
+            Some(JsonValue::String(description)),
+        ) = (
+            item.get("schema_fingerprint"),
+            item.get("kind"),
+            item.get("index"),
+            item.get("alias"),
+            item.get("description"),
+        )
+        else {
+            continue;
+        };
+        let (JsonValue::Number(kind), JsonValue::Number(index)) = (kind, index) else {
+            continue;
+        };
+        if !kind.is_finite() || !index.is_finite() || kind.fract() != 0.0 || index.fract() != 0.0 {
+            continue;
+        }
+        if let (Ok(kind), Ok(index)) = (u8::try_from(*kind as u32), u8::try_from(*index as u32)) {
+            entries.push((
+                fingerprint.clone(),
+                kind,
+                index,
+                alias.clone(),
+                description.clone(),
+            ));
+        }
+    }
+    ctrl.load_algo_metadata_overrides(entries);
+}
+
+fn _jit_metadata_path() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(|dir| dir.join("jit_metadata.json")))
+        .unwrap_or_else(|| PathBuf::from("jit_metadata.json"))
+}
+
 ///
 /// ★语义★: 导入**只写 UI 草稿**并置脏，不发送任何设备命令、不写 flash、不回读。真正下发只发生在
 /// 用户点击“保存到设备”(`AppController::save_config`)时；“撤销未保存改动”会把草稿清回导入前的
@@ -441,6 +546,24 @@ fn _export_algo(ctrl: &AppController) -> JsonValue {
         );
         metadata.push(JsonValue::Object(item));
     }
+    group.insert(
+        "schema_fingerprint".to_string(),
+        JsonValue::String(ctrl.algo_schema_fingerprint()),
+    );
+    let mut ui_metadata = Vec::new();
+    for (fingerprint, kind, index, alias, description) in ctrl.algo_metadata_overrides() {
+        let mut item = BTreeMap::new();
+        item.insert(
+            "schema_fingerprint".to_string(),
+            JsonValue::String(fingerprint),
+        );
+        item.insert("kind".to_string(), JsonValue::Number(kind as f64));
+        item.insert("index".to_string(), JsonValue::Number(index as f64));
+        item.insert("alias".to_string(), JsonValue::String(alias));
+        item.insert("description".to_string(), JsonValue::String(description));
+        ui_metadata.push(JsonValue::Object(item));
+    }
+    group.insert("ui_metadata".to_string(), JsonValue::Array(ui_metadata));
     group.insert("metadata".to_string(), JsonValue::Array(metadata));
     group.insert(
         "device_code_hex".to_string(),
@@ -751,6 +874,93 @@ fn _import_algo(
         }
     }
     // schema_source/metadata 是分享时携带的只读描述；元数据真相仍来自算法源码，导入旧文件时可缺省。
+    let current_fingerprint = ctrl.algo_schema_fingerprint();
+    if let Some(raw) = group.get("schema_fingerprint") {
+        match _string(raw, "algo.schema_fingerprint") {
+            Ok(fingerprint) if fingerprint == current_fingerprint => {}
+            Ok(_) => sum._skip("algo.ui_metadata", SkipReason::AlgorithmMismatch),
+            Err(_) => sum._skip("algo.schema_fingerprint", SkipReason::Malformed),
+        }
+    }
+    let metadata_matches = group
+        .get("schema_fingerprint")
+        .and_then(|raw| match raw {
+            JsonValue::String(value) => Some(value == &current_fingerprint),
+            _ => None,
+        })
+        .unwrap_or(true);
+    if metadata_matches {
+        if let Some(raw) = group.get("ui_metadata") {
+            match _array(raw, "algo.ui_metadata") {
+                Ok(items) => {
+                    for item in items {
+                        let Ok(item) = _object(item, "algo ui metadata") else {
+                            sum._skip("algo.ui_metadata", SkipReason::Malformed);
+                            continue;
+                        };
+                        let Some(raw) = item.get("kind") else {
+                            sum._skip("algo.ui_metadata", SkipReason::Malformed);
+                            continue;
+                        };
+                        let Ok(kind) = _u8(raw, "kind") else {
+                            sum._skip("algo.ui_metadata", SkipReason::Malformed);
+                            continue;
+                        };
+                        let Some(raw) = item.get("index") else {
+                            sum._skip("algo.ui_metadata", SkipReason::Malformed);
+                            continue;
+                        };
+                        let Ok(index) = _u8(raw, "index") else {
+                            sum._skip("algo.ui_metadata", SkipReason::Malformed);
+                            continue;
+                        };
+                        let item_name = format!("algo.ui_metadata[{kind}:{index}]");
+                        let Some(raw) = item.get("alias") else {
+                            sum._skip(item_name, SkipReason::Malformed);
+                            continue;
+                        };
+                        let Ok(alias) = _string(raw, "alias") else {
+                            sum._skip(item_name, SkipReason::Malformed);
+                            continue;
+                        };
+                        let Some(raw) = item.get("description") else {
+                            sum._skip(item_name, SkipReason::Malformed);
+                            continue;
+                        };
+                        let Ok(description) = _string(raw, "description") else {
+                            sum._skip(item_name, SkipReason::Malformed);
+                            continue;
+                        };
+                        if kind > 1 {
+                            sum._skip(
+                                format!("algo.ui_metadata[{kind}:{index}]"),
+                                SkipReason::OutOfRange,
+                            );
+                            continue;
+                        }
+                        if ctrl
+                            .set_algo_metadata_override(
+                                kind,
+                                index,
+                                alias.to_string(),
+                                description.to_string(),
+                            )
+                            .is_ok()
+                        {
+                            sum.applied_items += 1;
+                        } else {
+                            sum._skip(
+                                format!("algo.ui_metadata[{kind}:{index}]"),
+                                SkipReason::Malformed,
+                            );
+                        }
+                    }
+                }
+                Err(_) => sum._skip("algo.ui_metadata", SkipReason::Malformed),
+            }
+        }
+    }
+    // 旧 metadata 字段仅是源码声明快照，不作为 UI 覆盖导入。
     if let Some(metadata) = group.get("metadata") {
         if !matches!(metadata, JsonValue::Array(_)) {
             sum._skip("algo.metadata", SkipReason::Malformed);

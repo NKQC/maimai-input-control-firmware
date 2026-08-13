@@ -353,7 +353,10 @@ export component AllChannelsPage inherits Rectangle {
                 toggled => { root.channel_show_disabled = self.checked; }
             }
             Button {
-                text: root.batch_drawer_open ? @tr("收起批量应用 ▶") : @tr("◀ 批量应用参数");
+                // 最小交付窗口下工具栏还要容纳采集、排序、筛选和采样摘要；固定短按钮宽度，
+                // 不让批量入口被 HorizontalBox 推到客户区外。详细语义由抽屉内标题和操作说明提供。
+                width: 92px;
+                text: root.batch_drawer_open ? @tr("收起批量") : @tr("批量应用");
                 clicked => {
                     // 收起前先清理本次批量会话: 勾选态活在 Rust 里, 只把抽屉藏起来的话下次展开会
                     // 带着上一批勾选出现, 而"应用到已选通道"会照着它执行(写进用户以为没选的通道)。
@@ -366,7 +369,7 @@ export component AllChannelsPage inherits Rectangle {
                 // 文本首选宽度, 进而驱动 HorizontalBox 重新分配, 左侧说明文字被来回推动。钉死宽度后不抖。
                 // 固定 width(不是 min-width): 采样率/探测周期每帧刷新, min-width 挡不住"文本比下限更长"
                 // 时首选宽度随位数变化, 那会持续驱动 HorizontalBox 重分配, 左侧说明文字来回被推。
-                width: 300px;
+                width: 220px;
                 overflow: elide;
                 horizontal-alignment: right;
                 text: @tr("采样率") + root.sample_rate_hz + " Hz  " + @tr("探测周期 ") + (root.scan_period_valid

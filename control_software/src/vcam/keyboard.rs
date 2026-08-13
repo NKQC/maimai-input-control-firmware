@@ -11,7 +11,12 @@
 //!   - 仅在虚拟摄像头启用(`state.enabled`)时累积; 每串数据提交后清空缓冲, 保证只用一次。
 //!   - Raw Input 是**旁路监听**, 不吞按键, 扫码器输入照常进入前台窗口。
 
-use super::{VcamState, interception};
+use super::{VcamState, interception, winusb_scanner};
+
+/// WinUSB 直读模式的运行状态文案。★必须把副作用写在状态里★ 用户看到的"已吞键"是因为
+/// 系统已不把该设备当键盘, 这同时意味着它对任何程序都不再输入。
+const WINUSB_STATUS: &str =
+    "运行中 · WinUSB 直读目标设备（Windows 已不再将其识别为键盘，按键不会进入任何程序）";
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
@@ -21,8 +26,8 @@ use std::time::Instant;
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, GetKeyboardState, MAPVK_VSC_TO_VK_EX, MapVirtualKeyW, ToUnicode, VK_RETURN,
-    VK_SHIFT,
+    GetKeyState, GetKeyboardState, MAPVK_VSC_TO_VK_EX, MapVirtualKeyW, ToUnicode, VK_CAPITAL,
+    VK_RETURN, VK_SHIFT,
 };
 use windows::Win32::UI::Input::{
     GetRawInputData, GetRawInputDeviceInfoW, GetRawInputDeviceList, HRAWINPUT, RAWINPUT,
@@ -119,6 +124,9 @@ static RUNTIME_STATUS: OnceLock<Mutex<String>> = OnceLock::new();
 fn target_lock() -> &'static Mutex<Option<String>> {
     TARGET.get_or_init(|| Mutex::new(None))
 }
+pub fn target_device() -> Option<String> {
+    target_lock().lock().unwrap().clone()
+}
 fn accept_cache() -> &'static Mutex<HashMap<isize, bool>> {
     ACCEPT_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
@@ -138,9 +146,7 @@ pub fn runtime_status() -> String {
 /// 再写入新目标、启动唯一的新会话，避免双开和卡键。
 pub fn set_target_device(path: Option<String>) -> anyhow::Result<()> {
     let normalized = path.filter(|p| !p.trim().is_empty());
-    if target_device() == normalized {
-        return Ok(());
-    }
+    let previous_target = target_device();
     let restart_state = {
         let manager = manager_lock();
         manager._worker.as_ref().and_then(|_| {
@@ -149,6 +155,10 @@ pub fn set_target_device(path: Option<String>) -> anyhow::Result<()> {
                 .map(|capture| capture.lock().unwrap().state.clone())
         })
     };
+    if previous_target == normalized {
+        return Ok(());
+    }
+
     if restart_state.is_some() {
         stop();
     }
@@ -159,14 +169,43 @@ pub fn set_target_device(path: Option<String>) -> anyhow::Result<()> {
         None => log::info!("虚拟摄像头: 输入源为所有键盘(未限定设备)"),
     }
     if let Some(state) = restart_state {
-        start(state)?;
+        if let Err(switch_error) = start(state.clone()) {
+            *target_lock().lock().unwrap() = previous_target;
+            accept_cache().lock().unwrap().clear();
+            return match start(state) {
+                Ok(()) => Err(anyhow::anyhow!(
+                    "切换捕获会话失败，已恢复原输入源：{}",
+                    switch_error
+                )),
+                Err(restore_error) => Err(anyhow::anyhow!(
+                    "切换捕获会话失败且原会话恢复失败：{}；{}",
+                    switch_error,
+                    restore_error
+                )),
+            };
+        }
     }
     Ok(())
 }
 
-/// 当前输入源设备路径(None = 所有键盘)。
-pub fn target_device() -> Option<String> {
-    target_lock().lock().unwrap().clone()
+pub fn restart_current_capture() -> anyhow::Result<bool> {
+    let state = {
+        let manager = manager_lock();
+        if manager
+            ._worker
+            .as_ref()
+            .is_none_or(|worker| worker.is_finished())
+        {
+            return Ok(false);
+        }
+        CAPTURE
+            .get()
+            .map(|capture| capture.lock().unwrap().state.clone())
+            .ok_or_else(|| anyhow::anyhow!("键盘捕获会话状态不可用"))?
+    };
+    stop();
+    start(state)?;
+    Ok(true)
 }
 
 /// 枚举系统中所有 HID 键盘设备, 供 UI 下拉选择。
@@ -423,12 +462,23 @@ fn vid_pid_of(path: &str) -> String {
     }
 }
 
-/// 查一个设备节点的各路文案 + 其父设备实例 ID。查不到返回 None(枚举照常继续)。
-fn query_node(instance_id: &str) -> Option<(NodeText, Option<String>)> {
+/// 按实例 ID 打开单个设备节点, 把已开好的句柄交给 `read` 取值, 出口统一 Destroy。
+/// 节点查询有三处需求(文案 / 父节点 / 功能驱动名), 共用这一份开关箱, 免得各写一遍错误路径。
+#[inline]
+fn with_devnode<T>(
+    instance_id: &str,
+    read: impl FnOnce(
+        windows::Win32::Devices::DeviceAndDriverInstallation::HDEVINFO,
+        &windows::Win32::Devices::DeviceAndDriverInstallation::SP_DEVINFO_DATA,
+    ) -> Option<T>,
+) -> Option<T> {
     use windows::Win32::Devices::DeviceAndDriverInstallation::{
         SP_DEVINFO_DATA, SetupDiCreateDeviceInfoList, SetupDiDestroyDeviceInfoList,
         SetupDiOpenDeviceInfoW,
     };
+    if instance_id.trim().is_empty() {
+        return None;
+    }
     // SAFETY: 空 devinfo 集合 + 按实例 ID 打开单个设备; 出口统一 Destroy。
     unsafe {
         let h = SetupDiCreateDeviceInfoList(None, None).ok()?;
@@ -450,17 +500,36 @@ fn query_node(instance_id: &str) -> Option<(NodeText, Option<String>)> {
         )
         .is_ok()
         {
-            let text = NodeText {
-                bus: dev_prop(h, &data, &DEVPKEY_Device_BusReportedDeviceDesc).unwrap_or_default(),
-                friendly: reg_prop(h, &data, PROP_FRIENDLY).unwrap_or_default(),
-                desc: reg_prop(h, &data, PROP_DESC).unwrap_or_default(),
-                mfg: reg_prop(h, &data, PROP_MFG).unwrap_or_default(),
-            };
-            result = Some((text, parent_instance_id(data.DevInst)));
+            result = read(h, &data);
         }
         let _ = SetupDiDestroyDeviceInfoList(h);
         result
     }
+}
+
+/// 查一个设备节点的各路文案 + 其父设备实例 ID。查不到返回 None(枚举照常继续)。
+fn query_node(instance_id: &str) -> Option<(NodeText, Option<String>)> {
+    with_devnode(instance_id, |h, data| {
+        let text = NodeText {
+            bus: dev_prop(h, data, &DEVPKEY_Device_BusReportedDeviceDesc).unwrap_or_default(),
+            friendly: reg_prop(h, data, PROP_FRIENDLY).unwrap_or_default(),
+            desc: reg_prop(h, data, PROP_DESC).unwrap_or_default(),
+            mfg: reg_prop(h, data, PROP_MFG).unwrap_or_default(),
+        };
+        Some((text, parent_instance_id(data.DevInst)))
+    })
+}
+
+/// 取某设备节点的父实例 ID。HID 键盘节点的父就是 USB 设备节点(`USB\VID_xxxx&PID_xxxx\序列号`),
+/// 而 WinUSB 改绑只能作用在 USB 节点上, 故这是"HID 路径 → 可改绑目标"的唯一换算入口。
+pub(crate) fn parent_of(instance_id: &str) -> Option<String> {
+    with_devnode(instance_id, |_, data| parent_instance_id(data.DevInst))
+}
+
+/// 读设备节点的功能驱动服务名(`SPDRP_SERVICE`)。这是"到底绑到哪个驱动"的**唯一实测证据**:
+/// 命令退出码 0 只说明命令跑完了, 不代表 PnP 真的换了绑定。
+pub(crate) fn device_service(instance_id: &str) -> Option<String> {
+    with_devnode(instance_id, |h, data| reg_prop(h, data, PROP_SERVICE))
 }
 
 /// 读一项 DEVPROP_TYPE_STRING 设备属性(用于总线上报名)。
@@ -493,12 +562,13 @@ fn decode_wide(buf: &[u8], needed: u32) -> String {
 }
 
 use windows::Win32::Devices::DeviceAndDriverInstallation::{
-    SETUP_DI_REGISTRY_PROPERTY, SPDRP_DEVICEDESC, SPDRP_FRIENDLYNAME, SPDRP_MFG,
+    SETUP_DI_REGISTRY_PROPERTY, SPDRP_DEVICEDESC, SPDRP_FRIENDLYNAME, SPDRP_MFG, SPDRP_SERVICE,
 };
 use windows::Win32::Devices::Properties::DEVPKEY_Device_BusReportedDeviceDesc;
 const PROP_FRIENDLY: SETUP_DI_REGISTRY_PROPERTY = SPDRP_FRIENDLYNAME;
 const PROP_DESC: SETUP_DI_REGISTRY_PROPERTY = SPDRP_DEVICEDESC;
 const PROP_MFG: SETUP_DI_REGISTRY_PROPERTY = SPDRP_MFG;
+const PROP_SERVICE: SETUP_DI_REGISTRY_PROPERTY = SPDRP_SERVICE;
 
 /// 读一项 REG_SZ 设备属性。
 fn reg_prop(
@@ -618,27 +688,37 @@ pub fn start(state: Arc<VcamState>) -> anyhow::Result<()> {
             set_runtime_status("运行中 · Raw Input 旁路（所有键盘；不拦截按键）".to_string());
             spawn_raw_worker(&mut manager, generation)
         }
+        // ★优先 WinUSB 直读★ 目标已改绑 winusb.sys 时 Windows 根本不再为它建键盘栈,
+        // Raw Input 与键盘过滤驱动都收不到任何东西 —— 直读是唯一能拿到数据的路径。
+        Some(path) if super::driver_pkg::binding_status(path).bound() => {
+            match winusb_scanner::Capture::open(path) {
+                Ok(capture) => {
+                    set_runtime_status(WINUSB_STATUS.to_string());
+                    let target = path.to_string();
+                    spawn_worker(&mut manager, "vcam-winusb", move || {
+                        pump_winusb(generation, target, capture)
+                    })
+                }
+                Err(error) => {
+                    ACTIVE_GENERATION.store(0, Ordering::SeqCst);
+                    let reason = error.to_string();
+                    // 这里**不能**降级 Raw Input: 设备已不是键盘, 旁路一个字符也收不到,
+                    // 报"运行中"就是在骗人。如实停在未运行, 并给出可执行的下一步。
+                    set_runtime_status(format!(
+                        "未运行 · 目标已改绑 WinUSB 但直读未建立：{}。可点“恢复原驱动”退回普通 HID 键盘",
+                        reason
+                    ));
+                    Err(anyhow::anyhow!("WinUSB 直读未建立：{}", reason))
+                }
+            }
+        }
         Some(path) => match interception::Capture::open(path) {
             Ok(capture) => {
                 set_runtime_status(format!("运行中 · Interception 精确拦截目标设备 {}", path));
                 let target = path.to_string();
-                match std::thread::Builder::new()
-                    .name("vcam-interception".into())
-                    .spawn(move || pump_interception(generation, target, capture))
-                {
-                    Ok(worker) => {
-                        manager._worker = Some(worker);
-                        Ok(())
-                    }
-                    Err(error) => {
-                        ACTIVE_GENERATION.store(0, Ordering::SeqCst);
-                        set_runtime_status(format!(
-                            "未运行 · 无法创建 Interception 捕获线程：{}",
-                            error
-                        ));
-                        Err(anyhow::anyhow!("无法创建 Interception 捕获线程：{}", error))
-                    }
-                }
+                spawn_worker(&mut manager, "vcam-interception", move || {
+                    pump_interception(generation, target, capture)
+                })
             }
             Err(error) => {
                 let reason = error.to_string();
@@ -656,21 +736,27 @@ pub fn start(state: Arc<VcamState>) -> anyhow::Result<()> {
     }
 }
 
-fn spawn_raw_worker(manager: &mut Manager, generation: u64) -> anyhow::Result<()> {
-    match std::thread::Builder::new()
-        .name("vcam-rawinput".into())
-        .spawn(move || pump(generation))
-    {
+/// 起唯一的捕获线程并登记到 Manager。三种捕获模式共用同一份创建与失败收尾逻辑。
+fn spawn_worker(
+    manager: &mut Manager,
+    name: &'static str,
+    body: impl FnOnce() + Send + 'static,
+) -> anyhow::Result<()> {
+    match std::thread::Builder::new().name(name.into()).spawn(body) {
         Ok(worker) => {
             manager._worker = Some(worker);
             Ok(())
         }
         Err(error) => {
             ACTIVE_GENERATION.store(0, Ordering::SeqCst);
-            set_runtime_status(format!("未运行 · 无法创建 Raw Input 捕获线程：{}", error));
-            Err(anyhow::anyhow!("无法创建 Raw Input 捕获线程：{}", error))
+            set_runtime_status(format!("未运行 · 无法创建捕获线程 {}：{}", name, error));
+            Err(anyhow::anyhow!("无法创建捕获线程 {}：{}", name, error))
         }
     }
+}
+
+fn spawn_raw_worker(manager: &mut Manager, generation: u64) -> anyhow::Result<()> {
+    spawn_worker(manager, "vcam-rawinput", move || pump(generation))
 }
 
 /// 停止键盘捕获: **等旧线程真正注销 Raw Input、释放 Interception 已吞按键并退出**才返回。
@@ -682,6 +768,37 @@ pub fn stop() {
         let _ = worker.join();
     }
     set_runtime_status("未运行 · 键盘捕获已停止".to_string());
+}
+
+/// WinUSB 直读线程。
+///
+/// ★这条路不许降级 Raw Input★ 目标已改绑 winusb.sys ⇒ 系统里根本没有它的键盘节点,
+/// 旁路一个字符也收不到。会话中断时只能如实报"未运行", 而不是换个名字继续假装在跑。
+fn pump_winusb(generation: u64, target: String, mut capture: winusb_scanner::Capture) {
+    let still_mine = || ACTIVE_GENERATION.load(Ordering::SeqCst) == generation;
+    log::info!("虚拟摄像头: WinUSB 直读捕获已启动({})", target);
+    while still_mine() {
+        if target_device().as_deref() != Some(target.as_str()) {
+            break;
+        }
+        match capture.receive(100) {
+            Ok(keys) => {
+                for (vk, shift) in keys {
+                    push_key(vk, Some(shift));
+                }
+                submit_on_pause();
+            }
+            Err(error) => {
+                let reason = error.to_string();
+                log::error!("虚拟摄像头: WinUSB 直读已停止: {}", reason);
+                capture.stop();
+                set_runtime_status(format!("未运行 · WinUSB 直读中断：{}", reason));
+                return;
+            }
+        }
+    }
+    capture.stop();
+    log::info!("虚拟摄像头: WinUSB 直读捕获已停止");
 }
 
 /// Interception 捕获线程：只有已唯一匹配的目标设备进入驱动过滤；异常或目标改变时先释放已吞按键，
@@ -731,10 +848,11 @@ fn pump_interception(generation: u64, mut target: String, mut capture: intercept
                 let scan = u32::from(stroke.code) | if stroke.is_extended() { 0xe000 } else { 0 };
                 let vk = unsafe { MapVirtualKeyW(scan, MAPVK_VSC_TO_VK_EX) } as u16;
                 if vk != 0 {
-                    push_key(vk);
+                    // Interception 是键盘类过滤驱动: 按键仍然经过系统键盘状态机, OS Shift 态可信。
+                    push_key(vk, None);
                 }
             }
-            Ok(_) => {}
+            Ok(_) => submit_on_pause(),
             Err(error) => {
                 let reason = error.to_string();
                 log::error!(
@@ -790,17 +908,7 @@ fn pump(generation: u64) {
                 let _ = TranslateMessage(&msg);
                 DispatchMessageW(&msg);
             }
-            // 停顿超时提交: 缓冲非空且距上次按键超过阈值 → 提交并清空。
-            if let Some(m) = CAPTURE.get() {
-                let mut cap = m.lock().unwrap();
-                if !cap.buffer.is_empty() {
-                    let timeout = cap.state.submit_timeout_ms() as u128;
-                    if cap.last_key.elapsed().as_millis() >= timeout {
-                        let data = std::mem::take(&mut cap.buffer);
-                        cap.state.submit_data(&data);
-                    }
-                }
-            }
+            submit_on_pause();
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
 
@@ -902,11 +1010,33 @@ unsafe fn handle_raw_input(hri: HRAWINPUT) {
     if !device_accepted(raw.header.hDevice) {
         return;
     }
-    push_key(kb.VKey);
+    push_key(kb.VKey, None);
+}
+
+/// 停顿超时提交: 缓冲非空且距上次按键超过阈值 → 提交并清空。
+/// 三条捕获路径(Raw Input / Interception / WinUSB 直读)共用同一份提交判定与同一个下游,
+/// 不给某一条路单独造第二套缓冲语义。
+#[inline]
+fn submit_on_pause() {
+    let Some(m) = CAPTURE.get() else {
+        return;
+    };
+    let mut cap = m.lock().unwrap();
+    if cap.buffer.is_empty() {
+        return;
+    }
+    if cap.last_key.elapsed().as_millis() >= cap.state.submit_timeout_ms() as u128 {
+        let data = std::mem::take(&mut cap.buffer);
+        cap.state.submit_data(&data);
+    }
 }
 
 /// 累积一次按键: Enter 立即提交, 可打印字符入缓冲。
-fn push_key(vk: u16) {
+///
+/// `shift` = None 表示"这一击确实经过了系统", Shift 态可从 OS 键盘状态读;
+/// WinUSB 直读路径的按键**根本不进系统**, 必须由报告的 modifier 字节显式给出, 否则会拿到
+/// 用户主键盘此刻的 Shift 态, 解出与扫码内容无关的字符。
+fn push_key(vk: u16, shift: Option<bool>) {
     let Some(m) = CAPTURE.get() else {
         return;
     };
@@ -920,7 +1050,7 @@ fn push_key(vk: u16) {
             let data = std::mem::take(&mut cap.buffer);
             cap.state.submit_data(&data);
         }
-    } else if let Some(ch) = vk_to_char(vk) {
+    } else if let Some(ch) = vk_to_char(vk, shift) {
         cap.buffer.push(ch);
         cap.last_key = Instant::now();
         // 防御: 单串过长(异常)截断, 避免无限增长。
@@ -930,14 +1060,21 @@ fn push_key(vk: u16) {
     }
 }
 
-/// VK → 可打印字符(经 ToUnicode, 尊重当前 Shift/CapsLock 布局)。不可打印返回 None。
-fn vk_to_char(vk: u16) -> Option<char> {
+/// VK → 可打印字符(经 ToUnicode, 尊重当前布局)。不可打印返回 None。
+/// `shift` 为 Some 时**覆盖**系统 Shift 态(见 `push_key` 的说明)。
+fn vk_to_char(vk: u16, shift: Option<bool>) -> Option<char> {
     unsafe {
         let mut state = [0u8; 256];
         // 取当前键盘状态(供 ToUnicode 判断 Shift 等); 失败则退化用 Shift 单键。
         if GetKeyboardState(&mut state).is_err() {
-            let shift = (GetKeyState(VK_SHIFT.0 as i32) as u16 & 0x8000) != 0;
-            state[VK_SHIFT.0 as usize] = if shift { 0x80 } else { 0 };
+            let pressed = (GetKeyState(VK_SHIFT.0 as i32) as u16 & 0x8000) != 0;
+            state[VK_SHIFT.0 as usize] = if pressed { 0x80 } else { 0 };
+        }
+        if let Some(pressed) = shift {
+            // 直读路径: 只有报告里的 Shift 才算, 顺手清掉 CapsLock 影响(扫码器不发 CapsLock,
+            // 用户主键盘的 CapsLock 不该改变扫码内容)。
+            state[VK_SHIFT.0 as usize] = if pressed { 0x80 } else { 0 };
+            state[VK_CAPITAL.0 as usize] = 0;
         }
         let sc = 0u32; // scan code 0: ToUnicode 会据 vk 推断
         let mut buf = [0u16; 8];

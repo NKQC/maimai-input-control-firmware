@@ -23,12 +23,13 @@ export component AppWindow inherits Window {
     title: "mai2control-ui";
     // 窗口/任务栏图标(标题栏、Alt-Tab、任务栏都取它)。路径相对本 .slint 文件。
     icon: @image-url("assets/icon.png");
-    // 默认更宽敞, 且允许缩到较小尺寸: 布局用 HorizontalBox/VerticalBox stretch 自适应回流,
-    // 窄窗口下工具栏已拆多行, 不再右侧截断。
+    // 九个设置标签及页面工具栏在 720px 窗口会同时落入过度收缩：标签标题、操作按钮和底部
+    // 保存栏会越出客户区，导致末尾两页不可达或内容被裁切。保持 920×620 的真实客户区预算，
+    // 使左侧导航、完整标签栏及页面内 ScrollView 同时拥有可用空间；更小窗口不再伪装为可用。
     preferred-width: 1040px;
     preferred-height: 700px;
-    min-width: 720px;
-    min-height: 520px;
+    min-width: 920px;
+    min-height: 620px;
 
     // 设备下拉列表文本(由 main.rs 从 AppController::device_labels 回填)
     in property <[string]> device_labels: [];
@@ -221,14 +222,18 @@ export component AppWindow inherits Window {
     in property <int> latency_proc_us: 0;
     in property <int> latency_usb_us: 0;
     in property <int> latency_sensor_us: 0;
-    in property <string> latency_corrected_text: "补正后延迟: 未启用";
+    in property <string> latency_corrected_text: "链路耗时: 补正显示未启用";
     in-out property <bool> measure_latency: false;
     in property <string> log_text: "";
     in property <string> log_line_numbers: "";
     in-out property <int> log_filter: 2;   // 日志过滤等级 0=错误 1=警告 2=信息 3=调试
 
     in-out property <bool> log_auto_scroll: true;
-    in property <bool> log_file_on: true;
+    in-out property <int> log_page_start: 0;
+    in property <int> log_page_size: 500;
+    in property <int> log_total_lines: 0;
+    in property <bool> log_has_older: false;
+    in property <bool> log_has_newer: false;
     in property <string> log_file_path: "";
     in property <string> log_stats: "";
     callback set_log_filter(int);
@@ -236,8 +241,9 @@ export component AppWindow inherits Window {
     callback clear_log();
     callback copy_log_all();
     callback open_log_dir();
-    callback set_log_file_enabled(bool);
     in property <string> lat_path: "";
+    in property <string> lat_chart_title: "链路耗时历史 (SPI + RP处理 + USB写，µs)";
+    in property <string> lat_dev_badge: "未启用";
     in property <float> lat_y_max: 1;
     in property <float> lat_y_min: 0;
     in property <int> lat_point_count: 0;
@@ -344,6 +350,7 @@ export component AppWindow inherits Window {
     callback cfg_reset();
     callback settings_export(bool, bool, bool, bool, bool, bool);
     callback settings_import(bool, bool, bool, bool, bool, bool);
+    callback algo_metadata_edited(int, int, string, string);
     // 范围弹窗中的配置项数量由 Rust 从当前缓存更新；其余为固定协议槽位数。
     in property <int> settings_io_config_count: 0;
     in property <int> settings_io_channel_params_count: 396;
@@ -431,6 +438,10 @@ export component AppWindow inherits Window {
     in property <int> algo_c_capacity: 32768;
     in property <[AlgoMetadataRow]> algo_metadata_rows: [];
     in property <[AlgoSettingRow]> algo_setting_rows: [];
+    // 上报折线(图例 + 右轴 path)。★必须从这里一路透传到 CurvesPage★: 该属性原先只在
+    // curves.slint 上声明, AppWindow/SettingsPage 都没有它, Rust 侧那个每帧填好的模型
+    // 因此根本没有入口 —— 图例恒显示"未声明 ALGO_REPORT", 右轴折线一条都不画。
+    in property <[AlgoReportLine]> algo_report_lines: [];
     in property <int> g_inactive_sns: 1;
     in property <int> g_idac_gain: 4;
     in property <int> g_idac_sense_config: 0;   // 0=IDAC sourcing, 1=IDAC sinking
@@ -492,6 +503,11 @@ export component AppWindow inherits Window {
     // 部署(安装/卸载)是否在进行中: 两者改同一批注册表键与文件, 只能有一个在跑,
     // 故用**同一个**属性同时禁掉两个按钮(单一真值, 不给两个按钮各来一个标志)。
     in property <bool> vcam_deploy_busy: false;
+    // WinUSB 改绑的三档实测状态(签名 / 绑定)与本机内核驱动可行性诊断, 全部由 Rust 侧回填。
+    in property <string> vcam_signing_status: "未签名";
+    in property <string> vcam_binding_status: "未改绑";
+    in property <string> vcam_kernel_diag: "";
+    in property <string> vcam_winusb_note: "";
     // 输入源设备树(组头 + 设备项), 由 Rust 侧按分类展平后填充。
     in property <[VcamKbdRow]> vcam_kbd_rows;
     in property <int> vcam_device_index: 0;
@@ -502,6 +518,9 @@ export component AppWindow inherits Window {
     callback refresh_vcam_devices();
     callback install_vcam();
     callback uninstall_vcam();
+    callback sign_vcam_driver();
+    callback bind_vcam_winusb();
+    callback unbind_vcam_winusb();
 
     background: #15181c;
 
@@ -667,6 +686,8 @@ export component AppWindow inherits Window {
                 latency_corrected_text: root.latency_corrected_text;
                 measure_latency <=> root.measure_latency;
                 lat_path: root.lat_path;
+                lat_chart_title: root.lat_chart_title;
+                lat_dev_badge: root.lat_dev_badge;
                 lat_y_max: root.lat_y_max;
                 lat_y_min: root.lat_y_min;
                 lat_point_count: root.lat_point_count;
@@ -702,6 +723,7 @@ export component AppWindow inherits Window {
                 cfg_reset() => { root.cfg_reset(); }
                 settings_export(a, b, c, d, e, f) => { root.settings_export(a, b, c, d, e, f); }
                 settings_import(a, b, c, d, e, f) => { root.settings_import(a, b, c, d, e, f); }
+                algo_metadata_edited(idx, kind, alias, description) => { root.algo_metadata_edited(idx, kind, alias, description); }
                 settings_io_config_count: root.settings_io_config_count;
                 settings_io_channel_params_count: root.settings_io_channel_params_count;
                 settings_io_globals_count: root.settings_io_globals_count;
@@ -953,6 +975,7 @@ export component AppWindow inherits Window {
                 algo_asm: root.algo_asm;
                 algo_metadata_rows: root.algo_metadata_rows;
                 algo_setting_rows: root.algo_setting_rows;
+                algo_report_lines: root.algo_report_lines;
                 algo_setting_edited(idx, v) => { root.algo_setting_edited(idx, v); }
                 g_inactive_sns: root.g_inactive_sns;
                 g_idac_gain: root.g_idac_gain;
@@ -1019,14 +1042,26 @@ export component AppWindow inherits Window {
                 refresh_vcam_devices() => { root.refresh_vcam_devices(); }
                 install_vcam() => { root.install_vcam(); }
                 uninstall_vcam() => { root.uninstall_vcam(); }
+                vcam_signing_status: root.vcam_signing_status;
+                vcam_binding_status: root.vcam_binding_status;
+                vcam_kernel_diag: root.vcam_kernel_diag;
+                vcam_winusb_note: root.vcam_winusb_note;
+                sign_vcam_driver() => { root.sign_vcam_driver(); }
+                bind_vcam_winusb() => { root.bind_vcam_winusb(); }
+                unbind_vcam_winusb() => { root.unbind_vcam_winusb(); }
             }
 
-            if root.current_view == 3: LogPage {
+            LogPage {
+                visible: root.current_view == 3;
                 log_text: root.log_text;
                 log_line_numbers: root.log_line_numbers;
                 log_filter <=> root.log_filter;
                 log_auto_scroll <=> root.log_auto_scroll;
-                log_file_on: root.log_file_on;
+                log_page_start <=> root.log_page_start;
+                log_page_size: root.log_page_size;
+                log_total_lines: root.log_total_lines;
+                log_has_older: root.log_has_older;
+                log_has_newer: root.log_has_newer;
                 log_file_path: root.log_file_path;
                 log_stats: root.log_stats;
                 set_log_filter(v) => { root.set_log_filter(v); }
@@ -1034,7 +1069,6 @@ export component AppWindow inherits Window {
                 clear_log() => { root.clear_log(); }
                 copy_log_all() => { root.copy_log_all(); }
                 open_log_dir() => { root.open_log_dir(); }
-                set_log_file_enabled(v) => { root.set_log_file_enabled(v); }
             }
 
             if root.current_view == 4: AboutPage {

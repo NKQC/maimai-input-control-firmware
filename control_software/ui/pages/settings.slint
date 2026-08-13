@@ -329,7 +329,10 @@ export component SettingsPage inherits Rectangle {
     in property <string> algo_line_numbers: "1";
     in property <[AlgoMetadataRow]> algo_metadata_rows: [];
     in property <[AlgoSettingRow]> algo_setting_rows: [];
+    // 见 app.slint 同名属性的注释: 这一层原先缺失, 整条透传链断在这里。
+    in property <[AlgoReportLine]> algo_report_lines: [];
     callback algo_setting_edited(int, int);
+    callback algo_metadata_edited(int, int, string, string);
     in property <string> algo_status: "";
     in property <bool> algo_busy: false;
     in property <string> algo_phase: "";
@@ -382,12 +385,22 @@ export component SettingsPage inherits Rectangle {
     // 顺序: 0分区绑定|HID触控点位 1协议 2触控通道调整 3触控全局调整 4单通道精调
     //       5触控键盘映射 6物理键盘 7通信系统 8算法。
 
-    VerticalBox {
-        padding: 0px;
-        spacing: 0px;
+    // 设置页内容视口与保存栏解耦：所有子页的自然最小尺寸仅在此裁切视口内处理，
+    // 不能再反向撑大 SettingsPage、把底部操作栏推到客户区外。
+    tab_viewport := Rectangle {
+        x: 0px;
+        y: 0px;
+        width: root.width;
+        height: root.height - 46px;
+        min-width: 0px;
+        min-height: 0px;
+        clip: true;
 
         TabWidget {
-            vertical-stretch: 1;
+            x: 0px;
+            y: 0px;
+            width: parent.width;
+            height: parent.height;
             current-index <=> root.settings_tab;
             // ★保存栏永不丢失的根因修法★ TabWidgetImpl 默认 min-height = 各子页 min-height 最大值
             // + 标签栏高, min-width = max(子页 min-width, 标签栏首选宽 ≈760px)。而 Slint 的盒布局在
@@ -627,6 +640,7 @@ export component SettingsPage inherits Rectangle {
                 active_point_count: root.active_point_count;
                 show_active <=> root.show_active;
                 show_algo_overlay <=> root.show_algo_overlay;
+                algo_report_lines: root.algo_report_lines;
                 active_norm_amp: root.active_norm_amp;
                 curve_t_span_ms: root.curve_t_span_ms;
                 curve_t_end_text: root.curve_t_end_text;
@@ -778,15 +792,19 @@ export component SettingsPage inherits Rectangle {
                 algo_load_template(i) => { root.algo_load_template(i); }
                 algo_source_edited(s) => { root.algo_source_edited(s); }
                 algo_setting_edited(idx, v) => { root.algo_setting_edited(idx, v); }
+                algo_metadata_edited(idx, kind, alias, description) => { root.algo_metadata_edited(idx, kind, alias, description); }
             }
         }
 
         }
+    }
 
-        // 全局保存栏(设置页左下角常驻): 无改动锁定并提示, 有改动提示项数, 保存后即时反馈。
-        // ★固定 46px 是刻意的★: min==max 的项在盒布局里既不被拉伸也不被压缩, 配合上面 TabWidget
-        // 的 min 覆盖, 任何窗口尺寸下这一栏都保有完整 46px 且位于可视区内(严禁再套 ScrollView)。
+        // 全局保存栏固定锚定根层底部，不参与 TabWidget 的最小尺寸协商；因此不会被任一
+        // 子页的内容高度顶出客户区。
         HorizontalBox {
+            x: 0px;
+            y: parent.height - 46px;
+            width: parent.width;
             height: 46px;
             padding-left: 12px;
             padding-right: 12px;
@@ -839,7 +857,6 @@ export component SettingsPage inherits Rectangle {
                 overflow: elide;
             }
         }
-    }
 
     // 覆盖范围弹窗放在 SettingsPage 根层，避免 TabWidget/滚动容器裁剪，且与当前深色主题一致。
     Rectangle {

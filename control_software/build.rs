@@ -5,6 +5,17 @@ fn main() {
 
     slint_build::compile("ui/app.slint").unwrap();
 
+    // ★算法模板经 include_str! 打包, 必须显式声明重编译依赖★
+    // cargo 只跟踪 crate 源码树, 不会感知 ../psoc_firmware 下的文件变化。缺了这两行,
+    // 改完模板重新 build 会直接"Finished in 0.3s"复用旧产物 —— 模板改动静默不生效
+    // (实测: 清掉模板里的中文后界面仍显示旧文本, 误判成解析器还有 bug)。
+    for template in [
+        "../psoc_firmware/algo/psoc_algo_default.c",
+        "../psoc_firmware/algo/psoc_algo_led_demo.c",
+    ] {
+        println!("cargo:rerun-if-changed={template}");
+    }
+
     const PSOC_HEADER: &str = "../main_firmware/src/protocol/psoc/psoc_fw_image.h";
     println!("cargo:rerun-if-changed={PSOC_HEADER}");
     let psoc_source = fs::read_to_string(PSOC_HEADER).expect("read generated PSoC image header");

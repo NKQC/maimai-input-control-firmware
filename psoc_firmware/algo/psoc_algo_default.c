@@ -48,14 +48,19 @@
 /* v3.1 HDR 算法上报/可调重写: 每项设置占 cfg[] 一个字节(UI 每项一个 SpinBox), 每个上报占 report[]
  * 一个 u16。设置默认值: 0 视作"用内置默认"(仅 permille/window, 它们取 0 无意义); bsln_offset 例外
  * (0 即中性偏移, 合法)。 */
-ALGO_REPORT_META(0, "diff", "u16", 0, 65535, "中值滤波后的有效差值，作为主要判定信号", "有效差值")
-ALGO_REPORT_META(1, "env_hi", "u16", 0, 65535, "动态高包络 z_h", "高包络")
-ALGO_REPORT_META(2, "env_lo", "u16", 0, 65535, "动态低包络 z_l", "低包络")
-ALGO_REPORT_META(3, "margin", "u16", 0, 65535, "距离触发或释放阈值的余量", "判定余量")
-ALGO_SETTING_META(0, "rise_permille", "u8", 15, 0, 255, "相对基线的上升触发千分比，0 使用内置默认 15", "上升触发")
-ALGO_SETTING_META(1, "drop_permille", "u8", 25, 0, 255, "下降释放千分比，0 使用内置默认 25", "下降释放")
-ALGO_SETTING_META(2, "window_ms", "u8", 5, 0, 255, "动态包络时间窗口，0 使用内置默认 5ms", "包络窗口")
-ALGO_SETTING_META(3, "bsln_offset", "i8", 0, -128, 127, "加到判定 diff 的有符号基线偏移，0 为中性", "基线偏移")
+/* ★别名与简介不写在这里★ 它们是纯界面文本, 对编译与运行没有任何影响。写进 C 源就意味着中文
+ * 要随源码上传进设备 flash、再回读、再被宏解析器切一遍, 这条往返链上任一处按字节处理都会产出
+ * mojibake(实测踩到两处)。故约定: 固件侧只存 C 源与 ASM; 中文别名/简介由上位机按下面这些
+ * **英文 name** 提供(control_software/src/algo_i18n.rs), 用户覆盖存本地 jit_metadata.json,
+ * 可导入导出分享。name 即契约, 复用同名变量的自定义算法自动获得同一套中文。 */
+ALGO_REPORT_META(0, "diff", "u16", 0, 65535, "", "")
+ALGO_REPORT_META(1, "env_hi", "u16", 0, 65535, "", "")
+ALGO_REPORT_META(2, "env_lo", "u16", 0, 65535, "", "")
+ALGO_REPORT_META(3, "margin", "u16", 0, 65535, "", "")
+ALGO_SETTING_META(0, "rise_permille", "u8", 15, 0, 255, "", "")
+ALGO_SETTING_META(1, "drop_permille", "u8", 25, 0, 255, "", "")
+ALGO_SETTING_META(2, "window_ms", "u8", 5, 0, 255, "", "")
+ALGO_SETTING_META(3, "bsln_offset", "i8", 0, -128, 127, "", "")
 
 /* ---- forward declarations (bodies defined after algo(), see file footer)
  * _udiv1000() is force-inlined via always_inline: it is called twice from

@@ -10,6 +10,18 @@
 #define TELEM_FIELD_STATUS   0x08
 #define TELEM_FIELD_STATS    0x10
 static constexpr uint8_t TELEM_FIELD_LATENCY = 0x20;
+// ★算法运行值随帧上报★ 逐通道追加 out_active(u8) + report[4](u16 LE ×4) = 9B。
+// 为什么不再用 ALGO_GET_TRACE 轮询: 那是"core0 阻塞等 core1 执行"的读类命令, 而设备的 vendor
+// IN 是单响应槽; 独占流以上百帧/s 推送时它几乎抢不到响应窗口, 实测请求成片超时(既无响应也无
+// NAK), 算法变量永远显示"暂无运行值"。改为与 raw/diff 同帧同源: 天然对齐、零额外往返。
+static constexpr uint8_t TELEM_FIELD_ALGO = 0x40;
+// ★触控延迟线的补偿偏差★ int16 dev_min(LE) + int16 dev_max(LE) + u8 flags = 5B。见 latency_stats.h:
+// 语义是"(实际发出 − 采样) − comm.touch_delay_100us", 正=发晚、负=发早, 只有固件算得出。
+// ★为什么另开字段位而不是把它塞进 LATENCY 块★ 帧里字段块的长度由 fields 位决定, 而 fields 是
+// **主机在 TELEM_START 里指定的** ⇒ 新开一位天然向后兼容(旧主机不请求, 固件就不发);
+// 而把 6B 的 LATENCY 块扩成 9B 会让任何不知情的解码方把后面的逐通道数据整片读偏。
+// ★本位用掉了 fields 的最后一个 bit★: 再要新字段必须先扩宽 fields 宽度, 不得复用已退役位。
+static constexpr uint8_t TELEM_FIELD_DELAY_DEV = 0x80;
 
 /**
  * SensorLink exposes immutable PSoC CapSense snapshots on HostCmd telemetry.
@@ -20,6 +32,11 @@ public:
     static SensorLink* getInstance();
 
     void init();
+    // PSoC 设置类命令的单槽延迟终态，由 UsbComm 在响应缓冲空闲时取走并编码 ACK/NAK。
+    bool host_write_active() const { return _host_write.active; }
+    bool take_host_write_terminal(uint8_t* cmd, uint8_t* seq, bool* ok);
+    // Returns true when `frame` is an active duplicate or a bounded terminal replay.
+    bool replay_host_write(const HostFrame& frame, uint8_t* response, uint16_t* response_length);
     // 发送一帧遥测(仅当流处于 emitting 态)。周期由 TxScheduler 定时任务驱动, 本函数不再自门控频率。
     void tick();
 
@@ -31,7 +48,7 @@ public:
     static void emit_focus_task();
     static void focus_lease_expired_task();
 
-    // SweepSession 定时任务入口: 单步推进参数切换、快照统计、最终恢复校准与流式结果发送。
+    // SweepSession 定时任务入口: 单步推进参数切换、快照统计、原参数恢复与流式结果发送。
     void sweep_tick();
     static void emit_sweep_task();
     static void sweep_lease_expired_task();
@@ -47,9 +64,11 @@ public:
     void rescue_tick();
     static void emit_rescue_task();
 
-    // 停止遥测流(清流状态 + 关快照慢路)。新主机会话(HELLO)与 TELEM_STOP 时调用,
-    // 使遗留遥测流不再淹没 vendor 端点、DEVICE_INFO 可正常送达。之后不会自动恢复。
+    // 显式 TELEM_STOP 的永久停止语义：若扫描活跃则取消扫描并完成安全恢复，之后不会自动恢复。
     void stop();
+    // HELLO 的新主机会话语义：清除遗留输出以确保 DEVICE_INFO 可优先送达；扫描活跃时保留其
+    // PSoC 参数恢复链，仅在终态后静默输出，绝不把仍在进行的扫描取消在中间参数上。
+    void prepare_host_session();
 
     // ★主机租约超时用★: 只挂起, 保留 rate/fields/ch_mask/lease 参数。
     // 停流的理由是"上位机疑似丢失", 但 core0 也可能只是被长设备操作(JIT 下发/校准/flash 落地)
@@ -127,13 +146,11 @@ private:
     static constexpr uint8_t SWEEP_GAIN_COUNT = 7;
     static constexpr uint8_t SWEEP_DIV_COUNT = 64;
     enum class SweepPhase : uint8_t {
-        IDLE, SET_CELL, WAIT_PARAMS, READBACK, START_CALIBRATE, WAIT_CALIBRATE, SETTLE, SAMPLE,
-        RESTORE_WRITE, RESTORE_WAIT_PARAMS, RESTORE_READBACK, RESTORE_CALIBRATE,
-        RESTORE_WAIT_CALIBRATE, RESTORE_BASELINE, RESTORE_WAIT_BASELINE, TERMINAL,
-        RESTORE_APPLY, RESTORE_WAIT_APPLY,
+        IDLE, SET_CELL, WAIT_PARAMS, READBACK, SETTLE, SAMPLE,
+        RESTORE_WRITE, TERMINAL,
     };
     enum class SweepDataState : uint8_t { CELL = 1, RESTORING = 2, DONE = 3, CANCELLED = 4, FAILED = 5 };
-    enum class SweepOutputRestore : uint8_t { BROAD, STOPPED };
+    enum class SweepOutputRestore : uint8_t { BROAD, STOPPED, QUIET };
     struct SweepResult {
         uint16_t samples = 0;
         uint16_t mean = 0;
@@ -143,9 +160,7 @@ private:
         uint8_t div = 1;
         uint8_t flags = 0;
         // 该格未取得有效结果时**卡在哪个阶段**(SweepPhase 枚举值; 0=无故障)。
-        // ★为什么必须逐格记★ flags 只能说"这格不可用", 说不出是参数写不进、回读不符、校准被拒
-        // 还是快照代次不推进 —— 而这四种的处置完全不同。阶段码逐格上报后, 任何未知故障都能直接
-        // 定位到状态机的具体一步, 不必再靠复现去猜。
+        // flags 只能说明该格不可用，阶段码用于区分参数应用、回读或快照推进失败。
         uint8_t fail_phase = 0;
 
         void clear() {
@@ -171,6 +186,10 @@ private:
         uint16_t id = 0;
         uint16_t cell = 0;
         uint16_t produced = 0;
+        // 连续失败格数。单格失败记空洞继续扫, 连续失败到阈值才判真故障回滚(见 SWEEP_ABORT_FAIL_RUN)。
+        uint16_t fail_run = 0;
+        bool resolved[SWEEP_TOTAL] = {};
+        bool sampled[SWEEP_TOTAL] = {};
         uint16_t stream_cursor = 0;
         uint16_t resend_cursor = 0;
         uint16_t resend_end = 0;
@@ -179,32 +198,67 @@ private:
         uint8_t channel = 0;
         uint8_t settle_samples = 0;
         uint8_t sample_count = 0;
-        uint16_t phase_ticks = 0;   // 当前阶段已耗周期数: 每个阶段都有硬超时, 任何一步卡住都必然收敛到恢复
+        uint32_t phase_ticks = 0;   // 当前阶段已耗周期数
         uint8_t original_gain = 0;
         uint8_t original_div = 1;
-        uint8_t restore_flags = 0;  // 恢复阶段的异常位(回显在终态帧 flags): 写回/校准/基线各自失败可辨
+        uint8_t restore_flags = 0;  // 原 gain/div 恢复失败位，回显在终态帧 flags。
         uint8_t fail_phase = 0;     // 本会话**首个**失败阶段(SweepPhase 值; 0=至今无故障), 回显在非结果帧
         uint16_t failed_cells = 0;  // 累计无效格数(仅诊断/终态文案用, 不影响流程)
         bool restore_announced = false;
+        bool restoring = false;
+        bool restore_started = false;
         SweepStats stats {};
 
         void clear() {
             phase = SweepPhase::IDLE;
             terminal = SweepDataState::DONE;
             output_restore = SweepOutputRestore::BROAD;
-            id = 0; cell = 0; produced = 0; stream_cursor = 0; resend_cursor = 0; resend_end = 0;
+            id = 0; cell = 0; produced = 0; fail_run = 0;
+            for (uint16_t i = 0; i < SWEEP_TOTAL; ++i) {
+                resolved[i] = false;
+                sampled[i] = false;
+            }
+            stream_cursor = 0; resend_cursor = 0; resend_end = 0;
             last_generation = 0; settle_seen = 0; channel = 0; settle_samples = 0; sample_count = 0;
             phase_ticks = 0; original_gain = 0; original_div = 1; restore_flags = 0;
             fail_phase = 0; failed_cells = 0;
-            restore_announced = false; stats.clear();
+            restore_announced = false; restoring = false; restore_started = false; stats.clear();
         }
         bool active() const { return phase != SweepPhase::IDLE; }
     };
 
     StreamState _stream { false, false };
+    struct HostWriteState {
+        enum class Kind : uint8_t { NONE, PARAM, MODE, GLOBAL, GLOBAL_COMMIT, ALGO_CFG, ALGO_ROM,
+                                   CALIBRATE, BASELINE_RESET, CP_MEASURE };
+        bool active = false;
+        bool complete = false;
+        bool ok = false;
+        Kind kind = Kind::NONE;
+        uint8_t cmd = 0;
+        uint8_t seq = 0;
+        uint8_t a = 0;
+        uint8_t b = 0;
+        uint32_t value = 0;
+        uint8_t rom_count = 0;
+        uint8_t rom_index = 0;
+        uint8_t rom_ch[SENSOR_LINK_CHANNELS] = {};
+        uint16_t rom_value[SENSOR_LINK_CHANNELS] = {};
+
+        void clear() {
+            active = false; complete = false; ok = false; kind = Kind::NONE;
+            cmd = 0; seq = 0; a = 0; b = 0; value = 0; rom_count = 0; rom_index = 0;
+        }
+    };
+    HostWriteState _host_write;
+    uint8_t _host_write_last_cmd = 0;
+    uint8_t _host_write_last_seq = 0;
+    bool _host_write_last_ok = false;
+    uint32_t _host_write_last_ms = 0;
     FocusSession _focus;
     SweepSession _sweep;
     SweepResult _sweep_results[SWEEP_TOTAL] = {};
+    // 已判定格按真实 index 连续发布；空洞也进入 resolved 前缀并发送 samples=0 的空 CELL。
     SavedStreamState _saved_stream;
     uint16_t _focus_session_counter = 0;
     uint16_t _sweep_session_counter = 0;
@@ -243,25 +297,30 @@ private:
     // 返回 true = 已写好 NAK, 调用方直接 return。
     static bool _sweep_busy_reject(const char* what, const HostFrame& frame,
                                    uint8_t* response, uint16_t* response_length);
+    bool _start_host_write(HostWriteState::Kind kind, const HostFrame& frame,
+                           uint8_t a, uint8_t b, uint32_t value);
+    bool _start_next_host_rom();
+    void _poll_host_write();
     void _pause_broad_for_focus();
     void _restore_broad_after_focus();
     void _release_focus_scan();
     void _begin_sweep_restore(SweepDataState terminal);
     bool _emit_sweep_frame(uint16_t index, SweepDataState state, bool retransmit);
     void _finish_sweep_cell();
-    // 扫描阶段的有界超时: 当前格无效后仍逐格继续，最终完成全部 448 格。
-    void _sweep_cell_timeout(uint16_t limit);
+    void _resolve_sweep_tail();
+    // 当前格完成后推进到下一格(顺序全覆盖 0..SWEEP_TOTAL-1)。
+    void _advance_sweep_cell();
+    // 扫描阶段的有界超时: 当前格记空洞后继续下一格。
+    void _sweep_cell_timeout(uint32_t limit);
+    // 当前格判为空洞并推进; 连续失败达阈值才回滚整个会话。
+    void _abort_sweep_cell();
     // 恢复链的有界超时: 记录首个失败阶段并置对应异常位。
     void _sweep_note_fail_phase();
     // 恢复完毕(或终态帧已送达/放弃重试)后的唯一收尾出口: 清会话 + 按 output_restore 复原输出。
     void _finish_sweep_session();
     void _sweep_enter(SweepPhase phase) { _sweep.phase = phase; _sweep.phase_ticks = 0; }
     static bool _sweep_phase_is_restore(SweepPhase phase) {
-        return phase == SweepPhase::RESTORE_WRITE || phase == SweepPhase::RESTORE_WAIT_PARAMS ||
-               phase == SweepPhase::RESTORE_READBACK || phase == SweepPhase::RESTORE_CALIBRATE ||
-               phase == SweepPhase::RESTORE_WAIT_CALIBRATE || phase == SweepPhase::RESTORE_BASELINE ||
-               phase == SweepPhase::RESTORE_WAIT_BASELINE || phase == SweepPhase::TERMINAL ||
-               phase == SweepPhase::RESTORE_APPLY || phase == SweepPhase::RESTORE_WAIT_APPLY;
+        return phase == SweepPhase::RESTORE_WRITE || phase == SweepPhase::TERMINAL;
     }
     static uint16_t _sqrt_u32(uint32_t value);
 
@@ -293,8 +352,7 @@ private:
     static void _handle_algo_reset_default(const HostFrame& frame, uint8_t* response, uint16_t* response_length);
     static void _handle_algo_set_rom(const HostFrame& frame, uint8_t* response, uint16_t* response_length);
     static void _handle_algo_get_rom(const HostFrame& frame, uint8_t* response, uint16_t* response_length);
-    // 算法运行时追踪(report[]/out_active)与可调变量(cfg[8])
-    static void _handle_algo_get_trace(const HostFrame& frame, uint8_t* response, uint16_t* response_length);
+    // 算法可调变量(cfg[8])。运行值(report[]/out_active)无主机命令: 随遥测帧的 TELEM_FIELD_ALGO 走。
     static void _handle_algo_set_cfg(const HostFrame& frame, uint8_t* response, uint16_t* response_length);
     static void _handle_algo_get_cfg(const HostFrame& frame, uint8_t* response, uint16_t* response_length);
     // 算法 C 源(映射表)存取 + ASM 机器码回读

@@ -219,24 +219,8 @@ pub fn decode_algo_len_prefixed(payload: &[u8]) -> Vec<u8> {
     payload[2..end].to_vec()
 }
 
-// ---- 算法运行时追踪(report[]/out_active) + 可调变量(cfg[8]) ----
-
-/// payload = [ch(u8), idx(u8)]
-pub fn encode_algo_get_trace(seq: u8, ch: u8, idx: u8) -> Frame {
-    Frame::new(HostCmd::AlgoGetTrace as u8, 0, seq, vec![ch, idx])
-}
-
-/// 响应 [ch, idx, out_active(u8), report(u16 LE)]
-pub fn decode_algo_get_trace(payload: &[u8]) -> Option<(u8, u8, bool, u16)> {
-    if payload.len() < 5 {
-        return None;
-    }
-    let ch = payload[0];
-    let idx = payload[1];
-    let active = payload[2] != 0;
-    let report = u16::from_le_bytes([payload[3], payload[4]]);
-    Some((ch, idx, active, report))
-}
+// ---- 算法可调变量(cfg[8]) ----
+// 运行值(report[]/out_active)不在这里: 它随遥测帧的 FIELD_ALGO 块到达, 没有对应的请求/响应对。
 
 /// payload = [idx(u8), val(u8)]
 pub fn encode_algo_set_cfg(seq: u8, idx: u8, val: u8) -> Frame {
@@ -264,6 +248,10 @@ pub struct AlgoReportDecl {
     pub range: String,
     pub description: String,
     pub alias: String,
+    /// 声明层面的"是否二值量"。`None` = 旧式 `ALGO_REPORT(idx,name)`，它压根没带类型，
+    /// 这里的未知是真未知，只有这种情况才允许退回按运行数据反推。
+    /// META 声明一律给出确定结论：类型/范围是已知事实，不该等数据到齐才认。
+    pub declared_binary: Option<bool>,
 }
 
 /// 算法可设置变量声明。default 保持 u8 兼容设备 cfg[8]，其余字段来自 META 声明。
@@ -289,6 +277,11 @@ fn _meta_range(args: &[String], min_index: usize) -> String {
     }
 }
 
+/// META 声明的二值判定：类型名点明 bool，或声明范围恰为 `0..1`。
+fn _meta_is_binary(value_type: &str, range: &str) -> bool {
+    value_type.trim().eq_ignore_ascii_case("bool") || range.trim() == "0..1"
+}
+
 /// 从算法 C 源解析旧声明与稳定的 META 扩展声明：
 /// `ALGO_REPORT_META(idx, "name", "type", min, max, "description", "alias")`。
 pub fn parse_algo_reports(src: &str) -> Vec<AlgoReportDecl> {
@@ -297,11 +290,14 @@ pub fn parse_algo_reports(src: &str) -> Vec<AlgoReportDecl> {
         let Some(idx) = args.first().and_then(|v| v.trim().parse().ok()) else {
             continue;
         };
+        let value_type = _meta_text(&args, 2);
+        let range = _meta_range(&args, 3);
         out.push(AlgoReportDecl {
             idx,
             name: _meta_text(&args, 1),
-            value_type: _meta_text(&args, 2),
-            range: _meta_range(&args, 3),
+            declared_binary: Some(_meta_is_binary(&value_type, &range)),
+            value_type,
+            range,
             description: _meta_text(&args, 5),
             alias: _meta_text(&args, 6),
         });
@@ -318,8 +314,11 @@ pub fn parse_algo_reports(src: &str) -> Vec<AlgoReportDecl> {
             idx,
             alias: String::new(),
             name,
+            // 旧式声明只有 idx/name; 下面两项是**展示用兜底**, 不是声明事实,
+            // 所以 declared_binary 必须是 None(未知), 不能被兜底的 u16 冒充成"已知非二值"。
             value_type: "u16".to_string(),
             range: "0..65535".to_string(),
+            declared_binary: None,
             description: String::new(),
         });
     }
@@ -417,49 +416,55 @@ fn _parse_paren_args(src: &str, open_paren_pos: usize) -> Option<(Vec<String>, u
     let mut depth = 0i32;
     let mut in_str = false;
     let mut args = Vec::new();
-    let mut cur = String::new();
+    // ★按字节累积、成段再解码★ 原实现用 `bytes[i] as char` 逐字节推入 String, 会把任何
+    // UTF-8 多字节序列拆成若干 U+0080..U+00FF 字符(mojibake)。于是即便 C 源本身编码完好,
+    // 解析出的宏参数也是乱码 —— 这是"回灌干净源后界面仍乱码"的直接原因。
+    // 逐字节扫描本身安全: 分隔符 ( ) , " \ 全是 ASCII, 且 UTF-8 自同步。
+    let mut cur: Vec<u8> = Vec::new();
+    let flush = |cur: &Vec<u8>| String::from_utf8_lossy(cur).trim().to_string();
     let mut i = open_paren_pos;
     while i < bytes.len() {
-        let c = bytes[i] as char;
+        let b = bytes[i];
         if in_str {
-            cur.push(c);
-            if c == '\\' && i + 1 < bytes.len() {
-                cur.push(bytes[i + 1] as char);
+            cur.push(b);
+            if b == b'\\' && i + 1 < bytes.len() {
+                cur.push(bytes[i + 1]);
                 i += 2;
                 continue;
             }
-            if c == '"' {
+            if b == b'"' {
                 in_str = false;
             }
             i += 1;
             continue;
         }
-        match c {
-            '"' => {
+        match b {
+            b'"' => {
                 in_str = true;
-                cur.push(c);
+                cur.push(b);
             }
-            '(' => {
+            b'(' => {
                 depth += 1;
                 if depth > 1 {
-                    cur.push(c);
+                    cur.push(b);
                 }
             }
-            ')' => {
+            b')' => {
                 depth -= 1;
                 if depth == 0 {
-                    if !cur.trim().is_empty() {
-                        args.push(cur.trim().to_string());
+                    let text = flush(&cur);
+                    if !text.is_empty() {
+                        args.push(text);
                     }
                     return Some((args, i + 1));
                 }
-                cur.push(c);
+                cur.push(b);
             }
-            ',' if depth == 1 => {
-                args.push(cur.trim().to_string());
+            b',' if depth == 1 => {
+                args.push(flush(&cur));
                 cur.clear();
             }
-            _ => cur.push(c),
+            _ => cur.push(b),
         }
         i += 1;
     }
