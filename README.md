@@ -1,7 +1,8 @@
 # mai2control v4
 
 > 仓库：<https://github.com/NKQC/maimai-input-control-firmware/tree/v4>
-> design huhuzhu
+> 
+> design by huhuzhu
 
 ## 免责声明
 
@@ -51,7 +52,7 @@ Slint UI 入口为 `control_software/ui/app.slint`，通用定义位于 `ui/comm
 
 ### 环境依赖
 
-- **PSoC**：ModusToolbox 3.6。固定脚本使用 `%USERPROFILE%\ModusToolbox\tools_3.6\modus-shell\bin\make.exe`；`dev.ps1 build-psoc` 的当前实现使用 `C:\Users\asdfg\ModusToolbox\tools_3.6\modus-shell\bin\bash.exe`。
+- **PSoC**：ModusToolbox 3.6。固定脚本使用 `%USERPROFILE%\ModusToolbox\tools_3.6\modus-shell\bin\make.exe`；`dev.ps1 build-psoc` 的当前实现使用 `C:\Users\asdfg\ModusToolbox\tools_3.6\modus-shell\bin\bash.exe` 自行更换为当前环境的路径。
 - **RP2040**：PlatformIO 与 Arduino-Pico/Earle Philhower 框架。工程目标为 `pico`，主频 133 MHz。
 - **上位机**：Rust/Cargo；使用仓库锁定依赖构建。
 - **算法 blob**：`arm-none-eabi-gcc`、`objcopy`、`nm`、`objdump` 用于将 C 算法编译成 Cortex-M0+ Thumb 机器码并检查产物。脚本会从 ModusToolbox 或 PlatformIO 的工具链目录中查找这些工具。
@@ -85,18 +86,18 @@ powershell -ExecutionPolicy Bypass -File .\dev.ps1 build-blob
 - 36 通道 CapSense/CSD 扫描，支持通道阈值、噪声阈值、基线、IDAC、频率等参数调节与频率自适应；PSoC 侧进行校准并将快照回传。
 - JIT 触控算法引擎：PSoC 从 1 KiB 可执行 SRAM 槽（Thumb 入口 `algo_slot | 1`）执行上传的算法 blob。上传协议为 `ALGO_BEGIN`、`ALGO_PAGE`、`ALGO_END`、`ALGO_INFO`，提交前校验 CRC16；运行中还可使用 `ALGO_SET_ROM`/`ALGO_GET_ROM`、`ALGO_GET_TRACE`、`ALGO_SET_CFG`/`ALGO_GET_CFG`。
 - 算法 ABI v1 的 `algo_io_t` 固定为 128 字节：输入包含 `baseline`、`diff`、`raw`、噪声/触发阈值、`now_ms`、通道号和 `cfg[8]`；`state[64]` 为持久状态；输出包含 `out_active`、`report[4]` 与 `out_led`，并提供每通道只读 `rom`。
-- `ALGO_REPORT(idx, name)` 与 `ALGO_SETTING(idx, name, defval)` 是算法 C 源码中的声明宏，会展开为空；上位机解析源码中的名称和默认值，以生成 `report[]` 可视化及 `cfg[]` 设置项，不是独立的 SPI 帧。
-- 上位机提供遥测展示和单通道精调时间轴；为避免 WinUSB vendor IN 高吞吐导致不稳定，遥测在主机侧按 30 Hz 管理。
+- `ALGO_REPORT(idx, name)` 与 `ALGO_SETTING(idx, name, defval)` C 源码中的声明宏，会展开为空；上位机解析源码中的名称和默认值，以生成 `report[]` 可视化及 `cfg[]` 设置项。
 
 ### 协议、灯光与输入
 
 - 支持 mai2serial 与 mai2light CDC 协议。
-- PIO 驱动 WS2812，并支持将协议中的虚拟灯光单元映射到多个 NeoPixel 地址。
+- 支持将mai2light协议中的虚拟灯光单元映射到多个 NeoPixel 地址。
 - 支持触控区域到 HID 键盘的映射，以及 GPIO1–GPIO12 的物理按键到键盘映射。
 - 支持虚拟扫码摄像头：Rust 组件配合 Media Foundation 媒体源 DLL 提供设备端能力。
 - 配置通道支持 WinUSB 诊断、设备信息和配置交互；固件包含看门狗/BOOTSEL 恢复路径与 PSoC 自动重刷机制。
 
 ### `selftest` 无头诊断
+> [供二次开发agent自持验证使用]
 
 `control_software/src/bin/selftest.rs` 构建为 `selftest`。第一个非 `--` 参数可指定串口；常用选项包括：
 
@@ -121,13 +122,6 @@ powershell -ExecutionPolicy Bypass -File .\dev.ps1 build-blob
 ```
 
 另有 `--vcam-probe`、`--debug-read`、`--cfg-only`、`--telem-only`、`--idle-only`、`--param-dump`、`--algo-dump` 等诊断选项；以 `selftest --help` 和源码实际参数为准。
-
-## 硬件与协议要点
-
-- RP2040 与 PSoC 间采用经电平转换器的 SPI：RP2040 GPIO26 为 SCK、GPIO29 为 CS；由于板上 MOSI/MISO 连线与 RP2040 硬件 SPI1 固定 TX/RX 相反，实际由 PIO 自定义主机使用 GPIO28 输出到 PSoC P1.0、GPIO27 从 PSoC P1.1 输入，PSoC P1.2 为 SCK、P1.3 为 CS。当前 PIO SPI 时钟配置为 3 MHz。
-- RP2040→PSoC SWD 使用 GPIO16（DAT）、GPIO17（CLK）和 GPIO21（RST）；PSoC 自身 SWD 为 P3.2（DAT）与 P3.3（CLK）。`SWD_RELEASE_TO_EXTERNAL` 设为真时，RP2040 会让出该链路供外部 DAP-LINK 使用。
-- CapSense 共 36 个通道，分为 PA、PB、PC、PD 四组；P4.1 为 CSD SHIELD，P4.2 为 2.2 nF CMOD。完整引脚/通道对照以 `hardware.txt` 为准。
-- USB 设备 VID:PID 为 `2E8A:000A`。TinyUSB 配置中 vendor、CDC、HID 实例数分别为 1、2、1；WinUSB vendor RX/TX FIFO 均固定为 64 B。该限制来自已验证的端点行为：增大 vendor TX FIFO 会导致写入数据无法送至 IN 端点，因此高吞吐通过上层队列和降频管理，而不是扩大 FIFO。
 
 ## 相关源码入口
 
