@@ -15,7 +15,7 @@ use nusb::MaybeFuture;
 use nusb::descriptors::TransferType;
 use nusb::transfer::{ControlIn, ControlType, Direction, In, Interrupt, Recipient, TransferError};
 
-use super::driver_pkg;
+use super::{driver_pkg, keyboard};
 
 /// HID 类的 report descriptor 类型号(HID 1.11 §7.1.1)。
 const HID_REPORT_DESCRIPTOR: u8 = 0x22;
@@ -49,46 +49,7 @@ impl Capture {
             .instance()
             .ok_or_else(|| anyhow!("已改绑但读不到 USB 实例 ID"))?
             .to_string();
-        let (vid, pid, serial) = _identity(&instance)?;
-        let mut matched: Vec<nusb::DeviceInfo> = nusb::list_devices()
-            .wait()
-            .map_err(|error| anyhow!("枚举 USB 设备失败：{}", error))?
-            .filter(|info| info.vendor_id() == vid && info.product_id() == pid)
-            .filter(|info| match serial.as_deref() {
-                // 序列号是同型号多台设备的唯一区分依据; 设备没有序列号时才允许按 VID/PID 唯一匹配。
-                Some(want) => info
-                    .serial_number()
-                    .is_some_and(|have| have.eq_ignore_ascii_case(want)),
-                None => true,
-            })
-            .collect();
-        let info = match matched.len() {
-            1 => matched.remove(0),
-            0 => {
-                return Err(anyhow!(
-                    "WinUSB 枚举里找不到 {}（VID_{:04X}/PID_{:04X}）",
-                    instance,
-                    vid,
-                    pid
-                ));
-            }
-            count => {
-                return Err(anyhow!(
-                    "同 VID_{:04X}/PID_{:04X} 匹配到 {} 台设备且无序列号可区分，拒绝任选一台",
-                    vid,
-                    pid,
-                    count
-                ));
-            }
-        };
-        let device = info
-            .open()
-            .wait()
-            .map_err(|error| anyhow!("打开 WinUSB 设备失败：{}", error))?;
-        let interface = device
-            .claim_interface(TARGET_INTERFACE)
-            .wait()
-            .map_err(|error| anyhow!("claim WinUSB 接口 {} 失败：{}", TARGET_INTERFACE, error))?;
+        let interface = _claim(&instance)?;
         _log_report_descriptor(&interface);
         let (address, packet) = _interrupt_in(&interface)?;
         let endpoint = interface
@@ -193,26 +154,73 @@ impl Drop for Capture {
     }
 }
 
-/// `USB\VID_xxxx&PID_xxxx\<尾段>` → (vid, pid, 序列号)。
-/// 尾段含 `&` 时是总线生成的实例路径(设备没报序列号), 此时没有序列号可用于区分同型号设备。
-fn _identity(instance: &str) -> Result<(u16, u16, Option<String>)> {
-    let mut segments = instance.split('\\');
-    let (_, hardware, tail) = (
-        segments.next(),
-        segments
-            .next()
-            .ok_or_else(|| anyhow!("USB 实例 ID 缺少硬件 ID 段：{}", instance))?,
-        segments.next().unwrap_or_default(),
-    );
-    // VID/PID 的取法与 driver_pkg 共用同一份(它已保证是 4 位十六进制), 不另写第二套解析。
-    let field = |key: &str| -> Result<u16> {
-        let text = driver_pkg::hex_field(hardware, key)
-            .ok_or_else(|| anyhow!("USB 硬件 ID 缺少合法 {}xxxx：{}", key, hardware))?;
-        u16::from_str_radix(&text, 16)
-            .map_err(|error| anyhow!("USB 硬件 ID 的 {} 不是十六进制：{}", key, error))
+/// 直读可用性实测: 打开设备 → claim 接口 → 找到可解码的中断 IN 端点, 随即释放。
+///
+/// ★这是"已改绑设备到底还能不能用"的唯一硬判据★ 设备树只能证明它还插着; 而改绑设备的数据只有
+/// 这一条通路, 通路开不开必须实测。★不等按键★ 扫码器空闲时一个报文都不发, 等报告等于把空闲设备
+/// 判成不可用。★绝不抢占正在跑的直读★ claim 是独占的, 对当前捕获目标再 open 会把在跑的会话挤掉,
+/// 故先按设备身份认一次目标(持久化路径与本轮合成的稳定路径写法不同, 整串比会漏认)。
+pub(crate) fn probe(raw_input_path: &str) -> keyboard::DirectRead {
+    if keyboard::capture_running()
+        && keyboard::target_device().is_some_and(|target| {
+            target.eq_ignore_ascii_case(raw_input_path)
+                || keyboard::same_usb_identity(&target, raw_input_path)
+        })
+    {
+        return keyboard::DirectRead::InUse;
+    }
+    let status = driver_pkg::binding_status(raw_input_path);
+    let Some(instance) = status.instance().filter(|_| status.bound()) else {
+        return keyboard::DirectRead::Failed(status.detail());
     };
-    let serial = (!tail.is_empty() && !tail.contains('&')).then(|| tail.to_string());
-    Ok((field("VID_")?, field("PID_")?, serial))
+    match _claim(instance).and_then(|interface| _interrupt_in(&interface)) {
+        Ok((endpoint, packet)) => keyboard::DirectRead::Ready { endpoint, packet },
+        Err(error) => keyboard::DirectRead::Failed(error.to_string()),
+    }
+}
+
+/// 按已改绑的 USB 实例 ID 找到 nusb 设备并 claim 目标接口。
+/// 直读会话与可用性探测共用这一份匹配规则, 免得两条路各自宽松。
+fn _claim(instance: &str) -> Result<nusb::Interface> {
+    let identity = driver_pkg::UsbIdentity::of_usb_instance(instance)
+        .ok_or_else(|| anyhow!("USB 实例 ID 缺少合法 VID/PID：{}", instance))?;
+    let mut matched: Vec<nusb::DeviceInfo> = nusb::list_devices()
+        .wait()
+        .map_err(|error| anyhow!("枚举 USB 设备失败：{}", error))?
+        .filter(|info| info.vendor_id() == identity.vid && info.product_id() == identity.pid)
+        .filter(|info| match identity.serial.as_deref() {
+            // 序列号是同型号多台设备的唯一区分依据; 设备没有序列号时才允许按 VID/PID 唯一匹配。
+            Some(want) => info
+                .serial_number()
+                .is_some_and(|have| have.eq_ignore_ascii_case(want)),
+            None => true,
+        })
+        .collect();
+    let info = match matched.len() {
+        1 => matched.remove(0),
+        0 => {
+            return Err(anyhow!(
+                "WinUSB 枚举里找不到 {}（{}）",
+                instance,
+                identity.vid_pid_text()
+            ));
+        }
+        count => {
+            return Err(anyhow!(
+                "同 {} 匹配到 {} 台设备且无序列号可区分，拒绝任选一台",
+                identity.vid_pid_text(),
+                count
+            ));
+        }
+    };
+    let device = info
+        .open()
+        .wait()
+        .map_err(|error| anyhow!("打开 WinUSB 设备失败：{}", error))?;
+    device
+        .claim_interface(TARGET_INTERFACE)
+        .wait()
+        .map_err(|error| anyhow!("claim WinUSB 接口 {} 失败：{}", TARGET_INTERFACE, error))
 }
 
 /// 找接口上的中断 IN 端点。HID 键盘接口固定有且只有一个。

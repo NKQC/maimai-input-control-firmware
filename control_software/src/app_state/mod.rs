@@ -802,6 +802,14 @@ pub struct AppController {
     /// 为准; 若每次 PARAM_GET 回来都按源通道真值重置, 刚键入的数会被弹回(工程内 ParamEditorRow
     /// 踩过同一个坑)。故只在"选定源通道"与"该项仍为空"时才用真值预填。
     batch_values: [Option<u32>; 11],
+    /// 本次批量会话里已为哪个源通道发过参数回读(`None` = 还没发过)。
+    /// ★为什么需要这一位★ 面板上"通道参数"整列的值只来自 `params[src]` 缓存, 而缓存原先只有
+    /// **单通道精调页**会去填(切通道时发 PARAM_GET_ALL) ⇒ 选一个从没进过精调页的源通道, 整列
+    /// 全是 "—"(用户实测: 必须先进单通道页一次才回显)。选源即回读才是正确口径, 而回读是异步的,
+    /// 所以要记住"已经为谁发过", 否则 tick 会因为"仍有空项"每 16ms 重发一条 PARAM_GET_ALL。
+    /// ★不能用"空项已补齐"当停止条件★: 固件的 PARAM_GET_ALL 本来就不回 0x06/0x09 两项,
+    /// 那两行永远是空的(界面如实显示 "—"), 用空项判据等于永不停发。
+    batch_src_fetched: Option<u8>,
     /// 当前遥测档位: Some(true)=逐通道档, Some(false)=仅统计/延迟轻档, None=未知(需重新下发)。
     telem_scope_channels: Option<bool>,
     /// UI 批量 CSD 操作的 host 侧串行队列(逐通道校准/基线/频率自适应)。见 `ch_ops`。
@@ -1143,6 +1151,7 @@ impl AppController {
             batch_sel_version: 0,
             batch_source: 0,
             batch_values: [None; 11],
+            batch_src_fetched: None,
             telem_scope_channels: None,
             cfg_tx_queue: std::collections::VecDeque::new(),
             cfg_tx_inflight: None,
@@ -2846,6 +2855,32 @@ impl AppController {
         filled
     }
 
+    /// 源通道参数缺值时补一次该通道的回读(与单通道精调页**同一条** `request_params` 路径)。
+    /// 每拍调用一次即可: 已经为当前源发过就直接返回, 不做任何 IO。
+    /// ★为什么不在 `batch_set_source` 里就地发★ 选源那一刻设备可能正忙(`request_params` 遇
+    /// `_device_busy` 会把请求静默丢掉), 丢了就没有第二次机会, 面板会永远停在 "—"。改成待办由
+    /// tick 冲刷, 设备忙时保留待办、下一拍再试。
+    pub fn batch_request_source_params(&mut self) {
+        let src = self.batch_source;
+        if self.batch_src_fetched == Some(src) {
+            return;
+        }
+        // 已经齐了就不必打扰设备(缓存命中直接用)。
+        if crate::proto::BATCH_PARAM_IDS
+            .iter()
+            .all(|id| self.param(src, *id).is_some())
+        {
+            self.batch_src_fetched = Some(src);
+            return;
+        }
+        if self.io.is_none() || self._device_busy() {
+            return;
+        }
+        if self.request_params(src).is_ok() {
+            self.batch_src_fetched = Some(src);
+        }
+    }
+
     /// 预填实现(不动版本号): 供 `batch_set_source` 与 `batch_fill_missing_values` 复用。
     fn _batch_fill_missing(&mut self) -> bool {
         let src = self.batch_source;
@@ -2914,6 +2949,9 @@ impl AppController {
     /// 面板上手改过的待写值 + 源通道。草稿(已经写进 drafts 的改动)不动 —— 那是用户已确认的编辑,
     /// 该由"保存到设备"或"撤销改动"处置, 不属于抽屉的会话状态。
     pub fn batch_drawer_closed(&mut self) {
+        // 回读待办位也属于"本次会话": 清掉它, 下次展开抽屉会重新为源通道拉一次真值,
+        // 免得带着上一次会话的陈旧缓存(期间可能跑过校准/自适应, 设备值已经变了)。
+        self.batch_src_fetched = None;
         let had_ch = self.batch_sel.ch_mask != 0;
         let had_param = self.batch_sel.param_mask != 0;
         let had_value = self.batch_values.iter().any(|v| v.is_some());

@@ -14,6 +14,7 @@
 //! 命令退出码 0 一律不算证据。
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
@@ -26,12 +27,46 @@ const INF_FILE: &str = "mai2vcam.inf";
 const CAT_FILE: &str = "mai2vcam.cat";
 const CER_FILE: &str = "mai2vcam.cer";
 const CERT_SUBJECT: &str = "CN=mai2control vcam WinUSB (self-signed)";
-/// 与 INF 的 `DeviceInterfaceGUIDs` 同一个值: 既供 WinUSB 公开设备接口, 也是"哪一份 oemN.inf
-/// 是我们发布的"这一判定的唯一稳定标记(pnputil 的输出是本地化文案, 不可作为判定依据)。
-const DEVICE_INTERFACE_GUID: &str = "{B7A0F1C2-4E3D-4A5B-9C6D-8E7F00112233}";
+/// INF `[Strings]` 段里本应用自报的两个名字。
+/// ★改绑后它们会盖住设备节点的 `DeviceDesc` / `Manufacturer`★ 于是"现场读设备名"会把本应用的
+/// 名字当成用户扫码器的厂商报出去。故读到这两个值一律弃用(见 `rebound_devices`), 不冒充设备信息。
+const INF_PROVIDER: &str = "mai2control";
+const INF_DEV_DESC: &str = "mai2control vcam scanner (WinUSB)";
+/// 与 INF 的 `DeviceInterfaceGUIDs` 同一个值。三重身份, 缺一不可:
+///   ① 供 WinUSB 公开设备接口(直读靠它);
+///   ② "哪一份 oemN.inf 是本应用发布的"的唯一稳定标记(pnputil 输出是本地化文案, 不可作判据);
+///   ③ ★"这台设备是本应用改绑的"的唯一自带标识★ —— INF 把它写进被改绑设备的硬件键, winusb.sys
+///      据此注册设备接口, 于是该设备一定会出现在这个接口类的枚举里。这个标识活在**设备树上**,
+///      跨重启有效, 与 `toolbox.cfg` 的用户选择、与本应用的所有权记录文件都无关, 因此它才是
+///      "本应用改绑过哪些设备"的真相源(见 `rebound_devices`)。
+/// ★只在这里写一次★ INF/PowerShell 要的文本形式由 `_guid_text()` 从同一常量渲染, 不许两处各写。
+pub(crate) const DEVICE_INTERFACE_GUID: windows::core::GUID =
+    windows::core::GUID::from_u128(0xB7A0F1C2_4E3D_4A5B_9C6D_8E7F00112233);
+
+/// 设备接口类 GUID 的 `{XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX}` 文本形式(INF 正文与 INF 扫描用)。
+/// 必须与已安装 INF 里的写法逐字一致, 故固定大写加花括号。
+fn _guid_text() -> String {
+    let g = DEVICE_INTERFACE_GUID;
+    format!(
+        "{{{:08X}-{:04X}-{:04X}-{:02X}{:02X}-{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}}}",
+        g.data1,
+        g.data2,
+        g.data3,
+        g.data4[0],
+        g.data4[1],
+        g.data4[2],
+        g.data4[3],
+        g.data4[4],
+        g.data4[5],
+        g.data4[6],
+        g.data4[7],
+    )
+}
 pub(crate) const WINUSB_SERVICE: &str = "WinUSB";
 /// 设备栈重建(restart-device / 驱动换绑)需要重新枚举, 实测秒级; 给足余量但必须有上限。
 const REBIND_TIMEOUT: Duration = Duration::from_secs(25);
+/// 错行格式的所有权记录只报一次(一次刷新会读它好几遍)。
+static _MALFORMED_OWNER_LOGGED: AtomicBool = AtomicBool::new(false);
 
 /// 与 `interception::install_dir()` 同级的本应用 WinUSB 驱动包目录。
 fn _dir() -> PathBuf {
@@ -78,15 +113,92 @@ fn _safe_device_text(value: &str) -> bool {
 }
 
 /// 从 `VID_xxxx`/`PID_xxxx` 字段取 4 位十六进制。缺一个就判定这不是 USB 硬件 ID。
-/// WinUSB 直读侧与 UI 的合成设备行也用同一份解析(见 `winusb_scanner` / `ui_callbacks`),
-/// 不再另写第二套。★`pub` 而非 `pub(crate)`★: `ui_callbacks` 属 bin crate, 看不见 `pub(crate)`。
-pub fn hex_field(text: &str, key: &str) -> Option<String> {
+fn hex_field(text: &str, key: &str) -> Option<u16> {
     let at = text.find(key)? + key.len();
     let value: String = text[at..]
         .chars()
         .take_while(char::is_ascii_hexdigit)
         .collect();
-    (value.len() == 4).then_some(value)
+    (value.len() == 4)
+        .then(|| u16::from_str_radix(&value, 16).ok())
+        .flatten()
+}
+
+/// 一台 USB 设备的**稳定身份**: VID/PID + 设备自报序列号。
+///
+/// ★完整实例 ID 不能当身份用★ 设备没报序列号时实例 ID 形如
+/// `USB\VID_x&PID_y\6&<hash>&<port>`, 换口或重新枚举就变; 只把它记下来, 下次开机就认不回来了。
+/// 本类型只保留不会漂移的部分, 所有"记录 ↔ 现场"的对认、可持久化路径的合成都走它。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct UsbIdentity {
+    pub(crate) vid: u16,
+    pub(crate) pid: u16,
+    /// 设备自报序列号; `None` = 设备没报(此时同型号多台无法区分, 反查命中多台一律拒绝, 不猜)。
+    pub(crate) serial: Option<String>,
+}
+
+impl UsbIdentity {
+    /// 从 `USB\VID_xxxx&PID_xxxx\<尾段>` 解析。尾段含 `&` 即总线生成的实例路径, 不是序列号。
+    /// ★这条判据只此一份★ 直读侧(`winusb_scanner`)与改绑侧共用, 免得两套规则各自漂移。
+    pub(crate) fn of_usb_instance(instance: &str) -> Option<Self> {
+        let mut segments = instance.split('\\');
+        let hardware = segments.nth(1)?;
+        let tail = segments.next().unwrap_or_default();
+        Some(Self {
+            vid: hex_field(hardware, "VID_")?,
+            pid: hex_field(hardware, "PID_")?,
+            serial: (!tail.is_empty() && !tail.contains('&')).then(|| tail.to_string()),
+        })
+    }
+
+    /// 从任意带 VID/PID 的串解析(Raw Input HID 路径、本类型合成的稳定路径)。序列号信息无从取得。
+    pub(crate) fn of_text(text: &str) -> Option<Self> {
+        let upper = text.to_ascii_uppercase();
+        Some(Self {
+            vid: hex_field(&upper, "VID_")?,
+            pid: hex_field(&upper, "PID_")?,
+            serial: None,
+        })
+    }
+
+    /// 同一台设备(按 VID/PID; 两边都有序列号时序列号也必须相同)。
+    /// 本方的序列号为 `None` 表示"不知道", 只按 VID/PID 认 —— 这也是反查命中多台时必须拒绝的原因。
+    pub(crate) fn same_device(&self, other: &Self) -> bool {
+        self.vid == other.vid
+            && self.pid == other.pid
+            && match (&self.serial, &other.serial) {
+                (Some(mine), Some(theirs)) => mine.eq_ignore_ascii_case(theirs),
+                _ => true,
+            }
+    }
+
+    /// 界面副文案用的 VID/PID 读数。
+    pub(crate) fn vid_pid_text(&self) -> String {
+        format!("VID_{:04X} PID_{:04X}", self.vid, self.pid)
+    }
+
+    /// **不含漂移字段**的可持久化设备标识, 供已改绑设备当作下拉项的 `path`。
+    ///
+    /// ★为什么不复用原来的 HID 路径★ 那条路径里的 HID 实例尾段随重新枚举而变, 而且改绑后
+    /// 那个 HID 节点根本不存在了; 拿它当持久化键, 每次重新枚举都会对不上、选择随之丢失。
+    /// 尾段挂本应用的设备接口 GUID, 一眼可辨"这是本应用改绑的直读目标"。
+    pub(crate) fn stable_path(&self) -> String {
+        match &self.serial {
+            Some(serial) => format!(
+                r"\\?\USB#VID_{:04X}&PID_{:04X}#{}#{}",
+                self.vid,
+                self.pid,
+                serial,
+                _guid_text()
+            ),
+            None => format!(
+                r"\\?\USB#VID_{:04X}&PID_{:04X}#{}",
+                self.vid,
+                self.pid,
+                _guid_text()
+            ),
+        }
+    }
 }
 
 /// Raw Input HID 路径 → 可改绑的 USB 节点身份。
@@ -104,25 +216,19 @@ fn _resolve_target(raw_input_path: &str) -> Result<_Target> {
             usb_instance
         ));
     }
-    let hardware_tail = usb_instance
-        .split('\\')
-        .nth(1)
-        .ok_or_else(|| anyhow!("USB 实例 ID 缺少硬件 ID 段"))?;
-    let hardware_id = format!("USB\\{}", hardware_tail);
-    // VID/PID 必须都能取到 4 位十六进制，否则这条硬件 ID 不该被写进 INF 的 [Models] 段。
-    for key in ["VID_", "PID_"] {
-        if hex_field(&hardware_id, key).is_none() {
-            return Err(anyhow!(
-                "USB 硬件 ID 缺少合法 {}xxxx（读到 {}）",
-                key,
-                hardware_id
-            ));
-        }
-    }
     Ok(_Target {
-        _hardware_id: hardware_id,
+        _hardware_id: _hardware_id_of(&usb_instance)
+            .ok_or_else(|| anyhow!("USB 实例 ID 缺少合法硬件 ID 段（读到 {}）", usb_instance))?,
         _usb_instance: usb_instance,
     })
+}
+
+/// USB 实例 ID → INF `[Models]` 段要的硬件 ID。
+/// ★必须原样保留 `&MI_xx`★ 复合设备可改绑的是接口节点, 砍掉它会写出一条永远匹配不上的硬件 ID;
+/// 因此这里取整段硬件 ID 文本, 只用 `UsbIdentity` 校验 VID/PID 合法。
+fn _hardware_id_of(instance: &str) -> Option<String> {
+    let tail = instance.split('\\').nth(1)?;
+    UsbIdentity::of_usb_instance(instance).map(|_| format!("USB\\{}", tail))
 }
 
 /// 本应用改绑的所有权记录。
@@ -149,15 +255,44 @@ fn _owner_record() -> Option<_Owner> {
     // 记录文件现按 UTF-8 写(设备产品名可能含非 ASCII)。PowerShell 5.1 的 UTF8 一定带 BOM,
     // 不剥掉首行就永远匹配不上 marker ⇒ 整份记录被判为"不存在"。
     let text = text.trim_start_matches('\u{feff}');
-    let mut lines = text.lines();
-    if lines.next()?.trim() != OWNER_MARKER {
+    let lines: Vec<&str> = text.lines().map(str::trim).collect();
+    if lines.first()?.trim() != OWNER_MARKER {
         return None;
     }
+    // ★兼容一份写坏的历史记录★ 旧写盘脚本里 `@('k=' + $v, ...)` 被 PowerShell 当成
+    // `@('k=', $v, ...)`(逗号优先级高于 `+`), 于是每个字段都被拆成"键行 + 值行"两行,
+    // 按 `key=value` 读一律得到空串 —— 实例 ID 因此读不到, 已改绑的设备就从下拉里彻底消失。
+    // 写盘侧已修(见 `install_and_bind`), 但用户机上那份还在, 只能在读侧认回:
+    // 键行为空值且下一行不是键行时, 取下一行作为它的值。
     let field = |key: &str| -> String {
-        text.lines()
-            .find_map(|line| line.trim().strip_prefix(key).map(str::to_string))
+        lines
+            .iter()
+            .enumerate()
+            .find_map(|(at, line)| {
+                let value = line.strip_prefix(key)?;
+                if !value.is_empty() {
+                    return Some(value.to_string());
+                }
+                lines
+                    .get(at + 1)
+                    .filter(|next| !next.is_empty() && !next.contains('='))
+                    .map(|next| next.to_string())
+            })
             .unwrap_or_default()
     };
+    // 认回错行格式时留一次痕: 这是"记录读不出实例 ID ⇒ 改绑设备从下拉里消失"那条故障的现场凭据,
+    // 也说明这份文件出自旧写盘脚本。只报一次 —— 一次刷新会读它好几遍。
+    if lines.iter().enumerate().any(|(at, line)| {
+        line.ends_with('=')
+            && lines
+                .get(at + 1)
+                .is_some_and(|next| !next.is_empty() && !next.contains('='))
+    }) && !_MALFORMED_OWNER_LOGGED.swap(true, Ordering::Relaxed)
+    {
+        log::warn!(
+            "虚拟摄像头: 改绑所有权记录是旧写盘脚本留下的错行格式（键与值分处两行），已按行对读回；下次改绑会重写为正常格式"
+        );
+    }
     Some(_Owner {
         _published: field("published="),
         _thumbprint: field("thumbprint="),
@@ -168,27 +303,96 @@ fn _owner_record() -> Option<_Owner> {
     })
 }
 
-/// 改绑前登记的原始设备身份。改绑后目标从键盘枚举里消失, 界面上那条合成行的名字与端点读数
-/// 都只能从这里恢复; 拿不到的项一律留空, 由渲染侧显示"未知"。
-pub struct ReboundIdentity {
-    /// 总线上报的产品名(设备管理器"总线报告的设备说明"), 即用户认得的那个名字。
-    pub product: String,
-    /// HID 集合行显示名(接口/集合标识)。
-    pub label: String,
-    pub vendor: String,
-    /// 改绑时登记的 USB 节点实例 ID。
-    pub instance: String,
+/// 一台**已被本应用改绑到 WinUSB** 的设备。它已从键盘枚举里整体消失(Windows 不再为它建键盘栈),
+/// 因此只能由本结构把它补回可选输入源列表(见 `keyboard::list_input_sources`)。
+pub(crate) struct ReboundDevice {
+    /// 不含漂移字段的可持久化标识(见 `UsbIdentity::stable_path`)。
+    pub(crate) path: String,
+    /// 现场 USB 节点实例 ID。会随换口/重新枚举漂移, 只作显示与排查, 不作身份。
+    pub(crate) instance: String,
+    /// 实测功能驱动名(必为 `WinUSB`, 否则这台设备不会出现在本列表里)。
+    pub(crate) service: String,
+    pub(crate) vid_pid: String,
+    /// 用户认得的名字: 改绑前登记的产品名优先, 记录缺失时退回现场读 USB 节点的总线上报名。
+    pub(crate) product: String,
+    pub(crate) label: String,
+    pub(crate) vendor: String,
 }
 
-/// 取所有权记录里登记的原始设备身份。没有记录返回 None(渲染侧据此如实显示"未知")。
-pub fn rebound_identity() -> Option<ReboundIdentity> {
-    let owner = _owner_record()?;
-    Some(ReboundIdentity {
-        product: owner._product,
-        label: owner._label,
-        vendor: owner._vendor,
-        instance: owner._instance,
-    })
+/// 现场枚举"本应用改绑过、且此刻在位"的设备。
+///
+/// ★判据是设备自带的标识, 不是用户的持久化选择★ 旧实现把这条合成行挂在 `toolbox.cfg` 的
+/// `vcam_kbd` 上: 一旦该选择被清空(选过一次"所有键盘"/换机器/换 exe 目录), 或所有权记录里的
+/// 实例 ID 读不出来, 改绑过的设备就在界面上彻底不存在, 用户再也选不回来、直读随之停摆 ——
+/// 这正是"改成 WinUSB 的 HIDKeyBoard 重启后从下拉里消失"的成因。
+/// 现在改为按 `DEVICE_INTERFACE_GUID` 从设备树枚举: 那是 INF 在改绑时写进设备硬件键的标识,
+/// 只要设备还绑在本应用的驱动包上就一定在, 与任何本地文件无关。
+///
+/// 所有权记录退化为**名字的来源**(设备已不在键盘枚举里, 改绑前的产品名只能从那里恢复), 外加一条
+/// 兜底线索: 接口枚举没命中时, 仍按记录里的实例 / 稳定身份反查一次。
+pub(crate) fn rebound_devices() -> Vec<ReboundDevice> {
+    let owner = _owner_record();
+    let recorded = owner
+        .as_ref()
+        .map(|owner| owner._instance.to_ascii_uppercase())
+        .filter(|instance| _safe_device_text(instance) && instance.starts_with("USB\\"));
+    let recorded_identity = recorded.as_deref().and_then(UsbIdentity::of_usb_instance);
+    // ① 设备自带标识(真相源) ② 记录里登记的实例 ③ 按记录的稳定身份反查现场 WinUSB 节点
+    let mut candidates = keyboard::present_interface_instances(&DEVICE_INTERFACE_GUID);
+    candidates.extend(recorded);
+    if let Some(identity) = &recorded_identity
+        && let Ok(instance) = _scan_winusb_instance(identity)
+    {
+        candidates.push(instance);
+    }
+    let mut out: Vec<ReboundDevice> = Vec::new();
+    for instance in candidates {
+        let instance = instance.to_ascii_uppercase();
+        // 只认现场读得到、且功能驱动实测仍是 WinUSB 的节点: 设备拔了、或已恢复成 hidusb 的
+        // 陈旧接口记录一律不上界面(接口注册键在设备离场后仍留在注册表里)。
+        let Some(service) = keyboard::device_service(&instance)
+            .filter(|service| service.eq_ignore_ascii_case(WINUSB_SERVICE))
+        else {
+            continue;
+        };
+        let Some(identity) = UsbIdentity::of_usb_instance(&instance) else {
+            continue;
+        };
+        let path = identity.stable_path();
+        if out.iter().any(|have| have.path == path) {
+            continue;
+        }
+        // 记录里的名字只在确认是同一台设备时才采用, 否则那是另一台设备的登记。
+        let logged = owner
+            .as_ref()
+            .filter(|_| recorded_identity.as_ref().is_some_and(|id| *id == identity));
+        let named = |value: Option<&String>| -> Option<String> {
+            value.filter(|text| !text.trim().is_empty()).cloned()
+        };
+        // 现场读到的名字里, 凡是本应用 INF 自报的那两个串一律弃用: 那是我们盖上去的, 不是设备信息。
+        let live = |value: String| {
+            (!value.is_empty()
+                && !value.eq_ignore_ascii_case(INF_PROVIDER)
+                && !value.eq_ignore_ascii_case(INF_DEV_DESC))
+            .then_some(value)
+        };
+        let (live_product, live_vendor) = keyboard::node_identity(&instance);
+        let product = named(logged.map(|owner| &owner._product))
+            .or_else(|| live(live_product))
+            .unwrap_or_else(|| format!("已改绑设备 {}", identity.vid_pid_text()));
+        out.push(ReboundDevice {
+            label: named(logged.map(|owner| &owner._label)).unwrap_or_else(|| product.clone()),
+            vendor: named(logged.map(|owner| &owner._vendor))
+                .or_else(|| live(live_vendor))
+                .unwrap_or_default(),
+            product,
+            vid_pid: identity.vid_pid_text(),
+            path,
+            instance,
+            service,
+        });
+    }
+    out
 }
 
 /// 写进所有权记录的一行文案。记录是行分隔的 `key=value`, 因此换行/回车必须去掉;
@@ -311,43 +515,72 @@ impl BindingStatus {
 /// 因此先按现场设备树解析, 解析不到时回落到所有权记录里登记过的 USB 实例(仅当 VID/PID 与所选
 /// 路径一致才采用), 两条都不成立才报未确认。
 pub fn binding_status(raw_input_path: &str) -> BindingStatus {
-    let instance = match _resolve_target(raw_input_path) {
-        Ok(target) => target._usb_instance,
-        Err(live_error) => match _recorded_instance(raw_input_path) {
-            Some(instance) => instance,
-            None => {
-                return BindingStatus::Unknown {
-                    reason: format!("{}；也没有本应用的改绑记录可核对", live_error),
-                };
+    let mut unknown_reasons: Vec<String> = Vec::new();
+    let mut candidates: Vec<String> = Vec::new();
+    match _resolve_target(raw_input_path) {
+        Ok(target) => candidates.push(target._usb_instance),
+        Err(live_error) => unknown_reasons.push(live_error.to_string()),
+    }
+    candidates.extend(_recorded_instance(raw_input_path));
+    for instance in candidates {
+        match keyboard::device_service(&instance) {
+            Some(service) if service.eq_ignore_ascii_case(WINUSB_SERVICE) => {
+                return BindingStatus::Bound { instance };
+            }
+            Some(service) => return BindingStatus::Other { instance, service },
+            None => unknown_reasons.push(format!(
+                "读不到 {} 的 SPDRP_SERVICE（该实例可能已不在场）",
+                instance
+            )),
+        }
+    }
+    // ★最后一级: 按稳定身份反查现场★ 无序列号的设备实例 ID 换口/重新枚举就变, 记录随之变陈旧;
+    // 此时只剩"按 VID/PID(+序列号) 从 USB 枚举里找出仍绑在 WinUSB 上的那个节点"这条路。
+    match _selected_identity(raw_input_path).ok_or_else(|| {
+        anyhow!(
+            "所选路径里没有合法的 VID/PID（读到 {}），无法反查",
+            raw_input_path
+        )
+    }) {
+        Ok(identity) => match _scan_winusb_instance(&identity) {
+            Ok(instance) => BindingStatus::Bound { instance },
+            Err(scan_error) => {
+                unknown_reasons.push(scan_error.to_string());
+                BindingStatus::Unknown {
+                    reason: unknown_reasons.join("；"),
+                }
             }
         },
-    };
-    match keyboard::device_service(&instance) {
-        Some(service) if service.eq_ignore_ascii_case(WINUSB_SERVICE) => {
-            BindingStatus::Bound { instance }
+        Err(error) => {
+            unknown_reasons.push(error.to_string());
+            BindingStatus::Unknown {
+                reason: unknown_reasons.join("；"),
+            }
         }
-        Some(service) => BindingStatus::Other { instance, service },
-        None => BindingStatus::Unknown {
-            reason: format!("读不到 {} 的 SPDRP_SERVICE（设备可能已不在场）", instance),
-        },
     }
 }
 
 /// 所有权记录里登记的 USB 实例，且其 VID/PID 必须与当前所选路径一致。
 fn _recorded_instance(raw_input_path: &str) -> Option<String> {
-    let owner = _owner_record()?;
-    let instance = owner._instance.to_ascii_uppercase();
+    let want = UsbIdentity::of_text(raw_input_path)?;
+    let instance = _owner_record()?._instance.to_ascii_uppercase();
     if !_safe_device_text(&instance) || !instance.starts_with("USB\\") {
         return None;
     }
-    let selected = raw_input_path.to_ascii_uppercase();
-    let matches = ["VID_", "PID_"].iter().all(|key| {
-        match (hex_field(&instance, key), hex_field(&selected, key)) {
-            (Some(left), Some(right)) => left == right,
-            _ => false,
-        }
-    });
-    matches.then_some(instance)
+    UsbIdentity::of_usb_instance(&instance)?
+        .same_device(&want)
+        .then_some(instance)
+}
+
+/// 所选路径对应的稳定身份。所有权记录登记的身份优先——只有它带得出序列号，
+/// 而序列号是同型号多台设备唯一的区分依据；记录不是这台设备时退回路径自带的 VID/PID。
+fn _selected_identity(raw_input_path: &str) -> Option<UsbIdentity> {
+    let from_path = UsbIdentity::of_text(raw_input_path)?;
+    let recorded = _owner_record()
+        .as_ref()
+        .and_then(|owner| UsbIdentity::of_usb_instance(&owner._instance))
+        .filter(|recorded| recorded.same_device(&from_path));
+    Some(recorded.unwrap_or(from_path))
 }
 
 /// PowerShell 单引号字符串字面量。单引号内不做任何展开, 只需把 `'` 自身翻倍。
@@ -412,7 +645,7 @@ fn _ps_find_published(var: &str) -> String {
         "$hit = Get-ChildItem -LiteralPath (Join-Path $env:SystemRoot 'INF') -Filter 'oem*.inf' -ErrorAction SilentlyContinue | \
          Where-Object {{ (Get-Content -LiteralPath $_.FullName -Raw -ErrorAction SilentlyContinue) -like {guid_like} }} | Select-Object -First 1\n\
          if ($hit) {{ {var} = $hit.Name }}\n",
-        guid_like = _ps(&format!("*{}*", DEVICE_INTERFACE_GUID)),
+        guid_like = _ps(&format!("*{}*", _guid_text())),
         var = var,
     )
 }
@@ -537,8 +770,8 @@ Include = winusb.inf
 Needs   = WINUSB.NT.Services
 
 [Strings]
-Provider  = "mai2control"
-Dev.Desc  = "mai2control vcam scanner (WinUSB)"
+Provider  = "@@PROVIDER@@"
+Dev.Desc  = "@@DESC@@"
 "#;
 
 /// 把 INF 正文渲染成 PowerShell 字符串数组字面量。
@@ -550,7 +783,9 @@ fn _inf_ps_array(hardware_id: &str) -> String {
     let text = INF_TEMPLATE
         .replace("@@CAT@@", CAT_FILE)
         .replace("@@HWID@@", hardware_id)
-        .replace("@@GUID@@", DEVICE_INTERFACE_GUID);
+        .replace("@@GUID@@", &_guid_text())
+        .replace("@@PROVIDER@@", INF_PROVIDER)
+        .replace("@@DESC@@", INF_DEV_DESC);
     let body: Vec<String> = text.lines().map(_ps).collect();
     format!("@(\n{}\n)", body.join(",\n"))
 }
@@ -651,19 +886,17 @@ pub fn sign_and_trust() -> Result<String> {
 /// 取 INF 需要的硬件 ID。现场设备树优先；设备已改绑(HID 节点已消失)时回落到所有权记录，
 /// 使"改绑后再重新签名"这一步不至于因为拿不到 HID 父节点而失败。
 fn _hardware_id_for(raw_input_path: &str) -> Result<String> {
-    match _resolve_target(raw_input_path) {
-        Ok(target) => Ok(target._hardware_id),
-        Err(live_error) => {
-            let instance = _recorded_instance(raw_input_path).ok_or_else(|| {
-                anyhow!("{}；也没有本应用的改绑记录可用于取硬件 ID", live_error)
-            })?;
-            let tail = instance
-                .split('\\')
-                .nth(1)
-                .ok_or_else(|| anyhow!("改绑记录里的 USB 实例 ID 缺少硬件 ID 段"))?;
-            Ok(format!("USB\\{}", tail))
-        }
+    if let Ok(target) = _resolve_target(raw_input_path) {
+        return Ok(target._hardware_id);
     }
+    // 已改绑(HID 节点已消失)时用同一条绑定判定链找回 USB 节点: 记录、以及按稳定身份的现场反查
+    // 都在 `binding_status` 里, 这里不再写第二套降级。
+    let status = binding_status(raw_input_path);
+    let instance = status
+        .instance()
+        .ok_or_else(|| anyhow!("取不到可用于生成硬件 ID 的 USB 节点：{}", status.detail()))?;
+    _hardware_id_of(instance)
+        .ok_or_else(|| anyhow!("USB 实例 ID {} 缺少合法硬件 ID 段", instance))
 }
 
 fn _sign_failure_detail(lines: &[String]) -> String {
@@ -703,6 +936,12 @@ fn _await_binding(instance: &str, want_winusb: bool) -> Result<String> {
 }
 
 /// 步骤 ②：发布驱动包并把所选设备改绑到 WinUSB。签名未就绪时直接拒绝，绝不隐式代做签名。
+///
+/// ★所有权记录必须逐行 `$rec += ('key=' + $value)` 地拼★ 绝不要图省事写成
+/// `@('key=' + $a, 'key2=' + $b)`: PowerShell 的逗号优先级**高于** `+`, 那种写法会被解析成
+/// `@('key=', $a, 'key2=', $b)`, 于是每个字段都被写成"键行 + 值行"两行, 按 `key=value` 读一律
+/// 得到空串。实测后果: 记录里的 `instance=` 读不出来 ⇒ `binding_status` 判 `Unknown` ⇒
+/// 已改绑的设备从下拉里彻底消失, 用户再也选不回来。
 pub fn install_and_bind(raw_input_path: &str) -> Result<String> {
     let status = signing_status();
     if !status.ready() {
@@ -747,8 +986,14 @@ pub fn install_and_bind(raw_input_path: &str) -> Result<String> {
              $thumb = ''\n\
              if (Test-Path -LiteralPath {owner}) {{ foreach ($l in (Get-Content -LiteralPath {owner})) {{ \
              if ($l -like 'thumbprint=*') {{ $thumb = $l.Substring(11) }} }} }}\n\
-             Set-Content -LiteralPath {owner} -Value @({marker}, 'published=' + $pub, 'thumbprint=' + $thumb, \
-             'instance=' + {instance}, 'product=' + {product}, 'label=' + {label}, 'vendor=' + {vendor}) -Encoding UTF8\n\
+             $rec = @({marker})\n\
+             $rec += ('published=' + $pub)\n\
+             $rec += ('thumbprint=' + $thumb)\n\
+             $rec += ('instance=' + {instance})\n\
+             $rec += ('product=' + {product})\n\
+             $rec += ('label=' + {label})\n\
+             $rec += ('vendor=' + {vendor})\n\
+             Set-Content -LiteralPath {owner} -Value $rec -Encoding UTF8\n\
              Set-Content -LiteralPath {result} -Value $lines -Encoding UTF8\n",
             inf = _ps_path(&_pkg_dir().join(INF_FILE)),
             find_pub = _ps_find_published("$pub"),
@@ -788,27 +1033,16 @@ pub fn install_and_bind(raw_input_path: &str) -> Result<String> {
 /// ★恢复路径的最后一层兜底★ 改绑后 HID 节点消失, "Raw Input 路径 → HID → USB 父节点"这条换算
 /// 已断; 所有权记录里的 `instance=` 又可能缺失/被写空。此时只剩这一条路。
 /// 同型号有多台都在 WinUSB 上时**必须停下**: 猜错一台就会把用户另一台设备一起改回去。
-fn _scan_winusb_instance(raw_input_path: &str) -> Result<String> {
-    let selected = raw_input_path.to_ascii_uppercase();
-    let (vid, pid) = match (hex_field(&selected, "VID_"), hex_field(&selected, "PID_")) {
-        (Some(vid), Some(pid)) => (vid, pid),
-        _ => {
-            return Err(anyhow!(
-                "所选设备路径里没有合法的 VID/PID（读到 {}），无法从设备树反查 USB 节点",
-                raw_input_path
-            ));
-        }
-    };
+fn _scan_winusb_instance(identity: &UsbIdentity) -> Result<String> {
     let mut hits: Vec<String> = Vec::new();
     for instance in keyboard::present_usb_instances() {
         let upper = instance.to_ascii_uppercase();
-        if hex_field(&upper, "VID_").as_deref() != Some(vid.as_str())
-            || hex_field(&upper, "PID_").as_deref() != Some(pid.as_str())
-            || !_safe_device_text(&upper)
+        if !_safe_device_text(&upper)
+            || !UsbIdentity::of_usb_instance(&upper).is_some_and(|have| have.same_device(identity))
         {
             continue;
         }
-        if keyboard::device_service(&instance)
+        if keyboard::device_service(&upper)
             .is_some_and(|service| service.eq_ignore_ascii_case(WINUSB_SERVICE))
         {
             hits.push(upper);
@@ -817,16 +1051,14 @@ fn _scan_winusb_instance(raw_input_path: &str) -> Result<String> {
     match hits.len() {
         1 => Ok(hits.remove(0)),
         0 => Err(anyhow!(
-            "设备树里没有 VID_{}&PID_{} 且功能驱动为 {} 的 USB 节点（设备可能已拔出，或早已不在 WinUSB 上）",
-            vid,
-            pid,
+            "设备树里没有 {} 且功能驱动为 {} 的 USB 节点（设备可能已拔出，或早已不在 WinUSB 上）",
+            identity.vid_pid_text(),
             WINUSB_SERVICE
         )),
         n => Err(anyhow!(
-            "设备树里有 {} 个 VID_{}&PID_{} 的节点都绑在 {} 上，无法判定该恢复哪一个；请只保留目标设备后重试",
+            "设备树里有 {} 个 {} 的节点都绑在 {} 上且无序列号可区分，无法判定是哪一台；请只保留目标设备后重试",
             n,
-            vid,
-            pid,
+            identity.vid_pid_text(),
             WINUSB_SERVICE
         )),
     }
@@ -873,11 +1105,13 @@ pub fn unbind_and_uninstall(raw_input_path: &str) -> Result<String> {
     } else {
         String::new()
     };
-    let instance = match binding_status(raw_input_path).instance() {
-        Some(instance) => instance.to_string(),
-        None => _scan_winusb_instance(raw_input_path)
-            .map_err(|error| anyhow!("无法定位要恢复的 USB 节点：{}", error))?,
-    };
+    // 绑定判定链本身已含"按稳定身份反查现场 WinUSB 节点"这一级(见 `binding_status`),
+    // 这里不再重复一套降级。
+    let status = binding_status(raw_input_path);
+    let instance = status
+        .instance()
+        .map(str::to_string)
+        .ok_or_else(|| anyhow!("无法定位要恢复的 USB 节点：{}", status.detail()))?;
     let dir = _dir();
     let lines = _run_elevated_script("unbind", |result| {
         format!(

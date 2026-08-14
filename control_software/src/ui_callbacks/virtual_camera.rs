@@ -54,10 +54,9 @@ pub(crate) fn initialize(
         vcam::kernel_driver_feasibility()
     );
     ui.set_vcam_install_status(install_status.into());
-    // 可选 HID 键盘列表(下拉索引 0 = 所有键盘, 之后按此 Vec 顺序对应)。
+    // 可选输入源列表(下拉索引 0 = 所有键盘, 之后按此 Vec 顺序对应)。
     // 启动即按持久化的设备路径恢复选择: 设备不在场时回落到"所有键盘", 不静默失效。
-    let saved = controller.borrow().vcam_kbd_device();
-    refresh_vcam_devices(ui, &state.vcam_kbd_list, &saved);
+    let (_, saved) = refresh_vcam_devices(ui, &state.vcam_kbd_list, controller);
     apply_winusb_status(ui, winusb_status_texts(&saved));
 }
 
@@ -400,11 +399,10 @@ pub(crate) fn register_callbacks(
     let kbd_list_refresh = state.vcam_kbd_list.clone();
     ui.on_refresh_vcam_devices(move || {
         let ui = ui_kbd.upgrade().unwrap();
-        let saved = ctrl_clone.borrow().vcam_kbd_device();
-        let count = refresh_vcam_devices(&ui, &kbd_list_refresh, &saved);
+        let (count, saved) = refresh_vcam_devices(&ui, &kbd_list_refresh, &ctrl_clone);
         ctrl_clone
             .borrow_mut()
-            .push_log(format!("虚拟摄像头: 已刷新键盘设备列表, 共 {} 个", count));
+            .push_log(format!("虚拟摄像头: 已刷新输入源列表, 共 {} 个", count));
         // 绑定也可能被设备管理器等外部手段改掉，刷新时一并重新实测。
         // 放工作线程: 签名核验要起 PowerShell，压在事件循环上会明显卡顿。
         let ui_status = ui_kbd.clone();
@@ -476,9 +474,13 @@ fn _spawn_winusb_action(
 /// 同时成立时只报最强的那一个。
 #[inline]
 fn _name_prefix(dev: &vcam::keyboard::KeyboardDevice) -> &'static str {
-    use vcam::keyboard::KbdIface;
+    use vcam::keyboard::{DirectRead, KbdIface};
     if dev.rebound {
-        return "[WinUSB 直读] ";
+        // 已改绑设备只有直读这一条通路: 通路开不开是唯一值得摊在名字前面的事实。
+        return match dev.direct_read {
+            DirectRead::Failed(_) => "[已改绑 · 现在读不到] ",
+            _ => "[本程序直读] ",
+        };
     }
     match (dev.kbd_iface, dev.rawinput_visible) {
         (KbdIface::Failed(_), _) => "[系统收不到输入] ",
@@ -487,70 +489,19 @@ fn _name_prefix(dev: &vcam::keyboard::KeyboardDevice) -> &'static str {
     }
 }
 
-/// 重新枚举 HID 键盘并刷新设备树: 首行固定"所有键盘"(dev_index=0),
+/// 重新枚举可选输入源并刷新设备树: 首行固定"所有键盘"(dev_index=0),
 /// 之后按分类插入组头, 组内设备 dev_index = 在 `list` 中的下标 + 1。
-/// `saved_path` 非空且仍在场 → 恢复该选择并生效; 否则回落"所有键盘"。返回设备个数。
+/// 持久化路径仍能认出某台设备 → 恢复该选择并生效; 否则回落"所有键盘"。
+/// 返回 (设备个数, 当前生效的持久化路径)。
 pub(crate) fn refresh_vcam_devices(
     ui: &AppWindow,
     list: &Rc<RefCell<Vec<vcam::keyboard::KeyboardDevice>>>,
-    saved_path: &str,
-) -> usize {
-    let mut devices = vcam::keyboard::list_keyboards();
-    // ★已改绑 WinUSB 的目标必然从键盘枚举里消失★(Windows 不再为它建键盘栈)。若照常判定为
-    // "设备已拔出"而回落到"所有键盘", 用户就再也选不回刚改绑的扫码器, 直读也随之停摆。
-    // 故按所有权记录补一条合成项, 保持它可选、可恢复。
-    if !saved_path.trim().is_empty()
-        && !devices
-            .iter()
-            .any(|device| device.path.eq_ignore_ascii_case(saved_path))
-        && vcam::driver_pkg::binding_status(saved_path).bound()
-    {
-        // 端点读数只能落在 USB 节点上: HID 节点已随改绑消失, 这里如实标注"HID 节点已消失"而非留空。
-        let status = vcam::driver_pkg::binding_status(saved_path);
-        let usb_node = status.instance().unwrap_or("未知").to_string();
-        let service = vcam::keyboard::device_service(&usb_node).unwrap_or_else(|| "未知".into());
-        // ★原名从改绑前的登记里恢复★ 占位名("已改绑 WinUSB 的扫码器")既认不出是哪台设备,
-        // 也把端点读数挤掉了。名字与 VID/PID 只能来自所有权记录 —— 设备已不在键盘枚举里,
-        // 现场再也查不到。老记录没登记这些字段时如实显示"未知（改绑前未登记设备名）", 不编造。
-        let identity = vcam::driver_pkg::rebound_identity();
-        let recorded = |value: Option<&String>| -> Option<String> {
-            value.filter(|text| !text.trim().is_empty()).cloned()
-        };
-        let product = recorded(identity.as_ref().map(|id| &id.product))
-            .unwrap_or_else(|| "未知（改绑前未登记设备名）".to_string());
-        let label = recorded(identity.as_ref().map(|id| &id.label)).unwrap_or_else(|| product.clone());
-        let vendor = recorded(identity.as_ref().map(|id| &id.vendor)).unwrap_or_default();
-        // 端点行与普通行同口径: VID/PID + 实例 + 实测 service; 拿不到的项写"未知"。
-        let vid_pid = match (
-            vcam::driver_pkg::hex_field(&usb_node.to_ascii_uppercase(), "VID_"),
-            vcam::driver_pkg::hex_field(&usb_node.to_ascii_uppercase(), "PID_"),
-        ) {
-            (Some(vid), Some(pid)) => format!("VID_{} PID_{}", vid, pid),
-            _ => "VID/PID 未知".to_string(),
-        };
-        devices.insert(
-            0,
-            vcam::keyboard::KeyboardDevice {
-                path: saved_path.to_string(),
-                label,
-                detail: format!("{}  ·  USB 实例 {}", vid_pid, usb_node),
-                category: vcam::keyboard::CAT_USB.to_string(),
-                parent_key: saved_path.to_string(),
-                product,
-                vendor,
-                rawinput_visible: false,
-                // 改绑后 HID 节点整体消失, 键盘接口无从探测 —— 如实记 Unprobed, 不冒充结论。
-                kbd_iface: vcam::keyboard::KbdIface::Unprobed,
-                endpoint_text: format!(
-                    "HID 节点已随改绑消失 · service={} · 系统输入=未知 · RawInput=不可见 · {} · USB节点={}",
-                    service, vid_pid, usb_node
-                ),
-                service,
-                rebound: true,
-            },
-        );
-    }
-    let devices = devices;
+    controller: &Rc<RefCell<AppController>>,
+) -> (usize, String) {
+    let mut saved_path = controller.borrow().vcam_kbd_device();
+    // 已改绑设备的合成行由 `list_input_sources` 一并给出: 它挂在"本应用改绑过它"这个设备树事实上,
+    // 而不是挂在这里的持久化选择上 —— 后者被清空时用户就再也选不回那台设备了。
+    let devices = vcam::keyboard::list_input_sources();
     let mut rows: Vec<VcamKbdRow> = vec![VcamKbdRow {
         is_group: false,
         level: 0,
@@ -620,9 +571,29 @@ pub(crate) fn refresh_vcam_devices(
     }
     ui.set_vcam_kbd_rows(slint::ModelRc::new(slint::VecModel::from(rows)));
 
-    let picked = devices
+    let mut picked = devices
         .iter()
-        .position(|d| d.path.eq_ignore_ascii_case(saved_path));
+        .position(|d| d.path.eq_ignore_ascii_case(&saved_path));
+    // ★路径整串对不上时按设备身份再认一次★ 改绑设备的行用的是不含漂移字段的稳定路径, 与当初
+    // 持久化的那条 HID 路径写法完全不同; 只按字符串比就会把"设备还在、只是标识换了写法"当成
+    // "设备已拔出", 用户的选择随之丢失。认回后立刻把持久化改写成稳定路径, 免得每次开机重来一遍。
+    if picked.is_none() && !saved_path.trim().is_empty() {
+        picked = devices
+            .iter()
+            .position(|d| d.rebound && vcam::keyboard::same_usb_identity(&d.path, &saved_path));
+        if let Some(index) = picked {
+            log::info!(
+                "虚拟摄像头: 持久化路径 {} 已按设备身份认回改绑设备 {}，持久化改写为稳定标识 {}",
+                saved_path,
+                devices[index].label,
+                devices[index].path
+            );
+            saved_path = devices[index].path.clone();
+            controller
+                .borrow_mut()
+                .set_vcam_kbd_device(saved_path.clone());
+        }
+    }
     // ★不再因"实测有障碍"就把用户选好的目标偷偷换成所有键盘★ 那样只会让用户以为自己没选中,
     // 而"所有键盘"还会把打字混进扫码缓冲。障碍照实记进日志与状态行, 选择本身保留。
     if let Some(device) = picked.map(|index| &devices[index]) {
@@ -683,13 +654,23 @@ pub(crate) fn refresh_vcam_devices(
             lagging.join(" ｜ ")
         );
     }
+    // 改绑设备的直读实测结论必须留痕: 它是这类设备唯一的数据通路, "读不到"与"设备没在场"
+    // 在界面上看着一样, 只有这条日志能分开。
+    for device in devices.iter().filter(|d| d.rebound) {
+        log::info!(
+            "虚拟摄像头: 已改绑设备 {}（{}）直读实测 {:?}",
+            device.label,
+            device.endpoint_text,
+            device.direct_read
+        );
+    }
     log::info!(
-        "虚拟摄像头: 枚举到 {} 个 HID 键盘设备, 当前选择={}",
+        "虚拟摄像头: 枚举到 {} 个可选输入源, 当前选择={}",
         count,
         picked
             .map(|i| devices[i].label.clone())
             .unwrap_or_else(|| "所有键盘".into())
     );
     *list.borrow_mut() = devices;
-    count
+    (count, saved_path)
 }

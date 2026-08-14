@@ -162,4 +162,11 @@
         let _ = ctrl.request_params(current_channel.clamp(0, 35) as u8);
         last_param_request_channel = current_channel;
     }
+
+    // 批量抽屉源通道的参数回读(与上面切通道走同一条 PARAM_GET_ALL)。★为什么放在 tick★
+    // 选源那一刻设备可能正忙, 请求会被静默丢掉; 由本处按拍冲刷待办, 忙就下一拍再试。
+    // 每个源通道最多发一条, 详见 AppController::batch_request_source_params。
+    if connected && !conn_probes_pending {
+        ctrl.batch_request_source_params();
+    }
 }

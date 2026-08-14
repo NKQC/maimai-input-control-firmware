@@ -77,6 +77,38 @@ impl KbdIface {
     }
 }
 
+/// 已改绑 WinUSB 设备的**直读可用性**实测结论。
+///
+/// ★"设备还在"与"读得到数据"是两件事★ 设备树说它在位, 只说明它还插着; 能不能拿到扫码数据
+/// 取决于能否 claim 到接口并找到可解码的中断 IN 端点 —— 那才是这类设备唯一的数据来源。
+/// ★不等按键★ 扫码器空闲时本来就一个报文都不发, 把"收到一份报告"当作上架条件, 会让所有
+/// 空闲设备永远不可选; 故判据取到"端点已实测可打开"为止, 到底有没有收到数据由状态行的
+/// 收报计数(见 `reception_summary`)如实回答。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DirectRead {
+    /// 不适用: 该设备仍是普通键盘, 走 Raw Input / 键盘过滤驱动, 不走直读。
+    NotApplicable,
+    /// 端点实测可打开(中断 IN 地址 / 最大包长)。
+    Ready { endpoint: u8, packet: usize },
+    /// 正被本应用的直读会话占用 ⇒ 不再探测。直读是**独占** claim, 对在跑的目标再 open 会把
+    /// 正在跑的会话挤掉; 既然它在跑, 结论本来就已知。
+    InUse,
+    /// 打不开或没有可解码的端点, 带实测原因。
+    Failed(String),
+}
+
+impl DirectRead {
+    /// 界面用的单行读数。★只说功能后果★ 端点地址、错误原文等证据留给日志与警示文案。
+    pub fn text(&self) -> &'static str {
+        match self {
+            Self::NotApplicable => "不适用",
+            Self::Ready { .. } => "就绪",
+            Self::InUse => "正在直读",
+            Self::Failed(_) => "读不到",
+        }
+    }
+}
+
 /// 一个可选作输入源的键盘设备。
 /// `path` 是 Raw Input 设备名(唯一, 用于持久化); 其余字段供 UI 以设备树形式展示。
 #[derive(Clone, Debug)]
@@ -117,6 +149,8 @@ pub struct KeyboardDevice {
     /// 该物理设备是否已被本应用改绑 WinUSB(按 USB 父节点的功能驱动实测)。
     /// ★改绑后 HID 节点会整体消失★, 故判定只能落在 USB 父节点上。
     pub rebound: bool,
+    /// 直读可用性实测结论。只有 `rebound` 的设备才会真去探测, 其余一律 `NotApplicable`。
+    pub direct_read: DirectRead,
 }
 
 impl KeyboardDevice {
@@ -128,8 +162,16 @@ impl KeyboardDevice {
     /// 到底有没有收到数据。**绝不为了让设备可选而把探测结果说成好的。**
     pub fn capture_warning(&self) -> Option<String> {
         if self.rebound {
-            // 已改绑 WinUSB: 本来就不走键盘栈, 由直读拿数据, 键盘接口不存在属正常。
-            return None;
+            // 已改绑 WinUSB: 本来就不走键盘栈, 由直读拿数据, 键盘接口不存在属正常;
+            // 唯一有意义的判据是直读端点开不开。
+            return match &self.direct_read {
+                DirectRead::Failed(reason) => Some(format!(
+                    "⚠ 这台设备已改成由本程序直接读取，但现在读不到它：{}。\
+                     可点“恢复原驱动”让它退回普通键盘",
+                    reason
+                )),
+                _ => None,
+            };
         }
         match self.kbd_iface {
             KbdIface::Failed(_) => Some(format!(
@@ -270,6 +312,15 @@ fn target_lock() -> &'static Mutex<Option<String>> {
 }
 pub fn target_device() -> Option<String> {
     target_lock().lock().unwrap().clone()
+}
+/// 当前是否有捕获线程在跑。
+/// ★任何"试着打开设备看看"的探测都必须先问这一句★ WinUSB 直读是独占 claim, 对正在跑的目标
+/// 再 open 会把在跑的会话挤掉 —— 探测把功能弄坏, 比探测不出结论糟得多。
+pub fn capture_running() -> bool {
+    manager_lock()
+        ._worker
+        .as_ref()
+        .is_some_and(|worker| !worker.is_finished())
 }
 fn accept_cache() -> &'static Mutex<HashMap<isize, bool>> {
     ACCEPT_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
@@ -451,10 +502,139 @@ fn present_keyboard_instances() -> Vec<String> {
 
 /// 设备树里**在位**的 `USB\...` 节点实例 ID。
 /// ★改绑恢复的最后一层兜底用★ 改绑后 HID 节点整体消失, "Raw Input 路径 → HID → USB 父节点"
-/// 这条换算也断了; 所有权记录里的实例 ID 又可能缺失, 那时只剩"按 VID/PID 从 USB 枚举里反查"。
+/// 这条换算也断了; 所有权记录里的实例 ID 又可能缺失或已陈旧, 那时只剩"按稳定身份从 USB 枚举里反查"。
 /// 与键盘枚举共用同一份 SetupAPI 开关箱, 不另写第二套错误路径。
 pub fn present_usb_instances() -> Vec<String> {
     _present_instances(None, w!("USB"))
+}
+
+/// 公开了指定**设备接口类**的在位设备节点实例 ID。
+///
+/// ★这是"本应用改绑过哪些设备"的唯一自带标识★ 本应用的 INF 把 `DeviceInterfaceGUIDs` 写进被改绑
+/// 设备的硬件键, winusb.sys 据此注册该接口, 于是只要设备还绑在本应用的驱动包上就一定在这份枚举里 ——
+/// 与 `toolbox.cfg` 的用户选择、与本应用的记录文件都无关(见 `driver_pkg::rebound_devices`)。
+/// ★只筛在位设备★ 接口注册键在设备离场后仍留在注册表里, 不加 PRESENT 会把拔掉的设备也算进来。
+pub fn present_interface_instances(interface_class: &windows::core::GUID) -> Vec<String> {
+    use windows::Win32::Devices::DeviceAndDriverInstallation::{
+        CM_GET_DEVICE_INTERFACE_LIST_PRESENT, CM_Get_Device_Interface_List_SizeW,
+        CM_Get_Device_Interface_ListW, CR_SUCCESS,
+    };
+    let mut out = Vec::new();
+    // SAFETY: 两段式调用(先问缓冲字符数再取), 缓冲按返回长度分配; 结果是双 NUL 结尾的多字符串。
+    unsafe {
+        let mut chars: u32 = 0;
+        if CM_Get_Device_Interface_List_SizeW(
+            &mut chars,
+            interface_class,
+            windows::core::PCWSTR::null(),
+            CM_GET_DEVICE_INTERFACE_LIST_PRESENT,
+        ) != CR_SUCCESS
+            || chars <= 1
+        {
+            return out;
+        }
+        let mut buf = vec![0u16; chars as usize];
+        if CM_Get_Device_Interface_ListW(
+            interface_class,
+            windows::core::PCWSTR::null(),
+            &mut buf,
+            CM_GET_DEVICE_INTERFACE_LIST_PRESENT,
+        ) != CR_SUCCESS
+        {
+            return out;
+        }
+        for entry in buf.split(|&c| c == 0) {
+            if entry.is_empty() {
+                continue;
+            }
+            // 接口路径与 Raw Input 路径同构(`\\?\usb#vid_x&pid_y#尾段#{接口类}`), 换算沿用同一份。
+            if let Some(id) = instance_id_from_path(&String::from_utf16_lossy(entry)) {
+                out.push(id);
+            }
+        }
+    }
+    out
+}
+
+/// 下拉可选输入源的**唯一**清单: 现场键盘枚举 + 本应用改绑过、因此已从键盘枚举里消失的设备。
+///
+/// ★改绑设备必须挂在"本应用改绑过它"这个事实上★ 而不是挂在用户的持久化选择上: 后者一旦被清空
+/// (选过一次"所有键盘" / 换机器 / 换 exe 目录), 改绑过的设备就在界面上彻底不存在, 用户再也选不回来,
+/// 直读也随之停摆 —— 这正是"改成 WinUSB 的 HIDKeyBoard 重启后从下拉里消失"的成因。
+///
+/// ★会做直读探测(claim 后立刻释放)★ 因此**不要**在改绑/恢复流程里调用本函数,
+/// 那些地方要的是纯粹的现场键盘枚举, 用 `list_keyboards()`。
+pub fn list_input_sources() -> Vec<KeyboardDevice> {
+    let mut out = list_keyboards();
+    for (at, rebound) in super::driver_pkg::rebound_devices().into_iter().enumerate() {
+        // 极少数情形下改绑设备仍留着 HID 节点(枚举滞后), 那条现场行已经代表它, 不再补合成行。
+        if out.iter().any(|have| {
+            have.path.eq_ignore_ascii_case(&rebound.path)
+                || (have.rebound && same_usb_identity(&have.path, &rebound.path))
+        }) {
+            continue;
+        }
+        let direct_read = winusb_scanner::probe(&rebound.path);
+        // 改绑设备排在最前: 它与 `list_keyboards()` 的首个分类(USB / HID 键盘)同类, 插在队首
+        // 不会破坏"同类相邻"这一渲染前提(分组头按相邻同类合并)。
+        out.insert(
+            at,
+            KeyboardDevice {
+                endpoint_text: format!(
+                    "HID 节点已随改绑消失 · service={} · 系统输入=未知 · 直读={} · {} · USB节点={}",
+                    rebound.service,
+                    direct_read.text(),
+                    rebound.vid_pid,
+                    rebound.instance
+                ),
+                detail: format!("{}  ·  USB 实例 {}", rebound.vid_pid, rebound.instance),
+                path: rebound.path,
+                label: rebound.label,
+                category: CAT_USB.to_string(),
+                parent_key: rebound.instance,
+                product: rebound.product,
+                vendor: rebound.vendor,
+                service: rebound.service,
+                rawinput_visible: false,
+                // 改绑后 HID 节点整体消失, 键盘接口无从探测 —— 如实记 Unprobed, 不冒充结论。
+                kbd_iface: KbdIface::Unprobed,
+                rebound: true,
+                direct_read,
+            },
+        );
+    }
+    out
+}
+
+/// 两条设备路径是否指向同一台 USB 设备(按 VID/PID)。
+/// ★实例 ID 会漂移, 路径整串比不可靠★ 旧持久化路径与本轮合成的稳定路径写法完全不同,
+/// 只有按 VID/PID 认才能把用户当初选的那台设备认回来(见 `refresh_vcam_devices` 的选择恢复)。
+pub fn same_usb_identity(left: &str, right: &str) -> bool {
+    use super::driver_pkg::UsbIdentity;
+    match (UsbIdentity::of_text(left), UsbIdentity::of_text(right)) {
+        (Some(left), Some(right)) => left.vid == right.vid && left.pid == right.pid,
+        _ => false,
+    }
+}
+
+/// 某设备节点的展示用产品名与厂商(总线上报名优先, 通用名一律跳过)。查不到为空串。
+/// ★已改绑设备的合成行要用它★ 那台设备已不在键盘枚举里, 但 USB 节点还在, 名字仍能现场读到 ——
+/// 比"未知"有用得多, 也不必依赖改绑时的登记。
+pub fn node_identity(instance_id: &str) -> (String, String) {
+    let Some((text, _)) = query_node(instance_id) else {
+        return (String::new(), String::new());
+    };
+    let pick = |candidates: [&str; 3]| -> String {
+        candidates
+            .into_iter()
+            .find(|value| !value.is_empty() && !is_generic_name(value))
+            .unwrap_or_default()
+            .to_string()
+    };
+    (
+        pick([&text.bus, &text.friendly, &text.desc]),
+        pick([&text.mfg, "", ""]),
+    )
 }
 
 /// 在位设备节点实例 ID 枚举。`class` 为 None 时按枚举器(`enumerator`)取全类设备。
@@ -680,6 +860,9 @@ fn describe_device(path: String, node_id: String, rawinput_visible: bool) -> Key
         ),
         service,
         rebound,
+        // 现场枚举一律不做直读探测: 那会 claim 设备接口, 不该是"列一下设备"的副作用。
+        // 已改绑设备的探测集中在 `list_input_sources`。
+        direct_read: DirectRead::NotApplicable,
         rawinput_visible,
         kbd_iface,
         path,
