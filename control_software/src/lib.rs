@@ -5,6 +5,8 @@
 
 /// JIT 算法变量的中文别名/简介（纯 UI 侧资产，不进固件）。
 pub mod algo_i18n;
+/// 随程序打包的 JIT 算法 C 源模板（GUI 与无头自检共用同一份字节）。
+pub mod algo_template;
 pub mod app_state;
 pub mod comport;
 pub mod elevation;

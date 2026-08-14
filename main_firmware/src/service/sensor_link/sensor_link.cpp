@@ -159,6 +159,22 @@ inline bool disabled_ch_reject(const char* what, uint8_t ch, const HostFrame& fr
                                                 what, response, HOST_CMD_RESP_BUF_MAX);
     return true;
 }
+
+// ★参数回读的唯一入口: 0x0C(通道启用)只认 store, 其余问 PSoC★
+// 分野的依据是"谁有权改这一项":
+//   - snsClk/idacMod/idacGain/阈值: 校准与频率自适应会**合法地**改写它们, 设备上的值才是最新的
+//     真相, 必须问 PSoC(否则手动校准的结果在 UI 上永远看不到)。
+//   - 0x0C: 只有用户经 store 能改, PSoC 只是执行者。此前这一项也问 PSoC, 于是 UI 复选框显示的是
+//     "设备当前恰好在扫哪些通道", 而校准/基线复位/频率自适应的门禁读的是 store —— 两者一旦漂移,
+//     用户看到勾选却点不动那三个按钮, 且完全看不出原因。现在回读与门禁同源。
+inline bool param_read(uint8_t ch, uint8_t param_id, uint32_t* value) {
+    if (param_id == 0x0Cu) {
+        if (ch >= SENSOR_LINK_CHANNELS) return false;
+        *value = CsdConfig::getInstance()->ch_enabled(ch) ? 1u : 0u;
+        return true;
+    }
+    return Psoc::getInstance()->get_param(ch, param_id, value);
+}
 }  // namespace
 
 SensorLink::SensorLink()
@@ -1693,7 +1709,7 @@ void SensorLink::_handle_param_get(const HostFrame& frame, uint8_t* response, ui
     const uint8_t param_id = frame.payload[1];
     if (sync_read_gate_reject("PSoC command queue busy", frame, response, response_length)) return;
     uint32_t value = 0;
-    if (!Psoc::getInstance()->get_param(ch, param_id, &value)) {
+    if (!param_read(ch, param_id, &value)) {
         *response_length = HostCmdCodec::encode_nak(frame.seq, HostCmdError::SENSOR_ERROR,
             "PSoC param_get failed", response, HOST_CMD_RESP_BUF_MAX);
         return;
@@ -1750,7 +1766,7 @@ void SensorLink::_handle_param_get_all(const HostFrame& frame, uint8_t* response
     uint8_t count = 0;
     for (uint8_t i = 0; i < kParamCount; i++) {
         uint32_t value = 0;
-        if (!Psoc::getInstance()->get_param(ch, kParamIds[i], &value)) continue;
+        if (!param_read(ch, kParamIds[i], &value)) continue;
         resp.payload[position++] = kParamIds[i];
         resp.payload[position++] = static_cast<uint8_t>(value);
         resp.payload[position++] = static_cast<uint8_t>(value >> 8);
@@ -1781,7 +1797,7 @@ void SensorLink::_emit_param_all_channels(const HostFrame& frame, uint8_t* respo
     uint8_t count = 0;
     for (uint8_t ch = 0; ch < SENSOR_LINK_CHANNELS; ch++) {
         uint32_t value = 0;
-        if (!Psoc::getInstance()->get_param(ch, param_id, &value)) continue;
+        if (!param_read(ch, param_id, &value)) continue;
         resp.payload[position++] = ch;
         resp.payload[position++] = static_cast<uint8_t>(value);
         resp.payload[position++] = static_cast<uint8_t>(value >> 8);

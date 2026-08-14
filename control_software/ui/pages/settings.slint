@@ -643,6 +643,12 @@ export component SettingsPage inherits Rectangle {
                 show_active <=> root.show_active;
                 show_algo_overlay <=> root.show_algo_overlay;
                 algo_report_lines: root.algo_report_lines;
+                // ★这两行原先漏了, 与 algo_report_lines 当年同一个病★ CurvesPage 上声明了
+                // algo_setting_rows / algo_setting_edited, 但这里没绑 ⇒ 该属性恒为默认空表,
+                // 于是"算法可调变量(cfg)"区块永远显示"当前算法未声明 ALGO_SETTING" ——
+                // 与设备上真正跑着的算法有没有声明毫无关系, 且编辑也发不出去。
+                algo_setting_rows: root.algo_setting_rows;
+                algo_setting_edited(idx, v) => { root.algo_setting_edited(idx, v); }
                 active_norm_amp: root.active_norm_amp;
                 curve_t_span_ms: root.curve_t_span_ms;
                 curve_t_end_text: root.curve_t_end_text;

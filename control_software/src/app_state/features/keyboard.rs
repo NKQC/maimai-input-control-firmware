@@ -561,6 +561,54 @@ impl AppController {
         Ok(())
     }
 
+    /// 调试直发: 绕过草稿与"保存到设备", 立刻下发一帧 KBD_SET_MAP。
+    ///
+    /// ★为什么允许有这条旁路★ HID 键盘输出链只有"真人按键/真人触摸"一个入口, 无头环境下
+    /// 无法自持验证"报文到底有没有被主机认成按键"。固件对 KBD_SET_MAP / KBD_SET_KEYCFG 只写
+    /// RAM 影子(flash 落地由 SAVE_CONFIG 单独触发, 见 keyboard.cpp 各 _handle_set_* 的注释),
+    /// 因此本旁路改动**不落盘、复位即消失**, 不会污染用户配置。
+    /// 不进草稿是刻意的: 草稿会把这次临时改动显示成"未保存修改"并在下次保存时写进 flash。
+    pub fn kbd_send_map_now(&mut self, idx: u8, keycode: u8, modifier: u8) -> anyhow::Result<()> {
+        if idx >= 12 {
+            return Err(anyhow::anyhow!("物理键索引非法: {}", idx));
+        }
+        let seq = self.next_seq();
+        if let Some(handle) = &self.io {
+            handle.send(Frame::new(
+                HostCmd::KbdSetMap as u8,
+                0,
+                seq,
+                vec![idx, keycode, modifier],
+            ))?;
+        }
+        Ok(())
+    }
+
+    /// 调试直发: 绕过草稿, 立刻下发一帧 KBD_SET_KEYCFG。语义与落盘口径见 `kbd_send_map_now`。
+    pub fn kbd_send_keycfg_now(
+        &mut self,
+        idx: u8,
+        pol: u8,
+        debounce_us: u16,
+    ) -> anyhow::Result<()> {
+        if (idx as usize) >= KBD_HOLD_PHYS_COUNT {
+            return Err(anyhow::anyhow!("物理键索引非法: {}", idx));
+        }
+        if pol > crate::proto::KBD_POL_AUTO {
+            return Err(anyhow::anyhow!("触发极性非法: {}", pol));
+        }
+        let seq = self.next_seq();
+        if let Some(handle) = &self.io {
+            handle.send(Frame::new(
+                HostCmd::KbdSetKeycfg as u8,
+                0,
+                seq,
+                crate::proto::encode_kbd_set_keycfg(&[(idx, KbdKeyCfg { pol, debounce_us })]),
+            ))?;
+        }
+        Ok(())
+    }
+
     /// 拉取一批边沿记录。窗口=1(有在途请求就跳过): 逻辑分析仪不能把 vendor 端点抢光,
     /// 否则会连带影响遥测与按键映射的回读。旧固件已判定不支持时直接返回。
     pub fn kbd_request_edges(&mut self) -> anyhow::Result<()> {

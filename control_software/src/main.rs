@@ -60,17 +60,9 @@ use ui_plot::{
     build_logic_analyzer, dev_time_text, fmt_time_us,
 };
 
-/// 内置 v3.1 HDR 触控算法源(随程序打包), 供算法页"加载模板"按钮作参考/真实下发案例。
-const ALGO_V31_TEMPLATE: &str = include_str!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../psoc_firmware/algo/psoc_algo_default.c"
-));
-
-/// 纯"白灯演示"算法模板: 触摸即点亮白灯(out_active), 展示 JIT 算法对 PSoC 硬件的绝对可控性。
-const ALGO_LED_DEMO_TEMPLATE: &str = include_str!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../psoc_firmware/algo/psoc_algo_led_demo.c"
-));
+// 算法 C 源模板已上移到库(mai2control_ui::algo_template): GUI 的"加载模板"/默认源回灌与
+// 无头自检的同一路径复现必须用同一份字节, 不能两个二进制各 include_str! 一次。
+pub(crate) use mai2control_ui::algo_template::{ALGO_LED_DEMO_TEMPLATE, ALGO_V31_TEMPLATE};
 
 /// Cp 测量的真实失败：通道已参与测量，但结果无效。
 const CP_MEASURE_FAILED: u32 = 0x00FF_FFFF;

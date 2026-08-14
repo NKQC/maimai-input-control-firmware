@@ -656,7 +656,12 @@ export component PhysKbdPage inherits Rectangle {
                         text: @tr("原始 / 去抖后 / 实际输出。");
                         color: Theme.text-sub;
                         font-size: Theme.fs-small;
-                        wrap: word-wrap;
+                        // ★折叠区内不用 word-wrap★ 换行文本的高度依赖尚未确定的宽度, 会让外层
+                        // CollapsibleSection 的 body.preferred-height 反推偏小 —— 内容被裁掉一截,
+                        // 同时按真实高度绘制并溢出到上一个区块的标题之上(本页实测过的症状)。
+                        // 这行本来就是一句短说明, 单行足够; 真放不下就省略, 不牵连整块高度。
+                        wrap: no-wrap;
+                        overflow: elide;
                     }
                     VerticalLayout {
                     padding: 0px;

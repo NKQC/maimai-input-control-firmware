@@ -363,6 +363,10 @@ static volatile bool g_any_active = false;
 static volatile bool g_auto_calibrate = true;
 /* 每通道最近一次寄生电容测量值(fF)，0xFFFFFF=失败/未测量。 */
 static volatile uint32_t cp_value[SENSOR_CHANNEL_COUNT];
+/* BIST 的 Cp 上限钳位值(CY_CAPSENSE_BIST_CP_MAX_VALUE, cy_capsense_selftest_v2.c:43)。读到它说明
+ * 结果已溢出量程 —— 这才是"短路/异常大电容"的真故障判据, 见 MEASURE_CP 处说明。 */
+#define CP_BIST_OVERRANGE_FF             (400000u)
+
 /* CSD 处理模式：SCAN_MODE_AUTO(自动校准/标准完整处理) / SCAN_MODE_SEMI(半自动手动)。 */
 static volatile uint8_t scan_mode = SCAN_MODE_AUTO;
 /* ★通道启用位图(bit ch = 1 启用)★ 默认全 36 通道启用。
@@ -1115,6 +1119,36 @@ static inline void _initialize_enabled_baselines(void)
             Cy_CapSense_InitializeWidgetBaseline(w, &cy_capsense_context);
         }
     }
+}
+
+/* 一次完整扫描的等待预算(ms)。36 通道 res=12/div=32 实测约 40ms, MFS 三频约 120ms; 500ms 是
+ * 安全上界, 只用于"卡死时别把主循环永远堵住", 正常路径远早于此返回。 */
+#define SCAN_SETTLE_BUDGET_MS            (500u)
+
+/* ★基线只能取自"当前配置下真实扫出来的 raw"★
+ * Cy_CapSense_InitializeWidgetBaseline 做的是 bsln = 该通道当前的 raw(cy_capsense_filter.c),
+ * 它不会自己去扫一遍。于是"重配硬件 → 立刻初始化基线"这个序列拿到的是**上一套配置**留下的
+ * 陈旧 raw:
+ *   - MEASURE_CP: BIST 全程接管 CSD 硬件, 结束时 sensor context 里的 raw 与正常扫描口径无关;
+ *   - GLOBAL_APPLY / 非校准 APPLY: inactive_sns/IDAC/MFS/分频刚变, 旧 raw 与新配置差一个量级。
+ * 一旦基线被钉在这种陈旧值上, 下一次真实扫描的 diff 立刻远超 fingerTh → 判为按下 → 而 CapSense
+ * 在通道处于 active 时**冻结基线更新** → 该通道永久 status=1、diff 恒定, 自己再也走不出来
+ * (实测 CH10/CH28: bsln=344 恒定, raw≈2500, diff≈2200, 两个通道同一个错值)。
+ * 故所有重配之后统一走本函数: 先在新配置下完成一次全通道扫描, 再拿这份 raw 做基线。 */
+static inline void _scan_then_initialize_baselines(void)
+{
+    uint32_t t0;
+    if (!_any_ch_enabled()) { return; }   /* 无启用通道: 无扫描可做, 也无基线可立 */
+    t0 = g_ms_tick;
+    while ((CY_CAPSENSE_NOT_BUSY != Cy_CapSense_IsBusy(&cy_capsense_context)) &&
+           ((uint32_t)(g_ms_tick - t0) < SCAN_SETTLE_BUDGET_MS)) { }
+    if (CY_CAPSENSE_STATUS_SUCCESS == Cy_CapSense_ScanAllWidgets(&cy_capsense_context))
+    {
+        t0 = g_ms_tick;
+        while ((CY_CAPSENSE_NOT_BUSY != Cy_CapSense_IsBusy(&cy_capsense_context)) &&
+               ((uint32_t)(g_ms_tick - t0) < SCAN_SETTLE_BUDGET_MS)) { }
+    }
+    _initialize_enabled_baselines();
 }
 
 /* 主循环(NOT_BUSY 窗口)落实 SPI 收到的启用/禁用请求。
@@ -2015,8 +2049,14 @@ int main(void)
         spi_dbg.stage = MLOOP_STAGE_WAIT_SCAN;
         spi_dbg.ms_tick_m = g_ms_tick;   /* 无条件刷新: 卡在等扫描时也能看出时间在走 */
         spi_dbg.clk_now = cy_capsense_tuner.widgetContext[0].snsClk;   /* 当前生效分频 */
-        /* 兼容未发送 PARAM_ENABLED/APPLY 的旧 RP：3 秒后明确回退全启用。 */
-        if (g_provision_pending && (g_ms_tick >= PROVISION_TIMEOUT_MS))
+        /* ★兼容回退只针对"从头到尾没送过位图"的旧 RP★
+         * 原判据只看时间: 只要 3 秒内没走完 provisioning 就把 36 通道全部打开 —— 而新 RP 送完
+         * 36 条 PARAM_ENABLED 之后还要送约 396 条 PARAMS 才发放行 APPLY, 那段时间必然超过 3 秒,
+         * 于是刚刚送到的启用位图被这条回退整片冲成"全启用", 用户关掉的通道每次复位后偷偷复活。
+         * 判据改为"一条都没收到": 只要 RP 已经开始送位图, 它就是真相源, 等它送完; RP 侧 ENABLED
+         * 阶段只在成功时推进、失败无限重试, 链路真断则 RP 换代次后从 MODE 重新下发, 不会永久悬空。 */
+        if (g_provision_pending && (g_ms_tick >= PROVISION_TIMEOUT_MS) &&
+            (g_provision_enable_seen == 0u))
         {
             g_ch_enabled = CH_ENABLED_ALL;
             ch_enable_dirty = CH_ENABLED_ALL;
@@ -2104,6 +2144,19 @@ int main(void)
                         cp_value[w] = 0xFFFFFFu;
                     }
 #if (defined(CY_CAPSENSE_TST_SNS_CAP_EN) && (CY_CAPSENSE_ENABLE == CY_CAPSENSE_TST_SNS_CAP_EN))
+                    /* ★整段 BIST 期间必须屏蔽 CSD 中断★
+                     * BIST 是**轮询式**的: Cy_CapSense_BistWaitEndOfScan(cy_capsense_selftest_v2.c:4489)
+                     * 死等 ptrCsdBase->INTR 的 SAMPLE 位。而本工程把 CSD 中断挂到了 NVIC
+                     * (capsense_isr → Cy_CapSense_InterruptHandler), 转换一结束 ISR 先跑, 顺手把 INTR
+                     * 清掉 —— 轮询循环就永远看不到那一位, 耗尽 watchdog 计数后返回 TIMEOUT。
+                     * 这是一场竞态: ISR 抢先与否取决于中断延迟(SPI DMA 中断正忙时更容易抢先), 所以
+                     * 表现为"每次测电容都有几个通道随机失败, 失败集合每次都不一样"(实测三轮分别是
+                     * {15,20,26,31} / {7,14,15,26,34} / {1,3,5,11,26,28,30}) —— 与电极本身无关,
+                     * 重测也救不回来(重测只是再赌一次同一场竞态)。
+                     * 顺带还有第二重危害: ISR 里跑的是**正常扫描**的后处理, 它会把 BIST 的转换结果
+                     * 当成 raw 写进 sns context, 污染基线与差值。
+                     * 故这里整段屏蔽; 恢复扫描【之前】必须重新打开(下面的重扫要靠它推进扫描链)。 */
+                    NVIC_DisableIRQ(CYBSP_CSD_IRQ);
                     for (uint32_t w = 0u; w < SENSOR_CHANNEL_COUNT; w++)
                     {
                         uint32_t v = 0u;
@@ -2114,14 +2167,27 @@ int main(void)
                         status =
                             Cy_CapSense_MeasureCapacitanceSensor(w, 0u, &v, &cy_capsense_context);
 
-                        /* HIGH_LIMIT is the 400pF BIST saturation/overrange outcome and
-                         * indicates a short-circuit fault; LOW_LIMIT indicates abnormally
-                         * small capacitance. Both are faults, like BAD_PARAM/HW_BUSY/TIMEOUT/ERROR
-                         * and a zero result, so the prefilled 0xFFFFFF failure marker remains.
-                         * Only a nonzero SUCCESS result is valid. 0xFFFFFF remains reserved for
-                         * the protocol failure marker, so a colliding valid value saturates at
-                         * 0xFFFFFE. */
-                        if ((CY_CAPSENSE_BIST_SUCCESS_E == status) && (v != 0u))
+                        /* ★不能把 LOW_LIMIT / HIGH_LIMIT 当成故障★
+                         * 中间件的这两个"故障"判据是**它自己那把尺子的量程边界**, 不是电极的物理
+                         * 结论(cy_capsense_selftest_v2.c:2629 BistMeasureCapacitanceSensor):
+                         *   - 合法 raw 窗口只有满量程的 7.5%~45%(MIN/MAX_RAW_PROMILLE = 75/450);
+                         *   - 而它只有 4 个测点(gain/code = 300k×20, 300k×80, 2400k×40, 4800k×80),
+                         *     相邻测点之间是 4 倍跳变, 单个测点能覆盖的 Cp 只有 6 倍。
+                         *   ⇒ 4 倍步长 > 6 倍窗口的余量很薄, 落在两个测点缝隙附近的 Cp 无论走哪一档
+                         *     都贴着窗口边, 于是同一块板连测多轮, "失败"的通道集合每轮都不一样, 而它
+                         *     们的 Cp 与相邻通道毫无区别(实测 CH3=69pF 报失败、CH17=143pF 却成功)。
+                         * 关键事实: LOW_LIMIT / HIGH_LIMIT 这两条路上 **Cp 已经算出来并写回**了
+                         * (同文件 2722 行: 只有 TIMEOUT 才不写值), 只是 raw 不在它偏爱的窗口内、精度
+                         * 略差。把它判成"测量失败"是拿量程当故障, 属于假故障。
+                         * ★真正的故障判据★ 只保留物理上说不通的两种:
+                         *   - 没有值写回(TIMEOUT / HW_BUSY / BAD_PARAM) ⇒ v 保持 0;
+                         *   - 值被钳在 CY_CAPSENSE_BIST_CP_MAX_VALUE(400pF) ⇒ 溢出/短路。
+                         * 0xFFFFFF 仍保留给协议的失败标记, 故撞上该值的真实读数饱和到 0xFFFFFE。 */
+                        if ((v != 0u) &&
+                            ((CY_CAPSENSE_BIST_SUCCESS_E == status) ||
+                             (CY_CAPSENSE_BIST_LOW_LIMIT_E == status) ||
+                             (CY_CAPSENSE_BIST_HIGH_LIMIT_E == status)) &&
+                            (v < CP_BIST_OVERRANGE_FF))
                         {
                             cp_value[w] = (v >= 0xFFFFFFu) ? 0xFFFFFEu : v;
                         }
@@ -2133,7 +2199,12 @@ int main(void)
                      * then prepare CSD so disabled electrodes are High-Z before regular scanning resumes. */
                     (void)Cy_CapSense_Initialize(&cy_capsense_context);
                     _prepare_csd_mode();
-                    _initialize_enabled_baselines();
+                    /* 重扫要靠 CSD 中断推进扫描链, 故必须在这之前恢复中断; BIST 残留的 pending 一并清掉。 */
+                    NVIC_ClearPendingIRQ(CYBSP_CSD_IRQ);
+                    NVIC_EnableIRQ(CYBSP_CSD_IRQ);
+                    /* BIST 期间 raw 与正常扫描口径无关 —— 必须先真扫一遍再立基线, 否则整块面板的
+                     * 基线被钉在 BIST 残留值上并因"判为按下"永久冻结(见函数处说明)。 */
+                    _scan_then_initialize_baselines();
 #endif
                     interrupt_state = Cy_SysLib_EnterCriticalSection();
                     measure_cp_active = false;
@@ -2194,7 +2265,8 @@ int main(void)
                  * 配置改动(inactive_sns/IDAC/MFS)本身即时生效但不重扫校准。 */
                 (void)Cy_CapSense_Initialize(&cy_capsense_context);
                 _prepare_csd_mode();
-                _initialize_enabled_baselines();
+                /* inactive_sns/IDAC/MFS 刚变 ⇒ 旧 raw 与新配置差一个量级, 不能直接当基线。 */
+                _scan_then_initialize_baselines();
             }
 
             /* APPLY 指令：在主循环(非 ISR)重新初始化扫描硬件使硬件参数(分辨率/时钟/IDAC)生效。 */
@@ -2204,6 +2276,20 @@ int main(void)
                 spi_dbg.stage = MLOOP_STAGE_APPLY;
 
                 apply_pending = false;
+                /* ★放行屏障: 启用位图在本次重配【之前】落到中间件★
+                 * provisioning 期间 _ch_enable_apply 是空转的(它见 g_provision_pending 直接返回),
+                 * 于是位图只存在于 g_ch_enabled 里、中间件的 widget ENABLE 位还全是关。若不在此处
+                 * 重放, 下面的校准/基线跑完仍然一个通道都不会被扫, 要等下一轮 _ch_enable_apply 逐
+                 * 通道 SetWidgetStatus + 再校准一次 —— 那就是"provision 后 APPLY 12.4s"的来源
+                 * (同一批通道被校准两遍)。这里重放并吃掉脏位, 本次 APPLY 的校准+基线即为终态。 */
+                if (g_provision_apply_release)
+                {
+                    uint32_t rel_st = Cy_SysLib_EnterCriticalSection();
+                    ch_enable_dirty = 0u;
+                    Cy_SysLib_ExitCriticalSection(rel_st);
+                    _ch_enable_restore();
+                    _prepare_csd_mode();
+                }
                 if (scan_mode == SCAN_MODE_AUTO && g_auto_calibrate)
                 {
                     /* Do not call Enable here: it performs Initialize then starts ScanAllWidgets internally,
@@ -2214,7 +2300,7 @@ int main(void)
                     spi_dbg.stage = MLOOP_STAGE_APPLY_RECAL;
                     _calibrate_enabled_channels();
                     spi_dbg.stage = MLOOP_STAGE_APPLY_BASELINE;
-                    _initialize_enabled_baselines();
+                    _scan_then_initialize_baselines();
                 }
                 else
                 {
@@ -2229,7 +2315,7 @@ int main(void)
                     (void)Cy_CapSense_Initialize(&cy_capsense_context);
                     _prepare_csd_mode();
                     spi_dbg.stage = MLOOP_STAGE_APPLY_BASELINE;
-                    _initialize_enabled_baselines();
+                    _scan_then_initialize_baselines();
                 }
                 (void)apply_t0;
                 /* APPLY 是 RP provisioning 的 FIFO 完成屏障：只有主循环已执行完重配后才开闸。 */

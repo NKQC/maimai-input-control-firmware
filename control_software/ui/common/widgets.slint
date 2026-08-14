@@ -68,21 +68,26 @@ export component CollapsibleSection inherits Rectangle {
             }
         }
 
-        // 内容区。Slint 不允许把 @children 放进条件元素(if), 所以折叠只能靠"高度归零 + 裁切"。
-        // ★但绝不能为此在布局里套一层 Rectangle★ 这正是本工程记过的那一课: Rectangle 在布局里
-        // 没有内在高度, 拿 `body.preferred-height` 反推时, 只要 body 里有 `wrap: word-wrap` 的
-        // Text(它的高度依赖尚未确定的宽度), 反推值就会偏小 —— 于是内容被裁掉一截, 而 body 仍按
-        // 自己的真实高度绘制并向上溢出, 压到上一个区块的标题上面去。
-        // 实测症状(物理键盘页): "当前按键触发状态"展开后只剩最后两行可见, 且那两行画到了下一个
-        // 折叠区标题"每键参数"之上, 底部同时被裁。
-        // 现在: 内容直接就是布局(有内在高度, 由子项自然反推, 不做任何 preferred-height 反推),
-        // 折叠时用 max-height 归零, 溢出部分由 root 自身的 clip 吃掉。
-        body := VerticalLayout {
-            padding: 0px;
-            spacing: Theme.gap;
-            // 展开: 不设上限, 取自然高度。折叠: 归零, 子项溢出交给 root 的 clip。
-            max-height: root.expanded ? 100000px : 0px;
-            @children
+        // 内容区。Slint 不允许把 @children 放进条件元素(if), 故折叠用"高度归零 + clip 裁切"实现,
+        // 展开时高度取内容自身首选高度 ——效果等价于条件实例化, 且外层布局会随之伸缩。
+        // ★试过并已回退的方案★ 把这层 Rectangle 去掉、改成 `body` 直接用
+        // `max-height: expanded ? 100000px : 0px` —— 结果**所有折叠区一起失效**: body 里只要有
+        // 任何 vertical-stretch > 0 的子项, 那个极大上限就会被布局当成可用空间吸收, 区块高度爆炸。
+        // 折叠的高度必须是一个**确定值**, 不能是"很大的上限"。
+        // 高度反推不准的真正病灶在使用方: body 里若有 `wrap: word-wrap` 的 Text(高度依赖尚未确定
+        // 的宽度), preferred-height 会偏小。那要在放内容的那一页消除宽度依赖, 不是把这层拆掉。
+        Rectangle {
+            clip: true;
+            // ★用 min/max 同值钉死, 不能写 height★ Slint 禁止 height 与 min/max-height 并存;
+            // 而只写 height 时外层仍可压缩本容器 —— 一旦被压小, body 仍按自己的真实高度绘制并
+            // 向上溢出, 压到上一个区块的标题上面去(物理键盘页实测过的症状)。
+            min-height: root.expanded ? body.preferred-height : 0px;
+            max-height: self.min-height;
+            body := VerticalLayout {
+                padding: 0px;
+                spacing: Theme.gap;
+                @children
+            }
         }
     }
 }

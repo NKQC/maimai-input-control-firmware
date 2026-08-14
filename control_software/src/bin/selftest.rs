@@ -2432,6 +2432,293 @@ fn run_bus_test(ctrl: &mut AppController) -> Result<(), String> {
 }
 
 // ============================================================================
+// --cfg-set <键> <值>: 无头改单个配置项并落盘。
+//
+// ★类型必须取自设备回读的 schema 真值★ 同名键在不同版本可能是 Bool/U8/U16/U32, 按字面量猜
+// 类型会下发一个必被固件 NAK(或被静默截断)的值。因此先 CFG_GET_ALL 拿到该键当前值的类型,
+// 再按该类型解析命令行给的字面量; 键不存在直接失败, 不新建键。
+// 走的是界面上改同一项的**同一条**路径(set_config → save_config), 因此它验证/修改的就是
+// 用户点界面时真正发生的事。
+// ============================================================================
+fn run_cfg_set(ctrl: &mut AppController, key: &str, raw: &str) -> ! {
+    let _ = ctrl.request_config_all();
+    let deadline = std::time::Instant::now() + Duration::from_millis(4000);
+    while std::time::Instant::now() < deadline && ctrl.config_entries().is_empty() {
+        ctrl.poll();
+        thread::sleep(Duration::from_millis(20));
+    }
+    let Some(current) = ctrl.config_get(key) else {
+        println!("[CFGSET] FAIL: 设备配置里没有键 '{}'", key);
+        std::process::exit(1);
+    };
+    let parse_bool = |s: &str| -> Option<bool> {
+        match s.to_ascii_lowercase().as_str() {
+            "1" | "true" | "on" | "yes" => Some(true),
+            "0" | "false" | "off" | "no" => Some(false),
+            _ => None,
+        }
+    };
+    let value = match &current.value {
+        CfgValue::Bool(_) => parse_bool(raw).map(CfgValue::Bool),
+        CfgValue::U8(_) => raw.parse::<u8>().ok().map(CfgValue::U8),
+        CfgValue::U16(_) => raw.parse::<u16>().ok().map(CfgValue::U16),
+        CfgValue::U32(_) => raw.parse::<u32>().ok().map(CfgValue::U32),
+        CfgValue::I8(_) => raw.parse::<i8>().ok().map(CfgValue::I8),
+        CfgValue::F32(_) => raw.parse::<f32>().ok().map(CfgValue::F32),
+        CfgValue::Str(_) => Some(CfgValue::Str(raw.to_string())),
+    };
+    let Some(value) = value else {
+        println!(
+            "[CFGSET] FAIL: '{}' 的 schema 类型是 {:?}, 无法解析给定值 '{}'",
+            key, current.value, raw
+        );
+        std::process::exit(1);
+    };
+    println!(
+        "[CFGSET] {} : {:?} -> {:?} (写穿 + 落盘)",
+        key, current.value, value
+    );
+    if let Err(e) = ctrl.set_config(ConfigEntry::new(key.to_string(), value)) {
+        println!("[CFGSET] FAIL set_config: {}", e);
+        std::process::exit(1);
+    }
+    if let Err(e) = ctrl.save_config() {
+        println!("[CFGSET] FAIL save_config: {}", e);
+        std::process::exit(1);
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while std::time::Instant::now() < deadline && ctrl.cfg_tx_pending() != 0 {
+        ctrl.poll();
+        thread::sleep(Duration::from_millis(16));
+    }
+    if ctrl.cfg_tx_pending() != 0 {
+        println!("[CFGSET] FAIL: 保存队列超时 pending={}", ctrl.cfg_tx_pending());
+        std::process::exit(1);
+    }
+    // 回读校验: 退出码不作证据, 只认设备真值。
+    let _ = ctrl.request_config_all();
+    let deadline = std::time::Instant::now() + Duration::from_millis(4000);
+    let mut got = None;
+    while std::time::Instant::now() < deadline {
+        ctrl.poll();
+        thread::sleep(Duration::from_millis(20));
+        if let Some(e) = ctrl.config_get(key) {
+            got = Some(e.value.clone());
+        }
+    }
+    println!("[CFGSET] 回读: {} = {:?}", key, got);
+    std::process::exit(0);
+}
+
+// ============================================================================
+// --kbd-hidout: HID 键盘输出闭环自检(无人值守)
+//
+// ★为什么必须有这条旁路★ "按键映射显示发送成功、系统却没有真实输入"横跨固件 HID 报文、USB
+// 端点、Windows 键盘栈三层, 而这条链原本唯一的触发入口是"真人按物理键 / 真人摸触控板" ——
+// 无头环境下不可复现, 只能靠猜。本开关把触发端也变成可编程的:
+//   1) 把物理键 idx 的键码临时改成"只有 LeftCtrl 修饰位、无普通键码": 主机即便真收到也只是
+//      按下一个 Ctrl, 不会把字符打进当前焦点窗口(沿用用户原键码会真往编辑器里敲字)。
+//   2) 把该键极性临时改成高电平触发: 板上 1K 外部上拉使引脚恒高 ⇒ 固件判为"一直按住",
+//      走的是与真人按键**完全同一条** _apply_phys → HID::press_key → 报文出口。
+//   3) 按住期间用 GetAsyncKeyState 观测主机侧 Ctrl 是否真的处于按下态。
+// 两项改动只写设备 RAM 影子(固件 KBD_SET_MAP / KBD_SET_KEYCFG 不碰 flash), 收尾回填原值,
+// 复位亦自然恢复, 不污染用户配置。
+//
+// 判据三分, 不合并 —— 合并就回到"只知道不工作、不知道断在哪":
+//   固件计数不增        ⇒ 断在固件内部(极性/长按/HID 未初始化)
+//   计数增 + 主机没看到 ⇒ 报文发出去了但 Windows 没认成按键(描述符/报文格式/键盘栈)
+//   计数增 + 主机看到   ⇒ HID 键盘链路本身是通的, 故障在更上层(消费方/焦点)
+// ============================================================================
+const KBD_HIDOUT_KEY_INDEX: u8 = 0;
+const KBD_HIDOUT_MOD_LCTRL: u8 = 0x01;
+const KBD_HIDOUT_VK_LCONTROL: i32 = 0xA2;
+const KBD_HIDOUT_VK_CONTROL: i32 = 0x11;
+const KBD_HIDOUT_KEYCODE_ESC: u8 = 0x29;
+const KBD_HIDOUT_VK_ESCAPE: i32 = 0x1B;
+
+fn _kbd_hidout_key_down(vk: i32) -> bool {
+    // 只看 0x8000(此刻是否按下)。低位是"上次调用以来是否按过", 会把早已抬起的历史算成按下。
+    (unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(vk) } as u16 & 0x8000)
+        != 0
+}
+
+fn run_kbd_hidout(ctrl: &mut AppController, hold_ms: u64) -> ! {
+    let pump = |ctrl: &mut AppController, n: u32| {
+        for _ in 0..n {
+            ctrl.poll();
+            thread::sleep(Duration::from_millis(20));
+        }
+    };
+    let read_state = |ctrl: &mut AppController| {
+        let _ = ctrl.kbd_request_state();
+        pump(ctrl, 15);
+    };
+
+    println!("[HIDOUT] 读取物理键码表 / 每键配置 / 实时态…");
+    let _ = ctrl.kbd_request_map();
+    let _ = ctrl.kbd_request_keycfg();
+    let _ = ctrl.kbd_request_state();
+    pump(ctrl, 40);
+
+    let idx = KBD_HIDOUT_KEY_INDEX;
+    let orig_code = ctrl.kbd_map(idx);
+    let orig_mod = ctrl.kbd_keymod(idx);
+    let orig_cfg = ctrl.kbd_keycfg(idx);
+    println!(
+        "[HIDOUT] 键{} 原值: keycode={:#04X} mod={:#04X} pol={} debounce={}us",
+        idx + 1,
+        orig_code,
+        orig_mod,
+        orig_cfg.pol,
+        orig_cfg.debounce_us
+    );
+
+    let diag0 = ctrl.kbd_link_diag().cloned();
+    let sent0 = diag0.as_ref().map(|d| d.hid_sent);
+    let fail0 = diag0.as_ref().map(|d| d.hid_failed);
+    let hid_init = diag0.as_ref().map(|d| d.hid_initialized);
+    println!(
+        "[HIDOUT] 基线: hid_initialized={:?} hid_sent={:?} hid_failed={:?}",
+        hid_init, sent0, fail0
+    );
+    if _kbd_hidout_key_down(KBD_HIDOUT_VK_LCONTROL) || _kbd_hidout_key_down(KBD_HIDOUT_VK_CONTROL) {
+        println!("[HIDOUT] FAIL: 测试开始前主机侧 Ctrl 已处于按下态, 观测口径不可信");
+        std::process::exit(1);
+    }
+
+    // 一轮 = 临时把该键改成给定 [keycode, modifier] + 高电平触发(恒读按下), 观测主机是否真收到。
+    // ★修饰位与普通键码必须分成两轮★ 两者在报文里是**不同字节**([0] vs [2..7]), 也走中间件里
+    // 不同的分支; 只测一种就无法区分"整条链断了"和"只有键码数组那一段没被主机认"。
+    let mut phase = |ctrl: &mut AppController,
+                     label: &str,
+                     keycode: u8,
+                     modifier: u8,
+                     vks: &[i32],
+                     hold: u64|
+     -> (Option<u32>, bool, u16) {
+        let base = ctrl.kbd_link_diag().map(|d| d.hid_sent);
+        if let Err(e) = ctrl.kbd_send_map_now(idx, keycode, modifier) {
+            println!("[HIDOUT] FAIL: KBD_SET_MAP 下发失败: {}", e);
+            std::process::exit(1);
+        }
+        if let Err(e) = ctrl.kbd_send_keycfg_now(idx, 1, 0) {
+            println!("[HIDOUT] FAIL: KBD_SET_KEYCFG 下发失败: {}", e);
+            std::process::exit(1);
+        }
+        println!(
+            "[HIDOUT] {}: 键{} → keycode={:#04X} mod={:#04X} + 高电平触发, 按住 {}ms…",
+            label,
+            idx + 1,
+            keycode,
+            modifier,
+            hold
+        );
+        let mut saw = false;
+        let mut out_seen: u16 = 0;
+        let deadline = std::time::Instant::now() + Duration::from_millis(hold);
+        let mut last_req = std::time::Instant::now() - Duration::from_millis(1000);
+        while std::time::Instant::now() < deadline {
+            ctrl.poll();
+            if vks.iter().any(|vk| _kbd_hidout_key_down(*vk)) {
+                saw = true;
+            }
+            if last_req.elapsed() >= Duration::from_millis(150) {
+                last_req = std::time::Instant::now();
+                let _ = ctrl.kbd_request_state();
+            }
+            out_seen |= ctrl.kbd_state_out();
+            thread::sleep(Duration::from_millis(10));
+        }
+        read_state(ctrl);
+        let after = ctrl.kbd_link_diag().map(|d| d.hid_sent);
+        // 松手: 极性回 AUTO 即视为抬起, 报文由固件的收缩补清路径发出。
+        let _ = ctrl.kbd_send_keycfg_now(idx, orig_cfg.pol, orig_cfg.debounce_us);
+        pump(ctrl, 25);
+        let delta = match (base, after) {
+            (Some(a), Some(b)) => Some(b.wrapping_sub(a)),
+            _ => None,
+        };
+        println!(
+            "[HIDOUT] {}: out=0x{:03X} hid_sent {:?}->{:?} 主机侧按下={}",
+            label, out_seen, base, after, saw
+        );
+        (delta, saw, out_seen)
+    };
+
+    // A) 仅修饰位(LeftCtrl): 报文第 0 字节。
+    let (mod_delta, mod_saw, _) = phase(
+        ctrl,
+        "阶段A 仅修饰位LeftCtrl",
+        0,
+        KBD_HIDOUT_MOD_LCTRL,
+        &[KBD_HIDOUT_VK_LCONTROL, KBD_HIDOUT_VK_CONTROL],
+        hold_ms,
+    );
+    // B) 仅普通键码(Escape): 报文第 2..7 字节的键码数组。
+    // ★选 Escape★ 无副作用(不往焦点窗口写入字符), 且 HID usage 0x29 与 VK 0x1B 一一对应。
+    let (key_delta, key_saw, _) = phase(
+        ctrl,
+        "阶段B 仅键码Escape",
+        KBD_HIDOUT_KEYCODE_ESC,
+        0,
+        &[KBD_HIDOUT_VK_ESCAPE],
+        hold_ms.min(600),
+    );
+
+    // 收尾: 无论上面结论如何都必须回填键码与极性, 否则该键会一直被判成按住。
+    let _ = ctrl.kbd_send_keycfg_now(idx, orig_cfg.pol, orig_cfg.debounce_us);
+    let _ = ctrl.kbd_send_map_now(idx, orig_code, orig_mod);
+    pump(ctrl, 30);
+    let _ = ctrl.kbd_request_keycfg();
+    let _ = ctrl.kbd_request_map();
+    read_state(ctrl);
+    println!(
+        "[HIDOUT] 已回填: keycode={:#04X} mod={:#04X} pol={} debounce={}us (未落盘)",
+        ctrl.kbd_map(idx),
+        ctrl.kbd_keymod(idx),
+        ctrl.kbd_keycfg(idx).pol,
+        ctrl.kbd_keycfg(idx).debounce_us
+    );
+
+    let verdict = |label: &str, delta: Option<u32>, saw: bool| -> bool {
+        match (delta, saw) {
+            (None, _) => {
+                println!("[HIDOUT] {} FAIL: 设备未回传链路诊断段, 无法判定", label);
+                false
+            }
+            (Some(0), _) => {
+                println!(
+                    "[HIDOUT] {} FAIL(断点=固件内部): HID 报文实发数没有增加 ⇒ 按键没走到 HID 出口",
+                    label
+                );
+                false
+            }
+            (Some(n), false) => {
+                println!(
+                    "[HIDOUT] {} FAIL(断点=主机侧): 固件发出 {} 份报文, Windows 从未认成按下 ⇒ 报文格式/描述符/键盘栈",
+                    label, n
+                );
+                false
+            }
+            (Some(n), true) => {
+                println!(
+                    "[HIDOUT] {} PASS: 固件发出 {} 份报文, 主机侧确实按下",
+                    label, n
+                );
+                true
+            }
+        }
+    };
+    let ok_mod = verdict("阶段A 修饰位", mod_delta, mod_saw);
+    let ok_key = verdict("阶段B 键码", key_delta, key_saw);
+    if ok_mod && ok_key {
+        println!("[HIDOUT] PASS: 修饰位与普通键码两条报文字段主机都能收到");
+        std::process::exit(0);
+    }
+    std::process::exit(1);
+}
+
+// ============================================================================
 // --kbd-repair: 把 --nv-soak 写坏的**这几项**定向救回来, 不做整体 RESET_DEFAULTS。
 //
 // 只改三处:
@@ -4546,6 +4833,22 @@ fn main() {
     };
     // 定向修复: 只把 --nv-soak 写坏的极性与状态灯这几项救回来, 不做整体 RESET_DEFAULTS。
     let kbd_repair = args.iter().any(|a| a == "--kbd-repair");
+    // --cfg-set <键> <值>: 无头改单个配置项并落盘。类型按设备回读的 schema 真值推导, 不猜。
+    let cfg_set: Option<(String, String)> = args
+        .iter()
+        .position(|a| a == "--cfg-set")
+        .and_then(|i| match (args.get(i + 1), args.get(i + 2)) {
+            (Some(k), Some(v)) => Some((k.clone(), v.clone())),
+            _ => None,
+        });
+    // --kbd-hidout [按住毫秒]: HID 键盘输出闭环自检(无人值守)。见 run_kbd_hidout 的说明。
+    let kbd_hidout = args.iter().any(|a| a == "--kbd-hidout");
+    let kbd_hidout_ms: u64 = args
+        .iter()
+        .position(|a| a == "--kbd-hidout")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2500);
     let led_test = args.iter().any(|a| a == "--led");
     let set_verify_brightness: Option<u8> = args
         .iter()
@@ -5046,6 +5349,66 @@ fn main() {
                 DBG_LEN_COUNTERS
             ),
             Err(error) => println!("[ALGO-INFO] debug-read failed: {}", error),
+        }
+        // ★schema 解析结果必须能无头看到★ 界面上"未声明 ALGO_SETTING"这句话有两个完全不同的
+        // 来源: 设备源码里真的没声明, 或者声明解析出来了但没透传到那个页面。只看界面分不开,
+        // 这里直接打设备回读源的解析计数与每一项, 作为界面结论的对照真值。
+        // 本开关前面 cancel_conn_probes_for_diagnostic() 把连接探针(含 ALGO_GET_SRC)取消了,
+        // 所以必须自己再要一次源, 否则读到的恒是空串 —— 那只说明没请求, 不说明设备没源。
+        if let Err(error) = ctrl.request_algo_src() {
+            println!("[ALGO-INFO] ALGO_GET_SRC 请求失败: {}", error);
+        }
+        let started = std::time::Instant::now();
+        while started.elapsed() < Duration::from_secs(6) {
+            ctrl.poll();
+            thread::sleep(Duration::from_millis(20));
+        }
+        // 设备侧无存源(出厂默认算法只有内嵌 blob, 映射表里没有 C 源)时, GUI 的做法是把内嵌默认源
+        // 去注释后回灌一次, 使此后"读取信息"能真从设备取回。这里走**同一条**路径复现它, 否则
+        // 无头侧永远只能读到空串, 也就无法证明整条 schema 链是通的。
+        if ctrl.algo_device_src().trim().is_empty()
+            && ctrl.algo_info().map(|i| i.is_default).unwrap_or(false)
+        {
+            let default_src =
+                AppController::strip_c_comments(mai2control_ui::algo_template::ALGO_V31_TEMPLATE);
+            println!(
+                "[ALGO-INFO] 设备映射表无 C 源(默认算法) → 按 GUI 同一路径回灌内嵌默认源 {} 字节",
+                default_src.len()
+            );
+            if let Err(error) = ctrl.send_algo_src(&default_src) {
+                println!("[ALGO-INFO] ALGO_SET_SRC 回灌失败: {}", error);
+            }
+            let started = std::time::Instant::now();
+            while started.elapsed() < Duration::from_secs(8) {
+                ctrl.poll();
+                thread::sleep(Duration::from_millis(20));
+            }
+            let _ = ctrl.request_algo_src();
+            let started = std::time::Instant::now();
+            while started.elapsed() < Duration::from_secs(6) {
+                ctrl.poll();
+                thread::sleep(Duration::from_millis(20));
+            }
+        }
+        let src_len = ctrl.algo_device_src().len();
+        let settings = ctrl.algo_setting_decls();
+        let reports = ctrl.algo_report_decls();
+        println!(
+            "[ALGO-INFO] 设备源回读 {} 字节 → 解析 ALGO_REPORT×{} / ALGO_SETTING×{}",
+            src_len,
+            reports.len(),
+            settings.len()
+        );
+        for d in &settings {
+            println!(
+                "[ALGO-INFO]   cfg[{}] {} type={} range={} default={} 设备当前值={}",
+                d.idx,
+                d.name,
+                d.value_type,
+                d.range,
+                d.default,
+                ctrl.algo_cfg(d.idx)
+            );
         }
         std::process::exit(if sent && received { 0 } else { 1 });
     }
@@ -7123,6 +7486,14 @@ fn main() {
         }
     }
 
+    if let Some((key, raw)) = cfg_set.clone() {
+        run_cfg_set(&mut ctrl, &key, &raw);
+    }
+
+    if kbd_hidout {
+        run_kbd_hidout(&mut ctrl, kbd_hidout_ms);
+    }
+
     // 键盘闭环: 读物理键码表(12) + 触控映射表(34) + 物理实时态; SET_MAP round-trip 校验设备回读。
     if kbd_test {
         let pump = |ctrl: &mut AppController, n: u32| {
@@ -7144,6 +7515,28 @@ fn main() {
         );
         let zones: Vec<u8> = (0..34u8).map(|z| ctrl.kbd_touch_keycode(z)).collect();
         println!("[SELFTEST]   触控映射(34, 0=不映射) = {:02X?}", zones);
+        // ★组合表与链路诊断必须一起打★ per-zone 表为空时判定全走组合表, 只看前者会得出
+        // "一个映射都没有"的错误结论; 而 delay_ms/max_hold_ms 正是"点一下没反应"的常见原因,
+        // 不打出来就只能靠猜。
+        let _ = ctrl.kbd_request_combo();
+        let _ = ctrl.kbd_request_state();
+        pump(&mut ctrl, 30);
+        let combos = ctrl.kbd_combos();
+        println!(
+            "[SELFTEST]   组合表 {} 条 (supported={:?})",
+            combos.len(),
+            ctrl.kbd_combo_supported()
+        );
+        for (i, c) in combos.iter().enumerate() {
+            println!(
+                "[SELFTEST]     #{:02} zone_mask=0x{:09X} keys={:02X?} mod={:#04X} delay={}ms max_hold={}ms",
+                i, c.zone_mask, c.keycodes, c.modifiers, c.delay_ms, c.max_hold_ms
+            );
+        }
+        match ctrl.kbd_link_diag() {
+            Some(d) => println!("[SELFTEST]   链路诊断: {}", d.summary()),
+            None => println!("[SELFTEST]   链路诊断: 不可用(设备未回传)"),
+        }
         // round-trip: 物理键0 改成 KEY_A(0x04) → 设备回读校验 → 恢复原值。
         let orig = ctrl.kbd_map(0);
         let test_code: u8 = if orig == 0x04 { 0x05 } else { 0x04 };

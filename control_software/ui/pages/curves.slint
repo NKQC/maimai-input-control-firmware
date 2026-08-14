@@ -1075,6 +1075,34 @@ export component CurvesPage inherits Rectangle {
                         }
                 }
 
+                // ★紧跟"通道参数"之后★: cfg 与通道基础参数是同一件事的两半(硬件量纲的阈值/分频
+                // 在上, 算法量纲的可调量在下), 中间夹一个默认收起、几百次重校准的频谱扫描区块会
+                // 让人以为"可调变量属于频谱扫描"。频谱区排到二者之后。
+                CollapsibleSection {
+                    title: "算法可调变量(cfg)";
+                    summary: root.algo_setting_rows.length > 0
+                        ? root.algo_setting_rows.length + " 项 · 改即下发"
+                        : "无声明";
+                    expanded <=> root.algo_cfg_expanded;
+
+                    Text {
+                        text: root.algo_setting_rows.length > 0
+                            ? "修改立即下发并持久化(与设备上运行的算法共享 cfg[8])。"
+                            : "当前算法未声明 ALGO_SETTING, 无可调变量。";
+                        color: #b0b8c0;
+                        font-size: 10px;
+                        wrap: word-wrap;
+                    }
+                    VerticalBox {
+                            padding: 0px;
+                            spacing: 2px;
+                            for row in root.algo_setting_rows: AlgoSettingEditorRow {
+                                entry: row;
+                                edited(idx, v) => { root.algo_setting_edited(idx, v); }
+                            }
+                        }
+                }
+
                 // ── 响应噪声频谱 ─────────────────────────────────────────────────
                 // ★默认收起★: 这是一次要改写本通道 gain/div、逐点重校准 448 次的重操作。
                 // 热图只显示 host 实测出来的东西, 不做任何模型推断。
@@ -1181,31 +1209,6 @@ export component CurvesPage inherits Rectangle {
                         font-size: 10px;
                         wrap: word-wrap;
                     }
-                }
-
-                CollapsibleSection {
-                    title: "算法可调变量(cfg)";
-                    summary: root.algo_setting_rows.length > 0
-                        ? root.algo_setting_rows.length + " 项 · 改即下发"
-                        : "无声明";
-                    expanded <=> root.algo_cfg_expanded;
-
-                    Text {
-                        text: root.algo_setting_rows.length > 0
-                            ? "修改立即下发并持久化(与设备上运行的算法共享 cfg[8])。"
-                            : "当前算法未声明 ALGO_SETTING, 无可调变量。";
-                        color: #b0b8c0;
-                        font-size: 10px;
-                        wrap: word-wrap;
-                    }
-                    VerticalBox {
-                            padding: 0px;
-                            spacing: 2px;
-                            for row in root.algo_setting_rows: AlgoSettingEditorRow {
-                                entry: row;
-                                edited(idx, v) => { root.algo_setting_edited(idx, v); }
-                            }
-                        }
                 }
                 }
             }

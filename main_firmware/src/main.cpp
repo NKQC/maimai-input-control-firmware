@@ -92,7 +92,6 @@ void setup() {
     // 仅当【运行时指令 DEBUG_CRASH_BOOTSEL 已武装】(scratch[6]=magic, 跨复位存活)时, 运行中崩溃才进
     // BOOTSEL——供自持 debug: 上位机连上发指令武装后, 一旦崩溃自动进烧录便于 dev.ps1 自动重烧恢复。
     // scratch[6] 由指令置/清, 掉电清零; scratch[7]=运行中标记, 每次启动清零。
-    const uint32_t boot_flag = watchdog_hw->scratch[7];
     const bool crash_bootsel_armed = (watchdog_hw->scratch[6] == DEBUG_BOOTSEL_MAGIC);
     // ★死前遗言★: scratch[5] 记录"复位前 core0 正处于哪个阶段"(见 CrashStage)。scratch 跨复位保留,
     // 于是崩溃重启后能精确知道卡在哪一步, 不必再靠时间差反推 —— 掉线定位已经在退避/环容量/串行队列/
@@ -127,8 +126,8 @@ void setup() {
     watchdog_hw->scratch[CRASH_SCRATCH_STAGE] = 0u;
     watchdog_hw->scratch[7] = 0u;
     // ★仅当"上次确实运行中崩溃"且"已武装"才进 BOOTSEL★: ran_before 读 scratch[0]=CRASH_RUN_MAGIC(主循环每轮刷),
-    // boot_flag 读 scratch[7]=WD_RUNNING_MAGIC(只在 setup 末写一次)。主动重启会清 scratch[7] 但保留 scratch[0],
-    // 所以判据必须用 ran_before, 否则任何主动重启+武装窗口重合都会误进 BOOTSEL。
+    // 而 scratch[7]=WD_RUNNING_MAGIC 只在 setup 末写一次。主动重启会清 scratch[7] 但保留 scratch[0],
+    // 所以判据必须用 ran_before, 否则任何主动重启+武装窗口重合都会误进 BOOTSEL(故 scratch[7] 不参与判定)。
     if (ran_before && crash_bootsel_armed) {
         reset_usb_boot(0, 0);
     }

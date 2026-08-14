@@ -192,8 +192,7 @@ void CsdConfig::tick_provisioning(Psoc* psoc) {
             if (psoc->set_mode(_mode)) {
                 _provision_ch = 0u;
                 _provision_index = 0u;
-                _provision_stage = _global_valid ? ProvisionStage::GLOBALS :
-                    ((_mode == CSD_MODE_SEMI && _valid) ? ProvisionStage::PARAMS : ProvisionStage::ENABLED);
+                _provision_stage = _global_valid ? ProvisionStage::GLOBALS : ProvisionStage::ENABLED;
             }
             return;
 
@@ -201,8 +200,10 @@ void CsdConfig::tick_provisioning(Psoc* psoc) {
             if (_provision_index >= CSD_GLOBAL_COUNT) {
                 _provision_ch = 0u;
                 _provision_index = 0u;
-                _provision_stage = (_mode == CSD_MODE_SEMI && _valid)
-                    ? ProvisionStage::PARAMS : ProvisionStage::ENABLED;
+                // ★全局项设完必须 COMMIT★ 否则 inactive_sns/IDAC/MFS 只落在 PSoC 的 RAM 影子里,
+                // 要等下一次无关的重初始化才生效 —— store 与设备实际行为不一致的又一条暗路。
+                _provision_stage = _provision_need_global_commit
+                    ? ProvisionStage::GLOBAL_COMMIT : ProvisionStage::ENABLED;
                 return;
             }
             if (psoc->set_global(static_cast<uint8_t>(CSD_GLOBAL_ID_MIN + _provision_index),
@@ -212,14 +213,28 @@ void CsdConfig::tick_provisioning(Psoc* psoc) {
             return;
 
         case ProvisionStage::GLOBAL_COMMIT:
-            if (psoc->global_commit()) _provision_stage = ProvisionStage::ENABLED;
+            // COMMIT 内含 Cy_CapSense_Init(会把全部 widget 的 ENABLE 位重新置起), 故必须排在
+            // ENABLED 之前; PSoC 侧 Init 之后自己会重放位图, 两侧都不依赖对方的时序巧合。
+            if (psoc->global_commit()) {
+                _provision_need_global_commit = false;
+                _provision_stage = ProvisionStage::ENABLED;
+            }
             return;
 
         case ProvisionStage::ENABLED:
+            // ★启用位图必须无条件下发, 且必须排在 PARAMS 之前★
+            // 1) 无条件: 它是硬件开关而非调参项, AUTO 模式与 !_valid 的空 store 同样有明确的启用集
+            //    (_reset_params 把该列复位成"全启用")。历史实现里 PARAMS 分支直接跳到 DONE, 于是
+            //    正常的 SEMI+valid 路径**永远不下发这 36 条**, PSoC 的启动 gate 只能 3s 超时回退成
+            //    "全 36 通道启用" —— 每次 PSoC 复位后用户关掉的通道都会偷偷复活并继续扫描, 而
+            //    UI 读的是 PSoC(说启用)、校准门禁读的是 store(说禁用), 双真相源就是从这里长出来的。
+            // 2) 先于 PARAMS: PSoC 的 gate 只按"位图静默"计时, 36 条能在窗口内送完; 若排在 ~396 条
+            //    PARAMS 之后, 窗口早已耗尽。
             if (_provision_ch >= CSD_CHANNELS) {
                 _provision_ch = 0u;
                 _provision_index = 0u;
-                _provision_stage = ProvisionStage::RELEASE_APPLY;
+                _provision_stage = (_mode == CSD_MODE_SEMI && _valid)
+                    ? ProvisionStage::PARAMS : ProvisionStage::RELEASE_APPLY;
                 return;
             }
             if (psoc->set_param(_provision_ch, CSD_PARAM_ENABLED,
@@ -256,7 +271,9 @@ void CsdConfig::tick_provisioning(Psoc* psoc) {
                 _provision_ch++;
                 _provision_index = 0u;
             }
-            _provision_stage = ProvisionStage::DONE;
+            // 参数写完必须走放行屏障, 不能直接 DONE: RELEASE_APPLY 才是"这套镜像整体生效"的那一步
+            // (PSoC 侧据它清 g_provision_pending 并开始扫描)。
+            _provision_stage = ProvisionStage::RELEASE_APPLY;
             return;
 
         case ProvisionStage::IDLE:
@@ -331,6 +348,12 @@ int8_t CsdConfig::tick_recapture(Psoc* psoc) {
             }
             const uint8_t ch = static_cast<uint8_t>(_recapture_index / CSD_PARAM_COUNT);
             const uint8_t index = static_cast<uint8_t>(_recapture_index % CSD_PARAM_COUNT);
+            // ★启用列绝不回读★ 见 capture_from_psoc 同处说明: 它是 store 单向下发的硬件开关,
+            // 从 PSoC 读回就等于让执行者反过来定义真相。
+            if (index == _param_index(CSD_PARAM_ENABLED)) {
+                _recapture_index++;
+                return 0;
+            }
             uint32_t value = 0u;
             if (!psoc->get_param(ch, static_cast<uint8_t>(CSD_PARAM_ID_MIN + index), &value)) {
                 return -1;
@@ -429,6 +452,11 @@ bool CsdConfig::capture_from_psoc(Psoc* psoc) {
     _baseline_untrusted = !sampling_trustworthy(psoc);
     for (uint8_t ch = 0; ch < CSD_CHANNELS; ch++) {
         for (uint8_t i = 0; i < CSD_PARAM_COUNT; i++) {
+            // ★启用列(0x0C)绝不从 PSoC 回读★
+            // 其余参数问 PSoC 是对的: 校准/频率自适应会**合法地**改 idac/snsClk, 设备值才是最新。
+            // 而启用与否只由用户经 store 决定, PSoC 只是执行者 —— 一旦把它读回来, PSoC 任何一次
+            // 位图漂移(启动 gate 超时回退、丢一条 SET_PARAM)都会被固化成"用户的配置", 真相源反转。
+            if (i == _param_index(CSD_PARAM_ENABLED)) continue;
             uint32_t v = 0;
             if (psoc->get_param(ch, (uint8_t)(CSD_PARAM_ID_MIN + i), &v)) {
                 _param[ch][i] = (uint16_t)v;

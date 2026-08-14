@@ -71,9 +71,14 @@ pub struct KeyboardDevice {
     /// 该设备树节点是否出现在 `GetRawInputDeviceList` 的列表里。
     ///
     /// ★这是本模块最重要的诊断位★ 设备树里在位、Raw Input 里却没有 = 键盘栈没有把该节点公开给
-    /// Raw Input 子系统。实测本工程固件的 HID 接口(MI_05 的三个 &COL0x 键盘集合)正是这种状态:
-    /// SetupAPI 报 PRESENT OK, `GetRawInputDeviceList` 一个都不返回。**根因尚未定位**,
-    /// 这里只负责把矛盾如实暴露出来, 不做任何补偿或掩盖。
+    /// Raw Input 子系统, 旁路监听对它注定收不到任何数据。
+    ///
+    /// ★曾经在此断言"本工程固件的三个 &COL0x 键盘集合就是这种状态、根因未定位"——该结论已被实测
+    /// 推翻, 勿再据此排查★ 复测(`GetRawInputDeviceList` + `RIDI_DEVICENAME`)三个集合均以
+    /// dwType=1(键盘)正常返回, kbdhid/kbdclass 已挂载且 kbdclass 类过滤未被第三方驱动插队;
+    /// 同期用"临时把某物理键改成高电平触发制造恒按下"的闭环(selftest --kbd-hidout)确认修饰位与
+    /// 普通键码两类报文主机都真的收到。当时看到的"一个都不返回"更可能是该设备已被本应用改绑
+    /// WinUSB(改绑后 HID 节点整体消失, 见 `rebound`)或列表在设备栈重建期间被读取。
     pub rawinput_visible: bool,
     /// 端点/接口实测读数单行文案(集合标识 · service · Raw Input 可见性 · 实例/USB 父节点)。
     /// 拿不到的项写"未知", 不留空、不编造。
