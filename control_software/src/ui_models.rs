@@ -268,6 +268,8 @@ pub(crate) fn config_display_order(key: &str) -> u16 {
         "comm.serial_reset_baseline" => 70,
         "comm.serial_reset_calibrate" => 71,
         // —— PSoC 每启动代次的一次性校准 + 主机端延迟补正 ——
+        // 延迟排在三档之前: 它决定这三档"什么时候开始", 读起来才是时间顺序。
+        "calib.boot_delay_ms" => 5,
         "calib.boot_idac" => 10,
         "calib.boot_channel" => 20,
         "calib.boot_baseline" => 30,
@@ -313,7 +315,8 @@ pub(crate) fn parse_config_label(key: &str) -> (String, String, String) {
         // 语义上属协议能力而非键盘映射本身, 故归到协议页 mai2serial 块。
         | "comm.keyboard_map_serial_only" => "mai2serial 协议参数",
         // PSoC 启动流水线开关属于设备设置；主机侧延迟补正保留在协议页。
-        "calib.boot_idac" | "calib.boot_channel" | "calib.boot_baseline" => "开机校准",
+        "calib.boot_delay_ms" | "calib.boot_idac" | "calib.boot_channel"
+        | "calib.boot_baseline" => "开机校准",
         "comm.latency_correction_en" => "延迟补正",
         // mai2light: 灯板串口 + 节点号 + 灯珠总数 → 协议页 mai2light 块
         "comm.light_baud" | "led.node_id" | "led.count" => "mai2light 协议参数",
@@ -367,6 +370,10 @@ pub(crate) fn parse_config_label(key: &str) -> (String, String, String) {
         "comm.serial_reset_baseline" => (
             "串口重启后自动基线复位",
             "收到 mai2serial 重启指令({E} RSET)后，自动执行一次全通道基线复位",
+        ),
+        "calib.boot_delay_ms" => (
+            "开机校准延迟 (ms)",
+            "上电就绪观察通过后，再等这么久才开始下面三档校准；0=不等待。对三档统一生效，等待期间设备照常推流与响应协议，只是暂不发起校准/自适应/基线复位。用于部分通道上电初期读数未稳、立刻校准会把不稳定态学成基准的板子。上限 60000ms",
         ),
         "calib.boot_idac" => (
             "开机 IDAC 校准",

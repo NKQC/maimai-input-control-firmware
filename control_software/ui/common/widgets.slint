@@ -477,9 +477,38 @@ export component TypeTag inherits Rectangle {
     }
 }
 
+// 作用域标签: 与 TypeTag 并列, 标出"这一行改的是一份全通道共享的值"。
+// ★为什么要和数据类型同级地摆出来★ 一行里"改什么类型的数"和"这次改会影响几个通道"是同等重要的
+// 两件事, 而后者原先只能靠读源码知道。批量应用抽屉里其余每一行都是逐通道写入, 唯独 cfg 是一份
+// 全局值 —— 没有这个标签, 那几行看起来与旁边的逐通道参数毫无区别。
+export component ScopeTag inherits Rectangle {
+    in property <string> text: "全通道共享";
+
+    horizontal-stretch: 0;
+    border-radius: 3px;
+    border-width: 1px;
+    border-color: Theme.pick;
+    background: Theme.pick-bg;
+    HorizontalLayout {
+        padding-left: 4px;
+        padding-right: 4px;
+        Text {
+            text: root.text;
+            color: Theme.pick;
+            font-size: Theme.fs-small;
+            vertical-alignment: center;
+        }
+    }
+}
+
 // 算法可调变量编辑行: 0..255(u8)，同时显示别名、类型标签与范围。
 export component AlgoSettingEditorRow inherits HorizontalBox {
     in property <AlgoSettingRow> entry;
+    // 窄栏模式: 收起"范围"那一列。★不是简单的省略★ 全通道页批量抽屉只有 300px 宽, 而本行的
+    // 名称 + 类型标签 + 共用标签 + 范围(92px) + 数字框(132px) 加起来超出这个宽度, 会让抽屉的
+    // ScrollView 长出一条横向滚动条(纵向滚动的列里再横向滚是本工程明确避免的交互)。
+    // 范围信息并没有丢: 数字框自身就按同一围栏夹取, 类型标签也仍在。
+    in property <bool> compact: false;
     callback edited(int, int);
 
     padding: 0px;
@@ -498,7 +527,8 @@ export component AlgoSettingEditorRow inherits HorizontalBox {
     // ★可调变量的类型/范围一律有确定结论★: 设备 cfg[8] 就是 8 个 u8, 旧式 ALGO_SETTING 缺
     // META 时退回的 u8/0..255 是协议事实(不是猜的), 所以这里不需要"未声明"分支。
     TypeTag { value_type: root.entry.value_type; }
-    Text {
+    if root.entry.shared_scope: ScopeTag { }
+    if !root.compact: Text {
         text: root.entry.range;
         width: 92px;
         color: Theme.text-sub;

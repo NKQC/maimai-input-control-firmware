@@ -244,6 +244,11 @@ export component SettingsPage inherits Rectangle {
     // 批量启用/禁用 + 抽屉收起时的会话清理(见 all_channels.slint 的说明)。
     callback batch_enable_channels();
     callback batch_disable_channels();
+    // 批量抽屉四个折叠分区的展开态: 抽屉是 `if` 条件实例化的, 状态必须活在 AppWindow 上。
+    in-out property <bool> batch_targets_expanded: true;
+    in-out property <bool> batch_enable_expanded: false;
+    in-out property <bool> batch_params_expanded: true;
+    in-out property <bool> batch_algo_cfg_expanded: false;
     callback batch_drawer_closed();
     // 全通道页排序/筛选(排序与筛选实际由 Rust 侧按绑定映射执行, 这里只透传用户选择)。
     in-out property <int> channel_sort: 0;
@@ -534,6 +539,14 @@ export component SettingsPage inherits Rectangle {
                 batch_enable_channels() => { root.batch_enable_channels(); }
                 batch_disable_channels() => { root.batch_disable_channels(); }
                 batch_drawer_closed() => { root.batch_drawer_closed(); }
+                // 批量抽屉里的算法可调变量: 与单通道精调页共用同一个模型与同一个回调。
+                algo_setting_rows: root.algo_setting_rows;
+                algo_setting_edited(idx, v) => { root.algo_setting_edited(idx, v); }
+                // 抽屉四个折叠分区的展开态存在 AppWindow(抽屉是 `if` 实例化的, 见该页说明)。
+                batch_targets_expanded <=> root.batch_targets_expanded;
+                batch_enable_expanded <=> root.batch_enable_expanded;
+                batch_params_expanded <=> root.batch_params_expanded;
+                batch_algo_cfg_expanded <=> root.batch_algo_cfg_expanded;
                 channel_sort <=> root.channel_sort;
                 channel_show_disabled <=> root.channel_show_disabled;
                 channel_hidden_count: root.channel_hidden_count;

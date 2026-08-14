@@ -155,6 +155,12 @@ export component AppWindow inherits Window {
     // 批量启用/禁用(复用 PARAM_ENABLED=0x0C) + 抽屉收起时的会话清理。
     callback batch_enable_channels();
     callback batch_disable_channels();
+    // 全通道页批量抽屉四个折叠分区的展开态。抽屉是 `if` 条件实例化的, 状态放在页面里会随收起
+    // 被销毁 —— 与曲线页各折叠区同一约定: 折叠态一律由 AppWindow 持有, 切页/收起都不丢。
+    in-out property <bool> batch_targets_expanded: true;
+    in-out property <bool> batch_enable_expanded: false;
+    in-out property <bool> batch_params_expanded: true;
+    in-out property <bool> batch_algo_cfg_expanded: false;
     callback batch_drawer_closed();
     // 全通道页排序/筛选: 真正的排序与筛选在 Rust 侧做(逻辑顺序的唯一真相源是绑定映射),
     // 这两个属性只是把用户的选择传下去; channel_hidden_count 由 Rust 回填被筛掉的通道数。
@@ -886,6 +892,10 @@ export component AppWindow inherits Window {
                 batch_enable_channels() => { root.batch_enable_channels(); }
                 batch_disable_channels() => { root.batch_disable_channels(); }
                 batch_drawer_closed() => { root.batch_drawer_closed(); }
+                batch_targets_expanded <=> root.batch_targets_expanded;
+                batch_enable_expanded <=> root.batch_enable_expanded;
+                batch_params_expanded <=> root.batch_params_expanded;
+                batch_algo_cfg_expanded <=> root.batch_algo_cfg_expanded;
                 channel_sort <=> root.channel_sort;
                 channel_show_disabled <=> root.channel_show_disabled;
                 channel_hidden_count: root.channel_hidden_count;

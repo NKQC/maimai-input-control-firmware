@@ -187,6 +187,11 @@ export struct AlgoSettingRow {
     range: string,
     alias: string,
     description: string,
+    // 该变量是否为全通道共享(一份值对 36 个通道同时生效)。
+    // ★必须与 value_type 一样成为行数据的一部分★ 设备侧 cfg[8] 只有一份(PSoC g_algo_cfg[8]、
+    // RP PsocAlgo::_cfg[8] 都不带通道下标), 而同一个编辑行组件也会出现在"全通道页批量应用"抽屉里
+    // —— 那里其余每一行都是"逐通道写入"。不把作用域标出来, 用户会以为这几项也只写勾选的通道。
+    shared_scope: bool,
 }
 // 虚拟摄像头输入源设备树的一行: 组头(分类)或设备项。
 // 日志页一行。no=全局行号(跨过滤稳定, 便于指位与去重), level: 0错误 1警告 2信息 3调试。

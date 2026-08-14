@@ -63,6 +63,10 @@ windows = { version = "0.62.2", default-features = false, features = [
     "Win32_System_DataExchange",
     "Win32_System_Memory",
     "Win32_System_LibraryLoader",
+    # CreateFileW/OPEN_EXISTING/FILE_SHARE_*: 键盘接口可开性实测(vcam/keyboard.rs 的
+    # `probe_kbd_iface`)。这是判断"选中该设备到底收不收得到数据"的唯一硬判据 ——
+    # Raw Input 列表会漏报健康节点, 不能拿它当判据。
+    "Win32_Storage_FileSystem",
 ] }
 
 # ★UI 流畅度的决定性开关★ 实测(main.rs 的 [PROF] gap = 16ms 定时器的实际到达间隔):

@@ -65,6 +65,10 @@ export component ToolboxPage inherits Rectangle {
     // 「签名并信任」的二次确认闸: 第一次点击只展开告知文案, 必须再点一次专门的确认按钮才真的执行。
     // 往受信任根证书存储里写东西是不可当作顺手操作的, 所以确认状态放在 UI 本地, 不参与持久化。
     property <bool> sign_confirm: false;
+    // 「安装」的二次确认闸。★这一步必须先告知再执行★ 安装会连带装上键盘输入过滤组件, 它在重启前
+    // 会让**此后重新插拔/重新上电的每一个键盘**在整个系统里收不到输入 —— 这个代价必须事先说清,
+    // 不能等用户事后发现扫码器和固件键盘一起没反应。确认状态同样只活在 UI 本地。
+    property <bool> install_confirm: false;
 
     // ★整页装进 ScrollView★ 本页内容(权限提示 + 设备树 + 若干参数行 + 说明)的 min-height 约 660px,
     // 在 520px 高的窗口里会溢出并把底部说明/预览挤出可视区。ScrollView 自身 min 只有 50px, 且其
@@ -243,8 +247,8 @@ export component ToolboxPage inherits Rectangle {
                                     // 并发点只会得到互相踩踏后无法解释的核验结果。
                                     Button {
                                         text: root.vcam_deploy_busy ? "安装中…" : "安装(需管理员)";
-                                        enabled: !root.vcam_deploy_busy;
-                                        clicked => { root.install_vcam(); }
+                                        enabled: !root.vcam_deploy_busy && !root.install_confirm;
+                                        clicked => { root.install_confirm = true; }
                                     }
                                     Button {
                                         text: root.vcam_deploy_busy ? "请稍候…" : "卸载(需管理员)";
@@ -252,8 +256,39 @@ export component ToolboxPage inherits Rectangle {
                                         clicked => { root.uninstall_vcam(); }
                                     }
                                 }
+                                // ★安装前告示★ 与「签名并信任」同一手法: 第一次点击只展开这段文案。
+                                // 三件事必须齐全 —— 装什么、要你做什么、影响谁; 只讲功能与后果,
+                                // 不讲实现。★不要套 Rectangle★ 见下方签名告示处的同一条布局告诫。
+                                if root.install_confirm: Text {
+                                    text: "将安装：系统虚拟摄像头 + 键盘输入过滤组件。\n"
+                                        + "需要你做的：过程中确认管理员弹窗；装完必须重启电脑，过滤组件才会生效。\n"
+                                        + "⚠ 影响面：从装完到重启电脑之前，凡是重新插拔或重新上电的键盘（扫码器、本机固件键盘都算）"
+                                        + "会在整个系统里收不到输入，重启后自行恢复；当前已在用的键盘不受影响。\n"
+                                        + "只要扫码器独占输入，用下面的「WinUSB 改绑」即可，不必安装本组件。";
+                                    color: #f5c469;
+                                    font-size: 10px;
+                                    wrap: word-wrap;
+                                }
+                                if root.install_confirm: HorizontalBox {
+                                    padding: 0px;
+                                    spacing: 8px;
+                                    Button {
+                                        text: root.vcam_deploy_busy ? "安装中…" : "确认安装";
+                                        enabled: !root.vcam_deploy_busy;
+                                        clicked => {
+                                            root.install_confirm = false;
+                                            root.install_vcam();
+                                        }
+                                    }
+                                    Button {
+                                        text: "取消";
+                                        enabled: !root.vcam_deploy_busy;
+                                        clicked => { root.install_confirm = false; }
+                                    }
+                                    Rectangle { horizontal-stretch: 1; }
+                                }
                                 Text {
-                                    text: "可对选定设备执行热重启；若未执行则不会拦截目标设备输入。";
+                                    text: "键盘输入过滤组件装完需重启电脑才生效；只要扫码器可改用下面的「WinUSB 改绑」。";
                                     color: #7f8c96;
                                     font-size: 10px;
                                     wrap: word-wrap;

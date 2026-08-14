@@ -40,6 +40,10 @@ void app_config_register_schema() {
         // 档位越高 → PSoC 在"校准刚好通过的临界最高频率"基础上往低频多让 2 个 snsClk 分频/档,
         // 充电更充分产生近场探测效应(更灵敏); 档位 1 = 临界频率本身(最不灵敏, 余量最小)。
         config_map["calib.pref"]                 = ConfigValue(uint8_t(4), uint8_t(1), uint8_t(7));
+        // 三档开机校准共用的统一起跑延迟(ms, 0=不延迟)。0..60000 与上位机围栏同源。
+        // 用途: 部分通道上电初期读数尚未稳定, 立刻校准会把不稳定态学成基准。延迟窗口内设备
+        // 照常推流与响应协议, 只是暂不发起校准/自适应/基线复位。
+        config_map["calib.boot_delay_ms"]        = ConfigValue(uint16_t(0), uint16_t(0), uint16_t(60000));
         // 每颗 PSoC 启动并完成 provisioning 后执行一次的非阻塞校准流水线。
         config_map["calib.boot_idac"]            = ConfigValue(true);
         config_map["calib.boot_channel"]         = ConfigValue(true);

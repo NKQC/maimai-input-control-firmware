@@ -3,9 +3,9 @@
 // ============================================================================
 
 import { Button, CheckBox, VerticalBox, HorizontalBox, ScrollView, SpinBox, ComboBox } from "std-widgets.slint";
-import { ChannelStatus, ParamRow } from "../common/types.slint";
+import { ChannelStatus, ParamRow, AlgoSettingRow } from "../common/types.slint";
 import { Theme } from "../common/theme.slint";
-import { GuardedSpinBox, GuardedComboBox, GuardedCheckBox, HelpDot, HelpOverlay } from "../common/widgets.slint";
+import { GuardedSpinBox, GuardedComboBox, GuardedCheckBox, HelpDot, HelpOverlay, CollapsibleSection, AlgoSettingEditorRow } from "../common/widgets.slint";
 
 // 批量应用抽屉的宽度。★只定义一次★: 抽屉自身宽度与"算通道网格列数时要扣掉的宽度"必须是同一个
 // 常量, 两处各写一个数就会出现"展开后右边一列被抽屉盖住"。
@@ -300,6 +300,18 @@ export component AllChannelsPage inherits Rectangle {
     // 抽屉从展开 → 收起时通知 Rust 清理本次批量会话(勾选/待写值/源通道)。
     callback batch_drawer_closed();
 
+    // ---- 算法可调变量(cfg): 全通道共享的一份值, 与批量勾选无关 ----
+    // 与单通道精调页同一个模型、同一个回调, 不新增第二条通路(否则两页的值会漂移)。
+    in property <[AlgoSettingRow]> algo_setting_rows: [];
+    callback algo_setting_edited(int, int);
+
+    // 抽屉内四个折叠分区的展开态。★必须由外部(AppWindow)持有★: 抽屉本身是 `if` 条件实例化的,
+    // 状态放在页面里会随抽屉收起被销毁, 下次展开全部回到默认值。
+    in-out property <bool> batch_targets_expanded: true;
+    in-out property <bool> batch_enable_expanded: false;
+    in-out property <bool> batch_params_expanded: true;
+    in-out property <bool> batch_algo_cfg_expanded: false;
+
     // 批量抽屉里 "?" 悬浮详解的当前文本(空 = 没悬浮在任何问号上)。
     property <string> help_text: "";
 
@@ -457,102 +469,97 @@ export component AllChannelsPage inherits Rectangle {
                     font-weight: 700;
                     color: Theme.text-title;
                 }
-                Text {
-                    text: @tr("编辑参数值并勾选目标；仅勾选项会写入。保存后生效。");
-                    font-size: Theme.fs-small;
-                    color: Theme.text-sub;
-                    wrap: word-wrap;
+
+                // ★抽屉改用与单通道精调右栏同一套折叠分区★ 原先四组内容(源/目标通道、启用禁用、
+                // 参数表、说明文字)平铺在一列里, 300px 宽下一屏放不下, 每次都要滚很久才能摸到
+                // "应用"按钮; 而说明文字与详解浮层还会随内容变化改变列高。改成折叠区后:
+                //   · 每组能各自收起, 只留标题行 + 一行摘要, 常用的那组保持展开;
+                //   · 折叠态是确定高度(见 CollapsibleSection 说明), 不再因说明文字长短抖动。
+                // ★分区体内一律不放 wrap: word-wrap 的 Text★ 那会让区块 preferred-height 偏小
+                // (CollapsibleSection 注释里记的老病灶), 表现为展开后内容被裁。说明一律进摘要或
+                // 进页面底部的详解浮层。
+                CollapsibleSection {
+                    title: @tr("目标通道");
+                    summary: @tr("源 CH") + root.batch_source;
+                    expanded <=> root.batch_targets_expanded;
+
+                    Text {
+                        text: @tr("源通道 CH") + root.batch_source + @tr(" · Shift+单击网格更换");
+                        font-size: Theme.fs-small;
+                        color: #7cf5a0;
+                        overflow: elide;
+                    }
+                    // 抽屉里的按钮行都加行尾弹性空白: Slint 在"全部子项 stretch=0"时平分余量,
+                    // 没有这块空白时两三个按钮会各被摊成整列宽的巨块。
+                    HorizontalBox {
+                        padding: 0px;
+                        spacing: Theme.gap;
+                        Button {
+                            horizontal-stretch: 0;
+                            text: @tr("全选");
+                            clicked => { root.batch_channels_all(); }
+                        }
+                        Button {
+                            horizontal-stretch: 0;
+                            text: @tr("反选");
+                            clicked => { root.batch_channels_invert(); }
+                        }
+                        Button {
+                            horizontal-stretch: 0;
+                            text: @tr("清空");
+                            clicked => { root.batch_clear(); }
+                        }
+                        Rectangle { horizontal-stretch: 1; }
+                    }
                 }
 
-                Text {
-                    text: @tr("源通道: CH") + root.batch_source + @tr(" · Shift+单击更换");
-                    font-size: Theme.fs-small;
-                    color: #7cf5a0;
-                    wrap: word-wrap;
-                }
-
-                Text {
-                    text: @tr("目标通道选择");
-                    font-size: Theme.fs-small;
-                    color: Theme.text-title;
-                }
-                // 抽屉里的三组按钮行都加行尾弹性空白: Slint 在"全部子项 stretch=0"时平分余量,
-                // 没有这块空白时两三个按钮会各被摊成整列宽的巨块(用户反馈的"不够优雅"之一)。
-                HorizontalBox {
-                    padding: 0px;
-                    spacing: Theme.gap;
-                    Button {
-                        horizontal-stretch: 0;
-                        text: @tr("全选");
-                        clicked => { root.batch_channels_all(); }
-                    }
-                    Button {
-                        horizontal-stretch: 0;
-                        text: @tr("反选");
-                        clicked => { root.batch_channels_invert(); }
-                    }
-                    Button {
-                        horizontal-stretch: 0;
-                        text: @tr("清空");
-                        clicked => { root.batch_clear(); }
-                    }
-                    Rectangle { horizontal-stretch: 1; }
-                }
-
-                // ---- 批量启用 / 禁用 ----
                 // ★与"批量应用参数"分开成一组★: 参数是调参(要选参数、要填值), 而启用是硬件开关
-                // (只有开/关两种结果)。混进上面那张参数表会让"启用"看着像又一个可复制的数值项。
-                Text {
-                    text: @tr("批量启用 / 禁用");
-                    font-size: Theme.fs-small;
-                    color: Theme.text-title;
-                }
-                Text {
-                    text: @tr("启用或禁用已选通道；保存后生效。");
-                    font-size: Theme.fs-small;
-                    color: Theme.text-sub;
-                    wrap: word-wrap;
-                }
-                HorizontalBox {
-                    padding: 0px;
-                    spacing: Theme.gap;
-                    Button {
-                        horizontal-stretch: 0;
-                        text: @tr("启用已选");
-                        clicked => { root.batch_enable_channels(); }
+                // (只有开/关两种结果)。混进参数表会让"启用"看着像又一个可复制的数值项。
+                CollapsibleSection {
+                    title: @tr("批量启用 / 禁用");
+                    summary: @tr("硬件开关");
+                    expanded <=> root.batch_enable_expanded;
+
+                    HorizontalBox {
+                        padding: 0px;
+                        spacing: Theme.gap;
+                        Button {
+                            horizontal-stretch: 0;
+                            text: @tr("启用已选");
+                            clicked => { root.batch_enable_channels(); }
+                        }
+                        Button {
+                            horizontal-stretch: 0;
+                            text: @tr("禁用已选");
+                            clicked => { root.batch_disable_channels(); }
+                        }
+                        Rectangle { horizontal-stretch: 1; }
                     }
-                    Button {
-                        horizontal-stretch: 0;
-                        text: @tr("禁用已选");
-                        clicked => { root.batch_disable_channels(); }
-                    }
-                    Rectangle { horizontal-stretch: 1; }
                 }
 
-                Text {
-                    text: @tr("参数选择（勾选项才会被写入）");
-                    font-size: Theme.fs-small;
-                    color: Theme.text-title;
-                }
-                HorizontalBox {
-                    padding: 0px;
-                    spacing: Theme.gap;
-                    Button {
-                        horizontal-stretch: 0;
-                        text: @tr("全选");
-                        clicked => { root.batch_params_all(); }
-                    }
-                    Button {
-                        horizontal-stretch: 0;
-                        text: @tr("反选");
-                        clicked => { root.batch_params_invert(); }
-                    }
-                    Rectangle { horizontal-stretch: 1; }
-                }
+                CollapsibleSection {
+                    title: @tr("通道参数");
+                    summary: root.batch_param_rows.length + @tr(" 项 · 勾选才写入");
+                    expanded <=> root.batch_params_expanded;
 
-                // 参数行按自然高度排布(11 行 × 26px), 整列的滚动由抽屉外层那个 ScrollView 承担。
-                // 这里不再套第二层 ScrollView: 嵌套 Flickable 会抢滚动事件, 且内层 min 仍要占位。
-                VerticalLayout {
+                    HorizontalBox {
+                        padding: 0px;
+                        spacing: Theme.gap;
+                        Button {
+                            horizontal-stretch: 0;
+                            text: @tr("全选");
+                            clicked => { root.batch_params_all(); }
+                        }
+                        Button {
+                            horizontal-stretch: 0;
+                            text: @tr("反选");
+                            clicked => { root.batch_params_invert(); }
+                        }
+                        Rectangle { horizontal-stretch: 1; }
+                    }
+                    // 参数行按自然高度排布, 整列的滚动由抽屉外层那个 ScrollView 承担。
+                    // 这里不再套第二层 ScrollView: 嵌套 Flickable 会抢滚动事件, 且内层 min 仍要占位。
+                    VerticalLayout {
                         padding: 0px;
                         spacing: 1px;
                         for row[i] in root.batch_param_rows: BatchParamRow {
@@ -565,13 +572,40 @@ export component AllChannelsPage inherits Rectangle {
                             value_set(v) => { root.batch_param_value_set(row.param_id, v); }
                             help_hovered(t) => { root.help_text = t; }
                         }
+                    }
                 }
 
-                // 详解浮层就放在参数行下方。★这里不能像曲线页那样浮到页面顶层★: 抽屉是 clip:true
-                // 的 300px 固定宽列, 浮到外面反而会盖住通道网格; 顺着列往下长, 抽屉自身的 ScrollView
-                // 会给出滚动。没悬浮任何问号时高度为 0, 抽屉观感与从前一致。
-                HelpOverlay {
-                    text: root.help_text;
+                // ---- 算法可调变量(cfg) ----
+                // ★与上面的通道参数是两种东西, 必须分区并标出作用域★ cfg[8] 在设备上只有一份
+                // (PSoC g_algo_cfg[8] / RP PsocAlgo::_cfg[8] 都不带通道下标), 改一次即对全部 36 个
+                // 通道生效, 与"勾了哪些目标通道"无关, 也不参与下面那个"应用到已选通道"。
+                // 放进本抽屉的理由: 用户在全通道页对着一片读数调参时, 算法量与硬件量本来就要一起看;
+                // 作用域差异由每行的 ScopeTag(全通道共享)与本区摘要如实标注, 不靠用户记。
+                CollapsibleSection {
+                    title: @tr("算法可调变量(cfg)");
+                    summary: root.algo_setting_rows.length > 0
+                        ? root.algo_setting_rows.length + @tr(" 项 · 全通道共享 · 改即下发")
+                        : @tr("无声明");
+                    expanded <=> root.batch_algo_cfg_expanded;
+
+                    Text {
+                        text: root.algo_setting_rows.length > 0
+                            ? @tr("一份值对全部通道生效, 不随目标通道勾选")
+                            : @tr("当前算法未声明 ALGO_SETTING");
+                        font-size: Theme.fs-small;
+                        color: Theme.text-sub;
+                        overflow: elide;
+                    }
+                    VerticalLayout {
+                        padding: 0px;
+                        spacing: 2px;
+                        for row in root.algo_setting_rows: AlgoSettingEditorRow {
+                            entry: row;
+                            // 抽屉只有 300px 宽: 收起"范围"列, 免得整列长出横向滚动条。
+                            compact: true;
+                            edited(idx, v) => { root.algo_setting_edited(idx, v); }
+                        }
+                    }
                 }
 
                 Button {
@@ -583,5 +617,17 @@ export component AllChannelsPage inherits Rectangle {
             }
         }
         }
+    }
+
+    // 参数 "?" 的详解浮层。★与单通道精调页同一手法: 贴在页面底部、绝对定位、不进任何布局★
+    // 原先它长在抽屉那一列的参数行下方, 于是鼠标每划过一个问号, 详解文本的高度变化就会改变抽屉
+    // VerticalBox 的累加高度 → 列内所有控件上下跳动(用户反馈的"震荡"), 严重时正在瞄的那个数字框
+    // 会从指针下跑掉。作为根 Rectangle 的兄弟节点后, 它只是盖在页面上的一层, 对布局零影响;
+    // 没悬浮任何问号时 text 为空 ⇒ 组件自身高度 0 且不可见, 观感与从前一致。
+    HelpOverlay {
+        x: 8px;
+        y: parent.height - self.height - 8px;
+        width: parent.width - 16px;
+        text: root.help_text;
     }
 }

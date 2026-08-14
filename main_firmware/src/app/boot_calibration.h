@@ -32,6 +32,10 @@ enum class BootCalibrationStage : uint8_t {
     BASELINE_WAIT,
     VERIFY_WAIT,
     DONE,
+    // ★刻意排在 DONE 之后而不是 WAIT_TRUST 之后★ 阶段值本身要经 UsbDebugCounters::boot_cal_diag
+    // 的 bit0..3 上报, 插在中间会把已有的 0..8 全部平移一格, 让所有历史诊断读数改变含义。
+    // 执行次序由状态迁移决定, 与枚举字面顺序无关: WAIT_TRUST → DELAY_WAIT → IDAC_START。
+    DELAY_WAIT,
 };
 
 struct BootCalibrationState {
@@ -46,6 +50,9 @@ struct BootCalibrationState {
     uint32_t heavy_started_ms = 0u;
     // 本档"启动"的首次尝试时刻(0=还没真正尝试过)。见 BOOT_CAL_START_RETRY_MS。
     uint32_t start_try_ms = 0u;
+    // 用户设定的开机校准统一延迟(calib.boot_delay_ms)的起算时刻。0 = 还没进入 DELAY_WAIT。
+    // ★只在进入 DELAY_WAIT 的那一拍取一次 millis()★: 每轮重取会让窗口永远走不完。
+    uint32_t delay_started_ms = 0u;
     // 各档结局位图, 经 UsbDebugCounters::boot_cal_fail_mask 上报(见该字段说明)。
     uint8_t fail_mask = 0u;
     uint8_t baseline_retry = 0u;
@@ -60,6 +67,7 @@ struct BootCalibrationState {
         health_generation = 0u;
         heavy_started_ms = 0u;
         start_try_ms = 0u;
+        delay_started_ms = 0u;
         fail_mask = 0u;
         baseline_retry = 0u;
         health_primed = 0u;
@@ -96,6 +104,26 @@ inline bool boot_calibration_any_enabled() {
            ConfigManager::get_bool("calib.boot_baseline");
 }
 
+// 三档共用的统一延迟(ms)。0 = 不延迟, 行为与改造前完全一致。
+// ★为什么是"三档共用一个延迟"而不是每档一个★ 用户要的是"等设备稳定了再开始自动校准", 稳定与否
+// 是整机一次性的事; 每档各自延迟只会把三档之间本已串行的等待再叠加一遍, 拖长可用时间且无新语义。
+constexpr uint32_t BOOT_CAL_DELAY_MS_MAX = 60000u;
+
+inline uint32_t boot_calibration_delay_ms() {
+    const uint32_t v = ConfigManager::get_uint16("calib.boot_delay_ms");
+    return (v > BOOT_CAL_DELAY_MS_MAX) ? BOOT_CAL_DELAY_MS_MAX : v;
+}
+
+// 观察期结束后的下一档。全关 ⇒ 直接 DONE(连末尾验收也不做); 否则先进统一延迟窗口。
+// ★两处入口必须共用本函数★ WAIT_TRUST 有"看到扫描推进"和"观察窗超时"两条出口, 早先两处各自
+// 写一遍 `IDAC_START`; 新增延迟档后若只改一条, 另一条就会绕过延迟直接开始校准。
+inline BootCalibrationStage boot_calibration_stage_after_trust() {
+    if (!boot_calibration_any_enabled()) return BootCalibrationStage::DONE;
+    return (boot_calibration_delay_ms() == 0u)
+        ? BootCalibrationStage::IDAC_START
+        : BootCalibrationStage::DELAY_WAIT;
+}
+
 constexpr uint32_t BOOT_CAL_FAILURE_FLAG = 0x80000000u;
 
 inline void boot_calibration_fail(uint8_t stage) {
@@ -130,9 +158,8 @@ inline void boot_calibration_tick(Psoc* psoc, CsdConfig* csd, BootCalibrationSta
                 if (!csd->sampling_trustworthy(psoc)) csd->note_baseline_untrusted(true);
                 // 健康设备照旧零重操作直达 DONE —— 除非用户显式勾了开机校准。三档由各自阶段
                 // 再逐项门控, 这里只决定"要不要进流水线", 避免全关时白跑一遍末尾验收。
-                state.stage = boot_calibration_any_enabled()
-                    ? BootCalibrationStage::IDAC_START
-                    : BootCalibrationStage::DONE;
+                state.stage = boot_calibration_stage_after_trust();
+                state.delay_started_ms = now_ms;
                 return;
             }
             // Health monitoring remains mandatory, but normal startup must never
@@ -146,9 +173,19 @@ inline void boot_calibration_tick(Psoc* psoc, CsdConfig* csd, BootCalibrationSta
             csd->note_baseline_untrusted(true);
             // 观察窗内看不到扫描推进时同样进流水线(用户勾了才做): 校准/基线复位正是这种情况下
             // 唯一能自动尝试的恢复手段。仍然只走一遍、失败不重试, 不构成启动循环。
-            state.stage = boot_calibration_any_enabled()
-                ? BootCalibrationStage::IDAC_START
-                : BootCalibrationStage::DONE;
+            state.stage = boot_calibration_stage_after_trust();
+            state.delay_started_ms = now_ms;
+            return;
+        }
+
+        // 用户设定的统一延迟窗口。只等时间, 不做任何硬件动作 —— 目的正是"先让设备自己稳一会儿",
+        // 期间遥测/协议/自愈全部照常运行(本函数每轮只走这一个 case 并立即返回)。
+        // ★延迟值每轮重读★ 与 calib.boot_* 三个开关同一口径: 用户改完 CFG 不需要重启就对本次生效;
+        // 已经等过的时间照算, 把延迟改小可以立刻放行, 改大则继续等。
+        case BootCalibrationStage::DELAY_WAIT: {
+            const uint32_t wait_ms = boot_calibration_delay_ms();
+            if ((uint32_t)(millis() - state.delay_started_ms) < wait_ms) return;
+            state.stage = BootCalibrationStage::IDAC_START;
             return;
         }
 

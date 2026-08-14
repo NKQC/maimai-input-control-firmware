@@ -106,7 +106,9 @@ struct UsbDebugCounters {
     // 实测到"三档 KV 全为 true 但流水线一步不动", 而 core0 侧的每一个判据(provisioned /
     // output_suppressed / heavy_busy / link_alive / stage)在设备外部**全都不可观测** ——
     // 只能靠读源码推断。一个字节把五个判据一起摊开, 排查就不必再猜。
-    //   bit0..3 = BootCalibrationStage(0=WAIT_TRUST .. 8=DONE)
+    //   bit0..3 = BootCalibrationStage(0=WAIT_TRUST .. 8=DONE, 9=DELAY_WAIT)
+    //             ★9 排在 DONE 之后不是笔误★ 新增的统一延迟档刻意追加在枚举末尾, 以免把
+    //             既有的 0..8 平移一格、让历史诊断读数改变含义。执行次序见 boot_calibration.h。
     //   bit4 = Core0State::provisioned
     //   bit5 = SensorLink::output_suppressed()
     //   bit6 = Psoc::heavy_busy()

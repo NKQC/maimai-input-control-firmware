@@ -199,6 +199,10 @@
                 range: d.range.into(),
                 description: description.into(),
                 alias: alias.into(),
+                // cfg[8] 在设备上只有一份: PSoC 的 g_algo_cfg[8] 与 RP 的 PsocAlgo::_cfg[8]
+                // 都不带通道下标, ALGO_SET_CFG 也没有通道字段。所以这里恒为真, 不是"暂时如此"。
+                // 逐通道的算法量是 rom(ALGO_SET_ROM 带 ch), 它另有编辑入口, 不走本行。
+                shared_scope: true,
             }})
             .collect();
         while algo_setting_rows_model_timer.row_count() > rows.len() {

@@ -333,34 +333,18 @@ pub(crate) fn register_callbacks(
     let kbd_list_sel = state.vcam_kbd_list.clone();
     let ui_kbd_sel = ui_weak.clone();
     ui.on_set_vcam_device(move |index| {
-        // ★不可捕获的目标必须当场拒绝★ Raw Input 看不见的节点选中后一个字符也收不到,
-        // 静默接受等于让用户以为已经选好了。
-        let blocked = {
+        // ★不再按"是否在 Raw Input 列表里"拒绝选中★ 实测该列表会漏报接口健康的键盘节点
+        // (用户唯一可用的扫码器就是被这条挡住的)。现在一律受理选择, 把实测障碍写进状态行,
+        // 再由 keyboard::runtime_status 的收报计数如实回答"到底有没有收到数据"。
+        let warning = {
             let list = kbd_list_sel.borrow();
             (index > 0)
-                .then(|| list.get((index - 1) as usize).map(|d| !d.selectable()))
-                .flatten()
-                .unwrap_or(false)
-        };
-        if blocked {
-            let restored = vcam::keyboard::target_device()
-                .as_deref()
-                .and_then(|target| {
-                    kbd_list_sel
-                        .borrow()
-                        .iter()
-                        .position(|device| device.path.eq_ignore_ascii_case(target))
+                .then(|| {
+                    list.get((index - 1) as usize)
+                        .and_then(|device| device.capture_warning())
                 })
-                .map_or(0, |position| position as i32 + 1);
-            log::warn!("虚拟摄像头: 拒绝切换输入源: {}", NOT_SELECTABLE);
-            if let Some(ui) = ui_kbd_sel.upgrade() {
-                ui.set_vcam_device_index(restored);
-                ui.set_vcam_runtime_status(
-                    format!("{} · {}", vcam::keyboard::runtime_status(), NOT_SELECTABLE).into(),
-                );
-            }
-            return;
-        }
+                .flatten()
+        };
         let picked = {
             let list = kbd_list_sel.borrow();
             (index > 0)
@@ -395,9 +379,18 @@ pub(crate) fn register_callbacks(
             "虚拟摄像头: 输入源已切换为 {}",
             picked.as_deref().unwrap_or("所有键盘")
         ));
+        if let Some(warning) = warning.as_deref() {
+            log::warn!("虚拟摄像头: 已受理输入源切换, 但实测存在障碍: {}", warning);
+        }
         if let Some(ui) = ui_kbd_sel.upgrade() {
             ui.set_vcam_device_index(index);
-            ui.set_vcam_runtime_status(vcam::keyboard::runtime_status().into());
+            ui.set_vcam_runtime_status(
+                match warning {
+                    Some(warning) => format!("{} · {}", vcam::keyboard::runtime_status(), warning),
+                    None => vcam::keyboard::runtime_status(),
+                }
+                .into(),
+            );
         }
     });
 
@@ -479,20 +472,20 @@ fn _spawn_winusb_action(
 }
 
 /// 设备行名的状态前缀。★只在渲染侧拼，绝不烧进 `label`★ 否则持久化比较、排序与日志全被污染。
-/// 改绑与"Raw Input 看不见"同时成立时只报改绑: 改绑是更强的解释, 看不见是它的必然结果。
+/// 三档按"解释力从强到弱"排: 改绑 > 键盘接口打不开 > 仅列表滞后。前者都是后者的成因,
+/// 同时成立时只报最强的那一个。
 #[inline]
 fn _name_prefix(dev: &vcam::keyboard::KeyboardDevice) -> &'static str {
-    match (dev.rebound, dev.rawinput_visible) {
-        (true, _) => "[WinUSB 直读] ",
-        (false, false) => "[无 Raw Input] ",
-        (false, true) => "",
+    use vcam::keyboard::KbdIface;
+    if dev.rebound {
+        return "[WinUSB 直读] ";
+    }
+    match (dev.kbd_iface, dev.rawinput_visible) {
+        (KbdIface::Failed(_), _) => "[系统收不到输入] ",
+        (_, false) => "[系统未登记为输入源] ",
+        (_, true) => "",
     }
 }
-
-/// 选中一个不可捕获的设备时给出的明确原因。★不静默失败★ 设备树里在位不等于 Raw Input 能收到数据。
-const NOT_SELECTABLE: &str =
-    "该设备不在 Raw Input 列表内，无法旁路捕获（设备树里在位，但键盘栈未把它公开给 Raw Input；\
-     可改绑 WinUSB 后走直读）";
 
 /// 重新枚举 HID 键盘并刷新设备树: 首行固定"所有键盘"(dev_index=0),
 /// 之后按分类插入组头, 组内设备 dev_index = 在 `list` 中的下标 + 1。
@@ -546,8 +539,10 @@ pub(crate) fn refresh_vcam_devices(
                 product,
                 vendor,
                 rawinput_visible: false,
+                // 改绑后 HID 节点整体消失, 键盘接口无从探测 —— 如实记 Unprobed, 不冒充结论。
+                kbd_iface: vcam::keyboard::KbdIface::Unprobed,
                 endpoint_text: format!(
-                    "HID 节点已随改绑消失 · service={} · RawInput=不可见 · {} · USB节点={}",
+                    "HID 节点已随改绑消失 · service={} · 系统输入=未知 · RawInput=不可见 · {} · USB节点={}",
                     service, vid_pid, usb_node
                 ),
                 service,
@@ -625,22 +620,20 @@ pub(crate) fn refresh_vcam_devices(
     }
     ui.set_vcam_kbd_rows(slint::ModelRc::new(slint::VecModel::from(rows)));
 
-    let found = devices
+    let picked = devices
         .iter()
         .position(|d| d.path.eq_ignore_ascii_case(saved_path));
-    // 持久化的目标可能已退化成"设备树在位但 Raw Input 不可见"(例如恢复原驱动后键盘栈没把它公开)。
-    // 恢复到这种目标只会静默收不到数据, 故如实回落"所有键盘"并告警。
-    let picked = match found {
-        Some(i) if !devices[i].selectable() => {
+    // ★不再因"实测有障碍"就把用户选好的目标偷偷换成所有键盘★ 那样只会让用户以为自己没选中,
+    // 而"所有键盘"还会把打字混进扫码缓冲。障碍照实记进日志与状态行, 选择本身保留。
+    if let Some(device) = picked.map(|index| &devices[index]) {
+        if let Some(warning) = device.capture_warning() {
             log::warn!(
-                "虚拟摄像头: 持久化目标 {} 不可捕获（{}）；已回落到所有键盘",
-                devices[i].label,
-                NOT_SELECTABLE
+                "虚拟摄像头: 已恢复持久化目标 {}，但实测存在障碍: {}",
+                device.label,
+                warning
             );
-            None
         }
-        other => other,
-    };
+    }
     ui.set_vcam_device_index(picked.map(|i| i as i32 + 1).unwrap_or(0));
     if let Err(error) = vcam::keyboard::set_target_device(picked.map(|i| devices[i].path.clone())) {
         log::warn!("虚拟摄像头: 恢复输入源时未能重启捕获: {}", error);
@@ -660,17 +653,34 @@ pub(crate) fn refresh_vcam_devices(
         );
     }
     // ★设备树与 Raw Input 不一致本身就是最重要的诊断信息★ 必须在日志里点名, 否则"UI 看不到自己的
-    // HID 端点"只能靠用户逐行读 debug 日志才发现。根因尚未定位, 这里只如实报告矛盾。
-    let invisible: Vec<&str> = devices
+    // HID 端点"只能靠用户逐行读 debug 日志才发现。根因已定位: 缺失节点的键盘接口 CreateFileW
+    // 打不开(实测 ERROR_GEN_FAILURE), win32k 因此既不列它也读不到它 ⇒ 全系统收不到该设备按键。
+    // 故按"接口打不开"与"仅列表滞后"分开报: 前者要重建键盘栈, 后者无需任何处置。
+    // 界面只说"系统收不到", 具体错误码留在这里: `KbdIface` 的 Debug 带 Win32 码, 是复现与归因的凭据。
+    let broken: Vec<String> = devices
         .iter()
-        .filter(|d| !d.rawinput_visible && !d.rebound)
+        .filter(|d| !d.rebound && matches!(d.kbd_iface, vcam::keyboard::KbdIface::Failed(_)))
+        .map(|d| format!("{} · {:?}", d.endpoint_text, d.kbd_iface))
+        .collect();
+    if !broken.is_empty() {
+        log::warn!(
+            "虚拟摄像头: {} 个键盘节点的键盘接口打不开（Windows 收不到它们的任何按键，需停用再启用该节点或重启系统）：{}",
+            broken.len(),
+            broken.join(" ｜ ")
+        );
+    }
+    let lagging: Vec<&str> = devices
+        .iter()
+        .filter(|d| {
+            !d.rebound && !d.rawinput_visible && d.kbd_iface == vcam::keyboard::KbdIface::Open
+        })
         .map(|d| d.endpoint_text.as_str())
         .collect();
-    if !invisible.is_empty() {
+    if !lagging.is_empty() {
         log::warn!(
-            "虚拟摄像头: {} 个键盘节点在设备树里在位但不在 Raw Input 列表内（根因未定位，这些节点无法旁路捕获）：{}",
-            invisible.len(),
-            invisible.join(" ｜ ")
+            "虚拟摄像头: {} 个键盘节点键盘接口可打开但暂不在 Raw Input 列表内（属列表滞后，仍允许选中）：{}",
+            lagging.len(),
+            lagging.join(" ｜ ")
         );
     }
     log::info!(

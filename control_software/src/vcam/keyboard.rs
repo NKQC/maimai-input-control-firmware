@@ -24,7 +24,10 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::thread::JoinHandle;
 use std::time::Instant;
 
-use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Storage::FileSystem::{
+    CreateFileW, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, GetKeyboardState, MAPVK_VSC_TO_VK_EX, MapVirtualKeyW, ToUnicode, VK_CAPITAL,
@@ -46,13 +49,42 @@ use windows::core::w;
 const HID_USAGE_PAGE_GENERIC: u16 = 0x01;
 const HID_USAGE_GENERIC_KEYBOARD: u16 = 0x06;
 
+/// 键盘接口(`GUID_DEVINTERFACE_KEYBOARD`)的实测可开性。
+///
+/// ★这是"选中该设备后到底收不收得到数据"的唯一硬判据★ win32k 的 Raw Input 子系统正是打开这个
+/// 接口去读键盘的: 打不开 ⇒ 它既不会把该设备列进 `GetRawInputDeviceList`, 也永远读不到它的输入,
+/// 于是 Windows 全系统都收不到该设备的按键。反之"能打开但暂时不在 Raw Input 列表里"只是列表滞后,
+/// 不构成禁选理由(实测本机 11 个在位键盘节点里有 4 个接口打不开, 列表恰好也少这 4 个)。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KbdIface {
+    /// 能打开 ⇒ 键盘栈就绪。
+    Open,
+    /// 打不开, 带 Win32 错误码(实测坏节点为 31 = ERROR_GEN_FAILURE)。
+    Failed(u32),
+    /// 没有可探测的接口(已改绑 WinUSB 的合成行等) ⇒ 不做判断, 也不冒充结论。
+    Unprobed,
+}
+
+impl KbdIface {
+    /// 界面用的单行读数。★只说功能后果, 不说实现★ 错误码等证据由 `Debug` 落日志(见
+    /// `refresh_vcam_devices` 的 WARN), 摊在界面上只会让用户去排查用不上的系统细节。
+    fn text(&self) -> &'static str {
+        match self {
+            Self::Open => "正常",
+            Self::Failed(_) => "收不到",
+            Self::Unprobed => "未知",
+        }
+    }
+}
+
 /// 一个可选作输入源的键盘设备。
 /// `path` 是 Raw Input 设备名(唯一, 用于持久化); 其余字段供 UI 以设备树形式展示。
 #[derive(Clone, Debug)]
 pub struct KeyboardDevice {
     /// Raw Input 设备名 `\\?\HID#VID_xxxx&PID_xxxx#...`。
     /// ★Raw Input 看不见的节点这里是**按实例 ID 换算出的规范路径**★, 不是系统给的真路径;
-    /// 此类节点 `selectable()` 为假, 不可被选作捕获目标(见 `set_target_device` 的调用侧保护)。
+    /// 比较目标时一律换算成实例 ID 再比(见 `device_accepted`), 所以合成路径同样能匹配上
+    /// 日后真的送达的报文 —— 这是"允许选中不在列表里的设备"能成立的前提。
     pub path: String,
     /// 本项(HID 集合)显示名: 集合/接口标识, 单集合设备直接用产品名。
     /// ★不含任何状态前缀★ 前缀由渲染侧按状态拼(见 ui_callbacks/virtual_camera.rs);
@@ -70,17 +102,14 @@ pub struct KeyboardDevice {
     pub vendor: String,
     /// 该设备树节点是否出现在 `GetRawInputDeviceList` 的列表里。
     ///
-    /// ★这是本模块最重要的诊断位★ 设备树里在位、Raw Input 里却没有 = 键盘栈没有把该节点公开给
-    /// Raw Input 子系统, 旁路监听对它注定收不到任何数据。
-    ///
-    /// ★曾经在此断言"本工程固件的三个 &COL0x 键盘集合就是这种状态、根因未定位"——该结论已被实测
-    /// 推翻, 勿再据此排查★ 复测(`GetRawInputDeviceList` + `RIDI_DEVICENAME`)三个集合均以
-    /// dwType=1(键盘)正常返回, kbdhid/kbdclass 已挂载且 kbdclass 类过滤未被第三方驱动插队;
-    /// 同期用"临时把某物理键改成高电平触发制造恒按下"的闭环(selftest --kbd-hidout)确认修饰位与
-    /// 普通键码两类报文主机都真的收到。当时看到的"一个都不返回"更可能是该设备已被本应用改绑
-    /// WinUSB(改绑后 HID 节点整体消失, 见 `rebound`)或列表在设备栈重建期间被读取。
+    /// ★只作诊断标注, 不再作禁选判据★ 实测(本机 11 个在位键盘节点 / 列表里只有 7 个): 缺的 4 个
+    /// `GUID_DEVINTERFACE_KEYBOARD` 接口全部在位且已启用、`SPDRP_SERVICE=kbdhid`、无第三方过滤、
+    /// ProblemCode=0, 只是接口 `CreateFileW` 打不开(ERROR_GEN_FAILURE)。也就是说"不在列表里"是
+    /// `kbd_iface` 的**结果**而不是独立事实, 拿它硬拦截会把用户唯一可用的设备挡在外面。
     pub rawinput_visible: bool,
-    /// 端点/接口实测读数单行文案(集合标识 · service · Raw Input 可见性 · 实例/USB 父节点)。
+    /// 键盘接口可开性实测结论。见 `KbdIface`。
+    pub kbd_iface: KbdIface,
+    /// 端点/接口实测读数单行文案(集合标识 · service · 键盘接口可开性 · Raw Input 可见性 · 实例/USB 父节点)。
     /// 拿不到的项写"未知", 不留空、不编造。
     pub endpoint_text: String,
     /// 本节点的 `SPDRP_SERVICE`(功能驱动名, 如 `kbdhid` / `WinUSB`); 读不到为空串。
@@ -91,12 +120,87 @@ pub struct KeyboardDevice {
 }
 
 impl KeyboardDevice {
-    /// 能否被选作捕获目标。
+    /// 选中该设备前应当亮出的实测警示; `None` = 没有已知障碍。
     ///
-    /// Raw Input 看不见 ⇒ 旁路监听收不到任何数据; 唯一例外是已改绑 WinUSB 的设备 ——
-    /// 它本来就不走键盘栈, 由 WinUSB 直读拿数据。除此之外选中即注定静默失效, 必须拦住并说明原因。
-    pub fn selectable(&self) -> bool {
-        self.rawinput_visible || self.rebound
+    /// ★这里刻意不再提供"禁止选中"语义★ 旧实现按 `rawinput_visible` 硬拦截, 结果把接口健康、
+    /// 只是列表滞后的设备也一并挡住 —— 用户唯一可用的扫码器就是被这条挡住的。现在一律允许选中,
+    /// 由本文案给出障碍与下一步, 再由状态行的实测收报计数(见 `runtime_status`)如实告诉用户
+    /// 到底有没有收到数据。**绝不为了让设备可选而把探测结果说成好的。**
+    pub fn capture_warning(&self) -> Option<String> {
+        if self.rebound {
+            // 已改绑 WinUSB: 本来就不走键盘栈, 由直读拿数据, 键盘接口不存在属正常。
+            return None;
+        }
+        match self.kbd_iface {
+            KbdIface::Failed(_) => Some(format!(
+                "⚠ 系统收不到这台设备的按键，选中它也不会有数据。{}",
+                _kbd_stack_hint()
+            )),
+            KbdIface::Open if !self.rawinput_visible => Some(
+                "这台设备可用但系统尚未把它登记为输入源：已允许选中，\
+                 请看上方状态行的收到次数确认是否真的有数据"
+                    .to_string(),
+            ),
+            _ => None,
+        }
+    }
+}
+
+/// 键盘栈起不来时的下一步建议。
+///
+/// ★首要嫌疑是本应用自己装的 Interception 键盘类上层过滤★ 实测: 该过滤一旦写进键盘类
+/// `UpperFilters`, 此后**每一个重新枚举的键盘**都会把它挂进栈里; 它在下次开机前并未真正加载,
+/// 于是这些设备的键盘接口起不来 —— 已重新枚举过的设备(热插拔的扫码器、每次重刷都重新枚举的
+/// 本机固件键盘)集体失效, 而开机时就建好栈的老键盘不受影响。这正好对上"重启设备后键盘映射
+/// 没有真实输出"。故只在该过滤确实在册时才把它作为首要成因说出来, 不在册就不臆测。
+fn _kbd_stack_hint() -> &'static str {
+    if interception::registration_present() {
+        "原因: 已安装的键盘输入过滤组件要重启电脑才生效，在此之前重新插拔过的键盘都会这样。\
+         请重启电脑，或卸载该组件后重新插拔这台设备；也可以对它用「WinUSB 改绑」"
+    } else {
+        "请重新插拔这台设备，或重启电脑；也可以对它用「WinUSB 改绑」"
+    }
+}
+
+/// 实测键盘接口能否打开。`instance_id` 为设备节点实例 ID(`HID\VID_x&PID_y\inst`)。
+///
+/// 只申请 0 访问权 + 共享读写并立刻关闭 —— 纯查询握手, 不抢占正在读该键盘的 kbdclass/win32k。
+/// 实例 ID 大小写与系统枚举不一致也无妨: 设备路径在对象管理器里大小写不敏感(已实测)。
+fn probe_kbd_iface(instance_id: &str) -> KbdIface {
+    if instance_id.is_empty() {
+        return KbdIface::Unprobed;
+    }
+    let path = format!(
+        r"\\?\{}#{}",
+        instance_id.replace('\\', "#"),
+        IFACE_GUID_KEYBOARD
+    );
+    // SAFETY: 只读打开一个设备接口路径; 成功则立刻关闭句柄, 失败取线程错误码。
+    unsafe {
+        match CreateFileW(
+            &windows::core::HSTRING::from(path),
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAGS_AND_ATTRIBUTES(0),
+            None,
+        ) {
+            Ok(handle) => {
+                _ = CloseHandle(handle);
+                KbdIface::Open
+            }
+            Err(error) => {
+                // Win32 错误码经 HRESULT_FROM_WIN32 包成 0x8007xxxx; 只在确认是该封装时才剥壳,
+                // 其余情形原样带出整个 HRESULT, 不谎报成一个看起来像 Win32 码的数。
+                let hr = error.code().0 as u32;
+                KbdIface::Failed(if hr & 0xFFFF_0000 == 0x8007_0000 {
+                    hr & 0xFFFF
+                } else {
+                    hr
+                })
+            }
+        }
     }
 }
 
@@ -155,6 +259,11 @@ static TARGET: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 static ACCEPT_CACHE: OnceLock<Mutex<HashMap<isize, bool>>> = OnceLock::new();
 /// 当前实际捕获模式。目标选择持久化不变，但运行时只能如实报告已拦截或旁路降级。
 static RUNTIME_STATUS: OnceLock<Mutex<String>> = OnceLock::new();
+/// 本次会话里**确实从目标设备收到**的按下次数(目标为 None 时即任意键盘)。
+/// ★"选中了"不等于"收得到"★ 这两个计数是唯一能证明链路通不通的现场证据, 状态行必须带上它们。
+static TARGET_KEYDOWNS: AtomicU64 = AtomicU64::new(0);
+/// 同期被目标过滤掉的其他键盘按下次数。用来区分"捕获没在跑"与"捕获在跑但该设备没有输入"。
+static OTHER_KEYDOWNS: AtomicU64 = AtomicU64::new(0);
 
 fn target_lock() -> &'static Mutex<Option<String>> {
     TARGET.get_or_init(|| Mutex::new(None))
@@ -172,9 +281,49 @@ fn set_runtime_status(status: String) {
     *runtime_status_lock().lock().unwrap() = status;
 }
 
+/// 会话重置收报计数(切目标、启停都要清), 否则上一目标的战绩会被当成新目标的证据。
+#[inline]
+fn reset_reception() {
+    TARGET_KEYDOWNS.store(0, Ordering::SeqCst);
+    OTHER_KEYDOWNS.store(0, Ordering::SeqCst);
+}
+/// 记一次来自目标设备的按下(三条捕获路径共用)。
+#[inline]
+fn note_target_key() {
+    TARGET_KEYDOWNS.fetch_add(1, Ordering::Relaxed);
+}
+/// 记一次被目标过滤掉的按下。
+#[inline]
+fn note_other_key() {
+    OTHER_KEYDOWNS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// 收报实测小结。★不猜, 只报数★
+fn reception_summary() -> String {
+    let mine = TARGET_KEYDOWNS.load(Ordering::Relaxed);
+    let other = OTHER_KEYDOWNS.load(Ordering::Relaxed);
+    if target_device().is_none() {
+        return if mine == 0 {
+            "尚未收到任何按键".to_string()
+        } else {
+            format!("已收到按键 {} 次", mine)
+        };
+    }
+    match (mine, other) {
+        (0, 0) => "目标尚未收到按键（同期也没有其他键盘输入，暂时判断不了）".to_string(),
+        (0, other) => format!(
+            "⚠ 目标一次也没收到（同期其他键盘 {} 次，说明采集在工作，是这台设备没有输入进来）",
+            other
+        ),
+        (mine, _) => format!("目标已收到按键 {} 次", mine),
+    }
+}
+
 /// 给现有 vcam UI 的实际运行状态，不改变目标设备持久化或任何对外协议。
+/// 尾部固定挂上实测收报小结: 状态行说"运行中"只代表会话起来了, 说不出有没有真的收到数据。
 pub fn runtime_status() -> String {
-    runtime_status_lock().lock().unwrap().clone()
+    let base = runtime_status_lock().lock().unwrap().clone();
+    format!("{} · {}", base, reception_summary())
 }
 
 /// 设定输入源设备(`None`/空串 = 所有键盘)。运行中切换时必须先等待旧会话释放所有被吞按键并退出，
@@ -199,6 +348,7 @@ pub fn set_target_device(path: Option<String>) -> anyhow::Result<()> {
     }
     *target_lock().lock().unwrap() = normalized.clone();
     accept_cache().lock().unwrap().clear();
+    reset_reception();
     match normalized {
         Some(ref path) => log::info!("虚拟摄像头: 输入源限定为设备 {}", path),
         None => log::info!("虚拟摄像头: 输入源为所有键盘(未限定设备)"),
@@ -253,10 +403,11 @@ const IFACE_GUID_KEYBOARD: &str = "{884b96c3-56ef-11d1-bc8c-00a0c91405dd}";
 
 /// 枚举系统中所有键盘类设备节点, 供 UI 下拉选择。
 ///
-/// ★主枚举必须走设备树, 不能走 Raw Input★ Raw Input 只公开"键盘栈已向它注册的"节点;
-/// 实测本工程固件的三个 HID 键盘集合在设备树里 PRESENT OK, 而 `GetRawInputDeviceList`
-/// 一个都不返回 —— 只用 Raw Input 枚举就等于**看不见自己的 HID 端点**, 用户无从选择也无从排查。
-/// 现在 Raw Input 列表退化为一个**标注来源**: 只用来给每个设备树节点判定 `rawinput_visible`。
+/// ★主枚举必须走设备树, 不能走 Raw Input★ Raw Input 只公开"win32k 成功打开过的"键盘节点;
+/// 实测本机 11 个在位键盘节点里 `GetRawInputDeviceList` 只返回 7 个(缺的正是本工程固件的三个
+/// &COL0x 集合与用户的扫码器) —— 只用 Raw Input 枚举就等于**看不见自己的 HID 端点**,
+/// 用户无从选择也无从排查。现在 Raw Input 列表退化为一个**标注来源**: 只用来给每个设备树节点
+/// 判定 `rawinput_visible`; 能不能收到数据由 `kbd_iface` 的实测握手说话。
 /// 过滤掉远程桌面虚拟键盘(`RDP_KBD`)——它不是物理输入源, 选它必然收不到数据。
 pub fn list_keyboards() -> Vec<KeyboardDevice> {
     // Raw Input 路径按实例 ID 建索引: 同一节点在两处的写法不同(`#` vs `\` 且带接口 GUID 尾段),
@@ -352,6 +503,11 @@ fn _present_instances(
 }
 
 /// `GetRawInputDeviceList` 里所有键盘项的设备名。★只作标注来源★, 不再充当主枚举。
+///
+/// ★不要为了"多找回几个设备"去收 `dwType=2`(RIM_TYPEHID)★ 已实测: 列表里缺失的键盘节点在
+/// type=2 里同样没有(整条 21 项列表逐项 dump 过, 3 个鼠标 + 7 个键盘 + 11 个 HID, 无一命中);
+/// 收 type=2 只会把非键盘的 HID 顶层集合混进键盘列表, 换来一份认不出设备的假名单。
+/// 缓冲也别再加大: 用 count+64 的超大缓冲复测, 返回数依旧是同一个 21, 不是两段式调用的容量问题。
 fn rawinput_keyboard_paths() -> Vec<String> {
     let mut out = Vec::new();
     // SAFETY: 两段式调用(先问数量再取数据), 缓冲按返回数量分配。
@@ -383,7 +539,8 @@ fn rawinput_keyboard_paths() -> Vec<String> {
 /// `HID\VID_x&PID_y\inst` → `\\?\HID#VID_x&PID_y#inst#{接口类 GUID}`。
 ///
 /// ★只给 Raw Input 看不见的节点用★ 系统从未公开过它们的真路径, 这里合成一个规范写法只为让
-/// `path` 字段保持"唯一可持久化标识"的语义; 此类节点不可被选为捕获目标。
+/// `path` 字段保持"唯一可持久化标识"的语义。此类节点**可以**被选为捕获目标: `device_accepted`
+/// 按实例 ID 匹配, 所以设备一旦真的开始送报文就能对上(尾段接口 GUID 与大小写差异被忽略)。
 fn path_from_instance_id(instance_id: &str) -> String {
     let guid = if instance_id.to_ascii_uppercase().starts_with("HID\\") {
         IFACE_GUID_HID
@@ -503,6 +660,7 @@ fn describe_device(path: String, node_id: String, rawinput_visible: bool) -> Key
     }
 
     let node = instance_id.as_deref().unwrap_or_default();
+    let kbd_iface = probe_kbd_iface(node);
     let service = device_service(node).unwrap_or_default();
     // 改绑判定必须落在 USB 父节点: 改绑成功后 HID 节点整体消失, 只有 USB 节点还在。
     let usb_parent = usb_ancestor(node);
@@ -518,10 +676,12 @@ fn describe_device(path: String, node_id: String, rawinput_visible: bool) -> Key
             &service,
             &collection,
             rawinput_visible,
+            kbd_iface,
         ),
         service,
         rebound,
         rawinput_visible,
+        kbd_iface,
         path,
         label,
         detail: parts.join("  ·  "),
@@ -537,23 +697,25 @@ fn describe_device(path: String, node_id: String, rawinput_visible: bool) -> Key
 }
 
 /// 端点/接口实测读数单行。★本模块的核心诊断价值★: 让"设备树有、Raw Input 没有"这个矛盾
-/// 在界面上一眼可见。任何拿不到的项写"未知", 不留空也不编造。
+/// 在界面上一眼可见, 并当场给出它的成因(键盘接口可开性)。拿不到的项写"未知", 不留空也不编造。
 fn endpoint_text(
     node_id: &str,
     usb_parent: Option<&str>,
     service: &str,
     collection: &str,
     rawinput_visible: bool,
+    kbd_iface: KbdIface,
 ) -> String {
     let unknown = "未知";
     format!(
-        "{} · service={} · RawInput={} · 实例={} · USB父={}",
+        "{} · service={} · 系统输入={} · RawInput={} · 实例={} · USB父={}",
         if collection.is_empty() {
             "无接口/集合标识"
         } else {
             collection
         },
         if service.is_empty() { unknown } else { service },
+        kbd_iface.text(),
         if rawinput_visible {
             "可见"
         } else {
@@ -842,6 +1004,11 @@ fn device_name(h_device: HANDLE) -> Option<String> {
 }
 
 /// 判断这一击是否来自目标设备。目标为 None 时全收。
+///
+/// ★按实例 ID 比, 不按路径字符串比★ 目标路径可能是 `path_from_instance_id` 合成出来的
+/// (设备当时不在 Raw Input 列表里), 它带的是 HID 接口 GUID 且大小写取自设备树; 而报文里的
+/// 设备名带的是键盘接口 GUID、大小写取自驱动。整串比一定不等 —— 于是设备后来真的开始送报文了,
+/// 也会被判成"不是目标"而全部丢掉。换算成实例 ID 再比才对得上。
 fn device_accepted(h_device: HANDLE) -> bool {
     let Some(target) = target_device() else {
         return true;
@@ -850,8 +1017,13 @@ fn device_accepted(h_device: HANDLE) -> bool {
     if let Some(&cached) = accept_cache().lock().unwrap().get(&key) {
         return cached;
     }
+    let target_node = instance_id_from_path(&target).map(|id| id.to_ascii_uppercase());
     let accepted = device_name(h_device)
-        .map(|n| n.eq_ignore_ascii_case(&target))
+        .map(|name| match (&target_node, instance_id_from_path(&name)) {
+            (Some(want), Some(got)) => got.eq_ignore_ascii_case(want),
+            // 两边都换算不出实例 ID(非常规路径)时退回整串比较, 不放宽也不误收。
+            _ => name.eq_ignore_ascii_case(&target),
+        })
         .unwrap_or(false);
     accept_cache().lock().unwrap().insert(key, accepted);
     accepted
@@ -888,6 +1060,7 @@ pub fn start(state: Arc<VcamState>) -> anyhow::Result<()> {
     manager._generation += 1;
     let generation = manager._generation;
     let selected_target = target_device();
+    reset_reception();
     ACTIVE_GENERATION.store(generation, Ordering::SeqCst);
     match selected_target.as_deref() {
         None => {
@@ -990,6 +1163,7 @@ fn pump_winusb(generation: u64, target: String, mut capture: winusb_scanner::Cap
         match capture.receive(100) {
             Ok(keys) => {
                 for (vk, shift) in keys {
+                    note_target_key();
                     push_key(vk, Some(shift));
                 }
                 submit_on_pause();
@@ -1055,6 +1229,7 @@ fn pump_interception(generation: u64, mut target: String, mut capture: intercept
                 let vk = unsafe { MapVirtualKeyW(scan, MAPVK_VSC_TO_VK_EX) } as u16;
                 if vk != 0 {
                     // Interception 是键盘类过滤驱动: 按键仍然经过系统键盘状态机, OS Shift 态可信。
+                    note_target_key();
                     push_key(vk, None);
                 }
             }
@@ -1214,8 +1389,10 @@ unsafe fn handle_raw_input(hri: HRAWINPUT) {
         return;
     }
     if !device_accepted(raw.header.hDevice) {
+        note_other_key();
         return;
     }
+    note_target_key();
     push_key(kb.VKey, None);
 }
 

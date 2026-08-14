@@ -2589,7 +2589,7 @@ fn run_kbd_hidout(ctrl: &mut AppController, hold_ms: u64) -> ! {
     // 一轮 = 临时把该键改成给定 [keycode, modifier] + 高电平触发(恒读按下), 观测主机是否真收到。
     // ★修饰位与普通键码必须分成两轮★ 两者在报文里是**不同字节**([0] vs [2..7]), 也走中间件里
     // 不同的分支; 只测一种就无法区分"整条链断了"和"只有键码数组那一段没被主机认"。
-    let mut phase = |ctrl: &mut AppController,
+    let phase = |ctrl: &mut AppController,
                      label: &str,
                      keycode: u8,
                      modifier: u8,
@@ -5095,6 +5095,9 @@ fn main() {
                         6 => "BASELINE_WAIT",
                         7 => "VERIFY_WAIT",
                         8 => "DONE",
+                        // ★9 排在 DONE 之后不是笔误★ 固件把新增的统一延迟档追加在枚举末尾,
+                        // 以免把既有 0..8 平移一格、改变历史诊断读数的含义(见 boot_calibration.h)。
+                        9 => "DELAY_WAIT(等 calib.boot_delay_ms)",
                         other => {
                             println!("[DBG] 开机校准: 未知 stage 编码 {}", other);
                             "?"
