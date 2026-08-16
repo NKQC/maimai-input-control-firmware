@@ -504,6 +504,12 @@ export component AppWindow inherits Window {
     // X 镜像: 左右翻转输出帧(部分消费端会把摄像头画面当自拍镜像处理)。
     in property <bool> vcam_mirror_x: false;
     callback set_vcam_mirror_x(bool);
+    // 输出分辨率与 QR 占短边的百分比。
+    in property <int> vcam_frame_w: 640;
+    in property <int> vcam_frame_h: 480;
+    in property <int> vcam_qr_fill_pct: 75;
+    callback set_vcam_resolution(int, int);
+    callback set_vcam_qr_fill_pct(int);
     in property <int> vcam_submit_secs: 2;
     in property <int> vcam_display_secs: 10;
     in property <string> vcam_last_data: "";
@@ -1046,6 +1052,11 @@ export component AppWindow inherits Window {
                 set_vcam_test_pattern(v) => { root.set_vcam_test_pattern(v); }
                 vcam_mirror_x: root.vcam_mirror_x;
                 set_vcam_mirror_x(v) => { root.set_vcam_mirror_x(v); }
+                vcam_frame_w: root.vcam_frame_w;
+                vcam_frame_h: root.vcam_frame_h;
+                vcam_qr_fill_pct: root.vcam_qr_fill_pct;
+                set_vcam_resolution(w, h) => { root.set_vcam_resolution(w, h); }
+                set_vcam_qr_fill_pct(v) => { root.set_vcam_qr_fill_pct(v); }
                 vcam_submit_secs: root.vcam_submit_secs;
                 vcam_display_secs: root.vcam_display_secs;
                 vcam_last_data: root.vcam_last_data;

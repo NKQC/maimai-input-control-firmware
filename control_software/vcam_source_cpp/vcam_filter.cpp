@@ -79,7 +79,8 @@ private:
 
 class TypeEnumerator : public IEnumMediaTypes {
 public:
-    TypeEnumerator(LONGLONG interval, ULONG index) : _interval(interval), _index(index) {
+    TypeEnumerator(LONGLONG interval, int width, int height, ULONG index)
+        : _interval(interval), _width(width), _height(height), _index(index) {
         Mai2VcamLockModule();
     }
     ~TypeEnumerator() { Mai2VcamUnlockModule(); }
@@ -118,7 +119,7 @@ public:
             if (type == nullptr) {
                 return E_OUTOFMEMORY;
             }
-            if (FAILED(Mai2VcamBuildMediaType(type, _interval))) {
+            if (FAILED(Mai2VcamBuildMediaType(type, _interval, _width, _height))) {
                 CoTaskMemFree(type);
                 return E_OUTOFMEMORY;
             }
@@ -143,13 +144,15 @@ public:
         if (enumerator == nullptr) {
             return E_POINTER;
         }
-        *enumerator = new TypeEnumerator(_interval, _index);
+        *enumerator = new TypeEnumerator(_interval, _width, _height, _index);
         return *enumerator == nullptr ? E_OUTOFMEMORY : S_OK;
     }
 
 private:
     LONG _references = 1;
     LONGLONG _interval = MAI2VCAM_DEFAULT_INTERVAL;
+    int _width = MAI2VCAM_DEFAULT_WIDTH;
+    int _height = MAI2VCAM_DEFAULT_HEIGHT;
     ULONG _index = 0;
 };
 
@@ -166,8 +169,12 @@ bool FullySpecified(const AM_MEDIA_TYPE* type) {
 
 Mai2VcamPin::Mai2VcamPin(Mai2VcamFilter* owner) : _owner(owner) {
     InitializeCriticalSection(&_lock);
-    Mai2VcamBuildMediaType(&_mt, MAI2VCAM_DEFAULT_INTERVAL);
+    // 分辨率在这里定终身: 消费端每次打开摄像头都会新建过滤器与针脚, 因此"改分辨率后重新打开"
+    // 就是它取到新值的时机。
+    Mai2VcamQueryQueueSize(&_width, &_height);
+    Mai2VcamBuildMediaType(&_mt, MAI2VCAM_DEFAULT_INTERVAL, _width, _height);
     _hasMt = true;
+    Mai2VcamLog("pin: 分辨率取自共享队列 = %dx%d", _width, _height);
 }
 
 Mai2VcamPin::~Mai2VcamPin() {
@@ -228,7 +235,7 @@ STDMETHODIMP Mai2VcamPin::Connect(IPin* receive, const AM_MEDIA_TYPE* type) {
     }
     LeaveCriticalSection(&_lock);
 
-    if (type != nullptr && !Mai2VcamAcceptMediaType(type)) {
+    if (type != nullptr && !Mai2VcamAcceptMediaType(type, _width, _height)) {
         return VFW_E_TYPE_NOT_ACCEPTED;
     }
     if (FullySpecified(type)) {
@@ -236,7 +243,7 @@ STDMETHODIMP Mai2VcamPin::Connect(IPin* receive, const AM_MEDIA_TYPE* type) {
     }
     // 部分指定或未指定: 用本针脚唯一支持的类型(帧率沿用对方给出的合理值)。
     AM_MEDIA_TYPE mine = {};
-    HRESULT hr = Mai2VcamBuildMediaType(&mine, Mai2VcamIntervalOf(type));
+    HRESULT hr = Mai2VcamBuildMediaType(&mine, Mai2VcamIntervalOf(type), _width, _height);
     if (FAILED(hr)) {
         return hr;
     }
@@ -283,12 +290,12 @@ HRESULT Mai2VcamPin::_Attempt(IPin* receive, const AM_MEDIA_TYPE* type) {
         Mai2VcamLog("pin: allocator 协商失败 hr=0x%08X", hr);
         return hr;
     }
-    Mai2VcamLog("pin: 已连接下游, NV12 %dx%d 帧间隔=%lld(100ns)", MAI2VCAM_WIDTH, MAI2VCAM_HEIGHT,
-                _interval);
+    Mai2VcamLog("pin: 已连接下游, NV12 %dx%d 帧间隔=%lld(100ns)", _width, _height, _interval);
     return S_OK;
 }
 
 HRESULT Mai2VcamPin::_DecideAllocator() {
+    const LONG frameBytes = (LONG)Mai2VcamFrameBytes(_width, _height);
     ALLOCATOR_PROPERTIES request = {};
     if (FAILED(_input->GetAllocatorRequirements(&request))) {
         ZeroMemory(&request, sizeof(request));
@@ -309,12 +316,12 @@ HRESULT Mai2VcamPin::_DecideAllocator() {
         ALLOCATOR_PROPERTIES want = {};
         want.cBuffers = request.cBuffers > 4 ? request.cBuffers : 4;
         want.cbBuffer =
-            request.cbBuffer > MAI2VCAM_FRAME_BYTES ? request.cbBuffer : MAI2VCAM_FRAME_BYTES;
+                request.cbBuffer > frameBytes ? request.cbBuffer : frameBytes;
         want.cbAlign = request.cbAlign > 0 ? request.cbAlign : 1;
         want.cbPrefix = request.cbPrefix;
         ALLOCATOR_PROPERTIES actual = {};
         HRESULT hr = allocator->SetProperties(&want, &actual);
-        if (SUCCEEDED(hr) && actual.cbBuffer >= MAI2VCAM_FRAME_BYTES && actual.cBuffers >= 1) {
+        if (SUCCEEDED(hr) && actual.cbBuffer >= frameBytes && actual.cBuffers >= 1) {
             hr = _input->NotifyAllocator(allocator, FALSE);
             if (SUCCEEDED(hr)) {
                 EnterCriticalSection(&_lock);
@@ -435,7 +442,7 @@ STDMETHODIMP Mai2VcamPin::QueryId(LPWSTR* id) {
 }
 
 STDMETHODIMP Mai2VcamPin::QueryAccept(const AM_MEDIA_TYPE* type) {
-    return Mai2VcamAcceptMediaType(type) ? S_OK : S_FALSE;
+    return Mai2VcamAcceptMediaType(type, _width, _height) ? S_OK : S_FALSE;
 }
 
 STDMETHODIMP Mai2VcamPin::EnumMediaTypes(IEnumMediaTypes** enumerator) {
@@ -445,7 +452,7 @@ STDMETHODIMP Mai2VcamPin::EnumMediaTypes(IEnumMediaTypes** enumerator) {
     EnterCriticalSection(&_lock);
     LONGLONG interval = _interval;
     LeaveCriticalSection(&_lock);
-    *enumerator = new TypeEnumerator(interval, 0);
+    *enumerator = new TypeEnumerator(interval, _width, _height, 0);
     return *enumerator == nullptr ? E_OUTOFMEMORY : S_OK;
 }
 
@@ -467,11 +474,11 @@ STDMETHODIMP Mai2VcamPin::SetFormat(AM_MEDIA_TYPE* type) {
     if (type == nullptr) {
         return E_POINTER;
     }
-    if (!Mai2VcamAcceptMediaType(type)) {
+    if (!Mai2VcamAcceptMediaType(type, _width, _height)) {
         return VFW_E_INVALIDMEDIATYPE;
     }
     AM_MEDIA_TYPE updated = {};
-    HRESULT hr = Mai2VcamBuildMediaType(&updated, Mai2VcamIntervalOf(type));
+    HRESULT hr = Mai2VcamBuildMediaType(&updated, Mai2VcamIntervalOf(type), _width, _height);
     if (FAILED(hr)) {
         return hr;
     }
@@ -541,17 +548,18 @@ STDMETHODIMP Mai2VcamPin::GetStreamCaps(int index, AM_MEDIA_TYPE** type, BYTE* c
     if (copy == nullptr) {
         return E_OUTOFMEMORY;
     }
-    HRESULT hr = Mai2VcamBuildMediaType(copy, MAI2VCAM_DEFAULT_INTERVAL);
+    HRESULT hr = Mai2VcamBuildMediaType(copy, MAI2VCAM_DEFAULT_INTERVAL, _width, _height);
     if (FAILED(hr)) {
         CoTaskMemFree(copy);
         return hr;
     }
+    const LONGLONG frameBytes = (LONGLONG)Mai2VcamFrameBytes(_width, _height);
     VIDEO_STREAM_CONFIG_CAPS* caps = (VIDEO_STREAM_CONFIG_CAPS*)capabilities;
     ZeroMemory(caps, sizeof(VIDEO_STREAM_CONFIG_CAPS));
     caps->guid = FORMAT_VideoInfo;
     caps->VideoStandard = AnalogVideo_None;
-    caps->InputSize.cx = MAI2VCAM_WIDTH;
-    caps->InputSize.cy = MAI2VCAM_HEIGHT;
+    caps->InputSize.cx = _width;
+    caps->InputSize.cy = _height;
     caps->MinCroppingSize = caps->InputSize;
     caps->MaxCroppingSize = caps->InputSize;
     caps->CropGranularityX = 1;
@@ -565,10 +573,8 @@ STDMETHODIMP Mai2VcamPin::GetStreamCaps(int index, AM_MEDIA_TYPE** type, BYTE* c
     // 固定分辨率源: 不做缩放/裁剪, 只在帧率上给出协商范围(30fps..5fps)。
     caps->MinFrameInterval = MAI2VCAM_DEFAULT_INTERVAL;
     caps->MaxFrameInterval = MAI2VCAM_MAX_INTERVAL;
-    caps->MinBitsPerSecond =
-        (LONG)((LONGLONG)MAI2VCAM_FRAME_BYTES * 8 * 10000000LL / MAI2VCAM_MAX_INTERVAL);
-    caps->MaxBitsPerSecond =
-        (LONG)((LONGLONG)MAI2VCAM_FRAME_BYTES * 8 * 10000000LL / MAI2VCAM_DEFAULT_INTERVAL);
+    caps->MinBitsPerSecond = (LONG)(frameBytes * 8 * 10000000LL / MAI2VCAM_MAX_INTERVAL);
+    caps->MaxBitsPerSecond = (LONG)(frameBytes * 8 * 10000000LL / MAI2VCAM_DEFAULT_INTERVAL);
     *type = copy;
     return S_OK;
 }
@@ -765,6 +771,10 @@ void Mai2VcamPin::_PushLoop() {
             input->AddRef();
         }
         const LONGLONG interval = _interval;
+        // 分辨率在针脚构造时定死, 这里只是取本地副本, 免得在锁外读成员。
+        const int width = _width;
+        const int height = _height;
+        const long frameBytes = Mai2VcamFrameBytes(width, height);
         const bool notifyType = _notifyType;
         _notifyType = false;
         AM_MEDIA_TYPE pending = {};
@@ -793,9 +803,9 @@ void Mai2VcamPin::_PushLoop() {
         if (SUCCEEDED(hr) && sample != nullptr) {
             BYTE* data = nullptr;
             if (SUCCEEDED(sample->GetPointer(&data)) && data != nullptr &&
-                sample->GetSize() >= MAI2VCAM_FRAME_BYTES) {
-                _reader.Read(data);
-                sample->SetActualDataLength(MAI2VCAM_FRAME_BYTES);
+                sample->GetSize() >= frameBytes) {
+                _reader.Read(data, width, height);
+                sample->SetActualDataLength(frameBytes);
                 REFERENCE_TIME start = frame * interval;
                 REFERENCE_TIME end = start + interval;
                 sample->SetTime(&start, &end);

@@ -69,12 +69,13 @@ static void _UnregisterClsid() {
     }
     WCHAR path[128] = {0};
     swprintf_s(path, L"CLSID\\%s", clsid);
-    HKEY key = nullptr;
-    if (RegOpenKeyExW(HKEY_CLASSES_ROOT, path, 0, KEY_WRITE, &key) == ERROR_SUCCESS) {
-        RegDeleteKeyW(key, L"InprocServer32");
-        RegCloseKey(key);
-    }
-    RegDeleteKeyW(HKEY_CLASSES_ROOT, path);
+    // ★整棵删, 不要逐个删子键★
+    // RegDeleteKeyW 在目标键下仍有子键时直接失败。这里至少有 InprocServer32, 旧实现是"先删它,
+    // 再删父键" —— 只要将来有任何别的组件往这个 CLSID 下加过一个子键(TypeLib / ProgID 之类),
+    // 父键就再也删不掉, 而返回值一直没人看, 于是留下"DLL 已删、CLSID 键还在"的残壳。
+    // 消费端枚举的是类别登记项, 那个残壳会让摄像头继续出现在设备列表里, 且此时 DLL 已经没了,
+    // 再也没法靠 regsvr32 /u 补救。RegDeleteTreeW 连子键一起删, 从根上消掉这条失败路径。
+    RegDeleteTreeW(HKEY_CLASSES_ROOT, path);
 }
 
 // 过滤器在类别里的登记信息: 单个输出针脚, 只报 NV12。

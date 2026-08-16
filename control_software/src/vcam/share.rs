@@ -43,7 +43,9 @@ use windows::Win32::System::SystemInformation::GetTickCount;
 use windows::Win32::System::Threading::{CreateMutexW, GetCurrentProcessId, ReleaseMutex};
 use windows::core::w;
 
-use super::{FRAME_H, FRAME_W};
+use super::{
+    DEFAULT_FRAME_H, DEFAULT_FRAME_W, Frame, MAX_FRAME_H, MAX_FRAME_W, clamp_resolution,
+};
 
 /// 共享对象所在的内核命名空间。
 ///
@@ -153,10 +155,20 @@ const FRAME_INTERVAL_100NS: u32 = 1_000_000;
 /// 发布本身承担, 不再需要第二条易漏的旁路。
 pub const PUBLISH_INTERVAL_MS: u64 = 100;
 
-/// 一帧 NV12 字节数: Y 平面 W*H + 交错 UV 平面 W*H/2。
-pub const NV12_BYTES: usize = FRAME_W * FRAME_H * 3 / 2;
-const RGB24_BYTES: usize = FRAME_W * FRAME_H * 3;
-const MAP_BYTES: usize = HEADER_BYTES + SLOT_COUNT as usize * NV12_BYTES;
+/// 指定尺寸下一帧 NV12 的字节数: Y 平面 W*H + 交错 UV 平面 W*H/2。
+pub fn nv12_bytes(width: usize, height: usize) -> usize {
+    width * height * 3 / 2
+}
+
+/// 槽间距 = 上限分辨率下的一帧字节数。**恒定**, 与当前分辨率无关。
+///
+/// ★为什么映射按上限开而不按当前分辨率开★ 映射的名字是固定的, 消费端(可能在别的进程甚至别的
+/// 会话)映射时必须先知道映射多大。若映射大小随分辨率变, 每次改分辨率都得重建映射并让所有消费端
+/// 重新打开 —— 而消费端何时打开不由我们决定。按上限一次开好后, 槽偏移恒定, 改分辨率只动头部两个
+/// 字段, 布局完全不变。代价是虚拟地址空间按上限预留(1920x1080 三槽约 8.9MB), 没写到的页不会真正
+/// 占用物理内存。★这两个上限必须与 C++ 侧 `MAI2VCAM_MAX_WIDTH/HEIGHT` 一致★。
+pub const SLOT_STRIDE: usize = MAX_FRAME_W * MAX_FRAME_H * 3 / 2;
+const MAP_BYTES: usize = HEADER_BYTES + SLOT_COUNT as usize * SLOT_STRIDE;
 
 /// 头部字段的 u32 下标(= 字节偏移 / 4)。用显式下标而非结构体, 保证不受打包策略影响。
 #[derive(Clone, Copy)]
@@ -201,29 +213,33 @@ impl QueueState {
 ///
 /// full range 而不是 studio range: 本路画面只有 QR 黑白两色, 压到 16..235 会牺牲对比度,
 /// 而扫码识别对比度最敏感。黑 = Y 0 / UV 128, 与过滤器的占位帧编码一致。
-pub fn rgb24_to_nv12(rgb: &[u8], nv12: &mut [u8]) -> Result<()> {
-    if rgb.len() != RGB24_BYTES || nv12.len() != NV12_BYTES {
+pub fn rgb24_to_nv12(frame: &Frame, nv12: &mut [u8]) -> Result<()> {
+    let (frame_w, frame_h) = (frame.width, frame.height);
+    let rgb = &frame.rgb[..];
+    if !frame.is_consistent() || nv12.len() != nv12_bytes(frame_w, frame_h) {
         return Err(anyhow!(
-            "帧尺寸错误: RGB24 {}(期望 {}) / NV12 {}(期望 {})",
+            "帧尺寸错误: {}x{} 的 RGB24 应为 {} 字节(实为 {}), NV12 应为 {} 字节(实为 {})",
+            frame_w,
+            frame_h,
+            frame.expected_len(),
             rgb.len(),
-            RGB24_BYTES,
-            nv12.len(),
-            NV12_BYTES
+            nv12_bytes(frame_w, frame_h),
+            nv12.len()
         ));
     }
-    let (luma, chroma) = nv12.split_at_mut(FRAME_W * FRAME_H);
-    for y in 0..FRAME_H {
-        for x in 0..FRAME_W {
-            let p = (y * FRAME_W + x) * 3;
+    let (luma, chroma) = nv12.split_at_mut(frame_w * frame_h);
+    for y in 0..frame_h {
+        for x in 0..frame_w {
+            let p = (y * frame_w + x) * 3;
             let (r, g, b) = (rgb[p] as i32, rgb[p + 1] as i32, rgb[p + 2] as i32);
-            luma[y * FRAME_W + x] = (((77 * r + 150 * g + 29 * b + 128) >> 8).clamp(0, 255)) as u8;
+            luma[y * frame_w + x] = (((77 * r + 150 * g + 29 * b + 128) >> 8).clamp(0, 255)) as u8;
         }
     }
     // 色度 4:2:0: 每 2x2 像素块取一组 UV。四个像素直接按下标取, 不再嵌第三层循环。
-    for by in 0..FRAME_H / 2 {
-        for bx in 0..FRAME_W / 2 {
-            let top = ((by * 2) * FRAME_W + bx * 2) * 3;
-            let bottom = top + FRAME_W * 3;
+    for by in 0..frame_h / 2 {
+        for bx in 0..frame_w / 2 {
+            let top = ((by * 2) * frame_w + bx * 2) * 3;
+            let bottom = top + frame_w * 3;
             let r =
                 rgb[top] as i32 + rgb[top + 3] as i32 + rgb[bottom] as i32 + rgb[bottom + 3] as i32;
             let g = rgb[top + 1] as i32
@@ -237,7 +253,7 @@ pub fn rgb24_to_nv12(rgb: &[u8], nv12: &mut [u8]) -> Result<()> {
             // >>10 = 4 像素平均(>>2) 与 8 位定点系数(>>8) 合并。
             let u = (((-43 * r - 85 * g + 128 * b + 512) >> 10) + 128).clamp(0, 255);
             let v = (((128 * r - 107 * g - 21 * b + 512) >> 10) + 128).clamp(0, 255);
-            let uv = (by * FRAME_W / 2 + bx) * 2;
+            let uv = (by * frame_w / 2 + bx) * 2;
             chroma[uv] = u as u8;
             chroma[uv + 1] = v as u8;
         }
@@ -247,9 +263,9 @@ pub fn rgb24_to_nv12(rgb: &[u8], nv12: &mut [u8]) -> Result<()> {
 
 /// 纯黑 NV12 帧(Y=0, UV=128)。与过滤器占位帧逐字节相同, 消费端在"生产者不在"与
 /// "生产者输出黑屏"两种情况下看到的画面完全一致。
-pub fn black_nv12() -> Vec<u8> {
-    let mut frame = vec![0u8; NV12_BYTES];
-    frame[FRAME_W * FRAME_H..].fill(128);
+pub fn black_nv12(width: usize, height: usize) -> Vec<u8> {
+    let mut frame = vec![0u8; nv12_bytes(width, height)];
+    frame[width * height..].fill(128);
     frame
 }
 
@@ -320,17 +336,20 @@ impl FramePublisher {
         }
         let reached: Vec<&str> = targets.iter().map(|t| t._namespace.map_name()).collect();
         log::info!(
-            "虚拟摄像头: 共享队列已就绪 (NV12 {}x{} x{} 槽, 10fps) 覆盖 {} · {}",
-            FRAME_W,
-            FRAME_H,
+            // 分辨率是运行期量, 这里只报槽布局(按上限预留)与节拍; 实际尺寸由每帧写入头部。
+            "虚拟摄像头: 共享队列已就绪 (NV12, 槽 {}x{} 上限 {}x{}, 10fps) 覆盖 {} · {}",
             SLOT_COUNT,
+            SLOT_STRIDE,
+            MAX_FRAME_W,
+            MAX_FRAME_H,
             reached.join(" + "),
             targets[0]._namespace.consequence()
         );
         Ok(Self {
             _targets: targets,
             _sequence: 0,
-            _staging: black_nv12(),
+            // 暂存起步按默认分辨率; publish 遇到更大的尺寸会一次性扩容后复用。
+            _staging: black_nv12(DEFAULT_FRAME_W, DEFAULT_FRAME_H),
         })
     }
 
@@ -355,20 +374,40 @@ impl FramePublisher {
 
     /// 发布一帧 RGB24: 像素转 NV12 一次, 写进每份队列的下一个槽, release 原子写提交 sequence,
     /// 消费者把 sequence 当作"该槽像素已写完"的提交标志。
-    pub fn publish(&mut self, rgb: &[u8]) -> Result<()> {
+    pub fn publish(&mut self, frame: &Frame) -> Result<()> {
+        let (w, h) = clamp_resolution(frame.width as u32, frame.height as u32);
+        if w != frame.width || h != frame.height {
+            return Err(anyhow!(
+                "帧分辨率 {}x{} 不在支持范围内(夹取后为 {}x{})",
+                frame.width,
+                frame.height,
+                w,
+                h
+            ));
+        }
+        let bytes = nv12_bytes(w, h);
+        // 暂存按当前尺寸取用; 只在变大时重新分配, 常态下不分配。
+        if self._staging.len() < bytes {
+            self._staging.resize(bytes, 0);
+        }
         // 转换先做且只做一次: 它是本函数里唯一的重活(逐像素 YUV), 每个目标各转一遍纯属重复。
-        rgb24_to_nv12(rgb, &mut self._staging)?;
+        rgb24_to_nv12(frame, &mut self._staging[..bytes])?;
         let next = self._sequence.wrapping_add(1);
         let slot = (next % SLOT_COUNT) as usize;
         let tick = unsafe { GetTickCount() };
         for target in &self._targets {
-            // SAFETY: 槽区间在映射内(HEADER_BYTES + slot*NV12_BYTES + NV12_BYTES <= MAP_BYTES),
-            // 且只有本生产者写该槽。
+            // ★尺寸先写、序号后提交★ 消费端把 sequence 当作"这一槽已就绪"的提交标志, 并在读之前
+            // 校验头部 width/height 与自己已协商的尺寸是否相等。因此尺寸必须在提交序号之前落地,
+            // 否则会出现"序号已推进、尺寸还是旧值"的窗口, 消费端据此按旧尺寸解释新像素。
+            target._store(Field::Width, w as u32, Ordering::Release);
+            target._store(Field::Height, h as u32, Ordering::Release);
+            // SAFETY: 槽区间在映射内(槽间距恒为 SLOT_STRIDE, 而 bytes <= SLOT_STRIDE 由
+            // clamp_resolution 的上限保证), 且只有本生产者写该槽。
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     self._staging.as_ptr(),
-                    target._view.as_ptr().add(HEADER_BYTES + slot * NV12_BYTES),
-                    NV12_BYTES,
+                    target._view.as_ptr().add(HEADER_BYTES + slot * SLOT_STRIDE),
+                    bytes,
                 );
             }
             // release 原子写 = "该槽像素已写完"的提交点: 它同时是屏障与可见性发布, 不再依赖
@@ -498,22 +537,24 @@ impl _Target {
         self._write(Field::Magic, MAGIC);
         self._write(Field::Version, LAYOUT_VERSION);
         self._write(Field::HeaderBytes, HEADER_BYTES as u32);
-        self._write(Field::Width, FRAME_W as u32);
-        self._write(Field::Height, FRAME_H as u32);
+        // 尺寸只是**初值**: 每次 publish 都会按实际帧尺寸刷新这两个字段。
+        self._write(Field::Width, DEFAULT_FRAME_W as u32);
+        self._write(Field::Height, DEFAULT_FRAME_H as u32);
         self._write(Field::Fourcc, FOURCC_NV12);
         self._write(Field::SlotCount, SLOT_COUNT);
-        self._write(Field::SlotBytes, NV12_BYTES as u32);
+        // 报的是**槽间距**(上限帧长), 不是当前帧长: 消费端靠它算槽偏移, 那个值必须恒定。
+        self._write(Field::SlotBytes, SLOT_STRIDE as u32);
         self._store(Field::Sequence, 0, Ordering::Relaxed);
         self._write(Field::ProducerPid, unsafe { GetCurrentProcessId() });
         self._write(Field::Interval, FRAME_INTERVAL_100NS);
-        let black = black_nv12();
+        let black = black_nv12(DEFAULT_FRAME_W, DEFAULT_FRAME_H);
         for slot in 0..SLOT_COUNT as usize {
-            // SAFETY: 同 publish, 槽区间在映射内。
+            // SAFETY: 同 publish, 槽区间在映射内(槽间距恒为 SLOT_STRIDE, 黑帧只占其前一段)。
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     black.as_ptr(),
-                    self._view.as_ptr().add(HEADER_BYTES + slot * NV12_BYTES),
-                    NV12_BYTES,
+                    self._view.as_ptr().add(HEADER_BYTES + slot * SLOT_STRIDE),
+                    black.len(),
                 );
             }
         }
@@ -662,28 +703,32 @@ impl QueueReader {
     /// 取一帧到 destination(长度必须为 NV12_BYTES)。返回该帧的 sequence。
     /// 与 C++ 侧同规则: 读前后各取 sequence, 差值 >= 2 判撕裂, 最多重试 3 次。
     pub fn read(&self, destination: &mut [u8]) -> Result<u32> {
-        if destination.len() != NV12_BYTES {
-            return Err(anyhow!(
-                "接收缓冲长度 {}(期望 {})",
-                destination.len(),
-                NV12_BYTES
-            ));
-        }
         let header = self.header()?;
         if header.state != QueueState::Ready {
             return Err(anyhow!("队列状态 {:?}, 非 Ready", header.state));
+        }
+        // 期望长度按**头部当前报的尺寸**算, 与 C++ 侧同一规则: 队列的尺寸是运行期量。
+        let expected = nv12_bytes(header.width as usize, header.height as usize);
+        if destination.len() != expected {
+            return Err(anyhow!(
+                "接收缓冲长度 {}(队列当前 {}x{} 期望 {})",
+                destination.len(),
+                header.width,
+                header.height,
+                expected
+            ));
         }
         for _ in 0..3 {
             // acquire 原子读: 与生产者的 release 提交配对, 保证读到 sequence 之后看到的
             // 就是该槽写完后的像素。
             let first = self._read(Field::Sequence);
             let slot = (first % SLOT_COUNT) as usize;
-            // SAFETY: 槽区间在映射内; 只读拷贝。
+            // SAFETY: 槽区间在映射内(槽间距恒为 SLOT_STRIDE, expected <= SLOT_STRIDE); 只读拷贝。
             unsafe {
                 std::ptr::copy_nonoverlapping(
-                    self._view.as_ptr().add(HEADER_BYTES + slot * NV12_BYTES),
+                    self._view.as_ptr().add(HEADER_BYTES + slot * SLOT_STRIDE),
                     destination.as_mut_ptr(),
-                    NV12_BYTES,
+                    expected,
                 );
             }
             let second = self._read(Field::Sequence);

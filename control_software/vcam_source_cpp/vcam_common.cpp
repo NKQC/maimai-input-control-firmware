@@ -105,37 +105,43 @@ void Mai2VcamDeleteMediaType(AM_MEDIA_TYPE* type) {
     CoTaskMemFree(type);
 }
 
-HRESULT Mai2VcamBuildMediaType(AM_MEDIA_TYPE* type, LONGLONG frameInterval) {
+HRESULT Mai2VcamBuildMediaType(AM_MEDIA_TYPE* type, LONGLONG frameInterval, int width,
+                               int height) {
     if (type == nullptr) {
         return E_POINTER;
     }
     if (frameInterval < MAI2VCAM_DEFAULT_INTERVAL || frameInterval > MAI2VCAM_MAX_INTERVAL) {
         frameInterval = MAI2VCAM_DEFAULT_INTERVAL;
     }
+    if (!Mai2VcamSizeValid(width, height)) {
+        width = MAI2VCAM_DEFAULT_WIDTH;
+        height = MAI2VCAM_DEFAULT_HEIGHT;
+    }
+    const int frameBytes = Mai2VcamFrameBytes(width, height);
     ZeroMemory(type, sizeof(AM_MEDIA_TYPE));
     VIDEOINFOHEADER* info = (VIDEOINFOHEADER*)CoTaskMemAlloc(sizeof(VIDEOINFOHEADER));
     if (info == nullptr) {
         return E_OUTOFMEMORY;
     }
     ZeroMemory(info, sizeof(VIDEOINFOHEADER));
-    info->rcSource = {0, 0, MAI2VCAM_WIDTH, MAI2VCAM_HEIGHT};
+    info->rcSource = {0, 0, width, height};
     info->rcTarget = info->rcSource;
-    info->dwBitRate = (DWORD)((LONGLONG)MAI2VCAM_FRAME_BYTES * 8 * 10000000LL / frameInterval);
+    info->dwBitRate = (DWORD)((LONGLONG)frameBytes * 8 * 10000000LL / frameInterval);
     info->AvgTimePerFrame = frameInterval;
     info->bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    info->bmiHeader.biWidth = MAI2VCAM_WIDTH;
+    info->bmiHeader.biWidth = width;
     // NV12 是平面 YUV: 高度取正(自上而下), 与 RGB 的倒置约定无关。
-    info->bmiHeader.biHeight = MAI2VCAM_HEIGHT;
+    info->bmiHeader.biHeight = height;
     info->bmiHeader.biPlanes = 1;
     info->bmiHeader.biBitCount = 12;
     info->bmiHeader.biCompression = MAKEFOURCC('N', 'V', '1', '2');
-    info->bmiHeader.biSizeImage = MAI2VCAM_FRAME_BYTES;
+    info->bmiHeader.biSizeImage = frameBytes;
 
     type->majortype = MEDIATYPE_Video;
     type->subtype = MEDIASUBTYPE_NV12;
     type->bFixedSizeSamples = TRUE;
     type->bTemporalCompression = FALSE;
-    type->lSampleSize = MAI2VCAM_FRAME_BYTES;
+    type->lSampleSize = frameBytes;
     type->formattype = FORMAT_VideoInfo;
     type->pUnk = nullptr;
     type->cbFormat = sizeof(VIDEOINFOHEADER);
@@ -143,9 +149,13 @@ HRESULT Mai2VcamBuildMediaType(AM_MEDIA_TYPE* type, LONGLONG frameInterval) {
     return S_OK;
 }
 
-bool Mai2VcamAcceptMediaType(const AM_MEDIA_TYPE* type) {
+bool Mai2VcamAcceptMediaType(const AM_MEDIA_TYPE* type, int width, int height) {
     if (type == nullptr) {
         return false;
+    }
+    if (!Mai2VcamSizeValid(width, height)) {
+        width = MAI2VCAM_DEFAULT_WIDTH;
+        height = MAI2VCAM_DEFAULT_HEIGHT;
     }
     // 部分指定的类型(GUID_NULL)按通配处理: 图构建器常给出只填了 majortype 的类型。
     if (type->majortype != GUID_NULL && type->majortype != MEDIATYPE_Video) {
@@ -161,11 +171,11 @@ bool Mai2VcamAcceptMediaType(const AM_MEDIA_TYPE* type) {
         return false;
     }
     const VIDEOINFOHEADER* info = (const VIDEOINFOHEADER*)type->pbFormat;
-    if (info->bmiHeader.biWidth != MAI2VCAM_WIDTH) {
+    if (info->bmiHeader.biWidth != width) {
         return false;
     }
-    LONG height = info->bmiHeader.biHeight < 0 ? -info->bmiHeader.biHeight : info->bmiHeader.biHeight;
-    if (height != MAI2VCAM_HEIGHT) {
+    LONG got = info->bmiHeader.biHeight < 0 ? -info->bmiHeader.biHeight : info->bmiHeader.biHeight;
+    if (got != height) {
         return false;
     }
     if (info->bmiHeader.biCompression != MAKEFOURCC('N', 'V', '1', '2')) {

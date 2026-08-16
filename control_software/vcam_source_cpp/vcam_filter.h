@@ -84,6 +84,14 @@ private:
     LONGLONG _interval = MAI2VCAM_DEFAULT_INTERVAL;
     // SetFormat 在连接状态下改帧率时置位, 下一帧携带新类型通知下游。
     bool _notifyType = false;
+    // 本针脚这一辈子只报这一种分辨率: 构造时从共享队列头读一次(生产者不在则用回落值)。
+    //
+    // ★为什么不能中途跟着队列变★ DirectShow 的媒体类型在 Connect 时就与下游定死了, 下游据此
+    // 申请缓冲、配置转换与渲染。运行中换尺寸没有合法的通知路径(SetMediaType 只能改同尺寸下的
+    // 次要属性)。所以: 生产者改了分辨率 → 队列头与本值不再相等 → 推流侧一律给占位黑帧, 直到
+    // 消费端重新打开摄像头(那时会新建一个针脚, 重新读一次队列头)。
+    int _width = MAI2VCAM_DEFAULT_WIDTH;
+    int _height = MAI2VCAM_DEFAULT_HEIGHT;
 
     HANDLE _thread = nullptr;
     HANDLE _stop = nullptr;

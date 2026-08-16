@@ -946,9 +946,15 @@ fn _probe_vcam_com(dll: &std::path::Path, probe_registered: bool, failures: &mut
 /// 过滤器自身的注册状态只做信息打印, 不参与判定(装不装是用户的选择)。
 fn _run_vcam_probe() -> bool {
     use mai2control_ui::vcam::share::{
-        FramePublisher, NV12_BYTES, QueueReader, QueueState, black_nv12, rgb24_to_nv12,
+        FramePublisher, QueueReader, QueueState, SLOT_STRIDE, black_nv12, nv12_bytes,
+        rgb24_to_nv12,
     };
-    use mai2control_ui::vcam::{FRAME_H, FRAME_W, backend as vcam_backend, render_qr_frame};
+    use mai2control_ui::vcam::{
+        DEFAULT_FRAME_H as FRAME_H, DEFAULT_FRAME_W as FRAME_W, Frame, backend as vcam_backend,
+        render_qr_frame,
+    };
+    // 本探针一律在默认分辨率下验证协议本身: 分辨率可变这件事由下面 2.6 节单独覆盖。
+    let nv12_len = nv12_bytes(FRAME_W, FRAME_H);
 
     println!("[VCAM] probe begin");
     println!(
@@ -1008,10 +1014,11 @@ fn _run_vcam_probe() -> bool {
                     header.width, header.height, FRAME_W, FRAME_H
                 ));
             }
-            if header.slot_count != 3 || header.slot_bytes != NV12_BYTES as u32 {
+            // 槽间距报的是**上限帧长**(恒定), 不是当前帧长 —— 消费端靠它算槽偏移。
+            if header.slot_count != 3 || header.slot_bytes != SLOT_STRIDE as u32 {
                 failures.push(format!(
                     "槽布局 {}x{}B 与 3x{}B 不符",
-                    header.slot_count, header.slot_bytes, NV12_BYTES
+                    header.slot_count, header.slot_bytes, SLOT_STRIDE
                 ));
             }
             if header.producer_pid != std::process::id() {
@@ -1026,10 +1033,14 @@ fn _run_vcam_probe() -> bool {
     }
 
     // 2) 黑帧编码必须与过滤器的占位帧逐字节相同, 否则"生产者不在"与"输出黑屏"会有可见跳变。
-    let black_rgb = vec![0u8; FRAME_W * FRAME_H * 3];
-    let mut converted = vec![0u8; NV12_BYTES];
+    let black_rgb = Frame {
+        width: FRAME_W,
+        height: FRAME_H,
+        rgb: vec![0u8; FRAME_W * FRAME_H * 3],
+    };
+    let mut converted = vec![0u8; nv12_len];
     match rgb24_to_nv12(&black_rgb, &mut converted) {
-        Ok(()) if converted == black_nv12() => {
+        Ok(()) if converted == black_nv12(FRAME_W, FRAME_H) => {
             println!("[VCAM] 黑帧编码: 与占位帧一致(Y=0 UV=128)")
         }
         Ok(()) => failures.push("黑帧 NV12 编码与占位帧不一致".to_string()),
@@ -1079,23 +1090,24 @@ fn _run_vcam_probe() -> bool {
     // 用 QR 帧而不是纯色/对称图案来验: 只有左右不对称的内容才分得出"翻了"与"没翻"。
     {
         let source = match render_qr_frame("MAI2CONTROL-VCAM-MIRROR") {
-            Ok(frame) => frame,
+            Ok(frame) => Some(frame),
             Err(error) => {
                 failures.push(format!("镜像用 QR 帧生成: {}", error));
-                Vec::new()
+                None
             }
         };
-        if !source.is_empty() {
+        if let Some(source) = source {
+            let (w, h) = (source.width, source.height);
             let mut mirrored = source.clone();
             mai2control_ui::vcam::mirror_x_in_place(&mut mirrored);
             // 逐行核对: 目标第 x 列必须等于源第 (W-1-x) 列, 三个分量都对上。
             let mut mismatch = 0usize;
-            for y in 0..FRAME_H {
-                let row = y * FRAME_W * 3;
-                for x in 0..FRAME_W {
+            for y in 0..h {
+                let row = y * w * 3;
+                for x in 0..w {
                     let dst = row + x * 3;
-                    let src = row + (FRAME_W - 1 - x) * 3;
-                    if mirrored[dst..dst + 3] != source[src..src + 3] {
+                    let src = row + (w - 1 - x) * 3;
+                    if mirrored.rgb[dst..dst + 3] != source.rgb[src..src + 3] {
                         mismatch += 1;
                     }
                 }
@@ -1104,9 +1116,9 @@ fn _run_vcam_probe() -> bool {
             mai2control_ui::vcam::mirror_x_in_place(&mut twice);
             if mismatch != 0 {
                 failures.push(format!("X 镜像有 {} 个像素不满足左右对称映射", mismatch));
-            } else if twice != source {
+            } else if twice.rgb != source.rgb {
                 failures.push("X 镜像翻两次未回到原帧(非对合)".to_string());
-            } else if mirrored == source {
+            } else if mirrored.rgb == source.rgb {
                 failures.push("X 镜像后与原帧完全相同(未生效)".to_string());
             } else {
                 println!("[VCAM] X 镜像: 逐像素对称映射一致, 翻两次复原");
@@ -1122,19 +1134,19 @@ fn _run_vcam_probe() -> bool {
         let expected_len = FRAME_W * FRAME_H * 3;
         let first = mai2control_ui::vcam::render_test_frame(0);
         let later = mai2control_ui::vcam::render_test_frame(64);
-        if first.len() != expected_len || later.len() != expected_len {
+        if first.rgb.len() != expected_len || later.rgb.len() != expected_len {
             failures.push(format!(
                 "测试图案长度 {}/{}(期望 {})",
-                first.len(),
-                later.len(),
+                first.rgb.len(),
+                later.rgb.len(),
                 expected_len
             ));
         } else {
-            let bright = first.chunks_exact(3).filter(|p| p[0] > 128).count();
+            let bright = first.rgb.chunks_exact(3).filter(|p| p[0] > 128).count();
             let ratio = bright as f32 / (FRAME_W * FRAME_H) as f32 * 100.0;
             if !(1.0..=60.0).contains(&ratio) {
                 failures.push(format!("测试图案亮像素占比 {:.1}% 不在 1%..60%", ratio));
-            } else if first == later {
+            } else if first.rgb == later.rgb {
                 failures.push("测试图案不随序号变化(游标未动, 无法证明帧在更新)".to_string());
             } else {
                 println!("[VCAM] 测试图案: 亮像素 {:.1}%, 游标随序号推进", ratio);
@@ -1142,8 +1154,75 @@ fn _run_vcam_probe() -> bool {
         }
     }
 
+    // 2.6) 自定义分辨率与 QR 占比: 三件事必须成立 ——
+    //   ① 非法输入被夹进范围且宽高取偶数(NV12 的色度按 2x2 取样, 奇数尺寸必然错位);
+    //   ② 渲染出的帧自带尺寸且与像素长度自洽(帧自带尺寸就是为了消灭"尺寸与像素对不上");
+    //   ③ 占比确实改变 QR 的像素占地面积, 且不会溢出画面。
+    {
+        use mai2control_ui::vcam::{
+            MAX_FRAME_H, MAX_FRAME_W, MIN_FRAME_H, MIN_FRAME_W, clamp_resolution,
+            render_qr_frame_sized,
+        };
+        // ① 夹取与偶数化。
+        let cases = [
+            ((1u32, 1u32), (MIN_FRAME_W, MIN_FRAME_H)),
+            ((99999, 99999), (MAX_FRAME_W, MAX_FRAME_H)),
+            ((641, 481), (640, 480)),
+        ];
+        for ((in_w, in_h), want) in cases {
+            let got = clamp_resolution(in_w, in_h);
+            if got != want {
+                failures.push(format!(
+                    "分辨率夹取 {}x{} → {:?}(期望 {:?})",
+                    in_w, in_h, got, want
+                ));
+            }
+        }
+        // ② 多种分辨率下渲染都要自洽。
+        for (w, h) in [(320usize, 240usize), (640, 480), (1280, 720)] {
+            match render_qr_frame_sized("MAI2CONTROL-VCAM-RES", w, h, 75) {
+                Ok(frame) => {
+                    if frame.width != w || frame.height != h {
+                        failures.push(format!(
+                            "{}x{} 渲染回报尺寸 {}x{}",
+                            w, h, frame.width, frame.height
+                        ));
+                    } else if !frame.is_consistent() {
+                        failures.push(format!(
+                            "{}x{} 渲染像素 {} 字节与尺寸不符(应为 {})",
+                            w,
+                            h,
+                            frame.rgb.len(),
+                            frame.expected_len()
+                        ));
+                    }
+                }
+                Err(error) => failures.push(format!("{}x{} 渲染失败: {}", w, h, error)),
+            }
+        }
+        // ③ 占比越大, QR 的白色模块覆盖面积越大; 且始终不越出画面(长度自洽已含此意)。
+        let area_of = |pct: u32| -> Option<usize> {
+            render_qr_frame_sized("MAI2CONTROL-VCAM-FILL", 640, 480, pct)
+                .ok()
+                .map(|f| f.rgb.chunks_exact(3).filter(|p| p[0] > 128).count())
+        };
+        match (area_of(30), area_of(90)) {
+            (Some(small), Some(large)) if large > small && small > 0 => {
+                println!(
+                    "[VCAM] 自定义分辨率/占比: 夹取与偶数化正确, 320x240~1280x720 渲染自洽, 占比 30%→90% 白模块 {}→{} 像素",
+                    small, large
+                );
+            }
+            (Some(small), Some(large)) => failures.push(format!(
+                "QR 占比未随设置增大(30%={} 像素, 90%={} 像素)",
+                small, large
+            )),
+            _ => failures.push("按占比渲染 QR 失败".to_string()),
+        }
+    }
+
     // 3) 发布/读取往返: 逐字节核对, 并检查 sequence 单调 +1(顺带覆盖 3 个槽的轮转)。
-    let qr = match render_qr_frame("MAI2CONTROL-VCAM-PROBE") {
+    let qr: Frame = match render_qr_frame("MAI2CONTROL-VCAM-PROBE") {
         Ok(frame) => frame,
         Err(error) => {
             failures.push(format!("QR 帧生成: {}", error));
@@ -1163,7 +1242,7 @@ fn _run_vcam_probe() -> bool {
             break;
         }
         expected_sequence += 1;
-        let mut got = vec![0u8; NV12_BYTES];
+        let mut got = vec![0u8; nv12_len];
         let sequence = match reader.read(&mut got) {
             Ok(sequence) => sequence,
             Err(error) => {
@@ -1179,7 +1258,7 @@ fn _run_vcam_probe() -> bool {
                 expected_sequence
             ));
         }
-        let mut expected = vec![0u8; NV12_BYTES];
+        let mut expected = vec![0u8; nv12_len];
         if let Err(error) = rgb24_to_nv12(rgb, &mut expected) {
             failures.push(format!("第 {} 轮转换: {}", round + 1, error));
             break;
@@ -1238,7 +1317,7 @@ fn _run_vcam_probe() -> bool {
         )),
         Err(error) => failures.push(format!("退出后头部读取: {}", error)),
     }
-    if reader.read(&mut vec![0u8; NV12_BYTES]).is_ok() {
+    if reader.read(&mut vec![0u8; nv12_len]).is_ok() {
         failures.push("生产者退出后仍能取到帧(消费端应转占位帧)".to_string());
     }
 

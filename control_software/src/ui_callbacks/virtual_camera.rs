@@ -348,6 +348,25 @@ pub(crate) fn register_callbacks(
         vcam_mirror_cb.set_mirror_x(on);
         ui.set_vcam_mirror_x(on);
     });
+    // 分辨率 / QR 占比: 回填**夹取后**的实际生效值, 界面上绝不显示一个从未生效过的数。
+    let vcam_res_cb = state.vcam.clone();
+    let ui_vcam_res = ui_weak.clone();
+    ui.on_set_vcam_resolution(move |w, h| {
+        let Some(ui) = ui_vcam_res.upgrade() else {
+            return;
+        };
+        let (w, h) = vcam_res_cb.set_resolution(w.max(0) as u32, h.max(0) as u32);
+        ui.set_vcam_frame_w(w as i32);
+        ui.set_vcam_frame_h(h as i32);
+    });
+    let vcam_fill_cb = state.vcam.clone();
+    let ui_vcam_fill = ui_weak.clone();
+    ui.on_set_vcam_qr_fill_pct(move |pct| {
+        let Some(ui) = ui_vcam_fill.upgrade() else {
+            return;
+        };
+        ui.set_vcam_qr_fill_pct(vcam_fill_cb.set_qr_fill_pct(pct.max(0) as u32) as i32);
+    });
     let vcam_cb = state.vcam.clone();
     ui.on_set_vcam_submit_secs(move |s| {
         vcam_cb.set_submit_timeout_ms((s.max(1) as u32) * 1000);

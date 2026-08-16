@@ -139,6 +139,18 @@ pub(crate) fn setup_ui_callbacks(
         ui.set_vcam_submit_secs(cfg.get_i32(k::VCAM_SUBMIT_SECS, 2).clamp(1, 10));
         ui.set_vcam_display_secs(cfg.get_i32(k::VCAM_DISPLAY_SECS, 10).clamp(1, 60));
         ui.set_vcam_mirror_x(cfg.get_bool(k::VCAM_MIRROR_X, false));
+        ui.set_vcam_frame_w(
+            cfg.get_i32(k::VCAM_FRAME_W, vcam::DEFAULT_FRAME_W as i32)
+                .clamp(vcam::MIN_FRAME_W as i32, vcam::MAX_FRAME_W as i32),
+        );
+        ui.set_vcam_frame_h(
+            cfg.get_i32(k::VCAM_FRAME_H, vcam::DEFAULT_FRAME_H as i32)
+                .clamp(vcam::MIN_FRAME_H as i32, vcam::MAX_FRAME_H as i32),
+        );
+        ui.set_vcam_qr_fill_pct(
+            cfg.get_i32(k::VCAM_QR_FILL_PCT, vcam::DEFAULT_QR_FILL_PCT as i32)
+                .clamp(vcam::MIN_QR_FILL_PCT as i32, vcam::MAX_QR_FILL_PCT as i32),
+        );
         ui.set_diag_expanded(cfg.get_bool(k::DIAG_EXPANDED, false));
         ui.set_curve_params_expanded(cfg.get_bool(k::CURVE_PARAMS_EXPANDED, true));
         ui.set_curve_algo_cfg_expanded(cfg.get_bool(k::CURVE_ALGO_CFG_EXPANDED, false));
@@ -199,6 +211,17 @@ pub(crate) fn setup_ui_callbacks(
         // 镜像同理: 只回填 UI 属性而不落到共享状态, 出画那边会一直用默认朝向, 直到用户
         // 手动切一次开关才对上 —— 那正是"设置看起来生效了其实没生效"的经典形态。
         vcam_state.vcam.set_mirror_x(ui.get_vcam_mirror_x());
+        // 分辨率与占比同理: 只回填 UI 而不落到共享状态, 出画就会一直用默认值。
+        // 回填夹取后的实际生效值, 免得界面显示一个从未生效过的数。
+        let (w, h) = vcam_state
+            .vcam
+            .set_resolution(ui.get_vcam_frame_w().max(0) as u32, ui.get_vcam_frame_h().max(0) as u32);
+        ui.set_vcam_frame_w(w as i32);
+        ui.set_vcam_frame_h(h as i32);
+        let pct = vcam_state
+            .vcam
+            .set_qr_fill_pct(ui.get_vcam_qr_fill_pct().max(0) as u32);
+        ui.set_vcam_qr_fill_pct(pct as i32);
     }
 
     // 二值算法线的归一化幅度 N(索引 0..3 = report[idx], 4 = 触发判定)。

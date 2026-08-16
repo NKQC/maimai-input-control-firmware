@@ -30,6 +30,12 @@ export component ToolboxPage inherits Rectangle {
     // X 镜像: 左右翻转输出帧。预览与出画同源, 勾上后两边一起翻。
     in property <bool> vcam_mirror_x: false;
     callback set_vcam_mirror_x(bool);
+    // 输出分辨率与 QR 占短边百分比。回填的都是夹取后的实际生效值。
+    in property <int> vcam_frame_w: 640;
+    in property <int> vcam_frame_h: 480;
+    in property <int> vcam_qr_fill_pct: 75;
+    callback set_vcam_resolution(int, int);
+    callback set_vcam_qr_fill_pct(int);
     in property <int> vcam_submit_secs: 2;
     in property <int> vcam_display_secs: 10;
     in property <string> vcam_last_data: "";
@@ -504,7 +510,56 @@ export component ToolboxPage inherits Rectangle {
                             }
                         }
 
-                        // 两项都走 FormRow: 左栏最宽只有 360px, 标签列取窄一档才留得下数字框。
+                        // 输出分辨率: 宽高各一个数字框。生效值会被夹进范围并取偶数(NV12 的色度按
+                        // 2x2 块取样, 奇数尺寸会让行距错位), 所以回填值可能与刚敲进去的不同 ——
+                        // 显示的始终是**实际生效**的那个值。
+                        FormRow {
+                            label: "输出分辨率(宽 x 高):";
+                            label_width: 160px;
+                            HorizontalLayout {
+                                spacing: 6px;
+                                GuardedSpinBox {
+                                    width: Theme.spin-narrow;
+                                    horizontal-stretch: 0;
+                                    minimum: 160;
+                                    maximum: 1920;
+                                    model_value: root.vcam_frame_w;
+                                    edited(v) => { root.set_vcam_resolution(v, root.vcam_frame_h); }
+                                }
+                                Text { text: "x"; vertical-alignment: center; color: #7f8c96; }
+                                GuardedSpinBox {
+                                    width: Theme.spin-narrow;
+                                    horizontal-stretch: 0;
+                                    minimum: 120;
+                                    maximum: 1080;
+                                    model_value: root.vcam_frame_h;
+                                    edited(v) => { root.set_vcam_resolution(root.vcam_frame_w, v); }
+                                }
+                                Rectangle { horizontal-stretch: 1; }
+                            }
+                        }
+
+                        FormRow {
+                            label: "QR 占画面短边(%):";
+                            label_width: 160px;
+                            GuardedSpinBox {
+                                width: Theme.spin-narrow;
+                                horizontal-stretch: 0;
+                                minimum: 10;
+                                maximum: 100;
+                                model_value: root.vcam_qr_fill_pct;
+                                edited(v) => { root.set_vcam_qr_fill_pct(v); }
+                            }
+                        }
+
+                        Text {
+                            text: "改分辨率后，消费端(游戏 / OBS / Windows 设置)需重新打开摄像头才会按新尺寸协商。";
+                            color: #7f8c96;
+                            font-size: 10px;
+                            wrap: word-wrap;
+                        }
+
+                        // 两项都走 FormRow: 左栏最宽 430px, 标签列取窄一档才留得下数字框。
                         FormRow {
                             label: "输入停顿提交阈值(秒):";
                             label_width: 160px;

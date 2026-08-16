@@ -25,6 +25,21 @@ use windows::core::{HRESULT, PCWSTR, w};
 const DS_CLSID: &str = "{6E5A1C74-2F83-4C9B-9D1E-7A4B0F3C58E2}";
 const VIDEO_INPUT_CATEGORY: &str = "{860BB310-5D01-11D0-BD3B-00A0C911CE86}";
 const INSTANCE_NAME: &str = "mai2control Virtual Camera";
+/// 旧 MF 实现留下的 DLL 文件名。当前实现只用 DirectShow, 不再注册 MF 设备, 这份文件仅作卸载清理。
+const LEGACY_MF_DLL: &str = "mai2vcam_source64.dll";
+
+/// 旧 MF 实现的 DLL 是否已从部署目录清除。
+fn _legacy_dll_clean() -> bool {
+    !install_dir().join(LEGACY_MF_DLL).is_file()
+}
+
+/// 卸载成功后附带的一句说明。
+///
+/// ★这句必须有★ 注册项删干净之后, Windows 设置里那一条通常还会留一会儿: 相机列表由帧服务器
+/// 缓存, 已经打开的设置页/应用不会重新枚举。用户此时看到"卸载成功"却仍在列表里看得见它, 只会
+/// 认定卸载没生效并反复重试。把这个已知的滞后如实说出来, 比让用户自己猜要好。
+const _STALE_LIST_NOTE: &str =
+    "；注意：Windows 设置/已打开的应用会缓存相机列表，该条目可能要等重新打开设置页或重启后才消失";
 
 mod embedded {
     include!(concat!(env!("OUT_DIR"), "/vcam_embedded.rs"));
@@ -475,6 +490,31 @@ pub fn uninstall() -> Result<String> {
             target = _cmd_quote(&target),
         ));
     }
+    // ★注册项兜底清扫: 必须在删文件之前★
+    //
+    // 上面那句 regsvr32 /u 是"正路" —— 它加载 DLL 让其自行反注册。但这条路会失败, 而且失败得
+    // 很安静: DLL 此刻可能正被某个消费端进程(游戏 / OBS / 系统帧服务器)载着, 也可能上一次卸载
+    // 已经把文件删了。旧实现既不看它的退出码, 紧接着就把 DLL 删掉 —— 于是注册项永久留在系统里,
+    // 而能用来反注册的那个 DLL 已经不存在了, 用户再点多少次卸载都清不掉, 表现就是"卸载完了,
+    // 摄像头还在设置里"。
+    //
+    // 所以这里不依赖 DLL 能不能加载, 直接按我方**自己写进去**的那几个键把它们删掉:
+    //   · CLSID\{我方 CLSID}                      —— COM 服务器登记
+    //   · CLSID\{视频输入设备类别}\Instance\{名字} —— 消费端 ICreateDevEnum 枚举到的那一项
+    // 两个注册表视图都要清: 64 位与 32 位应用各看各的视图, 漏一个就表现为"某些程序里还在"。
+    // 用 reg delete 而不是 RegDeleteKey: 它连子键一起删, 不会因为键下多了个子键就删不动。
+    // 键本来就不存在时 reg delete 会返回非零, 这里刻意不检查退出码 —— 卸载必须幂等。
+    for view in ["64", "32"] {
+        steps.push(format!(
+            "reg delete \"HKLM\\SOFTWARE\\Classes\\CLSID\\{clsid}\" /f /reg:{view} >nul 2>&1",
+            clsid = DS_CLSID,
+        ));
+        steps.push(format!(
+            "reg delete \"HKLM\\SOFTWARE\\Classes\\CLSID\\{category}\\Instance\\{name}\" /f /reg:{view} >nul 2>&1",
+            category = VIDEO_INPUT_CATEGORY,
+            name = INSTANCE_NAME,
+        ));
+    }
     if owned_driver {
         steps.push(format!(
             "{} /uninstall",
@@ -493,6 +533,12 @@ pub fn uninstall() -> Result<String> {
             old = _cmd_quote(&target.with_extension("dll.old")),
         ));
     }
+    // 旧 MF 实现留下的 DLL: 当前实现不再注册任何 MF 设备, 但老版本装过的这份文件会一直躺在
+    // 部署目录里。它已经不会被任何东西加载, 可只要它还在, "到底卸干净了没有"就答不清楚。
+    steps.push(format!(
+        "del /q {target} >nul 2>&1",
+        target = _cmd_quote(&directory.join(LEGACY_MF_DLL)),
+    ));
     for (name, _) in interception::deployment_assets() {
         steps.push(format!(
             "del /q {target} >nul 2>&1",
@@ -520,11 +566,13 @@ pub fn uninstall() -> Result<String> {
     let verified = _scan();
     let camera_clean = verified
         .iter()
-        .all(|entry| entry._absent() && entry._files_clean());
+        .all(|entry| entry._absent() && entry._files_clean())
+        && _legacy_dll_clean();
     if !camera_clean || !_interception_assets_clean() {
         return Err(anyhow!(
-            "卸载命令已执行（退出码 0），但仍有残留：{}；Interception 资产已清除={}",
+            "卸载命令已执行（退出码 0），但仍有残留：{}；旧 MF DLL 已清除={}；Interception 资产已清除={}",
             _describe(&verified),
+            _legacy_dll_clean(),
             _interception_assets_clean(),
         ));
     }
@@ -534,15 +582,15 @@ pub fn uninstall() -> Result<String> {
                 "官方 Interception 卸载器已返回成功，但驱动仍可枚举；不会声称卸载完成"
             ));
         }
-        Ok(
-            "未安装（已核验摄像头注册/文件清除，且仅移除了本应用安装的 Interception 驱动）"
-                .to_string(),
-        )
+        Ok(format!(
+            "未安装（已核验摄像头注册/文件清除，且仅移除了本应用安装的 Interception 驱动）{}",
+            _STALE_LIST_NOTE
+        ))
     } else {
-        Ok(
-            "未安装（已核验摄像头注册/文件清除；已保留非本应用安装的 Interception 驱动）"
-                .to_string(),
-        )
+        Ok(format!(
+            "未安装（已核验摄像头注册/文件清除；已保留非本应用安装的 Interception 驱动）{}",
+            _STALE_LIST_NOTE
+        ))
     }
 }
 

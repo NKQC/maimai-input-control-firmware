@@ -27,7 +27,7 @@ use mai2control_ui::proto::{
 };
 use mai2control_ui::proto::{LED_CH_UNMAPPED, LED_PREVIEW_ALL, LED_UNIT_COUNT};
 use mai2control_ui::touch_geometry;
-use mai2control_ui::vcam::{self, FRAME_H, FRAME_W, VcamState};
+use mai2control_ui::vcam::{self, VcamState};
 use mai2control_ui::vcam::{backend as vcam_backend, share, share::FramePublisher};
 use slint::Model;
 

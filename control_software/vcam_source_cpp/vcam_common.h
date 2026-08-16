@@ -60,11 +60,34 @@ EXTERN_C const GUID CLSID_Mai2VcamDshow;
 #define MAI2VCAM_LAYOUT_VERSION 1u
 #define MAI2VCAM_HEADER_BYTES 64u
 #define MAI2VCAM_SLOT_COUNT 3u
-#define MAI2VCAM_WIDTH 640
-#define MAI2VCAM_HEIGHT 480
-// NV12: Y 平面 W*H + 交错 UV 平面 W*H/2。
-#define MAI2VCAM_FRAME_BYTES ((MAI2VCAM_WIDTH * MAI2VCAM_HEIGHT * 3) / 2)
-#define MAI2VCAM_MAP_BYTES (MAI2VCAM_HEADER_BYTES + MAI2VCAM_SLOT_COUNT * MAI2VCAM_FRAME_BYTES)
+
+// ── 分辨率 ──────────────────────────────────────────────────────────────────────
+//
+// 分辨率是**运行期**量: 由生产者写在共享队列头的 width/height 里, 本 DLL 在过滤器构造时读一次。
+//
+// ★为什么共享映射按上限开, 而不按当前分辨率开★ 映射的名字是固定的, 消费端(可能是别的进程、
+// 甚至别的会话)映射时必须知道映射多大。若映射大小随分辨率变, 那么每次改分辨率都要重建映射并让
+// 所有消费端重新打开 —— 而消费端的打开时机不由我们控制。按上限一次开好, 槽间距恒定, 改分辨率
+// 只改头部两个字段, 布局完全不动。代价是常驻虚拟内存按上限计(1920x1080 三槽约 8.9MB, 且未写到
+// 的页不会真正占物理内存)。
+#define MAI2VCAM_MAX_WIDTH 1920
+#define MAI2VCAM_MAX_HEIGHT 1080
+// 槽间距 = 上限分辨率下的一帧字节数(NV12: Y 平面 W*H + 交错 UV 平面 W*H/2)。恒定, 与当前分辨率无关。
+#define MAI2VCAM_SLOT_STRIDE ((MAI2VCAM_MAX_WIDTH * MAI2VCAM_MAX_HEIGHT * 3) / 2)
+#define MAI2VCAM_MAP_BYTES (MAI2VCAM_HEADER_BYTES + MAI2VCAM_SLOT_COUNT * MAI2VCAM_SLOT_STRIDE)
+
+// 生产者不在时的回落分辨率: 没有队列可读时也必须报得出一种格式, 否则消费端连枚举都做不了。
+#define MAI2VCAM_DEFAULT_WIDTH 640
+#define MAI2VCAM_DEFAULT_HEIGHT 480
+
+// 当前分辨率下的一帧字节数。NV12 要求宽高均为偶数(色度 4:2:0 按 2x2 块取样), 生产者侧已强制。
+inline int Mai2VcamFrameBytes(int width, int height) { return (width * height * 3) / 2; }
+
+// 分辨率是否在本实现支持的范围内且满足 NV12 的偶数要求。
+inline bool Mai2VcamSizeValid(int width, int height) {
+    return width >= 16 && height >= 16 && width <= MAI2VCAM_MAX_WIDTH &&
+           height <= MAI2VCAM_MAX_HEIGHT && (width % 2) == 0 && (height % 2) == 0;
+}
 
 // ★固定 10fps(100ns 单位)★ 上下限取同一个值 ⇒ 协商结果恒为 10fps, 不再随下游喜好漂移。
 // 本路画面是"静态 QR 显示若干秒"的准静态源, 30fps 只是把同一帧重复推 3 倍、白烧 CPU 与带宽;
@@ -113,10 +136,14 @@ HRESULT Mai2VcamCopyMediaType(AM_MEDIA_TYPE* destination, const AM_MEDIA_TYPE* s
 void Mai2VcamFreeMediaTypeContents(AM_MEDIA_TYPE* type);
 void Mai2VcamDeleteMediaType(AM_MEDIA_TYPE* type);
 
-// 构造本过滤器唯一支持的媒体类型(NV12 640x480, 指定帧间隔)。
-HRESULT Mai2VcamBuildMediaType(AM_MEDIA_TYPE* type, LONGLONG frameInterval);
+// 构造本过滤器当前支持的媒体类型(NV12, 指定分辨率与帧间隔)。
+HRESULT Mai2VcamBuildMediaType(AM_MEDIA_TYPE* type, LONGLONG frameInterval, int width, int height);
 // 判定给定媒体类型是否可接受(部分指定也允许: 空 major/subtype/format 视为通配)。
-bool Mai2VcamAcceptMediaType(const AM_MEDIA_TYPE* type);
+// 分辨率必须与本针脚当前这一种完全一致 —— 本源只报一种格式, 不做缩放。
+bool Mai2VcamAcceptMediaType(const AM_MEDIA_TYPE* type, int width, int height);
+// 从共享队列头读一次生产者的当前分辨率; 读不到(生产者不在/头非法)则给回落分辨率。
+// 只读一次: DirectShow 的格式在连接时就定死了, 中途变不了(见 vcam_filter.cpp 的说明)。
+void Mai2VcamQueryQueueSize(int* width, int* height);
 // 从媒体类型取帧间隔; 非法值回落默认值。
 LONGLONG Mai2VcamIntervalOf(const AM_MEDIA_TYPE* type);
 

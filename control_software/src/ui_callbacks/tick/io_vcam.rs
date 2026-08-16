@@ -34,8 +34,8 @@
         // 测试覆盖模式的动画游标由这同一个节拍驱动: 画面里会动的东西就是"帧确实在更新"的现场证据。
         vcam_timer.advance_test_frame();
         if let Some(publisher) = publisher_timer.borrow_mut().as_mut() {
-            let rgb = vcam_timer.frame_copy();
-            match publisher.publish(&rgb) {
+            let frame = vcam_timer.frame_copy();
+            match publisher.publish(&frame) {
                 Ok(()) => {
                     if vcam_publish_failed {
                         log::info!("虚拟摄像头: 帧发布已恢复");
@@ -58,13 +58,22 @@
     let vframe_ver = vcam_timer.frame_version();
     if vframe_ver != last_vcam_frame_version {
         last_vcam_frame_version = vframe_ver;
-        let rgb = vcam_timer.frame_copy();
-        log::debug!("虚拟摄像头: 帧内容更新 version={}", vframe_ver);
-        let mut buf =
-            slint::SharedPixelBuffer::<slint::Rgb8Pixel>::new(FRAME_W as u32, FRAME_H as u32);
+        let frame = vcam_timer.frame_copy();
+        log::debug!(
+            "虚拟摄像头: 帧内容更新 version={} 尺寸={}x{}",
+            vframe_ver,
+            frame.width,
+            frame.height
+        );
+        // 预览位图按**帧自带的尺寸**建, 不按"当前设置的分辨率": 两者在改分辨率的那一瞬间可能
+        // 不同, 用帧自己的尺寸才不会错位。
+        let mut buf = slint::SharedPixelBuffer::<slint::Rgb8Pixel>::new(
+            frame.width as u32,
+            frame.height as u32,
+        );
         let dst = buf.make_mut_bytes();
-        if dst.len() == rgb.len() {
-            dst.copy_from_slice(&rgb);
+        if dst.len() == frame.rgb.len() {
+            dst.copy_from_slice(&frame.rgb);
             ui.set_vcam_preview(slint::Image::from_rgb8(buf));
         }
         ui.set_vcam_last_data(vcam_timer.last_data().into());

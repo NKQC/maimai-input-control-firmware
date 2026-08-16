@@ -16,16 +16,18 @@ public:
     Mai2VcamQueueReader() = default;
     ~Mai2VcamQueueReader() { Close(); }
 
-    // 取一帧 NV12 到 destination(容量必须 >= MAI2VCAM_FRAME_BYTES)。
+    // 取一帧 NV12 到 destination(容量必须 >= Mai2VcamFrameBytes(width, height))。
+    // width/height 是本针脚**已协商**的分辨率: 队列头报的分辨率与它不一致时一律给占位帧,
+    // 绝不把另一种尺寸的像素塞进按这个尺寸协商好的缓冲(那是花屏或越界)。
     // 返回 true = 来自生产者的真实帧; false = 已填占位帧。
-    bool Read(BYTE* destination);
+    bool Read(BYTE* destination, int width, int height);
 
     void Close();
 
 private:
     bool _Open();
     unsigned int _Load(unsigned int offset) const;
-    static void _Placeholder(BYTE* destination);
+    static void _Placeholder(BYTE* destination, int width, int height);
 
     HANDLE _map = nullptr;
     const BYTE* _view = nullptr;

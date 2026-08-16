@@ -109,6 +109,9 @@ pub mod keys {
     pub const VCAM_SUBMIT_SECS: &str = "vcam_submit_secs";
     pub const VCAM_DISPLAY_SECS: &str = "vcam_display_secs";
     pub const VCAM_MIRROR_X: &str = "vcam_mirror_x";
+    pub const VCAM_FRAME_W: &str = "vcam_frame_w";
+    pub const VCAM_FRAME_H: &str = "vcam_frame_h";
+    pub const VCAM_QR_FILL_PCT: &str = "vcam_qr_fill_pct";
     pub const DIAG_EXPANDED: &str = "diag_expanded";
     pub const CURVE_PARAMS_EXPANDED: &str = "curve_params_expanded";
     pub const CURVE_ALGO_CFG_EXPANDED: &str = "curve_algo_cfg_expanded";
