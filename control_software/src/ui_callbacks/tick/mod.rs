@@ -234,6 +234,11 @@ pub(super) fn start(ui: &AppWindow, inputs: TickInputs) -> slint::Timer {
     let publisher_timer = vcam_state.frame_publisher.clone();
     let mut last_vcam_frame_version = 0u32;
     let mut last_vcam_runtime_status = String::new();
+    // 上一次向共享队列发布的时刻: 定频 10fps 的节拍源(见 io_vcam.rs)。
+    // None = 还没发过, 首拍立即发, 不让消费端多等一个周期。
+    let mut last_vcam_publish: Option<Instant> = None;
+    // 发布失败是否已记过日志: 10fps 下同一错误每秒会复现十次, 只在状态翻转时记录。
+    let mut vcam_publish_failed = false;
     // ★tick 剖面(每 ~2s 一条 WARN)★: "卡顿"必须用实测归因, 不能靠猜。分别累计整帧、IO 排空、
     // 主图重建、36 卡片重建的耗时与命中次数; 峰值单独记, 因为卡顿是峰值现象而非均值现象。
     let mut prof_ticks = 0u32;

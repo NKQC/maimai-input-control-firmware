@@ -69,6 +69,13 @@ pub struct VcamState {
     display_ms: AtomicU32,
     /// 提交停顿阈值(ms): 键盘输入停顿超过此值自动提交。
     submit_timeout_ms: AtomicU32,
+    /// 测试覆盖模式: 恒定输出带外框的 TEST 图案, 用来把"出画链路通不通"与"扫码数据对不对"
+    /// 拆成两个可独立验证的问题。开着时 QR 仍可临时占用显示期, 到期回落到 TEST 而不是黑屏。
+    test_pattern: AtomicBool,
+    /// 测试图案的动画序号: 每次定频重绘 +1, 驱动一个游标。
+    /// ★静态图案证明不了帧在更新★ 消费端画面卡住与生产者停发在静态图上完全同形,
+    /// 只有会动的元素能把两者区分开 —— 这正是本次要验证的东西。
+    test_seq: AtomicU32,
 }
 
 impl VcamState {
@@ -81,6 +88,8 @@ impl VcamState {
             last_data: Mutex::new(String::new()),
             display_ms: AtomicU32::new(10_000),
             submit_timeout_ms: AtomicU32::new(1500),
+            test_pattern: AtomicBool::new(false),
+            test_seq: AtomicU32::new(0),
         })
     }
 
@@ -106,6 +115,41 @@ impl VcamState {
     }
     pub fn frame_version(&self) -> u32 {
         self.frame_version.load(Ordering::SeqCst)
+    }
+    pub fn test_pattern(&self) -> bool {
+        self.test_pattern.load(Ordering::SeqCst)
+    }
+    /// 开/关测试覆盖模式。开启即立刻出图并清掉 QR 显示期(测试图是"当前该显示什么"的答案,
+    /// 不能让上一次扫码的残余显示期继续压着它)。关闭则回落黑屏, 等下一次扫码。
+    pub fn set_test_pattern(&self, on: bool) {
+        self.test_pattern.store(on, Ordering::SeqCst);
+        *self.show_until.lock().unwrap() = None;
+        if on {
+            self.test_seq.store(0, Ordering::SeqCst);
+            self.publish(render_test_frame(0));
+        } else {
+            self.publish(black_frame());
+        }
+        log::info!(
+            "虚拟摄像头: 测试覆盖模式{}",
+            if on {
+                "已开启 → 恒定输出 TEST 图案"
+            } else {
+                "已关闭 → 回落黑屏"
+            }
+        );
+    }
+    /// 定频重绘测试图案(由发布侧的 10fps 节拍驱动)。仅在测试模式开启且当前没有 QR 占着
+    /// 显示期时动作 —— 扫码结果的可读性优先于测试图。
+    pub fn advance_test_frame(&self) {
+        if !self.test_pattern() || !self.enabled() {
+            return;
+        }
+        if self.show_until.lock().unwrap().is_some() {
+            return;
+        }
+        let seq = self.test_seq.fetch_add(1, Ordering::SeqCst).wrapping_add(1);
+        self.publish(render_test_frame(seq));
     }
     pub fn last_data(&self) -> String {
         self.last_data.lock().unwrap().clone()
@@ -153,8 +197,16 @@ impl VcamState {
             }
         };
         if expired {
-            self.publish(black_frame());
-            log::info!("虚拟摄像头: QR 显示到期 → 黑屏");
+            // 测试模式开着时到期回落到测试图, 而不是黑屏: 否则一开测试模式扫一次码,
+            // 十秒后画面就变黑, 用户会以为链路又断了。
+            if self.test_pattern() {
+                let seq = self.test_seq.load(Ordering::SeqCst);
+                self.publish(render_test_frame(seq));
+                log::info!("虚拟摄像头: QR 显示到期 → 回落测试图案");
+            } else {
+                self.publish(black_frame());
+                log::info!("虚拟摄像头: QR 显示到期 → 黑屏");
+            }
         }
     }
 }
@@ -215,4 +267,135 @@ pub fn render_qr_frame(data: &str) -> anyhow::Result<Rgb24> {
         }
     }
     Ok(frame)
+}
+
+// ── 测试覆盖图案 ────────────────────────────────────────────────────────────────
+//
+// 用途: 把"帧到底有没有出到消费端"从"扫码数据对不对"里剥离出来独立验证。
+// 之所以自己画而不引字体库: 只需要 T/E/S 三个字形, 引一个字体渲染栈(以及它的字体文件依赖)
+// 换来的是同样的四个字母, 却多出一份要随二进制分发的资产与一套失败路径。
+
+/// 5x7 点阵字形, 每行低 5 位有效(bit4 = 最左列)。
+const GLYPH_W: usize = 5;
+const GLYPH_H: usize = 7;
+
+/// "TEST" 四个字形。顺序即绘制顺序。
+const TEST_GLYPHS: [[u8; GLYPH_H]; 4] = [
+    // T
+    [
+        0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100,
+    ],
+    // E
+    [
+        0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b11111,
+    ],
+    // S
+    [
+        0b01111, 0b10000, 0b10000, 0b01110, 0b00001, 0b00001, 0b11110,
+    ],
+    // T
+    [
+        0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100,
+    ],
+];
+
+/// 外框内缩与线宽(像素)。
+const FRAME_INSET: usize = 16;
+const FRAME_THICK: usize = 4;
+/// 字形放大倍数与字间距(以放大后像素计)。
+const GLYPH_SCALE: usize = 12;
+const GLYPH_GAP: usize = GLYPH_SCALE;
+/// 动画游标的边长。
+const CURSOR_SIZE: usize = 18;
+
+/// 在 RGB24 帧上填一个实心矩形(自动按帧边界裁剪, 越界不 panic)。
+#[inline]
+fn fill_rect(frame: &mut Rgb24, x0: usize, y0: usize, w: usize, h: usize, rgb: (u8, u8, u8)) {
+    let x_end = (x0 + w).min(FRAME_W);
+    let y_end = (y0 + h).min(FRAME_H);
+    for y in y0.min(FRAME_H)..y_end {
+        let row = y * FRAME_W;
+        for x in x0.min(FRAME_W)..x_end {
+            let idx = (row + x) * 3;
+            frame[idx] = rgb.0;
+            frame[idx + 1] = rgb.1;
+            frame[idx + 2] = rgb.2;
+        }
+    }
+}
+
+/// 生成测试覆盖帧: 黑底 + 白色外框 + 居中放大的 "TEST" + 沿框内侧走的动画游标。
+///
+/// `seq` 只驱动游标位置。游标是判"帧在更新"的唯一现场证据: 画面静止与生产者停发在静态图上
+/// 完全同形, 有它才分得开。
+pub fn render_test_frame(seq: u32) -> Rgb24 {
+    const WHITE: (u8, u8, u8) = (255, 255, 255);
+    let mut frame = black_frame();
+
+    // 外框: 四条边各画一个实心矩形。
+    let inner_w = FRAME_W - FRAME_INSET * 2;
+    let inner_h = FRAME_H - FRAME_INSET * 2;
+    fill_rect(&mut frame, FRAME_INSET, FRAME_INSET, inner_w, FRAME_THICK, WHITE);
+    fill_rect(
+        &mut frame,
+        FRAME_INSET,
+        FRAME_H - FRAME_INSET - FRAME_THICK,
+        inner_w,
+        FRAME_THICK,
+        WHITE,
+    );
+    fill_rect(&mut frame, FRAME_INSET, FRAME_INSET, FRAME_THICK, inner_h, WHITE);
+    fill_rect(
+        &mut frame,
+        FRAME_W - FRAME_INSET - FRAME_THICK,
+        FRAME_INSET,
+        FRAME_THICK,
+        inner_h,
+        WHITE,
+    );
+
+    // 居中的 "TEST"。
+    let text_w = TEST_GLYPHS.len() * GLYPH_W * GLYPH_SCALE + (TEST_GLYPHS.len() - 1) * GLYPH_GAP;
+    let text_h = GLYPH_H * GLYPH_SCALE;
+    let ox = (FRAME_W - text_w) / 2;
+    let oy = (FRAME_H - text_h) / 2;
+    for (index, glyph) in TEST_GLYPHS.iter().enumerate() {
+        let gx = ox + index * (GLYPH_W * GLYPH_SCALE + GLYPH_GAP);
+        for (row, bits) in glyph.iter().enumerate() {
+            for col in 0..GLYPH_W {
+                // bit4 是最左列。
+                if bits & (1 << (GLYPH_W - 1 - col)) == 0 {
+                    continue;
+                }
+                fill_rect(
+                    &mut frame,
+                    gx + col * GLYPH_SCALE,
+                    oy + row * GLYPH_SCALE,
+                    GLYPH_SCALE,
+                    GLYPH_SCALE,
+                    WHITE,
+                );
+            }
+        }
+    }
+
+    // 动画游标: 沿外框内侧一圈匀速走。周长按四段等分, 每帧走一步。
+    let track_w = inner_w - CURSOR_SIZE;
+    let track_h = inner_h - CURSOR_SIZE;
+    let perimeter = (track_w + track_h) * 2;
+    if perimeter > 0 {
+        let position = (seq as usize) % perimeter;
+        let base = FRAME_INSET + FRAME_THICK;
+        let (cx, cy) = if position < track_w {
+            (base + position, base)
+        } else if position < track_w + track_h {
+            (base + track_w, base + (position - track_w))
+        } else if position < track_w * 2 + track_h {
+            (base + track_w - (position - track_w - track_h), base + track_h)
+        } else {
+            (base, base + track_h - (position - track_w * 2 - track_h))
+        };
+        fill_rect(&mut frame, cx, cy, CURSOR_SIZE, CURSOR_SIZE, WHITE);
+    }
+    frame
 }

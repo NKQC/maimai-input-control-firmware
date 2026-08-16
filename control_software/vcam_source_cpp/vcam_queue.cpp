@@ -47,7 +47,16 @@ bool Mai2VcamQueueReader::_Open() {
         return false;
     }
     _retryCountdown = kRetryFrames;
-    HANDLE map = OpenFileMappingW(FILE_MAP_READ, FALSE, MAI2VCAM_MAP_NAME);
+    // ★Global 优先, Local 兜底★ 本 DLL 可能被载入 Session 0 的 Frame Server(Windows 设置 /
+    // 相机应用的取帧路径), 那里的 `Local\` 与上位机所在交互会话的 `Local\` 是两个不同的对象
+    // 目录 —— 只试 Local 就等于对 Windows 自带的相机预览永久输出黑帧。顺序不能反: 生产者
+    // 提权时两个名字都存在, 而 Global 那份才是跨会话都指向同一块内存的那一份。
+    HANDLE map = OpenFileMappingW(FILE_MAP_READ, FALSE, MAI2VCAM_MAP_NAME_GLOBAL);
+    const wchar_t* opened = MAI2VCAM_MAP_NAME_GLOBAL;
+    if (map == nullptr) {
+        map = OpenFileMappingW(FILE_MAP_READ, FALSE, MAI2VCAM_MAP_NAME_LOCAL);
+        opened = MAI2VCAM_MAP_NAME_LOCAL;
+    }
     if (map == nullptr) {
         return false;
     }
@@ -56,6 +65,7 @@ bool Mai2VcamQueueReader::_Open() {
         CloseHandle(map);
         return false;
     }
+    Mai2VcamLog("queue: 已打开共享映射 %ls", opened);
     // 映射实际大小必须覆盖整个布局: 生产者版本不一致时宁可当作没有生产者。
     MEMORY_BASIC_INFORMATION region = {};
     if (VirtualQuery(view, &region, sizeof(region)) == 0 || region.RegionSize < MAI2VCAM_MAP_BYTES) {

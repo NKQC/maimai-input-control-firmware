@@ -45,19 +45,113 @@ use windows::core::w;
 
 use super::{FRAME_H, FRAME_W};
 
-/// 队列名(与 C++ 侧 `MAI2VCAM_MAP_NAME` 一致)。
-pub const MAP_NAME: &str = r"Local\Mai2ControlVirtualCamVideoV1";
-/// 生产者租约名: 与映射同 `Local\` 会话, 与 publisher 同生命周期。
-/// 队列只允许**一个**活生产者, 这把互斥体就是唯一凭证。
-pub const LEASE_NAME: &str = r"Local\Mai2ControlVirtualCamProducerV1";
+/// 共享对象所在的内核命名空间。
+///
+/// ★这是"Windows 设置里恒黑"的根因所在★
+/// `Local\` 是**会话相对**的: 它在每个登录会话里解析到各自的 `\Sessions\<N>\BaseNamedObjects`。
+/// 而 Windows 设置 / 相机应用的预览并不在本用户会话里开图 —— 它们走 Windows Camera Frame
+/// Server 服务(LOCAL SERVICE, **Session 0**), 由该服务进程载入过滤器 DLL 取帧。于是上位机在
+/// Session 1 建的 `Local\...` 与过滤器在 Session 0 查的 `Local\...` 是两个毫无关系的对象目录,
+/// `OpenFileMapping` 必然失败, 过滤器只能一直输出占位黑帧。
+///
+/// `Global\` 是全局命名空间, 跨会话都指向同一个对象, 是让 Frame Server 能取到帧的**唯一**途径。
+/// 代价是创建它需要 `SeCreateGlobalPrivilege`(管理员/服务持有; UAC 过滤后的普通令牌没有), 所以
+/// 生产者按 Global → Local 顺序退化, 并把实际落到哪一层如实报给界面, 不假装成功。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Namespace {
+    /// 跨会话可见: Windows 设置 / 相机应用(Session 0 的 Frame Server)也能取到帧。需管理员。
+    Global,
+    /// 仅本会话可见: 同会话消费端(OBS / 游戏)可用, Windows 自带相机预览取不到。
+    Local,
+}
+
+impl Namespace {
+    /// 映射名的宽字符串常量。用 `w!()` 编译期字面量而不是运行时拼串: 避免为每次调用分配,
+    /// 也避免忘记结尾 NUL。
+    fn _map(self) -> windows::core::PCWSTR {
+        match self {
+            Self::Global => w!("Global\\Mai2ControlVirtualCamVideoV1"),
+            Self::Local => w!("Local\\Mai2ControlVirtualCamVideoV1"),
+        }
+    }
+
+    /// 生产者租约名(命名互斥体), 与映射同命名空间。
+    fn _lease(self) -> windows::core::PCWSTR {
+        match self {
+            Self::Global => w!("Global\\Mai2ControlVirtualCamProducerV1"),
+            Self::Local => w!("Local\\Mai2ControlVirtualCamProducerV1"),
+        }
+    }
+
+    pub fn map_name(self) -> &'static str {
+        match self {
+            Self::Global => r"Global\Mai2ControlVirtualCamVideoV1",
+            Self::Local => r"Local\Mai2ControlVirtualCamVideoV1",
+        }
+    }
+
+    pub fn lease_name(self) -> &'static str {
+        match self {
+            Self::Global => r"Global\Mai2ControlVirtualCamProducerV1",
+            Self::Local => r"Local\Mai2ControlVirtualCamProducerV1",
+        }
+    }
+
+    /// 界面用的一句话后果说明。只说用户能据此行动的事, 不解释内核命名空间。
+    pub fn consequence(self) -> &'static str {
+        match self {
+            Self::Global => "全局可见（Windows 设置 / 相机应用也能取到画面）",
+            Self::Local => "仅本会话可见（OBS / 游戏可用；Windows 设置的相机预览取不到画面，需以管理员重启本程序）",
+        }
+    }
+
+    /// 所有候选命名空间, 按优先级从高到低。
+    const ORDER: [Self; 2] = [Self::Global, Self::Local];
+}
+
+/// 默认(优先)命名空间下的队列名, 供界面在尚未创建生产者时展示。
+pub const MAP_NAME: &str = r"Global\Mai2ControlVirtualCamVideoV1";
+/// 默认(优先)命名空间下的生产者租约名。队列只允许**一个**活生产者, 这把互斥体就是唯一凭证。
+pub const LEASE_NAME: &str = r"Global\Mai2ControlVirtualCamProducerV1";
+
+/// 一次建队尝试的失败原因。
+///
+/// ★必须把"没权限"与"已被占用"分开★ 前者应当退化到 `Local\` 继续可用; 后者说明**另一个实例
+/// 正在发布**, 此时退化到 `Local\` 会凭空造出第二个生产者往另一块内存写, 消费端随机连到哪一块
+/// 全看运气 —— 那正是租约机制要杜绝的事。故占用一律直接上报, 绝不退化。
+enum _CreateFailure {
+    /// 租约已被他人持有 ⇒ 立即上报, 不退化。
+    LeaseTaken(anyhow::Error),
+    /// 权限/系统原因失败 ⇒ 允许退化到下一个命名空间。
+    Rejected(anyhow::Error),
+}
+
+impl _CreateFailure {
+    fn into_error(self) -> anyhow::Error {
+        match self {
+            Self::LeaseTaken(error) | Self::Rejected(error) => error,
+        }
+    }
+}
 
 const MAGIC: u32 = 0x4D32_5643; // 'M2VC'
 const LAYOUT_VERSION: u32 = 1;
 const HEADER_BYTES: usize = 64;
 const SLOT_COUNT: u32 = 3;
 const FOURCC_NV12: u32 = u32::from_le_bytes(*b"NV12");
-/// 默认 30fps(100ns 单位), 与过滤器协商下限一致。
-const FRAME_INTERVAL_100NS: u32 = 333_333;
+/// ★固定 10fps(100ns 单位)★ 与 C++ 侧 `MAI2VCAM_DEFAULT_INTERVAL`/`MAI2VCAM_MAX_INTERVAL`
+/// 取同一个值 ⇒ 协商结果恒为 10fps。本路画面是"静态 QR 显示若干秒"的准静态源, 更高帧率只是把
+/// 同一帧重复推更多次; 生产者侧也按 100ms 定频发布(见 `PUBLISH_INTERVAL_MS`), 两端一一对应。
+const FRAME_INTERVAL_100NS: u32 = 1_000_000;
+
+/// 生产者定频发布周期(ms), 与 `FRAME_INTERVAL_100NS` 对应的 10fps。
+///
+/// ★为什么必须定频重发, 而不是"帧变了才发"★ 消费端(过滤器)靠 `tick_ms` 心跳判活, 超过
+/// `MAI2VCAM_HEARTBEAT_TIMEOUT_MS` 就转占位帧; 而 QR 一旦显示就是长达十秒的静止画面, 期间
+/// 帧内容根本不变。只在帧变化时发布, 等于把"画面静止"与"生产者死了"压成同一种观测结果,
+/// 只能靠另一路 heartbeat 补救。定频发布让 sequence 与 tick_ms 一起单调推进, 心跳语义由
+/// 发布本身承担, 不再需要第二条易漏的旁路。
+pub const PUBLISH_INTERVAL_MS: u64 = 100;
 
 /// 一帧 NV12 字节数: Y 平面 W*H + 交错 UV 平面 W*H/2。
 pub const NV12_BYTES: usize = FRAME_W * FRAME_H * 3 / 2;
@@ -159,88 +253,91 @@ pub fn black_nv12() -> Vec<u8> {
     frame
 }
 
-/// 帧生产者。句柄刻意只在 UI 线程持有(与 `VcamState` 的 tick 同线程),
-/// 不跨线程传递 Windows HANDLE。
-pub struct FramePublisher {
-    /// 生产者租约(命名互斥体), 与本对象同生死: 它存在即代表"本进程是唯一生产者"。
+/// 一个命名空间下的一份队列(租约 + 映射 + 视图)。
+///
+/// ★为什么要允许"同时存在多份"★ 一块命名映射只能有一个名字, 而消费端分两类:
+/// 已部署的旧过滤器只查 `Local\`, 新过滤器与跨会话的 Frame Server 要 `Global\`。若只建
+/// 优先的那一个, 提权运行就会把同会话的旧消费端(OBS/游戏)一起打黑 —— 修一个洞开另一个洞。
+/// 故两个名字各建一份, 由 `publish` 把同一帧写进各自的槽; NV12 转换只做一次, 多出的成本
+/// 只是一次 460KB memcpy(10fps 下约 4.6MB/s), 换来的是两类消费端同时可用。
+struct _Target {
+    /// 生产者租约(命名互斥体), 与本对象同生死: 它存在即代表"本进程是该命名空间的唯一生产者"。
     _lease: HANDLE,
     _map: HANDLE,
     _view: NonNull<u8>,
+    _namespace: Namespace,
+}
+
+/// 帧生产者。句柄刻意只在 UI 线程持有(与 `VcamState` 的 tick 同线程),
+/// 不跨线程传递 Windows HANDLE。
+pub struct FramePublisher {
+    /// 已建成的队列, 按 `Namespace::ORDER` 的优先级顺序。非空由 `create` 保证。
+    _targets: Vec<_Target>,
     _sequence: u32,
+    /// NV12 暂存: 一帧只转一次, 再分别拷进各目标的槽。
+    /// 复用同一块缓冲而不是每帧新分配 —— 10fps 下每次 460KB 的分配纯属浪费。
+    _staging: Vec<u8>,
 }
 
 impl FramePublisher {
-    /// 取得生产者租约并创建命名映射, 最后置 READY。
+    /// 在所有可用命名空间上取租约并建映射, 最后各自置 READY。
     ///
     /// ★不接管活着的 owner★: 先 `CreateMutexW` 抢租约, 拿到 `ERROR_ALREADY_EXISTS` 就直接报错
     /// 退出。历史实现是"已存在同名映射就重写头接管", 那等于两个实例同时往一块内存写像素,
     /// 消费端拿到的帧必然撕裂, 且先来的实例的 Drop 会把队列置 STOPPING 把后来者一起打死。
     pub fn create() -> Result<Self> {
-        let (mut attributes, descriptor) = Self::_security_attributes()?;
-        // SAFETY: attributes 内的安全描述符在本次调用期间存活; 句柄由本函数负责关闭。
-        let lease = unsafe {
-            CreateMutexW(
-                Some(&mut attributes),
-                true,
-                w!("Local\\Mai2ControlVirtualCamProducerV1"),
-            )
-        };
-        let existed = unsafe { GetLastError() } == ERROR_ALREADY_EXISTS;
-        let lease = match lease {
-            Ok(handle) if !existed => handle,
-            Ok(handle) => {
-                unsafe { _ = CloseHandle(handle) };
-                unsafe { Self::_free_descriptor(descriptor) };
-                return Err(anyhow!(
-                    "另一个 mai2control 实例已在发布虚拟摄像头帧(租约 {} 已被占用); 请先关闭它",
-                    LEASE_NAME
-                ));
+        let mut targets: Vec<_Target> = Vec::new();
+        let mut rejected: Vec<String> = Vec::new();
+        for namespace in Namespace::ORDER {
+            match _Target::_create(namespace) {
+                Ok(target) => targets.push(target),
+                // 租约被占用 ⇒ 另一个实例正在发布。此时**整体**放弃: 继续下去就会出现两个
+                // 生产者各写一块内存, 消费端连到哪一块全看运气。已建成的 target 由 Drop 收回。
+                Err(_CreateFailure::LeaseTaken(error)) => return Err(error),
+                Err(failure @ _CreateFailure::Rejected(_)) => {
+                    let error = failure.into_error();
+                    if namespace == Namespace::Global {
+                        // 未提权拿不到 SeCreateGlobalPrivilege 是最常见的一种, 属预期降级路径。
+                        log::warn!(
+                            "虚拟摄像头: 无法在全局命名空间建队({}); 仅本会话可见, \
+                             Windows 设置的相机预览将取不到画面(以管理员重启本程序可解决)",
+                            error
+                        );
+                    }
+                    rejected.push(error.to_string());
+                }
             }
-            Err(error) => {
-                unsafe { Self::_free_descriptor(descriptor) };
-                return Err(anyhow!("创建生产者租约 {} 失败: {}", LEASE_NAME, error));
-            }
-        };
-        let mapping = unsafe {
-            CreateFileMappingW(
-                HANDLE((-1isize) as *mut _),
-                Some(&mut attributes),
-                PAGE_READWRITE,
-                0,
-                MAP_BYTES as u32,
-                w!("Local\\Mai2ControlVirtualCamVideoV1"),
-            )
-        };
-        unsafe { Self::_free_descriptor(descriptor) };
-        let mapping = match mapping {
-            Ok(mapping) => mapping,
-            Err(error) => {
-                unsafe { Self::_drop_lease(lease) };
-                return Err(error.into());
-            }
-        };
-        let view = unsafe { MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, MAP_BYTES) };
-        let Some(view) = NonNull::new(view.Value.cast::<u8>()) else {
-            let error = windows::core::Error::from_thread();
-            unsafe {
-                _ = CloseHandle(mapping);
-                Self::_drop_lease(lease);
-            }
-            return Err(error.into());
-        };
-        let mut publisher = Self {
-            _lease: lease,
-            _map: mapping,
-            _view: view,
-            _sequence: 0,
-        };
-        publisher._init_header();
+        }
+        if targets.is_empty() {
+            return Err(anyhow!(
+                "没有可用的共享队列命名空间: {}",
+                if rejected.is_empty() {
+                    "未知原因".to_string()
+                } else {
+                    rejected.join("; ")
+                }
+            ));
+        }
+        let reached: Vec<&str> = targets.iter().map(|t| t._namespace.map_name()).collect();
         log::info!(
-            "虚拟摄像头: 共享队列已就绪 {} (NV12 640x480 x3 槽, 生产者租约 {})",
-            MAP_NAME,
-            LEASE_NAME
+            "虚拟摄像头: 共享队列已就绪 (NV12 {}x{} x{} 槽, 10fps) 覆盖 {} · {}",
+            FRAME_W,
+            FRAME_H,
+            SLOT_COUNT,
+            reached.join(" + "),
+            targets[0]._namespace.consequence()
         );
-        Ok(publisher)
+        Ok(Self {
+            _targets: targets,
+            _sequence: 0,
+            _staging: black_nv12(),
+        })
+    }
+
+    /// 可达性最好的命名空间(界面据此说明 Windows 自带相机预览能否取到画面)。
+    /// `_targets` 按优先级顺序建成, 首个即最佳。
+    pub fn namespace(&self) -> Namespace {
+        self._targets[0]._namespace
     }
 
     /// SAFETY: descriptor 必须来自 `_security_attributes` 且尚未释放。
@@ -256,32 +353,43 @@ impl FramePublisher {
         }
     }
 
-    /// 发布一帧 RGB24: 先把像素转成 NV12 写进下一个槽, release 栅栏后才提交 sequence,
+    /// 发布一帧 RGB24: 像素转 NV12 一次, 写进每份队列的下一个槽, release 原子写提交 sequence,
     /// 消费者把 sequence 当作"该槽像素已写完"的提交标志。
     pub fn publish(&mut self, rgb: &[u8]) -> Result<()> {
+        // 转换先做且只做一次: 它是本函数里唯一的重活(逐像素 YUV), 每个目标各转一遍纯属重复。
+        rgb24_to_nv12(rgb, &mut self._staging)?;
         let next = self._sequence.wrapping_add(1);
         let slot = (next % SLOT_COUNT) as usize;
-        // SAFETY: 槽区间在映射内(HEADER_BYTES + slot*NV12_BYTES + NV12_BYTES <= MAP_BYTES),
-        // 且只有本生产者写该槽。
-        let destination = unsafe {
-            std::slice::from_raw_parts_mut(
-                self._view.as_ptr().add(HEADER_BYTES + slot * NV12_BYTES),
-                NV12_BYTES,
-            )
-        };
-        rgb24_to_nv12(rgb, destination)?;
-        // release 原子写 = "该槽像素已写完"的提交点: 它同时是屏障与可见性发布, 不再依赖
-        // 单独的 fence + volatile 写(后者不构成跨进程原子)。
+        let tick = unsafe { GetTickCount() };
+        for target in &self._targets {
+            // SAFETY: 槽区间在映射内(HEADER_BYTES + slot*NV12_BYTES + NV12_BYTES <= MAP_BYTES),
+            // 且只有本生产者写该槽。
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    self._staging.as_ptr(),
+                    target._view.as_ptr().add(HEADER_BYTES + slot * NV12_BYTES),
+                    NV12_BYTES,
+                );
+            }
+            // release 原子写 = "该槽像素已写完"的提交点: 它同时是屏障与可见性发布, 不再依赖
+            // 单独的 fence + volatile 写(后者不构成跨进程原子)。
+            target._store(Field::Sequence, next, Ordering::Release);
+            target._store(Field::TickMs, tick, Ordering::Release);
+        }
         self._sequence = next;
-        self._store(Field::Sequence, next, Ordering::Release);
-        self._store(Field::TickMs, unsafe { GetTickCount() }, Ordering::Release);
         Ok(())
     }
 
     /// 心跳: 不换帧, 只刷新 tick_ms。消费者靠它区分"生产者在但画面没变"与"生产者已消失"
     /// (进程被杀不会有机会把 state 改成 STOPPING)。
+    ///
+    /// ★主链路已不依赖它★ 发布改成定频 10fps 后, tick_ms 由 `publish` 自己带着推进
+    /// (见 `PUBLISH_INTERVAL_MS` 的说明)。保留本入口是给不发帧只判活的场景(自检)。
     pub fn heartbeat(&mut self) {
-        self._store(Field::TickMs, unsafe { GetTickCount() }, Ordering::Release);
+        let tick = unsafe { GetTickCount() };
+        for target in &self._targets {
+            target._store(Field::TickMs, tick, Ordering::Release);
+        }
     }
 
     /// SDDL: Everyone 读/执行 + 低完整性可读(`S:(ML;;NW;;;LW)`)。
@@ -305,6 +413,79 @@ impl FramePublisher {
             },
             descriptor,
         ))
+    }
+}
+
+impl _Target {
+    /// 在指定命名空间里取租约并建映射。失败原因区分"被占用"与"被拒绝", 供上层决定是否降级。
+    fn _create(namespace: Namespace) -> std::result::Result<Self, _CreateFailure> {
+        let (mut attributes, descriptor) =
+            FramePublisher::_security_attributes().map_err(_CreateFailure::Rejected)?;
+        // SAFETY: attributes 内的安全描述符在本次调用期间存活; 句柄由本函数负责关闭。
+        let lease = unsafe { CreateMutexW(Some(&mut attributes), true, namespace._lease()) };
+        let existed = unsafe { GetLastError() } == ERROR_ALREADY_EXISTS;
+        let lease = match lease {
+            Ok(handle) if !existed => handle,
+            Ok(handle) => {
+                unsafe { _ = CloseHandle(handle) };
+                unsafe { FramePublisher::_free_descriptor(descriptor) };
+                return Err(_CreateFailure::LeaseTaken(anyhow!(
+                    "另一个 mai2control 实例已在发布虚拟摄像头帧(租约 {} 已被占用); 请先关闭它",
+                    namespace.lease_name()
+                )));
+            }
+            Err(error) => {
+                unsafe { FramePublisher::_free_descriptor(descriptor) };
+                return Err(_CreateFailure::Rejected(anyhow!(
+                    "创建生产者租约 {} 失败: {}",
+                    namespace.lease_name(),
+                    error
+                )));
+            }
+        };
+        let mapping = unsafe {
+            CreateFileMappingW(
+                HANDLE((-1isize) as *mut _),
+                Some(&mut attributes),
+                PAGE_READWRITE,
+                0,
+                MAP_BYTES as u32,
+                namespace._map(),
+            )
+        };
+        unsafe { FramePublisher::_free_descriptor(descriptor) };
+        let mapping = match mapping {
+            Ok(mapping) => mapping,
+            Err(error) => {
+                unsafe { FramePublisher::_drop_lease(lease) };
+                return Err(_CreateFailure::Rejected(anyhow!(
+                    "创建共享映射 {} 失败: {}",
+                    namespace.map_name(),
+                    error
+                )));
+            }
+        };
+        let view = unsafe { MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, MAP_BYTES) };
+        let Some(view) = NonNull::new(view.Value.cast::<u8>()) else {
+            let error = windows::core::Error::from_thread();
+            unsafe {
+                _ = CloseHandle(mapping);
+                FramePublisher::_drop_lease(lease);
+            }
+            return Err(_CreateFailure::Rejected(anyhow!(
+                "映射 {} 失败: {}",
+                namespace.map_name(),
+                error
+            )));
+        };
+        let mut target = Self {
+            _lease: lease,
+            _map: mapping,
+            _view: view,
+            _namespace: namespace,
+        };
+        target._init_header();
+        Ok(target)
     }
 
     /// 头部初始化顺序: 先 STARTING → 写全部字段与黑帧 → 最后才 READY。
@@ -342,7 +523,7 @@ impl FramePublisher {
     }
 
     /// 静态头字段的普通写(仅 READY 之前使用)。
-    fn _write(&mut self, field: Field, value: u32) {
+    fn _write(&self, field: Field, value: u32) {
         // SAFETY: field 取值受限于头部 64 字节内, view 至少 MAP_BYTES。
         unsafe {
             std::ptr::write_volatile(self._view.as_ptr().cast::<u32>().add(field as usize), value);
@@ -350,12 +531,15 @@ impl FramePublisher {
     }
 
     /// 动态头字段的跨进程原子写。
-    fn _store(&mut self, field: Field, value: u32, order: Ordering) {
+    ///
+    /// 取 `&self` 而非 `&mut self`: 写的是共享内存里的原子单元, 不改本结构体自身的任何字段,
+    /// 这样 `publish` 才能在遍历 `&self._targets` 的同时提交各自的 sequence。
+    fn _store(&self, field: Field, value: u32, order: Ordering) {
         _cell(self._view.as_ptr(), field).store(value, order);
     }
 }
 
-impl Drop for FramePublisher {
+impl Drop for _Target {
     fn drop(&mut self) {
         // 正常退出先原子发布 STOPPING: 消费者立刻转占位帧, 不必等心跳超时。
         // 顺序固定为 STOPPING → 解除映射 → 释放租约: 租约必须最后放, 否则下一个实例可能在
@@ -366,7 +550,7 @@ impl Drop for FramePublisher {
                 Value: self._view.as_ptr().cast(),
             });
             _ = CloseHandle(self._map);
-            Self::_drop_lease(self._lease);
+            FramePublisher::_drop_lease(self._lease);
         }
     }
 }
@@ -402,25 +586,35 @@ pub struct QueueReader {
 }
 
 impl QueueReader {
+    /// 按 Global → Local 顺序打开, 与 C++ 侧 `Mai2VcamQueueReader::_Open` 同一顺序。
+    /// ★顺序必须与过滤器一致★ 否则自检读到的是另一块内存, 其结论对真实出画毫无证明力。
     pub fn open() -> Result<Self> {
-        let map = unsafe {
-            OpenFileMappingW(
-                FILE_MAP_READ.0,
-                false,
-                w!("Local\\Mai2ControlVirtualCamVideoV1"),
-            )
+        let mut last: Option<anyhow::Error> = None;
+        for namespace in Namespace::ORDER {
+            match unsafe { OpenFileMappingW(FILE_MAP_READ.0, false, namespace._map()) } {
+                Ok(map) => {
+                    let view = unsafe { MapViewOfFile(map, FILE_MAP_READ, 0, 0, MAP_BYTES) };
+                    let Some(view) = NonNull::new(view.Value.cast::<u8>()) else {
+                        let error = windows::core::Error::from_thread();
+                        unsafe { _ = CloseHandle(map) };
+                        last = Some(anyhow!("映射 {} 失败: {}", namespace.map_name(), error));
+                        continue;
+                    };
+                    return Ok(Self {
+                        _map: map,
+                        _view: view,
+                    });
+                }
+                Err(error) => {
+                    last = Some(anyhow!(
+                        "打开共享队列 {} 失败: {}",
+                        namespace.map_name(),
+                        error
+                    ));
+                }
+            }
         }
-        .map_err(|error| anyhow!("打开共享队列 {} 失败: {}", MAP_NAME, error))?;
-        let view = unsafe { MapViewOfFile(map, FILE_MAP_READ, 0, 0, MAP_BYTES) };
-        let Some(view) = NonNull::new(view.Value.cast::<u8>()) else {
-            let error = windows::core::Error::from_thread();
-            unsafe { _ = CloseHandle(map) };
-            return Err(anyhow!("映射共享队列失败: {}", error));
-        };
-        Ok(Self {
-            _map: map,
-            _view: view,
-        })
+        Err(last.unwrap_or_else(|| anyhow!("没有可用的共享队列命名空间")))
     }
 
     pub fn header(&self) -> Result<QueueHeader> {

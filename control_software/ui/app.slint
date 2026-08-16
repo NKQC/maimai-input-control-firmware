@@ -498,6 +498,9 @@ export component AppWindow inherits Window {
 
     // 虚拟扫码摄像头(透传给内部 ToolboxPage 实例)
     in property <bool> vcam_enabled: false;
+    // 测试覆盖模式: 恒定输出带外框的 TEST 图案, 把"出画链路通不通"与"扫码数据对不对"分开验证。
+    in property <bool> vcam_test_pattern: false;
+    callback set_vcam_test_pattern(bool);
     in property <int> vcam_submit_secs: 2;
     in property <int> vcam_display_secs: 10;
     in property <string> vcam_last_data: "";
@@ -1036,6 +1039,8 @@ export component AppWindow inherits Window {
                 apply_ports() => { root.apply_ports(); }
 
                 vcam_enabled: root.vcam_enabled;
+                vcam_test_pattern: root.vcam_test_pattern;
+                set_vcam_test_pattern(v) => { root.set_vcam_test_pattern(v); }
                 vcam_submit_secs: root.vcam_submit_secs;
                 vcam_display_secs: root.vcam_display_secs;
                 vcam_last_data: root.vcam_last_data;

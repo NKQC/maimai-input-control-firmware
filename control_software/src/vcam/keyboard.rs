@@ -1591,8 +1591,16 @@ fn submit_on_pause() {
     if cap.buffer.is_empty() {
         return;
     }
-    if cap.last_key.elapsed().as_millis() >= cap.state.submit_timeout_ms() as u128 {
+    let elapsed = cap.last_key.elapsed().as_millis();
+    let threshold = cap.state.submit_timeout_ms() as u128;
+    if elapsed >= threshold {
         let data = std::mem::take(&mut cap.buffer);
+        log::debug!(
+            "虚拟摄像头键盘: 停顿超时提交, 停顿={}ms 阈值={}ms 数据长度={}",
+            elapsed,
+            threshold,
+            data.len()
+        );
         cap.state.submit_data(&data);
     }
 }
@@ -1610,17 +1618,29 @@ fn push_key(vk: u16, shift: Option<bool>) {
     if !cap.state.enabled() {
         return;
     }
+    
+    // 逐击追踪属排查信息, 不该占 info: 一次扫码就是几十上百条, 会把真正的状态迁移刷没。
+    log::debug!(
+        "虚拟摄像头键盘: 收到按键 VK=0x{:02X} shift={:?} 缓冲长度={}",
+        vk,
+        shift,
+        cap.buffer.len()
+    );
     if vk == VK_RETURN.0 {
         // Enter: 立即提交当前缓冲(每串只用一次)。
         if !cap.buffer.is_empty() {
             let data = std::mem::take(&mut cap.buffer);
+            log::debug!("虚拟摄像头键盘: Enter 触发提交, 数据长度={}", data.len());
             cap.state.submit_data(&data);
+        } else {
+            log::debug!("虚拟摄像头键盘: Enter 但缓冲为空, 忽略");
         }
     } else if let Some(ch) = vk_to_char(vk, shift) {
         cap.buffer.push(ch);
         cap.last_key = Instant::now();
         // 防御: 单串过长(异常)截断, 避免无限增长。
         if cap.buffer.len() > 4096 {
+            log::warn!("虚拟摄像头键盘: 单串超过 4096 字符, 按异常截断");
             cap.buffer.clear();
         }
     }

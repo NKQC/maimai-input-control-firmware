@@ -9,9 +9,7 @@
         }
     }
 
-    // 虚拟摄像头: 推进时序状态机(显示到期转黑)。帧变化时把 RGB24 转 NV12 提交到共享
-    // 队列(序号在像素写完之后才提交, 由 FramePublisher 保证), 再刷新 UI 预览。
-    // 每 tick 都刷心跳: 过滤器靠 tick_ms 区分"画面没变"与"生产者已消失(进程被杀)"。
+    // 虚拟摄像头: 推进时序状态机(显示到期 → 黑屏, 或回落测试图案)。
     vcam_timer.tick();
     if ui.get_vcam_enabled() {
         let status = vcam::keyboard::runtime_status();
@@ -20,19 +18,50 @@
             last_vcam_runtime_status = status;
         }
     }
-    if let Some(publisher) = publisher_timer.borrow_mut().as_mut() {
-        publisher.heartbeat();
+
+    // ★定频 10fps 发布, 不再"帧变了才发"★
+    // 过滤器靠头部 tick_ms 判生产者是否还活着(超时即转占位黑帧), 而 QR 一旦显示就是长达十秒的
+    // 静止画面 —— 只在帧变化时发布, 等于把"画面静止"和"生产者已死"压成同一种观测结果, 只能靠
+    // 另一条 heartbeat 旁路补救(漏一次就黑屏)。定频发布让 sequence 与 tick_ms 一起单调推进,
+    // 心跳语义由发布本身承担, 与协商出的 10fps 一一对应, 少一条易漏的路径。
+    let vcam_publish_due = last_vcam_publish
+        .map(|at: Instant| {
+            at.elapsed() >= Duration::from_millis(mai2control_ui::vcam::share::PUBLISH_INTERVAL_MS)
+        })
+        .unwrap_or(true);
+    if vcam_publish_due {
+        last_vcam_publish = Some(Instant::now());
+        // 测试覆盖模式的动画游标由这同一个节拍驱动: 画面里会动的东西就是"帧确实在更新"的现场证据。
+        vcam_timer.advance_test_frame();
+        if let Some(publisher) = publisher_timer.borrow_mut().as_mut() {
+            let rgb = vcam_timer.frame_copy();
+            match publisher.publish(&rgb) {
+                Ok(()) => {
+                    if vcam_publish_failed {
+                        log::info!("虚拟摄像头: 帧发布已恢复");
+                        vcam_publish_failed = false;
+                    }
+                }
+                // 10fps 下同一个错误会每秒复现十次, 只在状态翻转时记一条。
+                Err(error) => {
+                    if !vcam_publish_failed {
+                        log::error!("虚拟摄像头: 帧发布到共享队列失败: {}", error);
+                        vcam_publish_failed = true;
+                    }
+                }
+            }
+        }
     }
+
+    // UI 预览与"最近数据"只在帧内容真的变了才重建: 预览是本地 RGB 显示, 与共享队列无关,
+    // 没必要跟着 10fps 的发布节拍重复上传同一张位图。
     let vframe_ver = vcam_timer.frame_version();
     if vframe_ver != last_vcam_frame_version {
         last_vcam_frame_version = vframe_ver;
         let rgb = vcam_timer.frame_copy();
-        if let Some(publisher) = publisher_timer.borrow_mut().as_mut() {
-            if let Err(error) = publisher.publish(&rgb) {
-                log::error!("虚拟摄像头: 帧发布失败: {}", error);
-            }
-        }
-        let mut buf = slint::SharedPixelBuffer::<slint::Rgb8Pixel>::new(FRAME_W as u32, FRAME_H as u32);
+        log::debug!("虚拟摄像头: 帧内容更新 version={}", vframe_ver);
+        let mut buf =
+            slint::SharedPixelBuffer::<slint::Rgb8Pixel>::new(FRAME_W as u32, FRAME_H as u32);
         let dst = buf.make_mut_bytes();
         if dst.len() == rgb.len() {
             dst.copy_from_slice(&rgb);

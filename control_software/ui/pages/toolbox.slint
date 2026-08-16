@@ -24,6 +24,9 @@ export component ToolboxPage inherits Rectangle {
 
     // 虚拟扫码摄像头
     in property <bool> vcam_enabled: false;
+    // 测试覆盖模式: 恒定输出带外框的 TEST 图案(含走动的游标), 用来独立验证出画链路。
+    in property <bool> vcam_test_pattern: false;
+    callback set_vcam_test_pattern(bool);
     in property <int> vcam_submit_secs: 2;
     in property <int> vcam_display_secs: 10;
     in property <string> vcam_last_data: "";
@@ -210,6 +213,12 @@ export component ToolboxPage inherits Rectangle {
                         HorizontalBox {
                             padding: 0px;
                             spacing: 8px;
+                            CheckBox {
+                                text: "测试图案";
+                                checked: root.vcam_test_pattern;
+                                enabled: root.vcam_enabled;
+                                toggled => { root.set_vcam_test_pattern(self.checked); }
+                            }
                             CheckBox {
                                 text: "启用虚拟扫码摄像头";
                                 checked: root.vcam_enabled;

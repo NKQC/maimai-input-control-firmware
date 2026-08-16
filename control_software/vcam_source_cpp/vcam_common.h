@@ -43,7 +43,17 @@ EXTERN_C const GUID CLSID_Mai2VcamDshow;
 #define MAI2VCAM_PIN_NAME L"Capture"
 
 // ── 共享队列布局(必须与 Rust 侧 src/vcam/share.rs 逐字段一致) ───────────────────
-#define MAI2VCAM_MAP_NAME L"Local\\Mai2ControlVirtualCamVideoV1"
+//
+// ★为什么必须有 Global\ 这一路★
+// Windows 设置 / 相机应用的预览并不在本用户会话里开图: 它们走 Windows Camera Frame Server
+// 服务(以 LOCAL SERVICE 跑在 **Session 0**), 由该服务进程载入本 DLL 取帧。而 `Local\` 是
+// **会话相对**命名空间, 在 Session 0 里解析成 \Sessions\0\BaseNamedObjects, 与上位机所在
+// 交互会话(通常 Session 1)的 \Sessions\1\BaseNamedObjects 是两个不同的对象目录 ——
+// 于是 OpenFileMapping 必然失败, 表现为"设备能列出、别的软件能出画、Windows 设置里恒黑"。
+// 因此消费端按 Global → Local 顺序各试一次: Global 覆盖跨会话(Frame Server), Local 兜住
+// 生产者未提权(拿不到 SeCreateGlobalPrivilege)时的同会话消费端。
+#define MAI2VCAM_MAP_NAME_GLOBAL L"Global\\Mai2ControlVirtualCamVideoV1"
+#define MAI2VCAM_MAP_NAME_LOCAL L"Local\\Mai2ControlVirtualCamVideoV1"
 
 // 'M2VC'
 #define MAI2VCAM_MAGIC 0x4D325643u
@@ -56,9 +66,13 @@ EXTERN_C const GUID CLSID_Mai2VcamDshow;
 #define MAI2VCAM_FRAME_BYTES ((MAI2VCAM_WIDTH * MAI2VCAM_HEIGHT * 3) / 2)
 #define MAI2VCAM_MAP_BYTES (MAI2VCAM_HEADER_BYTES + MAI2VCAM_SLOT_COUNT * MAI2VCAM_FRAME_BYTES)
 
-// 默认 30fps(100ns 单位)与协商下限 5fps。
-#define MAI2VCAM_DEFAULT_INTERVAL 333333LL
-#define MAI2VCAM_MAX_INTERVAL 2000000LL
+// ★固定 10fps(100ns 单位)★ 上下限取同一个值 ⇒ 协商结果恒为 10fps, 不再随下游喜好漂移。
+// 本路画面是"静态 QR 显示若干秒"的准静态源, 30fps 只是把同一帧重复推 3 倍、白烧 CPU 与带宽;
+// 10fps 对扫码识别绰绰有余, 且与生产者侧的 100ms 定频发布一一对应(见 src/vcam/share.rs)。
+// 上下限一致后 Mai2VcamBuildMediaType / AcceptMediaType / IntervalOf 的钳位逻辑自动收敛到该值,
+// 无需在各处另写特例。
+#define MAI2VCAM_DEFAULT_INTERVAL 1000000LL
+#define MAI2VCAM_MAX_INTERVAL 1000000LL
 
 // 生产者心跳超时: 超过则视为生产者停滞, 输出占位帧。
 #define MAI2VCAM_HEARTBEAT_TIMEOUT_MS 1500u

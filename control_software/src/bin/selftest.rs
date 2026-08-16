@@ -1036,6 +1036,34 @@ fn _run_vcam_probe() -> bool {
         Err(error) => failures.push(format!("黑帧转换: {}", error)),
     }
 
+    // 2.5) 测试覆盖图案: 它是"出画链路通不通"的独立判据, 自身必须先被判定为有效画面。
+    // 验三件事 —— 几何不越界(渲染不 panic 且长度正确)、内容足够醒目(亮像素占比落在合理区间,
+    // 既不是全黑也不是全白), 以及**会动**(不同序号必须给出不同像素: 静止图证明不了帧在更新,
+    // 而"证明帧在更新"正是这个模式存在的唯一理由)。
+    {
+        let expected_len = FRAME_W * FRAME_H * 3;
+        let first = mai2control_ui::vcam::render_test_frame(0);
+        let later = mai2control_ui::vcam::render_test_frame(64);
+        if first.len() != expected_len || later.len() != expected_len {
+            failures.push(format!(
+                "测试图案长度 {}/{}(期望 {})",
+                first.len(),
+                later.len(),
+                expected_len
+            ));
+        } else {
+            let bright = first.chunks_exact(3).filter(|p| p[0] > 128).count();
+            let ratio = bright as f32 / (FRAME_W * FRAME_H) as f32 * 100.0;
+            if !(1.0..=60.0).contains(&ratio) {
+                failures.push(format!("测试图案亮像素占比 {:.1}% 不在 1%..60%", ratio));
+            } else if first == later {
+                failures.push("测试图案不随序号变化(游标未动, 无法证明帧在更新)".to_string());
+            } else {
+                println!("[VCAM] 测试图案: 亮像素 {:.1}%, 游标随序号推进", ratio);
+            }
+        }
+    }
+
     // 3) 发布/读取往返: 逐字节核对, 并检查 sequence 单调 +1(顺带覆盖 3 个槽的轮转)。
     let qr = match render_qr_frame("MAI2CONTROL-VCAM-PROBE") {
         Ok(frame) => frame,

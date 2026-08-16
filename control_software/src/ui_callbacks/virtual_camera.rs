@@ -114,6 +114,7 @@ pub(crate) fn register_callbacks(
             ui.set_vcam_runtime_status(
                 "未运行 · 摄像头仍在系统设备列表中，消费端会读到黑帧".into(),
             );
+            log::info!("虚拟摄像头: 已停止, 共享队列生产者已释放");
             return;
         }
         // 启动顺序：注册核验 → 队列 → 键盘采集。每个失败分支都回收已完成阶段。
@@ -135,8 +136,14 @@ pub(crate) fn register_callbacks(
                 return;
             }
         }
-        match FramePublisher::create() {
-            Ok(publisher) => *publisher_cb.borrow_mut() = Some(publisher),
+        // 队列落在哪个命名空间决定了 Windows 设置 / 相机应用能不能取到画面(它们走 Session 0 的
+        // Frame Server, 只有 Global\ 跨得过去), 因此这条结论必须上界面, 不能只躺在日志里。
+        let queue_note = match FramePublisher::create() {
+            Ok(publisher) => {
+                let note = publisher.namespace().consequence().to_string();
+                *publisher_cb.borrow_mut() = Some(publisher);
+                note
+            }
             Err(error) => {
                 log::error!("虚拟摄像头: 无法创建共享队列: {}", error);
                 vcam_cb.set_enabled(false);
@@ -144,12 +151,14 @@ pub(crate) fn register_callbacks(
                 ui.set_vcam_runtime_status(format!("未运行 · {}", error).into());
                 return;
             }
-        }
+        };
         match vcam::keyboard::start(vcam_cb.clone()) {
             Ok(()) => {
                 vcam_cb.set_enabled(true);
                 ui.set_vcam_enabled(true);
-                ui.set_vcam_runtime_status(vcam::keyboard::runtime_status().into());
+                ui.set_vcam_runtime_status(
+                    format!("{} · {}", vcam::keyboard::runtime_status(), queue_note).into(),
+                );
             }
             Err(error) => {
                 log::warn!("虚拟摄像头: 目标设备捕获未启动: {}", error);
@@ -159,6 +168,17 @@ pub(crate) fn register_callbacks(
                 ui.set_vcam_runtime_status(format!("未运行 · 目标设备过滤降级: {}", error).into());
             }
         }
+    });
+    // 测试覆盖模式: 只切 VcamState 的一个标志, 出画由既有的 10fps 发布节拍照常承担 ——
+    // 它验证的正是那条路本身, 所以绝不能给它另开一条发布通道。
+    let vcam_test_cb = state.vcam.clone();
+    let ui_vcam_test = ui_weak.clone();
+    ui.on_set_vcam_test_pattern(move |on| {
+        let Some(ui) = ui_vcam_test.upgrade() else {
+            return;
+        };
+        vcam_test_cb.set_test_pattern(on);
+        ui.set_vcam_test_pattern(on);
     });
     if ui.get_vcam_enabled() {
         ui.invoke_set_vcam_enabled(true);
