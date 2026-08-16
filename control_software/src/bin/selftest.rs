@@ -1036,6 +1036,45 @@ fn _run_vcam_probe() -> bool {
         Err(error) => failures.push(format!("黑帧转换: {}", error)),
     }
 
+    // 2.4) X 镜像必须是真正的逐行对称翻转, 且翻两次回到原样(对合)。
+    // 用 QR 帧而不是纯色/对称图案来验: 只有左右不对称的内容才分得出"翻了"与"没翻"。
+    {
+        let source = match render_qr_frame("MAI2CONTROL-VCAM-MIRROR") {
+            Ok(frame) => frame,
+            Err(error) => {
+                failures.push(format!("镜像用 QR 帧生成: {}", error));
+                Vec::new()
+            }
+        };
+        if !source.is_empty() {
+            let mut mirrored = source.clone();
+            mai2control_ui::vcam::mirror_x_in_place(&mut mirrored);
+            // 逐行核对: 目标第 x 列必须等于源第 (W-1-x) 列, 三个分量都对上。
+            let mut mismatch = 0usize;
+            for y in 0..FRAME_H {
+                let row = y * FRAME_W * 3;
+                for x in 0..FRAME_W {
+                    let dst = row + x * 3;
+                    let src = row + (FRAME_W - 1 - x) * 3;
+                    if mirrored[dst..dst + 3] != source[src..src + 3] {
+                        mismatch += 1;
+                    }
+                }
+            }
+            let mut twice = mirrored.clone();
+            mai2control_ui::vcam::mirror_x_in_place(&mut twice);
+            if mismatch != 0 {
+                failures.push(format!("X 镜像有 {} 个像素不满足左右对称映射", mismatch));
+            } else if twice != source {
+                failures.push("X 镜像翻两次未回到原帧(非对合)".to_string());
+            } else if mirrored == source {
+                failures.push("X 镜像后与原帧完全相同(未生效)".to_string());
+            } else {
+                println!("[VCAM] X 镜像: 逐像素对称映射一致, 翻两次复原");
+            }
+        }
+    }
+
     // 2.5) 测试覆盖图案: 它是"出画链路通不通"的独立判据, 自身必须先被判定为有效画面。
     // 验三件事 —— 几何不越界(渲染不 panic 且长度正确)、内容足够醒目(亮像素占比落在合理区间,
     // 既不是全黑也不是全白), 以及**会动**(不同序号必须给出不同像素: 静止图证明不了帧在更新,

@@ -138,6 +138,7 @@ pub(crate) fn setup_ui_callbacks(
         ui.set_vcam_enabled(cfg.get_bool(k::VCAM_ENABLED, false));
         ui.set_vcam_submit_secs(cfg.get_i32(k::VCAM_SUBMIT_SECS, 2).clamp(1, 10));
         ui.set_vcam_display_secs(cfg.get_i32(k::VCAM_DISPLAY_SECS, 10).clamp(1, 60));
+        ui.set_vcam_mirror_x(cfg.get_bool(k::VCAM_MIRROR_X, false));
         ui.set_diag_expanded(cfg.get_bool(k::DIAG_EXPANDED, false));
         ui.set_curve_params_expanded(cfg.get_bool(k::CURVE_PARAMS_EXPANDED, true));
         ui.set_curve_algo_cfg_expanded(cfg.get_bool(k::CURVE_ALGO_CFG_EXPANDED, false));
@@ -195,6 +196,9 @@ pub(crate) fn setup_ui_callbacks(
         vcam_state
             .vcam
             .set_display_ms((ui.get_vcam_display_secs().max(1) as u32) * 1000);
+        // 镜像同理: 只回填 UI 属性而不落到共享状态, 出画那边会一直用默认朝向, 直到用户
+        // 手动切一次开关才对上 —— 那正是"设置看起来生效了其实没生效"的经典形态。
+        vcam_state.vcam.set_mirror_x(ui.get_vcam_mirror_x());
     }
 
     // 二值算法线的归一化幅度 N(索引 0..3 = report[idx], 4 = 触发判定)。

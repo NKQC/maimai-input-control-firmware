@@ -16,6 +16,7 @@ pub(crate) fn persist_ui_settings(
     cfg.set_bool(k::VCAM_ENABLED, ui.get_vcam_enabled());
     cfg.set_i32(k::VCAM_SUBMIT_SECS, ui.get_vcam_submit_secs());
     cfg.set_i32(k::VCAM_DISPLAY_SECS, ui.get_vcam_display_secs());
+    cfg.set_bool(k::VCAM_MIRROR_X, ui.get_vcam_mirror_x());
     cfg.set_bool(k::DIAG_EXPANDED, ui.get_diag_expanded());
     cfg.set_bool(k::CURVE_PARAMS_EXPANDED, ui.get_curve_params_expanded());
     cfg.set_bool(k::CURVE_ALGO_CFG_EXPANDED, ui.get_curve_algo_cfg_expanded());

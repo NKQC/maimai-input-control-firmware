@@ -501,6 +501,9 @@ export component AppWindow inherits Window {
     // 测试覆盖模式: 恒定输出带外框的 TEST 图案, 把"出画链路通不通"与"扫码数据对不对"分开验证。
     in property <bool> vcam_test_pattern: false;
     callback set_vcam_test_pattern(bool);
+    // X 镜像: 左右翻转输出帧(部分消费端会把摄像头画面当自拍镜像处理)。
+    in property <bool> vcam_mirror_x: false;
+    callback set_vcam_mirror_x(bool);
     in property <int> vcam_submit_secs: 2;
     in property <int> vcam_display_secs: 10;
     in property <string> vcam_last_data: "";
@@ -1041,6 +1044,8 @@ export component AppWindow inherits Window {
                 vcam_enabled: root.vcam_enabled;
                 vcam_test_pattern: root.vcam_test_pattern;
                 set_vcam_test_pattern(v) => { root.set_vcam_test_pattern(v); }
+                vcam_mirror_x: root.vcam_mirror_x;
+                set_vcam_mirror_x(v) => { root.set_vcam_mirror_x(v); }
                 vcam_submit_secs: root.vcam_submit_secs;
                 vcam_display_secs: root.vcam_display_secs;
                 vcam_last_data: root.vcam_last_data;

@@ -338,6 +338,16 @@ pub(crate) fn register_callbacks(
         }
     });
 
+    // X 镜像: 与测试图案同样只切一个标志, 出画由既有的 10fps 节拍照常承担。
+    let vcam_mirror_cb = state.vcam.clone();
+    let ui_vcam_mirror = ui_weak.clone();
+    ui.on_set_vcam_mirror_x(move |on| {
+        let Some(ui) = ui_vcam_mirror.upgrade() else {
+            return;
+        };
+        vcam_mirror_cb.set_mirror_x(on);
+        ui.set_vcam_mirror_x(on);
+    });
     let vcam_cb = state.vcam.clone();
     ui.on_set_vcam_submit_secs(move |s| {
         vcam_cb.set_submit_timeout_ms((s.max(1) as u32) * 1000);

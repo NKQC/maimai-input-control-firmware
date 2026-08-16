@@ -27,6 +27,9 @@ export component ToolboxPage inherits Rectangle {
     // 测试覆盖模式: 恒定输出带外框的 TEST 图案(含走动的游标), 用来独立验证出画链路。
     in property <bool> vcam_test_pattern: false;
     callback set_vcam_test_pattern(bool);
+    // X 镜像: 左右翻转输出帧。预览与出画同源, 勾上后两边一起翻。
+    in property <bool> vcam_mirror_x: false;
+    callback set_vcam_mirror_x(bool);
     in property <int> vcam_submit_secs: 2;
     in property <int> vcam_display_secs: 10;
     in property <string> vcam_last_data: "";
@@ -213,6 +216,11 @@ export component ToolboxPage inherits Rectangle {
                         HorizontalBox {
                             padding: 0px;
                             spacing: 8px;
+                            CheckBox {
+                                text: "X 镜像";
+                                checked: root.vcam_mirror_x;
+                                toggled => { root.set_vcam_mirror_x(self.checked); }
+                            }
                             CheckBox {
                                 text: "测试图案";
                                 checked: root.vcam_test_pattern;

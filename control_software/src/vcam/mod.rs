@@ -72,6 +72,13 @@ pub struct VcamState {
     /// 测试覆盖模式: 恒定输出带外框的 TEST 图案, 用来把"出画链路通不通"与"扫码数据对不对"
     /// 拆成两个可独立验证的问题。开着时 QR 仍可临时占用显示期, 到期回落到 TEST 而不是黑屏。
     test_pattern: AtomicBool,
+    /// X 镜像(左右翻转)输出。
+    ///
+    /// ★为什么是输出侧变换, 而不是在渲染时就画反★ QR 的生成、测试图案的绘制、以及"当前该
+    /// 显示什么"的时序状态机都与朝向无关; 把翻转塞进渲染就得让每个渲染路径各记一遍这件事,
+    /// 多一条路就多一处会忘。存起来的 `frame` 始终是**未翻转**的规范帧, 翻转只在帧离开本状态
+    /// 机时施加(见 `frame_copy`), 于是出画与预览必然一致, 且开关可随时切换而不必重新渲染。
+    mirror_x: AtomicBool,
     /// 测试图案的动画序号: 每次定频重绘 +1, 驱动一个游标。
     /// ★静态图案证明不了帧在更新★ 消费端画面卡住与生产者停发在静态图上完全同形,
     /// 只有会动的元素能把两者区分开 —— 这正是本次要验证的东西。
@@ -89,6 +96,7 @@ impl VcamState {
             display_ms: AtomicU32::new(10_000),
             submit_timeout_ms: AtomicU32::new(1500),
             test_pattern: AtomicBool::new(false),
+            mirror_x: AtomicBool::new(false),
             test_seq: AtomicU32::new(0),
         })
     }
@@ -154,9 +162,32 @@ impl VcamState {
     pub fn last_data(&self) -> String {
         self.last_data.lock().unwrap().clone()
     }
-    /// 拷贝当前帧(供后端/预览)。
+    /// 拷贝当前帧(供后端/预览), 按需施加 X 镜像。
+    ///
+    /// ★镜像只在这一个出口施加★ 出画与预览是本状态机唯一的两个消费者, 都走这里, 因此
+    /// "看到的"与"发出去的"不可能不一致。这里本来就要 clone, 翻转做在克隆体上是原地交换,
+    /// 不额外分配。
     pub fn frame_copy(&self) -> Rgb24 {
-        self.frame.lock().unwrap().clone()
+        let mut frame = self.frame.lock().unwrap().clone();
+        if self.mirror_x() {
+            mirror_x_in_place(&mut frame);
+        }
+        frame
+    }
+    pub fn mirror_x(&self) -> bool {
+        self.mirror_x.load(Ordering::SeqCst)
+    }
+    /// 开/关 X 镜像。只翻一个标志并让帧版本前进一格 —— 版本推进是让 UI 预览立刻重建的依据;
+    /// 出画那边本来就在按 10fps 定频取帧, 下一拍自然带上新朝向, 不需要重新渲染任何内容。
+    pub fn set_mirror_x(&self, on: bool) {
+        if self.mirror_x.swap(on, Ordering::SeqCst) == on {
+            return;
+        }
+        self.frame_version.fetch_add(1, Ordering::SeqCst);
+        log::info!(
+            "虚拟摄像头: X 镜像{}",
+            if on { "已开启" } else { "已关闭" }
+        );
     }
 
     fn publish(&self, f: Rgb24) {
@@ -214,6 +245,24 @@ impl VcamState {
 /// 全黑 RGB24 帧。
 fn black_frame() -> Rgb24 {
     vec![0u8; FRAME_W * FRAME_H * 3]
+}
+
+/// RGB24 帧原地左右翻转(逐行对称交换像素)。
+///
+/// 按 3 字节像素整体交换, 不逐分量搬: 分量顺序在翻转中不变, 拆开只会多两轮下标计算。
+/// 只交换到行中点, 奇数宽度时正中那一列本来就不动。
+pub fn mirror_x_in_place(frame: &mut Rgb24) {
+    debug_assert_eq!(frame.len(), FRAME_W * FRAME_H * 3);
+    for y in 0..FRAME_H {
+        let row = y * FRAME_W * 3;
+        for x in 0..FRAME_W / 2 {
+            let left = row + x * 3;
+            let right = row + (FRAME_W - 1 - x) * 3;
+            for component in 0..3 {
+                frame.swap(left + component, right + component);
+            }
+        }
+    }
 }
 
 /// 用数据生成 QR 帧: 黑底, 中央白色 QR(含静区)方块, 占 min(W,H) 的 75%, 居中。
