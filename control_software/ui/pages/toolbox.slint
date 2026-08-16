@@ -204,43 +204,61 @@ export component ToolboxPage inherits Rectangle {
                     padding: 4px;
                     spacing: 12px;
 
-                    // 左: 设置
-                    // 原 width: 320px 在 720px 宽窗口下无法压缩, 会把右侧预览挤成零宽。改成
-                    // "下限 240 / 上限 360": 窄窗口先让设置栏收窄, 宽窗口到 360 就停, 余量全归预览。
-                    VerticalBox {
-                        min-width: 240px;
-                        max-width: 360px;
-                        padding: 0px;
-                        spacing: 10px;
+                    // 左: 设置栏, 自带滚动。
+                    //
+                    // ★为什么左栏必须是"宽度确定 + 自带滚动", 而不是弹性宽度★
+                    // 本栏几乎全是 wrap: word-wrap 的说明文本, 而换行文本的 min-height 取决于它拿到
+                    // 多宽。以前这里写 min-width: 240 / max-width: 360 —— 布局先按某个宽度算出各段
+                    // 文本的 min-height, 实际分配时若比那个宽度窄, 每段文本就要多折一行, 于是整栏
+                    // 的真实高度大于已分配的高度, 底部的块被顶出卡片(用户看到的"底部超出边界")。
+                    // 两个 vertical-stretch: 1(设备树 + 尾部占位)在滚动视口里还会互相抢那点余量,
+                    // 让症状随窗口尺寸飘忽不定。
+                    // 现在: 宽度由窗口宽**唯一**决定 ⇒ 文本折行确定 ⇒ min-height 确定; 高度不够时
+                    // 由本栏自己滚动, 不再把父布局撑破。
+                    // ★宽度只准依赖 root.width★ 它是本页整体宽度(由外层给出), 与本 ScrollView 内部
+                    // 滚动条无关。绝不能用 visible-width: 那会形成"滚动条 → 可见宽 → 文本高 →
+                    // 视口高 → 滚动条"的求值环(本工程别处已栽过)。
+                    ScrollView {
+                        horizontal-stretch: 0;
+                        width: max(280px, min(430px, root.width * 0.38));
+                        // ★上下限必须是常量★ 一旦写成由 parent.height 推, 子的 min-height 会向上
+                        // 决定父的 min, 父高度又回头喂给子, 布局直接成环。
+                        min-height: 240px;
+                        max-height: 1000px;
 
-                        HorizontalBox {
-                            padding: 0px;
-                            spacing: 8px;
-                            CheckBox {
-                                text: "X 镜像";
-                                checked: root.vcam_mirror_x;
-                                toggled => { root.set_vcam_mirror_x(self.checked); }
-                            }
-                            CheckBox {
-                                text: "测试图案";
-                                checked: root.vcam_test_pattern;
-                                enabled: root.vcam_enabled;
-                                toggled => { root.set_vcam_test_pattern(self.checked); }
-                            }
+                        VerticalLayout {
+                            // 减掉竖向滚动条占位, 免得再横向滚一下。
+                            width: parent.width - 14px;
+                            spacing: 10px;
+
+                            // 开关分两行: 三个勾选框加一句状态挤在一行, 在 300px 上下的栏宽里必然
+                            // 溢出。主开关独占一行, 两个输出选项并排, 状态文案单独一行换行显示。
                             CheckBox {
                                 text: "启用虚拟扫码摄像头";
                                 checked: root.vcam_enabled;
                                 toggled => { root.set_vcam_enabled(self.checked); }
                             }
+                            HorizontalLayout {
+                                spacing: 12px;
+                                CheckBox {
+                                    text: "X 镜像";
+                                    checked: root.vcam_mirror_x;
+                                    toggled => { root.set_vcam_mirror_x(self.checked); }
+                                }
+                                CheckBox {
+                                    text: "测试图案";
+                                    checked: root.vcam_test_pattern;
+                                    enabled: root.vcam_enabled;
+                                    toggled => { root.set_vcam_test_pattern(self.checked); }
+                                }
+                                Rectangle { horizontal-stretch: 1; }
+                            }
                             Text {
                                 text: root.vcam_runtime_status;
                                 color: root.vcam_enabled ? #8fd6ff : #9aa6b2;
                                 font-size: 11px;
-                                vertical-alignment: center;
-                                horizontal-stretch: 1;
                                 wrap: word-wrap;
                             }
-                        }
 
                         Rectangle {
                             background: #1a1e23;
@@ -429,9 +447,11 @@ export component ToolboxPage inherits Rectangle {
                         }
 
                         Rectangle {
-                            // 设备树是本列唯一"越高越有用"的块: 下限 120px + 独占多余高度, 取代固定 168px。
-                            min-height: 120px;
-                            vertical-stretch: 1;
+                            // 设备树自己就能滚(内部是 ListView), 所以这里只需要一个确定高度, 不再
+                            // 用 vertical-stretch 去抢余量 —— 在滚动视口里"抢余量"本就没有意义,
+                            // 反而让整栏高度算不准。高度随窗口高走, 但只依赖 root.height(外层给出的
+                            // 页面高度), 不依赖本栏内容, 因此不会成环。
+                            height: max(150px, min(280px, root.height * 0.3));
                             background: #14181c;
                             border-color: #2b3238;
                             border-width: 1px;
@@ -523,24 +543,27 @@ export component ToolboxPage inherits Rectangle {
                             }
                         }
 
-                        Text {
-                            text: "扫码内容转为 QR 画面；停顿或 Enter 提交。";
-                            color: #7f8c96;
-                            font-size: 11px;
-                            wrap: word-wrap;
+                            Text {
+                                text: "扫码内容转为 QR 画面；停顿或 Enter 提交。QR 规则与游戏侧图样一致（Version 自适应 / 纠错 M / 字母数字模式）。";
+                                color: #7f8c96;
+                                font-size: 11px;
+                                wrap: word-wrap;
+                            }
+                            // 末尾留白: 让上面各块保持自身首选高度, 而不是被平分多余空间压扁。
+                            // 内容超过视口时由本栏的 ScrollView 滚动。
+                            Rectangle { vertical-stretch: 1; }
                         }
-
-                        Rectangle { vertical-stretch: 1; }
                     }
 
-                    // 右: 预览(黑底 QR)
+                    // 右: 预览(黑底 QR)。宽高都跟着窗口走, 余量全归它 —— 预览越大越好扫。
                     Rectangle {
                         horizontal-stretch: 1;
                         // 给下限, 否则窄窗口下左栏吃满宽度会把预览压成一条缝(QR 变得不可扫)。
                         min-width: 180px;
-                        min-height: 180px;
+                        min-height: 200px;
                         background: #000000;
                         border-radius: 4px;
+                        clip: true;
                         Image {
                             source: root.vcam_preview;
                             image-fit: contain;

@@ -265,13 +265,51 @@ pub fn mirror_x_in_place(frame: &mut Rgb24) {
     }
 }
 
+/// QR 纠错级别: **M**。
+///
+/// ★与游戏侧实际在用的图样一一对齐★ 依据是仓库根的 `sample.jpg`: 把它解回模块矩阵后实测为
+/// Version 4(33x33) / 纠错 M / 掩码 0 / 字母数字模式, 而本函数按同一套规则对同一串数据生成的
+/// 矩阵与它逐模块相同(0 个差异)。改动本常量或下面任何一个参数都会让图样与样本分家。
+const QR_EC_LEVEL: qrcodegen::QrCodeEcc = qrcodegen::QrCodeEcc::Medium;
+
+/// 生成 QR 模块矩阵(行优先, true = 深色), 返回 (边长模块数, 矩阵)。不含静区。
+///
+/// 规则全部固定, 与 `sample.jpg` 对齐:
+///   - **模式**: 由 `QrSegment::make_segments` 按内容自选(纯数字→数字、全为字母数字集→字母数字、
+///     其余→字节)。样本内容是大写字母加数字, 因此走字母数字模式 —— 这也是 84 个字符能塞进
+///     Version 4 的前提(字节模式在 v4/M 下只有 62 字节, 根本放不下)。
+///   - **版本**: 在 1..=40 里取放得下的最小值, 不写死。样本那串 84 字符因此落在 Version 4。
+///   - **纠错**: 固定 `QR_EC_LEVEL`, 且**关闭**自动提升。
+///     ★boost 必须关★ 打开后, 只要同一版本还塞得下更高一级纠错, 级别就会被悄悄上调 ——
+///     于是纠错级别变成"随数据长度而变"的隐式行为, 短数据和长数据生成规则不一致, 无法与
+///     样本这种固定级别的图样长期对齐。
+///   - **掩码**: 交给按 ISO/IEC 18004 罚分规则的自动选择(样本那串数据的结果是掩码 0)。
+///     不写死掩码: 罚分规则本身就是标准的一部分, 固定成某个数字反而会在别的数据上偏离标准。
+pub fn qr_matrix(data: &str) -> anyhow::Result<(usize, Vec<bool>)> {
+    use qrcodegen::{QrCode, QrSegment, Version};
+    let segments = QrSegment::make_segments(data);
+    let code = QrCode::encode_segments_advanced(
+        &segments,
+        QR_EC_LEVEL,
+        Version::new(1),
+        Version::new(40),
+        None,
+        false,
+    )
+    .map_err(|error| anyhow::anyhow!("QR 生成失败: {}", error))?;
+    let size = code.size() as usize;
+    let mut matrix = Vec::with_capacity(size * size);
+    for y in 0..size {
+        for x in 0..size {
+            matrix.push(code.get_module(x as i32, y as i32));
+        }
+    }
+    Ok((size, matrix))
+}
+
 /// 用数据生成 QR 帧: 黑底, 中央白色 QR(含静区)方块, 占 min(W,H) 的 75%, 居中。
 pub fn render_qr_frame(data: &str) -> anyhow::Result<Rgb24> {
-    use qrcode::{EcLevel, QrCode};
-    let code = QrCode::with_error_correction_level(data.as_bytes(), EcLevel::M)
-        .map_err(|e| anyhow::anyhow!("QR 生成失败: {:?}", e))?;
-    let modules = code.width(); // QR 模块边长(不含静区)
-    let colors = code.to_colors(); // 行优先, Dark/Light
+    let (modules, matrix) = qr_matrix(data)?;
 
     let mut frame = black_frame();
 
@@ -295,7 +333,7 @@ pub fn render_qr_frame(data: &str) -> anyhow::Result<Rgb24> {
             } else {
                 let cmx = mx - quiet;
                 let cmy = my - quiet;
-                matches!(colors[cmy * modules + cmx], qrcode::Color::Dark)
+                matrix[cmy * modules + cmx]
             };
             let (r, g, b) = if dark {
                 (0u8, 0u8, 0u8)

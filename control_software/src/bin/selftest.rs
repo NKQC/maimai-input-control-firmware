@@ -1036,6 +1036,45 @@ fn _run_vcam_probe() -> bool {
         Err(error) => failures.push(format!("黑帧转换: {}", error)),
     }
 
+    // 2.3) QR 生成规则必须与游戏侧实际在用的图样(仓库根 sample.jpg)一一对齐。
+    //
+    // 判据来自把 sample.jpg 解回模块矩阵的实测: Version 4(33x33) / 纠错 M / 掩码 0 /
+    // 字母数字模式。这里用样本里那串原文再生成一遍, 核对边长与整张矩阵的 FNV-1a 校验值 ——
+    // 校验值是从"与样本逐模块相同(0 个差异)"的那份矩阵上算出来的, 因此它同时锁住了模式选择、
+    // 版本挑选、纠错级别与掩码这四件事; 任何一处漂移都会让本项立刻失败。
+    {
+        const SAMPLE_DATA: &str =
+            "SGWCMAID260817033841D664FF353C56D87225240F0DFCDE1F415D2BF66CF91CDD766881215EB17A5B65";
+        const SAMPLE_MODULES: usize = 33;
+        const SAMPLE_FNV1A64: u64 = 0x6F6E_0981_8214_633D;
+        match mai2control_ui::vcam::qr_matrix(SAMPLE_DATA) {
+            Ok((size, matrix)) => {
+                let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+                for dark in &matrix {
+                    hash ^= u64::from(*dark);
+                    hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+                }
+                if size != SAMPLE_MODULES {
+                    failures.push(format!(
+                        "QR 边长 {} 模块(样本 {}; 版本对不上 ⇒ 模式或纠错级别已偏离)",
+                        size, SAMPLE_MODULES
+                    ));
+                } else if hash != SAMPLE_FNV1A64 {
+                    failures.push(format!(
+                        "QR 模块矩阵校验 0x{:016X} 与样本 0x{:016X} 不符(掩码/纠错/模式已偏离)",
+                        hash, SAMPLE_FNV1A64
+                    ));
+                } else {
+                    println!(
+                        "[VCAM] QR 规则对齐 sample.jpg: {}x{} 模块(Version 4), 纠错 M, 掩码 0, 字母数字模式, 矩阵逐格一致",
+                        size, size
+                    );
+                }
+            }
+            Err(error) => failures.push(format!("QR 矩阵生成: {}", error)),
+        }
+    }
+
     // 2.4) X 镜像必须是真正的逐行对称翻转, 且翻两次回到原样(对合)。
     // 用 QR 帧而不是纯色/对称图案来验: 只有左右不对称的内容才分得出"翻了"与"没翻"。
     {

@@ -27,7 +27,14 @@ serialport = "4.9.0"
 slint = "1.17.1"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 # 虚拟摄像头扫码输出: QR 码生成(纯 Rust, 无 C 依赖)。
-qrcode = { version = "0.14", default-features = false }
+#
+# ★为什么是 qrcodegen 而不是 qrcode★ 本路输出必须与游戏侧实际在用的 QR(见仓库根 sample.jpg)
+# 逐模块一致, 否则同一串数据生成出的图样不同, 识别行为就无从对齐。实测(把 sample.jpg 解回模块
+# 矩阵逐格比对): 两者的模式选择、版本、纠错级别都能对上, 但 `qrcode` 0.14 的掩码评分挑出的
+# 掩码与样本不同 —— 整个数据区因此全不一样, 且该 crate 没有指定掩码的公开入口。
+# qrcodegen 是 Nayuki 参考实现的官方 Rust 移植, 其按 ISO/IEC 18004 罚分规则自选的掩码与样本
+# 完全一致(实测 diff=0 个模块), 并且允许显式固定掩码与关闭"纠错级别自动提升"。
+qrcodegen = "1.8"
 windows-core = "=0.62.2"
 windows = { version = "0.62.2", default-features = false, features = [
     "Win32_Foundation",
