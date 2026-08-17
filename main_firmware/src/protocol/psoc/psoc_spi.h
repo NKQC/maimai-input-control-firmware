@@ -73,12 +73,31 @@ public:
     bool set_mode(uint8_t mode);                                   // 0=自动校准/标准完整处理，1=半自动手动
 
     // ---- JIT 算法 blob 下发（分页事务；仅启动/更新用，非延迟关键）----
-    bool algo_begin(uint16_t len);                                 // 复位暂存 + 记录期望 len(<=1024)
-    bool algo_page(uint8_t page, const uint8_t four[4]);           // 写第 page 页(4 字节)
+    bool algo_begin(uint16_t len);                                 // 复位暂存 + 记录期望 len(<=PSOC_ALGO_MAX_LEN)
+    // ★page 必须是 u16★ 4KB 槽 = 1024 页, 早已越过 255。PSoC(ABI v2)侧改用内部字节游标定址,
+    // 帧里的 page 字节退化为"(游标/4) 的低 8 位"顺序校验 ⇒ 这里只发低 8 位、也只校验低 8 位,
+    // 但**必须严格顺序发页**。旧代码把 page 截成 u8 传进来, page≥256 时回绕后校验反而"通过",
+    // 于是上传报成功、PSoC 实际写歪 ⇒ 表现为"上传成功但仍跑旧算法"(本次的根因)。
+    bool algo_page(uint16_t page, const uint8_t four[4]);           // 写第 page 页(4 字节)
     bool algo_end(uint16_t crc16, bool* out_ok, uint16_t* out_len);// 触发 commit；回读 ok/len 回显
-    bool algo_info(bool* out_valid, uint16_t* out_len);            // 读 PSoC 端算法 valid/len
+    // out_uploading = PSoC 仍处于 upload_active(ABI v2 把 INFO 响应 b3 从恒 0 改成了这个标志)。
+    bool algo_info(bool* out_valid, uint16_t* out_len, bool* out_uploading = nullptr);
+    // 槽内**实际内容**的 CRC16(PSoC 在 commit 时算出)。这是判"新算法真装上了"的唯一硬证据:
+    // valid+len 无法区分"旧算法还在、长度恰好相同"。
+    bool algo_get_crc(bool* out_valid, uint16_t* out_crc);
+    // 算法共享堆(ABI v2): 容量与历史峰值占用。仅上报, RP 侧不参与分配。
+    bool algo_get_heap(uint16_t* out_size, uint16_t* out_used);
+    // PSoC 编译期自报的可执行槽/共享堆容量，供 RP 与上位机发现三层常量漂移。
+    bool algo_get_caps(uint16_t* out_slot, uint16_t* out_heap);
+    // ★一次下发的硬上限★ 4KB = 1024 页 × 1 笔 SPI 事务, 正常 1~2s 完成; commit 的 CRC 校验也只
+    // 是 PSoC 主循环一两拍。定成 20s 是给最坏抖动留一个数量级余量。
+    // ★绝不能再回到 120s★: 这段时间里 _algo_dl.busy 一直为真, 上传通道整个被锁住 —— 用户在
+    // PSoC 已被坏算法搞死的情况下想传一份修好的进来, 只会连吃两分钟 DEVICE_BUSY。
+    // 门禁必须有界且短, 这是"任何门禁都不许把上传通道永久锁死"的一部分。
+    static constexpr uint32_t ALGO_UPLOAD_TIMEOUT_MS = 20000u;
+
     // 异步完整下发：begin_upload_algo() 只受理并锁定 blob，poll_upload_algo() 每次最多执行一笔
-    // SPI 事务，直至 PSoC commit 真正回读 valid+len。调用方必须在完成前保持 data 不变。
+    // SPI 事务，直至 PSoC commit 真正回读 valid+len+内容 CRC。调用方必须在完成前保持 data 不变。
     bool begin_upload_algo(const uint8_t* data, uint16_t len, uint16_t crc16);
     bool poll_upload_algo(bool* out_complete, bool* out_ok, bool* out_valid, uint16_t* out_len);
     bool upload_algo(const uint8_t* data, uint16_t len, uint16_t crc16);
@@ -88,6 +107,9 @@ public:
     bool algo_get_trace(uint8_t ch, uint8_t idx, uint8_t* out_active, uint16_t* out_report);
     bool algo_set_cfg(uint8_t idx, uint8_t val);                   // 设共享 cfg[idx](回显校验)
     bool algo_get_cfg(uint8_t idx, uint8_t* out_val);
+    // 逐通道可设置变量 cfg_ch[ch][idx](ABI v2)。回显校验同 cfg: 响应 b2=ch b3=idx。
+    bool algo_set_cfg_ch(uint8_t ch, uint8_t idx, uint8_t val);
+    bool algo_get_cfg_ch(uint8_t ch, uint8_t idx, uint8_t* out_val);
     bool set_global(uint8_t gparam_id, uint32_t value);            // 写全局 CSD 配置(仅影子, 不重初始化)
     bool get_global(uint8_t gparam_id, uint32_t* out_value);       // 读全局 CSD 配置
     bool global_commit();                                          // 全局项设完后触发一次完整重初始化

@@ -22,8 +22,8 @@
 //! (windows crate 0.62 不提供任何用户态 `Interlocked*` 绑定, x64 kernel32 也不导出它们 ——
 //!  它们在 SDK 里是编译器内建, 无法从 Rust 直接调用。)
 //!
-//! 命名空间固定 `Local\`(会话内): 消费端与上位机同会话, 不依赖 SeCreateGlobalPrivilege,
-//! 因此**发布帧本身不需要管理员**; 需要管理员的只有过滤器 DLL 的注册(见 `backend`)。
+//! 命名空间按 `Global\` → `Local\` 顺序各建一份(见 `Namespace`): 同会话消费端两者都能用,
+//! 跨会话/以服务运行的消费端只有 `Global\` 那份可用, 而建 `Global\` 需要管理员。
 
 use std::mem::size_of;
 use std::ptr::NonNull;
@@ -43,22 +43,23 @@ use windows::Win32::System::SystemInformation::GetTickCount;
 use windows::Win32::System::Threading::{CreateMutexW, GetCurrentProcessId, ReleaseMutex};
 use windows::core::w;
 
-use super::{
-    DEFAULT_FRAME_H, DEFAULT_FRAME_W, Frame, MAX_FRAME_H, MAX_FRAME_W, clamp_resolution,
-};
+use super::{Frame, MAX_FRAME_H, MAX_FRAME_W, clamp_resolution};
 
 /// 共享对象所在的内核命名空间。
 ///
-/// ★这是"Windows 设置里恒黑"的根因所在★
 /// `Local\` 是**会话相对**的: 它在每个登录会话里解析到各自的 `\Sessions\<N>\BaseNamedObjects`。
-/// 而 Windows 设置 / 相机应用的预览并不在本用户会话里开图 —— 它们走 Windows Camera Frame
-/// Server 服务(LOCAL SERVICE, **Session 0**), 由该服务进程载入过滤器 DLL 取帧。于是上位机在
-/// Session 1 建的 `Local\...` 与过滤器在 Session 0 查的 `Local\...` 是两个毫无关系的对象目录,
-/// `OpenFileMapping` 必然失败, 过滤器只能一直输出占位黑帧。
+/// 只要消费端进程不在上位机所在的登录会话里(以服务运行、或跑在 Session 0), 它查的
+/// `Local\...` 与我们建的就是两个毫无关系的对象目录, `OpenFileMapping` 必然失败。
 ///
-/// `Global\` 是全局命名空间, 跨会话都指向同一个对象, 是让 Frame Server 能取到帧的**唯一**途径。
-/// 代价是创建它需要 `SeCreateGlobalPrivilege`(管理员/服务持有; UAC 过滤后的普通令牌没有), 所以
-/// 生产者按 Global → Local 顺序退化, 并把实际落到哪一层如实报给界面, 不假装成功。
+/// `Global\` 跨会话都指向同一个对象, 是这类消费端唯一取得到帧的途径。代价是创建它需要
+/// `SeCreateGlobalPrivilege`(管理员/服务持有; UAC 过滤后的普通令牌没有), 所以生产者按
+/// Global → Local 顺序退化, 并把实际落到哪一层如实报给界面, 不假装成功。
+///
+/// ★不要再把这件事和"Windows 设置里恒黑"挂钩★ 那条路根本不经过命名空间:
+/// Media Foundation 不枚举 DirectShow 采集过滤器(`selftest --vcam-mf-list` 已实测),
+/// 所以 Windows 设置 / 相机应用 / Teams 这类 MF 消费端从来就看不到本摄像头, 提权与否无关。
+/// 用户此前在设置里看到的那一条是旧 Media Foundation 实现残留的幽灵相机(见
+/// `backend::LEGACY_MF_CLSID`)。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Namespace {
     /// 跨会话可见: Windows 设置 / 相机应用(Session 0 的 Frame Server)也能取到帧。需管理员。
@@ -100,10 +101,15 @@ impl Namespace {
     }
 
     /// 界面用的一句话后果说明。只说用户能据此行动的事, 不解释内核命名空间。
+    ///
+    /// ★这里不再提"Windows 设置 / 相机应用"★ 实测(`selftest --vcam-mf-list`)确认: Media
+    /// Foundation 根本不枚举 DirectShow 采集过滤器, 所以 Windows 设置、相机应用、Teams 这类
+    /// MF 消费端**无论命名空间给到哪一层都看不到本摄像头**, 与提权无关。旧文案把这件事挂在
+    /// 提权上, 把用户引到了完全错误的排查方向。
     pub fn consequence(self) -> &'static str {
         match self {
-            Self::Global => "全局可见（Windows 设置 / 相机应用也能取到画面）",
-            Self::Local => "仅本会话可见（OBS / 游戏可用；Windows 设置的相机预览取不到画面，需以管理员重启本程序）",
+            Self::Global => "全局可见（跨会话、以服务运行的 DirectShow 消费端也能取到画面）",
+            Self::Local => "仅本会话可见（同会话的 OBS / 游戏可用；跨会话或以服务运行的消费端取不到画面，需以管理员重启本程序）",
         }
     }
 
@@ -137,7 +143,13 @@ impl _CreateFailure {
 }
 
 const MAGIC: u32 = 0x4D32_5643; // 'M2VC'
-const LAYOUT_VERSION: u32 = 1;
+/// ★布局版本 2★ 与 1 相比有两处**不兼容**改动, 因此必须换号(与 C++ 侧
+/// `MAI2VCAM_LAYOUT_VERSION` 同步):
+///   · `slot_bytes` 的含义从"当前帧字节数"变成"槽间距(上限帧长, 恒定)";
+///   · 映射总大小随之按上限分辨率计算, 从约 1.4MB 变成约 8.9MB。
+/// 不换号的后果是: 装着旧 DLL 的消费端会在头部校验里静默失败(它拿 `slot_bytes` 与自己编译期的
+/// 帧长比), 只表现为"一直黑屏", 没有任何线索指向"DLL 该更新了"。
+const LAYOUT_VERSION: u32 = 2;
 const HEADER_BYTES: usize = 64;
 const SLOT_COUNT: u32 = 3;
 const FOURCC_NV12: u32 = u32::from_le_bytes(*b"NV12");
@@ -269,6 +281,64 @@ pub fn black_nv12(width: usize, height: usize) -> Vec<u8> {
     frame
 }
 
+/// 当前进程用户的 SID 字符串。拿不到就返回 None(此时安全描述符退化到不含用户 ACE 的那份)。
+fn _current_user_sid() -> Option<String> {
+    use windows::Win32::Foundation::HANDLE as WinHandle;
+    use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
+    use windows::Win32::Security::{GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser};
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    let mut token = WinHandle::default();
+    // SAFETY: GetCurrentProcess 返回伪句柄无需关闭; token 是出参。
+    unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) }.ok()?;
+    // TOKEN_USER 后面紧跟着可变长的 SID, 所以要按运行期长度取一块缓冲, 不能只给结构体大小。
+    let mut needed = 0u32;
+    let _ = unsafe { GetTokenInformation(token, TokenUser, None, 0, &mut needed) };
+    let mut buffer = vec![0u8; needed as usize];
+    let queried = unsafe {
+        GetTokenInformation(
+            token,
+            TokenUser,
+            Some(buffer.as_mut_ptr().cast()),
+            needed,
+            &mut needed,
+        )
+    };
+    let text = queried.ok().and_then(|()| {
+        let user = unsafe { &*(buffer.as_ptr() as *const TOKEN_USER) };
+        let mut raw = windows::core::PWSTR::null();
+        unsafe { ConvertSidToStringSidW(user.User.Sid, &mut raw) }.ok()?;
+        let text = unsafe { raw.to_string() }.ok();
+        unsafe { _ = windows::Win32::Foundation::LocalFree(Some(HLOCAL(raw.as_ptr() as *mut _))) };
+        text
+    });
+    unsafe { _ = CloseHandle(token) };
+    text
+}
+
+/// 共享对象(映射与租约)的安全描述符 SDDL, 进程内只算一次。
+///
+/// ★必须显式给"本进程用户"完全控制★ 一块命名映射只要还有任何进程持着句柄就不会消失, 而消费端
+/// 里的过滤器正是这样的持有者。于是"停用再启用摄像头"时 `CreateFileMappingW` 走的是**按名字
+/// 打开已存在对象**这条路 —— 那要过一次访问检查。只给 Everyone 读、只给 Administrators 写的
+/// 描述符会让**未提权**的上位机在这里拿到 ERROR_ACCESS_DENIED, 表现就是"第一次能开, 关掉再开
+/// 就说拒绝访问", 而代码里那段"接管孤儿映射"的逻辑根本走不到。写权限只给当前用户自己, 不放给
+/// Users/Authenticated Users: 别的本地账户没有理由能往这条摄像头里塞像素。
+fn _sddl() -> &'static [u16] {
+    static SDDL: std::sync::OnceLock<Vec<u16>> = std::sync::OnceLock::new();
+    SDDL.get_or_init(|| {
+        let owner = _current_user_sid()
+            .map(|sid| format!("(A;;GA;;;{})", sid))
+            .unwrap_or_default();
+        format!(
+            "D:{owner}(A;;GRGX;;;WD)(A;;GRGX;;;AC)(A;;GRGX;;;S-1-15-2-2)(A;;GA;;;BA)(A;;GA;;;SY)S:(ML;;NW;;;LW)"
+        )
+        .encode_utf16()
+        .chain(Some(0))
+        .collect()
+    })
+}
+
 /// 一个命名空间下的一份队列(租约 + 映射 + 视图)。
 ///
 /// ★为什么要允许"同时存在多份"★ 一块命名映射只能有一个名字, 而消费端分两类:
@@ -298,14 +368,23 @@ pub struct FramePublisher {
 impl FramePublisher {
     /// 在所有可用命名空间上取租约并建映射, 最后各自置 READY。
     ///
+    /// `width`/`height` 是**建队那一刻**的输出分辨率, 会直接写进队列头与初始黑帧。
+    ///
+    /// ★为什么建队就必须带上真实分辨率, 不能等第一次 publish 补★ 消费端里的过滤器是按队列头
+    /// 报格式的(见 `vcam_source_cpp` 的 `_RefreshSize`), 而它可能在建队后的任意时刻探测 ——
+    /// 包括第一次 publish 之前那不到 100ms 的窗口。头里若先写一个固定的 640x480, 那个窗口里
+    /// 打开摄像头的消费端就会协商到 640x480, 之后与真实尺寸永久错开(不缩放 ⇒ 黑帧)。
+    /// 初始黑帧同理: 映射页初值全 0, 按小尺寸铺黑会把大尺寸下多出来的部分留成 UV=0(绿屏)。
+    ///
     /// ★不接管活着的 owner★: 先 `CreateMutexW` 抢租约, 拿到 `ERROR_ALREADY_EXISTS` 就直接报错
     /// 退出。历史实现是"已存在同名映射就重写头接管", 那等于两个实例同时往一块内存写像素,
     /// 消费端拿到的帧必然撕裂, 且先来的实例的 Drop 会把队列置 STOPPING 把后来者一起打死。
-    pub fn create() -> Result<Self> {
+    pub fn create(width: usize, height: usize) -> Result<Self> {
+        let (width, height) = clamp_resolution(width as u32, height as u32);
         let mut targets: Vec<_Target> = Vec::new();
         let mut rejected: Vec<String> = Vec::new();
         for namespace in Namespace::ORDER {
-            match _Target::_create(namespace) {
+            match _Target::_create(namespace, width, height) {
                 Ok(target) => targets.push(target),
                 // 租约被占用 ⇒ 另一个实例正在发布。此时**整体**放弃: 继续下去就会出现两个
                 // 生产者各写一块内存, 消费端连到哪一块全看运气。已建成的 target 由 Drop 收回。
@@ -336,8 +415,10 @@ impl FramePublisher {
         }
         let reached: Vec<&str> = targets.iter().map(|t| t._namespace.map_name()).collect();
         log::info!(
-            // 分辨率是运行期量, 这里只报槽布局(按上限预留)与节拍; 实际尺寸由每帧写入头部。
-            "虚拟摄像头: 共享队列已就绪 (NV12, 槽 {}x{} 上限 {}x{}, 10fps) 覆盖 {} · {}",
+            // 槽布局按上限预留, 与当前分辨率无关; 头里的尺寸就是消费端会协商到的那个(硬透传)。
+            "虚拟摄像头: 共享队列已就绪 (NV12 {}x{}, 槽 {}x{} 上限 {}x{}, 10fps) 覆盖 {} · {}",
+            width,
+            height,
             SLOT_COUNT,
             SLOT_STRIDE,
             MAX_FRAME_W,
@@ -348,8 +429,8 @@ impl FramePublisher {
         Ok(Self {
             _targets: targets,
             _sequence: 0,
-            // 暂存起步按默认分辨率; publish 遇到更大的尺寸会一次性扩容后复用。
-            _staging: black_nv12(DEFAULT_FRAME_W, DEFAULT_FRAME_H),
+            // 暂存按建队尺寸起步; publish 遇到更大的尺寸会一次性扩容后复用。
+            _staging: black_nv12(width, height),
         })
     }
 
@@ -431,14 +512,25 @@ impl FramePublisher {
         }
     }
 
-    /// SDDL: Everyone 读/执行 + 低完整性可读(`S:(ML;;NW;;;LW)`)。
-    /// 消费端可能是低/中完整性进程, 而上位机可能以管理员(高完整性)运行 —— 不降标签的话
-    /// 强制完整性控制会直接拦掉低完整性进程的读取, 表现为"摄像头一片黑"。
+    /// SDDL: Everyone + **应用容器** 读/执行 + 低完整性可读(`S:(ML;;NW;;;LW)`)。
+    ///
+    /// 三个 ACE 各自不可少:
+    /// - `WD`(Everyone): 普通桌面消费端(OBS / 游戏)与服务(帧服务器以 LOCAL SERVICE 运行)。
+    /// - `AC`(ALL APPLICATION PACKAGES) 与 `S-1-15-2-2`(所有受限制的应用程序包):
+    ///   ★这两个是"Windows 设置 / 相机应用里恒黑"的直接原因★ UWP / AppContainer 进程的访问
+    ///   检查比普通进程多一道: 除了用户与组 SID, 安全描述符里还必须有一条 ACE 授权给该应用包
+    ///   SID、某个能力 SID, 或这两个"所有应用程序包"通配 SID。只给 `Everyone` 时 AppContainer
+    ///   一律 ERROR_ACCESS_DENIED —— 这也是为什么 `C:\Program Files` 默认就带着这两条 ACE,
+    ///   而 `C:\ProgramData` 不带。Windows 的相机取帧管道跑在(受限)应用容器里, 少了它们就
+    ///   连共享段都打不开, 表现正是"设备列得出来、画面恒黑、过滤器日志里一条记录都没有"。
+    /// - `S:(ML;;NW;;;LW)`: 上位机可能以管理员(高完整性)运行, 不把强制完整性标签降到低,
+    ///   低完整性的消费端连读都过不去。
     fn _security_attributes() -> Result<(SECURITY_ATTRIBUTES, PSECURITY_DESCRIPTOR)> {
+        let sddl = _sddl();
         let mut descriptor = PSECURITY_DESCRIPTOR::default();
         unsafe {
             ConvertStringSecurityDescriptorToSecurityDescriptorW(
-                w!("D:(A;;GRGX;;;WD)(A;;GA;;;BA)(A;;GA;;;SY)S:(ML;;NW;;;LW)"),
+                windows::core::PCWSTR(sddl.as_ptr()),
                 SDDL_REVISION_1 as u32,
                 &mut descriptor,
                 None,
@@ -457,7 +549,11 @@ impl FramePublisher {
 
 impl _Target {
     /// 在指定命名空间里取租约并建映射。失败原因区分"被占用"与"被拒绝", 供上层决定是否降级。
-    fn _create(namespace: Namespace) -> std::result::Result<Self, _CreateFailure> {
+    fn _create(
+        namespace: Namespace,
+        width: usize,
+        height: usize,
+    ) -> std::result::Result<Self, _CreateFailure> {
         let (mut attributes, descriptor) =
             FramePublisher::_security_attributes().map_err(_CreateFailure::Rejected)?;
         // SAFETY: attributes 内的安全描述符在本次调用期间存活; 句柄由本函数负责关闭。
@@ -492,6 +588,13 @@ impl _Target {
                 namespace._map(),
             )
         };
+        // ★"映射已存在"必须留痕★ 同名映射只要还有**任何**进程持着句柄就不会消失 —— 消费端里的
+        // 过滤器正是这样一个持有者。于是常见情形是: 上一轮的生产者早已退出, 而某个消费端把那份
+        // 队列钉在内存里; 此时 CreateFileMapping 不会新建, 而是**接管**这份孤儿(返回
+        // ERROR_ALREADY_EXISTS)。租约已经保证了"只有一个活生产者", 所以接管本身是安全且正确的
+        // (随后 _init_header 会把它整个重写成 READY)。但它同时说明"还有旧消费端连着上一份队列",
+        // 那是排查黑屏时的关键线索, 不能一声不响。
+        let adopted = unsafe { GetLastError() } == ERROR_ALREADY_EXISTS;
         unsafe { FramePublisher::_free_descriptor(descriptor) };
         let mapping = match mapping {
             Ok(mapping) => mapping,
@@ -517,13 +620,20 @@ impl _Target {
                 error
             )));
         };
+        if adopted {
+            log::warn!(
+                "虚拟摄像头: {} 已存在, 本次为接管(说明仍有消费端持着上一份队列; \
+                 若它此前协商的分辨率与当前不同, 需要在那个消费端里重新打开摄像头)",
+                namespace.map_name()
+            );
+        }
         let mut target = Self {
             _lease: lease,
             _map: mapping,
             _view: view,
             _namespace: namespace,
         };
-        target._init_header();
+        target._init_header(width, height);
         Ok(target)
     }
 
@@ -532,14 +642,15 @@ impl _Target {
     ///
     /// 静态字段(magic/版本/尺寸/槽布局/pid/interval)在 READY 之前只有本进程会读写, 用普通写即可;
     /// 只有 state/sequence/tick 这三个动态字段需要跨进程原子。
-    fn _init_header(&mut self) {
+    fn _init_header(&mut self, width: usize, height: usize) {
         self._store(Field::State, QueueState::Starting as u32, Ordering::Release);
         self._write(Field::Magic, MAGIC);
         self._write(Field::Version, LAYOUT_VERSION);
         self._write(Field::HeaderBytes, HEADER_BYTES as u32);
-        // 尺寸只是**初值**: 每次 publish 都会按实际帧尺寸刷新这两个字段。
-        self._write(Field::Width, DEFAULT_FRAME_W as u32);
-        self._write(Field::Height, DEFAULT_FRAME_H as u32);
+        // ★这里就得是真实分辨率, 不能填一个固定初值★ 消费端可能在第一次 publish 之前就来探测
+        // 并据此协商(见 `create` 的说明), 协商完就再也改不了了。
+        self._write(Field::Width, width as u32);
+        self._write(Field::Height, height as u32);
         self._write(Field::Fourcc, FOURCC_NV12);
         self._write(Field::SlotCount, SLOT_COUNT);
         // 报的是**槽间距**(上限帧长), 不是当前帧长: 消费端靠它算槽偏移, 那个值必须恒定。
@@ -547,7 +658,8 @@ impl _Target {
         self._store(Field::Sequence, 0, Ordering::Relaxed);
         self._write(Field::ProducerPid, unsafe { GetCurrentProcessId() });
         self._write(Field::Interval, FRAME_INTERVAL_100NS);
-        let black = black_nv12(DEFAULT_FRAME_W, DEFAULT_FRAME_H);
+        // 按**建队尺寸**铺黑: 映射页初值全 0(Y=0/UV=0 是绿, 不是黑), 少铺一块就是绿边。
+        let black = black_nv12(width, height);
         for slot in 0..SLOT_COUNT as usize {
             // SAFETY: 同 publish, 槽区间在映射内(槽间距恒为 SLOT_STRIDE, 黑帧只占其前一段)。
             unsafe {
@@ -627,35 +739,64 @@ pub struct QueueReader {
 }
 
 impl QueueReader {
-    /// 按 Global → Local 顺序打开, 与 C++ 侧 `Mai2VcamQueueReader::_Open` 同一顺序。
-    /// ★顺序必须与过滤器一致★ 否则自检读到的是另一块内存, 其结论对真实出画毫无证明力。
+    /// 按 Global → Local 顺序挑一份**可用**的队列打开, 与 C++ 侧 `Mai2VcamQueueReader::_Open`
+    /// 同一顺序、同一判据。
+    ///
+    /// ★"能打开"不等于"可用", 必须按可用性选★
+    /// 同名映射只要还有任何进程持着句柄就不会消失, 而消费端里的过滤器正是这样的持有者。于是
+    /// 会出现这种局面: 上位机曾以管理员在 `Global\` 建过队列, 某个消费端把它钉在内存里; 之后
+    /// 上位机以普通权限重启, 只能在 `Local\` 建队。此时两个名字都打得开, 但 `Global\` 那份是
+    /// 布局版本过时、状态为 Stopping 的孤儿。只按"能否打开"来选就会一直读那份死队列, 明明有
+    /// 活着的 `Local\` 队列却一帧都取不到(实测正是如此)。
+    ///
+    /// 故分两轮: 先找**头部合法且状态为 Ready** 的; 都没有再退而接受"头部合法"的(便于诊断
+    /// Starting/Stopping 这类中间态); 仍没有才报错。
     pub fn open() -> Result<Self> {
+        let mut fallback: Option<Self> = None;
         let mut last: Option<anyhow::Error> = None;
         for namespace in Namespace::ORDER {
-            match unsafe { OpenFileMappingW(FILE_MAP_READ.0, false, namespace._map()) } {
-                Ok(map) => {
-                    let view = unsafe { MapViewOfFile(map, FILE_MAP_READ, 0, 0, MAP_BYTES) };
-                    let Some(view) = NonNull::new(view.Value.cast::<u8>()) else {
-                        let error = windows::core::Error::from_thread();
-                        unsafe { _ = CloseHandle(map) };
-                        last = Some(anyhow!("映射 {} 失败: {}", namespace.map_name(), error));
-                        continue;
-                    };
-                    return Ok(Self {
-                        _map: map,
-                        _view: view,
-                    });
+            let candidate = match Self::_open_in(namespace) {
+                Ok(reader) => reader,
+                Err(error) => {
+                    last = Some(error);
+                    continue;
+                }
+            };
+            match candidate.header() {
+                Ok(header) if header.state == QueueState::Ready => return Ok(candidate),
+                Ok(header) => {
+                    log::debug!(
+                        "虚拟摄像头: {} 状态 {:?}, 暂不作首选",
+                        namespace.map_name(),
+                        header.state
+                    );
+                    // 头部合法但非 Ready: 留作备选, 继续看下一个命名空间有没有活的。
+                    fallback = fallback.or(Some(candidate));
                 }
                 Err(error) => {
-                    last = Some(anyhow!(
-                        "打开共享队列 {} 失败: {}",
-                        namespace.map_name(),
-                        error
-                    ));
+                    // 头部非法(版本过时的孤儿等) ⇒ 直接弃用这一份。
+                    last = Some(anyhow!("{} 头部不可用: {}", namespace.map_name(), error));
                 }
             }
         }
-        Err(last.unwrap_or_else(|| anyhow!("没有可用的共享队列命名空间")))
+        fallback
+            .ok_or_else(|| last.unwrap_or_else(|| anyhow!("没有可用的共享队列命名空间")))
+    }
+
+    /// 只做"打开并映射"这一步, 不判可用性。
+    fn _open_in(namespace: Namespace) -> Result<Self> {
+        let map = unsafe { OpenFileMappingW(FILE_MAP_READ.0, false, namespace._map()) }
+            .map_err(|error| anyhow!("打开共享队列 {} 失败: {}", namespace.map_name(), error))?;
+        let view = unsafe { MapViewOfFile(map, FILE_MAP_READ, 0, 0, MAP_BYTES) };
+        let Some(view) = NonNull::new(view.Value.cast::<u8>()) else {
+            let error = windows::core::Error::from_thread();
+            unsafe { _ = CloseHandle(map) };
+            return Err(anyhow!("映射 {} 失败: {}", namespace.map_name(), error));
+        };
+        Ok(Self {
+            _map: map,
+            _view: view,
+        })
     }
 
     pub fn header(&self) -> Result<QueueHeader> {

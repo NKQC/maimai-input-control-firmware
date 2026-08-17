@@ -248,7 +248,17 @@ export component SettingsPage inherits Rectangle {
     in-out property <bool> batch_targets_expanded: true;
     in-out property <bool> batch_enable_expanded: false;
     in-out property <bool> batch_params_expanded: true;
+    in-out property <bool> batch_algo_ch_expanded: false;
     in-out property <bool> batch_algo_cfg_expanded: false;
+    // 批量抽屉里的逐通道算法配置(cfg_ch)与共享项下拉框; 真相源在 Rust, 这里只透传。
+    in property <[AlgoSettingRow]> batch_algo_ch_rows: [];
+    in property <[bool]> batch_algo_ch_selected: [];
+    callback batch_toggle_algo_ch(int);
+    callback batch_algo_ch_value_set(int, int);
+    callback batch_algo_ch_all();
+    callback batch_algo_ch_invert();
+    in property <[string]> batch_algo_shared_names: [];
+    in-out property <int> batch_algo_shared_sel: 0;
     callback batch_drawer_closed();
     // 全通道页排序/筛选(排序与筛选实际由 Rust 侧按绑定映射执行, 这里只透传用户选择)。
     in-out property <int> channel_sort: 0;
@@ -336,6 +346,9 @@ export component SettingsPage inherits Rectangle {
     in property <string> algo_line_numbers: "1";
     in property <[AlgoMetadataRow]> algo_metadata_rows: [];
     in property <[AlgoSettingRow]> algo_setting_rows: [];
+    // 逐通道可调变量(cfg_ch), 值对应当前 sel_channel; 与共享项分列, 见 curves.slint 的说明。
+    in property <[AlgoSettingRow]> algo_setting_ch_rows: [];
+    callback algo_setting_ch_edited(int, int);
     // 见 app.slint 同名属性的注释: 这一层原先缺失, 整条透传链断在这里。
     in property <[AlgoReportLine]> algo_report_lines: [];
     callback algo_setting_edited(int, int);
@@ -345,9 +358,15 @@ export component SettingsPage inherits Rectangle {
     in property <string> algo_phase: "";
     in property <string> algo_asm: "";
     in property <int> algo_asm_bytes: 0;
-    in property <int> algo_asm_capacity: 1024;
+    in property <int> algo_asm_capacity: 4096;
     in property <int> algo_c_bytes: 0;
     in property <int> algo_c_capacity: 32768;
+    in property <int> algo_heap_used: -1;
+    in property <int> algo_heap_capacity: 256;
+    // 容量来源与告警(见 app.slint 同名属性): 容量真相源在设备, 这里只透传。
+    in property <bool> algo_caps_known: false;
+    in property <int> algo_upload_limit: 4092;
+    in property <string> algo_caps_warning: "";
     // 全局 CSD(现由"触控全局调整"页使用)
     in property <int> g_inactive_sns: 1;
     in property <int> g_idac_gain: 4;
@@ -542,11 +561,20 @@ export component SettingsPage inherits Rectangle {
                 // 批量抽屉里的算法可调变量: 与单通道精调页共用同一个模型与同一个回调。
                 algo_setting_rows: root.algo_setting_rows;
                 algo_setting_edited(idx, v) => { root.algo_setting_edited(idx, v); }
-                // 抽屉四个折叠分区的展开态存在 AppWindow(抽屉是 `if` 实例化的, 见该页说明)。
+                // 抽屉五个折叠分区的展开态存在 AppWindow(抽屉是 `if` 实例化的, 见该页说明)。
                 batch_targets_expanded <=> root.batch_targets_expanded;
                 batch_enable_expanded <=> root.batch_enable_expanded;
                 batch_params_expanded <=> root.batch_params_expanded;
+                batch_algo_ch_expanded <=> root.batch_algo_ch_expanded;
                 batch_algo_cfg_expanded <=> root.batch_algo_cfg_expanded;
+                batch_algo_ch_rows: root.batch_algo_ch_rows;
+                batch_algo_ch_selected: root.batch_algo_ch_selected;
+                batch_toggle_algo_ch(idx) => { root.batch_toggle_algo_ch(idx); }
+                batch_algo_ch_value_set(idx, v) => { root.batch_algo_ch_value_set(idx, v); }
+                batch_algo_ch_all() => { root.batch_algo_ch_all(); }
+                batch_algo_ch_invert() => { root.batch_algo_ch_invert(); }
+                batch_algo_shared_names: root.batch_algo_shared_names;
+                batch_algo_shared_sel <=> root.batch_algo_shared_sel;
                 channel_sort <=> root.channel_sort;
                 channel_show_disabled <=> root.channel_show_disabled;
                 channel_hidden_count: root.channel_hidden_count;
@@ -662,6 +690,8 @@ export component SettingsPage inherits Rectangle {
                 // 与设备上真正跑着的算法有没有声明毫无关系, 且编辑也发不出去。
                 algo_setting_rows: root.algo_setting_rows;
                 algo_setting_edited(idx, v) => { root.algo_setting_edited(idx, v); }
+                algo_setting_ch_rows: root.algo_setting_ch_rows;
+                algo_setting_ch_edited(idx, v) => { root.algo_setting_ch_edited(idx, v); }
                 active_norm_amp: root.active_norm_amp;
                 curve_t_span_ms: root.curve_t_span_ms;
                 curve_t_end_text: root.curve_t_end_text;
@@ -807,6 +837,11 @@ export component SettingsPage inherits Rectangle {
                 algo_asm_capacity: root.algo_asm_capacity;
                 algo_c_bytes: root.algo_c_bytes;
                 algo_c_capacity: root.algo_c_capacity;
+                algo_heap_used: root.algo_heap_used;
+                algo_heap_capacity: root.algo_heap_capacity;
+                algo_caps_known: root.algo_caps_known;
+                algo_upload_limit: root.algo_upload_limit;
+                algo_caps_warning: root.algo_caps_warning;
                 algo_reset_default() => { root.algo_reset_default(); }
                 algo_compile(s) => { root.algo_compile(s); }
                 algo_upload() => { root.algo_upload(); }

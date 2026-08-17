@@ -244,6 +244,11 @@ pub enum HostCmd {
     // ★不要复用该码★: 旧固件仍会把它当追踪请求处理。
     AlgoSetCfg = 0x6A,
     AlgoGetCfg = 0x6B,
+    // ★逐通道算法配置(ABI v2 的 cfg_ch[8])★ 与 SET_CFG/GET_CFG 的 cfg[8] **并存**,
+    // 两者下标空间互相独立: SET_CFG(0) 指全通道共享的 cfg[0], SET_CFG_CH(ch,0) 指该通道的 cfg_ch[0]。
+    // 合成一条命令是行不通的: 共享项没有通道维度, 逐通道项没有"对全部通道生效"的语义。
+    AlgoSetCfgCh = 0x6C,
+    AlgoGetCfgCh = 0x6D,
 
     // Keyboard (physical GPIO1-12 + touch->key) domain 0x70-0x7D
     KbdGetState = 0x70,

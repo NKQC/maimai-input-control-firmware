@@ -16,7 +16,12 @@
 #endif
 
 namespace {
-constexpr uint32_t ALGO_BLOB_MAGIC = 0x31474C41u;  // "ALG1"
+// ★magic 随 Mirror 布局改代★ "ALG1"(ABI v1: data[1024], 无 cfg_ch) → "ALG2"(ABI v2: data[4096]
+// + cfg_ch[36][8])。区头的 CRC32 只能证明"这块字节没被写坏", 证明不了"它是当前布局";
+// 若沿用旧 magic, 旧 flash 内容会被按新结构错读 —— len/crc16 落在同一偏移故看着合法, 但 data
+// 之后的 rom/cfg 全部错位, 表现为"升级后每通道 ROM 变成一堆随机数"。bump 一代即让旧区
+// 干净作废, 由内嵌默认重建。
+constexpr uint32_t ALGO_BLOB_MAGIC = 0x32474C41u;  // "ALG2"
 constexpr const char* ALGO_BLOB_PATH = "/algo.bin";
 constexpr uint32_t ALGO_SRC_MAGIC = 0x31435241u;   // "ARC1" (algo source / mapping table)
 constexpr const char* ALGO_SRC_PATH = "/algo_src.bin";
@@ -28,6 +33,7 @@ PsocAlgo* PsocAlgo::_instance = nullptr;
 PsocAlgo::PsocAlgo() : _len(0), _crc16(0), _is_default(true) {
     std::memset(_rom, 0, sizeof(_rom));   // 每通道 ROM 默认 0(算法未下发校准前)
     std::memset(_cfg, 0, sizeof(_cfg));   // 共享可设置变量默认 0
+    std::memset(_cfg_ch, 0, sizeof(_cfg_ch));   // 逐通道可设置变量默认 0(与 PSoC 上电值一致)
     std::memset(_src, 0, sizeof(_src));
     _src_len = 0;
     _load_default();
@@ -43,6 +49,18 @@ void PsocAlgo::set_rom(uint8_t ch, uint16_t val) {
 void PsocAlgo::set_cfg(uint8_t idx, uint8_t val) {
     if (idx >= 8u) return;
     _cfg[idx] = val;
+    _sync_bin_storage();
+    request_save();
+}
+
+uint8_t PsocAlgo::cfg_ch(uint8_t ch, uint8_t idx) const {
+    if (ch >= PSOC_ALGO_CHANNELS || idx >= 8u) return 0u;
+    return _cfg_ch[ch][idx];
+}
+
+void PsocAlgo::set_cfg_ch(uint8_t ch, uint8_t idx, uint8_t val) {
+    if (ch >= PSOC_ALGO_CHANNELS || idx >= 8u) return;
+    _cfg_ch[ch][idx] = val;
     _sync_bin_storage();
     request_save();
 }
@@ -90,6 +108,7 @@ void PsocAlgo::init() {
         if (crc == blob.crc32) {
             std::memcpy(_rom, blob.rom, sizeof(_rom));
             std::memcpy(_cfg, blob.cfg, sizeof(_cfg));
+            std::memcpy(_cfg_ch, blob.cfg_ch, sizeof(_cfg_ch));
             if (blob.is_default == 0u && blob.len > 0u && blob.len <= PSOC_ALGO_MAX_LEN &&
                 HostCmdCrc16::crc16(blob.data, blob.len) == blob.crc16) {
                 std::memcpy(_blob, blob.data, blob.len);
@@ -132,9 +151,34 @@ bool PsocAlgo::set_algo(const uint8_t* src, uint16_t src_len, uint16_t src_crc16
     // 上传是比"恢复默认"更晚的用户意图, 必须赢。
     _reset_default_pending = false;
     _reset_default_started = false;
+    // ★"每次新上传都必然获得一次运行机会"的唯一保证★
+    // 隔离是按"上一份算法连续 3 次搞死 PSoC"下的判决, 它绝不能顺延到用户刚换上的这一份 ——
+    // 否则用户改好了 bug 重新上传, 设备照旧不跑它, 且界面上看不出为什么(算法明明存进去了)。
+    // 同时置 pending: 即使此刻链路不可用/core1 正忙, tick() 也会自己把它推下去, 不需要用户再点一次。
+    clear_quarantine();
+    _download_pending = true;
+    _download_retry_ms = 0u;   // 立刻允许第一次尝试(不吃 500ms 节流)
     _sync_bin_storage();
     request_save();
     return true;
+}
+
+void PsocAlgo::note_fatal() {
+    if (_fatal_run < 0xFFu) _fatal_run++;
+    // ★这里绝不碰 _blob/_len/_crc16/_src★: 隔离只改"这一代要不要下发", 算法与 C 源必须原样
+    // 留在 flash 里可回读。旧实现在这一步直接 reset_default() 把用户算法扔了, 用户既拿不回
+    // 代码也说不清是谁改的 —— 那是本次要修掉的行为。
+    if (_fatal_run >= FATAL_QUARANTINE_RUN) _quarantined = true;
+}
+
+void PsocAlgo::clear_quarantine() {
+    _fatal_run = 0u;
+    _quarantined = false;
+    // 解除隔离必须伴随一次真实下发(见头文件注释), 否则"救援"只是改了个标志位。
+    if (_len != 0u) {
+        _download_pending = true;
+        _download_retry_ms = 0u;   // 不吃节流, 下一轮 tick 立刻试
+    }
 }
 
 // ★本函数只切 blob, 不动 C 源★
@@ -145,6 +189,10 @@ bool PsocAlgo::set_algo(const uint8_t* src, uint16_t src_len, uint16_t src_crc16
 // 因此 C 源的清空改由 request_reset_default() 在受理命令的那一刻同步完成(见其注释)。
 void PsocAlgo::reset_default() {
     _load_default();
+    // ★隔离历史属于被换掉的那份自定义算法, 不能顺延到内嵌默认★
+    // 否则"恢复默认"之后设备仍拒绝下发(默认算法是出厂验证过的), PSoC 会一直跑原生 CapSense,
+    // 而界面显示的是"已恢复默认算法" —— 两边说法不一致且无从解释。
+    clear_quarantine();
     _sync_bin_storage();
     request_save();
 }
@@ -162,9 +210,29 @@ bool PsocAlgo::request_reset_default() {
     return true;
 }
 
+// ★语义: "已受理"★ 返回 false 只保留给"根本没算法可发"这种调用方写错了的情形。
+// 链路不可用 / core1 正忙 / 入队失败 ⇒ 记 pending 由 tick() 重试; 被隔离 ⇒ 按策略不发但也算受理。
+// 这样上层就没有任何一条路径会因为 PSoC 的状态而把上传拒掉(见 sensor_link 的 _handle_algo_upload)。
 bool PsocAlgo::request_download(Psoc* psoc) {
+    if (psoc == nullptr || _len == 0u) return false;
+    if (_quarantined) {
+        // 已隔离: 本代不下发(PSoC 跑原生 CapSense), 且不留 pending —— 否则 tick() 会一直空转重试。
+        // 解除方式只有两个: 重新上传(set_algo)或用户显式救援(clear_quarantine)。
+        _download_pending = false;
+        return true;
+    }
+    // ★blob 保护必须留着★: 上一次下发未完成时 blob 被 core1 持有, 此刻重发会让它写出半新半旧的
+    // 代码。推迟而不是失败, 由 tick() 在 busy 落下后自动补上。
+    if (psoc->algo_download_busy()) {
+        _download_pending = true;
+        return true;
+    }
     // 判据用去抖后的 link_alive(): 遥测流式期间瞬时 link_ok 频繁为 false, 拿它当门禁会永远下发不了。
-    if (psoc == nullptr || !psoc->link_alive() || _len == 0u) return false;
+    // 链路真不可用时也只是推迟 —— 用户在 PSoC 挂死期间上传的修复算法必须能存下并在链路恢复后自动生效。
+    if (!psoc->link_alive()) {
+        _download_pending = true;
+        return true;
+    }
     // ★不能用 provisioning_active() 当门禁★
     // 它含 _runtime_sync_active —— 那是"逐条补推 36 个 ROM + 8 个 cfg"的阶段, 共 44 轮且每轮都要
     // core1_idle()。补推阶段**并不持有 blob**: 真正的 blob 保护是 Psoc::_algo_dl.busy(在
@@ -172,11 +240,16 @@ bool PsocAlgo::request_download(Psoc* psoc) {
     // 用它挡上传的后果(实测): 上位机停在算法页时会持续读 cfg/追踪, core1 频繁非空 ⇒ 补推迟迟
     // 走不完 ⇒ 用户此刻点"编译并上传"必被回 DEVICE_BUSY(cmd=0x61 NAK), 且越是盯着算法页越必然。
     // 新代码上传本就要按新算法重推一遍 ROM/cfg, 打断旧补推是正确且必要的。
-    if (!psoc->upload_algo(_blob, _len, _crc16)) return false;
+    if (!psoc->upload_algo(_blob, _len, _crc16)) {
+        // 入队失败(core1 长时间不消费命令环)同样只是推迟, 不是拒收。
+        _download_pending = true;
+        return true;
+    }
     // 旧补推作废, 由本次下发完成后重新走一遍(_params_pending → _start_runtime_sync)。
     _runtime_sync_active = false;
     _runtime_index = 0u;
     _params_pending = true;
+    _download_pending = false;   // 真正入队成功才算发出去了
     return true;
 }
 
@@ -193,6 +266,20 @@ void PsocAlgo::tick(Psoc* psoc) {
         _runtime_sync_active = false;
         return;
     }
+    // ★推迟的下发在这里重试, 且必须放在最前面★
+    // 本函数后续每个分支(恢复默认 / 补推 / runtime sync)都带 early return, 把重试写在末尾就永远
+    // 走不到 —— 那等于"链路恢复后算法再也不会被推下去", 正是 R1 要修的东西。
+    // _reset_default_pending 期间不插手: 那条分支自己负责下发, 两边都发会白跑一遍旧 blob。
+    if (_download_pending && !_quarantined && !_reset_default_pending) {
+        const uint32_t now_ms = millis();
+        // 节流: core1 忙时每轮主循环都试一次只会白白占 SPI 命令环, 500ms 一次足够(用户感知不到)。
+        if (_download_retry_ms == 0u || (uint32_t)(now_ms - _download_retry_ms) >= DOWNLOAD_RETRY_MS) {
+            _download_retry_ms = now_ms;
+            if (psoc->link_alive() && !psoc->algo_download_busy() && psoc->core1_idle()) {
+                (void)request_download(psoc);   // 成功入队即自行清 _download_pending
+            }
+        }
+    }
     if (_reset_default_pending) {
         // 先等旧上传释放 blob；切换后 pending 持续到 PSoC 的异步 INFO cache 确认默认代码真实生效。
         if (!_reset_default_started) {
@@ -200,7 +287,10 @@ void PsocAlgo::tick(Psoc* psoc) {
             _params_pending = false;
             _runtime_sync_active = false;
             reset_default();
-            if (!request_download(psoc)) return;
+            // ★这里必须用严格版★: 宽松版"推迟也返回 true"会让 _reset_default_started 在没真发出去
+            // 的情况下置位, 随后本函数只走"等 INFO 确认默认长度"那条分支, 而顶部的 pending 重试又
+            // 被 _reset_default_pending 排除 ⇒ 恢复默认永久挂起。返回 false 就下轮重试, 与改造前一致。
+            if (!download_to_psoc(psoc)) return;
             _reset_default_started = true;
             return;
         }
@@ -222,14 +312,26 @@ void PsocAlgo::tick(Psoc* psoc) {
     if (!_runtime_sync_active || !psoc->core1_idle() || psoc->heavy_busy()) return;
 
     if (_runtime_index < PSOC_ALGO_CHANNELS) {
-        const uint8_t ch = _runtime_index++;
+        const uint8_t ch = static_cast<uint8_t>(_runtime_index++);
         if (_rom[ch] != 0u) (void)psoc->set_algo_rom(ch, _rom[ch]);
         return;
     }
-    const uint8_t cfg_index = static_cast<uint8_t>(_runtime_index - PSOC_ALGO_CHANNELS);
+    const uint16_t cfg_index = static_cast<uint16_t>(_runtime_index - PSOC_ALGO_CHANNELS);
     if (cfg_index < 8u) {
         _runtime_index++;
-        (void)psoc->algo_set_cfg(cfg_index, _cfg[cfg_index]);
+        (void)psoc->algo_set_cfg(static_cast<uint8_t>(cfg_index), _cfg[cfg_index]);
+        return;
+    }
+    // 逐通道 cfg_ch: 36×8 = 288 项。★与 ROM 同款: 值为 0 就跳过不发★
+    // PSoC 的 g_algo_cfg_ch 上电即全 0, 补推一个 0 等于什么也没做, 却要占 288 轮 core1_idle 窗口
+    // (每轮一笔 SPI 事务)。默认状态下绝大多数是 0, 逐条硬推会让每次下发后的补推阶段拖上几百 ms,
+    // 期间用户的 GET_CFG/追踪读全部排在后面(实测过这种迟滞: 上位机成片超时)。
+    const uint16_t ch_index = static_cast<uint16_t>(cfg_index - 8u);
+    if (ch_index < PSOC_ALGO_CHANNELS * 8u) {
+        _runtime_index++;
+        const uint8_t ch = static_cast<uint8_t>(ch_index / 8u);
+        const uint8_t idx = static_cast<uint8_t>(ch_index % 8u);
+        if (_cfg_ch[ch][idx] != 0u) (void)psoc->set_algo_cfg_ch(ch, idx, _cfg_ch[ch][idx]);
         return;
     }
     _runtime_sync_active = false;
@@ -239,8 +341,15 @@ void PsocAlgo::_push_runtime_params(Psoc* psoc) {
     (void)_start_runtime_sync(psoc);
 }
 
+// ★严格语义(与 request_download 的宽松语义刻意分开)★
+// 启动 provisioning 用本函数判"本代是否已真正开始下发算法"(见 core0_loop 的 provisioning_started)。
+// 若沿用 request_download 的"推迟也算受理", provisioning 会在算法其实一个字节都没发出去的情况下
+// 直接推进到 CSD 阶段并把本代标记为完成 —— 那就再也没有人重发它了。
 bool PsocAlgo::download_to_psoc(Psoc* psoc) {
-    return request_download(psoc);
+    if (!request_download(psoc)) return false;
+    // 被隔离时"不下发"就是本代终态: provisioning 必须照常往下走, 否则一个坏算法会把 CSD 参数
+    // 下发也一起锁死(整台设备停在未配置状态), 那比不跑算法严重得多。
+    return _quarantined || !_download_pending;
 }
 
 void PsocAlgo::abort_provisioning() {
@@ -260,6 +369,7 @@ void PsocAlgo::_sync_bin_storage() {
     std::memcpy(blob.data, _blob, (_len <= PSOC_ALGO_MAX_LEN) ? _len : PSOC_ALGO_MAX_LEN);
     std::memcpy(blob.rom, _rom, sizeof(blob.rom));
     std::memcpy(blob.cfg, _cfg, sizeof(blob.cfg));
+    std::memcpy(blob.cfg_ch, _cfg_ch, sizeof(blob.cfg_ch));
     blob.crc32 = ConfigCRC::calculate_crc32((const uint8_t*)&blob, sizeof(blob) - sizeof(uint32_t));
     _mirror_len = sizeof(_mirror);
     NvStore::getInstance()->mark_dirty(NvStore::Region::ALGO_BIN);

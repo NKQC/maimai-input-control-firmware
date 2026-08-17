@@ -26,6 +26,9 @@ pub(crate) fn persist_ui_settings(
     cfg.set_bool(k::CURVE_SERIES_EXPANDED, ui.get_curve_series_expanded());
     cfg.set_bool(k::CURVE_SPECTRUM_EXPANDED, ui.get_curve_spectrum_expanded());
     cfg.set_bool(k::CHANNEL_SHOW_DISABLED, ui.get_channel_show_disabled());
+    cfg.set_bool(k::BATCH_ALGO_CH_EXPANDED, ui.get_batch_algo_ch_expanded());
+    cfg.set_bool(k::BATCH_ALGO_CFG_EXPANDED, ui.get_batch_algo_cfg_expanded());
+    cfg.set_i32(k::BATCH_ALGO_SHARED_SEL, ui.get_batch_algo_shared_sel());
     cfg.set_bool(k::PHYS_LIVE_EXPANDED, ui.get_phys_live_expanded());
     cfg.set_bool(k::PHYS_KEYS_EXPANDED, ui.get_phys_keys_expanded());
     cfg.set_bool(k::PHYS_LA_EXPANDED, ui.get_phys_la_expanded());

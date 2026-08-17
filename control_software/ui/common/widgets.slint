@@ -509,6 +509,8 @@ export component AlgoSettingEditorRow inherits HorizontalBox {
     // ScrollView 长出一条横向滚动条(纵向滚动的列里再横向滚是本工程明确避免的交互)。
     // 范围信息并没有丢: 数字框自身就按同一围栏夹取, 类型标签也仍在。
     in property <bool> compact: false;
+    // 逐通道行要说明"这一份值属于哪个通道"(如 "CH7")。空串 = 不显示通道后缀。
+    in property <string> channel_text: "";
     callback edited(int, int);
 
     padding: 0px;
@@ -516,8 +518,12 @@ export component AlgoSettingEditorRow inherits HorizontalBox {
     height: Theme.row-height;
 
     Text {
+        // ★寄存器名必须如实区分 cfg 与 cfg_ch★ 两者是设备上两组独立的数组, 下标空间也独立
+        // (cfg[0] 与 cfg_ch[*][0] 是不同变量)。全都写成 "cfg[i]" 会让用户按下标去对照算法源码时
+        // 对到另一个变量上。
         text: (root.entry.alias != "" ? root.entry.alias : root.entry.name)
-            + " (cfg[" + root.entry.idx + "])";
+            + (root.entry.shared_scope ? " (cfg[" : " (cfg_ch[") + root.entry.idx + "])"
+            + (root.channel_text != "" ? " · " + root.channel_text : "");
         horizontal-stretch: 1;
         overflow: elide;
         wrap: no-wrap;
@@ -527,7 +533,10 @@ export component AlgoSettingEditorRow inherits HorizontalBox {
     // ★可调变量的类型/范围一律有确定结论★: 设备 cfg[8] 就是 8 个 u8, 旧式 ALGO_SETTING 缺
     // META 时退回的 u8/0..255 是协议事实(不是猜的), 所以这里不需要"未声明"分支。
     TypeTag { value_type: root.entry.value_type; }
-    if root.entry.shared_scope: ScopeTag { }
+    // 两种作用域都明确标注: 只标一种会让另一种看起来"没说明", 用户还是得去猜。
+    ScopeTag {
+        text: root.entry.shared_scope ? @tr("全通道共享") : @tr("逐通道");
+    }
     if !root.compact: Text {
         text: root.entry.range;
         width: 92px;

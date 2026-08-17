@@ -1,6 +1,9 @@
 #include "psoc_spi.h"
 #include "../../config.h"
 #include "../../hal/pio/hal_pio.h"
+// 只为取 PSOC_ALGO_MAX_LEN(= PSoC 的 ALGO_SLOT_SIZE)。该头只依赖 cstdint 且仅前置声明 Psoc,
+// 不引入反向依赖; 槽大小是协议契约, 必须与 store 用同一个常量, 不许在此另写一份数字。
+#include "../../service/psoc_algo/psoc_algo.h"
 #include <pico/stdlib.h>
 #include <hardware/clocks.h>
 #include <hardware/gpio.h>
@@ -523,12 +526,16 @@ bool PsocSpi::algo_begin(uint16_t len) {
     return resp[1] == (uint8_t)psoc::Cmd::ALGO_BEGIN;
 }
 
-bool PsocSpi::algo_page(uint8_t page, const uint8_t four[4]) {
-    // 帧 [magic,ALGO_PAGE,page,d0,d1,d2,d3]: b2=page, b3=four[0], val24=four[1..3]
+bool PsocSpi::algo_page(uint16_t page, const uint8_t four[4]) {
+    // 帧 [magic,ALGO_PAGE,page,d0,d1,d2,d3]: b2=page 低 8 位, b3=four[0], val24=four[1..3]
+    // ★ABI v2 起 page 只是顺序校验位★: PSoC 用内部字节游标定址, 只把 (游标/4) 的低 8 位与本字节
+    // 对账, 失序/越界回 page^0xFF。故这里只能发低 8 位、也只能校验低 8 位, 但调用方**必须严格
+    // 顺序发页**(见 poll_upload_algo 的单向 page++)。
+    const uint8_t page_lo = (uint8_t)(page & 0xFFu);
     uint8_t resp[7];
     uint32_t v = (uint32_t)four[1] | ((uint32_t)four[2] << 8) | ((uint32_t)four[3] << 16);
-    if (!_cmd_txn((uint8_t)psoc::Cmd::ALGO_PAGE, page, four[0], v, resp)) return false;
-    return resp[1] == (uint8_t)psoc::Cmd::ALGO_PAGE && resp[2] == page;
+    if (!_cmd_txn((uint8_t)psoc::Cmd::ALGO_PAGE, page_lo, four[0], v, resp)) return false;
+    return resp[1] == (uint8_t)psoc::Cmd::ALGO_PAGE && resp[2] == page_lo;
 }
 
 bool PsocSpi::algo_end(uint16_t crc16, bool* out_ok, uint16_t* out_len) {
@@ -540,17 +547,50 @@ bool PsocSpi::algo_end(uint16_t crc16, bool* out_ok, uint16_t* out_len) {
     return true;
 }
 
-bool PsocSpi::algo_info(bool* out_valid, uint16_t* out_len) {
+bool PsocSpi::algo_info(bool* out_valid, uint16_t* out_len, bool* out_uploading) {
     uint8_t resp[7];
     if (!_cmd_txn((uint8_t)psoc::Cmd::ALGO_INFO, 0, 0, 0, resp)) return false;
     if (resp[1] != (uint8_t)psoc::Cmd::ALGO_INFO) return false;
     if (out_valid) *out_valid = resp[2] != 0;
+    // b3: ABI v1 恒 0, ABI v2 = upload_active(1=正在上传)。旧固件读到 0 ⇒ 行为与改造前一致。
+    if (out_uploading) *out_uploading = resp[3] != 0;
     if (out_len) *out_len = (uint16_t)resp[4] | ((uint16_t)resp[5] << 8);
     return true;
 }
 
+bool PsocSpi::algo_get_crc(bool* out_valid, uint16_t* out_crc) {
+    // 帧 [magic,ALGO_GET_CRC,0,...] → 响应 [..,valid,0,crc_lo,crc_hi,0]
+    uint8_t resp[7];
+    if (!_cmd_txn((uint8_t)psoc::Cmd::ALGO_GET_CRC, 0, 0, 0, resp)) return false;
+    if (resp[1] != (uint8_t)psoc::Cmd::ALGO_GET_CRC) return false;
+    if (out_valid) *out_valid = resp[2] != 0;
+    if (out_crc) *out_crc = (uint16_t)resp[4] | ((uint16_t)resp[5] << 8);
+    return true;
+}
+
+bool PsocSpi::algo_get_heap(uint16_t* out_size, uint16_t* out_used) {
+    // 帧 [magic,ALGO_GET_HEAP,0,...] → 响应 [..,size_lo,size_hi,used_peak_lo,used_peak_hi,0]
+    uint8_t resp[7];
+    if (!_cmd_txn((uint8_t)psoc::Cmd::ALGO_GET_HEAP, 0, 0, 0, resp)) return false;
+    if (resp[1] != (uint8_t)psoc::Cmd::ALGO_GET_HEAP) return false;
+    if (out_size) *out_size = (uint16_t)resp[2] | ((uint16_t)resp[3] << 8);
+    if (out_used) *out_used = (uint16_t)resp[4] | ((uint16_t)resp[5] << 8);
+    return true;
+}
+
+bool PsocSpi::algo_get_caps(uint16_t* out_slot, uint16_t* out_heap) {
+    // 帧 [magic,ALGO_GET_CAPS,0,...] → 响应 [..,heap_lo,heap_hi,slot_lo,slot_hi,0]
+    uint8_t resp[7];
+    if (!_cmd_txn((uint8_t)psoc::Cmd::ALGO_GET_CAPS, 0, 0, 0, resp)) return false;
+    if (resp[1] != (uint8_t)psoc::Cmd::ALGO_GET_CAPS) return false;
+    if (out_heap) *out_heap = (uint16_t)resp[2] | ((uint16_t)resp[3] << 8);
+    if (out_slot) *out_slot = (uint16_t)resp[4] | ((uint16_t)resp[5] << 8);
+    return true;
+}
+
 bool PsocSpi::begin_upload_algo(const uint8_t* data, uint16_t len, uint16_t crc16) {
-    if (!_ready || data == nullptr || len == 0u || len > 1024u || _algo_upload.phase != 0u) return false;
+    if (!_ready || data == nullptr || len == 0u || len > PSOC_ALGO_MAX_LEN ||
+        _algo_upload.phase != 0u) return false;
     if (!algo_begin(len)) return false;
     _algo_upload.data = data;
     _algo_upload.len = len;
@@ -574,7 +614,9 @@ bool PsocSpi::poll_upload_algo(bool* out_complete, bool* out_ok, bool* out_valid
         uint8_t four[4] = {0, 0, 0, 0};
         const uint32_t base = (uint32_t)_algo_upload.page * 4u;
         for (uint16_t b = 0; b < 4u && base + b < _algo_upload.len; ++b) four[b] = _algo_upload.data[base + b];
-        if (!algo_page((uint8_t)_algo_upload.page, four)) {
+        // ★不再截断成 u8★: 4KB 槽最多 1024 页, 截断后 page≥256 会回绕, 而 PSoC 只比低 8 位 ⇒
+        // 回绕值恰好"校验通过", 上传报成功但字节写到了别处 = "上传成功仍跑旧算法"的根因。
+        if (!algo_page(_algo_upload.page, four)) {
             _algo_upload.clear();
             if (out_complete) *out_complete = true;
             return false;
@@ -595,7 +637,11 @@ bool PsocSpi::poll_upload_algo(bool* out_complete, bool* out_ok, bool* out_valid
     }
 
     const uint32_t now_ms = millis();
-    if ((uint32_t)(now_ms - _algo_upload.started_ms) >= 120000u) {
+    // ★上限从 120s 降到 20s★ 4KB = 1024 页, 每页一笔 SPI 事务(core1 每拍推进一笔), 正常 1~2s
+    // 就走完; commit 的 CRC 校验在 PSoC 主循环里, 也只是一个扫描周期的量级。
+    // 120s 的真正含义是"_algo_dl.busy 最长能把上传通道锁死两分钟" —— 那本身就是一种门禁死锁:
+    // 期间用户想上传修好的算法只会拿到 DEVICE_BUSY, 而 PSoC 可能已经挂在坏算法里了。
+    if ((uint32_t)(now_ms - _algo_upload.started_ms) >= ALGO_UPLOAD_TIMEOUT_MS) {
         _algo_upload.clear();
         if (out_complete) *out_complete = true;
         return false;
@@ -603,18 +649,34 @@ bool PsocSpi::poll_upload_algo(bool* out_complete, bool* out_ok, bool* out_valid
     if ((uint32_t)(now_ms - _algo_upload.last_info_ms) < 100u) return true;
     _algo_upload.last_info_ms = now_ms;
     bool valid = false;
+    bool uploading = false;
     uint16_t len = 0u;
-    if (!algo_info(&valid, &len)) return true;
+    if (!algo_info(&valid, &len, &uploading)) return true;
     if (out_valid) *out_valid = valid;
     if (out_len) *out_len = len;
-    if (valid && len == _algo_upload.len) {
-        if (++_algo_upload.confirmed < 2u) return true;
+    // ★终态判据 = 内容对账, 不是 valid+len★
+    // "valid && len==expected" 分不出"新算法装上了"与"旧算法还在、长度恰好相同"(同一份源改一个
+    // 常量再编译, 长度几乎必然不变) —— 那正是上位机反复报"上传成功却行为没变"的来源。
+    // uploading 还为真说明 PSoC 尚未 commit, 此刻的 valid/len 属于上一份, 一律不采信。
+    if (valid && !uploading && len == _algo_upload.len) {
+        if (++_algo_upload.confirmed < 2u) return true;   // 仍保留连续 2 次确认(防单帧巧合)
+        // 再要一次槽内真实内容 CRC16: 相符才算装上。取不到就当本轮确认无效(下轮重来),
+        // 不相符则直接判失败 —— 不要无限等, 否则又变成锁住通道的死等。
+        bool crc_valid = false;
+        uint16_t slot_crc = 0u;
+        if (!algo_get_crc(&crc_valid, &slot_crc)) {
+            _algo_upload.confirmed = 0u;
+            return true;
+        }
+        const bool content_ok = crc_valid && slot_crc == _algo_upload.crc16;
         _algo_upload.clear();
         if (out_complete) *out_complete = true;
-        if (out_ok) *out_ok = true;
-    } else {
-        _algo_upload.confirmed = 0u;
+        if (out_ok) *out_ok = content_ok;
+        // 返回值是"SPI 应答是否正常", 与"内容是否对上"是两件事: 这里应答一切正常, 只是内容不符,
+        // 故仍返回 true 并靠 out_ok=false 让上层走"下发失败"分支(而不是混进链路失败的重试计数)。
+        return true;
     }
+    _algo_upload.confirmed = 0u;
     return true;
 }
 
@@ -669,6 +731,24 @@ bool PsocSpi::algo_get_cfg(uint8_t idx, uint8_t* out_val) {
     uint8_t resp[7];
     if (!_cmd_txn((uint8_t)psoc::Cmd::ALGO_GET_CFG, idx, 0, 0, resp)) return false;
     if (resp[1] != (uint8_t)psoc::Cmd::ALGO_GET_CFG || resp[2] != idx) return false;
+    if (out_val) *out_val = (uint8_t)resp[4];
+    return true;
+}
+
+bool PsocSpi::algo_set_cfg_ch(uint8_t ch, uint8_t idx, uint8_t val) {
+    // 帧 [magic,SET_CFG_CH,ch,idx,val,0,0] → 响应 [..,ch,idx,实际写入值,0,0]
+    // ★ch+idx 双回显都要比★: 这条命令与 GET_CFG_CH/GET_TRACE 在同一条应答流水线上, 只比 ch
+    // 时另一条命令的残帧就能冒充成功(cfg 那条只有单键, 已经吃过这种苦)。
+    uint8_t resp[7];
+    if (!_cmd_txn((uint8_t)psoc::Cmd::ALGO_SET_CFG_CH, ch, idx, (uint32_t)val, resp)) return false;
+    return resp[1] == (uint8_t)psoc::Cmd::ALGO_SET_CFG_CH && resp[2] == ch && resp[3] == idx;
+}
+
+bool PsocSpi::algo_get_cfg_ch(uint8_t ch, uint8_t idx, uint8_t* out_val) {
+    // 帧 [magic,GET_CFG_CH,ch,idx,0,0,0] → 响应 [..,ch,idx,cfg_ch[ch][idx],0,0]
+    uint8_t resp[7];
+    if (!_cmd_txn((uint8_t)psoc::Cmd::ALGO_GET_CFG_CH, ch, idx, 0, resp)) return false;
+    if (resp[1] != (uint8_t)psoc::Cmd::ALGO_GET_CFG_CH || resp[2] != ch || resp[3] != idx) return false;
     if (out_val) *out_val = (uint8_t)resp[4];
     return true;
 }

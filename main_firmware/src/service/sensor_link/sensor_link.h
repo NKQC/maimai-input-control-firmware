@@ -229,8 +229,10 @@ private:
 
     StreamState _stream { false, false };
     struct HostWriteState {
+        // ALGO_CFG_CH 与 ALGO_ROM 同属"批量逐条下发"型: 共用下面那组 batch 条目做进度记账
+        // (见 BatchEntry 注释), 不再为它另开一套平行缓冲。
         enum class Kind : uint8_t { NONE, PARAM, MODE, GLOBAL, GLOBAL_COMMIT, ALGO_CFG, ALGO_ROM,
-                                   CALIBRATE, BASELINE_RESET, CP_MEASURE };
+                                   ALGO_CFG_CH, CALIBRATE, BASELINE_RESET, CP_MEASURE };
         bool active = false;
         bool complete = false;
         bool ok = false;
@@ -240,14 +242,25 @@ private:
         uint8_t a = 0;
         uint8_t b = 0;
         uint32_t value = 0;
-        uint8_t rom_count = 0;
-        uint8_t rom_index = 0;
-        uint8_t rom_ch[SENSOR_LINK_CHANNELS] = {};
-        uint16_t rom_value[SENSOR_LINK_CHANNELS] = {};
+        // ★批量逐条下发的共用条目缓冲★
+        // ALGO_SET_ROM(≤36 条)与 ALGO_SET_CFG_CH(≤288 条)都是"整帧收下 → 逐条走 PSoC 单槽 →
+        // 全部完成才 ACK"。两者共用 host_write 这一个所有者槽, 天然互斥, 故合成一组 struct 条目
+        // 而不是各开一套平行数组(ROM: a=ch, value=rom16; CFG_CH: a=ch, b=idx, value=val8)。
+        // ★count/index 必须是 u16★: 288 装不进 u8(旧 rom_count 是 u8, 直接沿用会静默截断)。
+        struct BatchEntry {
+            uint8_t a = 0;
+            uint8_t b = 0;
+            uint16_t value = 0;
+            void clear() { a = 0; b = 0; value = 0; }
+        };
+        static constexpr uint16_t BATCH_MAX = SENSOR_LINK_CHANNELS * 8u;   // = 288(cfg_ch 满帧)
+        BatchEntry batch[BATCH_MAX] = {};
+        uint16_t batch_count = 0;
+        uint16_t batch_index = 0;
 
         void clear() {
             active = false; complete = false; ok = false; kind = Kind::NONE;
-            cmd = 0; seq = 0; a = 0; b = 0; value = 0; rom_count = 0; rom_index = 0;
+            cmd = 0; seq = 0; a = 0; b = 0; value = 0; batch_count = 0; batch_index = 0;
         }
     };
     HostWriteState _host_write;
@@ -299,7 +312,8 @@ private:
                                    uint8_t* response, uint16_t* response_length);
     bool _start_host_write(HostWriteState::Kind kind, const HostFrame& frame,
                            uint8_t a, uint8_t b, uint32_t value);
-    bool _start_next_host_rom();
+    // 批量条目推进(ALGO_ROM / ALGO_CFG_CH 共用): 把 batch[batch_index] 投给 PSoC 单槽。
+    bool _start_next_host_batch();
     void _poll_host_write();
     void _pause_broad_for_focus();
     void _restore_broad_after_focus();
@@ -355,6 +369,9 @@ private:
     // 算法可调变量(cfg[8])。运行值(report[]/out_active)无主机命令: 随遥测帧的 TELEM_FIELD_ALGO 走。
     static void _handle_algo_set_cfg(const HostFrame& frame, uint8_t* response, uint16_t* response_length);
     static void _handle_algo_get_cfg(const HostFrame& frame, uint8_t* response, uint16_t* response_length);
+    // 逐通道可调变量(cfg_ch[36][8], ABI v2)。SET 批量走 host_write 单槽; GET 直读 RP 存储真相源。
+    static void _handle_algo_set_cfg_ch(const HostFrame& frame, uint8_t* response, uint16_t* response_length);
+    static void _handle_algo_get_cfg_ch(const HostFrame& frame, uint8_t* response, uint16_t* response_length);
     // 算法 C 源(映射表)存取 + ASM 机器码回读
     static void _handle_algo_get_src(const HostFrame& frame, uint8_t* response, uint16_t* response_length);
     static void _handle_algo_set_src(const HostFrame& frame, uint8_t* response, uint16_t* response_length);

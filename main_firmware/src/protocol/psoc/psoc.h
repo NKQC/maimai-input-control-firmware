@@ -121,8 +121,16 @@ public:
     bool algo_download_take_failure();
     bool get_algo_info(bool* out_valid, uint16_t* out_len);   // 读 PSoC 端算法 valid/len
     // 只读 core1 周期刷新结果；不会投递或同步等待 SPI 命令。返回 true 表示缓存可用。
-    bool get_algo_info_cached(bool* out_valid, uint16_t* out_len) const;
+    // 追加出参全部默认 nullptr ⇒ 既有调用点一行不用改:
+    //   out_crc      = PSoC 槽内**实际内容** CRC16(0 = 本轮没取到)。★判"上传成功"只能看它★
+    //   out_heap_*   = 算法共享堆峰值占用 / 容量(0 = 没取到)
+    //   out_uploading= PSoC 仍在 upload_active(此时 valid/len 属于上一份算法, 不可采信)
+    bool get_algo_info_cached(bool* out_valid, uint16_t* out_len,
+                              uint16_t* out_crc = nullptr, uint16_t* out_heap_used = nullptr,
+                              uint16_t* out_heap_size = nullptr, bool* out_uploading = nullptr) const;
     bool set_algo_rom(uint8_t ch, uint16_t rom);              // 设每通道 16 位只读 ROM
+    // PSoC 编译期自报容量的惰性缓存；未读到时返回 false，调用方须显示“—”而非伪造为 0。
+    bool get_algo_caps_cached(uint16_t* out_slot, uint16_t* out_heap) const;
     bool start_host_algo_set_rom(uint8_t ch, uint16_t rom);
     bool start_host_calibrate(uint8_t ch);
     bool start_host_baseline_reset(uint8_t ch);
@@ -133,6 +141,16 @@ public:
     bool algo_set_cfg(uint8_t idx, uint8_t val);
     bool start_host_algo_set_cfg(uint8_t idx, uint8_t val);
     bool algo_get_cfg(uint8_t idx, uint8_t* out_val);
+    // 逐通道可设置变量 cfg_ch[36][8](ABI v2)。两条路径与 cfg 完全对照:
+    //   set_algo_cfg_ch          = 写类异步入队(内部补推用, 不占 host_write 单槽);
+    //   start_host_algo_set_cfg_ch = 走 host_write 单槽的延迟 ACK(主机命令用)。
+    bool set_algo_cfg_ch(uint8_t ch, uint8_t idx, uint8_t val);
+    bool start_host_algo_set_cfg_ch(uint8_t ch, uint8_t idx, uint8_t val);
+    bool algo_get_cfg_ch(uint8_t ch, uint8_t idx, uint8_t* out_val);
+    // 槽内容 CRC16 / 共享堆的按需读取(阻塞读类)。周期刷新走 _refresh_algo_info_cache, 这两个
+    // 只给"必须拿到当刻真值"的调用方; 常规查询请用 get_algo_info_cached 的追加出参。
+    bool algo_get_crc(bool* out_valid, uint16_t* out_crc);
+    bool algo_get_heap(uint16_t* out_size, uint16_t* out_used);
     bool set_global(uint8_t gparam_id, uint32_t value);       // 写全局 CSD 配置(仅影子, 不重初始化)
     bool start_host_global_set(uint8_t gparam_id, uint32_t value);
     bool get_global(uint8_t gparam_id, uint32_t* out_value);  // 读全局 CSD 配置
@@ -281,6 +299,8 @@ private:
     enum class SpiOp : uint8_t { NONE, SET_PARAM, GET_PARAM, GET_RAW, SET_MODE, APPLY, RUNTIME_PARAM_APPLY, FOCUS_SCAN, CALIBRATE, BASELINE_RESET, MEASURE_CP, GET_CP,
                                  UPLOAD_ALGO, GET_ALGO_INFO, SET_ALGO_ROM, GET_ALGO_ROM,
                                  ALGO_GET_TRACE, ALGO_SET_CFG, ALGO_GET_CFG,
+                                 // ABI v2: 逐通道 cfg_ch + 共享堆 + 槽内容 CRC(内容对账)
+                                 ALGO_SET_CFG_CH, ALGO_GET_CFG_CH, ALGO_GET_HEAP, ALGO_GET_CRC, ALGO_GET_CAPS,
                                  SET_GLOBAL, GET_GLOBAL, GLOBAL_COMMIT, AUTO_TUNE };
     volatile bool _core1_running = false;   // core1_run() 已接管 SPI 后置真
 
@@ -329,6 +349,17 @@ private:
     volatile uint8_t _algo_info_available = 0;
     volatile uint8_t _algo_info_valid = 0;
     volatile uint16_t _algo_info_len = 0;
+    // ABI v2 追加缓存项(与 valid/len 同一 seqlock 临界区发布, 保证四项互相一致)。
+    // ★取不到就置 0, 但绝不作废整份缓存★: 旧 PSoC 固件不认 0x4C/0x4D, 若因此把 valid/len 也
+    // 一起作废, 上位机连"算法有没有装上"都读不到了 —— 功能倒退。
+    volatile uint16_t _algo_info_crc = 0;
+    volatile uint8_t _algo_info_uploading = 0;
+    volatile uint16_t _algo_heap_used = 0;
+    volatile uint16_t _algo_heap_size = 0;
+    // 容量是 PSoC 固件编译期常量：首次读到后跨 XRES 保留，避免每 100ms 白烧一笔 core1 SPI 事务。
+    volatile uint16_t _algo_slot_cap = 0;
+    volatile uint16_t _algo_heap_cap = 0;
+    bool _algo_caps_mismatch_reported = false;  // 同一固件容量漂移只留一条 SelfHeal 痕迹
     volatile uint32_t _algo_info_refresh_ms = 0;
     volatile uint32_t _algo_info_cache_epoch = 0;
     volatile uint32_t _algo_info_epoch = 1;
@@ -467,7 +498,11 @@ private:
     bool _poll_algo_upload_async();
     bool _refresh_algo_info_cache();       // core1 安全位置直接读取 PSoC
     void _invalidate_algo_info_cache();   // core1 写者：链路失效时清空
-    void _publish_algo_info_cache(bool valid, uint16_t len);
+    // crc/heap 取不到时传 0(见成员处注释), uploading 由 INFO 的 b3 给出。
+    void _publish_algo_info_cache(bool valid, uint16_t len, uint16_t crc = 0u,
+                                  bool uploading = false, uint16_t heap_used = 0u,
+                                  uint16_t heap_size = 0u, bool caps_read = false,
+                                  uint16_t slot_cap = 0u, uint16_t heap_cap = 0u);
     bool _start_runtime_param_apply(uint8_t ch, uint8_t gain, uint8_t div);
     bool _start_host_write(SpiOp op, uint8_t ch, uint8_t pid = 0u, uint32_t val = 0u);
     bool _submit(SpiOp op, uint8_t ch, uint8_t pid, uint32_t val, uint32_t* out, const uint8_t* data = nullptr,

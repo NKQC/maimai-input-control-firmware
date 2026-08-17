@@ -61,6 +61,7 @@ ALGO_SETTING_META(0, "rise_permille", "u8", 15, 0, 255, "", "")
 ALGO_SETTING_META(1, "drop_permille", "u8", 25, 0, 255, "", "")
 ALGO_SETTING_META(2, "window_ms", "u8", 5, 0, 255, "", "")
 ALGO_SETTING_META(3, "bsln_offset", "i8", 0, -128, 127, "", "")
+ALGO_SETTING_META(4, "stay_active_permille", "u8", 0, 0, 255, "", "")
 
 /* ---- forward declarations (bodies defined after algo(), see file footer)
  * _udiv1000() is force-inlined via always_inline: it is called twice from
@@ -157,6 +158,18 @@ void algo(algo_io_t *io)
         st->z_lt             = io->now_ms;
     }
 
+    /* Calculate stay_active_threshold: if cfg[4] (stay_active_permille) is set,
+     * compute baseline * stay_active_permille / 1000. When the filtered diff
+     * exceeds this threshold during an active touch, forced_release is blocked,
+     * preventing accidental release from transient interference. Default 0 means
+     * the feature is disabled (threshold = 0, never blocks). */
+    uint16_t stay_active_threshold = 0u;
+    if (io->cfg[4] != 0u)
+    {
+        uint32_t thresh = _udiv1000((uint32_t)io->baseline * (uint32_t)io->cfg[4]);
+        stay_active_threshold = (thresh > 0xFFFFu) ? 0xFFFFu : (uint16_t)thresh;
+    }
+
     {
         uint32_t now = io->now_ms;
         uint32_t win = (io->cfg[2] != 0u) ? (uint32_t)io->cfg[2] : _HDR_WINDOW_MS;  /* window_ms(cfg[2]) */
@@ -245,10 +258,23 @@ void algo(algo_io_t *io)
             override_active = 1;
             if ((st->z_h - d) > (int32_t)st->x_delta_rise)
             {
-                st->forced_release = 1u;
-                override_active    = 0;
-                st->z_h  = d; st->z_l  = d;
-                st->z_ht = now; st->z_lt = now;
+                /* High-diff protection: if stay_active_threshold is configured
+                 * and the current filtered diff exceeds it, block forced_release.
+                 * This prevents accidental release when a strong, stable touch
+                 * is briefly disturbed by a transient interference (e.g., hand
+                 * brushing past the sensor). The touch remains active until diff
+                 * naturally drops below the threshold. */
+                if ((stay_active_threshold > 0u) && ((uint16_t)d > stay_active_threshold))
+                {
+                    /* Do nothing: stay active, do not enter forced_release. */
+                }
+                else
+                {
+                    st->forced_release = 1u;
+                    override_active    = 0;
+                    st->z_h  = d; st->z_l  = d;
+                    st->z_ht = now; st->z_lt = now;
+                }
             }
         }
 

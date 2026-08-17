@@ -15,48 +15,8 @@ void Mai2VcamLockModule() { InterlockedIncrement(&g_moduleLocks); }
 void Mai2VcamUnlockModule() { InterlockedDecrement(&g_moduleLocks); }
 long Mai2VcamModuleLocks() { return InterlockedCompareExchange(&g_moduleLocks, 0, 0); }
 
-void Mai2VcamLog(const char* format, ...) {
-    // 日志目录与上位机安装目录同源; 建不出来就直接放弃(过滤器绝不能因为日志失败而失败)。
-    wchar_t directory[MAX_PATH] = {0};
-    DWORD written = GetEnvironmentVariableW(L"ProgramData", directory, MAX_PATH);
-    if (written == 0 || written >= MAX_PATH) {
-        return;
-    }
-    wchar_t path[MAX_PATH] = {0};
-    wcsncpy_s(path, MAX_PATH, directory, _TRUNCATE);
-    wcsncat_s(path, MAX_PATH, L"\\mai2control", _TRUNCATE);
-    CreateDirectoryW(path, nullptr);
-    wcsncat_s(path, MAX_PATH, L"\\mai2vcam_dshow.log", _TRUNCATE);
-
-    HANDLE file = CreateFileW(path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
-                             OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (file == INVALID_HANDLE_VALUE) {
-        return;
-    }
-    char line[1024] = {0};
-    SYSTEMTIME now = {};
-    GetLocalTime(&now);
-    int header = _snprintf_s(line, sizeof(line), _TRUNCATE, "[%04u-%02u-%02u %02u:%02u:%02u.%03u pid=%lu] ",
-                             now.wYear, now.wMonth, now.wDay, now.wHour, now.wMinute, now.wSecond,
-                             now.wMilliseconds, GetCurrentProcessId());
-    if (header < 0) {
-        CloseHandle(file);
-        return;
-    }
-    va_list args;
-    va_start(args, format);
-    _vsnprintf_s(line + header, sizeof(line) - header, _TRUNCATE, format, args);
-    va_end(args);
-    size_t length = strlen(line);
-    if (length + 2 < sizeof(line)) {
-        line[length++] = '\r';
-        line[length++] = '\n';
-        line[length] = '\0';
-    }
-    DWORD bytes = 0;
-    WriteFile(file, line, (DWORD)length, &bytes, nullptr);
-    CloseHandle(file);
-}
+// Mai2VcamLog 的实现已移到 vcam_log.cpp: MF 媒体源那个 DLL 也要用同一份日志, 而它不能包含
+// 本 TU(这里定义 DirectShow 的 CLSID 与媒体类型工具)。声明在 vcam_queue_layout.h。
 
 HRESULT Mai2VcamCopyMediaType(AM_MEDIA_TYPE* destination, const AM_MEDIA_TYPE* source) {
     if (destination == nullptr || source == nullptr) {

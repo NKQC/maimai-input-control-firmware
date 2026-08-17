@@ -69,6 +69,9 @@ pub enum RequestKind {
     AlgoGetCfg {
         idx: u8,
     },
+    /// 逐通道算法配置的全量回读(ALGO_GET_CFG_CH)。无参数 ⇒ 天然是窗口=1:
+    /// 一帧就带回 36×8 全量, 同时挂两条在途只会互相挤掉设备的单个读响应槽。
+    RequestAlgoCfgCh,
     RequestAlgoSrc,
     RequestAlgoCode,
     BusXfer,
@@ -117,6 +120,7 @@ impl RequestKind {
             ),
             Self::AlgoGetRom => "ALGO_GET_ROM".to_string(),
             Self::AlgoGetCfg { idx } => format!("ALGO_GET_CFG(idx={})", idx),
+            Self::RequestAlgoCfgCh => "ALGO_GET_CFG_CH".to_string(),
             Self::RequestAlgoSrc => "ALGO_GET_SRC".to_string(),
             Self::RequestAlgoCode => "ALGO_GET_CODE".to_string(),
 
@@ -154,6 +158,7 @@ impl RequestKind {
             Self::AlgoGetInfo => HostCmd::AlgoGetInfo,
             Self::AlgoGetRom => HostCmd::AlgoGetRom,
             Self::AlgoGetCfg { .. } => HostCmd::AlgoGetCfg,
+            Self::RequestAlgoCfgCh => HostCmd::AlgoGetCfgCh,
             Self::RequestAlgoSrc => HostCmd::AlgoGetSrc,
             Self::RequestAlgoCode => HostCmd::AlgoGetCode,
             Self::BusXfer => HostCmd::BusXfer,

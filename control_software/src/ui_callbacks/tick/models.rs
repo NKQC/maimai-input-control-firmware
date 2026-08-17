@@ -68,6 +68,9 @@
     if ctrl.batch_sel_version() != last_batch_sel_version
         || current_param_version != last_param_version
         || channel_changed
+        // 换算法后逐通道声明会变(项数/别名/默认值), 而上面三个门控都看不见 schema 的变化 ——
+        // 不加这一条, 批量抽屉里的算法行会一直停在上一版算法的清单上。
+        || ctrl.algo_schema_version() != last_batch_algo_schema_version
     {
         // 先补空再取版本号: 补空自身会 bump 版本, 顺序反了会多触发一次无谓的行模型重建。
         ctrl.batch_fill_missing_values();
@@ -88,6 +91,54 @@
             // 16ms 把用户正在编辑的那一行推回设备值(GuardedSpinBox 有焦点守卫, 但没必要多此一举)。
             if batch_params_model.row_data(i).as_ref() != Some(&row) {
                 batch_params_model.set_row_data(i, row);
+            }
+        }
+        // ---- 逐通道算法配置(cfg_ch): 与上面的硬件参数**同款**参与批量设置 ----
+        // 勾选决定写不写、值取自源通道且可手改、-1 显示"—"。三件事都与 batch_param_rows 一致,
+        // 因为在用户眼里它就是"又一批每通道各一份的可调项"; 交互长得不一样等于宣布这一区规则另算。
+        last_batch_algo_schema_version = ctrl.algo_schema_version();
+        ui.set_batch_algo_ch_selected(slint::ModelRc::new(slint::VecModel::from(
+            ctrl.batch_algo_ch_selected())));
+        let algo_ch_values = ctrl.batch_algo_ch_values();
+        let batch_algo_rows: Vec<AlgoSettingRow> = ctrl
+            .algo_setting_decls()
+            .into_iter()
+            .filter(|decl| decl.per_channel)
+            .map(|decl| {
+                let (alias, description) = ctrl.algo_decl_text_named(
+                    1,
+                    decl.idx + mai2control_ui::proto::algo::ALGO_CFG_CH_META_BASE,
+                    &decl.name,
+                    &decl.alias,
+                    &decl.description,
+                );
+                AlgoSettingRow {
+                    idx: decl.idx as i32,
+                    name: decl.name.into(),
+                    default_val: decl.default as i32,
+                    // ★这里不能用 algo_cfg_ch()★ 那个会回落到声明默认值; 批量面板写下去是要真发到
+                    // 一批通道的, 拿一个从未与设备核对过的默认值冒充"源通道当前值"就是在覆盖用户
+                    // 没打算改的东西。故用 batch_algo_ch_values 的 -1 哨兵如实显示"尚无值"。
+                    value: algo_ch_values.get(decl.idx as usize).copied().unwrap_or(-1),
+                    value_type: decl.value_type.into(),
+                    range: decl.range.into(),
+                    description: description.into(),
+                    alias: alias.into(),
+                    shared_scope: false,
+                }
+            })
+            .collect();
+        while batch_algo_ch_rows_model_timer.row_count() > batch_algo_rows.len() {
+            batch_algo_ch_rows_model_timer
+                .remove(batch_algo_ch_rows_model_timer.row_count() - 1);
+        }
+        for (row, setting) in batch_algo_rows.into_iter().enumerate() {
+            if row < batch_algo_ch_rows_model_timer.row_count() {
+                if batch_algo_ch_rows_model_timer.row_data(row).as_ref() != Some(&setting) {
+                    batch_algo_ch_rows_model_timer.set_row_data(row, setting);
+                }
+            } else {
+                batch_algo_ch_rows_model_timer.push(setting);
             }
         }
     }

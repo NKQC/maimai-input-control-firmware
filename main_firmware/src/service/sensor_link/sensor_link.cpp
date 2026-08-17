@@ -227,6 +227,8 @@ void SensorLink::init() {
 
     dispatcher->register_handler(HostCmd::ALGO_SET_CFG, _handle_algo_set_cfg);
     dispatcher->register_handler(HostCmd::ALGO_GET_CFG, _handle_algo_get_cfg);
+    dispatcher->register_handler(HostCmd::ALGO_SET_CFG_CH, _handle_algo_set_cfg_ch);
+    dispatcher->register_handler(HostCmd::ALGO_GET_CFG_CH, _handle_algo_get_cfg_ch);
     dispatcher->register_handler(HostCmd::ALGO_GET_SRC, _handle_algo_get_src);
     dispatcher->register_handler(HostCmd::ALGO_SET_SRC, _handle_algo_set_src);
     dispatcher->register_handler(HostCmd::ALGO_GET_CODE, _handle_algo_get_code);
@@ -241,11 +243,20 @@ void SensorLink::_poll_host_write() {
         _host_write.complete = true;
         return;
     }
-    if (_host_write.kind == HostWriteState::Kind::ALGO_ROM) {
-        PsocAlgo::getInstance()->set_rom(_host_write.a, static_cast<uint16_t>(_host_write.value));
-        _host_write.rom_index++;
-        if (_host_write.rom_index < _host_write.rom_count) {
-            if (_start_next_host_rom()) return;
+    // 批量类(ROM / CFG_CH): 每条 PSoC 终态回来就落一条 RP 存储, 再投下一条; 全部完成才 ACK。
+    // 落存储放在"PSoC 这条成功之后"是刻意的: RP 存储是下次启动重新下发的真相源, 不能把 PSoC
+    // 根本没收下的值记成既成事实。
+    if (_host_write.kind == HostWriteState::Kind::ALGO_ROM ||
+        _host_write.kind == HostWriteState::Kind::ALGO_CFG_CH) {
+        if (_host_write.kind == HostWriteState::Kind::ALGO_ROM) {
+            PsocAlgo::getInstance()->set_rom(_host_write.a, static_cast<uint16_t>(_host_write.value));
+        } else {
+            PsocAlgo::getInstance()->set_cfg_ch(_host_write.a, _host_write.b,
+                                                static_cast<uint8_t>(_host_write.value));
+        }
+        _host_write.batch_index++;
+        if (_host_write.batch_index < _host_write.batch_count) {
+            if (_start_next_host_batch()) return;
             _host_write.ok = false;
             _host_write.complete = true;
             return;
@@ -274,13 +285,17 @@ void SensorLink::_poll_host_write() {
     _host_write.complete = true;
 }
 
-bool SensorLink::_start_next_host_rom() {
-    if (_host_write.rom_index >= _host_write.rom_count) return false;
-    const uint8_t index = _host_write.rom_index;
-    _host_write.a = _host_write.rom_ch[index];
-    _host_write.value = _host_write.rom_value[index];
-    return Psoc::getInstance()->start_host_algo_set_rom(_host_write.a,
-                                                         static_cast<uint16_t>(_host_write.value));
+bool SensorLink::_start_next_host_batch() {
+    if (_host_write.batch_index >= _host_write.batch_count) return false;
+    const HostWriteState::BatchEntry& e = _host_write.batch[_host_write.batch_index];
+    _host_write.a = e.a;
+    _host_write.b = e.b;
+    _host_write.value = e.value;
+    Psoc* psoc = Psoc::getInstance();
+    if (_host_write.kind == HostWriteState::Kind::ALGO_CFG_CH) {
+        return psoc->start_host_algo_set_cfg_ch(e.a, e.b, static_cast<uint8_t>(e.value));
+    }
+    return psoc->start_host_algo_set_rom(e.a, e.value);
 }
 
 bool SensorLink::_start_host_write(HostWriteState::Kind kind, const HostFrame& frame,
@@ -314,6 +329,9 @@ bool SensorLink::_start_host_write(HostWriteState::Kind kind, const HostFrame& f
             break;
         case HostWriteState::Kind::ALGO_ROM:
             accepted = psoc->start_host_algo_set_rom(a, static_cast<uint16_t>(value));
+            break;
+        case HostWriteState::Kind::ALGO_CFG_CH:
+            accepted = psoc->start_host_algo_set_cfg_ch(a, b, static_cast<uint8_t>(value));
             break;
         case HostWriteState::Kind::CALIBRATE:
             accepted = psoc->start_host_calibrate(a);
@@ -1336,6 +1354,12 @@ void SensorLink::_handle_psoc_rescue(const HostFrame& frame, uint8_t* response, 
         return;
     }
     updater->rescue_request();
+    // ★救援 = 显式把被隔离的算法重新放行★
+    // 隔离(连续 3 次致命)之后 PSoC 跑的是原生 CapSense, 用户算法仍完好躺在 flash 里。用户点
+    // "救援"的意思就是"我知道它之前搞死过, 再给它一次机会"(通常他刚在外部改过 ROM/cfg 或就是
+    // 想复现)。clear_quarantine 同时会重新武装一次下发, 使解禁立刻生效而不是等下次复位。
+    // 这也是"任何门禁都不许把上传通道永久锁死"的最后一道人工出口。
+    PsocAlgo::getInstance()->clear_quarantine();
     SensorLink* self = getInstance();
     self->_rescue_ticks = 0;
     TxScheduler::getInstance()->schedule(TX_TASK_RESCUE, RESCUE_INTERVAL_US, RESCUE_LEASE_MS,
@@ -2103,7 +2127,26 @@ void SensorLink::_handle_global_get_all(const HostFrame& frame, uint8_t* respons
 
 // ---- JIT 算法引擎命令 ----
 void SensorLink::_handle_algo_get_info(const HostFrame& frame, uint8_t* response, uint16_t* response_length) {
-    // 空请求 → [is_default(u8), psoc_valid(u8), len(u16 LE), crc16(u16 LE)]
+    // 空请求 → 响应布局(前 6 字节的语义与偏移与旧固件**逐字节相同**, 只在尾部追加):
+    //   [0]      is_default
+    //   [1]      psoc_valid
+    //   [2..3]   store_len    (u16 LE) RP 存储的算法长度
+    //   [4..5]   store_crc16  (u16 LE) RP 存储的算法 CRC16
+    //   [6..7]   psoc_len     (u16 LE) ★PSoC 槽内实际长度
+    //   [8..9]   psoc_crc16   (u16 LE) ★PSoC 槽内实际内容 CRC16(PSoC commit 时算出)
+    //   [10..11] heap_used    (u16 LE) ★算法共享堆峰值占用
+    //   [12..13] heap_size    (u16 LE) ★算法共享堆容量
+    //   [14]     flags: bit0=quarantined bit1=download_pending bit2=uploading bit3=psoc_cache_unavailable
+    //   [15..16] slot_capacity (u16 LE): PSoC 自报可执行槽容量；读不到回 RP 上限作兜底
+    //   [17..18] upload_limit  (u16 LE): 单帧算法代码上限 = HOST_CMD_PAYLOAD_MAX - 4
+    //   [19..22] src_capacity  (u32 LE): C 源存储容量
+    //   [23..24] src_chunk     (u16 LE): C 源分片粒度
+    //   [25]     caps_flags: bit0=slot_capacity 来自 PSoC；bit1=PSoC 与 RP 槽容量不一致
+    // ★上位机判"上传成功"只能用 psoc_len + psoc_crc16★:
+    //   · store_* 只证明"RP 把字节存下了", 与 PSoC 槽里装的是什么毫无关系;
+    //   · psoc_valid 也不够 —— 它分不出"新算法装上了"和"旧算法还在、长度恰好相同"(同一份源改
+    //     一个常量重编译, 长度几乎必然不变), 这正是"上传成功但行为没变"这类报告的来源。
+    //   判据: psoc_len == store_len && psoc_crc16 == store_crc16 && !uploading。
     PsocAlgo* store = PsocAlgo::getInstance();
     // REST_DEFAULT 的 ACK 仅表示异步请求已受理；先用 RP 侧权威默认元数据回包，避免同一 USB
     // 批次中紧随其后的 GET_INFO 抢在 core1 完成默认 blob 下发前读到旧 PSoC cache。
@@ -2111,16 +2154,29 @@ void SensorLink::_handle_algo_get_info(const HostFrame& frame, uint8_t* response
     const bool reset_pending = store->reset_default_pending();
     bool psoc_valid = false;
     uint16_t psoc_len = 0u;
+    uint16_t psoc_crc16 = 0u;
+    uint16_t heap_used = 0u;
+    uint16_t heap_size = 0u;
+    bool uploading = false;
+    bool cache_ok = false;
     const uint16_t reported_len = reset_pending
         ? static_cast<uint16_t>(PSOC_ALGO_DEFAULT_LEN) : store->len();
     const uint16_t reported_crc16 = reset_pending
         ? static_cast<uint16_t>(PSOC_ALGO_DEFAULT_CRC16) : store->crc16();
     // RESET_DEFAULT ACK 表示恢复已被异步所有者受理；同一 USB 批次里的即时查询据此返回
     // 目标默认元数据。pending 只会在 core1 cache 已确认 valid+540 后清除，普通查询始终报告真值。
+    // ★缓存的 psoc_* 与 flags 无条件取一次★: 即使处于 reset_pending, 上位机也需要看到 PSoC 侧
+    // 真值(否则"恢复默认还没落地"这段时间里界面上完全看不出 PSoC 里现在装的是什么)。
+    cache_ok = Psoc::getInstance()->get_algo_info_cached(&psoc_valid, &psoc_len, &psoc_crc16,
+                                                        &heap_used, &heap_size, &uploading);
+    // 容量独立于 INFO 新鲜度：首次由 PSoC 自报成功后即可复用，读不到才回退 RP 编译期上限。
+    uint16_t slot_capacity = static_cast<uint16_t>(PSOC_ALGO_MAX_LEN);
+    const bool slot_capacity_from_psoc =
+        Psoc::getInstance()->get_algo_caps_cached(&slot_capacity, nullptr);
     if (reset_pending) {
+        // 恢复默认已被异步所有者受理: psoc_valid 先按目标态报, 避免同一 USB 批次里的即时查询
+        // 读到旧自定义信息(下发仍由 tick() 异步完成)。psoc_len/psoc_crc16 保持缓存真值不篡改。
         psoc_valid = true;
-    } else {
-        Psoc::getInstance()->get_algo_info_cached(&psoc_valid, &psoc_len);
     }
 
     // HostFrame 为 4102B；core0 栈只有 8192B 且下界就是堆顶，响应帧必须借共享静态工作帧。
@@ -2136,6 +2192,40 @@ void SensorLink::_handle_algo_get_info(const HostFrame& frame, uint8_t* response
     resp.payload[p++] = static_cast<uint8_t>(reported_len >> 8);
     resp.payload[p++] = static_cast<uint8_t>(reported_crc16);
     resp.payload[p++] = static_cast<uint8_t>(reported_crc16 >> 8);
+    resp.payload[p++] = static_cast<uint8_t>(psoc_len);
+    resp.payload[p++] = static_cast<uint8_t>(psoc_len >> 8);
+    resp.payload[p++] = static_cast<uint8_t>(psoc_crc16);
+    resp.payload[p++] = static_cast<uint8_t>(psoc_crc16 >> 8);
+    resp.payload[p++] = static_cast<uint8_t>(heap_used);
+    resp.payload[p++] = static_cast<uint8_t>(heap_used >> 8);
+    resp.payload[p++] = static_cast<uint8_t>(heap_size);
+    resp.payload[p++] = static_cast<uint8_t>(heap_size >> 8);
+    // flags: 隔离/推迟是 RP 侧的策略态, uploading/cache 不可用是 PSoC 侧的采集态。
+    // 没有这一字节, "算法存着但设备就是不跑它"在界面上完全无法解释(只能看成设备坏了)。
+    uint8_t flags = 0u;
+    if (store->quarantined()) flags |= 0x01u;
+    if (store->download_pending()) flags |= 0x02u;
+    if (uploading) flags |= 0x04u;
+    if (!cache_ok) flags |= 0x08u;   // psoc_len/psoc_crc16/heap_* 本次不可信(链路抖动或缓存过期)
+    resp.payload[p++] = flags;
+    // ★槽上限与单帧上限必须分开上报★ 槽可装 4096B，但 ALGO_UPLOAD 的 len/crc 头占 4B，
+    // 混成同一个数会让 4093..4096B 的算法在上传门口被拒却无从解释。
+    resp.payload[p++] = static_cast<uint8_t>(slot_capacity);
+    resp.payload[p++] = static_cast<uint8_t>(slot_capacity >> 8);
+    const uint16_t upload_limit = static_cast<uint16_t>(HOST_CMD_PAYLOAD_MAX - 4u);
+    resp.payload[p++] = static_cast<uint8_t>(upload_limit);
+    resp.payload[p++] = static_cast<uint8_t>(upload_limit >> 8);
+    const uint32_t src_capacity = PSOC_ALGO_SRC_MAX;
+    resp.payload[p++] = static_cast<uint8_t>(src_capacity);
+    resp.payload[p++] = static_cast<uint8_t>(src_capacity >> 8);
+    resp.payload[p++] = static_cast<uint8_t>(src_capacity >> 16);
+    resp.payload[p++] = static_cast<uint8_t>(src_capacity >> 24);
+    const uint16_t src_chunk = static_cast<uint16_t>(HOST_CMD_ALGO_SRC_CHUNK);
+    resp.payload[p++] = static_cast<uint8_t>(src_chunk);
+    resp.payload[p++] = static_cast<uint8_t>(src_chunk >> 8);
+    uint8_t caps_flags = slot_capacity_from_psoc ? 0x01u : 0u;
+    if (slot_capacity_from_psoc && slot_capacity != PSOC_ALGO_MAX_LEN) caps_flags |= 0x02u;
+    resp.payload[p++] = caps_flags;
     resp.len = p;
     *response_length = HostCmdCodec::encode_frame(resp, response, HOST_CMD_RESP_BUF_MAX);
 }
@@ -2152,8 +2242,12 @@ void SensorLink::_handle_algo_upload(const HostFrame& frame, uint8_t* response, 
     const uint16_t crc16 = static_cast<uint16_t>(frame.payload[2]) |
                            (static_cast<uint16_t>(frame.payload[3]) << 8);
     if (len == 0u || len > PSOC_ALGO_MAX_LEN || (uint32_t)frame.len < 4u + (uint32_t)len) {
+        // ★单帧承载上限比槽小 4 字节★ payload 固定 4096 而本命令要占 4 字节头(len+crc16),
+        // 故一帧最多带 4092 字节代码; 槽本身是 4096。真要用满 4096 必须先给 ALGO_UPLOAD 加分片
+        // (照 ALGO_SET_SRC 的 offset/total 协议), 那要上位机同步改, 不在本次改动范围。
+        // 这里把上限如实写进错误文案, 免得用户对着"len invalid"猜半天。
         *response_length = HostCmdCodec::encode_nak(frame.seq, HostCmdError::INVALID_PARAM,
-            "algo_upload len invalid", response, HOST_CMD_RESP_BUF_MAX);
+            "algo_upload len invalid(单帧最多 4092 字节代码)", response, HOST_CMD_RESP_BUF_MAX);
         return;
     }
     // ★必须先挡住"上一次下发还没做完"★: blob 缓冲被 core1 持有, 此刻 set_algo 改写它会让 PSoC
@@ -2169,24 +2263,18 @@ void SensorLink::_handle_algo_upload(const HostFrame& frame, uint8_t* response, 
             "algo crc16 mismatch", response, HOST_CMD_RESP_BUF_MAX);
         return;
     }
-    // 下发已受理(异步, 重活在 core1)。真实结果经 ALGO_GET_INFO 的 psoc_valid/len 回读对账,
-    // 失败则由主循环上报 SELF_HEAL_EVENT(SH_ALGO_FALLBACK, detail=1)。
-    // ★把失败原因分开, 不要都报成同一句 SENSOR_ERROR★
-    // download_to_psoc 只有三个失败出口: 链路不可用 / 存储为空 / 入队失败。原先一律回
-    // "algo download enqueue failed", 于是链路瞬断也被说成入队失败, 排查时完全指错方向(实测踩过)。
-    // 链路类是【可重试】的, 必须回 DEVICE_BUSY 让上位机自动重试, 而不是 SENSOR_ERROR 让用户以为算法坏了。
-    // 用去抖后的 link_alive(): 遥测流式期间瞬时 link_ok 频繁为 false, 会把上传全部拒掉。
-    if (!Psoc::getInstance()->link_alive()) {
-        *response_length = HostCmdCodec::encode_nak(frame.seq, HostCmdError::DEVICE_BUSY,
-            "PSoC 链路暂时不可用(可能正在重初始化), 请稍后重试", response, HOST_CMD_RESP_BUF_MAX);
-        return;
-    }
-    // 只入队代码下发即返回, ROM/cfg 由 PsocAlgo::tick() 补推(同步推会把 ACK 拖到几秒后)。
-    if (!store->request_download(Psoc::getInstance())) {
-        *response_length = HostCmdCodec::encode_nak(frame.seq, HostCmdError::DEVICE_BUSY,
-            "算法下发入队失败(core1 正忙于重校准/重初始化), 请稍后重试", response, HOST_CMD_RESP_BUF_MAX);
-        return;
-    }
+    // ★存储优先, 下发尽力★
+    // 这里【刻意删掉了原来的 !link_alive() ⇒ NAK】。原逻辑的后果: PSoC 正被坏算法搞死(链路自然
+    // 不可用)时, 用户想传一份修好的算法进来会被一律拒收 —— 而"传新算法"恰恰是唯一的自救手段,
+    // 于是设备进入一个用户无法脱出的死锁(只能重烧 PSoC)。
+    // 现在: blob 已经 set_algo 存进 RP 并落 flash(上面那步), 即使这一刻发不出去也不会丢:
+    //   · set_algo 内部已 clear_quarantine() + 置 _download_pending ⇒ 新算法必然获得一次运行机会;
+    //   · PsocAlgo::tick() 会在链路恢复/core1 空闲后自动把它推下去(500ms 节流重试);
+    //   · 即便本次上电一直发不出去, 下次 PSoC 启动的 provisioning 也会下发它(R1)。
+    // request_download() 现在恒返回"已受理"(链路不可用/入队失败只是推迟, 见其注释), 故它不再
+    // 产生任何 NAK 出口。ACK 的语义是"已存下并受理下发", 真实生效由 ALGO_GET_INFO 的
+    // psoc_len/psoc_crc16 回读对账(失败则主循环上报 SELF_HEAL_EVENT(SH_ALGO_FALLBACK))。
+    (void)store->request_download(Psoc::getInstance());
     *response_length = HostCmdCodec::encode_ack(frame.seq, response, HOST_CMD_RESP_BUF_MAX);
 }
 
@@ -2252,14 +2340,15 @@ void SensorLink::_handle_algo_set_rom(const HostFrame& frame, uint8_t* response,
     self->_host_write.kind = HostWriteState::Kind::ALGO_ROM;
     self->_host_write.cmd = frame.cmd;
     self->_host_write.seq = frame.seq;
-    self->_host_write.rom_count = count;
+    self->_host_write.batch_count = count;
     for (uint8_t i = 0; i < count; ++i) {
         const uint16_t p = static_cast<uint16_t>(i) * 3u;
-        self->_host_write.rom_ch[i] = frame.payload[p];
-        self->_host_write.rom_value[i] = static_cast<uint16_t>(frame.payload[p + 1]) |
-                                         (static_cast<uint16_t>(frame.payload[p + 2]) << 8);
+        self->_host_write.batch[i].a = frame.payload[p];
+        self->_host_write.batch[i].b = 0u;
+        self->_host_write.batch[i].value = static_cast<uint16_t>(frame.payload[p + 1]) |
+                                           (static_cast<uint16_t>(frame.payload[p + 2]) << 8);
     }
-    if (!self->_start_next_host_rom()) {
+    if (!self->_start_next_host_batch()) {
         self->_host_write.clear();
         *response_length = HostCmdCodec::encode_nak(frame.seq, HostCmdError::DEVICE_BUSY,
             "PSoC algo_set_rom enqueue failed", response, HOST_CMD_RESP_BUF_MAX);
@@ -2332,6 +2421,70 @@ void SensorLink::_handle_algo_get_cfg(const HostFrame& frame, uint8_t* response,
     resp.payload[0] = idx;
     resp.payload[1] = PsocAlgo::getInstance()->cfg(idx);   // 直读 RP 存储的真相源(不下发 PSoC 查询)
     resp.len = 2;
+    *response_length = HostCmdCodec::encode_frame(resp, response, HOST_CMD_RESP_BUF_MAX);
+}
+
+void SensorLink::_handle_algo_set_cfg_ch(const HostFrame& frame, uint8_t* response, uint16_t* response_length) {
+    // payload = [ch(u8), idx(u8), val(u8)] × N。逐通道 cfg_ch[ch][idx](ABI v2)。
+    // 与 ALGO_SET_ROM 完全同构: 整帧先全量校验, 再走**唯一的** host-write 所有者逐条下发,
+    // 全部条目完成才 ACK —— 半张帧被当成成功是最难查的一类问题(设备与界面从此各说各话)。
+    if (frame.len == 0u || (frame.len % 3u) != 0u ||
+        frame.len > PSOC_ALGO_CHANNELS * 8u * 3u) {
+        *response_length = HostCmdCodec::encode_nak(frame.seq, HostCmdError::INVALID_PARAM,
+            "algo_set_cfg_ch payload must be 1..288 [ch,idx,val] entries", response, HOST_CMD_RESP_BUF_MAX);
+        return;
+    }
+    SensorLink* self = getInstance();
+    if (self->_host_write.active) {
+        *response_length = HostCmdCodec::encode_nak(frame.seq, HostCmdError::DEVICE_BUSY,
+            "PSoC host write slot busy", response, HOST_CMD_RESP_BUF_MAX);
+        return;
+    }
+    const uint16_t count = static_cast<uint16_t>(frame.len / 3u);
+    for (uint16_t i = 0; i < count; ++i) {
+        const uint16_t p = static_cast<uint16_t>(i * 3u);
+        if (frame.payload[p] >= PSOC_ALGO_CHANNELS || frame.payload[p + 1] >= 8u) {
+            *response_length = HostCmdCodec::encode_nak(frame.seq, HostCmdError::INVALID_PARAM,
+                "algo_set_cfg_ch ch/idx out of range", response, HOST_CMD_RESP_BUF_MAX);
+            return;
+        }
+    }
+    self->_host_write.clear();
+    self->_host_write.active = true;
+    self->_host_write.kind = HostWriteState::Kind::ALGO_CFG_CH;
+    self->_host_write.cmd = frame.cmd;
+    self->_host_write.seq = frame.seq;
+    self->_host_write.batch_count = count;
+    for (uint16_t i = 0; i < count; ++i) {
+        const uint16_t p = static_cast<uint16_t>(i * 3u);
+        self->_host_write.batch[i].a = frame.payload[p];
+        self->_host_write.batch[i].b = frame.payload[p + 1];
+        self->_host_write.batch[i].value = frame.payload[p + 2];
+    }
+    if (!self->_start_next_host_batch()) {
+        self->_host_write.clear();
+        *response_length = HostCmdCodec::encode_nak(frame.seq, HostCmdError::DEVICE_BUSY,
+            "PSoC algo_set_cfg_ch enqueue failed", response, HOST_CMD_RESP_BUF_MAX);
+        return;
+    }
+    *response_length = 0u;   // 终态由 take_host_write_terminal 延迟 ACK
+}
+
+void SensorLink::_handle_algo_get_cfg_ch(const HostFrame& frame, uint8_t* response, uint16_t* response_length) {
+    // 空请求 → 288 字节(ch 主序, 每 ch 连续 8 字节)。回的是 **RP 存储的真相源**:
+    // 它才是"下次 PSoC 启动会被下发什么"的依据; 去查 PSoC 反而会在算法无效/正在上传时读到 0。
+    PsocAlgo* store = PsocAlgo::getInstance();
+    // HostFrame 为 4102B；core0 栈只有 8192B 且下界就是堆顶，响应帧必须借共享静态工作帧。
+    HostFrame& resp = HostCmdCodec::resp_frame();
+    resp.clear();
+    resp.cmd = static_cast<uint8_t>(HostCmd::ALGO_GET_CFG_CH);
+    resp.flags = HOST_CMD_FLAG_RESPONSE;
+    resp.seq = frame.seq;
+    uint16_t p = 0;
+    for (uint8_t ch = 0; ch < PSOC_ALGO_CHANNELS; ++ch) {
+        for (uint8_t idx = 0; idx < 8u; ++idx) resp.payload[p++] = store->cfg_ch(ch, idx);
+    }
+    resp.len = p;
     *response_length = HostCmdCodec::encode_frame(resp, response, HOST_CMD_RESP_BUF_MAX);
 }
 

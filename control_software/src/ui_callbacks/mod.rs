@@ -113,8 +113,16 @@ pub(crate) fn setup_ui_callbacks(
     let report_show = algo_state.report_show.clone();
     let algo_report_lines_model = algo_state.algo_report_lines_model.clone();
 
-    // 编译容量(PSoC 可执行槽字节数)一次性回填, 供进度条计算占用百分比。
-    ui.set_algo_asm_capacity(AppController::algo_slot_capacity() as i32);
+    // 编译容量(PSoC 可执行槽字节数)开机首帧回填。
+    // ★不再是"一次性"★: 容量的真相源已改成设备回报值(ALGO_GET_INFO 的容量组), 此刻还没连上,
+    // 这里填的是内置兜底值; 连上后由 tick 用设备真值覆盖, 并置 algo_caps_known 让界面注明来源。
+    {
+        let ctrl = controller.borrow();
+        ui.set_algo_asm_capacity(ctrl.algo_slot_capacity() as i32);
+        ui.set_algo_upload_limit(ctrl.algo_upload_limit() as i32);
+        ui.set_algo_heap_capacity(ctrl.algo_heap_capacity() as i32);
+        ui.set_algo_caps_known(ctrl.algo_caps_known());
+    }
 
     // 分区图绘制视框 = 分区几何并集 bbox, 一次性回填, 使圆形分区图缩放铺满画布(去 16:9 留白)。
     {
@@ -157,6 +165,12 @@ pub(crate) fn setup_ui_callbacks(
         ui.set_curve_series_expanded(cfg.get_bool(k::CURVE_SERIES_EXPANDED, true));
         ui.set_curve_spectrum_expanded(cfg.get_bool(k::CURVE_SPECTRUM_EXPANDED, false));
         ui.set_channel_show_disabled(cfg.get_bool(k::CHANNEL_SHOW_DISABLED, false));
+        // 批量抽屉里两个算法分区的展开态与"全通道算法配置"下拉的选中项。
+        // 与本仓其它折叠区同一约定: 默认值必须与 .slint 的属性默认值一致(两个区都默认收起),
+        // 否则首次启动会被"记忆"改掉初始观感。下拉下标的越界钳制在 .slint 侧做(换算法后项数会变)。
+        ui.set_batch_algo_ch_expanded(cfg.get_bool(k::BATCH_ALGO_CH_EXPANDED, false));
+        ui.set_batch_algo_cfg_expanded(cfg.get_bool(k::BATCH_ALGO_CFG_EXPANDED, false));
+        ui.set_batch_algo_shared_sel(cfg.get_i32(k::BATCH_ALGO_SHARED_SEL, 0).max(0));
         ui.set_phys_live_expanded(cfg.get_bool(k::PHYS_LIVE_EXPANDED, true));
         ui.set_phys_keys_expanded(cfg.get_bool(k::PHYS_KEYS_EXPANDED, false));
         ui.set_phys_la_expanded(cfg.get_bool(k::PHYS_LA_EXPANDED, false));
@@ -213,7 +227,9 @@ pub(crate) fn setup_ui_callbacks(
         vcam_state.vcam.set_mirror_x(ui.get_vcam_mirror_x());
         // 分辨率与占比同理: 只回填 UI 而不落到共享状态, 出画就会一直用默认值。
         // 回填夹取后的实际生效值, 免得界面显示一个从未生效过的数。
-        let (w, h) = vcam_state
+        // 此刻还没有生产者(队列在"启用摄像头"时才建), 所以这里不需要卸载重建 —— 恢复出来的
+        // 尺寸会被随后的建队原样带进队列头。
+        let (w, h, _) = vcam_state
             .vcam
             .set_resolution(ui.get_vcam_frame_w().max(0) as u32, ui.get_vcam_frame_h().max(0) as u32);
         ui.set_vcam_frame_w(w as i32);

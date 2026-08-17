@@ -17,9 +17,21 @@ export component AlgoPage inherits Rectangle {
     in property <string> algo_phase: "";
     in property <string> algo_asm: "";
     in property <int> algo_asm_bytes: 0;
-    in property <int> algo_asm_capacity: 1024;
+    // PSoC 可执行槽容量(4096), 只是进度条分母; 上传闸门另有 algo_upload_limit(4092), 见 Rust 侧。
+    in property <int> algo_asm_capacity: 4096;
     in property <int> algo_c_bytes: 0;
     in property <int> algo_c_capacity: 32768;
+    // 共享堆占用峰值 / 容量。★-1 = 设备未回报(旧固件或缓存不可用)★ 必须显示 "—" 而不是 0:
+    // "算法一个字节都没用堆"与"我们不知道用了多少"是两个完全不同的结论。
+    in property <int> algo_heap_used: -1;
+    in property <int> algo_heap_capacity: 256;
+    // ★上面这些容量是设备回报的★(ALGO_GET_INFO 容量组)。false = 还没回读到, 此刻显示的是内置
+    // 兜底值 —— 必须在文案里注明"容量待回读", 否则用户会把兜底值当成这台设备的真值。
+    in property <bool> algo_caps_known: false;
+    // 编译/上传的唯一闸门(比槽容量小 4 字节的 len+crc16 帧内头)。进度条分母仍用 algo_asm_capacity。
+    in property <int> algo_upload_limit: 4092;
+    // 非空 = 设备两级容量常量不一致, 必须显著显示。
+    in property <string> algo_caps_warning: "";
     property <int> editor_tab: 0; // 0=C 源，1=ASM
     in-out property <float> split_ratio: 0.66;
     property <float> split_drag_start_ratio: 0.66;
@@ -83,7 +95,9 @@ export component AlgoPage inherits Rectangle {
                     min-width: 300px;
                     max-width: 300px;
                     horizontal-stretch: 0;
-                    model: ["v3.1 HDR 默认", "纯白灯演示(触摸点亮)"];
+                    // ★既有两项的下标不能变★ Rust 侧 on_algo_load_template 按下标取模板,
+                    // 在中间插一项会让"纯白灯演示"变成别的东西。新模板一律追加在末尾。
+                    model: ["v3.1 HDR 默认", "纯白灯演示(触摸点亮)", "v4 单通道 HDR(逐通道+防掠过)"];
                     current-index: 0;
                 }
                 Button {
@@ -255,6 +269,23 @@ export component AlgoPage inherits Rectangle {
                             clicked => { root.algo_reset_default(); }
                         }
                         Rectangle { height: 1px; background: #3a4149; }
+                        // 容量一律来自设备; 还没回读到时明说"待回读", 不把兜底值冒充设备真值。
+                        Text {
+                            text: root.algo_caps_known
+                                ? "容量来自设备回报"
+                                : "容量待回读(暂用内置兜底值)";
+                            color: root.algo_caps_known ? #77828c : #f5a623;
+                            font-size: 10px;
+                            wrap: word-wrap;
+                        }
+                        // 两级容量常量不一致: 上传会被一侧放行、另一侧静默截断, 现象是"上传成功但
+                        // 算法跑飞", 两侧日志都看不出原因 ⇒ 必须显眼。
+                        if root.algo_caps_warning != "": Text {
+                            text: "⚠ " + root.algo_caps_warning;
+                            color: #ff6b6b;
+                            font-size: 11px;
+                            wrap: word-wrap;
+                        }
                         Text {
                             text: "C 源：" + root.algo_c_bytes + " / " + root.algo_c_capacity + " 字节";
                             color: root.algo_c_bytes > root.algo_c_capacity ? #ff6b6b : #b0b8c0;
@@ -273,10 +304,14 @@ export component AlgoPage inherits Rectangle {
                                 background: root.algo_c_bytes > root.algo_c_capacity ? #d64545 : #2b8a3e;
                             }
                         }
+                        // 分母是 PSoC 槽容量, 闸门却是单帧上传上限 —— 两个数差 4 字节且都来自设备,
+                        // 一起写出来才不会再排一次"编译得出来却传不进去"。
                         Text {
-                            text: "ASM：" + root.algo_asm_bytes + " / " + root.algo_asm_capacity + " 字节";
-                            color: #b0b8c0;
+                            text: "ASM：" + root.algo_asm_bytes + " / " + root.algo_asm_capacity
+                                + " 字节(上传闸门 " + root.algo_upload_limit + " 字节)";
+                            color: root.algo_asm_bytes > root.algo_upload_limit ? #ff6b6b : #b0b8c0;
                             font-size: 11px;
+                            wrap: word-wrap;
                         }
                         Rectangle {
                             height: 10px;
@@ -289,6 +324,34 @@ export component AlgoPage inherits Rectangle {
                                 height: parent.height;
                                 border-radius: 5px;
                                 background: root.algo_asm_bytes * 10 > root.algo_asm_capacity * 9 ? #f5a623 : #2b8a3e;
+                            }
+                        }
+                        // 共享堆(ABI v2)占用: 与 ASM 条同一手法。未回报时整行显示 "—" 并把进度条清空,
+                        // 绝不用 0 冒充"未知"。
+                        Text {
+                            // 百分比与 ASM 条同一手法; 未回报时整行是 "—", 连百分比也不给
+                            // (算不出来的数不该显示成 0%)。
+                            text: root.algo_heap_used >= 0
+                                ? "堆：" + root.algo_heap_used + " / " + root.algo_heap_capacity
+                                    + " 字节 (" + Math.round(root.algo_heap_used * 100
+                                        / Math.max(1, root.algo_heap_capacity)) + "%)"
+                                : "堆：— / " + root.algo_heap_capacity + " 字节(设备未回报)";
+                            color: #b0b8c0;
+                            font-size: 11px;
+                        }
+                        Rectangle {
+                            height: 10px;
+                            min-width: 120px;
+                            border-radius: 5px;
+                            background: #23282e;
+                            clip: true;
+                            Rectangle {
+                                width: (root.algo_heap_used >= 0 && root.algo_heap_capacity > 0)
+                                    ? parent.width * Math.min(1.0, root.algo_heap_used / root.algo_heap_capacity)
+                                    : 0px;
+                                height: parent.height;
+                                border-radius: 5px;
+                                background: root.algo_heap_used * 10 > root.algo_heap_capacity * 9 ? #f5a623 : #2b8a3e;
                             }
                         }
                         Rectangle { height: 1px; background: #3a4149; }
@@ -348,10 +411,14 @@ export component AlgoPage inherits Rectangle {
                             }
                         }
                         Rectangle { height: 1px; background: #3a4149; }
-                        Text { text: "可调变量"; color: Theme.text-title; font-size: Theme.fs-title; }
+                        // ★本区只列"全通道共享"项(cfg[8])★ 逐通道项(cfg_ch[8])每个通道各一份,
+                        // 在这里摆一个数就必须替用户选一个通道 —— 那是编造事实。它们的编辑入口在
+                        // 单通道精调页(改当前通道)与全通道页批量抽屉(批量写已选通道)。
+                        Text { text: "可调变量(全通道共享 cfg)"; color: Theme.text-title; font-size: Theme.fs-title; }
                         if root.algo_setting_rows.length == 0: Text {
-                            text: "当前源码未声明 ALGO_SETTING。";
+                            text: "当前源码未声明 ALGO_SETTING(共享项)。逐通道项 ALGO_SETTING_CH 请在单通道精调页或全通道页批量抽屉编辑。";
                             color: #77828c;
+                            wrap: word-wrap;
                         }
                         for row in root.algo_setting_rows: AlgoSettingEditorRow {
                             entry: row;

@@ -1,5 +1,7 @@
 #include "psoc.h"
 #include "../../config.h"
+#include "../../service/psoc_algo/psoc_algo.h"   // PSOC_ALGO_MAX_LEN(= PSoC ALGO_SLOT_SIZE), 只取常量
+#include "../../service/self_heal/self_heal.h"  // 容量常量漂移必须推送给上位机留痕
 #include "../../service/latency_stats.h"
 #include "../../hal/usb/hal_usb.h"
 #include <Arduino.h>
@@ -218,8 +220,11 @@ bool Psoc::_poll_algo_upload_async() {
     const bool response_ok = _spi.poll_upload_algo(&complete, &ok, &valid, &len);
     if (!response_ok) {
         if (_algo_upload_async.response_fail_run < 0xFFFFu) _algo_upload_async.response_fail_run++;
+        // ★与 SPI 层同一个上限★(原来两边各写一个 120000u, 改一处必漏一处)。见
+        // PsocSpi::ALGO_UPLOAD_TIMEOUT_MS 注释: 上限长 = 上传通道被 _algo_dl.busy 锁得久。
         if (!complete && _algo_upload_async.response_fail_run < 200u &&
-            (uint32_t)(now_ms - _algo_upload_async.started_ms) < 120000u) return true;
+            (uint32_t)(now_ms - _algo_upload_async.started_ms) <
+                PsocSpi::ALGO_UPLOAD_TIMEOUT_MS) return true;
         _algo_upload_async.clear();
         _algo_dl.failed = 1u;
         _algo_dl.busy = 0u;
@@ -230,7 +235,8 @@ bool Psoc::_poll_algo_upload_async() {
     _algo_upload_async.response_fail_run = 0u;
     if (!complete) {
         if (valid || len != 0u) _publish_algo_info_cache(valid, len);
-        if ((uint32_t)(now_ms - _algo_upload_async.started_ms) < 120000u) return true;
+        if ((uint32_t)(now_ms - _algo_upload_async.started_ms) <
+                PsocSpi::ALGO_UPLOAD_TIMEOUT_MS) return true;
         _algo_upload_async.clear();
         _algo_dl.failed = 1u;
         _algo_dl.busy = 0u;
@@ -735,7 +741,12 @@ bool Psoc::_exec_cmd(SpiOp op, uint8_t ch, uint8_t pid, uint32_t val, uint32_t* 
                 // 与首个分页事务错开约 10ms，随后上传期间仅按 20ms 保活触控。
                 _algo_upload_async.last_touch_ms = _algo_upload_async.started_ms - 10u;
                 _algo_upload_async.response_fail_run = 0u;
-                _reset_grace_until_ms = _algo_upload_async.started_ms + 130000u;
+                // ★宽限窗必须跟着上传上限一起收★ 宽限期内 core1 一律不判"PSoC 挂死", 原来给 130s
+                // 意味着刚装上的坏算法把 PSoC 跑死之后, 要等两分多钟才会被发现 —— 那期间 note_fatal
+                // 不会累计、隔离也就永远不触发, 救援机制形同虚设。上限 20s + 10s 余量足够覆盖
+                // 1024 页分页 + commit。
+                _reset_grace_until_ms = _algo_upload_async.started_ms +
+                                        (PsocSpi::ALGO_UPLOAD_TIMEOUT_MS + 10000u);
             }
             return ok;
         }
@@ -768,6 +779,34 @@ bool Psoc::_exec_cmd(SpiOp op, uint8_t ch, uint8_t pid, uint32_t val, uint32_t* 
             uint8_t v = 0;
             const bool ok = _spi.algo_get_cfg(ch, &v);   // ch 字段复用为 cfg idx
             if (out) *out = v;
+            return ok;
+        }
+        // 逐通道 cfg_ch: ch 字段=通道, pid 字段=idx, val 字段=值(沿用 ALGO_GET_TRACE 的复用手法,
+        // 不给信箱新增字段 —— 加字段会让 SpiCmd 变大 ×64 环深, 白吃 RAM)。
+        case SpiOp::ALGO_SET_CFG_CH:
+            return _spi.algo_set_cfg_ch(ch, pid, (uint8_t)val);
+        case SpiOp::ALGO_GET_CFG_CH: {
+            uint8_t v = 0;
+            const bool ok = _spi.algo_get_cfg_ch(ch, pid, &v);
+            if (out) *out = v;
+            return ok;
+        }
+        case SpiOp::ALGO_GET_HEAP: {
+            uint16_t size = 0; uint16_t used = 0;
+            const bool ok = _spi.algo_get_heap(&size, &used);
+            if (out) *out = ((uint32_t)used << 16) | size;   // 打包 used<<16 | size
+            return ok;
+        }
+        case SpiOp::ALGO_GET_CRC: {
+            bool v = false; uint16_t crc = 0;
+            const bool ok = _spi.algo_get_crc(&v, &crc);
+            if (out) *out = ((uint32_t)(v ? 1u : 0u) << 16) | crc;   // 打包 valid<<16 | crc
+            return ok;
+        }
+        case SpiOp::ALGO_GET_CAPS: {
+            uint16_t slot = 0; uint16_t heap = 0;
+            const bool ok = _spi.algo_get_caps(&slot, &heap);
+            if (out) *out = ((uint32_t)heap << 16) | slot;   // 打包 heap<<16 | slot
             return ok;
         }
         case SpiOp::SET_GLOBAL:
@@ -884,6 +923,10 @@ void Psoc::_invalidate_algo_info_cache() {
     _algo_info_available = 0u;
     _algo_info_valid = 0u;
     _algo_info_len = 0u;
+    _algo_info_crc = 0u;
+    _algo_info_uploading = 0u;
+    _algo_heap_used = 0u;
+    _algo_heap_size = 0u;
     _algo_info_refresh_ms = 0u;
     _algo_info_cache_epoch = _algo_info_epoch;
     __dmb();
@@ -892,20 +935,53 @@ void Psoc::_invalidate_algo_info_cache() {
 
 bool Psoc::_refresh_algo_info_cache() {
     bool valid = false;
+    bool uploading = false;
     uint16_t len = 0;
-    if (!_spi.algo_info(&valid, &len)) {
+    if (!_spi.algo_info(&valid, &len, &uploading)) {
         _invalidate_algo_info_cache();
         return false;
     }
-    _publish_algo_info_cache(valid, len);
+    // ★追加读取, 失败不作废★ 这两条是 ABI v2 新命令(0x4D/0x4C): 旧 PSoC 固件会回不认识的响应,
+    // 一律降级为 0 而不是把整份缓存判无效 —— 否则一台旧固件的板子连 valid/len 都读不出来。
+    bool crc_valid = false;
+    uint16_t crc = 0u;
+    if (!_spi.algo_get_crc(&crc_valid, &crc) || !crc_valid) crc = 0u;
+    uint16_t heap_size = 0u;
+    uint16_t heap_used = 0u;
+    if (!_spi.algo_get_heap(&heap_size, &heap_used)) { heap_size = 0u; heap_used = 0u; }
+    // 槽/堆容量是 PSoC 编译期常量，首次成功读到后永久复用；PSoC XRES 不会改变同一固件容量。
+    bool caps_read = false;
+    uint16_t slot_cap = 0u;
+    uint16_t heap_cap = 0u;
+    if (_algo_slot_cap == 0u && _spi.algo_get_caps(&slot_cap, &heap_cap) && slot_cap != 0u) {
+        caps_read = true;
+        if (slot_cap != PSOC_ALGO_MAX_LEN && !_algo_caps_mismatch_reported) {
+            // 三层任一容量常量漏改都会"上传成功却跑旧代码"；主动推事件使漂移当场可见。
+            SelfHeal::getInstance()->note(SH_ALGO_CAPACITY_MISMATCH,
+                                          ((uint32_t)PSOC_ALGO_MAX_LEN << 16) | slot_cap);
+            _algo_caps_mismatch_reported = true;
+        }
+    }
+    _publish_algo_info_cache(valid, len, crc, uploading, heap_used, heap_size,
+                             caps_read, slot_cap, heap_cap);
     return true;
 }
 
-void Psoc::_publish_algo_info_cache(bool valid, uint16_t len) {
+void Psoc::_publish_algo_info_cache(bool valid, uint16_t len, uint16_t crc, bool uploading,
+                                    uint16_t heap_used, uint16_t heap_size, bool caps_read,
+                                    uint16_t slot_cap, uint16_t heap_cap) {
     _algo_info_seq++;
     __dmb();
     _algo_info_valid = valid ? 1u : 0u;
     _algo_info_len = len;
+    _algo_info_crc = crc;
+    _algo_info_uploading = uploading ? 1u : 0u;
+    _algo_heap_used = heap_used;
+    _algo_heap_size = heap_size;
+    if (caps_read) {
+        _algo_slot_cap = slot_cap;
+        _algo_heap_cap = heap_cap;
+    }
     _algo_info_refresh_ms = millis();
     _algo_info_cache_epoch = _algo_info_epoch;
     _algo_info_available = 1u;
@@ -913,14 +989,24 @@ void Psoc::_publish_algo_info_cache(bool valid, uint16_t len) {
     _algo_info_seq++;
 }
 
-bool Psoc::get_algo_info_cached(bool* out_valid, uint16_t* out_len) const {
+bool Psoc::get_algo_info_cached(bool* out_valid, uint16_t* out_len, uint16_t* out_crc,
+                                uint16_t* out_heap_used, uint16_t* out_heap_size,
+                                bool* out_uploading) const {
     if (out_valid) *out_valid = false;
     if (out_len) *out_len = 0u;
+    if (out_crc) *out_crc = 0u;
+    if (out_heap_used) *out_heap_used = 0u;
+    if (out_heap_size) *out_heap_size = 0u;
+    if (out_uploading) *out_uploading = false;
     uint32_t s1;
     uint32_t s2;
     uint8_t available;
     uint8_t valid;
     uint16_t len;
+    uint16_t crc;
+    uint8_t uploading;
+    uint16_t heap_used;
+    uint16_t heap_size;
     uint32_t refreshed;
     uint32_t epoch;
     do {
@@ -929,6 +1015,10 @@ bool Psoc::get_algo_info_cached(bool* out_valid, uint16_t* out_len) const {
         available = _algo_info_available;
         valid = _algo_info_valid;
         len = _algo_info_len;
+        crc = _algo_info_crc;
+        uploading = _algo_info_uploading;
+        heap_used = _algo_heap_used;
+        heap_size = _algo_heap_size;
         refreshed = _algo_info_refresh_ms;
         epoch = _algo_info_cache_epoch;
         __dmb();
@@ -940,6 +1030,31 @@ bool Psoc::get_algo_info_cached(bool* out_valid, uint16_t* out_len) const {
     }
     if (out_valid) *out_valid = valid != 0u;
     if (out_len) *out_len = len;
+    if (out_crc) *out_crc = crc;
+    if (out_uploading) *out_uploading = uploading != 0u;
+    if (out_heap_used) *out_heap_used = heap_used;
+    if (out_heap_size) *out_heap_size = heap_size;
+    return true;
+}
+
+bool Psoc::get_algo_caps_cached(uint16_t* out_slot, uint16_t* out_heap) const {
+    if (out_slot) *out_slot = 0u;
+    if (out_heap) *out_heap = 0u;
+    uint32_t s1;
+    uint32_t s2;
+    uint16_t slot;
+    uint16_t heap;
+    do {
+        s1 = _algo_info_seq;
+        __dmb();
+        slot = _algo_slot_cap;
+        heap = _algo_heap_cap;
+        __dmb();
+        s2 = _algo_info_seq;
+    } while ((s1 & 1u) || s1 != s2);
+    if (slot == 0u) return false;
+    if (out_slot) *out_slot = slot;
+    if (out_heap) *out_heap = heap;
     return true;
 }
 
@@ -1103,6 +1218,11 @@ bool Psoc::start_host_algo_set_cfg(uint8_t idx, uint8_t val) {
     return _start_host_write(SpiOp::ALGO_SET_CFG, idx, 0u, val);
 }
 
+bool Psoc::start_host_algo_set_cfg_ch(uint8_t ch, uint8_t idx, uint8_t val) {
+    // 与 start_host_algo_set_cfg 逐字对照: ch 走 ch 字段、idx 走 pid 字段、值走 val 字段。
+    return _start_host_write(SpiOp::ALGO_SET_CFG_CH, ch, idx, val);
+}
+
 bool Psoc::start_host_algo_set_rom(uint8_t ch, uint16_t rom) {
     return _start_host_write(SpiOp::SET_ALGO_ROM, ch, 0u, rom);
 }
@@ -1198,7 +1318,9 @@ bool Psoc::get_cp(uint8_t ch, uint32_t* out) {
 }
 
 bool Psoc::upload_algo(const uint8_t* data, uint16_t len, uint16_t crc16) {
-    if (data == nullptr || len == 0 || len > 1024) return false;
+    // 上限取 store 的同一个常量(= PSoC 的 ALGO_SLOT_SIZE)。原先这里写死 1024, 槽扩到 4096 后
+    // 会把合法的大算法在门口就拒掉, 且错误信息与真实原因完全无关。
+    if (data == nullptr || len == 0 || len > PSOC_ALGO_MAX_LEN) return false;
     // 上一次下发未完成时拒绝: blob 缓冲被 core1 持有, 此刻改写会让它下发出半新半旧的代码。
     if (_algo_dl.busy != 0u) return false;
     _algo_dl.busy = 1u;
@@ -1264,6 +1386,39 @@ bool Psoc::algo_get_cfg(uint8_t idx, uint8_t* out_val) {
     uint32_t r = 0;
     const bool ok = _submit(SpiOp::ALGO_GET_CFG, idx, 0, 0, &r);
     if (ok && out_val) *out_val = (uint8_t)(r & 0xFFu);
+    return ok;
+}
+
+bool Psoc::set_algo_cfg_ch(uint8_t ch, uint8_t idx, uint8_t val) {
+    // 写类异步(同 algo_set_cfg / set_algo_rom): 一次补推最多 288 条, 逐条阻塞等回显会把 core0
+    // 按在 handler 里数百 ms。真值由 RP 存储持有(ALGO_GET_CFG_CH 回读的是 RP 侧真相源)。
+    return _submit(SpiOp::ALGO_SET_CFG_CH, ch, idx, val, nullptr);
+}
+
+bool Psoc::algo_get_cfg_ch(uint8_t ch, uint8_t idx, uint8_t* out_val) {
+    uint32_t r = 0;
+    const bool ok = _submit(SpiOp::ALGO_GET_CFG_CH, ch, idx, 0, &r);
+    if (ok && out_val) *out_val = (uint8_t)(r & 0xFFu);
+    return ok;
+}
+
+bool Psoc::algo_get_crc(bool* out_valid, uint16_t* out_crc) {
+    uint32_t r = 0;
+    const bool ok = _submit(SpiOp::ALGO_GET_CRC, 0, 0, 0, &r);
+    if (ok) {
+        if (out_valid) *out_valid = ((r >> 16) & 1u) != 0u;
+        if (out_crc) *out_crc = (uint16_t)(r & 0xFFFFu);
+    }
+    return ok;
+}
+
+bool Psoc::algo_get_heap(uint16_t* out_size, uint16_t* out_used) {
+    uint32_t r = 0;
+    const bool ok = _submit(SpiOp::ALGO_GET_HEAP, 0, 0, 0, &r);
+    if (ok) {
+        if (out_size) *out_size = (uint16_t)(r & 0xFFFFu);
+        if (out_used) *out_used = (uint16_t)((r >> 16) & 0xFFFFu);
+    }
     return ok;
 }
 

@@ -62,12 +62,14 @@ impl AppController {
         self.push_log("算法: 请求恢复默认(v3.1 HDR)并自动刷新设备信息");
         Ok(())
     }
-    /// 上传算法二进制(≤1024B)。内部计算 CRC16 随帧下发，并按既有灯效写入模式等待 ACK/NAK。
+    /// 上传算法二进制(≤ `algo_upload_limit()`)。内部计算 CRC16 随帧下发，并按既有写入模式等待 ACK/NAK。
     pub fn algo_upload(&mut self, data: &[u8]) -> anyhow::Result<()> {
-        if data.is_empty() || data.len() > crate::proto::algo::ALGO_MAX_LEN {
+        if data.is_empty() || data.len() > self.algo_upload_limit() {
             return Err(anyhow::anyhow!(
-                "算法长度非法: {} (须 1..=1024)",
-                data.len()
+                "算法长度非法: {} (须 1..={} = 单帧承载上限, PSoC 槽为 {} 字节)",
+                data.len(),
+                self.algo_upload_limit(),
+                self.algo_slot_capacity()
             ));
         }
         let seq = self.next_seq();
@@ -213,6 +215,91 @@ impl AppController {
     }
     pub fn algo_cfg_version(&self) -> u64 {
         self.algo_cfg_version
+    }
+
+    // ------------------------------------------------------------------
+    // 逐通道算法可设置变量(cfg_ch[8], ABI v2)
+    // ------------------------------------------------------------------
+    // ★与上面的 cfg[8] 完全对称★: 同一套"草稿 → 有序写队列 → ACK 归因"链路, 不新造第二条下发路。
+    // 唯一差别是多一个通道维度, 以及下发时要按 (ch, idx) 聚合成一帧多条(288 项逐项发帧会堵死队列)。
+
+    /// 某通道某槽的有效值。回退链: 草稿 → 设备缓存 → 声明默认值(逐通道声明, per_channel==true)。
+    /// ★不会返回"未知"★ 与 `algo_cfg` 同口径: 声明里带 defval, 那就是设备上算法在用的默认,
+    /// 显示它比显示 0 或空更接近事实。真正需要区分"未回读"的地方(批量面板)另有 `_algo_cfg_ch_known`。
+    pub fn algo_cfg_ch(&self, ch: u8, idx: u8) -> u8 {
+        if let Some(value) = self._algo_cfg_ch_known(ch, idx) {
+            return value;
+        }
+        self.algo_setting_decls()
+            .into_iter()
+            .find(|decl| decl.per_channel && decl.idx == idx)
+            .map_or(0, |decl| decl.default)
+    }
+
+    /// 只认"确定知道"的值: 草稿 → 设备缓存。都没有就返回 None(而不是拿声明默认值顶替)。
+    /// 批量面板必须用它 —— 那一列写下去是要真发到 36 个通道的, 拿一个从未与设备核对过的默认值
+    /// 冒充"源通道当前值"就是在批量覆盖用户没打算改的东西。
+    pub(crate) fn _algo_cfg_ch_known(&self, ch: u8, idx: u8) -> Option<u8> {
+        if let Some(value) = self.drafts.algo_cfg_ch(ch, idx) {
+            return Some(value);
+        }
+        let (ch, idx) = (ch as usize, idx as usize);
+        if self
+            .algo_cfg_ch_valid
+            .get(ch)
+            .and_then(|row| row.get(idx))
+            .copied()
+            .unwrap_or(false)
+        {
+            return Some(self.algo_cfg_ch[ch][idx]);
+        }
+        None
+    }
+
+    /// 暂存逐通道算法配置 cfg_ch[ch][idx]，点击“保存到设备”后统一下发。
+    pub fn set_algo_cfg_ch(&mut self, ch: u8, idx: u8, val: u8) -> anyhow::Result<()> {
+        if (ch as usize) >= crate::proto::algo::ALGO_CHANNELS {
+            return Err(anyhow::anyhow!("逐通道算法配置通道号非法: {}", ch));
+        }
+        if (idx as usize) >= crate::proto::algo::ALGO_CFG_CH_SLOTS {
+            return Err(anyhow::anyhow!("逐通道算法配置索引非法: {}", idx));
+        }
+        let (c, i) = (ch as usize, idx as usize);
+        let same_as_device = self.algo_cfg_ch_valid[c][i] && self.algo_cfg_ch[c][i] == val;
+        self.drafts.set_algo_cfg_ch(ch, idx, val, same_as_device);
+        // 草稿优先 getter 依赖版本号立即回显; 不覆盖设备缓存, 以支持撤销恢复。
+        self.algo_cfg_ch_version = self.algo_cfg_ch_version.wrapping_add(1);
+        Ok(())
+    }
+
+    pub fn algo_cfg_ch_version(&self) -> u64 {
+        self.algo_cfg_ch_version
+    }
+
+    /// 全量回读逐通道算法配置(一帧带回 36×8)。窗口=1 由 `RequestAlgoCfgCh` 保证。
+    pub fn request_algo_cfg_ch(&mut self) -> anyhow::Result<()> {
+        let _ = self._submit_poll(
+            RequestKind::RequestAlgoCfgCh,
+            crate::proto::algo::encode_algo_get_cfg_ch(0),
+        )?;
+        Ok(())
+    }
+
+    /// ALGO_GET_CFG_CH 响应: 288 字节(通道主序)。截断响应只落已收到的完整通道, 其余保留旧缓存。
+    pub(crate) fn _handle_algo_get_cfg_ch_response(&mut self, frame: &Frame) {
+        let rows = crate::proto::algo::decode_algo_get_cfg_ch(&frame.payload);
+        if rows.is_empty() {
+            // 空响应的含义是"此刻取不到", 不是"设备上没有这些值" ⇒ 保留旧缓存, 只留证。
+            log::warn!("ALGO_GET_CFG_CH 返回空 payload, 保留本地逐通道算法配置缓存");
+            return;
+        }
+        let count = rows.len();
+        for (ch, row) in rows.into_iter().enumerate() {
+            self.algo_cfg_ch[ch] = row;
+            self.algo_cfg_ch_valid[ch] = [true; crate::proto::algo::ALGO_CFG_CH_SLOTS];
+        }
+        self.algo_cfg_ch_version = self.algo_cfg_ch_version.wrapping_add(1);
+        log::debug!("ALGO_GET_CFG_CH: 已落 {} 个通道 × 8 槽", count);
     }
 
     /// schema 解析用的 C 源: ★设备回读源优先★, 无设备源时退回本地最近一次编译源。
@@ -384,9 +471,18 @@ impl AppController {
     fn _algo_decl_declared_text(&self, kind: u8, index: u8) -> (String, String) {
         // 两种声明是不同类型(AlgoSettingDecl / AlgoReportDecl), 各自取出同一组字段。
         let (name, alias, description) = if kind == 1 {
+            // ★index 里编着作用域★ 0..7 = 共享 cfg[idx], 8..15 = 逐通道 cfg_ch[idx-8]
+            // (见 proto::algo::ALGO_CFG_CH_META_BASE 的说明: kind=1 只有一套 index 空间, 而设备
+            // 侧有两套下标, 不错开就会两类共用同一条别名/注释)。按 idx 单独找必然找错一类。
+            let base = crate::proto::algo::ALGO_CFG_CH_META_BASE;
+            let (per_channel, idx) = if index >= base {
+                (true, index - base)
+            } else {
+                (false, index)
+            };
             self.algo_setting_decls()
                 .into_iter()
-                .find(|decl| decl.idx == index)
+                .find(|decl| decl.per_channel == per_channel && decl.idx == idx)
                 .map(|decl| (decl.name, decl.alias, decl.description))
                 .unwrap_or_default()
         } else {
@@ -499,23 +595,28 @@ impl AppController {
     /// 无重定位/algo 在偏移 0/≤1024B, 成功则返回二进制供 algo_upload。方案 a: 封装现成工具链。
     /// abi_header_dir 提供 psoc_algo_abi.h 的 include 路径。
     pub fn compile_c_to_blob(&mut self, c_source: &str) -> anyhow::Result<Vec<u8>> {
-        let out = Self::compile_blob(c_source)?;
+        let out = Self::compile_blob(c_source, self.algo_caps_snapshot())?;
         let blob = out.blob.clone();
         self.apply_compiled(c_source, out);
         Ok(blob)
     }
 
-    /// 纯编译(无 self): 只吃 C 源、只吐产物, 全程不碰控制器状态。
+    /// 纯编译(无 self): 只吃 C 源 + 一份容量快照、只吐产物, 全程不碰控制器状态。
     /// ★为什么必须是关联函数★: 编译要顺序阻塞跑 gcc/objcopy/nm/objdump 四个子进程, 首次还要
     /// 解压 18MB 内置工具链, 在 UI 线程里做会把界面冻死几秒。拆出来后可以丢进 std::thread,
     /// 而 `Rc<RefCell<AppController>>` 跨线程不安全 —— 后台只搬 String/Vec<u8> 这类纯数据,
     /// 产物回到 UI 线程再由 `apply_compiled` 写入状态。
-    pub fn compile_blob(c_source: &str) -> anyhow::Result<CompiledAlgo> {
+    /// ★容量因此只能"传进来"★: 后台线程碰不到 `&self`, 又不能把闸门退回硬编码常量(那正是
+    /// "固件扩容后上位机仍按旧数拒收"的来源), 所以由调用方在 spawn 之前 `algo_caps_snapshot()`。
+    pub fn compile_blob(
+        c_source: &str,
+        caps: crate::app_state::AlgoCaps,
+    ) -> anyhow::Result<CompiledAlgo> {
         use std::io::Write;
-        // 0) C 源容量闸门: 设备只能存 32KB"编译器有效内容"(= 滤注释后的 UTF-8 字节)。超了直接拒,
+        // 0) C 源容量闸门: 设备只能存有限的"编译器有效内容"(= 滤注释后的 UTF-8 字节)。超了直接拒,
         //    绝不先编译再在上传时截断 —— 那会让设备上的映射表源与实际算法脱节且无法还原。
         let used = Self::algo_src_used(c_source);
-        let cap = Self::algo_src_capacity();
+        let cap = caps.src;
         if used > cap {
             return Err(anyhow::anyhow!(
                 "C 源(去注释){} 字节, 超出设备存储上限 {} 字节: 请精简后再编译",
@@ -626,10 +727,16 @@ impl AppController {
                 "入口 algo 必须在偏移 0(检查是否首个函数/是否被内联到别处)"
             ));
         }
-        if data.is_empty() || data.len() > crate::proto::algo::ALGO_MAX_LEN {
+        // ★闸门用"单帧承载上限"而不是"槽容量"★ 槽是 4096, 但 ALGO_UPLOAD 帧要先放 len+crc16
+        // 两个 u16, 于是 4093..4096 字节的产物编译得出来却传不进去(设备只回 "len invalid" NAK,
+        // 现场看不出是少了 4 个字节的帧头)。这里把两个口径都写进报错文案, 免得再排一次。
+        if data.is_empty() || data.len() > caps.upload_limit {
             return Err(anyhow::anyhow!(
-                "产物大小非法: {} 字节(须 1..=1024)",
-                data.len()
+                "产物大小非法: {} 字节(须 1..={} = 单帧承载上限; PSoC 槽本身为 {} 字节, \
+                 两者相差的 4 字节是 ALGO_UPLOAD 的 len+crc16 帧内头)",
+                data.len(),
+                caps.upload_limit,
+                caps.slot
             ));
         }
         // objdump 用制表符对齐, Slint 文本控件会把 \t 渲染成方块; 替换为空格避免乱码。
@@ -652,11 +759,17 @@ impl AppController {
                 let _ = std::fs::write(dir.join("last_algo_source.c"), c_source);
             }
         }
+        let slot = self.algo_slot_capacity();
         self.push_log(format!(
-            "算法: 编译成功, ASM {} / {} 字节 ({}%)",
+            "算法: 编译成功, ASM {} / {} 字节 ({}%){}",
             len,
-            Self::algo_slot_capacity(),
-            (len * 100) / Self::algo_slot_capacity().max(1)
+            slot,
+            (len * 100) / slot.max(1),
+            if self.algo_caps_known() {
+                ""
+            } else {
+                " · 容量待回读(暂用内置兜底值)"
+            }
         ));
         len
     }
@@ -677,16 +790,152 @@ impl AppController {
         self.algo_upload(&blob)
     }
 
-    /// PSoC 可执行算法槽容量(字节)。ASM 产物必须 ≤ 此值, 否则会被截断导致运行异常。
-    pub fn algo_slot_capacity() -> usize {
-        crate::proto::algo::ALGO_MAX_LEN
+    // ------------------------------------------------------------------
+    // 算法容量: ★一律取自设备★
+    // ------------------------------------------------------------------
+    // 这一组原先是**关联函数**(不带 self), 直接返回编译期常量。那等于把"这台设备的槽有多大"
+    // 写死在上位机里, 而槽/单帧上限/C 源容量/堆容量四个数分散在 PSoC 与 RP 两版固件的常量里 ——
+    // 上位机可以连到任意一版。硬编码的后果有两种, 都很难查:
+    //   固件扩容了而上位机没跟 → 编译出的算法明明装得下, 却被上位机自己的闸门拒掉;
+    //   固件缩容了而上位机没跟 → 上位机放行, 设备静默 NAK 或截断, 表现为"上传成功但跑的是旧算法"。
+    // 设备现在在 ALGO_GET_INFO 里如实回报这四个容量, 故改成实例方法: 有设备值用设备值,
+    // 没有(未连接/旧固件)才退回兜底常量, 且 `algo_caps_known()` 让 UI 能把两种情况区分显示。
+
+    /// PSoC 可执行算法槽容量(字节)。**只用于占用百分比显示**, 不是编译/上传闸门。
+    pub fn algo_slot_capacity(&self) -> usize {
+        self.algo_caps
+            .map(|caps| caps.slot)
+            .unwrap_or(crate::proto::algo::ALGO_SLOT_FALLBACK)
+    }
+
+    /// 单次上传可承载的算法字节上限(设备 = 单帧 payload − 4 字节帧内头 len+crc16)。
+    /// ★与 `algo_slot_capacity()` 差 4 字节, 这 4 字节必须分得清★: 编译出 4093..4096 字节的算法
+    /// 在槽里放得下, 却会被设备以 "len invalid" 拒收 —— 闸门用本值, 进度条分母用槽容量。
+    pub fn algo_upload_limit(&self) -> usize {
+        self.algo_caps
+            .map(|caps| caps.upload_limit)
+            .unwrap_or(crate::proto::algo::ALGO_UPLOAD_FALLBACK)
+    }
+
+    /// 算法共享堆容量(字节)。只用于占用百分比显示。
+    pub fn algo_heap_capacity(&self) -> usize {
+        self.algo_caps
+            .map(|caps| caps.heap)
+            .unwrap_or(crate::proto::algo::ALGO_HEAP_FALLBACK)
+    }
+
+    /// 容量是否已从设备回读到。false ⇒ 上面几个方法返回的是兜底值, UI 必须显示"待回读"而非真值。
+    pub fn algo_caps_known(&self) -> bool {
+        self.algo_caps.is_some()
+    }
+
+    /// 设备自报"PSoC 槽容量与 RP 侧容量常量不一致"。为真时必须显著告警: 两级容量对不上时,
+    /// 上传会被一侧放行、另一侧静默截断, 现象是"上传成功但算法跑飞", 两侧日志都看不出原因。
+    pub fn algo_caps_mismatch(&self) -> bool {
+        self.algo_caps.map(|caps| caps.mismatch).unwrap_or(false)
+    }
+
+    /// 取一份容量快照。★后台编译线程唯一的容量来源★: 那里拿不到 `&self`, 必须在 spawn 之前
+    /// 由 UI 线程取好带过去(见 `compile_blob` 的签名与 main.rs 的 spawn_algo_compile)。
+    /// 未回读到设备容量时返回全兜底值的快照 —— 编译不该因为"还没连上设备"而不能进行。
+    pub fn algo_caps_snapshot(&self) -> crate::app_state::AlgoCaps {
+        self.algo_caps
+            .unwrap_or(crate::app_state::AlgoCaps {
+                slot: crate::proto::algo::ALGO_SLOT_FALLBACK,
+                upload_limit: crate::proto::algo::ALGO_UPLOAD_FALLBACK,
+                src: crate::proto::algo::ALGO_SRC_FALLBACK,
+                src_chunk: crate::proto::algo::ALGO_SRC_CHUNK,
+                heap: crate::proto::algo::ALGO_HEAP_FALLBACK,
+                from_psoc: false,
+                mismatch: false,
+            })
+    }
+
+    /// 分片粒度(字节)。设备值优先, 兜底 `ALGO_SRC_CHUNK` —— 步长必须与设备一致,
+    /// 否则设备按自己的粒度校验 offset 会整片 NAK, 而报错文案只说"分片非法"。
+    pub(crate) fn _algo_src_chunk(&self) -> usize {
+        self.algo_caps
+            .map(|caps| caps.src_chunk)
+            .unwrap_or(crate::proto::algo::ALGO_SRC_CHUNK)
+            .max(1)
+    }
+
+    /// 把设备回报的容量组落进缓存, 并在两级容量不一致时告警(只在结论变化时写一行, 不刷屏)。
+    pub(crate) fn _absorb_algo_caps(&mut self, info: crate::proto::algo::AlgoInfo) {
+        if !info.caps_known {
+            return; // 旧固件不回报 ⇒ 保持 None, UI 显示"待回读", 绝不拿兜底值冒充设备真值。
+        }
+        let caps = crate::app_state::AlgoCaps {
+            // 设备回 0 只可能是它自己也没算出来 ⇒ 退回兜底值, 免得进度条分母为 0、闸门拒一切。
+            slot: if info.slot_capacity == 0 {
+                crate::proto::algo::ALGO_SLOT_FALLBACK
+            } else {
+                info.slot_capacity as usize
+            },
+            upload_limit: if info.upload_limit == 0 {
+                crate::proto::algo::ALGO_UPLOAD_FALLBACK
+            } else {
+                info.upload_limit as usize
+            },
+            src: if info.src_capacity == 0 {
+                crate::proto::algo::ALGO_SRC_FALLBACK
+            } else {
+                info.src_capacity as usize
+            },
+            src_chunk: if info.src_chunk == 0 {
+                crate::proto::algo::ALGO_SRC_CHUNK
+            } else {
+                info.src_chunk as usize
+            },
+            heap: if info.heap_size == 0 {
+                crate::proto::algo::ALGO_HEAP_FALLBACK
+            } else {
+                info.heap_size as usize
+            },
+            from_psoc: info.slot_capacity_from_psoc,
+            mismatch: info.capacity_mismatch,
+        };
+        if self.algo_caps == Some(caps) {
+            return; // 每次 GET_INFO 都会走到这里, 容量却是不变量 —— 没变就别刷日志。
+        }
+        self.algo_caps = Some(caps);
+        self.algo_version = self.algo_version.wrapping_add(1);
+        if caps.mismatch {
+            self.push_log_warn(format!(
+                "算法: {}",
+                Self::algo_caps_mismatch_text(caps.slot, caps.upload_limit)
+            ));
+        } else {
+            self.push_log(format!(
+                "算法容量(设备回报): 槽 {}B{} · 单帧上传上限 {}B · C 源 {}B(分片 {}B) · 堆 {}B",
+                caps.slot,
+                if caps.from_psoc {
+                    "(PSoC 自报)"
+                } else {
+                    "(RP 兜底)"
+                },
+                caps.upload_limit,
+                caps.src,
+                caps.src_chunk,
+                caps.heap
+            ));
+        }
+    }
+
+    /// 容量不一致的统一告警文案(日志与算法页状态行同一句, 免得两处口径漂移)。
+    pub fn algo_caps_mismatch_text(slot: usize, upload_limit: usize) -> String {
+        format!(
+            "设备两级容量常量不一致(PSoC 槽 {} / RP 上限 {}), 上传可能静默跑飞, \
+             请重新烧写匹配的固件",
+            slot, upload_limit
+        )
     }
 
     /// 仅编译(不上传, 同步版): 产出 ASM 二进制并缓存, 返回其字节数。
     /// compile_blob 已在产物 >容量 时报错, 故成功返回的长度必然 ≤ 容量(不会截断)。
     /// UI 走的是后台线程 + `apply_compiled` 那条路(见 main.rs 算法编译任务), 本函数留给无头场景。
     pub fn compile_only(&mut self, c_source: &str) -> anyhow::Result<usize> {
-        let out = Self::compile_blob(c_source)?;
+        let out = Self::compile_blob(c_source, self.algo_caps_snapshot())?;
         Ok(self.apply_compiled(c_source, out))
     }
 
@@ -700,7 +949,7 @@ impl AppController {
         // 发送前再把 C 源容量闸门过一遍: 走到这里的产物可能来自更早一次编译, 而编辑器/模板
         // 随后被换过, 不能靠"编译时查过了"就免检。
         let src = Self::strip_c_comments(&self.algo_source);
-        let cap = Self::algo_src_capacity();
+        let cap = self.algo_src_capacity();
         if src.len() > cap {
             return Err(anyhow::anyhow!(
                 "C 源(去注释){} 字节, 超出设备存储上限 {} 字节: 未上传",
@@ -731,8 +980,11 @@ impl AppController {
     }
 
     /// C 源容量(字节)。编译器实际看到的内容 = 滤注释后的 UTF-8 字节数, 必须 ≤ 此值。
-    pub fn algo_src_capacity() -> usize {
-        crate::proto::algo::ALGO_SRC_MAX
+    /// 设备值优先(见上面容量组的说明), 未回读到才用兜底常量。
+    pub fn algo_src_capacity(&self) -> usize {
+        self.algo_caps
+            .map(|caps| caps.src)
+            .unwrap_or(crate::proto::algo::ALGO_SRC_FALLBACK)
     }
 
     /// 某段 C 源"编译器有效内容"的字节数: 复用唯一的注释过滤实现 `strip_c_comments`,
@@ -750,7 +1002,7 @@ impl AppController {
     /// 超上限直接报错 —— 截断会把一份编译不过的残源固化到设备上。
     pub fn send_algo_src(&mut self, src: &str) -> anyhow::Result<()> {
         let bytes = Self::strip_c_comments(src).into_bytes();
-        let cap = crate::proto::algo::ALGO_SRC_MAX;
+        let cap = self.algo_src_capacity();
         if bytes.len() > cap {
             return Err(anyhow::anyhow!(
                 "算法 C 源 {} 字节, 超出设备存储上限 {} 字节",
@@ -781,7 +1033,9 @@ impl AppController {
         };
         let total = tx.bytes.len();
         let offset = tx.acked;
-        let end = (offset + crate::proto::algo::ALGO_SRC_CHUNK).min(total);
+        // ★分片步长取设备回报值★ 设备按自己的粒度校验 offset 与片长, 步长对不上就整片 NAK,
+        // 而报错只说"分片非法" —— 现场看不出是主机按 2048 发、设备按别的数收。
+        let end = (offset + self._algo_src_chunk()).min(total);
         let chunk = tx.bytes[offset..end].to_vec();
         let seq = self.next_seq();
         let frame = crate::proto::algo::encode_algo_set_src_chunk(seq, offset, total, &chunk);
@@ -829,9 +1083,10 @@ impl AppController {
             self.push_log_error(format!("算法 C 源上传被设备拒绝(offset={}), 已放弃", at));
             return;
         }
+        let step = self._algo_src_chunk();
         let total = {
             let tx = self.algo_src_tx.as_mut().expect("刚判过 Some");
-            tx.acked = (tx.acked + crate::proto::algo::ALGO_SRC_CHUNK).min(tx.bytes.len());
+            tx.acked = (tx.acked + step).min(tx.bytes.len());
             tx.bytes.len()
         };
         if self.algo_src_tx.as_ref().map(|tx| tx.acked) == Some(total) {
@@ -990,7 +1245,7 @@ impl AppController {
             self.push_log_error("ALGO_GET_SRC 响应过短, 已放弃本次回读".to_string());
             return;
         };
-        if total > crate::proto::algo::ALGO_SRC_MAX {
+        if total > self.algo_src_capacity() {
             self.algo_src_rx = None;
             self.push_log_error(format!(
                 "ALGO_GET_SRC 声明长度 {} 超上限, 已放弃本次回读",
@@ -1011,6 +1266,8 @@ impl AppController {
         }
         let mut next = None;
         let mut complete = false;
+        // 片长上限同样取设备回报的粒度(先算好: 下面的块要可变借用 algo_src_rx, 借用期内不能再碰 self)。
+        let chunk_limit = self._algo_src_chunk();
         let error = {
             let rx = self.algo_src_rx.as_mut().expect("刚判过 Some");
             if offset == 0 && rx.buf.is_empty() && rx.total == 0 {
@@ -1025,7 +1282,7 @@ impl AppController {
                     offset,
                     total
                 ))
-            } else if chunk.len() > crate::proto::algo::ALGO_SRC_CHUNK {
+            } else if chunk.len() > chunk_limit {
                 Some(format!("ALGO_GET_SRC 分片长度 {} 超过上限", chunk.len()))
             } else if chunk.len() > total.saturating_sub(rx.buf.len()) {
                 Some(format!(
@@ -1264,6 +1521,9 @@ impl AppController {
         if let Some(info) = crate::proto::algo::decode_algo_info(&frame.payload) {
             self.algo_info = Some(info);
             self.algo_version = self.algo_version.wrapping_add(1);
+            // 容量组先落缓存再宣判上传: 终态文案里的"槽/上传上限"要用这一拍的设备口径,
+            // 否则同一条日志里会出现"按兜底值算的百分比"和"设备真值的长度"两种尺子。
+            self._absorb_algo_caps(info);
             self._settle_algo_upload(info);
         }
     }
@@ -1271,46 +1531,111 @@ impl AppController {
     /// 用设备真值给上一次上传下终态结论。
     ///
     /// ★为什么必须有这一步★ ACK 只表示设备"已受理并下发"; 固件的 commit 在 core1 异步执行
-    /// (整段分页 + PSoC 校验最坏 ~700ms)。原实现在 ACK 后只把状态写成"正在刷新设备真值…"
-    /// 就再无下文 —— 回读到的 info 只更新了信息行, 从不回写上传状态, 于是 UI 永久停在中间态,
-    /// "下发到底成没成"完全不可知。这里按 psoc_valid + len + crc16 三者齐备才判成功。
+    /// (整段分页 + PSoC 校验最坏 ~700ms)。若在 ACK 后就不再追问, UI 会永久停在中间态,
+    /// "下发到底成没成"完全不可知。
+    ///
+    /// ★判据必须落在 PSoC 真值上, 不能用 store 的 len/crc16★
+    /// `info.len`/`info.crc16` 取自 **RP2040 存储**, 它们相符只证明"主机端把字节存下了";
+    /// 而 `psoc_valid` 是"槽里有一份能跑的算法", 无法区分"新算法装上了"与"旧算法还在、
+    /// 长度恰好相同"。两者组合起来仍会把一次失败的上传报成"已装上并正在运行" —— 这正是用户
+    /// 报的 bug。扩展响应给了 `psoc_len`/`psoc_crc16`(commit 时按槽内实际内容算出), 那才是
+    /// "装上了什么"的唯一直接证据。
     fn _settle_algo_upload(&mut self, info: crate::proto::algo::AlgoInfo) {
         let Some((expect_len, expect_crc)) = self.algo_upload_expect else {
             return;
         };
-        if info.psoc_valid && info.len == expect_len && info.crc16 == expect_crc {
+        // 隔离态优先宣判: 此刻 PSoC 跑的是原生 CapSense 判定, 无论 len/crc 怎么对都不能叫"正在运行"。
+        if info.extended && info.quarantined {
+            self.algo_upload_expect = None;
+            self.algo_upload_verify_left = 0;
+            self.algo_upload_status =
+                "算法已被设备隔离(连续致命挂死), PSoC 正在跑原生判定; 重新上传或点救援即解除"
+                    .to_string();
+            self.algo_upload_version = self.algo_upload_version.wrapping_add(1);
+            self.push_log_error(self.algo_upload_status.clone());
+            return;
+        }
+        // 新固件(extended): 用 PSoC 槽内实际长度/CRC 对账, 且必须已不在上传中。
+        // 旧固件: 只有 store 的 len/crc 可用, 退回原判据并在文案里注明"未能按内容对账"。
+        let settled = if info.extended {
+            info.psoc_valid
+                && !info.uploading
+                && info.psoc_len == expect_len
+                && info.psoc_crc16 == expect_crc
+        } else {
+            info.psoc_valid && info.len == expect_len && info.crc16 == expect_crc
+        };
+        if settled {
             self.algo_upload_expect = None;
             self.algo_upload_verify_left = 0;
             // 文案同时保留 "ACK" 与 "已装上并正在运行": 前者是既有回执判据的关键词,
             // 后者是终态判据的关键词, 两个既有校验口径都必须继续成立。
-            self.algo_upload_status = format!(
-                "上传已确认(ACK) → 算法已装上并正在运行 (len={}B crc16=0x{:04X})",
-                info.len, info.crc16
-            );
+            let tail = if info.extended {
+                format!(
+                    "(PSoC len={}B crc16=0x{:04X})",
+                    info.psoc_len, info.psoc_crc16
+                )
+            } else {
+                format!(
+                    "(store len={}B crc16=0x{:04X}; 设备固件较旧, 未能按内容对账)",
+                    info.len, info.crc16
+                )
+            };
+            self.algo_upload_status =
+                format!("上传已确认(ACK) → 算法已装上并正在运行 {}", tail);
             self.algo_upload_version = self.algo_upload_version.wrapping_add(1);
-            self.push_log(format!(
-                "算法: 上传终态确认 — 设备真值 valid=true len={} crc16=0x{:04X}",
-                info.len, info.crc16
-            ));
+            self.push_log(format!("算法: 上传终态确认 — {}", tail));
             return;
         }
-        // 尚未收敛: 再给一次延时回读的机会(设备可能仍在 commit)。
+        // ★"仍在收敛"与"失败"必须分开★ uploading / psoc_cache_unavailable 为真时, PSoC 真值本来
+        // 就取不到或还没落定, 此刻宣判失败纯属冤判 —— 消耗一次重试, 等下一拍再读。
+        let converging = info.extended && (info.uploading || info.psoc_cache_unavailable);
         if self.algo_upload_verify_left > 0 {
             self.algo_upload_verify_left -= 1;
             self.algo_info_refresh_in = Some(50);
+            let reason = if converging {
+                if info.uploading {
+                    "设备仍在上传/commit"
+                } else {
+                    "PSoC 内容缓存暂不可用"
+                }
+            } else {
+                "等待 PSoC commit 落定"
+            };
             self.algo_upload_status = format!(
-                "上传已确认(ACK): 设备正在装载算法，核对真值中… (valid={} len={}B)",
-                info.psoc_valid, info.len
+                "上传已确认(ACK): {}，核对真值中… (valid={} psoc_len={}B)",
+                reason, info.psoc_valid, info.psoc_len
             );
             self.algo_upload_version = self.algo_upload_version.wrapping_add(1);
             return;
         }
         // 重试用尽仍不符 ⇒ 如实宣判, 绝不把"未确认"显示成成功。
+        // ★store 与 psoc 两侧都打出来★: "RP 存下了但 PSoC 没装上"是最常见的失败形态,
+        // 只打一侧的话它和"根本没存进去"在日志里长得一模一样。
         self.algo_upload_expect = None;
-        self.algo_upload_status = format!(
-            "上传已确认(ACK) 但终态不匹配: 设备真值 valid={} len={}B crc16=0x{:04X}，期望 len={}B crc16=0x{:04X}",
-            info.psoc_valid, info.len, info.crc16, expect_len, expect_crc
-        );
+        self.algo_upload_status = if info.extended {
+            format!(
+                "上传已确认(ACK) 但终态不匹配: 期望 len={}B crc16=0x{:04X}; \
+                 RP 存储 len={}B crc16=0x{:04X}; PSoC 槽内 len={}B crc16=0x{:04X}; \
+                 valid={} uploading={} download_pending={} psoc_cache_unavailable={}",
+                expect_len,
+                expect_crc,
+                info.len,
+                info.crc16,
+                info.psoc_len,
+                info.psoc_crc16,
+                info.psoc_valid,
+                info.uploading,
+                info.download_pending,
+                info.psoc_cache_unavailable
+            )
+        } else {
+            format!(
+                "上传已确认(ACK) 但终态不匹配: RP 存储 len={}B crc16=0x{:04X}, \
+                 期望 len={}B crc16=0x{:04X}; valid={}。设备固件较旧, 未能按 PSoC 槽内容对账",
+                info.len, info.crc16, expect_len, expect_crc, info.psoc_valid
+            )
+        };
         self.algo_upload_version = self.algo_upload_version.wrapping_add(1);
         self.push_log_error(self.algo_upload_status.clone());
     }

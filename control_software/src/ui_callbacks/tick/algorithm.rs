@@ -15,7 +15,8 @@
         };
         if let Some(result) = finished {
             let job = algo_job_timer.borrow_mut().take();
-            let cap = AppController::algo_slot_capacity();
+            // ★分母用设备回报的槽容量★(未回读到时是内置兜底值, 见 algo_caps_known)。
+            let cap = ctrl.algo_slot_capacity();
             match (result, job) {
                 (Ok(out), Some(job)) => {
                     let len = ctrl.apply_compiled(&job.src, out);
@@ -63,19 +64,65 @@
     let algo_page_visible = ctrl.state() == ConnState::Connected
         && ui.get_current_view() == 1
         && ui.get_settings_tab() == SETTINGS_PAGE_ALGO;
-    if algo_version != last_algo_version || !algo_info_filled || algo_page_visible && !last_algo_page_visible {
+    if algo_version != last_algo_version
+        || !algo_info_filled
+        || algo_page_visible && !last_algo_page_visible
+        || ctrl.algo_caps_known() != last_algo_caps_known
+    {
         last_algo_version = algo_version;
+        last_algo_caps_known = ctrl.algo_caps_known();
         let txt = match ctrl.algo_info() {
-            Some(i) => format!(
-                "当前算法: {} | PSoC valid={} | len={}B | crc16=0x{:04X}",
-                if i.is_default { "默认(v3.1 HDR)" } else { "自定义" },
-                i.psoc_valid, i.len, i.crc16
-            ),
+            Some(i) => {
+                let mut txt = format!(
+                    "当前算法: {} | PSoC valid={} | len={}B | crc16=0x{:04X}",
+                    if i.is_default { "默认(v3.1 HDR)" } else { "自定义" },
+                    i.psoc_valid, i.len, i.crc16
+                );
+                // ★隔离态绝不能显示成正常运行★ 此刻 PSoC 跑的是原生 CapSense 判定, 算法与 C 源
+                // 仍在 flash 可回读, 但一个字节都没在执行。上一行的 valid/len/crc 全都"看起来正常",
+                // 只有这一句能把"算法在跑"与"算法被摘掉了"分开。
+                if i.extended && i.quarantined {
+                    txt.push_str(
+                        " ‖ 算法已被设备隔离(连续致命), PSoC 正在跑原生判定; 重新上传或点救援即解除",
+                    );
+                }
+                // "已受理"不等于"已生效": 存进设备但还没下发到 PSoC 的状态必须如实写出。
+                if i.extended && i.download_pending {
+                    txt.push_str(" ‖ 已存入设备, 等待下发");
+                }
+                txt
+            }
             None if ctrl.state() == ConnState::Disconnected => "算法信息未读取（未连接）".to_string(),
             None => "算法信息未读取".to_string(),
         };
         ui.set_algo_info_text(txt.into());
         algo_info_filled = true;
+
+        // ---- 容量与堆占用: 一律取自设备 ----
+        // ★未回报时显示 "—" 而不是 0★(本仓既有约定: 0 与"未知"必须可区分)。堆占用用 -1 当哨兵,
+        // 容量则回填"当前生效口径"(设备值或兜底值)并另用 algo_caps_known 让界面注明"容量待回读"。
+        let caps_known = ctrl.algo_caps_known();
+        ui.set_algo_caps_known(caps_known);
+        ui.set_algo_asm_capacity(ctrl.algo_slot_capacity() as i32);
+        ui.set_algo_upload_limit(ctrl.algo_upload_limit() as i32);
+        ui.set_algo_c_capacity(ctrl.algo_src_capacity() as i32);
+        ui.set_algo_heap_capacity(ctrl.algo_heap_capacity() as i32);
+        ui.set_algo_heap_used(match ctrl.algo_info() {
+            // heap_used 是算法自报用量的峰值; 只有扩展响应才带它, 旧固件下"不知道"必须是 -1。
+            Some(i) if i.extended => i.heap_used as i32,
+            _ => -1,
+        });
+        ui.set_algo_caps_warning(
+            if ctrl.algo_caps_mismatch() {
+                AppController::algo_caps_mismatch_text(
+                    ctrl.algo_slot_capacity(),
+                    ctrl.algo_upload_limit(),
+                )
+            } else {
+                String::new()
+            }
+            .into(),
+        );
     }
     last_algo_page_visible = algo_page_visible;
     // 设备映射表 C 源回读(version 门控)→ 把"当前算法"的可编辑 C 载入编辑器:
@@ -178,33 +225,81 @@
     // 不限速就等于把它挂到 tick 全速(62Hz)上跑。用户交互驱动的那两路(cfg/metadata)不受限速,
     // 仍然立即生效 —— 只有"运行值又刷新了"这一路等下一个视觉节拍(~30Hz), 肉眼无差别。
     if ctrl.algo_cfg_version() != last_algo_cfg_version
+        || ctrl.algo_cfg_ch_version() != last_algo_cfg_ch_version
+        || channel_changed
         || (ctrl.algo_trace_version() != last_algo_metadata_trace_version && visual_refresh_tick)
         || ctrl.algo_metadata_version() != last_algo_metadata_version
     {
         last_algo_cfg_version = ctrl.algo_cfg_version();
+        last_algo_cfg_ch_version = ctrl.algo_cfg_ch_version();
         last_algo_metadata_trace_version = ctrl.algo_trace_version();
         last_algo_metadata_version = ctrl.algo_metadata_version();
-        let rows: Vec<AlgoSettingRow> = ctrl
-            .algo_setting_decls()
-            .into_iter()
+        // ★声明按作用域分流★ 一次解析, 分成两组: `ALGO_SETTING*` → cfg[8](一份值对 36 通道生效),
+        // `ALGO_SETTING_CH*` → cfg_ch[8](每通道各一份)。两者的 idx 是**互相独立**的下标空间,
+        // 所以不能只靠 idx 认变量, 也不能把两组塞进同一个模型(见 tick/mod.rs 两个模型的说明)。
+        let decls = ctrl.algo_setting_decls();
+        let sel_ch = ui.get_sel_channel().clamp(0, 35) as u8;
+        let rows: Vec<AlgoSettingRow> = decls
+            .iter()
+            .filter(|d| !d.per_channel)
             .map(|d| {
                 let (alias, description) =
                     ctrl.algo_decl_text_named(1, d.idx, &d.name, &d.alias, &d.description);
                 AlgoSettingRow {
                 idx: d.idx as i32,
-                name: d.name.into(),
+                name: d.name.clone().into(),
                 default_val: d.default as i32,
                 value: ctrl.algo_cfg(d.idx) as i32,
-                value_type: d.value_type.into(),
-                range: d.range.into(),
+                value_type: d.value_type.clone().into(),
+                range: d.range.clone().into(),
                 description: description.into(),
                 alias: alias.into(),
-                // cfg[8] 在设备上只有一份: PSoC 的 g_algo_cfg[8] 与 RP 的 PsocAlgo::_cfg[8]
-                // 都不带通道下标, ALGO_SET_CFG 也没有通道字段。所以这里恒为真, 不是"暂时如此"。
-                // 逐通道的算法量是 rom(ALGO_SET_ROM 带 ch), 它另有编辑入口, 不走本行。
+                // 共享项: 设备上 PSoC 的 g_algo_cfg[8] 与 RP 的 PsocAlgo::_cfg[8] 都不带通道下标,
+                // ALGO_SET_CFG 也没有通道字段 ⇒ 一份值必然对全部 36 通道生效。
                 shared_scope: true,
             }})
             .collect();
+        // 逐通道行: 值取**当前精调通道**(与该页 curve_ch_enable_set 同一手法, 通道号不进行数据流,
+        // 免得界面与 Rust 各持一个"当前通道"而漂移)。
+        // 元数据 override 的 index 用 idx+8: override 的键是 (fingerprint, kind, index), kind=1
+        // 只有一套下标空间, 而 cfg[0] 与 cfg_ch[0] 是两个不同变量 —— 不错开就会共用同一条别名/注释。
+        let ch_rows: Vec<AlgoSettingRow> = decls
+            .iter()
+            .filter(|d| d.per_channel)
+            .map(|d| {
+                let (alias, description) = ctrl.algo_decl_text_named(
+                    1,
+                    d.idx + mai2control_ui::proto::algo::ALGO_CFG_CH_META_BASE,
+                    &d.name,
+                    &d.alias,
+                    &d.description,
+                );
+                AlgoSettingRow {
+                    idx: d.idx as i32,
+                    name: d.name.clone().into(),
+                    default_val: d.default as i32,
+                    value: ctrl.algo_cfg_ch(sel_ch, d.idx) as i32,
+                    value_type: d.value_type.clone().into(),
+                    range: d.range.clone().into(),
+                    description: description.into(),
+                    alias: alias.into(),
+                    shared_scope: false,
+                }
+            })
+            .collect();
+        // 批量抽屉的"全通道算法配置"下拉: 只列共享项别名, 顺序与 algo_setting_rows 严格一致 ——
+        // 下拉的 current-index 就是拿去索引那个模型的(见 all_channels.slint), 两者错位就会编辑到别的变量。
+        let shared_names: Vec<slint::SharedString> = rows
+            .iter()
+            .map(|row| {
+                slint::SharedString::from(if row.alias.is_empty() {
+                    row.name.to_string()
+                } else {
+                    row.alias.to_string()
+                })
+            })
+            .collect();
+        ui.set_batch_algo_shared_names(slint::ModelRc::new(slint::VecModel::from(shared_names)));
         while algo_setting_rows_model_timer.row_count() > rows.len() {
             algo_setting_rows_model_timer.remove(algo_setting_rows_model_timer.row_count() - 1);
         }
@@ -215,6 +310,19 @@
                 }
             } else {
                 algo_setting_rows_model_timer.push(setting);
+            }
+        }
+        while algo_setting_ch_rows_model_timer.row_count() > ch_rows.len() {
+            algo_setting_ch_rows_model_timer
+                .remove(algo_setting_ch_rows_model_timer.row_count() - 1);
+        }
+        for (row, setting) in ch_rows.into_iter().enumerate() {
+            if row < algo_setting_ch_rows_model_timer.row_count() {
+                if algo_setting_ch_rows_model_timer.row_data(row).as_ref() != Some(&setting) {
+                    algo_setting_ch_rows_model_timer.set_row_data(row, setting);
+                }
+            } else {
+                algo_setting_ch_rows_model_timer.push(setting);
             }
         }
         let mut metadata = Vec::new();
@@ -236,15 +344,39 @@
                 kind: "上报变量".into(),
             });
         }
-        for decl in ctrl.algo_setting_decls() {
-            let (alias, description) =
-                ctrl.algo_decl_text_named(1, decl.idx, &decl.name, &decl.alias, &decl.description);
+        // 可调变量的元数据卡片: 共享项与逐通道项都要能改别名/注释, 但 override 的 index 必须错开
+        // (见上面 ch_rows 的说明)。★kind 字符串必须恒为"可调变量"★: algo.slint 是按
+        // `row.kind == "可调变量" ? 1 : 0` 反推 kind 的, 换个字面量就会把 setting 的编辑写到
+        // report 的 override 键上。作用域改由 name 后缀说明, 不动 kind。
+        for decl in decls.iter() {
+            let meta_index = if decl.per_channel {
+                decl.idx + mai2control_ui::proto::algo::ALGO_CFG_CH_META_BASE
+            } else {
+                decl.idx
+            };
+            let (alias, description) = ctrl.algo_decl_text_named(
+                1,
+                meta_index,
+                &decl.name,
+                &decl.alias,
+                &decl.description,
+            );
+            let current_value = if decl.per_channel {
+                format!("CH{}: {}", sel_ch, ctrl.algo_cfg_ch(sel_ch, decl.idx))
+            } else {
+                ctrl.algo_cfg(decl.idx).to_string()
+            };
             metadata.push(AlgoMetadataRow {
-                idx: decl.idx as i32,
-                name: decl.name.into(),
-                value_type: decl.value_type.into(),
-                range: decl.range.into(),
-                current_value: ctrl.algo_cfg(decl.idx).to_string().into(),
+                idx: meta_index as i32,
+                name: if decl.per_channel {
+                    format!("{} (cfg_ch[{}], 逐通道)", decl.name, decl.idx)
+                } else {
+                    format!("{} (cfg[{}], 全通道共享)", decl.name, decl.idx)
+                }
+                .into(),
+                value_type: decl.value_type.clone().into(),
+                range: decl.range.clone().into(),
+                current_value: current_value.into(),
                 description: description.into(),
                 alias: alias.into(),
                 kind: "可调变量".into(),

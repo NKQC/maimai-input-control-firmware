@@ -7,10 +7,11 @@
  * - Status LED: P1.6 (CYBSP_LED_SLD3)
  * - FW_VERSION: 编译时间戳 YYMMDDHHMM(十进制, 本地时间), 由 Makefile PREBUILD 生成
  *   fw_build_stamp.h 提供; 上位机补 "20" 前缀还原 YYYYMMDDHHMM
- * - JIT algo engine: 1KB executable RAM slot (ABI v1, psoc_algo_abi.h),
- *   uploaded via ALGO_BEGIN/PAGE/END/INFO SPI commands, CRC16-CCITT-FALSE
- *   verified commit in main loop, falls back to Cy_CapSense_IsWidgetActive
- *   when no valid algo is loaded.
+ * - JIT algo engine: 4KB executable RAM slot (ABI v1, psoc_algo_abi.h),
+ *   uploaded directly into the slot via ALGO_BEGIN/PAGE/END/INFO SPI commands;
+ *   16KB PSoC RAM cannot afford a second staging slot, so CRC16-CCITT-FALSE
+ *   is verified in the main loop before accepting the direct-write contents.
+ *   Falls back to Cy_CapSense_IsWidgetActive when no valid algo is loaded.
  ******************************************************************************/
 
 #include "cy_pdl.h"
@@ -418,17 +419,28 @@ static uint16_t transfer_generation;
 static bool transfer_valid;
 
 /* ---- JIT 可加载触控算法引擎（ABI v1，见 psoc_algo_abi.h）----
- * algo_slot：可执行 1KB RAM 槽，4 字节对齐（Cortex-M0+ 从 SRAM 取指，thumb 入口 |1）。
- * algo_staging：ALGO_PAGE 写入的暂存区；ALGO_END 只置 pending，由主循环校验 CRC16 后 commit。 */
+ * algo_slot：可执行 4KB RAM 槽，4 字节对齐（Cortex-M0+ 从 SRAM 取指，thumb 入口 |1）。
+ * PSoC 仅余约 3.5KB RAM，不能再留等大的暂存区；ALGO_PAGE 直写槽，由主循环 CRC16 决定是否接纳。 */
 static uint8_t algo_slot[ALGO_SLOT_SIZE] __attribute__((aligned(4)));
-static uint8_t algo_staging[ALGO_SLOT_SIZE];
+static uint8_t algo_heap[ALGO_HEAP_SIZE] __attribute__((aligned(4)));
 static volatile bool algo_valid = false;
 static volatile uint16_t algo_len = 0u;
 /* ALGO_BEGIN 声明的期望长度；ALGO_PAGE 越界保护用。 */
 static volatile uint16_t algo_expected_len = 0u;
-/* 主循环 commit 状态机：ISR 只置位，真正的 CRC 校验 + memcpy 由主循环执行。 */
+/* 主循环 commit 状态机：ISR 只置位，真正的 CRC 校验在主循环执行。 */
 static volatile bool algo_commit_pending = false;
 static volatile uint16_t algo_commit_crc = 0u;
+/* 已提交槽内容的 CRC16；上传失败时清零，避免上位机把坏码误当成功。 */
+static volatile uint16_t algo_slot_crc = 0u;
+/* 顺序页写游标（字节）：页号只校验低 8 位，地址始终由此游标决定。 */
+static volatile uint16_t algo_write_cursor = 0u;
+static volatile bool algo_upload_active = false;
+static volatile uint32_t algo_upload_last_ms = 0u;
+/* CRC 失败次数仅递增（饱和），供带外诊断确认坏码没有被静默接纳。 */
+static volatile uint16_t algo_reject_count = 0u;
+static volatile uint16_t algo_heap_used_peak = 0u;
+/* 每通道 8 字节运行时配置；与全局 cfg[8] 并存，供同一算法按电极差异调整。 */
+static uint8_t g_algo_cfg_ch[SENSOR_CHANNEL_COUNT][8];
 /* 逐通道持久 IO 记录：状态字段跨周期原地保留，仅输入字段每周期刷新。 */
 static algo_io_t g_algo_io[SENSOR_CHANNEL_COUNT];
 /* 记录上一周期各通道 base_active，用于检测非激活→激活边沿以清零 state[]。 */
@@ -846,13 +858,23 @@ static uint32_t algo_engine_run_channel(uint32_t ch, uint32_t base_active)
     io->ch           = ch;
     io->rom          = g_algo_rom[ch];   /* 每通道只读 ROM(上位机下发) */
     /* cfg[8] 全通道共享的可设置变量(上位机 ALGO_SET_CFG 下发)。 */
-    for (uint32_t k = 0u; k < 8u; k++) { io->cfg[k] = g_algo_cfg[k]; }
+    for (uint32_t k = 0u; k < 8u; k++)
+    {
+        io->cfg[k] = g_algo_cfg[k];
+        io->cfg_ch[k] = g_algo_cfg_ch[ch][k];
+    }
+    /* 堆由所有通道共享；算法每轮重新声明实际占用，固件只接受 ABI 约定的 256 字节范围。 */
+    io->heap = algo_heap;
+    io->heap_size = (uint16_t)ALGO_HEAP_SIZE;
+    io->heap_used = 0u;
 
     /* 每轮先清点灯请求, 由算法重新声明: 否则换成不写 out_led 的算法后, 上一个算法(如 LED 演示)
      * 留下的 1 会让白灯永久亮着 —— 那又变成了"用户改不掉的灯"。 */
     io->out_led = 0u;
 
     algo_fn(io);
+    if (io->heap_used > ALGO_HEAP_SIZE) { io->heap_used = (uint16_t)ALGO_HEAP_SIZE; }
+    if (io->heap_used > algo_heap_used_peak) { algo_heap_used_peak = io->heap_used; }
     return io->out_active;
 }
 
@@ -862,7 +884,7 @@ static void update_touch_frame(void)
     uint8_t mask[5] = {0u, 0u, 0u, 0u, 0u};
     uint32_t ch;
     uint32_t st;
-    bool use_algo = algo_valid;
+    bool use_algo = algo_valid && !algo_upload_active;
     /* 点灯请求只来自算法显式写入的 out_led; 与触控判定(out_active)彻底解耦。 */
     bool algo_led = false;
 
@@ -882,7 +904,10 @@ static void update_touch_frame(void)
         }
         base_active = Cy_CapSense_IsWidgetActive((uint32_t)ch, &cy_capsense_context);
 
-        if (use_algo)
+        /* 页写入发生在 SPI ISR，而 algo_fn 在主循环；BEGIN 与首页之间隔一个完整 SPI
+         * 事务和 RP2040 轮询间隔（至少 100us），单次 algo_fn 仅数 us。故逐通道复查
+         * upload_active 即可关死 "边执行边覆盖" 的窗口：上传一开始立即回退原生判定。 */
+        if (use_algo && !algo_upload_active)
         {
             active = algo_engine_run_channel(ch, base_active);
             /* 只认算法自己写的 out_led; 算法不写 → 恒 0 → 不点灯。 */
@@ -1380,35 +1405,58 @@ static void cmd_algo_begin(uint8_t len_lo, uint8_t len_hi)
     uint16_t len = (uint16_t)len_lo | ((uint16_t)len_hi << 8u);
     if (len > ALGO_SLOT_SIZE) { len = ALGO_SLOT_SIZE; }
     algo_expected_len = len;
-    algo_commit_pending = false;   /* 新一轮上传，废弃上一次未 commit 的请求 */
+    algo_commit_pending = false;
+    /* 必须在 BEGIN 立刻作废旧算法：此前 valid 粘滞会让上传失败时上位机仍看见成功。 */
+    algo_valid = false;
+    algo_len = 0u;
+    algo_slot_crc = 0u;
+    algo_write_cursor = 0u;
+    algo_upload_active = true;
+    algo_upload_last_ms = g_ms_tick;
     spi_load_algo_response(ALGO_BEGIN, len_lo, len_hi, len);
 }
 
 static void cmd_algo_page(uint8_t page, uint8_t d0, uint8_t d1, uint8_t d2, uint8_t d3)
 {
-    uint32_t offset = (uint32_t)page * 4u;
-    if ((offset + 4u) <= ALGO_SLOT_SIZE)
+    uint16_t cursor = algo_write_cursor;
+    uint8_t expected = (uint8_t)((cursor >> 2u) & 0xFFu);
+
+    if (!algo_upload_active)
     {
-        algo_staging[offset]      = d0;
-        algo_staging[offset + 1u] = d1;
-        algo_staging[offset + 2u] = d2;
-        algo_staging[offset + 3u] = d3;
+        spi_load_algo_response(ALGO_PAGE, (uint8_t)(page ^ 0xFFu), 0u, 0u);
+        return;
     }
+    /* page 退化为低 8 位顺序校验，真正地址来自游标；因此 4KB（乃至 64KB）均可寻址。
+     * RP2040 严格顺序发页，失序便回不匹配页号让其终止，绝不再静默错位。 */
+    if ((page != expected) || ((cursor + 4u) > ALGO_SLOT_SIZE))
+    {
+        spi_load_algo_response(ALGO_PAGE, (uint8_t)(page ^ 0xFFu), 0u, 0u);
+        return;
+    }
+    algo_slot[cursor]      = d0;
+    algo_slot[cursor + 1u] = d1;
+    algo_slot[cursor + 2u] = d2;
+    algo_slot[cursor + 3u] = d3;
+    algo_write_cursor = (uint16_t)(cursor + 4u);
+    algo_upload_last_ms = g_ms_tick;
     spi_load_algo_response(ALGO_PAGE, page, 0u, 0u);
 }
 
 static void cmd_algo_end(uint8_t crc_lo, uint8_t crc_hi)
 {
-    /* ISR 只置位 pending + 记录 CRC/len；真正的 CRC 校验与 memcpy 由主循环执行(见主循环)。
+    /* ISR 只置位 pending + 记录 CRC/len；真正的 CRC 校验由主循环执行(见主循环)。
      * ok=1 表示"已接收，将校验"；实际校验结果由后续 ALGO_INFO 反映(§设计文档 4)。 */
     algo_commit_crc = (uint16_t)crc_lo | ((uint16_t)crc_hi << 8u);
     algo_commit_pending = true;
+    algo_upload_last_ms = g_ms_tick;
     spi_load_algo_response(ALGO_END, 1u, 0u, algo_expected_len);
 }
 
 static void cmd_algo_info(void)
 {
-    spi_load_algo_response(ALGO_INFO, algo_valid ? 1u : 0u, 0u, algo_len);
+    /* b3 原来恒为 0，现复用为上传中标记，旧主机忽略该字节故保持向后兼容。 */
+    spi_load_algo_response(ALGO_INFO, algo_valid ? 1u : 0u,
+                           algo_upload_active ? 1u : 0u, algo_len);
 }
 
 /* 设置每通道 16 位 ROM：帧 [magic,SET_ROM,ch,rom_lo,rom_hi,0,0]。回显 [.. ,ch,0,rom] 供校验。 */
@@ -1452,6 +1500,46 @@ static void cmd_algo_get_cfg(uint8_t idx)
 {
     uint16_t val = (idx < 8u) ? (uint16_t)g_algo_cfg[idx] : 0u;
     spi_load_algo_response(ALGO_GET_CFG, idx, 0u, val);
+}
+
+/* 写每通道配置: 帧 [magic,SET_CFG_CH,ch,idx,val,..]。越界不写，回显实际存储值。 */
+static void cmd_algo_set_cfg_ch(uint8_t ch, uint8_t idx, uint8_t val)
+{
+    uint16_t actual = 0u;
+    if ((ch < SENSOR_CHANNEL_COUNT) && (idx < 8u))
+    {
+        g_algo_cfg_ch[ch][idx] = val;
+        actual = g_algo_cfg_ch[ch][idx];
+    }
+    spi_load_algo_response(ALGO_SET_CFG_CH, ch, idx, actual);
+}
+
+/* 读每通道配置: 响应 [..,ch,idx,value,0]。 */
+static void cmd_algo_get_cfg_ch(uint8_t ch, uint8_t idx)
+{
+    uint16_t val = ((ch < SENSOR_CHANNEL_COUNT) && (idx < 8u)) ? g_algo_cfg_ch[ch][idx] : 0u;
+    spi_load_algo_response(ALGO_GET_CFG_CH, ch, idx, val);
+}
+
+/* 返回 ABI 可用堆大小与本次已加载算法观察到的最高占用。 */
+static void cmd_algo_get_heap(void)
+{
+    spi_load_algo_response(ALGO_GET_HEAP, (uint8_t)(ALGO_HEAP_SIZE & 0xFFu),
+                           (uint8_t)(ALGO_HEAP_SIZE >> 8u), algo_heap_used_peak);
+}
+
+/* 返回已提交槽的 CRC；valid=0 时 CRC 固定为 0，防止坏码被误当已认证内容。 */
+static void cmd_algo_get_crc(void)
+{
+    spi_load_algo_response(ALGO_GET_CRC, algo_valid ? 1u : 0u, 0u, algo_slot_crc);
+}
+
+/* 自报本固件**真正生效**的容量: b2/b3 = 堆容量, val = 可执行槽容量。
+ * 上位机据此显示占用并做编译闸门, 不再自己硬编码一份 —— 三层常量漏改时当场可见(见 ABI 头注释)。 */
+static void cmd_algo_get_caps(void)
+{
+    spi_load_algo_response(ALGO_GET_CAPS, (uint8_t)(ALGO_HEAP_SIZE & 0xFFu),
+                           (uint8_t)(ALGO_HEAP_SIZE >> 8u), (uint16_t)ALGO_SLOT_SIZE);
 }
 
 /* 装载本次响应帧到 TX DMA 并重挂通道（照搬官方 CE 的 TX 重挂序: 设源 → 设长 → 指定当前描述符
@@ -1876,6 +1964,26 @@ static void spi_slave_task(uint8_t rx_index)
             cmd_algo_get_cfg(rx[2]);
             break;
 
+        case ALGO_SET_CFG_CH:
+            cmd_algo_set_cfg_ch(rx[2], rx[3], rx[4]);
+            break;
+
+        case ALGO_GET_CFG_CH:
+            cmd_algo_get_cfg_ch(rx[2], rx[3]);
+            break;
+
+        case ALGO_GET_HEAP:
+            cmd_algo_get_heap();
+            break;
+
+        case ALGO_GET_CAPS:
+            cmd_algo_get_caps();
+            break;
+
+        case ALGO_GET_CRC:
+            cmd_algo_get_crc();
+            break;
+
         case SENSOR_CMD_TOUCH:
         default:
             /* 触控快路（流水线）：装入最新触控帧，供下一次读取立即返回。 */
@@ -2018,10 +2126,19 @@ int main(void)
     memset(algo_prev_active, 0, sizeof(algo_prev_active));
     for (uint32_t channel = 0u; channel < SENSOR_CHANNEL_COUNT; channel++) { g_algo_rom[channel] = 0u; }
     for (uint32_t k = 0u; k < 8u; k++) { g_algo_cfg[k] = 0u; }
+    memset(g_algo_cfg_ch, 0, sizeof(g_algo_cfg_ch));
+    memset(algo_heap, 0, sizeof(algo_heap));
     algo_valid = false;
     algo_len = 0u;
     algo_expected_len = 0u;
     algo_commit_pending = false;
+    algo_commit_crc = 0u;
+    algo_slot_crc = 0u;
+    algo_write_cursor = 0u;
+    algo_upload_active = false;
+    algo_upload_last_ms = 0u;
+    algo_reject_count = 0u;
+    algo_heap_used_peak = 0u;
 
     __enable_irq();
     initialize_ms_tick();
@@ -2043,6 +2160,11 @@ int main(void)
 
     for (;;)
     {
+        /* 上传断流必须自愈：否则 BEGIN 后没有 END 会永久禁用 JIT，回退原生判定。 */
+        if (algo_upload_active && ((g_ms_tick - algo_upload_last_ms) > 3000u))
+        {
+            algo_upload_active = false;
+        }
         spi_dbg.stage = MLOOP_STAGE_LATCH;
         /* Snapshot payload copies are intentionally outside the DMA completion ISR. */
         spi_snapshot_latch_task();
@@ -2212,27 +2334,47 @@ int main(void)
                 }
             }
 
-            /* ALGO_END commit：主循环校验 CRC16 + 拷贝 1KB，避免在 ISR 里做耗时 memcpy。
-             * 校验失败拒绝、保留旧算法(algo_valid 不变)，符合设计文档 §3 ALGO_END 语义。 */
+            /* ALGO_END commit：槽内容已经被 PAGE 直接覆盖，只能 CRC16 校验后如实接纳或回退。
+             * CRC 失败不能保留旧算法：其字节早已被新上传覆盖，必须 valid=0 走原生 CapSense。 */
             if (algo_commit_pending)
             {
                 spi_dbg.stage = MLOOP_STAGE_ALGO_COMMIT;
                 uint16_t len;
                 uint16_t crc_expect;
                 uint16_t crc_calc;
+                uint32_t i;
 
                 algo_commit_pending = false;
                 len = algo_expected_len;
                 crc_expect = algo_commit_crc;
-                crc_calc = algo_crc16(algo_staging, len);
+                crc_calc = algo_crc16(algo_slot, len);
 
-                if (crc_calc == crc_expect)
+                if ((crc_calc == crc_expect) && (len != 0u) && (algo_write_cursor >= len))
                 {
-                    memcpy(algo_slot, algo_staging, ALGO_SLOT_SIZE);
                     algo_len = len;
+                    algo_slot_crc = crc_calc;
                     algo_valid = true;
+                    /* 换代必须清空逐通道现场与共享堆，否则新算法会读到旧版状态，表现仍像旧算法。 */
+                    for (i = 0u; i < SENSOR_CHANNEL_COUNT; i++)
+                    {
+                        memset(g_algo_io[i].state, 0, sizeof(g_algo_io[i].state));
+                        memset(g_algo_io[i].report, 0, sizeof(g_algo_io[i].report));
+                        g_algo_io[i].out_active = 0u;
+                        g_algo_io[i].out_led = 0u;
+                        g_algo_io[i].heap_used = 0u;
+                        algo_prev_active[i] = 0u;
+                    }
+                    memset(algo_heap, 0, sizeof(algo_heap));
+                    algo_heap_used_peak = 0u;
                 }
-                /* CRC 不一致：拒绝，algo_valid 保持旧值不变。 */
+                else
+                {
+                    algo_valid = false;
+                    algo_len = 0u;
+                    algo_slot_crc = 0u;
+                    if (algo_reject_count < 0xFFFFu) { algo_reject_count++; }
+                }
+                algo_upload_active = false;
             }
 
             /* 全局 CSD 配置改动：完整 Init + Initialize 重初始化，重算 inactive_sns/IDAC/MFS

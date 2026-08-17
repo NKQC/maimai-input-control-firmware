@@ -62,6 +62,15 @@ enum class Cmd : uint8_t {
     ALGO_GET_TRACE = 0x46, // [magic,GET_TRACE,ch,idx,0,0,0] → 响应 [..,ch,out_active,report[idx]_lo,report[idx]_hi,idx]
     ALGO_SET_CFG = 0x47,   // [magic,SET_CFG,idx,val,0,0,0] 设共享 cfg[idx] → 响应回显 [..,idx,0,cfg[idx],0,0]
     ALGO_GET_CFG = 0x48,   // [magic,GET_CFG,idx,0,0,0,0] → 响应 [..,idx,0,cfg[idx],0,0]
+    // ---- ABI v2 追加(槽 4096B + 共享堆 256B + 逐通道 cfg_ch[36][8]) ----
+    // ★注意 0x49 是 FOCUS_SCAN★(它历史上插在算法域中间), 故 v2 从 0x4A 起排, 不得回填 0x49。
+    ALGO_SET_CFG_CH = 0x4A, // [magic,SET_CFG_CH,ch,idx,val,0,0] 设逐通道 cfg_ch[ch][idx] → 响应 [..,ch,idx,实际写入值,0,0]
+    ALGO_GET_CFG_CH = 0x4B, // [magic,GET_CFG_CH,ch,idx,0,0,0] → 响应 [..,ch,idx,cfg_ch[ch][idx],0,0]
+    ALGO_GET_HEAP   = 0x4C, // [magic,GET_HEAP,0,...] → 响应 [..,size_lo,size_hi,used_peak,0,0] 共享堆容量/峰值占用
+    // ★内容对账用★: 只有 CRC 能区分"新算法真装上了"与"旧算法还在、长度恰好相同"。
+    ALGO_GET_CRC    = 0x4D, // [magic,GET_CRC,0,...] → 响应 [..,valid,0,crc_lo,crc_hi,0] 槽内实际内容 CRC16
+    // 容量由 PSoC 固件自报，避免槽/堆常量在 PSoC、RP、上位机三层静默漂移。
+    ALGO_GET_CAPS   = 0x4E, // [magic,GET_CAPS,0,...] → 响应 [..,heap_lo,heap_hi,slot_lo,slot_hi,0]
     SNAPSHOT_INFO = 0x11,
     SNAPSHOT_PAGE = 0x12,
     SNAPSHOT_DATA = 0x13,

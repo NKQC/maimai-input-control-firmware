@@ -20,8 +20,9 @@ pub(crate) fn register_algo_callbacks(
     let algo_default_src = "#include <stddef.h>\n#include \"psoc_algo_abi.h\"\n\n// 入口: 每通道调用一次, 读写 io 固定字段。\n// 禁: libc / '/' '%' / 64位。辅助请 static inline。\nvoid algo(algo_io_t* io)\n{\n    // 示例: 直接沿用中间件基础激活判定。\n    // io->diff/baseline/finger_th/now_ms/rom 等可用于自定义高动态逻辑。\n    io->out_active = (io->base_active != 0u) ? 1u : 0u;\n}\n";
     ui.set_algo_c_source(algo_default_src.into());
     ui.set_algo_line_numbers(line_numbers_for(algo_default_src).into());
-    // C 源容量条: 容量一次性回填, 占用随编辑器内容刷新(去注释后的字节数 = 编译器有效内容)。
-    ui.set_algo_c_capacity(AppController::algo_src_capacity() as i32);
+    // C 源容量条: 这里只是**开机首帧**的兜底回填(此刻还没连上设备, 拿不到设备容量);
+    // 真值由 tick 在收到 ALGO_GET_INFO 后覆盖(见 tick/algorithm.rs 的容量回填块)。
+    ui.set_algo_c_capacity(controller.borrow().algo_src_capacity() as i32);
     ui.set_algo_c_bytes(AppController::algo_src_used(algo_default_src) as i32);
 
     let ctrl_clone = controller.clone();
@@ -51,10 +52,12 @@ pub(crate) fn register_algo_callbacks(
 
     let ui_tpl = ui_weak.clone();
     ui.on_algo_load_template(move |idx| {
-        let tpl = if idx == 1 {
-            ALGO_LED_DEMO_TEMPLATE
-        } else {
-            ALGO_V31_TEMPLATE
+        // ★既有两项的下标不能动★ 0/1 是用户已经习惯的"v3.1 HDR"/"LED 演示", 且 config.cfg 里没有
+        // 记住这个下拉的选择 —— 但换掉顺序会让任何按截图/文档操作的人载入错误的模板。新项只能追加。
+        let tpl = match idx {
+            1 => ALGO_LED_DEMO_TEMPLATE,
+            2 => ALGO_V4_TEMPLATE,
+            _ => ALGO_V31_TEMPLATE,
         };
         let ui = ui_tpl.upgrade().unwrap();
         ui.set_algo_c_source(tpl.into());
@@ -92,6 +95,7 @@ pub(crate) fn register_algo_late_callbacks(
     let ui_algo = ui_weak.clone();
     let algo_busy_compile = algo_busy.clone();
     let algo_job_compile = algo_job.clone();
+    let ctrl_clone = controller.clone();
     ui.on_algo_compile(move |src| {
         let Some(ui) = ui_algo.upgrade() else { return };
         if algo_busy_compile.get() {
@@ -102,14 +106,16 @@ pub(crate) fn register_algo_late_callbacks(
             algo_busy_compile.set(false);
             ui.set_algo_busy(false);
         }
+        // ★容量快照必须在 spawn 之前取★ 后台线程碰不到 AppController(Rc<RefCell<_>> 不是 Send),
+        // 而闸门又不能退回硬编码常量。快照顺带保证报错文案与实际判据用的是同一口径。
+        let caps = ctrl_clone.borrow().algo_caps_snapshot();
         let used = AppController::algo_src_used(src.as_str());
-        let cap = AppController::algo_src_capacity();
         ui.set_algo_c_bytes(used as i32);
-        if used > cap {
+        if used > caps.src {
             ui.set_algo_status(
                 format!(
                     "C 源(去注释){} 字节, 超出设备存储上限 {} 字节: 已阻止编译",
-                    used, cap
+                    used, caps.src
                 )
                 .into(),
             );
@@ -119,7 +125,7 @@ pub(crate) fn register_algo_late_callbacks(
         ui.set_algo_busy(true);
         ui.set_algo_phase("编译中…".into());
         ui.set_algo_status("编译中…(后台工具链, 界面可继续操作)".into());
-        spawn_algo_compile(&algo_job_compile, src.to_string(), false);
+        spawn_algo_compile(&algo_job_compile, src.to_string(), false, caps);
     });
 
     let ctrl_clone = controller.clone();
@@ -146,6 +152,7 @@ pub(crate) fn register_algo_late_callbacks(
     let ui_algo = ui_weak.clone();
     let algo_busy_build = algo_busy.clone();
     let algo_job_build = algo_job.clone();
+    let ctrl_clone = controller.clone();
     ui.on_algo_build_upload(move |src| {
         let Some(ui) = ui_algo.upgrade() else { return };
         if algo_busy_build.get() {
@@ -156,14 +163,14 @@ pub(crate) fn register_algo_late_callbacks(
             algo_busy_build.set(false);
             ui.set_algo_busy(false);
         }
+        let caps = ctrl_clone.borrow().algo_caps_snapshot();
         let used = AppController::algo_src_used(src.as_str());
-        let cap = AppController::algo_src_capacity();
         ui.set_algo_c_bytes(used as i32);
-        if used > cap {
+        if used > caps.src {
             ui.set_algo_status(
                 format!(
                     "C 源(去注释){} 字节, 超出设备存储上限 {} 字节: 已阻止编译并上传",
-                    used, cap
+                    used, caps.src
                 )
                 .into(),
             );
@@ -173,7 +180,7 @@ pub(crate) fn register_algo_late_callbacks(
         ui.set_algo_busy(true);
         ui.set_algo_phase("编译中…".into());
         ui.set_algo_status("编译中…(后台工具链, 界面可继续操作)".into());
-        spawn_algo_compile(&algo_job_build, src.to_string(), true);
+        spawn_algo_compile(&algo_job_build, src.to_string(), true, caps);
     });
 
     let ctrl_clone = controller.clone();
@@ -183,6 +190,23 @@ pub(crate) fn register_algo_late_callbacks(
         }
         let mut ctrl = ctrl_clone.borrow_mut();
         let _ = ctrl.set_algo_cfg(idx as u8, value as u8);
+    });
+
+    // 逐通道算法配置(cfg_ch)的单通道编辑。★通道号不随参数传★: 由这里读 sel_channel(与
+    // curve_ch_enable_set 同一手法), 免得界面与 Rust 各持一个"当前通道"而漂移 —— 那种漂移的
+    // 表现是"在 CH7 上改的值落到了 CH0", 而两边看起来都对。
+    let ctrl_clone = controller.clone();
+    let ui_weak_cfg_ch = ui_weak.clone();
+    ui.on_algo_setting_ch_edited(move |idx, value| {
+        if idx < 0 || value < 0 || value > 255 {
+            return;
+        }
+        let Some(ui) = ui_weak_cfg_ch.upgrade() else {
+            return;
+        };
+        let ch = ui.get_sel_channel().clamp(0, 35) as u8;
+        let mut ctrl = ctrl_clone.borrow_mut();
+        let _ = ctrl.set_algo_cfg_ch(ch, idx as u8, value as u8);
     });
 
     let ctrl_clone = controller.clone();

@@ -110,6 +110,41 @@ pub(crate) fn register_batch_callbacks(
             .batch_set_value(param_id as u8, value as u32);
     });
 
+    // ---- 逐通道算法配置(cfg_ch)的批量项 ----
+    // 与上面的硬件参数走**同一套**语义: 勾选/手改值都只落在 AppController 的本次批量会话里,
+    // 真正写入是在 batch_apply_from 里对每个已选目标通道各写一份 set_algo_cfg_ch 草稿。
+    let ctrl_clone = controller.clone();
+    ui.on_batch_toggle_algo_ch(move |idx| {
+        if !(0..mai2control_ui::proto::algo::ALGO_CFG_CH_SLOTS as i32).contains(&idx) {
+            return;
+        }
+        ctrl_clone.borrow_mut().batch_toggle_algo_ch(idx as u8);
+    });
+
+    // 值域 0..255 是协议事实(设备 cfg_ch 就是 u8 数组), 不是这里猜的围栏; 越界直接忽略而不钳制 ——
+    // 钳制会把用户输错的数悄悄变成 255 写下去, 而忽略至少让面板停在原值。
+    let ctrl_clone = controller.clone();
+    ui.on_batch_algo_ch_value_set(move |idx, value| {
+        if !(0..mai2control_ui::proto::algo::ALGO_CFG_CH_SLOTS as i32).contains(&idx)
+            || !(0..=255).contains(&value)
+        {
+            return;
+        }
+        ctrl_clone
+            .borrow_mut()
+            .batch_algo_ch_value_set(idx as u8, value as u8);
+    });
+
+    let ctrl_clone = controller.clone();
+    ui.on_batch_algo_ch_all(move || {
+        ctrl_clone.borrow_mut().batch_algo_ch_all();
+    });
+
+    let ctrl_clone = controller.clone();
+    ui.on_batch_algo_ch_invert(move || {
+        ctrl_clone.borrow_mut().batch_algo_ch_invert();
+    });
+
     let ctrl_clone = controller.clone();
     ui.on_batch_apply(move |src| {
         if !(0..36).contains(&src) {

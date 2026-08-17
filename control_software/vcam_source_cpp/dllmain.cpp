@@ -128,6 +128,18 @@ STDAPI DllGetClassObject(REFCLSID clsid, REFIID riid, void** object) {
     if (clsid != CLSID_Mai2VcamDshow) {
         return CLASS_E_CLASSNOTAVAILABLE;
     }
+    // ★宿主进程必须留痕★ "Windows 设置里恒黑"要先分清两件事: 帧服务器到底有没有把本 DLL 载进去,
+    // 还是压根没来找过。没有这一行时日志里只有上位机自检留下的记录, 于是"没被加载"与"加载了但
+    // 取不到帧"被压成同一种观测结果 —— 那正是之前排查方向跑偏的原因。
+    // 放在这里而不是 DllMain: DllMain 持着加载器锁, 在里面做文件 I/O 是死锁源。
+    {
+        static LONG announced = 0;
+        if (InterlockedCompareExchange(&announced, 1, 0) == 0) {
+            WCHAR host[MAX_PATH] = {0};
+            GetModuleFileNameW(nullptr, host, MAX_PATH);
+            Mai2VcamLog("DllGetClassObject: 宿主进程 %ls", host);
+        }
+    }
     Mai2VcamClassFactory* factory = new Mai2VcamClassFactory();
     if (factory == nullptr) {
         return E_OUTOFMEMORY;

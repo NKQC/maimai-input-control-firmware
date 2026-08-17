@@ -18,7 +18,7 @@ use anyhow::Result;
 use log::info;
 
 use mai2control_ui::app_state::{
-    AppController, ChBatchKind, CompiledAlgo, ConnState, HID_COORD_MAX, HID_POINT_COUNT,
+    AlgoCaps, AppController, ChBatchKind, CompiledAlgo, ConnState, HID_COORD_MAX, HID_POINT_COUNT,
     SWEEP_DIVS, zone_label,
 };
 use mai2control_ui::proto::{
@@ -28,7 +28,7 @@ use mai2control_ui::proto::{
 use mai2control_ui::proto::{LED_CH_UNMAPPED, LED_PREVIEW_ALL, LED_UNIT_COUNT};
 use mai2control_ui::touch_geometry;
 use mai2control_ui::vcam::{self, VcamState};
-use mai2control_ui::vcam::{backend as vcam_backend, share, share::FramePublisher};
+use mai2control_ui::vcam::{backend as vcam_backend, share::FramePublisher};
 use slint::Model;
 
 slint::include_modules!();
@@ -62,7 +62,9 @@ use ui_plot::{
 
 // 算法 C 源模板已上移到库(mai2control_ui::algo_template): GUI 的"加载模板"/默认源回灌与
 // 无头自检的同一路径复现必须用同一份字节, 不能两个二进制各 include_str! 一次。
-pub(crate) use mai2control_ui::algo_template::{ALGO_LED_DEMO_TEMPLATE, ALGO_V31_TEMPLATE};
+pub(crate) use mai2control_ui::algo_template::{
+    ALGO_LED_DEMO_TEMPLATE, ALGO_V31_TEMPLATE, ALGO_V4_TEMPLATE,
+};
 
 /// Cp 测量的真实失败：通道已参与测量，但结果无效。
 const CP_MEASURE_FAILED: u32 = 0x00FF_FFFF;
@@ -86,12 +88,20 @@ struct AlgoCompileJob {
 }
 
 /// 起一次后台编译。同一时刻只允许一个任务(由调用处的 algo_busy 守门)。
-fn spawn_algo_compile(slot: &Rc<RefCell<Option<AlgoCompileJob>>>, src: String, upload_after: bool) {
+///
+/// `caps` 由调用方(UI 线程)在 spawn 之前用 `AppController::algo_caps_snapshot()` 取好:
+/// 编译的容量闸门必须是**设备回报值**, 而后台线程碰不到 `Rc<RefCell<AppController>>`。
+fn spawn_algo_compile(
+    slot: &Rc<RefCell<Option<AlgoCompileJob>>>,
+    src: String,
+    upload_after: bool,
+    caps: AlgoCaps,
+) {
     let (tx, rx) = std::sync::mpsc::channel();
     let src_for_thread = src.clone();
     std::thread::spawn(move || {
         // 发送失败只可能是 UI 已退出, 此时无人关心结果, 忽略即可。
-        let _ = tx.send(AppController::compile_blob(&src_for_thread));
+        let _ = tx.send(AppController::compile_blob(&src_for_thread, caps));
     });
     *slot.borrow_mut() = Some(AlgoCompileJob {
         rx,

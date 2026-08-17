@@ -226,7 +226,11 @@ export component ToolboxPage inherits Rectangle {
                     // 视口高 → 滚动条"的求值环(本工程别处已栽过)。
                     ScrollView {
                         horizontal-stretch: 0;
-                        width: max(280px, min(430px, root.width * 0.38));
+                        // 下限由**本栏内最宽的那一行**决定, 不是随手取的数: 「安装(需管理员)」+
+                        // 「卸载(需管理员)」并排约需 270px, 分辨率那行(标签 150 + 两个数字框 + "x")
+                        // 约需 310px, 再加内边距与滚动条 ⇒ 360px 才不裁切。低于这个数就会出现
+                        // 横向滚动条并把按钮文字切掉(实测截图里就是这样)。
+                        width: max(380px, min(470px, root.width * 0.46));
                         // ★上下限必须是常量★ 一旦写成由 parent.height 推, 子的 min-height 会向上
                         // 决定父的 min, 父高度又回头喂给子, 布局直接成环。
                         min-height: 240px;
@@ -369,6 +373,9 @@ export component ToolboxPage inherits Rectangle {
                                 }
                                 // 三个动作并排一行。★不要再把它们拆成三个各自带 stretch 的 HorizontalBox★
                                 // 那样每行都要独立分配高度, 与下面的条件确认块一起把布局撑得七零八落。
+                                // 三个动作拆成两行。★不要再挤成一行★ 三个按钮的最小宽度之和
+                                // 超过本栏可用宽度, 挤在一行的结果是后两个按钮被裁掉(第三个
+                                // 干脆看不见)。按钮不会缩到文字以下, 所以只能换行, 不能靠压缩。
                                 HorizontalBox {
                                     padding: 0px;
                                     spacing: 8px;
@@ -382,6 +389,11 @@ export component ToolboxPage inherits Rectangle {
                                         enabled: !root.vcam_deploy_busy;
                                         clicked => { root.bind_vcam_winusb(); }
                                     }
+                                    Rectangle { horizontal-stretch: 1; }
+                                }
+                                HorizontalBox {
+                                    padding: 0px;
+                                    spacing: 8px;
                                     Button {
                                         text: "恢复原驱动";
                                         enabled: !root.vcam_deploy_busy;
@@ -513,29 +525,32 @@ export component ToolboxPage inherits Rectangle {
                         // 输出分辨率: 宽高各一个数字框。生效值会被夹进范围并取偶数(NV12 的色度按
                         // 2x2 块取样, 奇数尺寸会让行距错位), 所以回填值可能与刚敲进去的不同 ——
                         // 显示的始终是**实际生效**的那个值。
+                        // ★宽高必须各占一行★ 挤在一行需要 标签160 + 数字框128 + "x" + 数字框128
+                        // ≈ 440px, 而本栏可用宽度只有 360 上下 —— 而 spin-narrow(128px) 已是数字框
+                        // 自报的下限, 再压就把里面的数字挤没了。所以只能分行, 不能靠压缩控件。
                         FormRow {
-                            label: "输出分辨率(宽 x 高):";
+                            label: "输出宽度(px):";
                             label_width: 160px;
-                            HorizontalLayout {
-                                spacing: 6px;
-                                GuardedSpinBox {
-                                    width: Theme.spin-narrow;
-                                    horizontal-stretch: 0;
-                                    minimum: 160;
-                                    maximum: 1920;
-                                    model_value: root.vcam_frame_w;
-                                    edited(v) => { root.set_vcam_resolution(v, root.vcam_frame_h); }
-                                }
-                                Text { text: "x"; vertical-alignment: center; color: #7f8c96; }
-                                GuardedSpinBox {
-                                    width: Theme.spin-narrow;
-                                    horizontal-stretch: 0;
-                                    minimum: 120;
-                                    maximum: 1080;
-                                    model_value: root.vcam_frame_h;
-                                    edited(v) => { root.set_vcam_resolution(root.vcam_frame_w, v); }
-                                }
-                                Rectangle { horizontal-stretch: 1; }
+                            GuardedSpinBox {
+                                width: Theme.spin-narrow;
+                                horizontal-stretch: 0;
+                                minimum: 160;
+                                maximum: 1920;
+                                model_value: root.vcam_frame_w;
+                                edited(v) => { root.set_vcam_resolution(v, root.vcam_frame_h); }
+                            }
+                        }
+
+                        FormRow {
+                            label: "输出高度(px):";
+                            label_width: 160px;
+                            GuardedSpinBox {
+                                width: Theme.spin-narrow;
+                                horizontal-stretch: 0;
+                                minimum: 120;
+                                maximum: 1080;
+                                model_value: root.vcam_frame_h;
+                                edited(v) => { root.set_vcam_resolution(root.vcam_frame_w, v); }
                             }
                         }
 
@@ -552,8 +567,11 @@ export component ToolboxPage inherits Rectangle {
                             }
                         }
 
+                        // ★这条不是提示, 是硬性要求的说明★ 分辨率全链路原样透传、不做任何缩放,
+                        // 而 DirectShow 的尺寸在连接时就与下游定死, 所以改分辨率只能整条链路重来:
+                        // 本程序会自动卸载重建摄像头, 消费端那边必须由用户重新打开一次。
                         Text {
-                            text: "改分辨率后，消费端(游戏 / OBS / Windows 设置)需重新打开摄像头才会按新尺寸协商。";
+                            text: "分辨率原样透传、不缩放：改分辨率会自动卸载并重建摄像头，之后必须在消费端(游戏 / OBS)重新打开一次摄像头，否则那边只会看到黑帧。";
                             color: #7f8c96;
                             font-size: 10px;
                             wrap: word-wrap;

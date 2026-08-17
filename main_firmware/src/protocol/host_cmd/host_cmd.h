@@ -160,6 +160,10 @@ enum class HostCmd : uint8_t {
     // 不再有对应的请求/响应。★不要复用该码★: 旧上位机仍可能发它, 复用会被误解为追踪请求。
     ALGO_SET_CFG       = 0x6A,  // payload=[idx(u8),val(u8)] 设共享 cfg[idx]+持久化+下发 → ACK
     ALGO_GET_CFG       = 0x6B,  // payload=[idx(u8)] → 响应 [idx,cfg(u8)]
+    // ★逐通道可设置变量(ABI v2 cfg_ch[36][8])★ 与 cfg[8] 并存: cfg 是全通道共享的一组,
+    // cfg_ch 是每个通道各自一组(例如逐电极阈值), 两者在 PSoC 侧是两张独立表, 不可互相代替。
+    ALGO_SET_CFG_CH    = 0x6C,  // payload=[ch,idx,val]×N 设逐通道 cfg_ch + 持久化 + 下发 → ACK
+    ALGO_GET_CFG_CH    = 0x6D,  // 空 → 响应 36×8 字节(ch 主序), RP 存储的真相源
 
     // 物理键盘 / 触控键盘映射域 + mai2 串口状态 0x70-0x7D
     // 空 → [phys_state(u16 LE), raw(u16 LE), out(u16 LE)]: 去抖后 / 去抖前 / 实际输出 HID 三态。

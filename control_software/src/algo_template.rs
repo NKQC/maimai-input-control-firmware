@@ -16,3 +16,10 @@ pub const ALGO_LED_DEMO_TEMPLATE: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../psoc_firmware/algo/psoc_algo_led_demo.c"
 ));
+
+/// v4 单通道 HDR 算法(ABI v2): 4 个可调量改为**逐通道**(cfg_ch), 并修掉 v3.1 的"被掠过即误松开"。
+/// 与上面两份同理放在库里 —— 算法页"加载模板"与无头自检必须拿到同一份字节。
+pub const ALGO_V4_TEMPLATE: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../psoc_firmware/algo/psoc_algo_v4.c"
+));

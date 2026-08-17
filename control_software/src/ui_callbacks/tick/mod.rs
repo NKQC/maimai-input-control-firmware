@@ -113,6 +113,13 @@ pub(super) fn start(ui: &AppWindow, inputs: TickInputs) -> slint::Timer {
     let mut last_algo_trace_version = u64::MAX;
     let mut last_algo_metadata_trace_version = u64::MAX;
     let mut last_algo_cfg_version = u64::MAX;
+    // 逐通道算法配置(cfg_ch)的重建门控。★与 cfg 分开一个游标★: 两组值来自两条独立的回读/草稿路径,
+    // 合用一个游标会让改共享项也重建逐通道行(反之亦然), 白丢一次编辑焦点。
+    let mut last_algo_cfg_ch_version = u64::MAX;
+    // 批量抽屉里逐通道算法行的 schema 门控: 换算法后声明项会变, 而批量块本身只看 batch/param 版本。
+    let mut last_batch_algo_schema_version = u64::MAX;
+    // 算法容量(设备回报)回填门控: 容量是不变量, 只在 algo_version 推进时核对一次即可。
+    let mut last_algo_caps_known = false;
     // 自动载入编辑器的那份文本: 用于判断编辑器是否已被用户改过(改过就不再自动覆盖)。
     // ★初值必须等于启动时预置进编辑器的那份模板★: 否则"编辑器 == 自动载入值"恒不成立,
     // 会把开机预置的模板当成"用户的改动"而永不载入设备算法源 —— 表现为 JIT 算法从不自动同步显示。
@@ -155,8 +162,19 @@ pub(super) fn start(ui: &AppWindow, inputs: TickInputs) -> slint::Timer {
         Rc::new(slint::VecModel::from(Vec::new()));
     let algo_metadata_rows_model: Rc<slint::VecModel<AlgoMetadataRow>> =
         Rc::new(slint::VecModel::from(Vec::new()));
+    // 逐通道算法配置(cfg_ch[8])的编辑行: 与共享 cfg 行**分成两个模型**而不是一个模型加个标记位。
+    // 理由是它们的值口径不同 —— 共享行的值只有一份, 逐通道行的值随"当前精调通道"变。混在一个
+    // 模型里, 单通道页切通道时会把共享行也一起重建(丢焦点), 而分开后只需重建逐通道那几行。
+    let algo_setting_ch_rows_model: Rc<slint::VecModel<AlgoSettingRow>> =
+        Rc::new(slint::VecModel::from(Vec::new()));
+    // 批量抽屉里那一份逐通道算法配置行: 值取自 batch_source 且可手改(见 batch_algo_ch_values),
+    // 与上面单通道精调那一份是**两组不同的值**, 因此也必须是两个模型。
+    let batch_algo_ch_rows_model: Rc<slint::VecModel<AlgoSettingRow>> =
+        Rc::new(slint::VecModel::from(Vec::new()));
     ui.set_algo_setting_rows(slint::ModelRc::from(algo_setting_rows_model.clone()));
     ui.set_algo_metadata_rows(slint::ModelRc::from(algo_metadata_rows_model.clone()));
+    ui.set_algo_setting_ch_rows(slint::ModelRc::from(algo_setting_ch_rows_model.clone()));
+    ui.set_batch_algo_ch_rows(slint::ModelRc::from(batch_algo_ch_rows_model.clone()));
     // ★这一行原先漏了★ 上报折线模型在 ui_callbacks/algo.rs 里建好、在 tick/chart.rs 里被逐行
     // 填满(每帧 4 行), 却从没绑到 Slint 的 `algo_report_lines` 属性上 —— 该属性因此永远是默认的
     // 空数组。后果有两处, 都与"算法里声明了什么"无关:
@@ -229,6 +247,8 @@ pub(super) fn start(ui: &AppWindow, inputs: TickInputs) -> slint::Timer {
     let algo_report_lines_model_timer = algo_report_lines_model.clone();
     let algo_setting_rows_model_timer = algo_setting_rows_model.clone();
     let algo_metadata_rows_model_timer = algo_metadata_rows_model.clone();
+    let algo_setting_ch_rows_model_timer = algo_setting_ch_rows_model.clone();
+    let batch_algo_ch_rows_model_timer = batch_algo_ch_rows_model.clone();
     let report_norm_timer = report_norm.clone();
     let vcam_timer = vcam_state.vcam.clone();
     let publisher_timer = vcam_state.frame_publisher.clone();

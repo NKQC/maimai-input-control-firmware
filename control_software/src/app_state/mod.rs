@@ -35,7 +35,9 @@ mod drafts;
 use drafts::ConfigDrafts;
 mod core;
 use core::conn::ConnProbeStep;
-pub use core::types::{CompiledAlgo, ConnState, DeviceEntry, LogLevel, PsocLinkEvidence};
+pub use core::types::{
+    AlgoCaps, CompiledAlgo, ConnState, DeviceEntry, LogLevel, PsocLinkEvidence,
+};
 pub use core::utils::{
     HID_COORD_MAX, HID_POINT_COUNT, binding_channel_mask, binding_device_mask, hid_en_key,
     hid_x_key, hid_y_key, make_binding, zone_key, zone_label,
@@ -778,6 +780,23 @@ pub struct AppController {
     /// 每槽是否已由设备或已提交草稿填入；false 时 UI 必须取 ABI 声明默认值，不能伪造 0。
     algo_cfg_valid: [bool; 8],
     algo_cfg_version: u64,
+
+    /// 逐通道算法可设置变量缓存(ABI v2 的 cfg_ch[8], ALGO_GET_CFG_CH/SET_CFG_CH)+ 版本号。
+    /// ★与 algo_cfg 并存而不是取代★ 设备侧就是两组: cfg[8] 全通道共享, cfg_ch[36][8] 逐通道,
+    /// 下标空间互相独立(cfg[0] 与 cfg_ch[*][0] 是不同变量)。
+    algo_cfg_ch: [[u8; crate::proto::algo::ALGO_CFG_CH_SLOTS]; crate::proto::algo::ALGO_CHANNELS],
+    /// 每 (通道, 槽) 是否已有设备真值; false 时 UI 必须回落到声明默认值, 不能伪造 0。
+    algo_cfg_ch_valid:
+        [[bool; crate::proto::algo::ALGO_CFG_CH_SLOTS]; crate::proto::algo::ALGO_CHANNELS],
+    algo_cfg_ch_version: u64,
+
+    /// 设备回报的算法容量(来自 `ALGO_GET_INFO` 的 26 字节响应)。
+    /// `None` = 还没连上 / 旧固件不回报 ⇒ 一切容量取兜底值, 且 UI 必须把它显示成"待回读"而不是真值。
+    /// ★为什么要缓存而不是每次从 algo_info 里取★ 后台编译线程拿不到 `&self`(见 `compile_blob`),
+    /// 必须在 spawn 之前取一份快照带过去; 而 `algo_info` 会被下一次 GET_INFO 覆盖成在途态
+    /// (uploading 期间 psoc_* 都是中间值), 容量却是不变量, 分开存才不会被在途态牵连。
+    algo_caps: Option<AlgoCaps>,
+
     /// 全局 CSD 配置缓存 gparam_id → value(GLOBAL_GET/GET_ALL 响应)+ 版本号。
     globals: BTreeMap<u8, u32>,
     globals_version: u64,
@@ -810,6 +829,12 @@ pub struct AppController {
     /// ★不能用"空项已补齐"当停止条件★: 固件的 PARAM_GET_ALL 本来就不回 0x06/0x09 两项,
     /// 那两行永远是空的(界面如实显示 "—"), 用空项判据等于永不停发。
     batch_src_fetched: Option<u8>,
+
+    /// 批量面板里"逐通道算法配置(cfg_ch)"各槽的勾选态与待写值(下标 = cfg_ch 槽号 0..7)。
+    /// ★与硬件参数完全同款的两件套★: 勾选决定写不写, 值是面板上真正要写下去的数(可手改);
+    /// `None` = 面板上尚无值(源通道未回读该槽且用户未手填) ⇒ 应用时跳过, 绝不拿 0 或默认值顶替。
+    batch_algo_ch_selected: [bool; crate::proto::algo::ALGO_CFG_CH_SLOTS],
+    batch_algo_ch_values: [Option<u8>; crate::proto::algo::ALGO_CFG_CH_SLOTS],
     /// 当前遥测档位: Some(true)=逐通道档, Some(false)=仅统计/延迟轻档, None=未知(需重新下发)。
     telem_scope_channels: Option<bool>,
     /// UI 批量 CSD 操作的 host 侧串行队列(逐通道校准/基线/频率自适应)。见 `ch_ops`。
@@ -1140,6 +1165,12 @@ impl AppController {
             algo_cfg: [0u8; 8],
             algo_cfg_valid: [false; 8],
             algo_cfg_version: 0,
+            algo_cfg_ch: [[0u8; crate::proto::algo::ALGO_CFG_CH_SLOTS];
+                crate::proto::algo::ALGO_CHANNELS],
+            algo_cfg_ch_valid: [[false; crate::proto::algo::ALGO_CFG_CH_SLOTS];
+                crate::proto::algo::ALGO_CHANNELS],
+            algo_cfg_ch_version: 0,
+            algo_caps: None,
             globals: BTreeMap::new(),
             globals_version: 0,
             csd_diag_probe_in: None,
@@ -1152,6 +1183,8 @@ impl AppController {
             batch_source: 0,
             batch_values: [None; 11],
             batch_src_fetched: None,
+            batch_algo_ch_selected: [false; crate::proto::algo::ALGO_CFG_CH_SLOTS],
+            batch_algo_ch_values: [None; crate::proto::algo::ALGO_CFG_CH_SLOTS],
             telem_scope_channels: None,
             cfg_tx_queue: std::collections::VecDeque::new(),
             cfg_tx_inflight: None,
@@ -1747,6 +1780,12 @@ impl AppController {
             kind: RequestKind::AlgoGetRom,
             frame: crate::proto::algo::encode_algo_get_rom(0),
         });
+        // 逐通道算法配置与 ROM 表并列进首次同步: 两者都是"每通道各一份"的算法侧真值,
+        // 少了它单通道精调页与批量面板只能显示声明默认值, 与设备实际在用的值无从区分。
+        self.conn_probe_queue.push_back(ConnProbeStep {
+            kind: RequestKind::RequestAlgoCfgCh,
+            frame: crate::proto::algo::encode_algo_get_cfg_ch(0),
+        });
         self.conn_probe_queue.push_back(ConnProbeStep {
             kind: RequestKind::KbdRequestState,
             frame: Frame::new(HostCmd::KbdGetState as u8, 0, 0, vec![]),
@@ -1927,6 +1966,10 @@ impl AppController {
             }
             x if x == HostCmd::AlgoGetSrc as u8 => {
                 crate::proto::algo::decode_algo_src_chunk(&frame.payload).is_some()
+            }
+            // 逐通道算法配置: 至少要带回一个完整通道(8 字节)才算有效响应, 否则半组数据无从落缓存。
+            x if x == HostCmd::AlgoGetCfgCh as u8 => {
+                !crate::proto::algo::decode_algo_get_cfg_ch(&frame.payload).is_empty()
             }
             x if x == HostCmd::KbdGetState as u8 => frame.payload.len() >= 2,
             x if x == HostCmd::KbdGetMap as u8 => {
@@ -2165,6 +2208,9 @@ impl AppController {
             self._confirm_data_pending(&frame, Self::_data_response_decode_ok(&frame));
         } else if frame.cmd == HostCmd::AlgoGetCfg as u8 && (frame.flags & 0x01) != 0 {
             self._handle_algo_get_cfg_response(&frame);
+        } else if frame.cmd == HostCmd::AlgoGetCfgCh as u8 && (frame.flags & 0x01) != 0 {
+            self._handle_algo_get_cfg_ch_response(&frame);
+            self._confirm_data_pending(&frame, Self::_data_response_decode_ok(&frame));
         } else if frame.cmd == HostCmd::AlgoGetSrc as u8 && (frame.flags & 0x01) != 0 {
             self._handle_algo_src_chunk(&frame);
             self._confirm_data_pending(&frame, Self::_data_response_decode_ok(&frame));
@@ -2584,6 +2630,26 @@ impl AppController {
             self.algo_cfg[idx as usize] = val;
             self.algo_cfg_valid[idx as usize] = true;
         }
+        // 4a) 逐通道算法配置。★整批聚合成一帧多条★ 草稿最多 36×8 = 288 项, 逐项发帧就是 288 个
+        // 往返 + 288 次 ACK 归因, 足以把有序写队列堵到用户以为程序卡死; 整批 864 字节远在单帧
+        // payload 上限(4096)之内。与 KBD_SET_HOLD/KEYCFG 的"整批一帧"同一手法。
+        let algo_cfg_ch_items: Vec<(u8, u8, u8)> = self.drafts.algo_cfg_ch_items();
+        if !algo_cfg_ch_items.is_empty() {
+            let seq = self.next_seq();
+            if self.io.is_some() {
+                queued.push(crate::proto::algo::encode_algo_set_cfg_ch(
+                    seq,
+                    &algo_cfg_ch_items,
+                ));
+            }
+            for (ch, idx, val) in &algo_cfg_ch_items {
+                let (c, i) = (*ch as usize, *idx as usize);
+                if c < self.algo_cfg_ch.len() && i < crate::proto::algo::ALGO_CFG_CH_SLOTS {
+                    self.algo_cfg_ch[c][i] = *val;
+                    self.algo_cfg_ch_valid[c][i] = true;
+                }
+            }
+        }
         // 4b) 触控组合映射(整表替换)。放在物理键/触控键之前无所谓: 固件侧是独立表, 互不影响。
         self._commit_combo(&mut queued)?;
         // 5) 工作模式
@@ -2702,6 +2768,7 @@ impl AppController {
         self.kbd_hold_version = self.kbd_hold_version.wrapping_add(1);
         self.kbd_keycfg_version = self.kbd_keycfg_version.wrapping_add(1);
         self.algo_cfg_version = self.algo_cfg_version.wrapping_add(1);
+        self.algo_cfg_ch_version = self.algo_cfg_ch_version.wrapping_add(1);
         self.led_version = self.led_version.wrapping_add(1);
     }
 
@@ -2739,9 +2806,13 @@ impl AppController {
     /// `ConfigDrafts::clear_all` 一次清净 —— 逐个手写清理正是"漏一个就永远显示未保存"的来源。
     fn _clear_drafts(&mut self) {
         let algo_cfg_changed = self.drafts.has_algo_cfg();
+        let algo_cfg_ch_changed = self.drafts.has_algo_cfg_ch();
         self.drafts.clear_all();
         if algo_cfg_changed {
             self.algo_cfg_version = self.algo_cfg_version.wrapping_add(1);
+        }
+        if algo_cfg_ch_changed {
+            self.algo_cfg_ch_version = self.algo_cfg_ch_version.wrapping_add(1);
         }
     }
 
@@ -2882,6 +2953,8 @@ impl AppController {
     }
 
     /// 预填实现(不动版本号): 供 `batch_set_source` 与 `batch_fill_missing_values` 复用。
+    /// 硬件参数与逐通道算法配置一并预填 —— 两者在面板上是同一种交互(勾选 + 可手改的值),
+    /// 只有下发命令不同, 预填口径必须一致(都取源通道的**已知**真值, 缺就留空显示 "—")。
     fn _batch_fill_missing(&mut self) -> bool {
         let src = self.batch_source;
         let mut filled = false;
@@ -2895,7 +2968,79 @@ impl AppController {
                 filled = true;
             }
         }
+        for idx in 0..crate::proto::algo::ALGO_CFG_CH_SLOTS {
+            if self.batch_algo_ch_values[idx].is_some() {
+                continue;
+            }
+            // ★只用"确定知道"的值★: `algo_cfg_ch` 会回落到声明默认值, 拿它预填等于把一个从未与
+            // 设备核对过的数当成"源通道当前值"批量刷到 36 个通道上。
+            if let Some(value) = self._algo_cfg_ch_known(src, idx as u8) {
+                self.batch_algo_ch_values[idx] = Some(value);
+                filled = true;
+            }
+        }
         filled
+    }
+
+    // ---- 批量面板的"逐通道算法配置"一列(与硬件参数完全对称) ----
+
+    /// 各 cfg_ch 槽的勾选态(下标 = 槽号 0..7)。
+    pub fn batch_algo_ch_selected(&self) -> Vec<bool> {
+        self.batch_algo_ch_selected.to_vec()
+    }
+
+    /// 各 cfg_ch 槽的待写值。`-1` = 面板上尚无值(与 `batch_values` 同一哨兵口径, 界面显示 "—")。
+    pub fn batch_algo_ch_values(&self) -> Vec<i32> {
+        self.batch_algo_ch_values
+            .iter()
+            .map(|v| v.map_or(-1i32, |value| value as i32))
+            .collect()
+    }
+
+    pub fn batch_toggle_algo_ch(&mut self, idx: u8) {
+        let Some(slot) = self.batch_algo_ch_selected.get_mut(idx as usize) else {
+            return;
+        };
+        *slot = !*slot;
+        self.batch_sel_version = self.batch_sel_version.wrapping_add(1);
+    }
+
+    /// 手改某槽的待写值。不校验范围 —— 与 `batch_set_value` 同口径, 校验统一由
+    /// `set_algo_cfg_ch` 在应用时做(cfg_ch 是 u8, 0..255 全合法, 越界由调用方的 u8 转换挡住)。
+    pub fn batch_algo_ch_value_set(&mut self, idx: u8, val: u8) {
+        let Some(slot) = self.batch_algo_ch_values.get_mut(idx as usize) else {
+            return;
+        };
+        *slot = Some(val);
+        self.batch_sel_version = self.batch_sel_version.wrapping_add(1);
+    }
+
+    /// 逐通道算法配置项全选。★只选"有声明的槽"★ 设备侧 cfg_ch 恒有 8 个槽, 但算法可能只声明
+    /// 其中几个; 把未声明的槽也勾上会写进一堆算法压根不读的字节, 白占一轮下发与对账。
+    pub fn batch_algo_ch_all(&mut self) {
+        let declared: Vec<u8> = self
+            .algo_setting_decls()
+            .into_iter()
+            .filter(|decl| decl.per_channel)
+            .map(|decl| decl.idx)
+            .collect();
+        for (idx, slot) in self.batch_algo_ch_selected.iter_mut().enumerate() {
+            *slot = declared.contains(&(idx as u8));
+        }
+        self.batch_sel_version = self.batch_sel_version.wrapping_add(1);
+    }
+
+    pub fn batch_algo_ch_invert(&mut self) {
+        let declared: Vec<u8> = self
+            .algo_setting_decls()
+            .into_iter()
+            .filter(|decl| decl.per_channel)
+            .map(|decl| decl.idx)
+            .collect();
+        for (idx, slot) in self.batch_algo_ch_selected.iter_mut().enumerate() {
+            *slot = !*slot && declared.contains(&(idx as u8));
+        }
+        self.batch_sel_version = self.batch_sel_version.wrapping_add(1);
     }
 
     pub fn batch_toggle_channel(&mut self, ch: u8) {
@@ -2937,6 +3082,10 @@ impl AppController {
 
     pub fn batch_clear(&mut self) {
         self.batch_sel.clear();
+        // 逐通道算法配置的勾选与待写值属于同一次批量会话, 必须一起清 ——
+        // 留着它, 用户"清空"后再点应用仍会把上一批算法值写进新勾的通道。
+        self.batch_algo_ch_selected = [false; crate::proto::algo::ALGO_CFG_CH_SLOTS];
+        self.batch_algo_ch_values = [None; crate::proto::algo::ALGO_CFG_CH_SLOTS];
         self.batch_sel_version = self.batch_sel_version.wrapping_add(1);
     }
 
@@ -2954,17 +3103,22 @@ impl AppController {
         self.batch_src_fetched = None;
         let had_ch = self.batch_sel.ch_mask != 0;
         let had_param = self.batch_sel.param_mask != 0;
-        let had_value = self.batch_values.iter().any(|v| v.is_some());
-        if !had_ch && !had_param && !had_value && self.batch_source == 0 {
+        let had_algo = self.batch_algo_ch_selected.iter().any(|on| *on);
+        let had_value = self.batch_values.iter().any(|v| v.is_some())
+            || self.batch_algo_ch_values.iter().any(|v| v.is_some());
+        if !had_ch && !had_param && !had_algo && !had_value && self.batch_source == 0 {
             return;
         }
         self.batch_sel.clear();
         self.batch_values = [None; 11];
+        self.batch_algo_ch_selected = [false; crate::proto::algo::ALGO_CFG_CH_SLOTS];
+        self.batch_algo_ch_values = [None; crate::proto::algo::ALGO_CFG_CH_SLOTS];
         self.batch_source = 0;
         self.batch_sel_version = self.batch_sel_version.wrapping_add(1);
-        if had_ch || had_param {
+        if had_ch || had_param || had_algo {
             self.push_log_debug(
-                "批量应用抽屉已收起: 已清空目标通道与参数勾选、面板待写值与源通道(草稿改动不受影响)"
+                "批量应用抽屉已收起: 已清空目标通道、硬件参数与逐通道算法配置的勾选、\
+                 面板待写值与源通道(草稿改动不受影响)"
                     .to_string(),
             );
         }
@@ -3001,7 +3155,12 @@ impl AppController {
             .copied()
             .filter(|id| self.batch_sel.param_selected(*id))
             .collect();
-        if targets.is_empty() && skipped_disabled > 0 && !ids.is_empty() {
+        // ★逐通道算法配置与硬件参数在同一次批量动作里完成★ 用户勾的是"这些通道要这样",
+        // 分两次点击(先参数后算法)只会让两者的目标通道集悄悄错开。
+        let algo_ids: Vec<u8> = (0..crate::proto::algo::ALGO_CFG_CH_SLOTS as u8)
+            .filter(|idx| self.batch_algo_ch_selected[*idx as usize])
+            .collect();
+        if targets.is_empty() && skipped_disabled > 0 && !(ids.is_empty() && algo_ids.is_empty()) {
             self.push_log_warn(format!(
                 "批量应用未执行: 已选的 {} 个通道全部处于禁用状态(电极高阻, 不参与扫描), \
                  调参对它们无效。先用「批量启用」打开再调。",
@@ -3009,11 +3168,13 @@ impl AppController {
             ));
             return Ok(());
         }
-        if targets.is_empty() || ids.is_empty() {
+        if targets.is_empty() || (ids.is_empty() && algo_ids.is_empty()) {
             self.push_log_warn(format!(
-                "批量应用未执行: 已选目标通道 {} 个 / 已选参数 {} 项 — 两者都需至少选一项。",
+                "批量应用未执行: 已选目标通道 {} 个 / 已选硬件参数 {} 项 / 已选逐通道算法项 {} 项 \
+                 — 目标通道与(参数或算法项)都需至少选一项。",
                 targets.len(),
-                ids.len()
+                ids.len(),
+                algo_ids.len()
             ));
             return Ok(());
         }
@@ -3041,6 +3202,21 @@ impl AppController {
                 rejected += 1;
             }
         }
+        // 逐通道算法配置: 与上面逐字同构(勾选 → 面板值 → 逐目标通道写草稿), 只是换成
+        // `set_algo_cfg_ch` 这条同款草稿路径。禁用通道同样被 targets 排除在外。
+        let mut algo_missing = 0usize;
+        let mut algo_written = 0usize;
+        for idx in &algo_ids {
+            let Some(value) = self.batch_algo_ch_values[*idx as usize] else {
+                algo_missing += 1;
+                continue;
+            };
+            for ch in &targets {
+                if self.set_algo_cfg_ch(*ch, *idx, value).is_ok() {
+                    algo_written += 1;
+                }
+            }
+        }
         // 批量写草稿不经控件, 必须显式 bump 让下一 tick 的既有门控重建行模型(同 JSON 导入路径)。
         self._bump_view_versions();
         let mut msg = format!(
@@ -3051,6 +3227,21 @@ impl AppController {
             ids.len() - missing - rejected,
             written
         );
+        if !algo_ids.is_empty() {
+            msg.push_str(&format!(
+                " 逐通道算法配置(cfg_ch): {} 项 × {} 个通道, 写入 {} 项草稿。",
+                algo_ids.len() - algo_missing,
+                targets.len(),
+                algo_written
+            ));
+        }
+        if algo_missing > 0 {
+            msg.push_str(&format!(
+                " 跳过 {} 项逐通道算法配置(面板上无值: 源通道该槽尚无设备真值且未手填, \
+                 未用声明默认值顶替)。",
+                algo_missing
+            ));
+        }
         if missing > 0 {
             msg.push_str(&format!(
                 " 跳过 {} 项(面板上无值: 源通道尚无该参数真值且未手填, 未用默认值顶替)。",
@@ -6107,13 +6298,38 @@ impl AppController {
                             (param_id, self._guard_readback_param(ch, param_id, value))
                         })
                         .collect();
+                    // ★合并而不是清空重填★
+                    // PARAM_GET_ALL 是"查询全集"的请求, 但设备是逐项去取的: 链路忙 / PSoC 正在
+                    // 重初始化时, 它可能只成功取到其中一部分并如实回一个**部分**响应。
+                    // 原实现在这里 `param_map.clear()` 后只回填本次带回的项 ⇒ 没被携带的项被抹成
+                    // 缺失, 界面上那几行突然变 "—"(此前只兜住了 params.is_empty() 的全空情况,
+                    // 部分响应没兜)。
+                    // 设备漏报一项的含义是"此刻取不到这个值", 不是"设备上没有这个值" ——
+                    // 参数集(0x01..0x0C)是固定的, 永不会真的消失。所以合并语义严格优于清空重填:
+                    // 它对全量响应的结果与清空重填完全等价, 对部分响应则保住了已知真值。
+                    let received: Vec<u8> = guarded.iter().map(|(id, _)| *id).collect();
                     let param_map = &mut self.params[ch as usize];
-                    param_map.clear();
                     for (param_id, value) in guarded {
                         param_map.insert(param_id, value);
                     }
+                    let cached = param_map.len();
                     self.param_version += 1;
-                    log::debug!("PARAM_GET_ALL: ch={} count={}", ch, param_map.len());
+                    // 缺项留证: 设备侧为什么漏报只能靠这行日志定位(界面上合并后是看不出来的)。
+                    let missing: Vec<String> = crate::proto::KNOWN_PARAM_IDS
+                        .iter()
+                        .filter(|id| !received.contains(id))
+                        .map(|id| format!("0x{:02X}", id))
+                        .collect();
+                    if missing.is_empty() {
+                        log::debug!("PARAM_GET_ALL: ch={} count={}", ch, cached);
+                    } else {
+                        log::debug!(
+                            "PARAM_GET_ALL: ch={} count={} 缺项(本次未携带, 已保留旧值): {}",
+                            ch,
+                            cached,
+                            missing.join(" ")
+                        );
+                    }
                 }
             }
             Err(e) => {

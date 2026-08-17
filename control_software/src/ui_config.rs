@@ -118,6 +118,12 @@ pub mod keys {
     pub const CURVE_SERIES_EXPANDED: &str = "curve_series_expanded";
     pub const CURVE_SPECTRUM_EXPANDED: &str = "curve_spectrum_expanded";
     pub const CHANNEL_SHOW_DISABLED: &str = "channel_show_disabled";
+    // —— 全通道页批量抽屉里两个算法分区的展开态 + "全通道算法配置"下拉的选中项 ——
+    // 与其它折叠区同性质的纯界面偏好: 抽屉是 `if` 条件实例化的, 展开态本就存在 AppWindow 上;
+    // 不持久化的话每次开程序都要把这两区重新点开、把下拉重新选回要调的那一项。
+    pub const BATCH_ALGO_CH_EXPANDED: &str = "batch_algo_ch_expanded";
+    pub const BATCH_ALGO_CFG_EXPANDED: &str = "batch_algo_cfg_expanded";
+    pub const BATCH_ALGO_SHARED_SEL: &str = "batch_algo_shared_sel";
     pub const PHYS_LIVE_EXPANDED: &str = "phys_live_expanded";
     pub const PHYS_KEYS_EXPANDED: &str = "phys_keys_expanded";
     pub const PHYS_LA_EXPANDED: &str = "phys_la_expanded";

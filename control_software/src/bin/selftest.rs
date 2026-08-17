@@ -546,7 +546,16 @@ fn _check_vcam_pe(
 /// `CreateInstance(IBaseFilter)` → 身份/针脚/格式核对 → 接入系统 Null Renderer 的完整 filter graph →
 /// graph Pause/Run/Stop → 全部释放 → `DllCanUnloadNow` 应回 S_OK → `FreeLibrary`。
 /// 直接加载构建产物，不写注册表；同一探针可分别编译成 x64/x86，验证两个 in-proc 位宽。
-fn _probe_vcam_com(dll: &std::path::Path, probe_registered: bool, failures: &mut Vec<String>) {
+/// `during_run`: graph 进入 Running 之后立刻回调一次, 供调用方在**推流真的在跑的时候**改动
+/// 生产者状态。目前唯一的用途是把发布分辨率换成与已协商的那一种不同的值, 以此覆盖"尺寸错开 →
+/// 只给占位帧、绝不缩放"这条分支 —— 它在别处根本没法触发: 针脚一旦连上尺寸就冻结, 同一次
+/// 连接里不主动改生产者就永远相等。
+fn _probe_vcam_com(
+    dll: &std::path::Path,
+    probe_registered: bool,
+    during_run: &mut dyn FnMut(),
+    failures: &mut Vec<String>,
+) {
     use std::os::windows::ffi::OsStrExt;
     use windows::Win32::Foundation::FreeLibrary;
     use windows::Win32::Media::DirectShow::{IBaseFilter, IEnumPins};
@@ -585,9 +594,9 @@ fn _probe_vcam_com(dll: &std::path::Path, probe_registered: bool, failures: &mut
             (Some(entry), Some(unload)) => {
                 let get_class_object: GetClassObject = std::mem::transmute(entry);
                 let can_unload: CanUnloadNow = std::mem::transmute(unload);
-                _probe_vcam_class_object(get_class_object, can_unload, failures);
+                _probe_vcam_class_object(get_class_object, can_unload, during_run, failures);
                 if probe_registered {
-                    _probe_registered_vcam(failures);
+                    _probe_registered_vcam(during_run, failures);
                 } else {
                     println!("[VCAM] 系统尚未完整部署，跳过注册表 CLSID graph 探针");
                 }
@@ -608,6 +617,7 @@ fn _probe_vcam_com(dll: &std::path::Path, probe_registered: bool, failures: &mut
     unsafe fn _probe_vcam_class_object(
         get_class_object: GetClassObject,
         can_unload: CanUnloadNow,
+        during_run: &mut dyn FnMut(),
         failures: &mut Vec<String>,
     ) {
         let mut raw: *mut core::ffi::c_void = std::ptr::null_mut();
@@ -645,8 +655,24 @@ fn _probe_vcam_com(dll: &std::path::Path, probe_registered: bool, failures: &mut
         }
         // 完整图：源针脚必须真的完成 allocator 协商、推流并让 Null Renderer 进入 Paused，
         // 这比未连接状态下直调过滤器状态机更接近 OBS/游戏的实际消费路径。
-        _probe_vcam_graph(&filter, failures);
+        _probe_vcam_graph(&filter, during_run, failures);
         drop(filter);
+        // ★第二轮: "改完分辨率, 在消费端重新打开摄像头"这一步必须真的走一遍★
+        // 上一轮的 during_run 已经把生产者分辨率换掉了, 此刻新建的过滤器实例就是用户重开摄像头
+        // 时拿到的那个东西 —— 它必须按**新**尺寸协商并取到真实帧。这一面不能只靠注册表那一轮
+        // 覆盖: 本机没装摄像头时那一轮整个会被跳过, 而"改分辨率要卸载重建"恰恰是最需要钉住的
+        // 硬要求, 不能让它的覆盖取决于本机装没装。
+        match unsafe { factory.CreateInstance(None) } {
+            Ok(reopened) => {
+                println!("[VCAM] COM: 生产者分辨率已变更 → 重新打开摄像头(新建第二个过滤器实例)");
+                _probe_vcam_graph(&reopened, during_run, failures);
+                drop(reopened);
+            }
+            Err(error) => failures.push(format!(
+                "分辨率变更后重新 CreateInstance(IBaseFilter): {}",
+                error
+            )),
+        }
         drop(factory);
         // 全部引用已释放 ⇒ 模块计数必须归零, 否则 DLL 永远卸不掉(类工厂/枚举器漏了计数)。
         let hr = unsafe { can_unload() };
@@ -660,7 +686,7 @@ fn _probe_vcam_com(dll: &std::path::Path, probe_registered: bool, failures: &mut
         }
     }
 
-    unsafe fn _probe_registered_vcam(failures: &mut Vec<String>) {
+    unsafe fn _probe_registered_vcam(during_run: &mut dyn FnMut(), failures: &mut Vec<String>) {
         use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance};
         let filter: IBaseFilter =
             match unsafe { CoCreateInstance(&VCAM_CLSID, None, CLSCTX_INPROC_SERVER) } {
@@ -674,7 +700,7 @@ fn _probe_vcam_com(dll: &std::path::Path, probe_registered: bool, failures: &mut
                 }
             };
         println!("[VCAM] 注册表 CLSID：原生位宽 CoCreateInstance 成功");
-        _probe_vcam_graph(&filter, failures);
+        _probe_vcam_graph(&filter, during_run, failures);
         // ★直接 CoCreateInstance(CLSID) 只证明"能造实例", 不证明"消费端枚举得到它"★
         // OBS/游戏这类消费端从不硬编码 CLSID, 而是走 ICreateDevEnum::CreateClassEnumerator(
         // CLSID_VideoInputDeviceCategory) 拿 IEnumMoniker, 再 BindToStorage 到 IPropertyBag 读
@@ -814,7 +840,11 @@ fn _probe_vcam_com(dll: &std::path::Path, probe_registered: bool, failures: &mut
         }
     }
 
-    fn _probe_vcam_graph(source: &IBaseFilter, failures: &mut Vec<String>) {
+    fn _probe_vcam_graph(
+        source: &IBaseFilter,
+        during_run: &mut dyn FnMut(),
+        failures: &mut Vec<String>,
+    ) {
         use windows::Win32::Media::DirectShow::{
             FILTER_STATE, IFilterGraph, IGraphBuilder, IMediaFilter, PIN_DIRECTION, PINDIR_INPUT,
             PINDIR_OUTPUT, State_Paused, State_Running, State_Stopped,
@@ -925,6 +955,8 @@ fn _probe_vcam_com(dll: &std::path::Path, probe_registered: bool, failures: &mut
             }
             match media.Run(0) {
                 Ok(()) => {
+                    // 推流线程此刻确实在跑, 调用方可以在这里改生产者状态(见 during_run 说明)。
+                    during_run();
                     std::thread::sleep(std::time::Duration::from_millis(180));
                     expect(&media, State_Running, "Run", failures);
                 }
@@ -970,7 +1002,7 @@ fn _run_vcam_probe() -> bool {
         vcam_backend::registration_status()
     );
 
-    let mut publisher = match FramePublisher::create() {
+    let mut publisher = match FramePublisher::create(FRAME_W, FRAME_H) {
         Ok(publisher) => publisher,
         Err(error) => {
             println!("[VCAM] FramePublisher::create: FAIL {}", error);
@@ -1337,18 +1369,116 @@ fn _run_vcam_probe() -> bool {
             false
         }
     };
+    // ★建图期间必须有活生产者, 且它必须先跑在一个**非默认**分辨率上, 建图中途再改一次★
+    //
+    // 这一节要钉住的是"分辨率硬透传, 全链路不缩放"这条硬要求, 它有两个必须分别覆盖到的面:
+    //   ① 新建针脚报出去的尺寸 = 队列头此刻的尺寸。起手就用 800x600(不是回落值 640x480),
+    //      否则针脚即使根本没读队列、直接用回落值, 也照样"看起来对"。
+    //   ② 已协商的连接遇到队列尺寸变化时**不缩放**, 只给占位帧。所以中途必须真的把两者错开。
+    // 判据取过滤器自己写在日志里的那几行(见下面第 7 步): 它跑在消费端进程里, 是唯一的现场证据。
+    const ALT_W: usize = 800;
+    const ALT_H: usize = 600;
+    let mut flip_publisher = match FramePublisher::create(ALT_W, ALT_H) {
+        Ok(mut publisher) => {
+            // 先按 800x600 发一帧: 第一轮针脚新建时读到的就是它。
+            let _ = publisher.publish(&mai2control_ui::vcam::render_test_frame_sized(
+                1, ALT_W, ALT_H,
+            ));
+            Some(publisher)
+        }
+        Err(error) => {
+            failures.push(format!("透传覆盖: 重建生产者失败: {}", error));
+            None
+        }
+    };
+    // 交替尺寸: 第一轮(类工厂建图)针脚定在 800x600 → 换成 640x480;
+    // 第二轮(注册表 CLSID 建图)针脚新建时队列已是 640x480, 于是它必须报 640x480(= 覆盖面 ①
+    // 里"改过分辨率之后重开也能拿到新尺寸"这一半), 再换回 800x600 错开一次。
+    let mut alternate = false;
+    let mut seq = 1u32;
+    let mut flip_resolution = || {
+        let Some(publisher) = flip_publisher.as_mut() else {
+            return;
+        };
+        alternate = !alternate;
+        let (w, h) = if alternate {
+            (FRAME_W, FRAME_H)
+        } else {
+            (ALT_W, ALT_H)
+        };
+        // 连发几帧: 过滤器按 10fps 取帧, 一帧不够保证它一定读到新尺寸。
+        for _ in 0..5 {
+            seq += 1;
+            if let Err(error) = publisher.publish(&mai2control_ui::vcam::render_test_frame_sized(
+                seq, w, h,
+            )) {
+                println!("[VCAM] 透传覆盖: publish {}x{} 失败: {}", w, h, error);
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(
+                mai2control_ui::vcam::share::PUBLISH_INTERVAL_MS,
+            ));
+        }
+    };
     match native {
         (label, Some(path)) => {
             println!(
                 "[VCAM] {} 原生消费探针：加载并运行完整 DirectShow graph",
                 label
             );
-            _probe_vcam_com(&path, probe_registered, &mut failures);
+            _probe_vcam_com(&path, probe_registered, &mut flip_resolution, &mut failures);
         }
         (label, None) => failures.push(format!(
             "{} 原生构建产物缺失，无法执行 COM graph 探针",
             label
         )),
+    }
+    drop(flip_resolution);
+    drop(flip_publisher);
+
+    // 7) 过滤器自己的判决: 它跑在消费端进程里, 是"分辨率到底有没有原样透传"的唯一现场证据。
+    //    C++ 侧的取帧代码不可能从 Rust 直接调用, 在 Rust 里另写一份对照实现只会造出第二套真相;
+    //    所以判据取过滤器自己写下的那几行。
+    //
+    //    "尺寸透传 WxH" 只在**队列尺寸与已协商尺寸相等**时才会写出(见 vcam_queue.cpp 的 Read),
+    //    因此它同时证明了两件事: 那一轮取到的是真实帧, 且协商尺寸 = 生产者尺寸。
+    {
+        let log = std::path::Path::new(r"C:\ProgramData\mai2control\mai2vcam_dshow.log");
+        match std::fs::read_to_string(log) {
+            Ok(text) => {
+                let tail: Vec<&str> = text.lines().rev().take(80).collect();
+                for line in tail.iter().rev() {
+                    println!("[VCAM]   {}", line);
+                }
+                let has = |needle: &str| tail.iter().any(|line| line.contains(needle));
+                // ① 起手的 800x600: 针脚若没读队列(直接用回落 640x480), 这行就不会出现。
+                let first = format!("尺寸透传 {}x{}", ALT_W, ALT_H);
+                if !has(&first) {
+                    failures.push(format!(
+                        "过滤器日志里没有「{}」: 针脚没把队列头的分辨率原样报给下游",
+                        first
+                    ));
+                }
+                // ② 改过分辨率之后新建的那一轮针脚必须拿到新尺寸 —— 这正是"卸载重建摄像头"能
+                //    解决黑屏的前提。
+                let second = format!("尺寸透传 {}x{}", FRAME_W, FRAME_H);
+                if !has(&second) {
+                    failures.push(format!(
+                        "过滤器日志里没有「{}」: 生产者改过分辨率后, 新建针脚仍没有按新尺寸协商",
+                        second
+                    ));
+                }
+                // ③ 已协商的连接遇到尺寸变化时只许给占位帧, 不许缩放。
+                if !has("本源不缩放") {
+                    failures.push(
+                        "过滤器日志里没有「本源不缩放」: 队列与协商尺寸错开时本应给占位帧, \
+                         而不是缩放或按旧尺寸解释像素"
+                            .to_string(),
+                    );
+                }
+            }
+            Err(error) => failures.push(format!("读取过滤器日志失败: {}", error)),
+        }
     }
 
     if failures.is_empty() {
@@ -1360,6 +1490,141 @@ fn _run_vcam_probe() -> bool {
         println!("[VCAM] probe: FAIL ({} 项)", failures.len());
     }
     println!("[VCAM] probe end");
+    failures.is_empty()
+}
+
+/// `--vcam-consume`: **纯消费侧**排查, 不创建任何生产者。
+///
+/// ★为什么必须单独有这一条★ `--vcam-probe` 总是自己造一个生产者再自己消费, 所以它证明的是
+/// "协议自洽", 证明不了真实场景 —— 真实场景是生产者在上位机进程、过滤器在**别的**进程(游戏 /
+/// OBS / Windows 帧服务器)里。两者的差别恰好是最容易出问题的地方: 命名空间跨不跨会话、队列是
+/// 活的还是被消费端钉住的孤儿、协商的分辨率与当前分辨率是否一致。
+///
+/// 用法: 先让上位机跑起来并**启用摄像头**, 再执行本命令。它做三件事:
+///   ① 只读打开队列, 隔 1 秒采两次头部 —— 序号是否推进直接回答"生产者到底在不在发帧";
+///   ② 用**注册表里那份**已部署 DLL 走真实 COM 建图并跑起来(与消费端同一条路径);
+///   ③ 把过滤器自己的日志尾巴打出来 —— 它会写明"已连上生产者(seq=N)"还是"队列不可用(...)",
+///      那是判定黑屏原因的唯一直接证据。
+fn _run_vcam_consume() -> bool {
+    use mai2control_ui::vcam::share::QueueReader;
+    use mai2control_ui::vcam::backend as vcam_backend;
+
+    println!("[VCAM] consume begin");
+    let mut failures: Vec<String> = Vec::new();
+
+    println!("[VCAM] 系统注册状态: {}", vcam_backend::registration_status());
+
+    // ① 队列活性: 序号推进是"正在发帧"的硬判据, 单看 state 不够(孤儿队列的 state 也可能是 Ready)。
+    let reader = match QueueReader::open() {
+        Ok(reader) => Some(reader),
+        Err(error) => {
+            failures.push(format!(
+                "打开共享队列失败: {}；请确认上位机已运行且已勾选「启用虚拟扫码摄像头」",
+                error
+            ));
+            None
+        }
+    };
+    if let Some(reader) = reader.as_ref() {
+        let first = reader.header();
+        std::thread::sleep(Duration::from_millis(1000));
+        let second = reader.header();
+        match (first, second) {
+            (Ok(a), Ok(b)) => {
+                println!(
+                    "[VCAM] 队列头: state={:?} {}x{} slot_bytes={} pid={} seq {} → {}",
+                    b.state, b.width, b.height, b.slot_bytes, b.producer_pid, a.sequence, b.sequence
+                );
+                if b.state != mai2control_ui::vcam::share::QueueState::Ready {
+                    failures.push(format!(
+                        "队列状态 {:?}(非 Ready): 生产者未在发布(上位机未启用摄像头, 或刚退出留下孤儿队列)",
+                        b.state
+                    ));
+                } else if b.sequence == a.sequence {
+                    failures.push(format!(
+                        "队列序号 1 秒内未推进(恒为 {}): 生产者没有在发帧",
+                        b.sequence
+                    ));
+                } else {
+                    println!(
+                        "[VCAM] 生产者在发帧: 1 秒内推进 {} 帧(定频 10fps)",
+                        b.sequence.wrapping_sub(a.sequence)
+                    );
+                }
+            }
+            (Err(error), _) | (_, Err(error)) => {
+                failures.push(format!("读取队列头失败: {}", error))
+            }
+        }
+    }
+
+    // ② 走消费端真实路径: 用注册表里那份已部署 DLL 建图并跑起来。
+    // 本进程不持有生产者, 因此这一步等价于"别的进程来取帧"。
+    let installed = vcam_backend::is_registered().unwrap_or(false);
+    if !installed {
+        failures.push(
+            "系统未完整注册本摄像头: 先在虚拟摄像头页点「安装(需管理员)」".to_string(),
+        );
+    } else {
+        let native = if cfg!(target_pointer_width = "64") {
+            ("x64", VCAM_DLL_X64)
+        } else {
+            ("x86", VCAM_DLL_X86)
+        };
+        match _check_vcam_pe(native.0, native.1, if cfg!(target_pointer_width = "64") { PE_MACHINE_AMD64 } else { PE_MACHINE_I386 }, &mut failures) {
+            Some(path) => {
+                println!("[VCAM] {} 消费探针: 走注册表 CLSID 建图取帧", native.0);
+                // 纯消费侧: 生产者在别的进程里, 这里不碰它的状态。
+                _probe_vcam_com(&path, true, &mut || {}, &mut failures);
+            }
+            None => failures.push(format!("{} 构建产物缺失, 无法建图", native.0)),
+        }
+    }
+
+    // ③ 过滤器自己的判决: 这一步的输出比上面任何断言都直接。
+    let log = std::path::Path::new(r"C:\ProgramData\mai2control\mai2vcam_dshow.log");
+    println!("[VCAM] ── 过滤器日志尾部 ──");
+    match std::fs::read_to_string(log) {
+        Ok(text) => {
+            let lines: Vec<&str> = text.lines().collect();
+            for line in lines.iter().rev().take(12).rev() {
+                println!("[VCAM]   {}", line);
+            }
+            // 只看本次建图之后新增的那几行里有没有"已连上生产者"。
+            let connected = lines
+                .iter()
+                .rev()
+                .take(12)
+                .any(|line| line.contains("已连上生产者"));
+            let unusable = lines
+                .iter()
+                .rev()
+                .take(12)
+                .any(|line| line.contains("队列不可用") || line.contains("生产者不在"));
+            if connected {
+                println!("[VCAM] 过滤器判决: 已取到真实帧(非占位)");
+            } else if unusable {
+                failures.push(
+                    "过滤器判决为占位帧: 见上面日志里的 state/心跳滞后/协商尺寸 —— \
+                     尺寸不符就在消费端重开摄像头, state=3 就是生产者没在发"
+                        .to_string(),
+                );
+            } else {
+                println!("[VCAM] 过滤器日志中未见本次判决(可能被节流未重复记录)");
+            }
+        }
+        Err(error) => println!("[VCAM]   读取失败: {}", error),
+    }
+
+    if failures.is_empty() {
+        println!("[VCAM] consume: PASS");
+    } else {
+        for reason in &failures {
+            println!("[VCAM] FAIL {}", reason);
+        }
+        println!("[VCAM] consume: FAIL ({} 项)", failures.len());
+    }
+    println!("[VCAM] consume end");
     failures.is_empty()
 }
 
@@ -4958,6 +5223,27 @@ fn main() {
             .map(String::as_str);
         println!("{}", mai2control_ui::vcam::interception_diagnostic(filter));
         std::process::exit(0);
+    }
+    // 纯消费侧排查: 不造生产者, 专门验证"上位机在发帧 → 别的进程取得到帧"这条真实路径。
+    if args.iter().any(|a| a == "--vcam-consume") {
+        std::process::exit(if _run_vcam_consume() { 0 } else { 1 });
+    }
+    // 帧服务器眼里到底有哪些摄像头。★这是区分"我方 DirectShow 摄像头"与"旧实现残留的 MF 幽灵
+    // 相机"的唯一手段★ 两者在 Windows 设置里显示成同一个名字, 只能靠这份枚举结果对上号。
+    if args.iter().any(|a| a == "--vcam-mf-list") {
+        match mai2control_ui::vcam::backend::mf_video_sources() {
+            Ok(names) => {
+                println!("[VCAM] 帧服务器列出 {} 个视频采集源:", names.len());
+                for name in &names {
+                    println!("  · {}", name);
+                }
+                std::process::exit(0);
+            }
+            Err(error) => {
+                println!("[VCAM] mf-list FAIL: {}", error);
+                std::process::exit(1);
+            }
+        }
     }
     // 虚拟摄像头探测不依赖 WinUSB 固件，必须在设备枚举之前独立退出。
     if args.iter().any(|a| a == "--vcam-probe") {
@@ -9463,7 +9749,8 @@ fn run_nv_soak(ctrl: &mut AppController) -> ! {
 
     let prefix = "#include <stddef.h>\n#include \"psoc_algo_abi.h\"\nvoid algo(algo_io_t* io){ io->out_active=(io->base_active!=0u)?1u:0u; }\nstatic const char nv_soak_pad[] = \"";
     let suffix = "\";\n";
-    let capacity = AppController::algo_src_capacity();
+    // 容量改成实例方法(设备回报值优先): 这条软压测跑在真机上, 用设备真值填满才是"填到上限"。
+    let capacity = ctrl.algo_src_capacity();
     let fill = capacity
         .checked_sub(prefix.len() + suffix.len())
         .unwrap_or_else(|| fail!("C 源模板超过 {} 字节", capacity));

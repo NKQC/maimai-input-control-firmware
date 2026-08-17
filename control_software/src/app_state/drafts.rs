@@ -35,6 +35,7 @@ const KEY_MODE: &str = "mode";
 
 /// 配置草稿覆盖层。dirty key 命名沿用既有稳定口径:
 /// `cfg:<key>` / `param:<ch>:<id>` / `param:all:<id>` / `global:<id>` / `algo:cfg:<idx>` /
+/// `algo:cfgch:<ch>:<idx>` /
 /// `mode` / `kbd:phys:<idx>` / `kbd:zone:<zone>` / `kbd:hold:phys:<idx>` /
 /// `kbd:hold:zone:<zone>` / `kbd:keycfg:<idx>` / `kbd:combo`。
 /// key 字符串一律在本结构内部拼装, 杜绝调用方两处拼法漂移。
@@ -43,6 +44,8 @@ pub struct ConfigDrafts {
     param: BTreeMap<(u8, u8), u32>,
     global: BTreeMap<u8, u32>,
     algo_cfg: BTreeMap<u8, u8>,
+    /// 逐通道算法配置草稿, 键 = (ch, idx)。与 `algo_cfg` 是**两套独立下标空间**, 不可合并成一张表。
+    algo_cfg_ch: BTreeMap<(u8, u8), u8>,
     mode: Option<u8>,
     kbd_map: BTreeMap<u8, (u8, u8)>,
     kbd_touch: BTreeMap<u8, (u8, u8)>,
@@ -70,6 +73,7 @@ impl ConfigDrafts {
             param: BTreeMap::new(),
             global: BTreeMap::new(),
             algo_cfg: BTreeMap::new(),
+            algo_cfg_ch: BTreeMap::new(),
             mode: None,
             kbd_map: BTreeMap::new(),
             kbd_touch: BTreeMap::new(),
@@ -127,6 +131,7 @@ impl ConfigDrafts {
         self.param.clear();
         self.global.clear();
         self.algo_cfg.clear();
+        self.algo_cfg_ch.clear();
         self.mode = None;
         self.kbd_map.clear();
         self.kbd_touch.clear();
@@ -246,6 +251,36 @@ impl ConfigDrafts {
     /// 是否存在算法变量草稿: 清空/提交后需据此决定是否 bump `algo_cfg_version`。
     pub fn has_algo_cfg(&self) -> bool {
         !self.algo_cfg.is_empty()
+    }
+
+    // ------------------------------------------------------------------
+    // 逐通道算法可设置变量 (algo:cfgch:<ch>:<idx>)
+    // ------------------------------------------------------------------
+    // 脏键前缀与 `algo:cfg:` **刻意不同**: 两者下标空间独立, 若共用 `algo:cfg:<idx>` 形式,
+    // 共享项 idx=0 与通道 0 的逐通道项就会撞成同一个脏键, "未保存"计数与撤稿都会错。
+
+    pub fn set_algo_cfg_ch(&mut self, ch: u8, idx: u8, val: u8, same_as_device: bool) {
+        let dirty_key = format!("algo:cfgch:{}:{}", ch, idx);
+        if same_as_device {
+            self.algo_cfg_ch.remove(&(ch, idx));
+            self._drop(&dirty_key);
+            return;
+        }
+        self.algo_cfg_ch.insert((ch, idx), val);
+        self._mark(dirty_key);
+    }
+    pub fn algo_cfg_ch(&self, ch: u8, idx: u8) -> Option<u8> {
+        self.algo_cfg_ch.get(&(ch, idx)).copied()
+    }
+    /// 提交路径用: 全部草稿项按 (ch, idx) 有序取出, 供 `encode_algo_set_cfg_ch` 聚合成一帧多条。
+    pub fn algo_cfg_ch_items(&self) -> Vec<(u8, u8, u8)> {
+        self.algo_cfg_ch
+            .iter()
+            .map(|((ch, idx), val)| (*ch, *idx, *val))
+            .collect()
+    }
+    pub fn has_algo_cfg_ch(&self) -> bool {
+        !self.algo_cfg_ch.is_empty()
     }
 
     // ------------------------------------------------------------------

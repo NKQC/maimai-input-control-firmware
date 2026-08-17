@@ -78,8 +78,15 @@ pub fn group_counts(ctrl: &AppController) -> GroupCounts {
         channel_params: (36 * KNOWN_PARAM_IDS.len()) as i32,
         // gparam 1..8 + CSD 处理模式枚举。
         globals: 9,
-        // 算法源、机器码与 cfg[0..7]。
-        algo: 10,
+        // 算法源、机器码、cfg[0..7], 外加逐通道算法配置(36 通道 × 当前算法声明的逐通道项数)。
+        // ★逐通道项按实际声明数计★: cfg_ch 恒有 8 个槽, 但只有被算法声明的槽才会导出,
+        // 写死 36×8 会让勾选框上的数字与实际导出内容不符(同 keyboard 的组合映射处置)。
+        algo: 10
+            + 36 * ctrl
+                .algo_setting_decls()
+                .iter()
+                .filter(|decl| decl.per_channel)
+                .count() as i32,
         // 12 个物理键 + 34 个触控分区键(各含键码、修饰位与长按参数) + 现有组合映射条数。
         // ★组合映射按实际条数计★: 它是变长表, 写死常数会让勾选框上的数字与实际导出内容不符。
         keyboard: 46 + ctrl.kbd_combos().len() as i32,
@@ -580,6 +587,30 @@ fn _export_algo(ctrl: &AppController) -> JsonValue {
         cfg.push(JsonValue::Object(item));
     }
     group.insert("cfg".to_string(), JsonValue::Array(cfg));
+    // ★逐通道算法配置(cfg_ch)独立成一段★ 它与上面的 cfg 是两套独立下标空间, 混进同一个数组
+    // 就无从分辨 index=0 指的是共享的 cfg[0] 还是某个通道的 cfg_ch[0]。
+    // 每项带 name 只为可读性(人要能看懂这份 JSON), 回灌时仍以 (ch, idx) 为准。
+    let mut cfg_ch = Vec::new();
+    let per_channel: Vec<(u8, String)> = ctrl
+        .algo_setting_decls()
+        .into_iter()
+        .filter(|decl| decl.per_channel)
+        .map(|decl| (decl.idx, decl.name))
+        .collect();
+    for ch in 0..crate::proto::algo::ALGO_CHANNELS as u8 {
+        for (idx, name) in &per_channel {
+            let mut item = BTreeMap::new();
+            item.insert("ch".to_string(), JsonValue::Number(ch as f64));
+            item.insert("idx".to_string(), JsonValue::Number(*idx as f64));
+            item.insert("name".to_string(), JsonValue::String(name.clone()));
+            item.insert(
+                "value".to_string(),
+                JsonValue::Number(ctrl.algo_cfg_ch(ch, *idx) as f64),
+            );
+            cfg_ch.push(JsonValue::Object(item));
+        }
+    }
+    group.insert("algo_cfg_ch".to_string(), JsonValue::Array(cfg_ch));
     JsonValue::Object(group)
 }
 
@@ -986,6 +1017,33 @@ fn _import_algo(
         match ctrl.set_algo_cfg(index, value) {
             Ok(()) => sum.applied_items += 1,
             Err(_) => sum._skip(name, SkipReason::OutOfRange),
+        }
+    }
+    // ★逐通道算法配置缺整段时不报错★: 旧版本导出的文件没有 `algo_cfg_ch`, 直接失败会让用户
+    // 连算法组都导不进来。缺失即"不动逐通道配置", 与"未勾选该组"同语义(同 keyboard.combo 的处置)。
+    // 导入只写草稿、不下发 —— 与本模块其余各组一致, 生效仍由"保存到设备"统一负责。
+    if let Some(raw) = group.get("algo_cfg_ch") {
+        let items = _array(raw, "algo.algo_cfg_ch")?;
+        for item in items {
+            let item = _object(item, "algo cfg_ch item")?;
+            let ch = _u8(_required(item, "ch", "algo cfg_ch item")?, "algo cfg_ch ch")?;
+            let idx = _u8(
+                _required(item, "idx", "algo cfg_ch item")?,
+                "algo cfg_ch idx",
+            )?;
+            let name = format!("algo.cfg_ch[{ch}][{idx}]");
+            let Some(raw) = item.get("value") else {
+                sum.absent_items += 1;
+                continue;
+            };
+            let Ok(value) = _u8(raw, "algo cfg_ch value") else {
+                sum._skip(name, SkipReason::TypeMismatch);
+                continue;
+            };
+            match ctrl.set_algo_cfg_ch(ch, idx, value) {
+                Ok(()) => sum.applied_items += 1,
+                Err(_) => sum._skip(name, SkipReason::OutOfRange),
+            }
         }
     }
     Ok(())

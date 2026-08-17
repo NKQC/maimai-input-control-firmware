@@ -239,6 +239,66 @@ component BatchParamRow inherits Rectangle {
     }
 }
 
+// 批量抽屉里的一行"逐通道算法配置(cfg_ch)"。
+//
+// ★与 BatchParamRow 逐字同构, 只换了数据来源与下发命令★ 逐通道算法量在用户眼里就是"又一批
+// 每通道各一份的可调项", 它必须和硬件参数**完全一样**地参与批量设置: 勾选决定写不写、值一列
+// 取自源通道且可手改、"?" 给出简介。交互长得不一样就等于告诉用户"这一区规则另算", 而它并不是。
+component BatchAlgoChRow inherits Rectangle {
+    in property <AlgoSettingRow> entry;
+    in property <bool> checked: false;
+    callback toggled();
+    callback value_set(int);
+    callback help_hovered(string);
+    // -1 = 面板上尚无值(源通道该槽还没有设备真值, 用户也没手填) → 显示"—", 不摆一个假的 0。
+    property <bool> has_value: root.entry.value >= 0;
+
+    height: Theme.row-height;
+    HorizontalLayout {
+        spacing: 6px;
+        // ★必须用 GuardedCheckBox★ 同 BatchParamRow: Repeater 复用行实例, 裸 CheckBox 点一次就
+        // 失去回填, 勾选状态会跟着行号而不是跟着数据。
+        GuardedCheckBox {
+            width: 22px;
+            model_checked: root.checked;
+            toggled => { root.toggled(); }
+        }
+        HelpDot {
+            // 简介的唯一来源是行数据(用户覆盖 → 内置中文表 → C 源声明), 这里不拼一个字。
+            help: root.entry.description;
+            hovered(t) => { root.help_hovered(t); }
+        }
+        Text {
+            text: (root.entry.alias != "" ? root.entry.alias : root.entry.name)
+                + " (cfg_ch[" + root.entry.idx + "])";
+            font-size: Theme.fs-small;
+            color: Theme.text-sub;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+            overflow: elide;
+        }
+        if !root.has_value: Text {
+            min-width: Theme.spin-width;
+            horizontal-stretch: 0;
+            text: "—";
+            font-size: Theme.fs-small;
+            color: Theme.accent;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+        // 设备 cfg_ch 是 u8 数组 ⇒ 0..255 是协议事实, 不是这里猜的围栏。
+        GuardedSpinBox {
+            visible: root.has_value;
+            width: root.has_value ? Theme.spin-width : 0px;
+            horizontal-stretch: 0;
+            minimum: 0;
+            maximum: 255;
+            model_value: root.entry.value >= 0 ? root.entry.value : 0;
+            committed(v) => { root.value_set(v); }
+        }
+    }
+}
+
 export component AllChannelsPage inherits Rectangle {
     in property <[ChannelStatus]> channels: [];
     in-out property <int> selected_channel: 0;
@@ -302,14 +362,31 @@ export component AllChannelsPage inherits Rectangle {
 
     // ---- 算法可调变量(cfg): 全通道共享的一份值, 与批量勾选无关 ----
     // 与单通道精调页同一个模型、同一个回调, 不新增第二条通路(否则两页的值会漂移)。
+    // ★本模型只含共享项★(per_channel==false); 逐通道项走下面 batch_algo_ch_rows 那一套。
     in property <[AlgoSettingRow]> algo_setting_rows: [];
     callback algo_setting_edited(int, int);
+    // 共享项的编辑入口: 一个下拉框选项目, 下面只显示选中那一项的编辑行。
+    // ★为什么不像逐通道项那样平铺★ 共享项改一次就对 36 个通道生效, 与"勾选目标通道"这件事
+    // 语义相反; 平铺在批量抽屉里会被读成"跟着勾选一起写"。用下拉框把它单独隔出来, 一次只露一项。
+    in property <[string]> batch_algo_shared_names: [];
+    in-out property <int> batch_algo_shared_sel: 0;
 
-    // 抽屉内四个折叠分区的展开态。★必须由外部(AppWindow)持有★: 抽屉本身是 `if` 条件实例化的,
+    // ---- 逐通道算法配置(cfg_ch): 与硬件参数完全同款的批量项 ----
+    // 每行带勾选(选中才写入) + 可手改的值(取自 batch_source 通道) + "?" 详解, 点"应用到已选通道"
+    // 时对每个已选目标通道各写一份草稿。值 = -1 表示面板上尚无值, 显示 "—"(不摆假的 0)。
+    in property <[AlgoSettingRow]> batch_algo_ch_rows: [];
+    in property <[bool]> batch_algo_ch_selected: [];
+    callback batch_toggle_algo_ch(int);
+    callback batch_algo_ch_value_set(int, int);
+    callback batch_algo_ch_all();
+    callback batch_algo_ch_invert();
+
+    // 抽屉内五个折叠分区的展开态。★必须由外部(AppWindow)持有★: 抽屉本身是 `if` 条件实例化的,
     // 状态放在页面里会随抽屉收起被销毁, 下次展开全部回到默认值。
     in-out property <bool> batch_targets_expanded: true;
     in-out property <bool> batch_enable_expanded: false;
     in-out property <bool> batch_params_expanded: true;
+    in-out property <bool> batch_algo_ch_expanded: false;
     in-out property <bool> batch_algo_cfg_expanded: false;
 
     // 批量抽屉里 "?" 悬浮详解的当前文本(空 = 没悬浮在任何问号上)。
@@ -575,16 +652,67 @@ export component AllChannelsPage inherits Rectangle {
                     }
                 }
 
-                // ---- 算法可调变量(cfg) ----
-                // ★与上面的通道参数是两种东西, 必须分区并标出作用域★ cfg[8] 在设备上只有一份
-                // (PSoC g_algo_cfg[8] / RP PsocAlgo::_cfg[8] 都不带通道下标), 改一次即对全部 36 个
-                // 通道生效, 与"勾了哪些目标通道"无关, 也不参与下面那个"应用到已选通道"。
-                // 放进本抽屉的理由: 用户在全通道页对着一片读数调参时, 算法量与硬件量本来就要一起看;
-                // 作用域差异由每行的 ScopeTag(全通道共享)与本区摘要如实标注, 不靠用户记。
+                // ---- 逐通道算法配置(cfg_ch) ----
+                // ★这一区与上面的"通道参数"是同一类东西★ 都是"每通道各一份"的可调量, 只是一个
+                // 落在 CSD 硬件寄存器上、一个落在算法的 cfg_ch[] 上。因此交互必须完全一致:
+                // 勾选才写入、值取自源通道且可手改、与硬件参数在同一次"应用到已选通道"里完成。
                 CollapsibleSection {
-                    title: @tr("算法可调变量(cfg)");
+                    title: @tr("逐通道算法配置(cfg_ch)");
+                    summary: root.batch_algo_ch_rows.length > 0
+                        ? root.batch_algo_ch_rows.length + @tr(" 项 · 勾选才写入")
+                        : @tr("无声明");
+                    expanded <=> root.batch_algo_ch_expanded;
+
+                    HorizontalBox {
+                        padding: 0px;
+                        spacing: Theme.gap;
+                        Button {
+                            horizontal-stretch: 0;
+                            text: @tr("全选");
+                            clicked => { root.batch_algo_ch_all(); }
+                        }
+                        Button {
+                            horizontal-stretch: 0;
+                            text: @tr("反选");
+                            clicked => { root.batch_algo_ch_invert(); }
+                        }
+                        Rectangle { horizontal-stretch: 1; }
+                    }
+                    Text {
+                        text: root.batch_algo_ch_rows.length > 0
+                            ? @tr("值取自源 CH") + root.batch_source + @tr(" · 每个已选通道各写一份")
+                            : @tr("当前算法未声明 ALGO_SETTING_CH");
+                        font-size: Theme.fs-small;
+                        color: Theme.text-sub;
+                        overflow: elide;
+                    }
+                    VerticalLayout {
+                        padding: 0px;
+                        spacing: 1px;
+                        for row[i] in root.batch_algo_ch_rows: BatchAlgoChRow {
+                            entry: row;
+                            // ★勾选态按行数据自身的 idx 取★, 不用循环下标反推 —— 算法可以只声明
+                            // cfg_ch 里的第 2、5 槽, 那时"下标 == 槽号"根本不成立。
+                            checked: row.idx < root.batch_algo_ch_selected.length
+                                ? root.batch_algo_ch_selected[row.idx] : false;
+                            toggled => { root.batch_toggle_algo_ch(row.idx); }
+                            value_set(v) => { root.batch_algo_ch_value_set(row.idx, v); }
+                            help_hovered(t) => { root.help_text = t; }
+                        }
+                    }
+                }
+
+                // ---- 全通道算法配置(cfg) ----
+                // ★与上面的逐通道项是两种东西, 必须分区、且用独立下拉框隔开★ cfg[8] 在设备上只有
+                // 一份(PSoC g_algo_cfg[8] / RP PsocAlgo::_cfg[8] 都不带通道下标), 改一次即对全部 36
+                // 个通道生效, 与"勾了哪些目标通道"无关, 也不参与下面那个"应用到已选通道"。
+                // 平铺成一列会被读成"跟着勾选一起写"; 用下拉框一次只露一项, 语义上就与批量分开了。
+                CollapsibleSection {
+                    title: @tr("全通道算法配置(cfg)");
+                    // ★不能写"改即下发"★ 这里的编辑走的是与其它设置同一条草稿链(set_algo_cfg),
+                    // 真正下发在"保存到设备"。写成"改即下发"就是把"已受理"显示成"已生效"。
                     summary: root.algo_setting_rows.length > 0
-                        ? root.algo_setting_rows.length + @tr(" 项 · 全通道共享 · 改即下发")
+                        ? root.algo_setting_rows.length + @tr(" 项 · 全通道共享 · 需保存到设备")
                         : @tr("无声明");
                     expanded <=> root.batch_algo_cfg_expanded;
 
@@ -596,15 +724,30 @@ export component AllChannelsPage inherits Rectangle {
                         color: Theme.text-sub;
                         overflow: elide;
                     }
-                    VerticalLayout {
-                        padding: 0px;
-                        spacing: 2px;
-                        for row in root.algo_setting_rows: AlgoSettingEditorRow {
-                            entry: row;
-                            // 抽屉只有 300px 宽: 收起"范围"列, 免得整列长出横向滚动条。
-                            compact: true;
-                            edited(idx, v) => { root.algo_setting_edited(idx, v); }
-                        }
+                    if root.algo_setting_rows.length > 0: ComboBox {
+                        // 抽屉宽度固定, 下拉按抽屉可用宽度铺满即可(别名可能较长)。
+                        horizontal-stretch: 1;
+                        model: root.batch_algo_shared_names;
+                        // 选中下标存在 AppWindow 上(见 batch_algo_shared_sel), 切页/收抽屉都不丢。
+                        current-index: root.batch_algo_shared_sel;
+                        selected => { root.batch_algo_shared_sel = self.current-index; }
+                    }
+                    if root.algo_setting_rows.length > 0: AlgoSettingEditorRow {
+                        // 越界钳制放在取行之前: 换算法后声明项数会变, 而记住的下标可能指向已消失的项。
+                        entry: root.algo_setting_rows[
+                            Math.max(0, Math.min(root.batch_algo_shared_sel,
+                                                 root.algo_setting_rows.length - 1))];
+                        // 抽屉只有 300px 宽: 收起"范围"列, 免得整列长出横向滚动条。
+                        compact: true;
+                        edited(idx, v) => { root.algo_setting_edited(idx, v); }
+                    }
+                    if root.algo_setting_rows.length > 0: Text {
+                        text: root.algo_setting_rows[
+                            Math.max(0, Math.min(root.batch_algo_shared_sel,
+                                                 root.algo_setting_rows.length - 1))].description;
+                        font-size: Theme.fs-small;
+                        color: Theme.text-sub;
+                        overflow: elide;
                     }
                 }
 

@@ -154,9 +154,17 @@ inline void core0_psoc_lifecycle(Core0State& st) {
     const uint8_t reset_reason = updater->rescue_active() ? 0u : psoc->needs_reset();
     if (reset_reason != 0u) {
         if (reset_reason == 2u && !PsocAlgo::getInstance()->is_default()) {
-            PsocAlgo::getInstance()->reset_default();
-            // 用户算法被判定致命并回退 —— 这是最容易让人误判"我的算法还在跑"的一步, 必须上报。
-            SelfHeal::getInstance()->note(SH_ALGO_FALLBACK, 0u);
+            // ★不再丢弃用户算法★
+            // 旧实现在这里直接 reset_default(): 用户辛辛苦苦写的算法被固件静默换成内嵌默认,
+            // 既拿不回代码也说不清是谁改的(上位机只看到"算法怎么变回默认了")。
+            // 现在只记一次"致命", 算法与 C 源原样留在 flash 里: 下次仍会重试它, 连续
+            // FATAL_QUARANTINE_RUN 次才转入隔离(仅不下发, 不删除)。
+            PsocAlgo::getInstance()->note_fatal();
+            // detail=0: 记一次致命, 下次仍会重试该算法。
+            // detail=2: 已连续 3 次致命, 转入隔离 —— PSoC 改跑原生 CapSense, 但算法与 C 源仍在
+            //           flash 里可回读; 重新上传新算法或点一次 PSOC_RESCUE 即解除隔离。
+            SelfHeal::getInstance()->note(SH_ALGO_FALLBACK,
+                PsocAlgo::getInstance()->quarantined() ? 2u : 0u);
         }
         psoc->reset_run();
         psoc->clear_reset_request();
@@ -330,8 +338,11 @@ inline void core0_algo_followup(const Core0State& st) {
     // 代码下发完成后补推每通道 ROM 与 cfg[8](不可放进 USB 命令处理器, 会拖住 ACK)。
     // 常规运行依赖 provisioned；但用户已受理的默认恢复必须独立推进，不能因链路代次
     // 尚未被标记为 provisioned 而永久挂起在旧自定义 blob 上。
+    // ★download_pending 也必须放行 tick★: 用户在链路不可用(PSoC 挂死/正在重初始化)时上传的算法
+    // 被存下并置成"推迟下发", 而那种时刻 provisioned 往往正是 false。若不在这里放行, 那份算法
+    // 就只能等下一次 PSoC 复位才有机会下去 —— 上传后"一直没反应"的死角。
     PsocAlgo* algo = PsocAlgo::getInstance();
-    if (st.provisioned || algo->reset_default_pending()) algo->tick(psoc);
+    if (st.provisioned || algo->reset_default_pending() || algo->download_pending()) algo->tick(psoc);
 }
 
 // ★大吞吐统一走定时任务队列★: 遥测等周期发送由 TxScheduler 按各自频率+租约驱动(续期制),

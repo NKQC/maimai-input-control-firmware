@@ -170,23 +170,24 @@ impl VcamState {
             self.height.load(Ordering::SeqCst) as usize,
         )
     }
-    /// 设置输出分辨率(自动夹到合法范围并取偶数)。返回实际生效值。
+    /// 设置输出分辨率(自动夹到合法范围并取偶数)。返回 (实际生效宽, 高, 是否发生变化)。
+    ///
+    /// ★"是否变化"必须回报给调用方★ 分辨率是硬透传的: 消费端协商到的尺寸来自共享队列头, 而
+    /// 已协商的连接在 DirectShow 里改不了尺寸。所以尺寸一变就必须把摄像头整个卸载重建(见
+    /// `ui_callbacks::virtual_camera` 的分辨率回调) —— 那个决定只能由这里的比较结果驱动,
+    /// 让调用方自己再比一遍就必然与本函数的夹取规则漂移。
     ///
     /// ★立刻按新尺寸重画当前画面★ 否则队列头里的 width/height 已经变了、槽里的像素还是旧尺寸,
     /// 消费端那一瞬间读到的就是尺寸与内容不符的一帧。改完即重画, 让两者始终同步。
-    pub fn set_resolution(&self, width: u32, height: u32) -> (usize, usize) {
+    pub fn set_resolution(&self, width: u32, height: u32) -> (usize, usize, bool) {
         let (w, h) = clamp_resolution(width, height);
         let changed = self.width.swap(w as u32, Ordering::SeqCst) != w as u32
             || self.height.swap(h as u32, Ordering::SeqCst) != h as u32;
         if changed {
             self._redraw_current();
-            log::info!(
-                "虚拟摄像头: 输出分辨率 → {}x{}（消费端需重新打开摄像头才会按新尺寸协商）",
-                w,
-                h
-            );
+            log::info!("虚拟摄像头: 输出分辨率 → {}x{}（全链路原样透传, 不缩放）", w, h);
         }
-        (w, h)
+        (w, h, changed)
     }
     /// 当前 QR 占短边的百分比。
     pub fn qr_fill_pct(&self) -> u32 {

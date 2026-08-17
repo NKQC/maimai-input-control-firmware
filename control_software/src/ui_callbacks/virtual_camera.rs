@@ -23,13 +23,10 @@ impl VirtualCameraCallbackState {
         // `FramePublisher` 存活。启动即创建等于本进程一直霸占租约, 第二个实例(哪怕只是想开个界面
         // 看日志)会被拒, 而摄像头明明还没启用。故只在"启用摄像头"回调里创建, 禁用/卸载时立刻 drop。
         let frame_publisher: Rc<RefCell<Option<FramePublisher>>> = Rc::new(RefCell::new(None));
-        ui.set_vcam_runtime_status(
-            format!(
-                "未运行 · 启用后创建共享队列 {}(独占生产者租约)",
-                share::MAP_NAME
-            )
-            .into(),
-        );
+        // ★这里不要把队列名摊到界面上★ 它是一串不含空格的长标识, 换行算法断不开, 在窄栏里
+        // 只会把整行文字挤出可视区(实测就是这么被裁掉的)。名字对用户没有可行动价值, 排查时
+        // 由日志给出(见 FramePublisher::create 的那条 info)。
+        ui.set_vcam_runtime_status("未运行 · 启用后创建共享队列（独占生产者租约）".into());
         let vcam_kbd_list: Rc<RefCell<Vec<vcam::keyboard::KeyboardDevice>>> =
             Rc::new(RefCell::new(Vec::new()));
         Self {
@@ -138,7 +135,10 @@ pub(crate) fn register_callbacks(
         }
         // 队列落在哪个命名空间决定了 Windows 设置 / 相机应用能不能取到画面(它们走 Session 0 的
         // Frame Server, 只有 Global\ 跨得过去), 因此这条结论必须上界面, 不能只躺在日志里。
-        let queue_note = match FramePublisher::create() {
+        // 建队即带上当前分辨率: 消费端可能在第一帧发布之前就来探测队列头并据此协商(协商完就
+        // 改不了了), 头里若先是个固定初值, 那一刻打开摄像头的消费端就永久错开尺寸。
+        let (queue_w, queue_h) = vcam_cb.resolution();
+        let queue_note = match FramePublisher::create(queue_w, queue_h) {
             Ok(publisher) => {
                 let note = publisher.namespace().consequence().to_string();
                 *publisher_cb.borrow_mut() = Some(publisher);
@@ -349,15 +349,31 @@ pub(crate) fn register_callbacks(
         ui.set_vcam_mirror_x(on);
     });
     // 分辨率 / QR 占比: 回填**夹取后**的实际生效值, 界面上绝不显示一个从未生效过的数。
+    //
+    // ★分辨率一变就强制卸载重建摄像头★ 分辨率是硬透传的: 消费端协商到的尺寸直接来自共享队列头,
+    // 而 DirectShow 的媒体类型在 Connect 时就与下游定死, 运行中没有任何合法途径换尺寸。既然不允许
+    // 用缩放去糊过去, 那么改分辨率就必须让整条链路重来一遍 —— 这里复用启用/停用那条既有路径
+    // (停用会释放生产者租约与队列, 启用会按新尺寸重建), 不另写一套建队逻辑。
+    // 队列一消失, 消费端立刻掉到占位黑帧, 用户在那边重新打开摄像头即按新尺寸协商。
     let vcam_res_cb = state.vcam.clone();
     let ui_vcam_res = ui_weak.clone();
     ui.on_set_vcam_resolution(move |w, h| {
         let Some(ui) = ui_vcam_res.upgrade() else {
             return;
         };
-        let (w, h) = vcam_res_cb.set_resolution(w.max(0) as u32, h.max(0) as u32);
+        let (w, h, changed) = vcam_res_cb.set_resolution(w.max(0) as u32, h.max(0) as u32);
         ui.set_vcam_frame_w(w as i32);
         ui.set_vcam_frame_h(h as i32);
+        if changed && ui.get_vcam_enabled() {
+            log::info!(
+                "虚拟摄像头: 分辨率改为 {}x{} → 卸载重建摄像头(队列按新尺寸重开; \
+                 消费端需重新打开摄像头)",
+                w,
+                h
+            );
+            ui.invoke_set_vcam_enabled(false);
+            ui.invoke_set_vcam_enabled(true);
+        }
     });
     let vcam_fill_cb = state.vcam.clone();
     let ui_vcam_fill = ui_weak.clone();

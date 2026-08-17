@@ -71,6 +71,8 @@ private:
     HRESULT _Attempt(IPin* receive, const AM_MEDIA_TYPE* type);
     HRESULT _DecideAllocator();
     void _ReleaseConnection();
+    // 未连接时重新从队列头取一次分辨率, 变了就连 _mt 一起换掉。已连接则原样返回(见 _width 说明)。
+    void _RefreshSize();
 
     Mai2VcamFilter* _owner = nullptr;
     CRITICAL_SECTION _lock = {};
@@ -84,12 +86,18 @@ private:
     LONGLONG _interval = MAI2VCAM_DEFAULT_INTERVAL;
     // SetFormat 在连接状态下改帧率时置位, 下一帧携带新类型通知下游。
     bool _notifyType = false;
-    // 本针脚这一辈子只报这一种分辨率: 构造时从共享队列头读一次(生产者不在则用回落值)。
+    // 本针脚报出去的分辨率 = 共享队列头里生产者当前的分辨率(生产者不在则用回落值)。
     //
-    // ★为什么不能中途跟着队列变★ DirectShow 的媒体类型在 Connect 时就与下游定死了, 下游据此
-    // 申请缓冲、配置转换与渲染。运行中换尺寸没有合法的通知路径(SetMediaType 只能改同尺寸下的
-    // 次要属性)。所以: 生产者改了分辨率 → 队列头与本值不再相等 → 推流侧一律给占位黑帧, 直到
-    // 消费端重新打开摄像头(那时会新建一个针脚, 重新读一次队列头)。
+    // ★分辨率硬透传, 一路不缩放★ 未连接期间的每个格式相关入口(构造 / QueryAccept /
+    // EnumMediaTypes / GetFormat / GetStreamCaps / Connect)都会先 _RefreshSize() 重取一次,
+    // 所以下游协商到的必然就是上位机设置的那个尺寸 —— 即使过滤器实例被消费端缓存着复用,
+    // 只要它重新打开(重新走一遍协商)就会拿到新值。
+    //
+    // ★为什么连上之后不能再跟着队列变★ DirectShow 的媒体类型在 Connect 时就与下游定死了,
+    // 下游据此申请缓冲、配置转换与渲染; 运行中换尺寸没有合法的通知路径(SetMediaType 只能改
+    // 同尺寸下的次要属性)。所以连接期间本值冻结, 生产者此时改分辨率只会让
+    // Mai2VcamQueueReader::Read 判尺寸不等而输出占位帧(**不缩放**), 由上位机侧强制卸载重建
+    // 摄像头 + 消费端重开来收敛。
     int _width = MAI2VCAM_DEFAULT_WIDTH;
     int _height = MAI2VCAM_DEFAULT_HEIGHT;
 

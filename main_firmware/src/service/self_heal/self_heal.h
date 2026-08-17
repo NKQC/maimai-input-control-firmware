@@ -34,6 +34,8 @@ enum SelfHealCode : uint8_t {
     // 某个 NvStore 区在 flash 里判为无效(detail = valid_mask)。单份存储的"坏只坏在那一区"
     // 必须让用户看得见, 否则该区静默恢复默认值, 用户只会以为"设置又丢了"。
     SH_NV_REGION_INVALID = 11,
+    // PSoC 自报算法槽容量与 RP 编译期上传上限不一致；detail=RP槽容量<<16 | PSoC槽容量。
+    SH_ALGO_CAPACITY_MISMATCH = 12,
 };
 
 class SelfHeal {

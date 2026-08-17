@@ -74,7 +74,13 @@ export component CurvesPage inherits Rectangle {
     in-out property <bool> show_algo_overlay: false;
     in property <[AlgoReportLine]> algo_report_lines: [];
     in property <int> algo_trace_point_count: 0;
+    // 共享可调变量(cfg[8], per_channel==false): 一份值对 36 通道生效。
     in property <[AlgoSettingRow]> algo_setting_rows: [];
+    // 逐通道可调变量(cfg_ch[8], per_channel==true): 值对应**当前 sel_channel**, 由 Rust 侧按通道回填。
+    in property <[AlgoSettingRow]> algo_setting_ch_rows: [];
+    // 逐通道项的编辑: (idx, value)。通道号不随参数传 —— 由 Rust 侧读 sel_channel(与本页
+    // curve_ch_enable_set 同一手法), 避免界面与 Rust 各持一个"当前通道"而漂移。
+    callback algo_setting_ch_edited(int, int);
     // 右列两个折叠区块的展开态, 放在 AppWindow 上双向绑定, 切页重建也不丢(同 CollapsibleSection 约定)。
     in-out property <bool> params_expanded: true;
     in-out property <bool> algo_cfg_expanded: false;
@@ -1079,16 +1085,37 @@ export component CurvesPage inherits Rectangle {
                 // 在上, 算法量纲的可调量在下), 中间夹一个默认收起、几百次重校准的频谱扫描区块会
                 // 让人以为"可调变量属于频谱扫描"。频谱区排到二者之后。
                 CollapsibleSection {
-                    title: "算法可调变量(cfg)";
-                    summary: root.algo_setting_rows.length > 0
-                        ? root.algo_setting_rows.length + " 项 · 改即下发"
+                    title: "算法可调变量(cfg / cfg_ch)";
+                    summary: (root.algo_setting_ch_rows.length + root.algo_setting_rows.length) > 0
+                        ? "逐通道 " + root.algo_setting_ch_rows.length
+                            + " · 共享 " + root.algo_setting_rows.length
                         : "无声明";
                     expanded <=> root.algo_cfg_expanded;
 
+                    // ★逐通道项与共享项必须分开列★ 前者改的只是**当前这个通道**, 后者改一次对
+                    // 36 个通道同时生效。混在一列里, 用户在精调 CH7 时会以为整列都只影响 CH7 ——
+                    // 那正是"单个通道不同配置"这件事在界面上唯一会被误解的地方。
+                    Text {
+                        text: root.algo_setting_ch_rows.length > 0
+                            ? "逐通道(cfg_ch): 只改 CH" + root.sel_channel + " 这一个通道。"
+                            : "当前算法未声明 ALGO_SETTING_CH(无逐通道算法量)。";
+                        color: #b0b8c0;
+                        font-size: 10px;
+                        wrap: word-wrap;
+                    }
+                    VerticalBox {
+                            padding: 0px;
+                            spacing: 2px;
+                            for row in root.algo_setting_ch_rows: AlgoSettingEditorRow {
+                                entry: row;
+                                channel_text: "CH" + root.sel_channel;
+                                edited(idx, v) => { root.algo_setting_ch_edited(idx, v); }
+                            }
+                        }
                     Text {
                         text: root.algo_setting_rows.length > 0
-                            ? "修改立即下发并持久化(与设备上运行的算法共享 cfg[8])。"
-                            : "当前算法未声明 ALGO_SETTING, 无可调变量。";
+                            ? "全通道共享(cfg[8]): 一份值对全部 36 个通道生效, 不只是当前通道。"
+                            : "当前算法未声明 ALGO_SETTING, 无共享可调变量。";
                         color: #b0b8c0;
                         font-size: 10px;
                         wrap: word-wrap;

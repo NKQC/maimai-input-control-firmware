@@ -160,7 +160,19 @@ export component AppWindow inherits Window {
     in-out property <bool> batch_targets_expanded: true;
     in-out property <bool> batch_enable_expanded: false;
     in-out property <bool> batch_params_expanded: true;
+    in-out property <bool> batch_algo_ch_expanded: false;
     in-out property <bool> batch_algo_cfg_expanded: false;
+    // 批量抽屉里"逐通道算法配置(cfg_ch)"的行、勾选态与两个批量动作。
+    in property <[AlgoSettingRow]> batch_algo_ch_rows: [];
+    in property <[bool]> batch_algo_ch_selected: [];
+    callback batch_toggle_algo_ch(int);
+    callback batch_algo_ch_value_set(int, int);
+    callback batch_algo_ch_all();
+    callback batch_algo_ch_invert();
+    // "全通道算法配置(cfg)"独立下拉框的选项名与选中下标。★下标必须存在 AppWindow★:
+    // 抽屉是 `if` 条件实例化的, 存在页面里收一次抽屉就丢。
+    in property <[string]> batch_algo_shared_names: [];
+    in-out property <int> batch_algo_shared_sel: 0;
     callback batch_drawer_closed();
     // 全通道页排序/筛选: 真正的排序与筛选在 Rust 侧做(逻辑顺序的唯一真相源是绑定映射),
     // 这两个属性只是把用户的选择传下去; channel_hidden_count 由 Rust 回填被筛掉的通道数。
@@ -441,11 +453,27 @@ export component AppWindow inherits Window {
     in property <string> algo_phase: "";
     in property <string> algo_asm: "";
     in property <int> algo_asm_bytes: 0;
-    in property <int> algo_asm_capacity: 1024;
+    // PSoC 可执行槽容量(4096)。★与"单帧上传上限"(4092)是两个数★: 前者只是进度条分母,
+    // 后者才是编译/上传闸门(ALGO_UPLOAD 帧要先放 len+crc16 两个 u16)。
+    in property <int> algo_asm_capacity: 4096;
     in property <int> algo_c_bytes: 0;
     in property <int> algo_c_capacity: 32768;
+    // 共享堆(ABI v2)占用峰值与容量。-1 = 设备未回报(旧固件/缓存不可用) ⇒ 界面显示 "—" 而非 0。
+    in property <int> algo_heap_used: -1;
+    in property <int> algo_heap_capacity: 256;
+    // ★上面四个容量的真相源是设备★(ALGO_GET_INFO 的容量组), 这里的默认值只是"还没连上"时的兜底。
+    // algo_caps_known=false ⇒ 界面必须注明"容量待回读", 不能让用户以为这就是这台设备的真值。
+    in property <bool> algo_caps_known: false;
+    // 单帧可上传的算法字节上限(编译/上传的唯一闸门, 比槽容量小 4 字节的帧内头)。
+    in property <int> algo_upload_limit: 4092;
+    // 非空 = 设备自报两级容量常量不一致, 必须显著显示(上传可能被一侧放行、另一侧静默截断)。
+    in property <string> algo_caps_warning: "";
     in property <[AlgoMetadataRow]> algo_metadata_rows: [];
+    // 全通道共享可调变量(cfg[8], per_channel==false)。
     in property <[AlgoSettingRow]> algo_setting_rows: [];
+    // 逐通道可调变量(cfg_ch[8], per_channel==true), 值对应当前 sel_channel(单通道精调页用)。
+    in property <[AlgoSettingRow]> algo_setting_ch_rows: [];
+    callback algo_setting_ch_edited(int, int);
     // 上报折线(图例 + 右轴 path)。★必须从这里一路透传到 CurvesPage★: 该属性原先只在
     // curves.slint 上声明, AppWindow/SettingsPage 都没有它, Rust 侧那个每帧填好的模型
     // 因此根本没有入口 —— 图例恒显示"未声明 ALGO_REPORT", 右轴折线一条都不画。
@@ -907,7 +935,16 @@ export component AppWindow inherits Window {
                 batch_targets_expanded <=> root.batch_targets_expanded;
                 batch_enable_expanded <=> root.batch_enable_expanded;
                 batch_params_expanded <=> root.batch_params_expanded;
+                batch_algo_ch_expanded <=> root.batch_algo_ch_expanded;
                 batch_algo_cfg_expanded <=> root.batch_algo_cfg_expanded;
+                batch_algo_ch_rows: root.batch_algo_ch_rows;
+                batch_algo_ch_selected: root.batch_algo_ch_selected;
+                batch_toggle_algo_ch(idx) => { root.batch_toggle_algo_ch(idx); }
+                batch_algo_ch_value_set(idx, v) => { root.batch_algo_ch_value_set(idx, v); }
+                batch_algo_ch_all() => { root.batch_algo_ch_all(); }
+                batch_algo_ch_invert() => { root.batch_algo_ch_invert(); }
+                batch_algo_shared_names: root.batch_algo_shared_names;
+                batch_algo_shared_sel <=> root.batch_algo_shared_sel;
                 channel_sort <=> root.channel_sort;
                 channel_show_disabled <=> root.channel_show_disabled;
                 channel_hidden_count: root.channel_hidden_count;
@@ -1000,6 +1037,8 @@ export component AppWindow inherits Window {
                 algo_asm: root.algo_asm;
                 algo_metadata_rows: root.algo_metadata_rows;
                 algo_setting_rows: root.algo_setting_rows;
+                algo_setting_ch_rows: root.algo_setting_ch_rows;
+                algo_setting_ch_edited(idx, v) => { root.algo_setting_ch_edited(idx, v); }
                 algo_report_lines: root.algo_report_lines;
                 algo_setting_edited(idx, v) => { root.algo_setting_edited(idx, v); }
                 g_inactive_sns: root.g_inactive_sns;
@@ -1026,6 +1065,11 @@ export component AppWindow inherits Window {
                 algo_asm_capacity: root.algo_asm_capacity;
                 algo_c_bytes: root.algo_c_bytes;
                 algo_c_capacity: root.algo_c_capacity;
+                algo_heap_used: root.algo_heap_used;
+                algo_heap_capacity: root.algo_heap_capacity;
+                algo_caps_known: root.algo_caps_known;
+                algo_upload_limit: root.algo_upload_limit;
+                algo_caps_warning: root.algo_caps_warning;
                 algo_refresh() => { root.algo_refresh(); }
                 algo_reset_default() => { root.algo_reset_default(); }
                 algo_compile(s) => { root.algo_compile(s); }

@@ -78,11 +78,13 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClInclude Include="vcam_queue_layout.h" />
     <ClInclude Include="vcam_common.h" />
     <ClInclude Include="vcam_queue.h" />
     <ClInclude Include="vcam_filter.h" />
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="vcam_log.cpp" />
     <ClCompile Include="vcam_common.cpp" />
     <ClCompile Include="vcam_queue.cpp" />
     <ClCompile Include="vcam_filter.cpp" />

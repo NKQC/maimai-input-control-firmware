@@ -169,12 +169,45 @@ bool FullySpecified(const AM_MEDIA_TYPE* type) {
 
 Mai2VcamPin::Mai2VcamPin(Mai2VcamFilter* owner) : _owner(owner) {
     InitializeCriticalSection(&_lock);
-    // 分辨率在这里定终身: 消费端每次打开摄像头都会新建过滤器与针脚, 因此"改分辨率后重新打开"
-    // 就是它取到新值的时机。
     Mai2VcamQueryQueueSize(&_width, &_height);
     Mai2VcamBuildMediaType(&_mt, MAI2VCAM_DEFAULT_INTERVAL, _width, _height);
     _hasMt = true;
     Mai2VcamLog("pin: 分辨率取自共享队列 = %dx%d", _width, _height);
+}
+
+// 未连接时把队列头的分辨率搬到本针脚上。这是分辨率透传的**唯一**入口, 所有格式相关的
+// IPin/IAMStreamConfig 方法都先过它一次。
+//
+// ★为什么不能只在构造时读一次★ 消费端(尤其 Windows 帧服务器与部分游戏)会把过滤器实例缓存
+// 住反复复用: 上位机改完分辨率、用户在消费端重新打开摄像头时, 走的可能是同一个针脚对象的
+// 第二轮协商。只在构造时读就意味着那一轮仍按旧尺寸协商, 于是"重开也没用"。
+// 已连接则一律不动 —— 那时媒体类型已与下游定死(见 _width 的说明)。
+void Mai2VcamPin::_RefreshSize() {
+    int width = 0;
+    int height = 0;
+    Mai2VcamQueryQueueSize(&width, &height);
+    EnterCriticalSection(&_lock);
+    if (_peer != nullptr || (width == _width && height == _height)) {
+        LeaveCriticalSection(&_lock);
+        return;
+    }
+    AM_MEDIA_TYPE updated = {};
+    if (FAILED(Mai2VcamBuildMediaType(&updated, _interval, width, height))) {
+        LeaveCriticalSection(&_lock);
+        return;
+    }
+    const int previousWidth = _width;
+    const int previousHeight = _height;
+    if (_hasMt) {
+        Mai2VcamFreeMediaTypeContents(&_mt);
+    }
+    _mt = updated;
+    _hasMt = true;
+    _width = width;
+    _height = height;
+    LeaveCriticalSection(&_lock);
+    Mai2VcamLog("pin: 分辨率随队列更新 %dx%d → %dx%d(未连接, 透传新尺寸)", previousWidth,
+                previousHeight, width, height);
 }
 
 Mai2VcamPin::~Mai2VcamPin() {
@@ -235,6 +268,8 @@ STDMETHODIMP Mai2VcamPin::Connect(IPin* receive, const AM_MEDIA_TYPE* type) {
     }
     LeaveCriticalSection(&_lock);
 
+    // 连接前最后一次机会把队列尺寸搬过来: 之后这个尺寸就与下游定死了。
+    _RefreshSize();
     if (type != nullptr && !Mai2VcamAcceptMediaType(type, _width, _height)) {
         return VFW_E_TYPE_NOT_ACCEPTED;
     }
@@ -442,6 +477,7 @@ STDMETHODIMP Mai2VcamPin::QueryId(LPWSTR* id) {
 }
 
 STDMETHODIMP Mai2VcamPin::QueryAccept(const AM_MEDIA_TYPE* type) {
+    _RefreshSize();
     return Mai2VcamAcceptMediaType(type, _width, _height) ? S_OK : S_FALSE;
 }
 
@@ -449,10 +485,14 @@ STDMETHODIMP Mai2VcamPin::EnumMediaTypes(IEnumMediaTypes** enumerator) {
     if (enumerator == nullptr) {
         return E_POINTER;
     }
+    // 图构建器就是靠这里报的类型决定要协商什么尺寸, 所以它必须反映队列**此刻**的分辨率。
+    _RefreshSize();
     EnterCriticalSection(&_lock);
     LONGLONG interval = _interval;
+    const int width = _width;
+    const int height = _height;
     LeaveCriticalSection(&_lock);
-    *enumerator = new TypeEnumerator(interval, _width, _height, 0);
+    *enumerator = new TypeEnumerator(interval, width, height, 0);
     return *enumerator == nullptr ? E_OUTOFMEMORY : S_OK;
 }
 
@@ -474,6 +514,9 @@ STDMETHODIMP Mai2VcamPin::SetFormat(AM_MEDIA_TYPE* type) {
     if (type == nullptr) {
         return E_POINTER;
     }
+    // 未连接时先与队列对齐, 再判可接受: 分辨率由生产者说了算, SetFormat 只能改帧率这类次要属性,
+    // 拿旧尺寸来设一律拒绝(而不是默默按旧尺寸接受, 那就等于在这里把透传破掉)。
+    _RefreshSize();
     if (!Mai2VcamAcceptMediaType(type, _width, _height)) {
         return VFW_E_INVALIDMEDIATYPE;
     }
@@ -513,6 +556,7 @@ STDMETHODIMP Mai2VcamPin::GetFormat(AM_MEDIA_TYPE** type) {
     if (type == nullptr) {
         return E_POINTER;
     }
+    _RefreshSize();
     AM_MEDIA_TYPE* copy = (AM_MEDIA_TYPE*)CoTaskMemAlloc(sizeof(AM_MEDIA_TYPE));
     if (copy == nullptr) {
         return E_OUTOFMEMORY;
@@ -544,22 +588,28 @@ STDMETHODIMP Mai2VcamPin::GetStreamCaps(int index, AM_MEDIA_TYPE** type, BYTE* c
     if (index != 0) {
         return S_FALSE;
     }
+    // 消费端的"分辨率下拉"读的就是这里: 必须报队列此刻的尺寸, 且上下界与它相同(本源不缩放)。
+    _RefreshSize();
+    EnterCriticalSection(&_lock);
+    const int width = _width;
+    const int height = _height;
+    LeaveCriticalSection(&_lock);
     AM_MEDIA_TYPE* copy = (AM_MEDIA_TYPE*)CoTaskMemAlloc(sizeof(AM_MEDIA_TYPE));
     if (copy == nullptr) {
         return E_OUTOFMEMORY;
     }
-    HRESULT hr = Mai2VcamBuildMediaType(copy, MAI2VCAM_DEFAULT_INTERVAL, _width, _height);
+    HRESULT hr = Mai2VcamBuildMediaType(copy, MAI2VCAM_DEFAULT_INTERVAL, width, height);
     if (FAILED(hr)) {
         CoTaskMemFree(copy);
         return hr;
     }
-    const LONGLONG frameBytes = (LONGLONG)Mai2VcamFrameBytes(_width, _height);
+    const LONGLONG frameBytes = (LONGLONG)Mai2VcamFrameBytes(width, height);
     VIDEO_STREAM_CONFIG_CAPS* caps = (VIDEO_STREAM_CONFIG_CAPS*)capabilities;
     ZeroMemory(caps, sizeof(VIDEO_STREAM_CONFIG_CAPS));
     caps->guid = FORMAT_VideoInfo;
     caps->VideoStandard = AnalogVideo_None;
-    caps->InputSize.cx = _width;
-    caps->InputSize.cy = _height;
+    caps->InputSize.cx = width;
+    caps->InputSize.cy = height;
     caps->MinCroppingSize = caps->InputSize;
     caps->MaxCroppingSize = caps->InputSize;
     caps->CropGranularityX = 1;
@@ -771,7 +821,8 @@ void Mai2VcamPin::_PushLoop() {
             input->AddRef();
         }
         const LONGLONG interval = _interval;
-        // 分辨率在针脚构造时定死, 这里只是取本地副本, 免得在锁外读成员。
+        // 已连接期间分辨率冻结(_RefreshSize 见 _peer != nullptr 即不动), 这里只取本地副本,
+        // 免得在锁外读成员。
         const int width = _width;
         const int height = _height;
         const long frameBytes = Mai2VcamFrameBytes(width, height);

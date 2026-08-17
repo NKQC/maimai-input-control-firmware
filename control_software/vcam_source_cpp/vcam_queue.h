@@ -17,8 +17,18 @@ public:
     ~Mai2VcamQueueReader() { Close(); }
 
     // 取一帧 NV12 到 destination(容量必须 >= Mai2VcamFrameBytes(width, height))。
-    // width/height 是本针脚**已协商**的分辨率: 队列头报的分辨率与它不一致时一律给占位帧,
-    // 绝不把另一种尺寸的像素塞进按这个尺寸协商好的缓冲(那是花屏或越界)。
+    // width/height 是本针脚**已协商**的分辨率。
+    //
+    // ★分辨率全程透传, 本源永不缩放★
+    // 生产者写进队列头的尺寸就是消费端拿到的尺寸: 针脚在**未连接**时按队列头报格式(见
+    // vcam_filter.cpp 的 _RefreshSize), 连上之后队列尺寸与协商尺寸必然相等, 于是这里只做
+    // 逐字节 memcpy。缩放会改变每模块的像素边长并抹掉 QR 的硬边, 属于对画面内容的加工,
+    // 与"设置的分辨率原样出画"这个硬要求直接冲突, 因此一行都不做。
+    //
+    // 唯一会出现尺寸不等的窗口是"消费端已协商完、生产者随后改了分辨率"。此时没有任何合法
+    // 途径把新尺寸通知下游(DirectShow 的媒体类型在 Connect 时定死), 所以只能给稳定占位帧
+    // 并要求在消费端重新打开摄像头 —— 上位机改分辨率时会强制卸载重建摄像头(见
+    // src/ui_callbacks/virtual_camera.rs), 把这个窗口压到一次重连之内。
     // 返回 true = 来自生产者的真实帧; false = 已填占位帧。
     bool Read(BYTE* destination, int width, int height);
 
@@ -27,6 +37,8 @@ public:
 private:
     bool _Open();
     unsigned int _Load(unsigned int offset) const;
+    // 三缓冲读取(撕裂重试在内)。frameBytes 恒为**协商尺寸**下的帧长 —— 尺寸不等时根本走不到这里。
+    bool _ReadSlots(BYTE* destination, int frameBytes, unsigned int* sequence);
     static void _Placeholder(BYTE* destination, int width, int height);
 
     HANDLE _map = nullptr;
@@ -36,4 +48,7 @@ private:
     // 只在状态发生变化时写日志。
     bool _lastLive = false;
     bool _logged = false;
+    // 已记录过的打开失败码(Global / Local), 只在变化时再记一条。
+    DWORD _loggedOpenError = 0;
+    DWORD _loggedLocalError = 0;
 };

@@ -27,10 +27,69 @@ const VIDEO_INPUT_CATEGORY: &str = "{860BB310-5D01-11D0-BD3B-00A0C911CE86}";
 const INSTANCE_NAME: &str = "mai2control Virtual Camera";
 /// 旧 MF 实现留下的 DLL 文件名。当前实现只用 DirectShow, 不再注册 MF 设备, 这份文件仅作卸载清理。
 const LEGACY_MF_DLL: &str = "mai2vcam_source64.dll";
+/// 旧 MF 媒体源的 COM CLSID(与 `_open_legacy_mf_camera` 传给 MFCreateVirtualCamera 的 sourceId 同一个)。
+///
+/// ★这把键是幽灵相机赖以存在的根★ 旧实现的卸载只删了 DirectShow 那个 CLSID, 从没删过它。
+/// 于是 DLL 删掉之后, `HKLM\SOFTWARE\Classes\CLSID\{…}\InprocServer32` 还指着一个已经不存在
+/// 的文件, 帧服务器照旧把这条虚拟相机登记项列给所有应用 —— 就是"Windows 设置里看得见、预览
+/// 恒黑、怎么重装都不变"的那一条。
+const LEGACY_MF_CLSID: &str = "{B7C5F1A2-3D64-4E8B-9A11-2F6C8D0E4A73}";
 
-/// 旧 MF 实现的 DLL 是否已从部署目录清除。
+/// 被载入过的 DLL 删不掉时改用的名字。改名对已加载模块是允许的, 删除不是。
+const PENDING_SUFFIX: &str = ".pendingdelete";
+
+/// 旧 MF 实现的 DLL 是否已从部署目录清除(不含已改名待删的副本)。
 fn _legacy_dll_clean() -> bool {
     !install_dir().join(LEGACY_MF_DLL).is_file()
+}
+
+/// 还有几份"已改名待删"的副本。它们不会再被任何东西加载(注册项早已删除),
+/// 只是宿主进程还没放开映像段, 下一次安装/卸载或重启后会被扫掉。
+fn _pending_delete_count() -> usize {
+    let Ok(entries) = std::fs::read_dir(install_dir()) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .ends_with(PENDING_SUFFIX)
+        })
+        .count()
+}
+
+/// 清扫历史遗留的"待删"副本。安装与卸载都先跑一遍: 宿主进程一旦放开映像段就删得掉了。
+fn _sweep_pending_steps(directory: &Path) -> Vec<String> {
+    vec![format!(
+        "del /q {pattern} >nul 2>&1",
+        pattern = _cmd_quote(&directory.join(format!("*{}", PENDING_SUFFIX))),
+    )]
+}
+
+/// 删除旧 MF 源 DLL。★必须能对付"文件正被当作映像加载"★
+///
+/// 这份 DLL 只要曾被帧服务器载入过, 普通 `del` 就会返回 ACCESS_DENIED(不是"正被占用" ——
+/// 有活动映像段的文件删除失败映射成的正是拒绝访问, 这一点让上一轮排查跑偏了很久)。
+/// 三级处置, 每一级只在上一级没解决时才付出代价:
+///   ① 直接删 —— 绝大多数情况就到这里;
+///   ② 仍在 ⇒ 停 Windows 相机帧服务器(按需启动的服务, FrameServerMonitor 会在下次用相机时
+///      把它拉起来), 等两秒让映像段释放后重删。只在确实需要时才动服务, 不无条件打断别人用相机;
+///   ③ 仍在 ⇒ 改名成 `.pendingdelete`。改名对已加载模块是允许的, 原名从此消失, 任何东西都
+///      不会再按原名加载它; 残下的副本由下一次安装/卸载(或重启后)的清扫带走。
+fn _legacy_dll_removal_steps(directory: &Path) -> Vec<String> {
+    let target = _cmd_quote(&directory.join(LEGACY_MF_DLL));
+    let pending = _cmd_quote(&directory.join(format!("{}{}", LEGACY_MF_DLL, PENDING_SUFFIX)));
+    vec![
+        format!("del /q {target} >nul 2>&1"),
+        format!("if exist {target} (sc stop FrameServerMonitor >nul 2>&1)"),
+        format!("if exist {target} (sc stop FrameServer >nul 2>&1)"),
+        // ping 当 sleep: timeout 在无交互 stdin 的提权批处理里会直接失败。
+        format!("if exist {target} (ping -n 3 127.0.0.1 >nul 2>&1)"),
+        format!("if exist {target} (del /q {target} >nul 2>&1)"),
+        format!("if exist {target} (move /y {target} {pending} >nul 2>&1)"),
+    ]
 }
 
 /// 卸载成功后附带的一句说明。
@@ -141,13 +200,67 @@ pub fn embedded_available() -> bool {
     _items().iter().all(|item| !item._bytes.is_empty())
 }
 
-/// 所有消费端都能读取的机器级部署目录。
-pub fn install_dir() -> PathBuf {
+/// 机器级数据根目录(`%ProgramData%\mai2control`)。过滤器日志也落在这里。
+fn _data_dir() -> PathBuf {
     std::env::var_os("ProgramData")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
         .join("mai2control")
-        .join("vcam")
+}
+
+/// 所有消费端都能读取的机器级部署目录。
+pub fn install_dir() -> PathBuf {
+    _data_dir().join("vcam")
+}
+
+/// 过滤器诊断日志(路径与 `vcam_common.cpp::Mai2VcamLog` 必须一致)。
+fn _filter_log() -> PathBuf {
+    _data_dir().join("mai2vcam_dshow.log")
+}
+
+/// ★消费端令牌可能是应用容器, 必须显式授权应用包 SID★
+///
+/// UWP / AppContainer 进程的访问检查比普通进程多一道: 除了用户与组 SID, 目标对象的 DACL 里
+/// 还必须有一条 ACE 授权给该应用包 SID、某个能力 SID, 或下面这两个"所有应用程序包"通配 SID。
+/// 只给 `Everyone` 时 AppContainer 一律拿到 ERROR_ACCESS_DENIED —— 这就是为什么
+/// `C:\Program Files` 默认带着这两条 ACE 而 `C:\ProgramData` 不带。
+/// Windows 的相机取帧管道跑在(受限)应用容器里, 少了它们连本 DLL 都载不进去, 表现正是
+/// "设备列得出来、Windows 设置里画面恒黑、过滤器日志里一条记录都没有"。
+const SID_EVERYONE: &str = "*S-1-1-0";
+const SID_ALL_APP_PACKAGES: &str = "*S-1-15-2-1";
+const SID_ALL_RESTRICTED_APP_PACKAGES: &str = "*S-1-15-2-2";
+
+/// 部署目录/日志文件的 ACL 步骤。授读的对象必须覆盖: 普通桌面消费端、以 LOCAL SERVICE 运行的
+/// 帧服务器、以及(受限)应用容器。
+fn _acl_steps(directory: &Path) -> Vec<String> {
+    let dir = _cmd_quote(directory);
+    let log = _cmd_quote(&_filter_log());
+    vec![
+        // 目录: 三个对象各给一条可继承的读+执行 ACE(新复制进来的 DLL 直接继承)。
+        format!(
+            "icacls {dir} /grant {everyone}:(OI)(CI)(RX) {app}:(OI)(CI)(RX) {restricted}:(OI)(CI)(RX) >nul 2>&1",
+            everyone = SID_EVERYONE,
+            app = SID_ALL_APP_PACKAGES,
+            restricted = SID_ALL_RESTRICTED_APP_PACKAGES,
+        ),
+        // 已存在的旧文件不会因为目录多了 ACE 就跟着变(它们各自带着当初继承下来的副本), 所以
+        // 再对整棵树补一遍不带继承标志的同权限 ACE。
+        format!(
+            "icacls {dir} /grant {everyone}:(RX) {app}:(RX) {restricted}:(RX) /T /C >nul 2>&1",
+            everyone = SID_EVERYONE,
+            app = SID_ALL_APP_PACKAGES,
+            restricted = SID_ALL_RESTRICTED_APP_PACKAGES,
+        ),
+        // 日志文件: 过滤器跑在帧服务器/应用容器里也要写得进去, 否则"到底有没有被加载"没法取证。
+        // 只放开这一个文件的写权限, 不放开放 DLL 的那个目录。
+        format!("type nul >> {log} 2>nul", log = log),
+        format!(
+            "icacls {log} /grant {everyone}:(M) {app}:(M) {restricted}:(M) >nul 2>&1",
+            everyone = SID_EVERYONE,
+            app = SID_ALL_APP_PACKAGES,
+            restricted = SID_ALL_RESTRICTED_APP_PACKAGES,
+        ),
+    ]
 }
 
 struct _Registered {
@@ -222,7 +335,15 @@ pub fn registration_status() -> String {
             .map(|entry| entry._label)
             .collect();
         if missing.is_empty() {
-            format!("摄像头已安装（{}）", install_dir().display())
+            // ★必须说清"谁看得到"★ 本摄像头是 DirectShow 源; 实测(`selftest --vcam-mf-list`)
+            // 确认 Media Foundation 不枚举 DirectShow 采集过滤器, 所以 Windows 设置 / 相机应用 /
+            // Teams 永远不会列出它 —— 不写清楚, 用户就会拿 Windows 设置当验收面, 然后把
+            // "设置里看不到/恒黑"误判成推帧坏了(这正是前两轮排查跑偏的原因)。
+            format!(
+                "摄像头已安装（{}）；仅 DirectShow 消费端可见（游戏 / OBS 的「视频采集设备」/ amcap）；\
+                 Windows 设置与相机应用只枚举 Media Foundation 设备，不会列出它",
+                install_dir().display()
+            )
         } else if missing.len() == scanned.len() {
             "摄像头未安装（系统中没有本摄像头）".to_string()
         } else {
@@ -343,6 +464,7 @@ pub fn install() -> Result<String> {
         "(if not exist {dir} mkdir {dir})",
         dir = _cmd_quote(&directory)
     )];
+    steps.extend(_sweep_pending_steps(&directory));
     _stage_interception_assets(&staging, &mut steps)?;
     for (index, item) in _items().iter().enumerate() {
         let staged = staging.join(item._dll);
@@ -363,10 +485,7 @@ pub fn install() -> Result<String> {
         ));
         steps.push(format!("if errorlevel 1 exit /b {}", 30 + index));
     }
-    steps.push(format!(
-        "icacls {dir} /grant *S-1-1-0:(RX) /T /C >nul 2>&1",
-        dir = _cmd_quote(&directory)
-    ));
+    steps.extend(_acl_steps(&directory));
 
     let exit = _run_elevated_steps(&steps)?;
     if exit != 0 {
@@ -459,7 +578,6 @@ fn _exit_reason(exit: u32) -> String {
 /// 因而绝不移除本应用安装前就存在的 Interception 驱动。
 pub fn uninstall() -> Result<String> {
     let _deploy = _deploy_guard("卸载")?;
-    _remove_legacy_mf_camera();
     let directory = install_dir();
     let interception_dir = interception::install_dir();
     let owned_driver = interception::owner_marker_matches();
@@ -481,7 +599,7 @@ pub fn uninstall() -> Result<String> {
             .map_err(|error| anyhow!("暂存 Interception API 以核验卸载结果失败：{}", error))?;
     }
 
-    let mut steps = Vec::new();
+    let mut steps = _sweep_pending_steps(&directory);
     for item in _items().iter().rev() {
         let target = directory.join(item._dll);
         steps.push(format!(
@@ -514,6 +632,11 @@ pub fn uninstall() -> Result<String> {
             category = VIDEO_INPUT_CATEGORY,
             name = INSTANCE_NAME,
         ));
+        // 旧 MF 媒体源的 COM 登记(见 LEGACY_MF_CLSID)。不删它, 幽灵相机就永远留在相机列表里。
+        steps.push(format!(
+            "reg delete \"HKLM\\SOFTWARE\\Classes\\CLSID\\{clsid}\" /f /reg:{view} >nul 2>&1",
+            clsid = LEGACY_MF_CLSID,
+        ));
     }
     if owned_driver {
         steps.push(format!(
@@ -533,12 +656,7 @@ pub fn uninstall() -> Result<String> {
             old = _cmd_quote(&target.with_extension("dll.old")),
         ));
     }
-    // 旧 MF 实现留下的 DLL: 当前实现不再注册任何 MF 设备, 但老版本装过的这份文件会一直躺在
-    // 部署目录里。它已经不会被任何东西加载, 可只要它还在, "到底卸干净了没有"就答不清楚。
-    steps.push(format!(
-        "del /q {target} >nul 2>&1",
-        target = _cmd_quote(&directory.join(LEGACY_MF_DLL)),
-    ));
+    steps.extend(_legacy_dll_removal_steps(&directory));
     for (name, _) in interception::deployment_assets() {
         steps.push(format!(
             "del /q {target} >nul 2>&1",
@@ -563,19 +681,64 @@ pub fn uninstall() -> Result<String> {
             _describe(&_scan())
         ));
     }
+    // ★MF 幽灵相机的清理必须放在提权批处理**之后**★
+    //
+    // 两个原因。其一, `_open_legacy_mf_camera` 走的 MFCreateVirtualCamera 会把这条虚拟相机
+    // 注册出来, 帧服务器随即把 mai2vcam_source64.dll 载进去 —— 放在前面就等于亲手给后面的
+    // `del` 制造一个删不掉的文件。其二, 批处理刚刚删掉了它的 COM 登记(LEGACY_MF_CLSID),
+    // 此刻这条登记项已经明确无效, `MFCleanupVirtualCameraEntries` 才有依据把它扫掉。
+    _remove_legacy_mf_camera();
+
     let verified = _scan();
-    let camera_clean = verified
+    // ★三类残留必须分开判、分开说★ 旧实现把它们与一句"仍有残留"揉在一起, 于是屏幕上出现
+    // "仍有残留：…CLSID键=无 InprocServer32=(无) 类别登记=无 DLL=无…" 这种自相矛盾的文案 ——
+    // DirectShow 明明全干净, 报错却是因为一份与当前实现无关的旧 MF DLL 删不掉。
+    let directshow_clean = verified
         .iter()
-        .all(|entry| entry._absent() && entry._files_clean())
-        && _legacy_dll_clean();
-    if !camera_clean || !_interception_assets_clean() {
-        return Err(anyhow!(
-            "卸载命令已执行（退出码 0），但仍有残留：{}；旧 MF DLL 已清除={}；Interception 资产已清除={}",
-            _describe(&verified),
-            _legacy_dll_clean(),
-            _interception_assets_clean(),
+        .all(|entry| entry._absent() && entry._files_clean());
+    let mut blocking: Vec<String> = Vec::new();
+    if !directshow_clean {
+        blocking.push(format!("DirectShow 注册/文件未清除（{}）", _describe(&verified)));
+    }
+    if !_interception_assets_clean() {
+        blocking.push("Interception 运行资产未清除".to_string());
+    }
+    // 旧 MF 幽灵相机仍被帧服务器列出 ⇒ 真的没卸干净(用户在 Windows 设置里还会看到它)。
+    if _mf_device_listed().unwrap_or(false) {
+        blocking.push(if crate::elevation::is_elevated() {
+            format!(
+                "帧服务器仍列出旧 MF 系统相机「{}」（注册项已删，帧服务器可能仍在缓存；重启后再确认一次）",
+                INSTANCE_NAME
+            )
+        } else {
+            format!(
+                "帧服务器仍列出旧 MF 系统相机「{}」，注销它需要管理员权限；请以管理员重新运行本程序后再卸载",
+                INSTANCE_NAME
+            )
+        });
+    }
+    if !_legacy_dll_clean() {
+        blocking.push(format!(
+            "旧 MF 源 DLL {} 既删不掉也改名不了",
+            LEGACY_MF_DLL
         ));
     }
+    if !blocking.is_empty() {
+        return Err(anyhow!(
+            "卸载命令已执行（退出码 0），但仍有残留：{}",
+            blocking.join("；")
+        ));
+    }
+    // 已改名待删的副本不算残留: 原名已消失, 不会再被加载, 下次安装/卸载或重启后清掉。
+    let pending = _pending_delete_count();
+    let pending_note = if pending == 0 {
+        String::new()
+    } else {
+        format!(
+            "；另有 {} 份旧 DLL 副本因宿主进程仍持有映像段而只能改名待删，重启后会自动清除",
+            pending
+        )
+    };
     if owned_driver {
         if interception::driver_status_from_api(&probe_api).is_loaded() {
             return Err(anyhow!(
@@ -583,13 +746,13 @@ pub fn uninstall() -> Result<String> {
             ));
         }
         Ok(format!(
-            "未安装（已核验摄像头注册/文件清除，且仅移除了本应用安装的 Interception 驱动）{}",
-            _STALE_LIST_NOTE
+            "未安装（已核验摄像头注册/文件清除，且仅移除了本应用安装的 Interception 驱动）{}{}",
+            pending_note, _STALE_LIST_NOTE
         ))
     } else {
         Ok(format!(
-            "未安装（已核验摄像头注册/文件清除；已保留非本应用安装的 Interception 驱动）{}",
-            _STALE_LIST_NOTE
+            "未安装（已核验摄像头注册/文件清除；已保留非本应用安装的 Interception 驱动）{}{}",
+            pending_note, _STALE_LIST_NOTE
         ))
     }
 }
@@ -775,8 +938,21 @@ fn _open_legacy_mf_camera() -> Result<IMFVirtualCamera> {
     .map_err(|error| anyhow!("创建 Media Foundation 虚拟相机失败：{}", error))
 }
 
-/// MF Frame Server 是否仍列出本相机。卸载后只用来确认幽灵设备已消失。
+/// MF Frame Server 是否仍列出本相机。用来判断幽灵设备在不在(卸载前后各一次)。
 fn _mf_device_listed() -> Result<bool> {
+    // MF 会给 FriendlyName 追加本地化后缀(例如"(Windows 虚拟摄像头)"), 只能按稳定基名包含匹配。
+    Ok(mf_video_sources()?
+        .iter()
+        .any(|name| name.contains(INSTANCE_NAME)))
+}
+
+/// 帧服务器当前列出的全部视频采集源友好名。
+///
+/// ★这是唯一能回答"Windows 设置里那条到底是谁"的入口★ DirectShow 桥接过来的摄像头与旧实现
+/// 残留的 MF 虚拟相机在设置页里长得一模一样, 只能靠枚举结果区分。
+/// ★不要放进 `registration_status()`★ 它在界面启动路径上被调用, 而 `MFEnumDeviceSources`
+/// 会把所有相机真枚举一遍(有摄像头时是百毫秒级的阻塞)。
+pub fn mf_video_sources() -> Result<Vec<String>> {
     use windows::Win32::Media::MediaFoundation::{
         IMFActivate, MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME, MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE,
         MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID, MF_VERSION, MFCreateAttributes,
@@ -786,7 +962,7 @@ fn _mf_device_listed() -> Result<bool> {
 
     unsafe { MFStartup(MF_VERSION, MFSTARTUP_FULL) }
         .map_err(|error| anyhow!("MFStartup 失败：{}", error))?;
-    let listed = (|| -> Result<bool> {
+    let listed = (|| -> Result<Vec<String>> {
         let mut attributes = None;
         unsafe { MFCreateAttributes(&mut attributes, 1) }
             .map_err(|error| anyhow!("MFCreateAttributes 失败：{}", error))?;
@@ -810,24 +986,27 @@ fn _mf_device_listed() -> Result<bool> {
                 .collect()
         };
         unsafe { CoTaskMemFree(Some(raw.cast())) };
-        // MF 会给 FriendlyName 追加本地化后缀，只能按稳定基名包含匹配，不能按完整值相等。
-        Ok(activates.iter().flatten().any(|activate| {
-            let mut name = windows::core::PWSTR::null();
-            let mut length = 0u32;
-            let read = unsafe {
-                activate.GetAllocatedString(
-                    &MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME,
-                    &mut name,
-                    &mut length,
-                )
-            };
-            if read.is_err() || name.is_null() {
-                return false;
-            }
-            let text = unsafe { name.to_string() }.unwrap_or_default();
-            unsafe { CoTaskMemFree(Some(name.as_ptr().cast())) };
-            text.contains(INSTANCE_NAME)
-        }))
+        Ok(activates
+            .iter()
+            .flatten()
+            .filter_map(|activate| {
+                let mut name = windows::core::PWSTR::null();
+                let mut length = 0u32;
+                let read = unsafe {
+                    activate.GetAllocatedString(
+                        &MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME,
+                        &mut name,
+                        &mut length,
+                    )
+                };
+                if read.is_err() || name.is_null() {
+                    return None;
+                }
+                let text = unsafe { name.to_string() }.unwrap_or_default();
+                unsafe { CoTaskMemFree(Some(name.as_ptr().cast())) };
+                Some(text)
+            })
+            .collect())
     })();
     let _ = unsafe { MFShutdown() };
     listed
@@ -861,6 +1040,28 @@ fn _cleanup_virtual_camera_entries() {
 /// 一次性清除旧 MF 实现留下的系统相机。★不返回错误★: 这是"顺手擦干净"的兼容动作,
 /// 新装机上本来就没有它, 失败也不该拦住 DirectShow 的正常卸载 —— 有残留时后面的核验会报出来。
 fn _remove_legacy_mf_camera() {
+    // ★绝不无条件调 MFCreateVirtualCamera★
+    //
+    // 这个 API 是"创建并注册", 没有"打开已有"的语义。旧实现每次卸载都先调它一次, 于是在早已
+    // 干净的系统上, **卸载动作本身**会把旧 MF 虚拟相机重新注册出来: Windows 设置里当即多出
+    // 一条 "mai2control Virtual Camera (Windows 虚拟摄像头)", 帧服务器随即把部署目录里那份
+    // 旧的 mai2vcam_source64.dll 载进去。该文件从此带着活动映像段, 后面的 `del` 一律返回
+    // ACCESS_DENIED(而不是"正被占用"), 于是核验永远报"仍有残留" —— 用户看到的就是
+    // "卸载总是卸载不干净", 而列出来的 DirectShow 各项其实全是"无"。
+    //
+    // 所以先用只读枚举确认它真的在, 才动手; 枚举不到就什么都不做, 保持幂等。
+    if !_mf_device_listed().unwrap_or(false) {
+        return;
+    }
+    // 注销系统级(System 生命周期)虚拟相机要改机器范围的登记, 普通令牌一律拒绝。这里不是
+    // 提权批处理能替代的: IMFVirtualCamera 是 COM 接口, 只能在本进程里调。
+    if !crate::elevation::is_elevated() {
+        log::warn!(
+            "虚拟摄像头: 帧服务器仍列出旧 MF 系统相机, 但本进程未提权, 无法注销; 请以管理员重新运行后再卸载"
+        );
+        return;
+    }
+    log::warn!("虚拟摄像头: 帧服务器仍列出旧 MF 系统相机, 开始清理");
     let Ok(camera) = _open_legacy_mf_camera() else {
         _cleanup_virtual_camera_entries();
         return;
