@@ -1,0 +1,3 @@
+F:\mai2control\mai2control-v4\control_software\vcam_source_mf\x64\Release\obj\mai2vcam_source.vcxproj.MdMergeInputs.cache
+F:\mai2control\mai2control-v4\control_software\vcam_source_mf\x64\Release\obj\mai2vcam_source.vcxproj.cppwinrt_plat.cache
+F:\mai2control\mai2control-v4\control_software\vcam_source_mf\x64\Release\obj\mai2vcam_source.vcxproj.cppwinrt_comp.cache
