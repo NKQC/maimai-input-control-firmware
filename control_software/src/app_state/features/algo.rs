@@ -82,7 +82,12 @@ impl AppController {
         // 记录本次上传的期望真值, 供 ACK 后的 ALGO_GET_INFO 回读对账(ACK 本身不是终态)。
         self.algo_upload_expect =
             Some((data.len() as u16, crate::proto::algo::crc16_ccitt(data)));
-        self.algo_upload_verify_left = 4;
+        // ★核对窗口必须覆盖满容量上传★ 每次重试间隔 50 tick(≈0.8s), 原来只给 4 次 ⇒ 总窗口
+        // 只有 3.2 秒。而槽扩到 4096B 后一次满容量下发要分 1364 页、每页 2 笔 SPI 事务, 设备侧
+        // 自己的上限都给到 30s —— 3.2 秒到期就宣判"终态不匹配", 实测把**正在正常进行**的大算法
+        // 上传全部误判成失败(小算法侥幸能在窗口内完成, 于是表现为"小的行、大的不行", 极易误导)。
+        // 40 次 × 0.8s ≈ 32s, 与设备侧 ALGO_UPLOAD_TIMEOUT_MS(30s) 对齐并留一点余量。
+        self.algo_upload_verify_left = 40;
         self.algo_upload_status =
             format!("上传已发送: {} 字节，等待设备 ACK/NAK 确认…", data.len());
         self.algo_upload_version = self.algo_upload_version.wrapping_add(1);
@@ -1617,7 +1622,8 @@ impl AppController {
             format!(
                 "上传已确认(ACK) 但终态不匹配: 期望 len={}B crc16=0x{:04X}; \
                  RP 存储 len={}B crc16=0x{:04X}; PSoC 槽内 len={}B crc16=0x{:04X}; \
-                 valid={} uploading={} download_pending={} psoc_cache_unavailable={}",
+                 valid={} uploading={} download_pending={} psoc_cache_unavailable={}; \
+                 中止现场: {}(第 {} 页, 累计 {} 次)",
                 expect_len,
                 expect_crc,
                 info.len,
@@ -1627,7 +1633,14 @@ impl AppController {
                 info.psoc_valid,
                 info.uploading,
                 info.download_pending,
-                info.psoc_cache_unavailable
+                info.psoc_cache_unavailable,
+                crate::proto::algo::algo_abort_reason_text(info.abort_reason),
+                if info.abort_page == 0xFFFF {
+                    "BEGIN".to_string()
+                } else {
+                    info.abort_page.to_string()
+                },
+                info.abort_count
             )
         } else {
             format!(

@@ -27,8 +27,6 @@ constexpr uint8_t PIN_PSOC_SPI_MOSI = 28;  // RP2040 数据输出
 constexpr uint8_t PIN_PSOC_SPI_MISO = 27;  // RP2040 数据输入
 constexpr uint8_t PIN_PSOC_SPI_CS   = 29;
 constexpr uint32_t PSOC_SPI_SCK_HZ  = 2000000;  // TXB 电平位移器裕量下的稳定 SCK
-// Phase C 全通道 raw 快照慢路：分块流水线读取，每次 update 只读少量页，与 1kHz 触控快路交织，
-// 保证触控不被 ~10ms 全快照读阻塞。每页间延时给 PSoC ISR 装载下一页的确定性窗口。
 // 看门狗自持恢复(宽松策略先保可迭代)：进入运行态后置 watchdog scratch[7]=此值。
 // 启动时若读到它=上次运行中被复位(任何看门狗超时:死锁/跑飞/flash异步冲突)→一律进 BOOTSEL 自动重烧。
 // 读后立即清零，恢复重烧后正常启动，打破循环。首次上电 scratch=0→正常；主动重启前清 0→回 app。
@@ -36,15 +34,19 @@ constexpr uint32_t WD_RUNNING_MAGIC = 0xB007C0DEu;
 // 运行时指令 DEBUG_CRASH_BOOTSEL 武装标志(存 watchdog scratch[6], 跨复位存活、掉电清零):
 // =此值 → 启用"运行中崩溃自动进 BOOTSEL"(自持 debug 便于 dev.ps1 自动重烧); 0 → 崩溃仅正常重启(默认)。
 constexpr uint32_t DEBUG_BOOTSEL_MAGIC = 0xDEB6B007u;
-constexpr uint32_t PSOC_SNAPSHOT_PAGE_DELAY_US = 60;   // 每页请求-应答间隔（< 旧 150us，仍留 ISR 余量）
-constexpr uint8_t  PSOC_SNAPSHOT_PAGES_PER_PUMP = 4;   // 每次 update 读取的页数（4×~80us≈320us < 触控预算，与触控快路交织）
+// LINK v2: 每次 pump 最多发多少帧。★不再有"每页间延时"★——帧与帧之间不允许有任何等待,
+// 请求/应答靠 tag 配对而不靠时序(见 psoc_link_abi.h)。8 帧 ≈ 0.6ms, 一轮 core1 周期内可推进
+// 一批快照通道或算法页, 又不会把从机的 SPI 中断占满(它需要空窗跑 CapSense 中间件)。
+constexpr uint8_t  PSOC_SNAPSHOT_PAGES_PER_PUMP = 8;
 
 // PSoC → RP2040 通知线（权威来源 hardware.txt：P1.4→GPIO23，P1.5→GPIO22，经电平移位器中继）
 // INT1 = "已发布新一代快照"：PSoC 每发布一份就翻转一次电平（不是脉冲，见 psoc.cpp 的
 // _int1_wait_generation 说明）。core1 据此从"固定间隔空转轮询"改为"等通知再取"，
 // 把原本白占的 SPI 事务还给 PSoC 的 CapSense 中间件。
-// INT2(GPIO22 ↔ P1.5) 两端都还没有约定事件语义，故此处不声明——不留没人驱动的常量。
+// INT2 = 从机 RX 环空余电平：高 = 空余至少 LNK_RX_SPACE_MIN 帧，可发一整批；低 = 一个字节都不许发。
+// 它必须走带外电平线：SPI 主机是唯一时钟源，帧内回报余量会在窗口满时因停止时钟而永远无法取回，形成死锁。
 constexpr uint8_t PIN_SENSOR_INT1 = 23;
+constexpr uint8_t PIN_SENSOR_INT2 = 22;
 
 // RGB 状态灯（普通 GPIO，非 WS2812）
 // 实测映射（顺序蓝红绿）：GPIO20=蓝 / GPIO19=红 / GPIO18=绿（hardware.txt 标注有误，以实测为准）

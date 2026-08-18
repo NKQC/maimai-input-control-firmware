@@ -165,6 +165,12 @@ typedef void (*algo_fn_t)(algo_io_t *io);
 #define ALGO_SLOT_SIZE (4096u)
 /* 全通道共享的算法暂存堆(字节)。见 algo_io_t::heap。 */
 #define ALGO_HEAP_SIZE (256u)
+/* ALGO_PAGE 每帧携带的算法字节数。7 字节帧 = magic + cmd + 16 位页号 + 本常量。
+ * ★为什么页号占 2 字节★ 4KB 槽的页数远超 255; 8 位页号会回绕并静默把数据写歪。
+ * ★为什么必须绝对寻址(page*ALGO_PAGE_BYTES)★ RP2040 的 _cmd_txn 在回显不匹配时会重发同一条
+ * 命令, 它整套原语都以"命令幂等"为前提。绝对寻址下重复写同一页结果不变, 天然幂等;
+ * 换成"顺序游标"就会因一次重发而错位, 且页数越多越容易撞上(实测 1056B 必败, 616B 能过)。 */
+#define ALGO_PAGE_BYTES (3u)
 
 #if defined(__cplusplus)
 }

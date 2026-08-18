@@ -4,7 +4,7 @@
 #include <stddef.h>
 #include "psoc_types.h"
 #include "psoc_swd.h"
-#include "psoc_spi.h"
+#include "psoc_link.h"
 
 /**
  * Psoc - PSoC 协议门面（单例）
@@ -18,11 +18,12 @@ class Psoc {
 public:
     // link_alive() 的默认判定窗口(ms): 足以跨过快照分页与重操作期间的连续失败, 远小于掉线判据。
     static constexpr uint32_t LINK_ALIVE_WINDOW_MS = 750u;
-    // ★触摸保留窗口(core1 周期数, 1 周期 = 1ms)★: 连续这么多周期取不到合法触控帧才把掩码优雅
-    // 释放为全 0。取 60ms —— 长于遥测分页/命令流水造成的成批错帧(实测数个到十几个周期), 短于
-    // LINK_FAIL_RESET_CYCLES(200ms)的掉线判据, 也短于人手最短一次点击, 故既不制造假抬起,
+    // ★触摸保留窗口(微秒, 按时间判)★: 掩码陈旧超过这么久才优雅释放为全 0。
+    // 60ms —— 长于快照/算法密集流对状态帧的正常挤占, 也短于人手最短一次点击, 故既不制造假抬起,
     // 也不会在真故障时把按下状态永久保持住。
-    static constexpr uint32_t TOUCH_RELEASE_FAIL_CYCLES = 60u;
+    // ★为什么不是"连续 N 个周期"★ LINK v2 的链路是事件驱动的: 空闲周期一帧都不发、周期本身也快
+    // 得多, 周期数与时间不再成正比, 按周期计会把正常空闲误判成假抬起。
+    static constexpr uint32_t TOUCH_HOLD_US = 60000u;
 
     static Psoc* getInstance();
 
@@ -32,9 +33,9 @@ public:
     // ---------- SPI 链路 ----------
     void update();                    // 兼容: 执行一次 SPI 服务(仅 setup 阶段 core1 未启动时直调)
     void core1_run();                 // ★core1 入口★: 固定 1ms 周期独占 PSoC SPI 传感器循环, 永不返回
-    // core1 发布(bool 原子): 最近一拍 read_touch 的**瞬时**结果。实时消费者(触控/键盘/灯效)用它。
+    // core1 发布(bool 原子): 最近一拍是否拿到过新鲜的合法状态帧(**瞬时**)。实时消费者用它。
     bool link_ok() const { return _pub_link_ok; }
-    // 去抖判据: 最近一次 read_touch 成功在窗口内即为真。供上传/下发这类非实时动作做门禁。
+    // 去抖判据: 最近一次成功在窗口内即为真。供上传/下发这类非实时动作做门禁。
     bool link_alive(uint32_t within_ms = LINK_ALIVE_WINDOW_MS) const;
 
     // Phase C：遥测慢路开关。激活后 update() 分块流水读全通道 raw/baseline/diff 填充 snapshot()。
@@ -44,8 +45,6 @@ public:
     // core0 写 / core1 读的单字节, 天然原子; volatile 保证 core1 每拍重新读取而非缓存在寄存器里。
     void set_focus_channel(uint8_t ch) { _focus_ch = ch; }
     uint8_t focus_channel() const { return _focus_ch; }
-    // PSoC 实际扫描切换。仅收到 PSoC 对目标/状态的明确回显才成功；0xFF 关闭单通道模式。
-    bool set_focus_scan(uint8_t ch);
 
     // ---------- 实时触控快路（core1 发布, core0 经 seqlock 读）----------
     // ★touch_mask() 自身就是触摸真相★: 合法新帧才更新; 短暂错帧保留最后一份合法值;
@@ -61,7 +60,7 @@ public:
     // 而不是在处理时刻之后再叠加一段设定延迟(那样链路耗时会全额附加到设定值上)。
     uint32_t touch_sample_us() const;
     // 低成本诊断计数(core1 单写者, 只增不减; 不打日志, 由上位机/压测按差值判断链路质量):
-    //   touch_bad_frames() = read_touch 未取到合法帧的周期数(含重试用尽);
+    //   touch_bad_frames() = 未取到新鲜合法状态帧的周期数;
     //   touch_releases()   = 因持续失败而优雅释放掩码的次数(每次故障只记一次)。
     uint32_t touch_bad_frames() const { return _pub_touch_bad; }
     uint32_t touch_releases() const { return _pub_touch_releases; }
@@ -87,7 +86,6 @@ public:
     bool start_host_param_set(uint8_t ch, uint8_t param_id, uint32_t value);
     bool get_param(uint8_t ch, uint8_t param_id, uint32_t* out);
     bool get_raw(uint8_t ch, uint16_t* out);
-    bool measure_cp();                          // 触发逐电极寄生电容测量；返回 true 表示 BIST 与固件 CSD 恢复已完成
     // ---------- JIT 算法引擎：下发/查询(core0→信箱→core1 独占 SPI) ----------
     // data 必须持续有效直到下发完成(调用方持久缓冲, 见 PsocAlgo::_blob)。
     // ★异步入队(修 USB 掉线 + 遥测永久冻结)★: core1 单次下发 = 256 页 SPI 事务 + PSoC commit 轮询
@@ -104,7 +102,7 @@ public:
     /// 前者把普通读写命令也算忙(过严, 正常轮询就会被拒), 后者是 30s 宽限窗(过宽, 会把设备锁死半分钟)。
     /// 判据 = 两个单写者计数器之差 —— core0 只写 _heavy_enq, core1 只写 _heavy_done, 故无跨核 RMW 竞态
     /// (与 _cmd_head/_cmd_tail 同一手法); 用单个 bool 会在"内部 APPLY 与主机指令先后入队"时被提前清掉。
-    bool heavy_busy() const { return _heavy_enq != _heavy_done || _spi.operation_busy() ||
+    bool heavy_busy() const { return _heavy_enq != _heavy_done || _link.operation_busy() ||
         _algo_upload_async.active != 0u; }
     /// 因"忙"被拒的长周期指令累计次数。压测据此**确证**堆叠真实发生过, 而不是靠推断。
     uint32_t heavy_reject_count() const { return _heavy_rejects; }
@@ -131,13 +129,24 @@ public:
     bool set_algo_rom(uint8_t ch, uint16_t rom);              // 设每通道 16 位只读 ROM
     // PSoC 编译期自报容量的惰性缓存；未读到时返回 false，调用方须显示“—”而非伪造为 0。
     bool get_algo_caps_cached(uint16_t* out_slot, uint16_t* out_heap) const;
+    // 最近一次算法下发中止的现场(哪一页 / 什么原因 / 累计次数)。见 PsocLink::AlgoAbort。
+    // ★为什么要透到主机★ 上传失败在主机侧只表现为"PSoC 槽内 len=0", 而成因可能是 BEGIN 没被
+    // 受理、状态泄漏、某页回显不符、END 失败或内容 CRC 不符 —— 五种修法完全不同。
+    void algo_abort_info(uint16_t* page, uint8_t* reason, uint16_t* count) const {
+        _link.algo_abort_info(page, reason, count);
+    }
+    // 语义随 LINK v2 换成链路级计数(宽度与存在性对上位机保持不变):
+    // resync = rx 非法帧数(SOF/CRC 不合法), restart = 事务重发次数。
+    uint16_t algo_resync_count() const { return _link.algo_resync_count(); }
+    uint16_t algo_restart_count() const { return _link.algo_restart_count(); }
+
     bool start_host_algo_set_rom(uint8_t ch, uint16_t rom);
     bool start_host_calibrate(uint8_t ch);
     bool start_host_baseline_reset(uint8_t ch);
     bool start_host_measure_cp();
     bool get_algo_rom(uint8_t ch, uint16_t* out_rom);         // 读每通道 16 位 ROM
-    // 算法运行时追踪(report[]/out_active)与可调变量(cfg[8], 见 psoc_algo_abi.h)
-    bool algo_get_trace(uint8_t ch, uint8_t idx, uint8_t* out_active, uint16_t* out_report);
+    // 算法运行时可调变量(cfg[8], 见 psoc_algo_abi.h)。report[]/out_active 不再有公有读接口:
+    // 它们随快照同批经 seqlock 发布(见 _spi_service 的 focus 分支), 阻塞读类那条路早已抢不到窗口。
     bool algo_set_cfg(uint8_t idx, uint8_t val);
     bool start_host_algo_set_cfg(uint8_t idx, uint8_t val);
     bool algo_get_cfg(uint8_t idx, uint8_t* out_val);
@@ -161,14 +170,9 @@ public:
     uint32_t samples_per_sec() const { return _samples_per_sec; }
     uint32_t scan_period_us() const { return _scan_period_us; }
     bool apply_params();
-    // 真正的 IDAC 重校准 + 基线复位。ch: 0..35=仅该通道(PSoC 只校准该 widget 并只初始化该 widget
-    // 基线), 0xFF=全 36 通道。★通道走 _submit 既有的 ch 字段★, 不新增命令码/不扩帧。
-    bool calibrate(uint8_t ch = 0xFFu);
-    // 基线复位。ch: 0..35=仅该通道, 0xFF=全通道。
-    bool baseline_reset(uint8_t ch = 0xFFu);
     // ---------- 开机校准流水线专用: 非阻塞入队 ----------
-    // 上面那两个是 Host 延迟 ACK 用的**阻塞**版(CALIBRATE 预算 70s, 全通道实测 12s+), core0 的
-    // 启动流水线绝不能阻塞在那里 —— 那会把 USB 服务与看门狗喂狗压在一条同步等待后面。
+    // Host 延迟 ACK 走 start_host_calibrate / start_host_baseline_reset(单槽 + 完成回执);
+    // core0 的启动流水线绝不能阻塞等真实完成 —— 那会把 USB 服务与看门狗喂狗压在同步等待后面。
     // 这两个用 out=nullptr 走 _submit 的写类分支: 入队即返回, 且因 CALIBRATE/BASELINE_RESET 都在
     // _op_is_heavy 名单内, 调用方直接用 heavy_busy() 由真到假判定"本条已真正执行完", 不需要额外
     // 完成标志、也不占用 _host_write 的单槽(那是主机延迟 ACK 的所有权窗口)。
@@ -183,12 +187,7 @@ public:
     bool runtime_param_apply_in_progress() const {
         return _runtime_apply.pending != 0u || _runtime_apply.active != 0u;
     }
-    // 频率自适应下探(阻塞至完成, 最多~10s): ch 0..35=单通道 / 0xFF=全通道;
-    // pref 灵敏度档位 1..7(越高越灵敏, 落档时往低频多让分频);
-    // out_result 0进行中/1成功/2失败, out_div 最终写入的分频;
-    // host_seq = 发起本轮的上位机请求 seq(折成 6 bit 标签下到 PSoC 并回显, 用于识别陈旧结果)。
-    bool auto_tune(uint8_t ch, uint8_t pref, uint8_t host_seq, uint8_t* out_result, uint16_t* out_div);
-    // ★异步启动(推荐)★: 入队即返回, core0 不阻塞; 阶段进度经 autotune_status() 读, 由服务层推送上位机。
+    // ★异步启动★: 入队即返回, core0 不阻塞; 阶段进度经 autotune_status() 读, 由服务层推送上位机。
     // core1 仍在 _exec_cmd 内一次跑完整个自适应(不拆成跨周期状态机), 否则 _spi_service 的 scan_count
     // 卡死兜底会在 PSoC 长校准期间误判并对其硬复位。
     // host_seq = 发起本轮的上位机请求 seq(见 auto_tune 说明), 服务层把它一路带到进度推送里。
@@ -274,7 +273,7 @@ private:
     Psoc& operator=(const Psoc&) = delete;
 
     SwdProgrammer _swd;
-    PsocSpi _spi;
+    PsocLink _link;
 
     bool _spi_ready;
     bool _swd_ready;
@@ -296,9 +295,9 @@ private:
 
     // ---------- 双核: core1 独占 SPI, seqlock 发布共享态 + 命令信箱投递低频指令 ----------
     // RP2040 无 cache, 跨核共享用 volatile + __dmb() 内存屏障即可保证可见性与顺序。
-    enum class SpiOp : uint8_t { NONE, SET_PARAM, GET_PARAM, GET_RAW, SET_MODE, APPLY, RUNTIME_PARAM_APPLY, FOCUS_SCAN, CALIBRATE, BASELINE_RESET, MEASURE_CP, GET_CP,
+    enum class SpiOp : uint8_t { NONE, SET_PARAM, GET_PARAM, GET_RAW, SET_MODE, APPLY, RUNTIME_PARAM_APPLY, CALIBRATE, BASELINE_RESET, MEASURE_CP, GET_CP,
                                  UPLOAD_ALGO, GET_ALGO_INFO, SET_ALGO_ROM, GET_ALGO_ROM,
-                                 ALGO_GET_TRACE, ALGO_SET_CFG, ALGO_GET_CFG,
+                                 ALGO_SET_CFG, ALGO_GET_CFG,
                                  // ABI v2: 逐通道 cfg_ch + 共享堆 + 槽内容 CRC(内容对账)
                                  ALGO_SET_CFG_CH, ALGO_GET_CFG_CH, ALGO_GET_HEAP, ALGO_GET_CRC, ALGO_GET_CAPS,
                                  SET_GLOBAL, GET_GLOBAL, GLOBAL_COMMIT, AUTO_TUNE };
@@ -309,12 +308,12 @@ private:
     volatile uint64_t _pub_touch_mask = 0;
     volatile bool     _pub_link_ok = false;
     volatile bool     _pub_touch_hold = false;   // 掩码可信(见 touch_hold_ok)
-    volatile uint32_t _pub_link_ok_ms = 0;   // 最近一次 read_touch 成功时刻(ms), 0=从未成功
+    volatile uint32_t _pub_link_ok_ms = 0;   // 最近一次拿到新鲜状态帧的时刻(ms), 0=从未成功
     volatile uint32_t _pub_touch_read_us = 0;
     volatile uint32_t _pub_touch_sample_us = 0;  // 掩码到手时刻(延迟补偿的时间基准)
     volatile uint32_t _pub_touch_bad = 0;        // 累计无合法触控帧的周期数(诊断)
     volatile uint32_t _pub_touch_releases = 0;   // 累计优雅释放次数(诊断)
-    uint32_t _touch_fail_run = 0;                // 连续无合法帧周期数(core1 独占, 与掉线判据分开计)
+
 
     // 新代数通知线 INT1: core1 唯一写者。_pub_* 供 core0 只读搬进调试上报, 其余为 core1 私有。
     volatile uint32_t _pub_int1_edges = 0;       // 累计电平翻转数
@@ -326,7 +325,7 @@ private:
     // 失效兜底检测态(core1 唯一写者, core0 只读 _pub_reset_reason / 清零)
     volatile uint8_t  _pub_reset_reason = 0;   // 0/1/2, core1 置位, core0 处理后清零
     bool     _link_established = false;         // 链路曾就绪(避免启动期误判)
-    uint32_t _link_fail_run = 0;                // 连续 read_touch 失败周期数
+    uint32_t _link_fail_since_ms = 0;            // 首次观测到链路失活的时刻(0=当前正常); 按时间升级
     // 宽限截止时刻: 期内一律【不把 PSoC 判成死了】(不累计链路失败/不累计卡死/不清 provisioned)。
     // 两个来源: ① XRES 复位后的启动宽限; ② 派发重操作(APPLY/CALIBRATE/GLOBAL_COMMIT/AUTO_TUNE)后的
     // 执行宽限 —— 这些操作由 PSoC 主循环同步执行(逐通道校准可达 12s+), 期间 CapSense 内部临界区会
@@ -339,11 +338,10 @@ private:
     // 算法信息缓存：仅 core1 刷新/失效，core0 通过 seqlock 只读；epoch 由 core0 在复位时递增。
     static constexpr uint32_t ALGO_INFO_CACHE_MAX_AGE_MS = 500u;
     // ★算法运行值缓存(core1 独占写)★ 与快照同批经 seqlock 发布, 见 _spi_service 的 focus 分支。
-    // 每份 Focus 快照只读一个 report 槽并轮转, 避免为 4 个槽各做一次 SPI 事务把 core1 占满。
+    // LNK_CMD_ALGO_TRACE 一帧回全部 4 个槽, 故不再需要"每份快照只读一个槽并轮转"那套。
     uint16_t _algo_trace_report[psoc::ALGO_REPORT_SLOTS] = {};
     uint8_t _algo_trace_active = 0;
     uint8_t _algo_trace_channel = 0xFFu;
-    uint8_t _algo_trace_slot = 0;
 
     volatile uint32_t _algo_info_seq = 0;
     volatile uint8_t _algo_info_available = 0;
@@ -373,7 +371,6 @@ private:
     psoc::AutoTuneProgress _at_work;                      // core1 工作副本
     mutable psoc::AutoTuneProgress _at_ro;                // core0 读出的一致副本
     void _publish_autotune();                             // core1: _at_work → _at_pub(seqlock)
-    static void _on_autotune_progress(void* ctx, const psoc::AutoTuneProgress& p);   // SPI 层回调
     volatile uint32_t _snap_seq = 0;        // 快照发布序列(奇=写入中)
     psoc::SensorSnapshot _snap_work;             // core1 快照流水工作缓冲
     mutable psoc::SensorSnapshot _snapshot_ro;   // core0 seqlock 读出的一致副本
@@ -508,6 +505,23 @@ private:
     bool _submit(SpiOp op, uint8_t ch, uint8_t pid, uint32_t val, uint32_t* out, const uint8_t* data = nullptr,
                  uint32_t timeout_us = 0u, AsyncOwner async_owner = AsyncOwner::NONE, uint8_t async_token = 0u);
     bool _exec_cmd(SpiOp op, uint8_t ch, uint8_t pid, uint32_t val, uint32_t* out, const uint8_t* data = nullptr); // 实际执行(core1 或 setup 直调)
+
+    // ---------- core1 内的链路便利式(只用 PsocLink 的公有接口) ----------
+    // 一帧同时取回 scan_count 与设备忙位(busy 现在直接读响应里的 st.OP_BUSY, 不再单独发命令)。
+    bool _link_stats(uint32_t* out_scan_count, uint8_t* out_busy);
+    bool _link_param_get(uint8_t ch, uint8_t param_id, uint32_t* out_value);
+    // 轮询 st.OP_BUSY 至从机主循环真正完成重操作(1→0)或超时。host 的延迟 ACK(校准/基线复位/
+    // MEASURE_CP/GLOBAL_COMMIT)与 AUTO_TUNE 共用它; with_progress=true 时每 PROGRESS_POLL_MS
+    // 额外读一次 AUTO_TUNE_GET 的阶段进度并经 seqlock 发布(busy 判定与超时窗完全不受影响)。
+    bool _wait_op_done(uint32_t timeout_ms, bool with_progress = false);
+    static constexpr uint32_t PROGRESS_POLL_MS = 100;   // 进度读取降频周期(busy 轮询仍为 3ms)
+    // 本轮 pump 认定"链路活着"的状态帧新鲜度窗口。pump 空闲时每次调用必发一帧轮询, 故健康链路
+    // 的状态帧年龄恒在一个 core1 周期内; 给 3ms 只是为了容忍一次被推迟的从机 DMA 中断。
+    // 链路存活窗口: 任意合法响应都算活着(每份响应都带 st)。必须 > PsocLink::LINK_WATCHDOG_US,
+    // 否则"看门狗还没到期、因此本来就不该发帧"的健康空闲链路会被判掉线。
+    static constexpr uint32_t LINK_STATUS_FRESH_US = 300000;
+    // 判定"链路真的死了"再升级到 XRES 的额外等待。总判死时间 ≈ 存活窗 + 本值。
+    static constexpr uint32_t LINK_FAIL_RESET_MS = 500;
 
     static Psoc* _instance;
 };

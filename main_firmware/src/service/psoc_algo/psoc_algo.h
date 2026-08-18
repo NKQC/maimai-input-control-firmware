@@ -1,19 +1,21 @@
 #pragma once
 
 #include <cstdint>
+// 容量常量取共享契约, 不在这里另写数字(见下)。
+#include "../../protocol/psoc/psoc_link_abi.h"
 
 class Psoc;
 
 // JIT 触控算法 blob store：RP2040 持有算法二进制(≤4096B, ABI v2)，在 PSoC 启动/复位后
 // 下发到其 4KB 可执行槽。host 上传的自定义算法持久化到 /algo.bin；无存储或校验失败时回退
 // 内嵌出厂默认(v3.1 HDR, 见 psoc_algo_default.h)。算法始终"上位机下发→RP 存储→PSoC 启动时下发"。
-// ★这个常量必须与 PSoC 的 ALGO_SLOT_SIZE 逐字节一致★(psoc_firmware 的 psoc_algo_abi.h)。
-// 改一处就要同时改三处: 此宏 / PSoC 的 ALGO_SLOT_SIZE / 上位机的 proto::algo::ALGO_MAX_LEN。
-// 任何一处漏改的表现都是"上传成功但算法跑飞/仍跑旧代码", 且没有任何一层会报错。
-#define PSOC_ALGO_MAX_LEN 4096u
-// PSoC 的算法共享堆容量(ABI v2 的 algo_io_t::heap_size)。RP2040 自己不用它, 只做上报与校对:
-// 上位机据此判断算法申请的堆是否已经贴到上限(heap_used 峰值 vs 这个值)。
-#define PSOC_ALGO_HEAP_SIZE 256u
+// ★直接取共享契约的容量★ 原先这里写死 4096u, 于是同一个数字散在 PSoC / RP / 上位机三处,
+// 漏改任何一处的表现都是"上传成功但算法跑飞/仍跑旧代码", 没有任何一层会报错。现在 RP 侧不再
+// 持有自己的副本; 上位机也已改为从设备读 LNK_CMD_ALGO_CAPS, 三层漂移这个类别就此消失。
+#define PSOC_ALGO_MAX_LEN LNK_ALGO_SLOT_SIZE
+// PSoC 的算法共享堆容量。RP2040 自己不用它, 只做上报与校对: 上位机据此判断算法申请的堆是否
+// 已经贴到上限(heap_used 峰值 vs 这个值)。
+#define PSOC_ALGO_HEAP_SIZE LNK_ALGO_HEAP_SIZE
 #define PSOC_ALGO_CHANNELS 36u
 // 算法 C 源(已滤注释)存储上限。PSoC 只收 ASM(≤PSOC_ALGO_MAX_LEN); RP2040 额外持久化这份源作为"映射表",
 // 供回读还原可编辑 C(变量名来自源本身)。

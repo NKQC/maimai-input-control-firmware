@@ -8,6 +8,8 @@
 #include "../tx_scheduler/tx_scheduler.h"
 #include "../latency_stats.h"
 #include <pico/stdlib.h>
+#include <hardware/watchdog.h>
+#include <cstdio>
 #include <cstring>
 
 // 遥测租约(ms): 上位机需在此时限内经任意命令帧续期(UsbComm renew_all), 否则任务自动停。
@@ -174,6 +176,24 @@ inline bool param_read(uint8_t ch, uint8_t param_id, uint32_t* value) {
         return true;
     }
     return Psoc::getInstance()->get_param(ch, param_id, value);
+}
+
+constexpr uint8_t PARAM_READ_TRIES = 3u;
+
+// param_read 的有界重试包装。失败几乎总是 core1 此刻正忙这种瞬时原因，而不是参数不存在；
+// 静默跳过会把一次链路抖动伪装成参数消失，冷读又没有旧值可兜。次数必须有界：12 项无限重试
+// 会卡住 USB 命令处理器。两次尝试之间沿用 Psoc::_submit() 的 USB 泵送、喂狗和 tight loop 让出，
+// 再以仓内已有的 sleep_us(200) 给 core1 留出最小 SPI 空窗，不能忙等。
+inline bool param_read_retry(uint8_t ch, uint8_t param_id, uint32_t* value) {
+    for (uint8_t attempt = 0; attempt < PARAM_READ_TRIES; attempt++) {
+        if (param_read(ch, param_id, value)) return true;
+        if (attempt + 1u == PARAM_READ_TRIES) break;
+        watchdog_update();
+        HAL_USB_Device::getInstance()->task();
+        tight_loop_contents();
+        sleep_us(200);
+    }
+    return false;
 }
 }  // namespace
 
@@ -1758,8 +1778,10 @@ void SensorLink::_handle_param_get(const HostFrame& frame, uint8_t* response, ui
 
 void SensorLink::_handle_param_get_all(const HostFrame& frame, uint8_t* response, uint16_t* response_length) {
     // payload = channel(u8) → 响应 channel + count + [param_id + value(u32 LE)]×count
-    // payload = 0xFF + param_id(u8) → "全通道单参数"变体: 响应 0xFF + param_id + count + [ch + value(u32 LE)]×count
-    //   (36 通道单参数一次取回, 替代 36 条单发 PARAM_GET; 36×5+3=183B 仍在单帧内)
+    //           + missing_count + missing_ids；尾随项只表示此刻取不到，旧上位机按 count 截止仍兼容。
+    // payload = 0xFF + param_id(u8) → "全通道单参数"变体: 响应 0xFF + param_id + count
+    //           + [ch + value(u32 LE)]×count + missing_count + missing_chs。
+    //   36 通道单参数一次取回替代 36 条单发 PARAM_GET；最大 3+36×5+1+36=220B，远小于 4096B payload。
     if (frame.len < 1) {
         *response_length = HostCmdCodec::encode_nak(frame.seq, HostCmdError::INVALID_PARAM,
             "param_get_all payload too short", response, HOST_CMD_RESP_BUF_MAX);
@@ -1788,9 +1810,14 @@ void SensorLink::_handle_param_get_all(const HostFrame& frame, uint8_t* response
     const uint16_t count_position = position++;
 
     uint8_t count = 0;
+    uint8_t missing_ids[kParamCount] = {};
+    uint8_t missing_count = 0;
     for (uint8_t i = 0; i < kParamCount; i++) {
         uint32_t value = 0;
-        if (!param_read(ch, kParamIds[i], &value)) continue;
+        if (!param_read_retry(ch, kParamIds[i], &value)) {
+            missing_ids[missing_count++] = kParamIds[i];
+            continue;
+        }
         resp.payload[position++] = kParamIds[i];
         resp.payload[position++] = static_cast<uint8_t>(value);
         resp.payload[position++] = static_cast<uint8_t>(value >> 8);
@@ -1799,12 +1826,26 @@ void SensorLink::_handle_param_get_all(const HostFrame& frame, uint8_t* response
         count++;
     }
     resp.payload[count_position] = count;
+    // 尾随项如实说明“此刻取不到”，不是“设备没有”：上位机可保留旧值，不能显示为 — 或 0。
+    resp.payload[position++] = missing_count;
+    for (uint8_t i = 0; i < missing_count; i++) resp.payload[position++] = missing_ids[i];
+    if (missing_count != 0u) {
+        char log[96];
+        int log_length = std::snprintf(log, sizeof(log),
+            "PARAM_GET_ALL missing: ch=%u param_ids=", static_cast<unsigned>(ch));
+        for (uint8_t i = 0; i < missing_count && log_length > 0 &&
+                            static_cast<size_t>(log_length) < sizeof(log); i++) {
+            log_length += std::snprintf(log + log_length, sizeof(log) - static_cast<size_t>(log_length),
+                                        "%s0x%02X", i == 0u ? "" : ",", missing_ids[i]);
+        }
+        std::printf("%s\n", log);  // 每次响应最多一行，避免 12 项失败时刷屏。
+    }
     resp.len = position;
     *response_length = HostCmdCodec::encode_frame(resp, response, HOST_CMD_RESP_BUF_MAX);
 }
 
-// "全通道单参数"批量回读: 响应 0xFF + param_id + count + [ch + value(u32 LE)]×count。
-// 读不到的通道直接跳过(不占 pair), 上位机按 count 解析。
+// "全通道单参数"批量回读: 响应 0xFF + param_id + count + [ch + value(u32 LE)]×count
+// + missing_count + missing_chs。读不到是“此刻取不到”，不是设备没有；旧上位机仍只按 count 解析。
 void SensorLink::_emit_param_all_channels(const HostFrame& frame, uint8_t* response, uint16_t* response_length) {
     const uint8_t param_id = frame.payload[1];
     // HostFrame 为 4102B；core0 栈只有 8192B 且下界就是堆顶，响应帧必须借共享静态工作帧。
@@ -1819,9 +1860,14 @@ void SensorLink::_emit_param_all_channels(const HostFrame& frame, uint8_t* respo
     const uint16_t count_position = position++;
 
     uint8_t count = 0;
+    uint8_t missing_chs[SENSOR_LINK_CHANNELS] = {};
+    uint8_t missing_count = 0;
     for (uint8_t ch = 0; ch < SENSOR_LINK_CHANNELS; ch++) {
         uint32_t value = 0;
-        if (!param_read(ch, param_id, &value)) continue;
+        if (!param_read_retry(ch, param_id, &value)) {
+            missing_chs[missing_count++] = ch;
+            continue;
+        }
         resp.payload[position++] = ch;
         resp.payload[position++] = static_cast<uint8_t>(value);
         resp.payload[position++] = static_cast<uint8_t>(value >> 8);
@@ -1830,6 +1876,21 @@ void SensorLink::_emit_param_all_channels(const HostFrame& frame, uint8_t* respo
         count++;
     }
     resp.payload[count_position] = count;
+    // 尾随项如实说明“此刻取不到”，不是“设备没有”：上位机可保留旧值，不能显示为 — 或 0。
+    resp.payload[position++] = missing_count;
+    for (uint8_t i = 0; i < missing_count; i++) resp.payload[position++] = missing_chs[i];
+    if (missing_count != 0u) {
+        char log[192];
+        int log_length = std::snprintf(log, sizeof(log),
+            "PARAM_GET_ALL missing: param_id=0x%02X chs=", param_id);
+        for (uint8_t i = 0; i < missing_count && log_length > 0 &&
+                            static_cast<size_t>(log_length) < sizeof(log); i++) {
+            log_length += std::snprintf(log + log_length, sizeof(log) - static_cast<size_t>(log_length),
+                                        "%s%u", i == 0u ? "" : ",",
+                                        static_cast<unsigned>(missing_chs[i]));
+        }
+        std::printf("%s\n", log);  // 每次响应最多一行，避免 36 通道失败时刷屏。
+    }
     resp.len = position;
     *response_length = HostCmdCodec::encode_frame(resp, response, HOST_CMD_RESP_BUF_MAX);
 }
@@ -2142,6 +2203,10 @@ void SensorLink::_handle_algo_get_info(const HostFrame& frame, uint8_t* response
     //   [19..22] src_capacity  (u32 LE): C 源存储容量
     //   [23..24] src_chunk     (u16 LE): C 源分片粒度
     //   [25]     caps_flags: bit0=slot_capacity 来自 PSoC；bit1=PSoC 与 RP 槽容量不一致
+    //   [26..27] abort_page   (u16 LE): 最近一次下发中止在第几页(0xFFFF=BEGIN 阶段)
+    //   [28]     abort_reason (u8): 1=BEGIN状态泄漏 2=BEGIN未受理 3=页回显不符 4=END失败
+    //                               5=commit超时 6=内容CRC不符 7=链路失败 (见 PsocLink::AlgoAbort)
+    //   [29..30] abort_count  (u16 LE): 累计中止次数
     // ★上位机判"上传成功"只能用 psoc_len + psoc_crc16★:
     //   · store_* 只证明"RP 把字节存下了", 与 PSoC 槽里装的是什么毫无关系;
     //   · psoc_valid 也不够 —— 它分不出"新算法装上了"和"旧算法还在、长度恰好相同"(同一份源改
@@ -2226,6 +2291,27 @@ void SensorLink::_handle_algo_get_info(const HostFrame& frame, uint8_t* response
     uint8_t caps_flags = slot_capacity_from_psoc ? 0x01u : 0u;
     if (slot_capacity_from_psoc && slot_capacity != PSOC_ALGO_MAX_LEN) caps_flags |= 0x02u;
     resp.payload[p++] = caps_flags;
+    // ★上传中止现场★ 没有这几个字节, "上传没成功"在主机侧只是一句 len=0, 五种完全不同的成因
+    // (BEGIN 未受理 / 状态泄漏 / 页回显不符 / END 失败 / 内容 CRC 不符)无法区分, 只能靠反复推断。
+    uint16_t abort_page = 0u;
+    uint8_t abort_reason = 0u;
+    uint16_t abort_count = 0u;
+    Psoc::getInstance()->algo_abort_info(&abort_page, &abort_reason, &abort_count);
+    resp.payload[p++] = static_cast<uint8_t>(abort_page);
+    resp.payload[p++] = static_cast<uint8_t>(abort_page >> 8);
+    resp.payload[p++] = abort_reason;
+    resp.payload[p++] = static_cast<uint8_t>(abort_count);
+    resp.payload[p++] = static_cast<uint8_t>(abort_count >> 8);
+    // ★LINK v2 起这两格换成链路级计数(宽度/偏移不变, 上位机无需改动)★
+    // 前者 = 收到的非法帧数(SOF/CRC 不合法, 含从机 TX FIFO 被读空的全 0 帧);
+    // 后者 = 事务超时重发次数。两者都是"链路抖动已被就地吸收"的证据: 若它们长期为 0 而上传仍失败,
+    // 说明成因不在链路层, 不要再往这个方向修。
+    const uint16_t resync_count = Psoc::getInstance()->algo_resync_count();
+    resp.payload[p++] = static_cast<uint8_t>(resync_count);
+    resp.payload[p++] = static_cast<uint8_t>(resync_count >> 8);
+    const uint16_t restart_count = Psoc::getInstance()->algo_restart_count();
+    resp.payload[p++] = static_cast<uint8_t>(restart_count);
+    resp.payload[p++] = static_cast<uint8_t>(restart_count >> 8);
     resp.len = p;
     *response_length = HostCmdCodec::encode_frame(resp, response, HOST_CMD_RESP_BUF_MAX);
 }

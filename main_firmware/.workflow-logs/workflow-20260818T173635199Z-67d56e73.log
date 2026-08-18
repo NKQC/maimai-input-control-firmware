@@ -1,0 +1,78 @@
+﻿**********************
+Windows PowerShell 脚本开始
+开始时间: 20260819013635
+用户名: ITX-HUHUZHU\asdfg
+RunAs 用户: ITX-HUHUZHU\asdfg
+配置名称: 
+计算机: ITX-HUHUZHU (Microsoft Windows NT 10.0.26200.0)
+主机应用程序: C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe -File dev.ps1 build-all
+进程 ID: 15900
+PSVersion: 5.1.26100.9168
+PSEdition: Desktop
+PSCompatibleVersions: 1.0, 2.0, 3.0, 4.0, 5.0, 5.1.26100.9168
+BuildVersion: 10.0.26100.9168
+CLRVersion: 4.0.30319.42000
+WSManStackVersion: 3.0
+PSRemotingProtocolVersion: 2.3
+SerializationVersion: 1.1.0.1
+**********************
+Workflow round: 20260818T173635199Z-67d56e73
+Workflow log: F:\mai2control\mai2control-v4\main_firmware\.workflow-logs\workflow-20260818T173635199Z-67d56e73.log
+Workflow mode: Flash
+Safety: UF2 writes require one removable RPI-RP2 volume and INFO_UF2.TXT; no fixed drive letter is used.
+
+=== Build PSoC firmware ===
+cwd: F:\mai2control\mai2control-v4\psoc_firmware\CY8C4147AZI-SensorCore
+exe: C:\Users\asdfg\ModusToolbox\tools_3.6\modus-shell\bin\make.exe
+args: build -j8
+
+PSoC build stamp: 2608190136 (2026-08-19 01:36) -> 0x9B75D2B8
+
+=== Embed PSoC HEX (0x9B75D2B8) ===
+cwd: F:\mai2control\mai2control-v4\main_firmware
+exe: C:\Users\asdfg\.platformio\penv\Scripts\python.exe
+args: F:\mai2control\mai2control-v4\main_firmware\tools\psoc_hex_to_c.py F:\mai2control\mai2control-v4\psoc_firmware\CY8C4147AZI-SensorCore\build\last_config\mtb-example-psoc4-capsense-smartsense-buttons-slider.hex F:\mai2control\mai2control-v4\main_firmware\src\protocol\psoc\psoc_fw_image.h 0x9B75D2B8
+
+
+=== Build RP2040 firmware ===
+cwd: F:\mai2control\mai2control-v4\main_firmware
+exe: C:\Users\asdfg\.platformio\penv\Scripts\platformio.exe
+args: run -e pico
+
+RP2040 UF2 identity: SHA256=F77502E9CF4B71488340BA3143AF15F89669628F0AE2E700FDE1B340F3EBED2D size=572928 mtime_utc=2026-08-18T17:36:40.2507163Z
+
+=== Build Rust UI and selftest ===
+cwd: F:\mai2control\mai2control-v4\control_software
+exe: C:\Users\asdfg\.cargo\bin\cargo.exe
+args: build --locked --bins
+  | .text                |  0x00000000   |  40468      |
+  | .ARM.exidx           |  0x00009e14   |  8          |
+  | .copy.table          |  0x00009e1c   |  12         |
+  | .zero.table          |  0x00009e28   |  8          |
+  | .ramVectors          |  0x20000000   |  192        |
+  | .data                |  0x200000c0   |  2856       |
+  | .noinit              |  0x20000be8   |  32         |
+  | .bss                 |  0x20000c08   |  11808      |
+  | .heap                |  0x20003a28   |  472        |
+  | .stack               |  0x20003c00   |  1024       |
+   ----------------------------------------------------
+
+  Total Internal Flash (Available)          131072
+  Total Internal Flash (Utilized)           43360
+
+PS F:\mai2control\mai2control-v4\psoc_firmware\CY8C4147AZI-SensorCore> cd "f:\mai2control\mai2control-v4" ; powershell -File dev.ps1 build-all 2>&1 | Select-Object -Last 25
+[20260818T173635199Z-67d56e73] Requesting RP2040 BOOTSEL through mai2 config WinUSB...
+
+[20260818T173635199Z-67d56e73] Verified stable UF2 target: G:\ (label RPI-RP2, removable, INFO_UF2.TXT present)
+[20260818T173635199Z-67d56e73] UF2 copied; waiting for RPI-RP2 to disappear before accepting application topology...
+Running WinUSB HELLO/DEVICE_INFO snapshot smoke test...
+
+Running MI_01/MI_03 CDC protocol smoke tests...
+CDC mapping: serial=COM3 (MI_01), light=COM21 (MI_03)
+MAI2SERIAL CDC PASS: STAT started legal 9-byte touch stream 28-00-00-00-00-00-00-00-29
+MAI2LIGHT CDC PASS: LIGHT reply E0-00-00-06-01-F3-01-01-01-01-FE
+FLASH PASS: UF2 programmed, REV_0401 topology, PSoC snapshot, WinUSB, Mai2Serial and Mai2Light smoke tests passed.
+**********************
+Windows PowerShell 脚本结束
+结束时间: 20260819013900
+**********************

@@ -52,6 +52,246 @@ fn _cfg_u32(value: &CfgValue) -> Option<u32> {
     }
 }
 
+/// 上传一份 blob 并取得**两条独立证据**: 身份(PSoC 槽内 len/crc16)与执行(report[0] 出现 marker)。
+/// 返回 (身份对账耗时ms, 执行证据耗时ms)。marker=None 表示"不是 marker 算法", 此时只验身份并要求
+/// report[0] 不再等于任何 marker(用来证明确实换代了)。
+fn _algo_swap_once(
+    ctrl: &mut AppController,
+    label: &str,
+    blob: &[u8],
+    marker: Option<u16>,
+    heap_expect: usize,
+) -> Result<(u128, u128), String> {
+    use mai2control_ui::proto::algo::crc16_ccitt;
+    let want_len = blob.len() as u16;
+    let want_crc = crc16_ccitt(blob);
+    println!(
+        // ★这里不再标"多少页"★ 原先写死 3B/页(LINK v1 的帧宽), 满容量 4092B 被标成 1364 页, 而
+        // v3 是 10B/页(410 页) —— 压测日志是验收证据, 错标会让"某页失败"的排查一开始就对不上号。
+        // 而正确做法不是把页宽同步过来: 分页是 RP↔PSoC 链路内部实现(主机一帧整传整个 blob),
+        // 上位机没有也不该有这个常量。真正的页号现场由设备在 ALGO_GET_INFO 的 abort_page 回报。
+        "[SWAP] --- {} : len={}B crc16=0x{:04X}",
+        label, want_len, want_crc
+    );
+    let t0 = std::time::Instant::now();
+    ctrl.algo_upload(blob)
+        .map_err(|e| format!("上传发起失败: {}", e))?;
+    // 终态由 _settle_algo_upload 给出; 它只认 PSoC 自报的槽内 len/crc16(见其注释)。
+    _review_pump(ctrl, 40000, |c| {
+        let s = c.algo_upload_status();
+        s.contains("已装上并正在运行")
+            || s.contains("终态不匹配")
+            || s.contains("被设备隔离")
+            || s.contains("上传被设备拒绝")
+            || s.contains("上传超时")
+    })
+    .map_err(|e| format!("等待上传终态: {}", e))?;
+    let ident_ms = t0.elapsed().as_millis();
+    let status = ctrl.algo_upload_status().to_string();
+    let info = ctrl.algo_info().ok_or("无 ALGO_INFO")?;
+    println!(
+        "[SWAP]     身份({}ms): PSoC 槽内 len={}B crc16=0x{:04X} valid={} | {}",
+        ident_ms, info.psoc_len, info.psoc_crc16, info.psoc_valid, status
+    );
+    if !status.contains("已装上并正在运行") {
+        // ★纯 ASCII 的一行★ 控制台在 GBK 下会把中文状态串打成乱码, 排查时反而看不见最关键的
+        // 中止现场。这一行保证无论终端编码如何都能读到"失败在哪一步"。
+        println!(
+            "[SWAP]     ABORT reason={} page={} count={} resync={} restart={} | psoc_len={} psoc_crc=0x{:04X} \
+             valid={} uploading={} dl_pending={} cache_na={}",
+            info.abort_reason,
+            info.abort_page,
+            info.abort_count,
+            info.resync_count,
+            info.restart_count,
+            info.psoc_len,
+            info.psoc_crc16,
+            info.psoc_valid,
+            info.uploading,
+            info.download_pending,
+            info.psoc_cache_unavailable
+        );
+        return Err(format!("身份对账未通过: {}", status));
+    }
+    if info.psoc_len != want_len || info.psoc_crc16 != want_crc {
+        return Err(format!(
+            "PSoC 槽内容与上传件不符: 期望 len={} crc=0x{:04X}, 实得 len={} crc=0x{:04X}",
+            want_len, want_crc, info.psoc_len, info.psoc_crc16
+        ));
+    }
+    // ---- 执行证据 ----
+    let t1 = std::time::Instant::now();
+    match marker {
+        Some(m) => {
+            let hit = _review_pump(ctrl, 8000, |c| {
+                c.algo_trace_report_last(0).map(|v| v as u32) == Some(m as u32)
+            });
+            let seen = ctrl.algo_trace_report_last(0).map(|v| v as u32);
+            if hit.is_err() {
+                return Err(format!(
+                    "身份已对上但 report[0] 未变成 marker 0x{:04X}(实测 {:?}) ⇒ 新算法没在跑",
+                    m, seen
+                ));
+            }
+            let exec_ms = t1.elapsed().as_millis();
+            let r2 = ctrl.algo_trace_report_last(2).map(|v| v as i32).unwrap_or(-1);
+            let r3 = ctrl.algo_trace_report_last(3).map(|v| v as i32).unwrap_or(-1);
+            let _ = ctrl.algo_get_info();
+            let _ = _review_pump(ctrl, 2500, |_| false);
+            let heap_used = ctrl.algo_info().map(|i| i.heap_used).unwrap_or(0);
+            println!(
+                "[SWAP]     执行({}ms): report[0]=0x{:04X} heap_size={} cfg_ch[0]={} | 设备回报 heap_used={}/{}",
+                exec_ms, m, r2, r3, heap_used, heap_expect
+            );
+            if r2 != heap_expect as i32 {
+                return Err(format!(
+                    "report[2] 应等于引擎填入的 heap_size({}), 实得 {} ⇒ ABI v2 堆字段未生效",
+                    heap_expect, r2
+                ));
+            }
+            if heap_used != 64 {
+                return Err(format!(
+                    "算法声明 heap_used=64, 设备回报 {} ⇒ 堆占用上报链路未生效(UI 的堆占用显示就靠它)",
+                    heap_used
+                ));
+            }
+            Ok((ident_ms, exec_ms))
+        }
+        None => {
+            let hit = _review_pump(ctrl, 8000, |c| {
+                !matches!(
+                    c.algo_trace_report_last(0).map(|v| v as u32),
+                    Some(0xA5A5) | Some(0x5A5A)
+                )
+            });
+            let seen = ctrl.algo_trace_report_last(0).map(|v| v as u32);
+            if hit.is_err() {
+                return Err(format!("report[0] 仍是上一份 marker({:?}) ⇒ 新算法没在跑", seen));
+            }
+            let exec_ms = t1.elapsed().as_millis();
+            println!(
+                "[SWAP]     执行({}ms): report[0]={:?} 已不再是 marker ⇒ 确已换代",
+                exec_ms, seen
+            );
+            Ok((ident_ms, exec_ms))
+        }
+    }
+}
+
+/// --algo-swap 的主体。返回进程退出码。
+fn _algo_swap_run(
+    ctrl: &mut AppController,
+    caps: mai2control_ui::app_state::AlgoCaps,
+    blob_a: &[u8],
+    blob_b: &[u8],
+    pad_to: &dyn Fn(&[u8], usize) -> Vec<u8>,
+    failures: &mut Vec<String>,
+    stats: &mut Vec<(String, u128, u128)>,
+) -> i32 {
+    // ★用局部 fn 而不是闭包★ 闭包会把 stats/failures 的可变借用一直握在手里, 循环里再读
+    // `failures.is_empty()` 就会撞 E0501。显式传引用后, 每次调用结束借用即释放。
+    fn step(
+        ctrl: &mut AppController,
+        label: &str,
+        blob: Vec<u8>,
+        marker: Option<u16>,
+        heap: usize,
+        stats: &mut Vec<(String, u128, u128)>,
+        failures: &mut Vec<String>,
+    ) {
+        if blob.is_empty() {
+            return; // 编译阶段已失败并记过账, 不再发一次空上传。
+        }
+        match _algo_swap_once(ctrl, label, &blob, marker, heap) {
+            Ok((a, b)) => stats.push((label.to_string(), a, b)),
+            Err(e) => {
+                println!("[SWAP] FAIL {}: {}", label, e);
+                failures.push(format!("{}: {}", label, e));
+            }
+        }
+    }
+
+    // 1) 最小 marker A: 建立基线。
+    step(ctrl, "① 最小 marker A", blob_a.to_vec(), Some(0xA5A5), caps.heap, stats, failures);
+    // 2) ★决定性回归★ 等长、仅 marker 不同 —— 旧代码在这里必然误报成功。
+    step(ctrl, "② 等长换 marker B(决定性回归)", blob_b.to_vec(), Some(0x5A5A), caps.heap, stats, failures);
+    // 3/4) 跨过 8 位页号边界(旧实现的回绕点): 每页 3 字节, 255 页=765B, 257 页=771B。
+    step(ctrl, "③ 765B(255 页, 边界内)", pad_to(blob_a, 765), Some(0xA5A5), caps.heap, stats, failures);
+    step(ctrl, "④ 771B(257 页, 跨 8 位页号)", pad_to(blob_b, 771), Some(0x5A5A), caps.heap, stats, failures);
+    // 5) 超过旧 1KB 槽: 证明扩容真的可用。
+    step(ctrl, "⑤ 2048B(旧槽装不下)", pad_to(blob_a, 2048), Some(0xA5A5), caps.heap, stats, failures);
+    // 6) ★满容量★ 顶到设备自报的单帧上传上限。
+    step(
+        ctrl,
+        &format!("⑥ 满容量 {}B", caps.upload_limit),
+        pad_to(blob_b, caps.upload_limit),
+        Some(0x5A5A),
+        caps.heap,
+        stats,
+        failures,
+    );
+    // 7) ★快速连续切换★ 不留间隔地来回换, 验证反复换代不会把引擎/救援门禁搞乱。
+    println!("[SWAP] === 快速连续切换 ×8 (A/B 交替, 每轮都要求身份+执行双证据) ===");
+    for round in 0..8u32 {
+        let (label, blob, marker) = if round % 2 == 0 {
+            (format!("⑦ 快切 #{} → A", round + 1), blob_a.to_vec(), 0xA5A5u16)
+        } else {
+            (format!("⑦ 快切 #{} → B", round + 1), blob_b.to_vec(), 0x5A5Au16)
+        };
+        step(ctrl, &label, blob, Some(marker), caps.heap, stats, failures);
+        if !failures.is_empty() {
+            break;
+        }
+    }
+    // 8) 真实 v4 算法(逐通道 + 防掠过), 非 marker: 只验身份 + 已换代。
+    step(
+        ctrl,
+        "⑧ v4 真实算法",
+        {
+            match AppController::compile_blob(mai2control_ui::algo_template::ALGO_V4_TEMPLATE, caps)
+            {
+                Ok(o) => o.blob,
+                Err(e) => {
+                    println!("[SWAP] FAIL 编译 v4 模板: {}", e);
+                    failures.push(format!("编译 v4: {}", e));
+                    Vec::new()
+                }
+            }
+        },
+        None,
+        caps.heap,
+        stats,
+        failures,
+    );
+    // 9) 恢复出厂默认, 别把测试算法留在设备上。
+    println!("[SWAP] 恢复出厂默认算法...");
+    let _ = ctrl.algo_reset_default();
+    let _ = _review_pump(ctrl, 15000, |c| {
+        c.algo_info().is_some_and(|i| i.is_default && i.psoc_valid)
+    });
+    ctrl.focus_set_target(None);
+    let _ = _review_pump(ctrl, 1200, |_| false);
+
+    println!("\n[SWAP] ================ 汇总 ================");
+    for (label, ident, exec) in stats.iter() {
+        println!("[SWAP] PASS {:<28} 身份 {:>5}ms | 执行 {:>4}ms", label, ident, exec);
+    }
+    if failures.is_empty() {
+        println!(
+            "[SWAP] ALGO-SWAP PASS: {} 轮全部取得身份+执行双证据(含满容量 {}B 与快速连续切换)",
+            stats.len(),
+            caps.upload_limit
+        );
+        0
+    } else {
+        for f in failures.iter() {
+            println!("[SWAP] FAILED → {}", f);
+        }
+        println!("[SWAP] ALGO-SWAP FAIL: {} 项未通过", failures.len());
+        1
+    }
+}
+
 fn _review_pump<F>(ctrl: &mut AppController, timeout_ms: u64, mut done: F) -> Result<(), String>
 where
     F: FnMut(&AppController) -> bool,
@@ -5283,6 +5523,8 @@ fn main() {
     let csd_provision = args.iter().any(|a| a == "--csd-provision");
     let csd_verify = args.iter().any(|a| a == "--csd-verify");
     let algo_test = args.iter().any(|a| a == "--algo");
+    // 运行时 JIT 替换的**执行证据** + 满容量 + 快速连续切换压测(见 --algo-swap 分支)。
+    let algo_swap_test = args.iter().any(|a| a == "--algo-swap");
     let global_test = args.iter().any(|a| a == "--global");
     let kbd_test = args.iter().any(|a| a == "--kbd");
     let bus_test = args.iter().any(|a| a == "--bus");
@@ -5784,13 +6026,21 @@ fn main() {
         }
         let received = ctrl.algo_version() > before;
         match ctrl.algo_info() {
+            // ★链路级计数必须一起打★ resync=主机侧收到的非法帧数, restart=事务重发次数。
+            // 二者是区分"主机根本没收到字节"与"收到了但帧边界错位"的唯一无头证据(见 psoc_link.cpp
+            // 的 _accept / _transfer): 前者 resync 恒定不动, 后者 resync 随时间猛涨。
             Some(info) => println!(
-                "[ALGO-INFO] {} is_default={} psoc_valid={} len={} crc16=0x{:04X}",
+                "[ALGO-INFO] {} is_default={} psoc_valid={} len={} crc16=0x{:04X} | link resync={} restart={} abort reason={} page={} count={}",
                 if received { "收到" } else { "未收到" },
                 info.is_default,
                 info.psoc_valid,
                 info.len,
-                info.crc16
+                info.crc16,
+                info.resync_count,
+                info.restart_count,
+                info.abort_reason,
+                info.abort_page,
+                info.abort_count
             ),
             None => println!(
                 "[ALGO-INFO] {} algo_info=<未取到>",
@@ -7834,6 +8084,112 @@ fn main() {
                 std::process::exit(1);
             }
         }
+    }
+
+    // ★运行时 JIT 替换的执行证据 + 满容量 + 快速连续切换★  --algo-swap
+    //
+    // 为什么必须有这个测试: "上传成功"从来不等于"新算法在跑"。旧判据只比对 RP2040 存储的
+    // len/crc, 而 PSoC 的 valid 又是粘滞的, 于是一次失败的上传会被报成"已装上并正在运行"。
+    // 本测试要求**两条互相独立的证据**同时成立才算通过:
+    //   ① 身份证据: PSoC 自报的 psoc_len/psoc_crc16 == 主机手里这份 blob 的 len/crc16。
+    //      该 CRC 是 PSoC 在 commit 时对**槽内实际字节**算出来的, 冒充不了。
+    //   ② 执行证据: 算法把一个独有的 marker 常量写进 report[0], 经遥测 FIELD_ALGO 实时读回。
+    //      marker 变了才证明**新代码真的在执行**, 而不只是被存下来了。
+    //
+    // 决定性回归用例是第 2 轮: 两份 blob **长度完全相同**、只有 marker 不同 —— 这正是旧代码
+    // 必然误判成功的形态(同一份源改个常量重编译, 长度几乎必然不变)。
+    //
+    // 长度构造: blob 是裸机器码, `algo` 在偏移 0 且会 return, 其后的填充字节永不被执行 ——
+    // 所以在主机侧给同一份 marker blob 追加填充即可精确构造任意长度, 用来覆盖分页边界与满容量。
+    if algo_swap_test {
+        use mai2control_ui::proto::algo::crc16_ccitt;
+
+        // marker 算法: 除 marker 外, 把引擎填进来的 ABI v2 字段原样上报 ——
+        // report[2]=heap_size 只有新引擎会填(旧引擎那里还是 reserved), 它本身就是 ABI v2 生效的证据;
+        // heap_used=64 用来验证"堆占用"这条上报链路真的通(UI 的堆占用显示就靠它)。
+        let marker_src = |marker: u16| -> String {
+            format!(
+                "#include <stddef.h>\n#include \"psoc_algo_abi.h\"\n\
+                 void algo(algo_io_t* io){{\n\
+                 \x20   io->report[0] = 0x{:04X}u;\n\
+                 \x20   io->report[1] = (uint16_t)io->ch;\n\
+                 \x20   io->report[2] = io->heap_size;\n\
+                 \x20   io->report[3] = (uint16_t)io->cfg_ch[0];\n\
+                 \x20   io->heap_used = 64u;\n\
+                 \x20   io->out_active = (io->base_active != 0u) ? 1u : 0u;\n\
+                 \x20   io->out_led = 0u;\n\
+                 }}\n",
+                marker
+            )
+        };
+
+        println!("[SWAP] 读取设备算法信息与容量...");
+        let _ = ctrl.algo_get_info();
+        if let Err(e) = _review_pump(&mut ctrl, 5000, |c| c.algo_info().is_some()) {
+            println!("[SWAP] FAIL 等待 ALGO_INFO: {}", e);
+            std::process::exit(1);
+        }
+        let caps = ctrl.algo_caps_snapshot();
+        println!(
+            "[SWAP] 设备自报容量: 槽={}B 单帧上传上限={}B C源={}B 堆={}B (来自PSoC={} 常量不一致={})",
+            caps.slot, caps.upload_limit, caps.src, caps.heap, caps.from_psoc, caps.mismatch
+        );
+        if !ctrl.algo_caps_known() {
+            println!("[SWAP] FAIL 设备未回报容量, 扩展 ALGO_GET_INFO 未生效");
+            std::process::exit(1);
+        }
+        if caps.mismatch {
+            println!("[SWAP] FAIL PSoC 与 RP2040 槽容量常量不一致, 上传必然静默跑飞");
+            std::process::exit(1);
+        }
+
+        // 执行证据靠单通道独占流的 FIELD_ALGO 块(与采样同帧回来), 先把 focus 开到 CH0。
+        const OBS: u8 = 0;
+        ctrl.focus_set_target(Some(OBS));
+        if let Err(e) = _review_pump(&mut ctrl, 8000, |c| c.algo_trace_report_last(0).is_some()) {
+            println!("[SWAP] FAIL 单通道流未带回算法运行值(FIELD_ALGO): {}", e);
+            std::process::exit(1);
+        }
+        println!("[SWAP] CH{} 单通道流已带回算法运行值, 可作执行证据", OBS);
+
+        // 预编译两份 marker blob(长度必须相同, 见上面的说明)。
+        let blob_a = match AppController::compile_blob(&marker_src(0xA5A5), caps) {
+            Ok(o) => o.blob,
+            Err(e) => {
+                println!("[SWAP] FAIL 编译 marker A: {}", e);
+                std::process::exit(1);
+            }
+        };
+        let blob_b = match AppController::compile_blob(&marker_src(0x5A5A), caps) {
+            Ok(o) => o.blob,
+            Err(e) => {
+                println!("[SWAP] FAIL 编译 marker B: {}", e);
+                std::process::exit(1);
+            }
+        };
+        println!(
+            "[SWAP] marker A len={}B crc=0x{:04X} / marker B len={}B crc=0x{:04X} (等长={})",
+            blob_a.len(),
+            crc16_ccitt(&blob_a),
+            blob_b.len(),
+            crc16_ccitt(&blob_b),
+            blob_a.len() == blob_b.len()
+        );
+        if blob_a.len() != blob_b.len() {
+            println!("[SWAP] FAIL 两份 marker blob 长度不同, 无法复现「同长不同内容」这一决定性用例");
+            std::process::exit(1);
+        }
+        // 把 blob 填充到指定长度: 尾部字节在 `algo` return 之后, 永不被执行。
+        let pad_to = |base: &[u8], want: usize| -> Vec<u8> {
+            let mut v = base.to_vec();
+            v.resize(want.max(base.len()), 0u8);
+            v
+        };
+        let mut failures: Vec<String> = Vec::new();
+        let mut swap_stats: Vec<(String, u128, u128)> = Vec::new();
+        std::process::exit(_algo_swap_run(
+            &mut ctrl, caps, &blob_a, &blob_b, &pad_to, &mut failures, &mut swap_stats,
+        ));
     }
 
     // JIT 算法引擎闭环: 读信息 → 编译并上传测试算法 → 校验 psoc_valid+非默认 → 恢复默认 → 校验默认。

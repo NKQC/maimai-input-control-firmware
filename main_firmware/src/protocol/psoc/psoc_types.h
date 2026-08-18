@@ -15,84 +15,14 @@
 
 namespace psoc {
 
-// ---------------- SPI 传感器帧 ----------------
-// 帧魔数，用于校验帧头合法性
-static constexpr uint8_t FRAME_MAGIC = 0xA5;
-static constexpr size_t FRAME_PAYLOAD_SIZE = 4;
+// ---------------- 传感器采样几何 ----------------
+// ★帧格式/命令码不在这里★ 它们的唯一真相源是 psoc_link_abi.h(两端共用)。此前 RP 侧在这里
+// 另写了一份(magic/Cmd/Frame), 与 PSoC 的 #define 和上位机常量三处并存 —— 漏改任何一处都
+// 表现为"上传成功却跑旧代码"。LINK v2 起本文件只留与线格式无关的采样/SWD 类型。
 static constexpr size_t SENSOR_CHANNEL_COUNT = 36;
 static constexpr size_t SENSOR_BYTES_PER_CHANNEL = 7;
 static constexpr size_t SNAPSHOT_SIZE = SENSOR_CHANNEL_COUNT * SENSOR_BYTES_PER_CHANNEL;
-static constexpr size_t SNAPSHOT_PAGE_COUNT = SNAPSHOT_SIZE / FRAME_PAYLOAD_SIZE;
 static constexpr uint8_t SENSOR_TOUCH_STATUS_MASK = 0x01;
-
-enum class Cmd : uint8_t {
-    PING = 0x01,
-    PONG = 0x02,
-    TOUCH = 0x03,   // 实时触控态：7字节帧 [magic,TOUCH,mask0..mask4]
-    SNAPSHOT_BEGIN = 0x10,
-    // Phase A CSD 运行时指令（帧 [magic,cmd,ch,param_id,val24]）
-    SET_PARAM = 0x30,
-    GET_PARAM = 0x31,
-    SET_MODE  = 0x32,
-    APPLY     = 0x33,
-    GET_RAW   = 0x34,
-    GET_STATS = 0x35,
-    MEASURE_CP = 0x36,   // 发送后确认 SPI ACK；PSoC 主循环异步执行实际测量
-    GET_CP     = 0x37,   // 测量中=0，成功=fF，失败/未测量=0xFFFFFF
-    SET_GLOBAL = 0x38,   // 全局 CSD 配置写(RAM 影子, 不重初始化)
-    GET_GLOBAL = 0x39,   // 全局 CSD 配置读：响应 [magic,GET_GLOBAL,gparam_id,0,val24]
-    GLOBAL_COMMIT = 0x3A,
-    CALIBRATE = 0x3B,      // 真正的 IDAC 重校准 + 基线复位(主循环执行, 耗时)
-    BASELINE_RESET = 0x3C, // 仅重置全部通道基线(主循环执行)// 全部全局项设完后触发一次完整重初始化(合并, 防反复重校准漂移)
-    AUTO_TUNE = 0x3D,      // 频率自适应下探(主循环逐档升 snsClk 分频重校准, 耗时数秒)
-    GET_AUTO_TUNE = 0x3E,  // 读自适应结果: [magic,GET_AUTO_TUNE,result(0进行中/1成功/2失败),0,div24]
-    // Runtime parameter apply: b2=channel, b3=gain, b4=divider. The PSoC applies the
-    // shadow values without calibration or baseline reset and reports the command result.
-    RUNTIME_PARAM_APPLY = 0x3F,
-    // Focus 扫描控制: b2=0..35 启用/续租指定已启用通道, 0xFF=立即恢复全通道;
-    // 响应 b2=实际目标(0xFF=全通道), b3=1 接受 / 0 拒绝。
-    FOCUS_SCAN = 0x49,
-    // JIT 可加载算法引擎：分页下发 blob 到 PSoC 的 1KB 可执行槽（ABI v1，见 jit-algo-engine.md）
-    ALGO_BEGIN = 0x40,   // [magic,ALGO_BEGIN,len_lo,len_hi,0,0,0] 复位暂存写指针+记录期望 len
-    ALGO_PAGE  = 0x41,   // [magic,ALGO_PAGE,page,d0,d1,d2,d3] 每页 4 字节写 staging[page*4..+4]
-    ALGO_END   = 0x42,   // [magic,ALGO_END,crc_lo,crc_hi,0,0,0] 触发主循环 commit(CRC16 校验+拷入槽)
-    ALGO_INFO  = 0x43,   // 响应 [magic,ALGO_INFO,valid,0,len_lo,len_hi,0]
-    ALGO_SET_ROM = 0x44, // [magic,ALGO_SET_ROM,ch,rom_lo,rom_hi,0,0] 设每通道 16 位只读 ROM
-    ALGO_GET_ROM = 0x45, // [magic,ALGO_GET_ROM,ch,0,0,0,0] → 响应 [.. ,ch,0,rom_lo,rom_hi,0]
-    ALGO_GET_TRACE = 0x46, // [magic,GET_TRACE,ch,idx,0,0,0] → 响应 [..,ch,out_active,report[idx]_lo,report[idx]_hi,idx]
-    ALGO_SET_CFG = 0x47,   // [magic,SET_CFG,idx,val,0,0,0] 设共享 cfg[idx] → 响应回显 [..,idx,0,cfg[idx],0,0]
-    ALGO_GET_CFG = 0x48,   // [magic,GET_CFG,idx,0,0,0,0] → 响应 [..,idx,0,cfg[idx],0,0]
-    // ---- ABI v2 追加(槽 4096B + 共享堆 256B + 逐通道 cfg_ch[36][8]) ----
-    // ★注意 0x49 是 FOCUS_SCAN★(它历史上插在算法域中间), 故 v2 从 0x4A 起排, 不得回填 0x49。
-    ALGO_SET_CFG_CH = 0x4A, // [magic,SET_CFG_CH,ch,idx,val,0,0] 设逐通道 cfg_ch[ch][idx] → 响应 [..,ch,idx,实际写入值,0,0]
-    ALGO_GET_CFG_CH = 0x4B, // [magic,GET_CFG_CH,ch,idx,0,0,0] → 响应 [..,ch,idx,cfg_ch[ch][idx],0,0]
-    ALGO_GET_HEAP   = 0x4C, // [magic,GET_HEAP,0,...] → 响应 [..,size_lo,size_hi,used_peak,0,0] 共享堆容量/峰值占用
-    // ★内容对账用★: 只有 CRC 能区分"新算法真装上了"与"旧算法还在、长度恰好相同"。
-    ALGO_GET_CRC    = 0x4D, // [magic,GET_CRC,0,...] → 响应 [..,valid,0,crc_lo,crc_hi,0] 槽内实际内容 CRC16
-    // 容量由 PSoC 固件自报，避免槽/堆常量在 PSoC、RP、上位机三层静默漂移。
-    ALGO_GET_CAPS   = 0x4E, // [magic,GET_CAPS,0,...] → 响应 [..,heap_lo,heap_hi,slot_lo,slot_hi,0]
-    SNAPSHOT_INFO = 0x11,
-    SNAPSHOT_PAGE = 0x12,
-    SNAPSHOT_DATA = 0x13,
-    INDICATOR_ON = 0x20,
-};
-
-// SCB 从机 FIFO 安全的定长 7-byte 帧。响应在下一 SPI 事务返回。
-struct Frame {
-    uint8_t magic = FRAME_MAGIC;
-    uint8_t cmd = 0;
-    uint8_t seq = 0;
-    uint8_t payload[FRAME_PAYLOAD_SIZE] = {};
-
-    void clear() {
-        magic = FRAME_MAGIC;
-        cmd = 0;
-        seq = 0;
-        for (auto& byte : payload) byte = 0;
-    }
-};
-static_assert(sizeof(Frame) == 3 + FRAME_PAYLOAD_SIZE, "psoc::Frame must be 7 bytes");
-static_assert((SNAPSHOT_SIZE % FRAME_PAYLOAD_SIZE) == 0, "snapshot must use complete pages");
 
 // JIT 算法 ABI 的 report 槽数(见 psoc_algo_abi.h 的 algo_io_t::report[4])。
 static constexpr size_t ALGO_REPORT_SLOTS = 4;
@@ -131,20 +61,16 @@ struct AutoTuneProgress {
     }
 };
 
-// ---------------- AUTO_TUNE 请求标签(端到端归属) ----------------
-// 上位机请求 seq → RP2040 → PSoC(AUTO_TUNE 帧 rx[4]) → GET_AUTO_TUNE 的 result 高 6 位回显 → RP2040。
-// ★为什么要它★: "发命令→轮询 busy→读结果"的流水线里, 命令若在 SPI 上丢了而 busy 恰好因上一条重
-// 操作为 1, 读回来的 result/div 是**上一轮**的, 却会被当成本轮成功。标签一比即知。
-// 0 保留给"未标记/旧固件", 故 seq 低 6 位为 0 时映射到 0x3F。
+// ---------------- AUTO_TUNE 请求标签(★仅 host 侧进度标签★) ----------------
+// LINK v2 起它**不再下到线上**: 链路 tag 已经保证"这份响应属于这次请求", 陈旧结果不可能冒充
+// 本轮成功(见 psoc_link_abi.h 的三条不变式)。这里保留它只是给上位机的进度推送带一个请求归属键,
+// 使界面能区分本轮进度与上一轮残留。0 保留给"未标记", 故 seq 低 6 位为 0 时映射到 0x3F。
 static constexpr uint8_t AUTOTUNE_TAG_MASK = 0x3Fu;
 static constexpr uint8_t AUTOTUNE_RESULT_MASK = 0x03u;
 static inline uint8_t autotune_tag_of(uint8_t host_seq) {
     const uint8_t tag = (uint8_t)(host_seq & AUTOTUNE_TAG_MASK);
     return (tag != 0u) ? tag : AUTOTUNE_TAG_MASK;
 }
-
-// SPI 层在阻塞等待中回吐进度用的回调(ctx 由调用方透传, 避免 SPI 层反向依赖门面类型)。
-using AutoTuneProgressFn = void (*)(void* ctx, const AutoTuneProgress& progress);
 
 struct SensorSnapshot {
     uint16_t generation = 0;

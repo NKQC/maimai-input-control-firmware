@@ -200,6 +200,19 @@ pub struct AlgoInfo {
     /// 另一侧静默截断, 表现为"上传成功但算法跑飞", 而任何一侧的日志都看不出原因。
     pub capacity_mismatch: bool,
 
+    // ---- 上传中止现场(payload ≥ 31 才有效) ----
+    /// 最近一次下发中止发生在第几页; `0xFFFF` = 还在 ALGO_BEGIN 阶段就失败了。
+    pub abort_page: u16,
+    /// 中止原因, 见 `algo_abort_reason_text`。0 = 最近一次下发是成功的。
+    pub abort_reason: u8,
+    /// 累计中止次数(设备上电以来)。偶发与必然失败靠它区分。
+    pub abort_count: u16,
+    /// 累计"应答流水重新对齐"次数。>0 = 错位确实发生过但被就地修复; 长期为 0 而上传仍失败,
+    /// 说明成因不在错位。
+    pub resync_count: u16,
+    /// 累计"整轮重传"次数。>0 而上传成功 = 设备自行吃掉了页级故障, 属正常自愈, 不必告警。
+    pub restart_count: u16,
+
     /// 设备是否回报了扩展字段(payload ≥ 15)。false = 旧固件, 只有前 6 字节可信。
     pub extended: bool,
     /// 设备是否回报了容量组(payload ≥ 26)。false 时上面那一组恒 0/false, UI 必须显示 "—"。
@@ -249,6 +262,11 @@ pub fn decode_algo_info(payload: &[u8]) -> Option<AlgoInfo> {
         capacity_mismatch: false,
         extended: false,
         caps_known: false,
+        abort_page: 0,
+        abort_reason: 0,
+        abort_count: 0,
+        resync_count: 0,
+        restart_count: 0,
     };
     if payload.len() >= 15 {
         let flags = payload[14];
@@ -273,7 +291,36 @@ pub fn decode_algo_info(payload: &[u8]) -> Option<AlgoInfo> {
         info.capacity_mismatch = (caps_flags & ALGO_CAPS_MISMATCH) != 0;
         info.caps_known = true;
     }
+    if payload.len() >= 31 {
+        info.abort_page = u16::from_le_bytes([payload[26], payload[27]]);
+        info.abort_reason = payload[28];
+        info.abort_count = u16::from_le_bytes([payload[29], payload[30]]);
+    }
+    if payload.len() >= 33 {
+        info.resync_count = u16::from_le_bytes([payload[31], payload[32]]);
+    }
+    if payload.len() >= 35 {
+        info.restart_count = u16::from_le_bytes([payload[33], payload[34]]);
+    }
     Some(info)
+}
+
+/// 上传中止原因(设备 `PsocSpi::AlgoAbort`)的人话解释。
+/// ★为什么要有这张表★ "上传没成功"在界面上原先只是一句 len=0, 而这五六种成因的修法完全不同:
+/// BEGIN 没被受理是链路/回显问题, 状态泄漏是固件 bug, 页回显不符是寻址/越界, 内容 CRC 不符
+/// 说明中途写歪。把原因直接说出来, 用户和排查者都不必再猜。
+pub fn algo_abort_reason_text(reason: u8) -> &'static str {
+    match reason {
+        0 => "无",
+        1 => "上一轮上传状态未归零(设备侧状态泄漏), 后续上传会被静默拒绝",
+        2 => "ALGO_BEGIN 未被受理(回显校验失败), 设备收到过 BEGIN 但一页都没收到",
+        3 => "某一页回显页号不符(越界/无在途上传/响应错位)",
+        4 => "ALGO_END 未被受理或长度回显不符",
+        5 => "等待设备 commit 超时",
+        6 => "设备槽内内容 CRC 与上传件不符(中途有字节写歪)",
+        7 => "SPI 链路传输失败",
+        _ => "未知原因",
+    }
 }
 
 /// payload = [len(u16 LE), crc16(u16 LE), data[len]]; crc16 内部按 CCITT-FALSE 计算。
