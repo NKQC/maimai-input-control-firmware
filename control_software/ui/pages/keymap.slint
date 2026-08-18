@@ -529,20 +529,12 @@ component PhysKeyRow inherits Rectangle {
                 current-index: root.pol_mode;
                 selected => { root.keycfg_set(self.current-index, root.debounce_us); }
             }
-            Text {
-                // 恒显"当前实际是什么电平触发"(不再只在 AUTO 档露出, 也不做二值化推断):
-                // 电平文案一律取固件回传的生效掩码; AUTO 档只多加一个"自动 → "前缀说明来源。
-                text: !root.pol_resolved_known
-                    ? @tr("当前: 未知")
-                    : (root.pol_mode == 2 ? @tr("自动 → ") : "")
-                      + (root.pol_resolved_high ? @tr("当前: 高电平触发") : @tr("当前: 低电平触发"));
-                font-size: Theme.fs-small;
-                color: root.pol_resolved_known ? Theme.text-sub : Theme.muted;
-                vertical-alignment: center;
-            }
-            Text { text: @tr("防抖(us)"); font-size: Theme.fs-small; vertical-alignment: center; }
             // ★三个数字框原为 96px★, 低于 fluent SpinBox 自报的 128px 下限 ⇒ 文本区被上下箭头挤掉,
             // 五位数(10000/65535)根本看不全。统一取 Theme.spin-narrow(=128px, 恰为下限)。
+            // ★列标题不在行内★ 三个"防抖/触发延时/自动抬起"标签原先每行都重复一遍, 与四个定宽控件
+            // 一起把本行撑到约 1010px, 而这一页的可用宽度只有约 820px ⇒ 行被撑宽后 ScrollView 直接
+            // 裁掉右侧, 连第一行的"清除"按钮也一并看不见。标题改为在 12 行之上只画一次(PhysKeyHeader),
+            // 与本文件上半部分的分区表同一范式; 本行只剩 220+128×3 ≈ 622px, 结构上不再可能溢出。
             GuardedSpinBox {
                 width: Theme.spin-narrow;
                 horizontal-stretch: 0;
@@ -552,7 +544,6 @@ component PhysKeyRow inherits Rectangle {
                 model_value: root.debounce_us;
                 edited(v) => { root.keycfg_set(root.pol_mode, v); }
             }
-            Text { text: @tr("触发延时(ms)"); font-size: Theme.fs-small; vertical-alignment: center; }
             GuardedSpinBox {
                 width: Theme.spin-narrow;
                 horizontal-stretch: 0;
@@ -561,7 +552,6 @@ component PhysKeyRow inherits Rectangle {
                 model_value: root.hold_delay;
                 edited(v) => { root.hold_set(v, root.hold_max); }
             }
-            Text { text: @tr("自动抬起(ms)"); font-size: Theme.fs-small; vertical-alignment: center; }
             GuardedSpinBox {
                 width: Theme.spin-narrow;
                 horizontal-stretch: 0;
@@ -570,8 +560,69 @@ component PhysKeyRow inherits Rectangle {
                 model_value: root.hold_max;
                 edited(v) => { root.hold_set(root.hold_delay, v); }
             }
-            Rectangle { horizontal-stretch: 1; }
+            Text {
+                // 恒显"当前实际是什么电平触发"(不再只在 AUTO 档露出, 也不做二值化推断):
+                // 电平文案一律取固件回传的生效掩码; AUTO 档只多加一个"自动 → "前缀说明来源。
+                // ★它就是本行的伸缩位★(原来这里是个 stretch 占位矩形): 放在末尾吃掉剩余宽度并
+                // 允许省略号, 于是无论窗口多窄, 溢出压力都落在这条可省略的说明文字上, 而不是
+                // 把定宽的数字框挤出可视区 —— 那正是原先整行被裁的原因。
+                text: !root.pol_resolved_known
+                    ? @tr("当前: 未知")
+                    : (root.pol_mode == 2 ? @tr("自动 → ") : "")
+                      + (root.pol_resolved_high ? @tr("当前: 高电平触发") : @tr("当前: 低电平触发"));
+                font-size: Theme.fs-small;
+                color: root.pol_resolved_known ? Theme.text-sub : Theme.muted;
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+                overflow: elide;
+            }
         }
+    }
+}
+
+// 每键参数表的列标题, 在 12 行之上只画一次。★宽度必须与 PhysKeyRow 第二行逐列一致★
+// (combo-wide / spin-narrow ×3 + Theme.gap), 否则标题与其下的控件对不上列。
+// 左侧 5px = PhysKeyRow 的边框 1px + 内层 VerticalLayout padding 4px。
+component PhysKeyHeader inherits HorizontalLayout {
+    padding-left: 5px;
+    padding-right: 5px;
+    spacing: Theme.gap;
+    height: 18px;
+    Text {
+        text: @tr("触发极性");
+        width: Theme.combo-wide;
+        font-size: Theme.fs-small;
+        color: Theme.text-sub;
+        vertical-alignment: center;
+    }
+    Text {
+        text: @tr("防抖(us)");
+        width: Theme.spin-narrow;
+        font-size: Theme.fs-small;
+        color: Theme.text-sub;
+        vertical-alignment: center;
+    }
+    Text {
+        text: @tr("触发延时(ms)");
+        width: Theme.spin-narrow;
+        font-size: Theme.fs-small;
+        color: Theme.text-sub;
+        vertical-alignment: center;
+    }
+    Text {
+        text: @tr("自动抬起(ms)");
+        width: Theme.spin-narrow;
+        font-size: Theme.fs-small;
+        color: Theme.text-sub;
+        vertical-alignment: center;
+    }
+    Text {
+        text: @tr("生效电平");
+        font-size: Theme.fs-small;
+        color: Theme.text-sub;
+        vertical-alignment: center;
+        horizontal-stretch: 1;
+        overflow: elide;
     }
 }
 
@@ -757,6 +808,7 @@ export component PhysKbdPage inherits Rectangle {
                     VerticalLayout {
                     padding: 0px;
                     spacing: 4px;
+                    PhysKeyHeader { }
                     for i in 12: PhysKeyRow {
                         index: i;
                         pressed: i < root.phys_pressed.length ? root.phys_pressed[i] : false;
